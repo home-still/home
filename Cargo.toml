@@ -1,0 +1,29 @@
+[workspace]
+members = ["hs-style", "paper", "pdf_masher/pdf-mash"]
+resolver = "2"
+
+[workspace.dependencies]
+# Shared across workspace crates
+reqwest = { version = "0.12", features = [
+    "json",
+    "rustls-tls-native-roots",
+], default-features = false }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+hs-style = { path = "hs-style" }
+owo-colors = { version = "4.3", features = ["supports-colors"] }
+serde_yaml_ng = "0.10"
+figment = { version = "0.10", features = ["yaml", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

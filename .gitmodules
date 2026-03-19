@@ -1,0 +1,10 @@
+[submodule "hs-style"]
+	path = hs-style
+	url = https://github.com/home-still/hs-style.git
+[submodule "paper"]
+	path = paper
+	url = git@github.com:home-still/paper.git
+[submodule "pdf_masher"]
+	path = pdf_masher
+	url = git@github.com:home-still/pdf_masher.git
+	branch = feature/vlm-refactor
