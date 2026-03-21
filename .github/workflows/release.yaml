@@ -60,7 +60,7 @@ jobs:
         if: matrix.use_zigbuild
         run: >
           cargo zigbuild --release
-          -- target ${{ matrix.target }}.2.28
+          --target ${{ matrix.target }}.2.28
           -p ${{ env.CRATE }}
 
       - name: Build (natives)
