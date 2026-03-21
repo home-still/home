@@ -16,6 +16,7 @@ struct OpenAlexResponse {
     results: Vec<Work>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct Meta {
     count: usize,
