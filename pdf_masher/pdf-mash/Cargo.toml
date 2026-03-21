@@ -1,0 +1,60 @@
+[package]
+name = "pdf-mash"
+version = "0.1.0"
+edition = "2021"
+default-run = "pdf-mash"
+
+[dependencies]
+# PDF Parsing
+pdfium-render = "0.8.35"
+
+# CLI
+clap = { workspace = true }
+
+# Image processing
+image = "0.25"
+
+# ONNX inference (layout detection)
+ort = { version = "=2.0.0-rc.12", features = ["cuda", "ndarray"] }
+ndarray = "0.17"
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async runtime
+tokio = { workspace = true }
+futures = "0.3"
+
+# VLM backends
+ollama-rs = { version = "0.3", features = ["stream"] }
+base64 = "0.22"
+reqwest = { workspace = true }
+
+# Configuration
+figment = { workspace = true }
+dirs = "6"
+
+# Watch mode
+notify = "8"
+notify-debouncer-full = "0.4"
+ctrlc = "3"
+
+# Eval (optional)
+edit-distance = { version = "2.1", optional = true }
+
+[features]
+eval = ["dep:edit-distance"]
+
+[[bin]]
+name = "eval_runner"
+path = "src/bin/eval_runner.rs"
+required-features = ["eval"]

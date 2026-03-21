@@ -1,0 +1,7 @@
+- Change the entry command from `paper-fetch` to `home-still`.  This turns into `home-still paper download` instead of `paper-fetch paper download`.  The latter seems redudant.
+- Progress bars
+- Add a note of for "End of Results" so if more result than are available then it's clear there werent' more out there.
+- Having an REST API that can handle these searches
+- Have a research agent that can take a general description "I want to know how to do PDF to markdown conversion better," discover the domain language and terms, search for articles, order the orders in relevance.
+- Having a librarian crate handle curating all documents into searchable embeddings
+- Implement all providers from https://github.com/Ladvien/research_hub_mcp/tree/main/src/client/providers

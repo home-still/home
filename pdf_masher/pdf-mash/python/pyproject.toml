@@ -1,0 +1,26 @@
+[project]
+name = "model-conversion-tools"
+version = "0.1.0"
+description = "Tools for converting ML models to ONNX format"
+requires-python = ">=3.10"
+
+dependencies = [
+    "torch>=2.0.1",
+    "torchvision>=0.15.0",
+    "onnx>=1.15.0",
+    "onnxruntime>=1.17.0",
+    "onnxscript>=0.1.0",
+    "doclayout-yolo>=0.0.1",
+    "huggingface-hub>=0.20.0",
+    "opencv-python>=4.8.0",
+    "pillow>=10.0.0",
+    "paddleocr>=2.7.0",
+    # paddle2onnx has build issues - will download pre-converted models instead
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+dev-dependencies = []

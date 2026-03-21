@@ -1,0 +1,122 @@
+name: Release Home Still
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TOOL: hs
+  CRATE: hs
+
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            use_zigbuild: true
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild + zig (ARM64 Linux only)
+        if: matrix.use_zigbuild
+        run: |
+          pip3 install ziglang --break-system-packages
+          cargo install cargo-zigbuild
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (zigbuild)
+        if: matrix.use_zigbuild
+        run: >
+          cargo zigbuild --release
+          -- target ${{ matrix.target }}.2.28
+          -p ${{ env.CRATE }}
+
+      - name: Build (natives)
+        if: ${{ !matrix.use_zigbuild }}
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          -p ${{ env.CRATE }}
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          ASSET="${{ env.TOOL }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$ASSET" \
+            -C "target/${{ matrix.target }}/release" "${{ env.TOOL }}"
+          shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          echo "ASSET=$ASSET" >> $GITHUB_ENV
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $asset = "${{ env.TOOL }}-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive `
+            -Path "target\${{ matrix.target }}\release\${{ env.TOOL }}.exe" `
+            -DestinationPath $asset
+          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
+          "$hash  $asset" | Out-File -Encoding ascii "$asset.sha256"
+          echo "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TOOL }}-${{ matrix.target }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+            
+  release:
+    name: Publish Github Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Combine Checksums
+        run: cat artifacts/*.sha256 > checksums-sha256.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*
+            checksums-sha256.txt
+          generate_release_notes: true
+          draft: false
+          fail_on_unmatched_files: true
+          

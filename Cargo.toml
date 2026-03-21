@@ -1,5 +1,5 @@
 [workspace]
-members = ["hs-style", "paper", "pdf_masher/pdf-mash"]
+members = ["crates/*", "hs-style", "paper", "pdf_masher/pdf-mash"]
 resolver = "2"
 
 [workspace.dependencies]

@@ -1,0 +1,16 @@
+[package]
+name = "hs"
+version = "0.0.1"
+edition = "2021"
+
+[[bin]]
+name = "hs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+hs-style = { workspace = true, features = ["cli"] }
+owo-colors = { workspace = true }
+paper = { path = "../../paper" }
