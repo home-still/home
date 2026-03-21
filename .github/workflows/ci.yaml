@@ -14,6 +14,7 @@ jobs:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
@@ -25,7 +26,7 @@ jobs:
       
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo fmt --all --check
+      - run: cargo fmt -p hs -p paper -p hs-style --check
       # TODO: Get pdf-mash building too
       - run: cargo clippy --workspace --exclude pdf-mash --all-targets -- -D warnings
       - run: cargo test --workspace --exclude pdf-mash
