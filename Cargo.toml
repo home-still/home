@@ -21,6 +21,7 @@ serde_yaml_ng = "0.10"
 figment = { version = "0.10", features = ["yaml", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dialoguer = "0.11"
 
 [profile.release]
 opt-level = 3

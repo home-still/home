@@ -1,4 +1,5 @@
 use clap::Parser;
+use dialoguer::{Confirm, Input};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -75,8 +76,12 @@ async fn handle_config(
             let config_path = home.join(".home-still/config.yaml");
 
             if config_path.exists() && !force {
-                let answer = prompt("Config already exists.  Overwrite? [y/N] ")?;
-                if !answer.eq_ignore_ascii_case("y") {
+                let overwrite = Confirm::new()
+                    .with_prompt("Config already exists.  Overwrite?")
+                    .default(false)
+                    .interact()?;
+
+                if !overwrite {
                     reporter.status("Skipped", "config unchanged");
                     return Ok(());
                 }
@@ -86,8 +91,10 @@ async fn handle_config(
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?;
             std::fs::create_dir_all(parent)?;
-            let email =
-                prompt("Email for Unpaywall API (enables more downloads, Enter to skip): ")?;
+            let email: String = Input::new()
+                .with_prompt("Email for Unpaywall API (enables more downloads, Enter to skip)")
+                .allow_empty(true)
+                .interact()?;
             std::fs::write(&config_path, generate_config(&email))?;
             reporter.status("Created", &format!("{}", config_path.display()));
 
@@ -114,13 +121,6 @@ async fn handle_config(
             Ok(())
         }
     }
-}
-
-fn prompt(question: &str) -> std::io::Result<String> {
-    eprint!("{}", question);
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    Ok(input.trim().to_string())
 }
 
 fn generate_config(email: &str) -> String {
