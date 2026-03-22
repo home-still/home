@@ -1,7 +1,7 @@
 use crate::resilience::config::ResilienceConfig;
 use anyhow::Context;
 use figment::{
-    providers::{Env, Format, Serialized, Yaml},
+    providers::{Env, Format, Yaml},
     Figment,
 };
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 /// Main application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// Resilience patterns configuration
     pub resilience: ResilienceConfig,
@@ -66,7 +67,6 @@ impl Config {
 
         let config: Config = figment
             .focus("paper")
-            .merge(Serialized::defaults(Config::default()))
             .extract()
             .context("Failed to load configuration")?;
 
@@ -75,6 +75,7 @@ impl Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ArxivConfig {
     pub base_url: String,
     pub timeout_secs: u64,
@@ -92,6 +93,7 @@ impl Default for ArxivConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OpenAlexConfig {
     pub base_url: String,
     pub api_key: Option<String>,
@@ -117,6 +119,7 @@ pub struct ProvidersConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DownloadConfig {
     /// Maximum concurrent downloads
     pub max_concurrent: usize,
