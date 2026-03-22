@@ -91,6 +91,17 @@ impl DownloadService for PaperDownloader {
 
         let file_path = self.download_path.join(filename);
 
+        // Skip if already downloaded
+        if file_path.exists() {
+            let metadata = tokio::fs::metadata(&file_path).await?;
+            return Ok(DownloadResult {
+                file_path,
+                doi: None,
+                sha256: String::new(),
+                size_bytes: metadata.len(),
+            });
+        }
+
         // Stream the response
         let response = self.client.get(url).send().await?.error_for_status()?;
 

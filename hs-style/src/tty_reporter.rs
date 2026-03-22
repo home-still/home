@@ -141,6 +141,16 @@ impl StageHandle for IndicatifStageHandle {
 
     fn finish_failed(&self, msg: &str) {
         let pw = self.prefix_width;
+        let term_width = terminal_size::terminal_size()
+            .map(|(w, _)| w.0 as usize)
+            .unwrap_or(DEFAULT_TERM_WIDTH);
+        let max_msg = term_width.saturating_sub(pw + 1);
+        let truncated = if msg.len() > max_msg {
+            format!("{}...", &msg[..max_msg.saturating_sub(3)])
+        } else {
+            String::from(msg)
+        };
+
         let template = if self.use_color {
             format!("{{prefix:{pw}.bold.red}} {{msg}}")
         } else {
@@ -150,7 +160,7 @@ impl StageHandle for IndicatifStageHandle {
             ProgressStyle::with_template(&template)
                 .unwrap_or_else(|_| ProgressStyle::default_bar()),
         );
-        self.pb.finish_with_message(String::from(msg));
+        self.pb.finish_with_message(truncated);
     }
 }
 
