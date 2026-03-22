@@ -14,3 +14,6 @@ anyhow = { workspace = true }
 hs-style = { workspace = true, features = ["cli"] }
 owo-colors = { workspace = true }
 paper = { path = "../../paper" }
+dirs = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }

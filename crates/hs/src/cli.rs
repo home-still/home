@@ -18,4 +18,23 @@ pub enum TopCmd {
         #[command(subcommand)]
         command: paper::cli::PaperCmd,
     },
+    /// View and manage configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    /// Generate default config at ~/.home-still/config.yaml
+    Init {
+        /// Overwrite existing config file
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the resolved configuration
+    Show,
+    /// Print the config file path
+    Path,
 }

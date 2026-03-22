@@ -1073,9 +1073,12 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "dirs",
  "hs-style",
  "owo-colors",
  "paper",
+ "serde_json",
+ "serde_yaml_ng",
  "tokio",
 ]
 

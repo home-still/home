@@ -12,6 +12,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+dirs = "6"
 anyhow = "1"
 thiserror = "2"
 hs-style = { path = "hs-style" }

@@ -1,0 +1,40 @@
+# home-still configuration
+
+# --- General settings ---
+home:
+  # log_level: info
+
+# --- Paper search & download ---
+paper:
+  # Where downloaded PDFs are saved
+  download_path: ~/Downloads/home-still/papers
+
+  # Metadata and search result cache
+  cache_path: ~/.home-still/paper/cache
+
+  # Search providers
+  providers:
+    arxiv:
+      base_url: http://export.arxiv.org/api/query
+      timeout_secs: 30
+      rate_limit_interval_ms: 3000
+
+    openalex:
+      base_url: http://api.openalex.org
+      # api_key: your-key-here
+      timeout_secs: 30
+      rate_limit_interval_ms: 100
+
+  # Download settings
+  download:
+    max_concurrent: 4
+    timeout_secs: 120
+
+  # Resilience patterns
+  resilience:
+    cb_initial_backoff_secs: 10
+    cb_max_backoff_secs: 60
+    cb_failure_threshold: 3
+    retry_max_attempts: 5
+    retry_min_backoff_ms: 100
+    retry_max_backoff_secs: 30

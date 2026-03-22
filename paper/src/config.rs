@@ -44,11 +44,11 @@ impl Default for Config {
 
 impl Config {
     pub fn config_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".home-still/paper/config.yaml"))
+        dirs::home_dir().map(|h| h.join(".home-still/config.yaml"))
     }
 
     pub fn load() -> anyhow::Result<Self> {
-        let mut figment = Figment::new().merge(Serialized::defaults(Config::default()));
+        let mut figment = Figment::new();
 
         let system_path = PathBuf::from("/etc/home-still/config.yaml");
         if system_path.exists() {
@@ -60,16 +60,15 @@ impl Config {
             if user_path.exists() {
                 figment = figment.merge(Yaml::file(&user_path));
             }
-
-            let app_path = home.join(".home-still/paper/config.yaml");
-            if app_path.exists() {
-                figment = figment.merge(Yaml::file(&app_path));
-            }
         }
 
         figment = figment.merge(Env::prefixed("HOME_STILL_").split("_"));
 
-        let config: Config = figment.extract().context("Failed to load configuration")?;
+        let config: Config = figment
+            .focus("paper")
+            .merge(Serialized::defaults(Config::default()))
+            .extract()
+            .context("Failed to load configuration")?;
 
         Ok(config)
     }

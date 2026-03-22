@@ -1,14 +1,16 @@
-mod cli;
-
+use clap::Parser;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::Parser;
+mod cli;
+
 use cli::{Cli, TopCmd};
 use hs_style::mode::{self, OutputMode};
 use hs_style::reporter::{Reporter, SilentReporter};
 use hs_style::styles::Styles;
 use hs_style::tty_reporter::TtyReporter;
+
+const DEFAULT_CONFIG: &str = include_str!("../config/default.yaml");
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -38,6 +40,7 @@ fn main() -> ExitCode {
     // Capture exit code mapper before cli.command is moved
     let exit_code_mapper: fn(&anyhow::Error) -> ExitCode = match &cli.command {
         TopCmd::Paper { .. } => paper::exit_codes::from_error,
+        TopCmd::Config { .. } => |_| ExitCode::FAILURE,
     };
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio  runtime");
@@ -47,6 +50,7 @@ fn main() -> ExitCode {
             TopCmd::Paper { command } => {
                 paper::commands::dispatch(command, &cli.global, &reporter, &styles).await
             }
+            TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
         }
     });
 
@@ -55,6 +59,58 @@ fn main() -> ExitCode {
         Err(e) => {
             reporter.error(&format!("Error: {e:#}"));
             exit_code_mapper(&e)
+        }
+    }
+}
+
+async fn handle_config(
+    action: cli::ConfigAction,
+    global: &hs_style::global_args::GlobalArgs,
+    reporter: &std::sync::Arc<dyn hs_style::reporter::Reporter>,
+) -> anyhow::Result<()> {
+    match action {
+        cli::ConfigAction::Init { force } => {
+            let home = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+            let config_path = home.join(".home-still/config.yaml");
+
+            if config_path.exists() && !force {
+                reporter.warn(&format!(
+                    "Config already exists: {}.  Use --force to overwrite",
+                    config_path.display()
+                ));
+
+                return Ok(());
+            }
+
+            let parent = config_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?;
+            std::fs::create_dir_all(parent)?;
+            std::fs::write(&config_path, DEFAULT_CONFIG)?;
+            reporter.status("Created", &format!("{}", config_path.display()));
+
+            Ok(())
+        }
+
+        cli::ConfigAction::Show => {
+            let config = paper::config::Config::load()?;
+            if global.is_json() {
+                let json = serde_json::to_string_pretty(&config)?;
+                println!("{json}");
+            } else {
+                let yaml = serde_yaml_ng::to_string(&config)?;
+                println!("{yaml}");
+            }
+            Ok(())
+        }
+
+        cli::ConfigAction::Path => {
+            let home = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+            let path = home.join(".home-still/config.yaml");
+            println!("{}", path.display());
+            Ok(())
         }
     }
 }
