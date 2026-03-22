@@ -1,7 +1,7 @@
 # Walkthrough: Fix Download Output (Sizing, Errors, Layout)
 
 **Date:** 2026-03-22
-**Status:** Planning
+**Status:** Complete
 **Checkpoint:** c867f748f5ce753df29141fae54b0595894d5fdc
 
 ## Goal
@@ -54,43 +54,43 @@ Three crates involved:
 
 **What you'll build:** Fix `Completed`/`Failed` events to use enumeration index `i` instead of atomic counter `count`
 **File:** `paper/src/services/download.rs`
-**Status:** [ ] Not started
+**Status:** [x] Complete
 
-The `Started` event uses `index: i` (line 58), but `Completed` (line 73) and `Failed` (line 82) use `index: count` from the atomic counter. Since the HashMap in `paper.rs` keys bars by `i`, the lookup fails and bars never get their finish message.
+Changed `index: count` → `index: i` for `Completed`/`Failed` events. Removed unused `AtomicUsize` import and `completed` counter.
 
-**Verify:** `cargo check -p paper`
+**Dragon:** `make_style` panics with empty `progress_chars` — indicatif requires at least 2 chars. Use `ProgressStyle::with_template` directly or pass `"  "` when no bar is rendered.
 
 ### Step 2: Context-Aware Error Message
 
 **What you'll build:** Make the "no OA PDF" error message conditional on whether `unpaywall_email` is configured
 **File:** `paper/src/providers/downloader.rs`
-**Status:** [ ] Not started
+**Status:** [x] Complete
 
-**Verify:** `cargo check -p paper`
+Conditional on `self.unpaywall_email.is_some()` — short message when configured, actionable suggestion when not.
 
 ### Step 3: Add `finish_failed` to StageHandle Trait
 
 **What you'll build:** New trait method for rendering failures differently from successes
 **Files:** `hs-style/src/reporter.rs`
-**Status:** [ ] Not started
+**Status:** [x] Complete
 
-**Verify:** `cargo check -p hs-style`
+**Dragon:** Must go on `StageHandle` (per-bar), not `Reporter` (global). A stage fails, not the reporter.
 
 ### Step 4: Implement Layout Fixes in TtyReporter
 
 **What you'll build:** `finish_failed` implementation, spinner alignment, prefix width formula
 **File:** `hs-style/src/tty_reporter.rs`
-**Status:** [ ] Not started
+**Status:** [x] Complete
 
-**Verify:** `cargo check -p hs-style`
+Extracted magic numbers to named constants. Made `bar_prefix_width()` public for reuse. Used proportional formula (40%) instead of fixed subtraction.
 
 ### Step 5: Wire Up in paper.rs
 
 **What you'll build:** Use `finish_failed` for failures, remove duplicate warnings, truncate inline errors
 **File:** `paper/src/commands/paper.rs`
-**Status:** [ ] Not started
+**Status:** [x] Complete
 
-**Verify:** `cargo check -p paper && hs paper download "autistic female"` (visual check)
+Removed duplicate `reporter.warn()` loop. Error truncation uses `bar_prefix_width()` from `hs-style`.
 
 ---
 *Plan created: 2026-03-22*
