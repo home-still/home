@@ -146,7 +146,10 @@ impl StageHandle for IndicatifStageHandle {
         } else {
             format!("{{prefix:{pw}}} FAILED: {{msg}}")
         };
-        self.pb.set_style(make_style(&template, ""));
+        self.pb.set_style(
+            ProgressStyle::with_template(&template)
+                .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
         self.pb.finish_with_message(String::from(msg));
     }
 }
