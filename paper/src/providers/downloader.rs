@@ -35,6 +35,36 @@ struct SemanticScholarPdf {
     url: String,
 }
 
+#[derive(Deserialize)]
+struct EuropePmcResponse {
+    #[serde(rename = "resultList")]
+    result_list: EuropePmcResultList,
+}
+
+#[derive(Deserialize)]
+struct EuropePmcResultList {
+    result: Vec<EuropePmcResult>,
+}
+
+#[derive(Deserialize)]
+struct EuropePmcResult {
+    #[serde(rename = "fullTextUrlList")]
+    full_text_url_list: Option<EuropePmcUrlList>,
+}
+
+#[derive(Deserialize)]
+struct EuropePmcUrlList {
+    #[serde(rename = "fullTextUrl")]
+    full_text_url: Vec<EuropePmcUrl>,
+}
+
+#[derive(Deserialize)]
+struct EuropePmcUrl {
+    #[serde(rename = "documentStyle")]
+    document_style: Option<String>,
+    url: String,
+}
+
 pub struct PaperDownloader {
     client: Client,
     download_path: PathBuf,
@@ -76,6 +106,21 @@ impl PaperDownloader {
             Some(pdf_url)
         }
     }
+
+    async fn resolve_europe_pmc(&self, doi: &str) -> Option<String> {
+        let url = format!(
+            "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:{}&format=json&resultType=core",
+            doi
+        );
+        let response = self.client.get(&url).send().await.ok()?;
+        let data: EuropePmcResponse = response.json().await.ok()?;
+        let result = data.result_list.result.into_iter().next()?;
+        let urls = result.full_text_url_list?;
+        urls.full_text_url
+            .into_iter()
+            .find(|u| u.document_style.as_deref() == Some("pdf"))
+            .map(|u| u.url)
+    }
 }
 
 #[async_trait]
@@ -86,20 +131,33 @@ impl DownloadService for PaperDownloader {
         // 1. arXiv fast path
         if let Some(arxiv_id) = doi.strip_prefix("10.48550/arXiv.") {
             let url = format!("https://arxiv.org/pdf/{}", arxiv_id);
-            return self.download_by_url(&url, &filename, None).await;
+            if let Ok(result) = self.download_by_url(&url, &filename, None).await {
+                return Ok(result);
+            }
         }
 
         // 2. Unpaywall lookup
         if let Some(pdf_url) = self.resolve_unpaywall(doi).await {
-            return self.download_by_url(&pdf_url, &filename, None).await;
+            if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
+                return Ok(result);
+            }
         }
 
         // 3. Semantic Scholar lookup
         if let Some(pdf_url) = self.resolve_semantic_scholar(doi).await {
-            return self.download_by_url(&pdf_url, &filename, None).await;
+            if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
+                return Ok(result);
+            }
         }
 
-        // 4. No resolver found
+        // 4. Europe PMC lookup
+        if let Some(pdf_url) = self.resolve_europe_pmc(doi).await {
+            if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
+                return Ok(result);
+            }
+        }
+
+        // 5. No resolver found
         let detail = if self.unpaywall_email.is_some() {
             format!("No open-access PDF found for DOI: {}", doi)
         } else {
