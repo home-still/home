@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest::Client;
+use reqwest::{header, Client};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -73,8 +73,26 @@ pub struct PaperDownloader {
 
 impl PaperDownloader {
     pub fn new(download_path: PathBuf, config: &DownloadConfig) -> Result<Self, PaperError> {
+        let user_agent = match &config.unpaywall_email {
+            Some(email) => format!(
+                "{}/{} (mailto:{})",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+                email
+            ),
+            None => format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+        };
+
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            header::HeaderValue::from_static("application/pdf,*/*"),
+        );
+
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .user_agent(user_agent)
+            .default_headers(headers)
             .build()?;
 
         Ok(Self {

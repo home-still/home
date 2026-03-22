@@ -35,6 +35,7 @@ struct Work {
     open_access: Option<OpenAccess>,
     best_oa_location: Option<OaLocation>,
     cited_by_count: Option<u64>,
+    locations: Option<Vec<OaLocation>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,10 +133,33 @@ impl OpenAlexProvider {
             .publication_date
             .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok());
 
-        let download_url = work
-            .best_oa_location
-            .and_then(|loc| loc.pdf_url)
-            .or_else(|| work.open_access.and_then(|oa| oa.oa_url));
+        let mut download_urls: Vec<String> = Vec::new();
+        // Priority 1: best_oa_location pdf_url
+        if let Some(ref loc) = work.best_oa_location {
+            if let Some(ref url) = loc.pdf_url {
+                download_urls.push(url.clone());
+            }
+        }
+
+        // Priority 2: open_access.oa_url
+        if let Some(ref oa) = work.open_access {
+            if let Some(ref url) = oa.oa_url {
+                if !download_urls.contains(url) {
+                    download_urls.push(url.clone());
+                }
+            }
+        }
+
+        // Priority 3: all other locations' pdf_urls
+        if let Some(ref locations) = work.locations {
+            for loc in locations {
+                if let Some(ref url) = loc.pdf_url {
+                    if !download_urls.contains(url) {
+                        download_urls.push(url.clone());
+                    }
+                }
+            }
+        }
 
         let cited_by_count = work.cited_by_count;
         let source = String::from("openalex");
@@ -147,7 +171,7 @@ impl OpenAlexProvider {
             abstract_text,
             publication_date,
             doi,
-            download_url,
+            download_urls,
             cited_by_count,
             source,
         }

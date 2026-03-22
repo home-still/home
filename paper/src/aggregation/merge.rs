@@ -20,11 +20,13 @@ pub fn merge_group(group: &DedupGroup) -> Paper {
         .filter_map(|p| p.doi.as_deref())
         .next()
         .map(String::from);
-    let download_url = papers
+    let mut seen = std::collections::HashSet::new();
+    let download_urls: Vec<String> = papers
         .iter()
-        .filter_map(|p| p.download_url.as_deref())
-        .next()
-        .map(String::from);
+        .flat_map(|p| p.download_urls.iter())
+        .filter(|u| seen.insert((*u).clone()))
+        .cloned()
+        .collect();
     let cited_by_count = papers.iter().filter_map(|p| p.cited_by_count).max();
     let source = contributing_sources(group).join("+");
 
@@ -35,7 +37,7 @@ pub fn merge_group(group: &DedupGroup) -> Paper {
         abstract_text,
         publication_date,
         doi,
-        download_url,
+        download_urls,
         cited_by_count,
         source,
     }

@@ -144,7 +144,7 @@ impl ArxivProvider {
             abstract_text,
             publication_date,
             doi,
-            download_url,
+            download_urls: download_url.into_iter().collect(),
             source: String::from("arxiv"),
             cited_by_count: None,
         })
@@ -297,7 +297,7 @@ mod tests {
             Some(chrono::NaiveDate::from_ymd_opt(2023, 1, 15).expect("Invalid date"))
         );
         assert_eq!(
-            paper.download_url.as_deref(),
+            paper.download_urls.first().map(|s| s.as_str()),
             Some("http://arxiv.org/pdf/2301.00001v1")
         );
         assert_eq!(paper.doi.as_deref(), Some("10.1234/test.doi"));

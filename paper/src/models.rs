@@ -16,7 +16,7 @@ pub struct Paper {
     pub abstract_text: Option<String>,
     pub publication_date: Option<NaiveDate>,
     pub doi: Option<String>,
-    pub download_url: Option<String>,
+    pub download_urls: Vec<String>,
     pub cited_by_count: Option<u64>,
     pub source: String,
 }

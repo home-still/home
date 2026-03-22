@@ -65,7 +65,7 @@ fn print_paper_row(index: usize, paper: &Paper, styles: &Styles, show_abstract: 
         print!("  doi:{}", doi.style(styles.doi));
     }
     println!();
-    if let Some(url) = &paper.download_url {
+    if let Some(url) = &paper.download_urls.first() {
         println!("   {}", url.style(styles.url));
     }
     println!();
@@ -102,7 +102,7 @@ pub fn print_paper(paper: &Paper, styles: &Styles) {
     if let Some(doi) = &paper.doi {
         println!("{} {}", "DOI:".style(styles.label), doi.style(styles.doi));
     }
-    if let Some(url) = &paper.download_url {
+    if let Some(url) = &paper.download_urls.first() {
         println!("{} {}", "PDF:".style(styles.label), url.style(styles.url));
     }
     if let Some(abs) = &paper.abstract_text {

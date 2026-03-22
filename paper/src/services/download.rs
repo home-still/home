@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 
-use crate::error::PaperError;
 use crate::models::{BatchDownloadResult, DownloadFailure, DownloadResult, Paper};
 use crate::ports::download_service::DownloadService;
 
@@ -152,21 +151,35 @@ async fn download_single(
 
     let progress_ref = chunk_cb.as_deref();
 
-    let result = if let Some(ref url) = paper.download_url {
-        service.download_by_url(url, &filename, progress_ref).await
-    } else if let Some(ref doi) = paper.doi {
-        service.download_by_doi(doi).await
-    } else {
-        Err(PaperError::NoDownloadUrl(paper.id.clone()))
-    };
+    let mut last_err = None;
 
-    match result {
-        Ok(mut dr) => {
-            dr.doi = paper.doi.clone();
-            Ok(dr)
+    for url in &paper.download_urls {
+        match service.download_by_url(url, &filename, progress_ref).await {
+            Ok(dr) => {
+                let mut dr = dr;
+                dr.doi = paper.doi.clone();
+                return Ok(dr);
+            }
+            Err(e) => last_err = Some(e),
         }
-        Err(e) => Err((paper.clone(), e.to_string())),
     }
+
+    if let Some(ref doi) = paper.doi {
+        match service.download_by_doi(doi).await {
+            Ok(mut dr) => {
+                dr.doi = paper.doi.clone();
+                return Ok(dr);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    Err((
+        paper.clone(),
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| format!("No download URL or DOI for paper {}", paper.id)),
+    ))
 }
 
 fn sanitize_filename(id: &str) -> String {
