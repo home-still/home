@@ -27,6 +27,8 @@ paper:
 
   # Download settings
   download:
+    # Email for Unpaywall API
+    # unpaywall_email: you@example.com
     max_concurrent: 4
     timeout_secs: 120
 

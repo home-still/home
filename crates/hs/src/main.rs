@@ -75,19 +75,20 @@ async fn handle_config(
             let config_path = home.join(".home-still/config.yaml");
 
             if config_path.exists() && !force {
-                reporter.warn(&format!(
-                    "Config already exists: {}.  Use --force to overwrite",
-                    config_path.display()
-                ));
-
-                return Ok(());
+                let answer = prompt("Config already exists.  Overwrite? [y/N] ")?;
+                if !answer.eq_ignore_ascii_case("y") {
+                    reporter.status("Skipped", "config unchanged");
+                    return Ok(());
+                }
             }
 
             let parent = config_path
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?;
             std::fs::create_dir_all(parent)?;
-            std::fs::write(&config_path, DEFAULT_CONFIG)?;
+            let email =
+                prompt("Email for Unpaywall API (enables more downloads, Enter to skip): ")?;
+            std::fs::write(&config_path, generate_config(&email))?;
             reporter.status("Created", &format!("{}", config_path.display()));
 
             Ok(())
@@ -113,4 +114,22 @@ async fn handle_config(
             Ok(())
         }
     }
+}
+
+fn prompt(question: &str) -> std::io::Result<String> {
+    eprint!("{}", question);
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn generate_config(email: &str) -> String {
+    let mut content = DEFAULT_CONFIG.to_string();
+    if !email.is_empty() {
+        content = content.replace(
+            "# unpaywall_email: you@example.com",
+            &format!("unpaywall_email: {}", email),
+        );
+    }
+    content
 }

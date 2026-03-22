@@ -43,62 +43,57 @@ pub async fn download_batch(
     let total = papers.len();
     let completed = Arc::new(AtomicUsize::new(0));
 
-    let results: Vec<Result<DownloadResult, (Paper, String)>> = stream::iter(papers)
-        .map(|paper| {
-            let service = Arc::clone(&service);
-            let completed = Arc::clone(&completed);
-            let on_progress = on_progress.clone();
+    let results: Vec<Result<DownloadResult, (Paper, String)>> =
+        stream::iter(papers.into_iter().enumerate())
+            .map(|(i, paper)| {
+                let service = Arc::clone(&service);
+                let completed = Arc::clone(&completed);
+                let on_progress = on_progress.clone();
 
-            async move {
-                let title = paper.title.clone();
+                async move {
+                    let title = paper.title.clone();
 
-                if let Some(ref cb) = on_progress {
-                    let count = completed.load(Ordering::Relaxed);
-                    cb(DownloadEvent::Started {
-                        index: count,
-                        total,
-                        title: title.clone(),
-                    })
-                }
+                    if let Some(ref cb) = on_progress {
+                        cb(DownloadEvent::Started {
+                            index: i,
+                            total,
+                            title: title.clone(),
+                        })
+                    }
 
-                let result = download_single(
-                    service.as_ref(),
-                    &paper,
-                    on_progress.as_ref(),
-                    completed.load(Ordering::Relaxed),
-                )
-                .await;
+                    let result =
+                        download_single(service.as_ref(), &paper, on_progress.as_ref(), i).await;
 
-                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
 
-                match &result {
-                    Ok(dr) => {
-                        if let Some(ref cb) = on_progress {
-                            cb(DownloadEvent::Completed {
-                                index: count,
-                                total,
-                                size_bytes: dr.size_bytes,
-                            })
+                    match &result {
+                        Ok(dr) => {
+                            if let Some(ref cb) = on_progress {
+                                cb(DownloadEvent::Completed {
+                                    index: count,
+                                    total,
+                                    size_bytes: dr.size_bytes,
+                                })
+                            }
+                        }
+                        Err((_, err)) => {
+                            if let Some(ref cb) = on_progress {
+                                cb(DownloadEvent::Failed {
+                                    index: count,
+                                    total,
+                                    title: title.clone(),
+                                    error: String::from(err),
+                                })
+                            }
                         }
                     }
-                    Err((_, err)) => {
-                        if let Some(ref cb) = on_progress {
-                            cb(DownloadEvent::Failed {
-                                index: count,
-                                total,
-                                title: title.clone(),
-                                error: String::from(err),
-                            })
-                        }
-                    }
-                }
 
-                result
-            }
-        })
-        .buffer_unordered(max_concurrent)
-        .collect()
-        .await;
+                    result
+                }
+            })
+            .buffer_unordered(max_concurrent)
+            .collect()
+            .await;
 
     let mut succeeded = Vec::new();
     let mut failed = Vec::new();

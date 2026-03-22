@@ -82,7 +82,7 @@ pub enum PaperCmd {
         search_type: SearchTypeArg,
 
         /// Provider to search
-        #[arg(short, long, default_value = "arxiv")]
+        #[arg(short, long, default_value = "all")]
         provider: ProviderArg,
     },
     /// View and manage configuration

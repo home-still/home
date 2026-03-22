@@ -122,6 +122,8 @@ pub struct DownloadConfig {
     pub max_concurrent: usize,
     /// Per-file download timeout in seconds
     pub timeout_secs: u64,
+    /// Unpaywall email address
+    pub unpaywall_email: Option<String>,
 }
 
 impl Default for DownloadConfig {
@@ -129,6 +131,7 @@ impl Default for DownloadConfig {
         Self {
             max_concurrent: 4,
             timeout_secs: 120,
+            unpaywall_email: None,
         }
     }
 }
