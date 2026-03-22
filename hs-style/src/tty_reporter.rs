@@ -5,6 +5,12 @@ use owo_colors::OwoColorize;
 
 use crate::reporter::{Reporter, StageHandle};
 
+const DEFAULT_TERM_WIDTH: usize = 80;
+const PREFIX_WIDTH_RATIO: usize = 2; // numerator of fraction
+const PREFIX_WIDTH_DENOM: usize = 5; // denominator — gives 40%
+const MIN_PREFIX_WIDTH: usize = 30;
+const MAX_PREFIX_WIDTH: usize = 80;
+const SPINNER_TICK_MS: u64 = 120;
 pub struct TtyReporter {
     mp: MultiProgress,
     use_color: bool,
@@ -64,14 +70,15 @@ impl Reporter for TtyReporter {
             }
             None => {
                 let pb = self.mp.add(ProgressBar::new_spinner());
+                let prefix_width = bar_prefix_width();
                 let template = if self.use_color {
-                    "{spinner:.cyan} {prefix:>12.bold.green} {msg}"
+                    format!("{{prefix:{prefix_width}.bold.green}} {{spinner:.cyan}} {{msg}}")
                 } else {
-                    "{spinner} {prefix:>12} {msg}"
+                    format!("{{prefix:{prefix_width}}} {{spinner}} {{msg}}")
                 };
-                pb.set_style(make_spinner_style(template));
+                pb.set_style(make_spinner_style(&template));
                 pb.set_prefix(truncate_name(name, bar_prefix_width()));
-                pb.enable_steady_tick(Duration::from_millis(120));
+                pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
                 pb
             }
         };
@@ -131,6 +138,17 @@ impl StageHandle for IndicatifStageHandle {
     fn finish_and_clear(&self) {
         self.pb.finish_and_clear();
     }
+
+    fn finish_failed(&self, msg: &str) {
+        let pw = self.prefix_width;
+        let template = if self.use_color {
+            format!("{{prefix:{pw}.bold.red}} {{msg}}")
+        } else {
+            format!("{{prefix:{pw}}} FAILED: {{msg}}")
+        };
+        self.pb.set_style(make_style(&template, ""));
+        self.pb.finish_with_message(String::from(msg));
+    }
 }
 
 fn make_style(template: &str, progress_chars: &str) -> ProgressStyle {
@@ -143,11 +161,11 @@ fn make_spinner_style(template: &str) -> ProgressStyle {
     ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_spinner())
 }
 
-fn bar_prefix_width() -> usize {
+pub fn bar_prefix_width() -> usize {
     let term_width = terminal_size::terminal_size()
         .map(|(w, _)| w.0 as usize)
-        .unwrap_or(80);
-    (term_width.saturating_sub(45)).clamp(20, 80)
+        .unwrap_or(DEFAULT_TERM_WIDTH);
+    (term_width * PREFIX_WIDTH_RATIO / PREFIX_WIDTH_DENOM).clamp(MIN_PREFIX_WIDTH, MAX_PREFIX_WIDTH)
 }
 
 fn truncate_name(name: &str, max: usize) -> String {

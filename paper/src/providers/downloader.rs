@@ -54,27 +54,31 @@ impl PaperDownloader {
 
 #[async_trait]
 impl DownloadService for PaperDownloader {
-                                                                                               
-  async fn download_by_doi(&self, doi: &str) -> Result<DownloadResult, PaperError> {               
-      let filename = format!("{}.pdf", doi.replace('/', "_"));    
-                                                                                                   
-      // 1. arXiv fast path
-      if let Some(arxiv_id) = doi.strip_prefix("10.48550/arXiv.") {                                
-          let url = format!("https://arxiv.org/pdf/{}", arxiv_id);                                 
-          return self.download_by_url(&url, &filename, None).await;
-      }                                                                                            
-                                                                  
-      // 2. Unpaywall lookup                                                                       
-      if let Some(pdf_url) = self.resolve_unpaywall(doi).await {  
-          return self.download_by_url(&pdf_url, &filename, None).await;
-      }                                                                                            
-                                                                                                   
-      // 3. No resolver found                                                                      
-      Err(PaperError::NotFound(format!(                                                            
-          "No open-access PDF found for DOI: {}.  Set unpaywall_email in config to enable Unpaywall lookups.",                                                                                      
-          doi                                                                                      
-      )))                                                                                          
-    }   
+    async fn download_by_doi(&self, doi: &str) -> Result<DownloadResult, PaperError> {
+        let filename = format!("{}.pdf", doi.replace('/', "_"));
+
+        // 1. arXiv fast path
+        if let Some(arxiv_id) = doi.strip_prefix("10.48550/arXiv.") {
+            let url = format!("https://arxiv.org/pdf/{}", arxiv_id);
+            return self.download_by_url(&url, &filename, None).await;
+        }
+
+        // 2. Unpaywall lookup
+        if let Some(pdf_url) = self.resolve_unpaywall(doi).await {
+            return self.download_by_url(&pdf_url, &filename, None).await;
+        }
+
+        // 3. No resolver found
+        let detail = if self.unpaywall_email.is_some() {
+            format!("No open-access PDF found for DOI: {}", doi)
+        } else {
+            format!(
+                "No open-access PDF found for DOI: {}.  Set unpaywall_email in config to enable Unpaywall lookups.",
+                doi
+            )
+        };
+        Err(PaperError::NotFound(detail))
+    }
 
     async fn download_by_url(
         &self,

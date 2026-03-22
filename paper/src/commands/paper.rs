@@ -238,8 +238,14 @@ pub async fn run_download(
                 }
                 DownloadEvent::Failed { index, error, .. } => {
                     if let Some(bar) = bars_ref.lock().unwrap().remove(&index) {
-                        bar.finish_with_message(&format!("FAILED: {}", error));
-                    }
+                        let max_err = hs_style::tty_reporter::bar_prefix_width();
+                        let short = if error.len() > max_err {
+                            format!("{}...", &error[..max_err - 3])
+                        } else {
+                            error.clone()
+                        };
+                        bar.finish_failed(&short);
+                    };
                 }
             }));
 
@@ -255,11 +261,6 @@ pub async fn run_download(
                 batch_result.total_requested,
                 batch_result.failed.len(),
             ));
-            if !batch_result.failed.is_empty() {
-                for f in &batch_result.failed {
-                    reporter.warn(&format!("{} -- {}", f.paper_id, f.error));
-                }
-            }
         }
 
         if !batch_result.failed.is_empty() {

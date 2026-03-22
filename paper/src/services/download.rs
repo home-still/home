@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
@@ -41,13 +40,11 @@ pub async fn download_batch(
     on_progress: Option<OnProgress>,
 ) -> BatchDownloadResult {
     let total = papers.len();
-    let completed = Arc::new(AtomicUsize::new(0));
 
     let results: Vec<Result<DownloadResult, (Paper, String)>> =
         stream::iter(papers.into_iter().enumerate())
             .map(|(i, paper)| {
                 let service = Arc::clone(&service);
-                let completed = Arc::clone(&completed);
                 let on_progress = on_progress.clone();
 
                 async move {
@@ -64,13 +61,11 @@ pub async fn download_batch(
                     let result =
                         download_single(service.as_ref(), &paper, on_progress.as_ref(), i).await;
 
-                    let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
-
                     match &result {
                         Ok(dr) => {
                             if let Some(ref cb) = on_progress {
                                 cb(DownloadEvent::Completed {
-                                    index: count,
+                                    index: i,
                                     total,
                                     size_bytes: dr.size_bytes,
                                 })
@@ -79,7 +74,7 @@ pub async fn download_batch(
                         Err((_, err)) => {
                             if let Some(ref cb) = on_progress {
                                 cb(DownloadEvent::Failed {
-                                    index: count,
+                                    index: i,
                                     total,
                                     title: title.clone(),
                                     error: String::from(err),
