@@ -29,6 +29,11 @@ pub enum DownloadEvent {
         title: String,
         error: String,
     },
+    Skipped {
+        index: usize,
+        total: usize,
+        size_bytes: u64,
+    },
 }
 
 pub type OnProgress = Arc<dyn Fn(DownloadEvent) + Send + Sync>;
@@ -64,11 +69,19 @@ pub async fn download_batch(
                     match &result {
                         Ok(dr) => {
                             if let Some(ref cb) = on_progress {
-                                cb(DownloadEvent::Completed {
-                                    index: i,
-                                    total,
-                                    size_bytes: dr.size_bytes,
-                                })
+                                if dr.skipped {
+                                    cb(DownloadEvent::Skipped {
+                                        index: i,
+                                        total,
+                                        size_bytes: dr.size_bytes,
+                                    })
+                                } else {
+                                    cb(DownloadEvent::Completed {
+                                        index: i,
+                                        total,
+                                        size_bytes: dr.size_bytes,
+                                    })
+                                }
                             }
                         }
                         Err((_, err)) => {
@@ -91,10 +104,12 @@ pub async fn download_batch(
             .await;
 
     let mut succeeded = Vec::new();
+    let mut skipped = Vec::new();
     let mut failed = Vec::new();
 
     for result in results {
         match result {
+            Ok(dr) if dr.skipped => skipped.push(dr),
             Ok(dr) => succeeded.push(dr),
             Err((paper, error)) => failed.push(DownloadFailure {
                 paper_id: paper.id,
@@ -108,6 +123,7 @@ pub async fn download_batch(
         succeeded,
         failed,
         total_requested: total,
+        skipped,
     }
 }
 

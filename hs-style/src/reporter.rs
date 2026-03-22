@@ -17,6 +17,7 @@ pub trait StageHandle: Send + Sync {
     fn finish_with_message(&self, msg: &str);
     fn finish_and_clear(&self);
     fn finish_failed(&self, msg: &str);
+    fn finish_skipped(&self, msg: &str);
 }
 
 pub struct SilentReporter;
@@ -45,4 +46,5 @@ impl StageHandle for NoopStageHandle {
     fn finish_with_message(&self, _msg: &str) {}
     fn finish_and_clear(&self) {}
     fn finish_failed(&self, _msg: &str) {}
+    fn finish_skipped(&self, _msg: &str) {}
 }

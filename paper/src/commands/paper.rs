@@ -213,8 +213,10 @@ pub async fn run_download(
         let progress: Option<OnProgress> =
             Some(Arc::new(move |event: DownloadEvent| match event {
                 DownloadEvent::Started { index, title, .. } => {
-                    let stage = reporter_ref.begin_stage(&title, None);
-                    bars_ref.lock().unwrap().insert(index, stage);
+                    if let Ok(mut bars) = bars_ref.lock() {
+                        let stage = reporter_ref.begin_stage(&title, None);
+                        bars.insert(index, stage);
+                    }
                 }
                 DownloadEvent::Progress {
                     index,
@@ -222,30 +224,48 @@ pub async fn run_download(
                     bytes_total,
                     ..
                 } => {
-                    if let Some(bar) = bars_ref.lock().unwrap().get(&index) {
-                        if let Some(total) = bytes_total {
-                            bar.set_length(total);
+                    if let Ok(bars) = bars_ref.lock() {
+                        if let Some(bar) = bars.get(&index) {
+                            if let Some(total) = bytes_total {
+                                bar.set_length(total);
+                            }
+                            bar.set_position(bytes_downloaded);
                         }
-                        bar.set_position(bytes_downloaded);
                     }
                 }
                 DownloadEvent::Completed {
                     index, size_bytes, ..
                 } => {
-                    if let Some(bar) = bars_ref.lock().unwrap().remove(&index) {
-                        bar.finish_with_message(&format_bytes(size_bytes));
+                    if let Ok(mut bars) = bars_ref.lock() {
+                        if let Some(bar) = bars.remove(&index) {
+                            bar.finish_with_message(&format_bytes(size_bytes));
+                        }
                     }
                 }
                 DownloadEvent::Failed { index, error, .. } => {
-                    if let Some(bar) = bars_ref.lock().unwrap().remove(&index) {
-                        let max_err = hs_style::tty_reporter::bar_prefix_width();
-                        let short = if error.len() > max_err {
-                            format!("{}...", &error[..max_err - 3])
-                        } else {
-                            error.clone()
-                        };
-                        bar.finish_failed(&short);
-                    };
+                    if let Ok(mut bars) = bars_ref.lock() {
+                        if let Some(bar) = bars.remove(&index) {
+                            let max_err = hs_style::tty_reporter::bar_prefix_width();
+                            let short = if error.len() > max_err {
+                                format!("{}...", &error[..max_err - 3])
+                            } else {
+                                error.clone()
+                            };
+                            bar.finish_failed(&short);
+                        }
+                    }
+                }
+                DownloadEvent::Skipped {
+                    index, size_bytes, ..
+                } => {
+                    if let Ok(mut bars) = bars_ref.lock() {
+                        if let Some(bar) = bars.remove(&index) {
+                            bar.finish_skipped(&format!(
+                                "already exists ({})",
+                                format_bytes(size_bytes)
+                            ))
+                        }
+                    }
                 }
             }));
 
@@ -256,9 +276,10 @@ pub async fn run_download(
             output::print_json(&batch_result)?;
         } else {
             reporter.finish(&format!(
-                "\nCompleted: {}/{} succeeded, {} failed",
+                "\nCompleted: {}/{} succeeded, {} skipped, {} failed",
                 batch_result.succeeded.len(),
                 batch_result.total_requested,
+                batch_result.skipped.len(),
                 batch_result.failed.len(),
             ));
         }

@@ -162,6 +162,20 @@ impl StageHandle for IndicatifStageHandle {
         );
         self.pb.finish_with_message(truncated);
     }
+
+    fn finish_skipped(&self, msg: &str) {
+        let pw = self.prefix_width;
+        let template = if self.use_color {
+            format!("{{prefix:{pw}.dim}} {{msg:.dim}}")
+        } else {
+            format!("{{prefix:{pw}}} SKIPPED: {{msg}}")
+        };
+        self.pb.set_style(
+            ProgressStyle::with_template(&template)
+                .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        self.pb.finish_with_message(String::from(msg));
+    }
 }
 
 fn make_style(template: &str, progress_chars: &str) -> ProgressStyle {

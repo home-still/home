@@ -181,6 +181,7 @@ pub struct DownloadResult {
     pub doi: Option<String>,
     pub sha256: String,
     pub size_bytes: u64,
+    pub skipped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +195,7 @@ pub struct PaperMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchDownloadResult {
     pub succeeded: Vec<DownloadResult>,
+    pub skipped: Vec<DownloadResult>,
     pub failed: Vec<DownloadFailure>,
     pub total_requested: usize,
 }

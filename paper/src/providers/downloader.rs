@@ -24,6 +24,17 @@ struct UnpaywallLocation {
     url_for_pdf: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SemanticScholarResponse {
+    #[serde(rename = "openAccessPdf")]
+    open_access_pdf: Option<SemanticScholarPdf>,
+}
+
+#[derive(Deserialize)]
+struct SemanticScholarPdf {
+    url: String,
+}
+
 pub struct PaperDownloader {
     client: Client,
     download_path: PathBuf,
@@ -50,6 +61,16 @@ impl PaperDownloader {
         let data: UnpaywallResponse = response.json().await.ok()?;
         data.best_oa_location?.url_for_pdf
     }
+
+    async fn resolve_semantic_scholar(&self, doi: &str) -> Option<String> {
+        let url = format!(
+            "https://api.semanticscholar.org/graph/v1/paper/DOI:{}?fields=openAccessPdf",
+            doi
+        );
+        let response = self.client.get(&url).send().await.ok()?;
+        let data: SemanticScholarResponse = response.json().await.ok()?;
+        Some(data.open_access_pdf?.url)
+    }
 }
 
 #[async_trait]
@@ -68,7 +89,12 @@ impl DownloadService for PaperDownloader {
             return self.download_by_url(&pdf_url, &filename, None).await;
         }
 
-        // 3. No resolver found
+        // 3. Semantic Scholar lookup
+        if let Some(pdf_url) = self.resolve_semantic_scholar(doi).await {
+            return self.download_by_url(&pdf_url, &filename, None).await;
+        }
+
+        // 4. No resolver found
         let detail = if self.unpaywall_email.is_some() {
             format!("No open-access PDF found for DOI: {}", doi)
         } else {
@@ -99,6 +125,7 @@ impl DownloadService for PaperDownloader {
                 doi: None,
                 sha256: String::new(),
                 size_bytes: metadata.len(),
+                skipped: true,
             });
         }
 
@@ -133,6 +160,7 @@ impl DownloadService for PaperDownloader {
             doi: None,
             sha256,
             size_bytes,
+            skipped: false,
         })
     }
 }
