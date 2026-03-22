@@ -277,7 +277,7 @@ pub async fn run_download(
         } else {
             reporter.finish(&format!(
                 "\nCompleted: {}/{} succeeded, {} skipped, {} failed",
-                batch_result.succeeded.len(),
+                batch_result.succeeded.len() + batch_result.skipped.len(),
                 batch_result.total_requested,
                 batch_result.skipped.len(),
                 batch_result.failed.len(),

@@ -69,7 +69,12 @@ impl PaperDownloader {
         );
         let response = self.client.get(&url).send().await.ok()?;
         let data: SemanticScholarResponse = response.json().await.ok()?;
-        Some(data.open_access_pdf?.url)
+        let pdf_url = data.open_access_pdf?.url;
+        if pdf_url.is_empty() {
+            None
+        } else {
+            Some(pdf_url)
+        }
     }
 }
 
