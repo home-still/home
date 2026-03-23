@@ -245,25 +245,24 @@ pub async fn run_download(
                 DownloadEvent::Failed { index, error, .. } => {
                     if let Ok(mut bars) = bars_ref.lock() {
                         if let Some(bar) = bars.remove(&index) {
-                            let max_err = hs_style::tty_reporter::bar_prefix_width();
-                            let short = if error.len() > max_err {
-                                format!("{}...", &error[..max_err - 3])
+                            if error.starts_with("Not found:") {
+                                bar.finish_and_clear();
                             } else {
-                                error.clone()
-                            };
-                            bar.finish_failed(&short);
+                                let max_err = hs_style::tty_reporter::bar_prefix_width();
+                                let short = if error.len() > max_err {
+                                    format!("{}...", &error[..max_err - 3])
+                                } else {
+                                    error.clone()
+                                };
+                                bar.finish_failed(&short);
+                            }
                         }
                     }
                 }
-                DownloadEvent::Skipped {
-                    index, size_bytes, ..
-                } => {
+                DownloadEvent::Skipped { index, .. } => {
                     if let Ok(mut bars) = bars_ref.lock() {
                         if let Some(bar) = bars.remove(&index) {
-                            bar.finish_skipped(&format!(
-                                "already exists ({})",
-                                format_bytes(size_bytes)
-                            ))
+                            bar.finish_and_clear();
                         }
                     }
                 }
@@ -276,8 +275,8 @@ pub async fn run_download(
             output::print_json(&batch_result)?;
         } else {
             reporter.finish(&format!(
-                "\nCompleted: {}/{} succeeded, {} skipped, {} failed",
-                batch_result.succeeded.len() + batch_result.skipped.len(),
+                "\nCompleted: {}/{} downloaded, {} already exist, {} unavailable",
+                batch_result.succeeded.len(),
                 batch_result.total_requested,
                 batch_result.skipped.len(),
                 batch_result.failed.len(),

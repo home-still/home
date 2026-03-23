@@ -65,10 +65,21 @@ struct EuropePmcUrl {
     url: String,
 }
 
+#[derive(Deserialize)]
+struct CoreSearchResponse {
+    results: Vec<CoreOutput>,
+}
+
+#[derive(Deserialize)]
+struct CoreOutput {
+    #[serde(rename = "downloadUrl")]
+    download_url: Option<String>,
+}
 pub struct PaperDownloader {
     client: Client,
     download_path: PathBuf,
     unpaywall_email: Option<String>,
+    core_api_key: Option<String>,
 }
 
 impl PaperDownloader {
@@ -99,6 +110,7 @@ impl PaperDownloader {
             client,
             download_path,
             unpaywall_email: config.unpaywall_email.clone(),
+            core_api_key: config.core_api_key.clone(),
         })
     }
 
@@ -139,6 +151,23 @@ impl PaperDownloader {
             .find(|u| u.document_style.as_deref() == Some("pdf"))
             .map(|u| u.url)
     }
+
+    async fn resolve_core(&self, doi: &str) -> Option<String> {
+        let api_key = self.core_api_key.as_ref()?;
+        let url = format!(
+            "https://api.core.ac.uk/v3/search/outputs/?q=doi:\"{}\"&limit=1",
+            doi
+        );
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .send()
+            .await
+            .ok()?;
+        let data: CoreSearchResponse = response.json().await.ok()?;
+        data.results.into_iter().next()?.download_url
+    }
 }
 
 #[async_trait]
@@ -168,14 +197,21 @@ impl DownloadService for PaperDownloader {
             }
         }
 
-        // 4. Europe PMC lookup
+        // 4. CORE Lookup
         if let Some(pdf_url) = self.resolve_europe_pmc(doi).await {
             if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
                 return Ok(result);
             }
         }
 
-        // 5. No resolver found
+        // 5. Europe PMC lookup
+        if let Some(pdf_url) = self.resolve_core(doi).await {
+            if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
+                return Ok(result);
+            }
+        }
+
+        // 6. No resolver found
         let detail = if self.unpaywall_email.is_some() {
             format!("No open-access PDF found for DOI: {}", doi)
         } else {
