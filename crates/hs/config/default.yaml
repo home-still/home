@@ -29,6 +29,8 @@ paper:
   download:
     # Email for Unpaywall API
     # unpaywall_email: you@example.com
+    # API key for CORE (https://core.ac.uk/services/api)
+    # core_api_key: your-key-here
     max_concurrent: 4
     timeout_secs: 120
 

@@ -95,7 +95,12 @@ async fn handle_config(
                 .with_prompt("Email for Unpaywall API (enables more downloads, Enter to skip)")
                 .allow_empty(true)
                 .interact()?;
-            std::fs::write(&config_path, generate_config(&email))?;
+            let core_key: String = Input::new()
+                .with_prompt("CORE API key (https://core.ac.uk, Enter to skip)")
+                .allow_empty(true)
+                .interact()?;
+
+            std::fs::write(&config_path, generate_config(&email, &core_key))?;
             reporter.status("Created", &format!("{}", config_path.display()));
 
             Ok(())
@@ -123,12 +128,18 @@ async fn handle_config(
     }
 }
 
-fn generate_config(email: &str) -> String {
+fn generate_config(email: &str, core_key: &str) -> String {
     let mut content = DEFAULT_CONFIG.to_string();
     if !email.is_empty() {
         content = content.replace(
             "# unpaywall_email: you@example.com",
             &format!("unpaywall_email: {}", email),
+        );
+    }
+    if !core_key.is_empty() {
+        content = content.replace(
+            "# core_api_key: your-key-here",
+            &format!("core_api_key: {}", core_key),
         );
     }
     content
