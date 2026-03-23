@@ -206,4 +206,3 @@ pub struct DownloadFailure {
     pub title: String,
     pub error: String,
 }
-

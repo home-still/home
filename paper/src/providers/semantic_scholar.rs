@@ -149,83 +149,86 @@ impl SemanticScholarProvider {
         Ok(url.to_string())
     }
 }
-                                                                                    
-#[async_trait]                                                                                   
-impl PaperProvider for SemanticScholarProvider {                                                 
-      fn name(&self) -> &'static str {                                                             
-          "semantic_scholar"
-      }                                                                                            
-                                                                  
-      fn priority(&self) -> u8 {
-          85
-      }                                                                                            
-   
-      fn supported_search_types(&self) -> Vec<SearchType> {                                        
-          vec![                                                   
-              SearchType::Keywords,
-              SearchType::Title,
-              SearchType::Author,
-              SearchType::DOI,                                                                     
-          ]
-      }                                                                                            
-                                                                  
-      async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {                                                        
-          let url = self.build_search_url(query)?;                                                 
-   
-          let mut request = self.client.get(&url);                                                 
-          if let Some(ref key) = self.api_key {                   
-              request = request.header("x-api-key", key);                                          
-          }
-                                                                                                   
-          let response = request.send().await?;                   
 
-          check_response(&response, "semantic_scholar")?;                                                       
+#[async_trait]
+impl PaperProvider for SemanticScholarProvider {
+    fn name(&self) -> &'static str {
+        "semantic_scholar"
+    }
 
-          let body: S2SearchResponse = response.json().await.map_err(|e| {                         
-              PaperError::ParseError(format!("Failed to parse Semantic Scholar response: {}", e))
-          })?;                                                                                     
-                                                                  
-          let papers: Vec<Paper> = body.data.into_iter().map(|p|                                   
-  self.s2_paper_to_paper(p)).collect();
-                                                                                                   
-          let next_offset = query.offset + query.max_results;     
-          let next_offset = if next_offset < body.total {
-              Some(next_offset)                                                                    
-          } else {
-              None                                                                                 
-          };                                                      
+    fn priority(&self) -> u8 {
+        85
+    }
 
-          Ok(SearchResult {
-              papers,
-              total_results: body.total,
-              next_offset,                                                                         
-              provider: String::from("semantic_scholar"),
-          })                                                                                       
-      }                                                           
+    fn supported_search_types(&self) -> Vec<SearchType> {
+        vec![
+            SearchType::Keywords,
+            SearchType::Title,
+            SearchType::Author,
+            SearchType::DOI,
+        ]
+    }
 
-      async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
-          let bare_doi = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
-          let url = format!(                                                                       
-              "{}/graph/v1/paper/DOI:{}?fields=title,abstract,externalIds,openAccessPdf,year,authors,citationCount",                                                                                
-              self.base_url, bare_doi                             
-          );                                                                                       
-                                                                  
-          let mut request = self.client.get(&url);                                                 
-          if let Some(ref key) = self.api_key {                   
-              request = request.header("x-api-key", key);
-          }                                                                                        
-   
-          let response = request.send().await?;                                                    
-                                                        
-          if response.status() == reqwest::StatusCode::NOT_FOUND {
-              return Ok(None);
-          }
-          check_response(&response, "semantic_scholar")?;
+    async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
+        let url = self.build_search_url(query)?;
 
-          let paper: S2Paper = response.json().await.map_err(|e| {                                 
-              PaperError::ParseError(format!("Failed to parse Semantic Scholar paper: {}", e))
-          })?;                                                                                     
-                                                                                                   
-          Ok(Some(self.s2_paper_to_paper(paper)))
-      }                                                                                            
-  }           
+        let mut request = self.client.get(&url);
+        if let Some(ref key) = self.api_key {
+            request = request.header("x-api-key", key);
+        }
+
+        let response = request.send().await?;
+
+        check_response(&response, "semantic_scholar")?;
+
+        let body: S2SearchResponse = response.json().await.map_err(|e| {
+            PaperError::ParseError(format!("Failed to parse Semantic Scholar response: {}", e))
+        })?;
+
+        let papers: Vec<Paper> = body
+            .data
+            .into_iter()
+            .map(|p| self.s2_paper_to_paper(p))
+            .collect();
+
+        let next_offset = query.offset + query.max_results;
+        let next_offset = if next_offset < body.total {
+            Some(next_offset)
+        } else {
+            None
+        };
+
+        Ok(SearchResult {
+            papers,
+            total_results: body.total,
+            next_offset,
+            provider: String::from("semantic_scholar"),
+        })
+    }
+
+    async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
+        let bare_doi = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
+        let url = format!(
+              "{}/graph/v1/paper/DOI:{}?fields=title,abstract,externalIds,openAccessPdf,year,authors,citationCount",
+              self.base_url, bare_doi
+          );
+
+        let mut request = self.client.get(&url);
+        if let Some(ref key) = self.api_key {
+            request = request.header("x-api-key", key);
+        }
+
+        let response = request.send().await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        check_response(&response, "semantic_scholar")?;
+
+        let paper: S2Paper = response.json().await.map_err(|e| {
+            PaperError::ParseError(format!("Failed to parse Semantic Scholar paper: {}", e))
+        })?;
+
+        Ok(Some(self.s2_paper_to_paper(paper)))
+    }
+}
