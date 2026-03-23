@@ -11,6 +11,9 @@ const PREFIX_WIDTH_DENOM: usize = 5; // denominator — gives 40%
 const MIN_PREFIX_WIDTH: usize = 30;
 const MAX_PREFIX_WIDTH: usize = 80;
 const SPINNER_TICK_MS: u64 = 120;
+
+const PROGRESS_BAR_CHARS: &str = "-> ";
+
 pub struct TtyReporter {
     mp: MultiProgress,
     use_color: bool,
@@ -64,7 +67,7 @@ impl Reporter for TtyReporter {
                 } else {
                     format!("{{prefix:{prefix_width}}} {{wide_bar}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
                 };
-                pb.set_style(make_style(&template, "━━ "));
+                pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
                 pb.set_prefix(truncate_name(name, prefix_width));
                 pb
             }
@@ -117,7 +120,7 @@ impl StageHandle for IndicatifStageHandle {
         } else {
             format!("{{prefix:{pw}}} {{wide_bar}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
         };
-        self.pb.set_style(make_style(&template, "━━ "));
+        self.pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
     }
     fn set_message(&self, msg: &str) {
         self.pb.set_message(String::from(msg));

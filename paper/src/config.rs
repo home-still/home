@@ -115,10 +115,51 @@ impl Default for OpenAlexConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SemanticScholarConfig {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub timeout_secs: u64,
+    pub rate_limit_interval_ms: u64,
+}
+
+impl Default for SemanticScholarConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::from("https://api.semanticscholar.org"),
+            api_key: None,
+            timeout_secs: 30,
+            rate_limit_interval_ms: 1100, // just over 1 req/s
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EuropePmcConfig {
+    pub base_url: String,
+    pub timeout_secs: u64,
+    pub rate_limit_interval_ms: u64,
+}
+
+impl Default for EuropePmcConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::from("https://www.ebi.ac.uk/europepmc"),
+            timeout_secs: 30,
+            rate_limit_interval_ms: 200,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ProvidersConfig {
     pub arxiv: ArxivConfig,
     pub openalex: OpenAlexConfig,
+    pub semantic_scholar: SemanticScholarConfig,
+    pub europe_pmc: EuropePmcConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,8 +12,10 @@ use crate::models::SortBy;
 use crate::ports::provider::PaperProvider;
 use crate::providers::arxiv::ArxivProvider;
 use crate::providers::downloader::PaperDownloader;
+use crate::providers::europe_pmc::EuropePmcProvider;
 use crate::providers::openalex::OpenAlexProvider;
 use crate::providers::resilient::ResilientProvider;
+use crate::providers::semantic_scholar::SemanticScholarProvider;
 use crate::resilience::circuit_breaker::new_circuit_breaker;
 use crate::services::download::{download_batch, DownloadEvent, OnProgress};
 use crate::services::search::AggregateProvider;
@@ -323,6 +325,27 @@ fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn Pape
                 ResilientProvider::new(Box::new(inner), interval, cb, config.resilience.clone());
             Ok(Box::new(resilient))
         }
+
+        ProviderArg::SemanticScholar => {
+            let inner = SemanticScholarProvider::new(&config.providers.semantic_scholar)
+                .context("Failed to create Semantic Scholar provider")?;
+            let interval =
+                Duration::from_millis(config.providers.semantic_scholar.rate_limit_interval_ms);
+            let cb = new_circuit_breaker(&config.resilience);
+            let resilient =
+                ResilientProvider::new(Box::new(inner), interval, cb, config.resilience.clone());
+            Ok(Box::new(resilient))
+        }
+        ProviderArg::EuropePmc => {
+            let inner = EuropePmcProvider::new(&config.providers.europe_pmc)
+                .context("Failed to create Europe PMC provider")?;
+            let interval =
+                Duration::from_millis(config.providers.europe_pmc.rate_limit_interval_ms);
+            let cb = new_circuit_breaker(&config.resilience);
+            let resilient =
+                ResilientProvider::new(Box::new(inner), interval, cb, config.resilience.clone());
+            Ok(Box::new(resilient))
+        }
         ProviderArg::All => {
             // Arxiv
             let arxiv_inner = ArxivProvider::new(&config.providers.arxiv)
@@ -350,8 +373,37 @@ fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn Pape
                 config.resilience.clone(),
             ));
 
+            // Semantic Scholar
+            let s2_inner = SemanticScholarProvider::new(&config.providers.semantic_scholar)
+                .context("Failed to create Semantic Scholar provider")?;
+            let s2_interval =
+                Duration::from_millis(config.providers.semantic_scholar.rate_limit_interval_ms);
+            let s2_cb = new_circuit_breaker(&config.resilience);
+            let semantic_scholar: Box<dyn PaperProvider> = Box::new(ResilientProvider::new(
+                Box::new(s2_inner),
+                s2_interval,
+                s2_cb,
+                config.resilience.clone(),
+            ));
+
+            // Europe PMC
+            let epmc_inner = EuropePmcProvider::new(&config.providers.europe_pmc)
+                .context("Failed to create Europe PMC provider")?;
+            let epmc_interval =
+                Duration::from_millis(config.providers.europe_pmc.rate_limit_interval_ms);
+            let epmc_cb = new_circuit_breaker(&config.resilience);
+            let europe_pmc: Box<dyn PaperProvider> = Box::new(ResilientProvider::new(
+                Box::new(epmc_inner),
+                epmc_interval,
+                epmc_cb,
+                config.resilience.clone(),
+            ));
+
             let timeout = Duration::from_secs(30);
-            let aggregate = AggregateProvider::new(vec![arxiv, openalex], timeout);
+            let aggregate = AggregateProvider::new(
+                vec![arxiv, openalex, semantic_scholar, europe_pmc],
+                timeout,
+            );
 
             Ok(Box::new(aggregate))
         }
