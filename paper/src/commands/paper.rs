@@ -259,10 +259,15 @@ pub async fn run_download(
                         }
                     }
                 }
-                DownloadEvent::Skipped { index, .. } => {
+                DownloadEvent::Skipped {
+                    index, size_bytes, ..
+                } => {
                     if let Ok(mut bars) = bars_ref.lock() {
                         if let Some(bar) = bars.remove(&index) {
-                            bar.finish_and_clear();
+                            bar.finish_skipped(&format!(
+                                "Already Downloaded ({})",
+                                format_bytes(size_bytes)
+                            ));
                         }
                     }
                 }

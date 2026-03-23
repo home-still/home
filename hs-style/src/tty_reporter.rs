@@ -166,7 +166,7 @@ impl StageHandle for IndicatifStageHandle {
     fn finish_skipped(&self, msg: &str) {
         let pw = self.prefix_width;
         let template = if self.use_color {
-            format!("{{prefix:{pw}.dim}} {{msg:.dim}}")
+            format!("{{prefix:{pw}.blue}} {{msg:.blue}}")
         } else {
             format!("{{prefix:{pw}}} SKIPPED: {{msg}}")
         };

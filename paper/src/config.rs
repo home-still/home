@@ -65,10 +65,13 @@ impl Config {
 
         figment = figment.merge(Env::prefixed("HOME_STILL_").split("_"));
 
-        let config: Config = figment
+        let mut config: Config = figment
             .focus("paper")
             .extract()
             .context("Failed to load configuration")?;
+
+        config.download_path = expand_tilde(&config.download_path);
+        config.cache_path = expand_tilde(&config.cache_path);
 
         Ok(config)
     }
@@ -140,4 +143,13 @@ impl Default for DownloadConfig {
             core_api_key: None,
         }
     }
+}
+
+fn expand_tilde(path: &PathBuf) -> PathBuf {
+    if let Ok(stripped) = path.strip_prefix("~") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped);
+        }
+    }
+    path.clone()
 }
