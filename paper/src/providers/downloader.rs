@@ -197,14 +197,14 @@ impl DownloadService for PaperDownloader {
             }
         }
 
-        // 4. CORE Lookup
+        // 4. Europe PMC lookup
         if let Some(pdf_url) = self.resolve_europe_pmc(doi).await {
             if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
                 return Ok(result);
             }
         }
 
-        // 5. Europe PMC lookup
+        // 5. CORE lookup
         if let Some(pdf_url) = self.resolve_core(doi).await {
             if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
                 return Ok(result);

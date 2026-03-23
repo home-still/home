@@ -3,6 +3,9 @@ use super::dedup::DedupGroup;
 use super::merge::contributing_sources;
 use crate::models::{Paper, RankedPaper};
 
+// Smoothing constant for Reciprocal Rank Fusion. Standard value from the
+// original RRF paper (Cormack et al. 2009). Higher values reduce the impact
+// of rank position differences between sources.
 const RRF_K: f64 = 60.0;
 
 pub fn rank_papers(groups: &[DedupGroup], merged: Vec<Paper>) -> Vec<RankedPaper> {

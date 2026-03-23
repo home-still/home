@@ -26,7 +26,7 @@ impl ArxivProvider {
         })
     }
 
-    fn build_query_url(&self, query: &SearchQuery) -> Result<String, PaperError> {
+    fn build_search_url(&self, query: &SearchQuery) -> Result<String, PaperError> {
         let search_prefix = match query.search_type {
             SearchType::Keywords => "all:",
             SearchType::Title => "ti:",
@@ -190,7 +190,7 @@ impl PaperProvider for ArxivProvider {
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
-        let url = self.build_query_url(query)?;
+        let url = self.build_search_url(query)?;
 
         let response = self.client.get(&url).send().await?;
 
@@ -243,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_url_title() {
+    fn test_build_search_url_title() {
         let p = provider();
         let query = SearchQuery {
             query: String::from("neural networks"),
@@ -253,7 +253,7 @@ mod tests {
             date_filter: None,
             sort_by: SortBy::default(),
         };
-        let url = p.build_query_url(&query).expect("Failed to build URL");
+        let url = p.build_search_url(&query).expect("Failed to build URL");
         assert!(url.contains("search_query=ti%3A"));
         assert!(url.contains("max_results=10"));
         assert!(url.contains("start=0"));

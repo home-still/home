@@ -69,6 +69,8 @@ pub fn deduplicate(source_results: Vec<(String, Vec<Paper>)>) -> (Vec<DedupGroup
     }
 
     // Stage 3: Fuzzy title matching for papers without DOIs
+    // Minimum normalized Levenshtein similarity to consider two titles the same paper.
+    // 0.85 catches minor formatting differences while avoiding false merges.
     const FUZZY_THRESHOLD: f64 = 0.85;
 
     for source_paper in no_doi {
