@@ -174,6 +174,21 @@ impl CrossRefProvider {
             SortBy::Relevance => {}
         }
 
+        // Date filter
+        if let Some(ref df) = query.date_filter {
+            let mut filters = Vec::new();
+            if let Some(after) = df.after {
+                filters.push(format!("from-pub-date:{}", after.format("%Y-%m-%d")));
+            }
+            if let Some(before) = df.before {
+                let inclusive = before - chrono::Duration::days(1);
+                filters.push(format!("until-pub-date:{}", inclusive.format("%Y-%m-%d")));
+            }
+            if !filters.is_empty() {
+                params.push(("filter", filters.join(",")));
+            }
+        }
+
         // Polite pool
         if let Some(ref email) = self.mailto {
             params.push(("mailto", email.clone()));

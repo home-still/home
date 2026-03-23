@@ -59,10 +59,10 @@ impl ArxivProvider {
         };
 
         let (sort_by, sort_order) = match query.sort_by {
-            SortBy::Relevance | SortBy::Citations => ("relevance", "descending"),
+            SortBy::Relevance => ("relevance", "descending"),
+            SortBy::Citations => ("relevance", "descending"), // TODO: arXiv has no citation sort
             SortBy::Date => ("submittedDate", "descending"),
         };
-
         let url = url::Url::parse_with_params(
             &self.base_url,
             &[

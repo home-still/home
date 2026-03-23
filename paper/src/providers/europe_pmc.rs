@@ -117,10 +117,37 @@ impl EuropePmcProvider {
             _ => query.query.clone(),
         };
 
+        let search_query = if let Some(ref df) = query.date_filter {
+            let from = df
+                .after
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "1900-01-01".to_string());
+            let to = df
+                .before
+                .map(|d| {
+                    let inclusive = d - chrono::Duration::days(1);
+                    inclusive.format("%Y-%m-%d").to_string()
+                })
+                .unwrap_or_else(|| "2999-12-31".to_string());
+            format!("{} FIRST_PDATE:[{} TO {}]", search_query, from, to)
+        } else {
+            search_query
+        };
+
         let page_size = query.max_results.min(100);
+
+        let sort_param = match query.sort_by {
+            SortBy::Date => "&sort=P_PDATE_D+desc",
+            SortBy::Citations => "&sort=CITED+desc",
+            SortBy::Relevance => "",
+        };
+
         let encoded: String =
             url::form_urlencoded::byte_serialize(search_query.as_bytes()).collect();
-        format!("{}/webservices/rest/search?query={}&format=json&resultType=core&pageSize={}&cursorMark=*",self.base_url, encoded, page_size)
+
+        format!("{}/webservices/rest/search?query={}&format=json&resultType=core&pageSize={}&cursorMark=*{}",
+          self.base_url, encoded, page_size, sort_param
+        )
     }
 }
 

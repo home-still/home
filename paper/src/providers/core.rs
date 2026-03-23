@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::config::CoreConfig;
 use crate::error::PaperError;
-use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType};
+use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType, SortBy};
 use crate::ports::provider::PaperProvider;
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +97,22 @@ impl CoreProvider {
             _ => query.query.clone(),
         };
 
+        // Date filter (year-only precision) — must come before q moves into params
+        let q = if let Some(ref df) = query.date_filter {
+            let from = df.after.map(|d| d.format("%Y").to_string());
+            let to = df.before.map(|d| d.format("%Y").to_string());
+            match (from, to) {
+                (Some(f), Some(t)) => {
+                    format!("({}) AND yearPublished>={} AND yearPublished<={}", q, f, t)
+                }
+                (Some(f), None) => format!("({}) AND yearPublished>={}", q, f),
+                (None, Some(t)) => format!("({}) AND yearPublished<={}", q, t),
+                (None, None) => q,
+            }
+        } else {
+            q
+        };
+
         let limit = query.max_results.min(100);
 
         let mut params: Vec<(&str, String)> = vec![
@@ -104,6 +120,13 @@ impl CoreProvider {
             ("limit", limit.to_string()),
             ("offset", query.offset.to_string()),
         ];
+
+        // Sort
+        match query.sort_by {
+            SortBy::Date => params.push(("sort", String::from("publishedDate:desc"))),
+            SortBy::Citations => params.push(("sort", String::from("citationCount:desc"))),
+            SortBy::Relevance => {}
+        }
 
         let base = format!("{}/v3/search/works", self.base_url);
         let url = url::Url::parse_with_params(&base, &params)
