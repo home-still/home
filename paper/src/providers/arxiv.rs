@@ -189,7 +189,7 @@ impl PaperProvider for ArxivProvider {
         vec![SearchType::Keywords, SearchType::Title, SearchType::Author]
     }
 
-    async fn search(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
+    async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
         let url = self.build_search_url(query)?;
 
         let response = self.client.get(&url).send().await?;
@@ -227,7 +227,7 @@ impl PaperProvider for ArxivProvider {
             sort_by: SortBy::default(),
         };
 
-        let result = self.search(&query).await?;
+        let result = self.search_by_query(&query).await?;
         Ok(result.papers.into_iter().next())
     }
 }

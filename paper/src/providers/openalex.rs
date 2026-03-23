@@ -9,6 +9,7 @@ use crate::config::OpenAlexConfig;
 use crate::error::PaperError;
 use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType, SortBy};
 use crate::ports::provider::PaperProvider;
+use crate::providers::response::check_response;
 
 #[derive(Debug, Deserialize)]
 struct OpenAlexResponse {
@@ -276,38 +277,11 @@ impl PaperProvider for OpenAlexProvider {
         ]
     }
 
-    async fn search(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
-        if matches!(query.search_type, SearchType::DOI) {
-            let paper = self.get_by_doi(&query.query).await?;
-            return Ok(SearchResult {
-                total_results: if paper.is_some() { 1 } else { 0 },
-                papers: paper.into_iter().collect(),
-                next_offset: None,
-                provider: String::from("openalex"),
-            });
-        }
-
+    async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
         let url = self.build_search_url(query)?;
         let response = self.client.get(&url).send().await?;
 
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(std::time::Duration::from_secs);
-
-            return Err(PaperError::RateLimited {
-                provider: String::from("openalex"),
-                retry_after,
-            });
-        } else if !response.status().is_success() {
-            return Err(PaperError::ProviderUnavailable(format!(
-                "OpenAlex returned {}",
-                response.status()
-            )));
-        }
+        check_response(&response, "openalex")?;
 
         let body: OpenAlexResponse = response.json().await.map_err(|e| {
             PaperError::ParseError(format!("Failed to parse OpenAlex response: {}", e))
@@ -349,23 +323,8 @@ impl PaperProvider for OpenAlexProvider {
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
-        } else if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(std::time::Duration::from_secs);
-            return Err(PaperError::RateLimited {
-                provider: String::from("openalex"),
-                retry_after,
-            });
-        } else if !response.status().is_success() {
-            return Err(PaperError::ProviderUnavailable(format!(
-                "OpenAlex returned {}",
-                response.status()
-            )));
         }
+        check_response(&response, "openalex")?;
 
         let work: Work = response
             .json()

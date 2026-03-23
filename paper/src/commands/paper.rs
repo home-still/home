@@ -7,7 +7,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::resilience::config::ResilienceConfig;
 use crate::models::SearchQuery;
 use crate::models::SortBy;
 use crate::ports::provider::PaperProvider;
@@ -20,6 +19,7 @@ use crate::providers::openalex::OpenAlexProvider;
 use crate::providers::resilient::ResilientProvider;
 use crate::providers::semantic_scholar::SemanticScholarProvider;
 use crate::resilience::circuit_breaker::new_circuit_breaker;
+use crate::resilience::config::ResilienceConfig;
 use crate::services::download::{download_batch, DownloadEvent, OnProgress};
 use crate::services::search::AggregateProvider;
 
@@ -47,11 +47,7 @@ pub async fn run_search(
 
     let stage = reporter.begin_stage("Searching", None);
     stage.set_message(&format!("{} for:{}", provider.name(), query));
-
-    let date_filter = date
-        .map(|d| crate::models::DateFilter::parse(&d))
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("Invalid date filter: {}", e))?;
+    let date_filter = parse_date_arg(date)?;
 
     if looks_like_doi(&query) {
         return lookup_and_display(&query, "DOI", &*provider, stage, global, reporter, styles)
@@ -75,7 +71,7 @@ pub async fn run_search(
     };
 
     let result = provider
-        .search(&search_query)
+        .search_by_query(&search_query)
         .await
         .context("Search failed")?;
 
@@ -175,10 +171,7 @@ pub async fn run_download(
         let search_stage = reporter.begin_stage("Searching", None);
         search_stage.set_message(&format!("{} for {}", provider_impl.name(), query_str));
 
-        let date_filter = date
-            .map(|d| crate::models::DateFilter::parse(&d))
-            .transpose()
-            .map_err(|e| anyhow::anyhow!("Invalid date filter: {}", e))?;
+        let date_filter = parse_date_arg(date)?;
 
         let search_query = SearchQuery {
             query: query_str,
@@ -190,7 +183,7 @@ pub async fn run_download(
         };
 
         let search_result = provider_impl
-            .search(&search_query)
+            .search_by_query(&search_query)
             .await
             .context("Search failed")?;
 
@@ -363,12 +356,37 @@ fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn Pape
             let timeout = Duration::from_secs(30);
             let aggregate = AggregateProvider::new(
                 vec![
-                    make_resilient(ArxivProvider::new(&p.arxiv).context("arXiv")?, p.arxiv.rate_limit_interval_ms, r),
-                    make_resilient(OpenAlexProvider::new(&p.openalex).context("OpenAlex")?, p.openalex.rate_limit_interval_ms, r),
-                    make_resilient(SemanticScholarProvider::new(&p.semantic_scholar).context("Semantic Scholar")?, p.semantic_scholar.rate_limit_interval_ms, r),
-                    make_resilient(EuropePmcProvider::new(&p.europe_pmc).context("Europe PMC")?, p.europe_pmc.rate_limit_interval_ms, r),
-                    make_resilient(CrossRefProvider::new(&p.crossref).context("CrossRef")?, p.crossref.rate_limit_interval_ms, r),
-                    make_resilient(CoreProvider::new(&p.core).context("CORE")?, p.core.rate_limit_interval_ms, r),
+                    make_resilient(
+                        ArxivProvider::new(&p.arxiv).context("arXiv")?,
+                        p.arxiv.rate_limit_interval_ms,
+                        r,
+                    ),
+                    make_resilient(
+                        OpenAlexProvider::new(&p.openalex).context("OpenAlex")?,
+                        p.openalex.rate_limit_interval_ms,
+                        r,
+                    ),
+                    make_resilient(
+                        SemanticScholarProvider::new(&p.semantic_scholar)
+                            .context("Semantic Scholar")?,
+                        p.semantic_scholar.rate_limit_interval_ms,
+                        r,
+                    ),
+                    make_resilient(
+                        EuropePmcProvider::new(&p.europe_pmc).context("Europe PMC")?,
+                        p.europe_pmc.rate_limit_interval_ms,
+                        r,
+                    ),
+                    make_resilient(
+                        CrossRefProvider::new(&p.crossref).context("CrossRef")?,
+                        p.crossref.rate_limit_interval_ms,
+                        r,
+                    ),
+                    make_resilient(
+                        CoreProvider::new(&p.core).context("CORE")?,
+                        p.core.rate_limit_interval_ms,
+                        r,
+                    ),
                 ],
                 timeout,
             );
@@ -422,6 +440,12 @@ async fn lookup_and_display(
 /// e.g., "10.1038/s41576-024-00001-2"
 fn looks_like_doi(query: &str) -> bool {
     query.starts_with("10.") && query.contains('/')
+}
+
+fn parse_date_arg(date: Option<String>) -> Result<Option<crate::models::DateFilter>> {
+    date.map(|d| crate::models::DateFilter::parse(&d))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Invalid date filter: {}", e))
 }
 
 /// arXiv ID format: digits, a dot, then more digits

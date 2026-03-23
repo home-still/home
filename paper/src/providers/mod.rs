@@ -5,4 +5,5 @@ pub mod downloader;
 pub mod europe_pmc;
 pub mod openalex;
 pub mod resilient;
+pub mod response;
 pub mod semantic_scholar;

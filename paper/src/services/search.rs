@@ -36,7 +36,7 @@ impl PaperProvider for AggregateProvider {
             .collect()
     }
 
-    async fn search(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
+    async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
         // Fan out to all providers with timeout
         let futures: Vec<_> = self
             .providers
@@ -45,7 +45,7 @@ impl PaperProvider for AggregateProvider {
                 let timeout = self.timeout;
                 async move {
                     let start = Instant::now();
-                    let result = tokio::time::timeout(timeout, p.search(query)).await;
+                    let result = tokio::time::timeout(timeout, p.search_by_query(query)).await;
                     let elapased = start.elapsed();
                     (p.name(), result, elapased)
                 }

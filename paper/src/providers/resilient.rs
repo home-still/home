@@ -47,7 +47,7 @@ impl<CB: failsafe::CircuitBreaker + Clone + Send + Sync + 'static> PaperProvider
         self.inner.supported_search_types()
     }
 
-    async fn search(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
+    async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
         if !self.circuit_breaker.is_call_permitted() {
             return Err(PaperError::CircuitBreakerOpen(String::from(
                 self.inner.name(),
@@ -59,7 +59,7 @@ impl<CB: failsafe::CircuitBreaker + Clone + Send + Sync + 'static> PaperProvider
         let inner = &self.inner;
 
         retry_with_backoff(&self.resilience_config, || async {
-            inner.search(query).await
+            inner.search_by_query(query).await
         })
         .await
     }

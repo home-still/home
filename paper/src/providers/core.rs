@@ -8,6 +8,7 @@ use crate::config::CoreConfig;
 use crate::error::PaperError;
 use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType, SortBy};
 use crate::ports::provider::PaperProvider;
+use crate::providers::response::check_response;
 
 #[derive(Debug, Deserialize)]
 struct CoreResponse {
@@ -155,17 +156,7 @@ impl PaperProvider for CoreProvider {
         ]
     }
 
-    async fn search(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
-        if matches!(query.search_type, SearchType::DOI) {
-            let paper = self.get_by_doi(&query.query).await?;
-            return Ok(SearchResult {
-                total_results: if paper.is_some() { 1 } else { 0 },
-                papers: paper.into_iter().collect(),
-                next_offset: None,
-                provider: String::from("core"),
-            });
-        }
-
+    async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
         let url = self.build_search_url(query)?;
 
         let mut request = self.client.get(&url);
@@ -175,23 +166,12 @@ impl PaperProvider for CoreProvider {
 
         let response = request.send().await?;
 
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(PaperError::RateLimited {
-                provider: String::from("core"),
-                retry_after: None,
-            });
-        } else if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(PaperError::ProviderUnavailable(
-                "CORE API key required or invalid. Set providers.core.api_key in 
-  config."
-                    .into(),
+                "CORE API key required or invalid. Set providers.core.api_key in config.".into(),
             ));
-        } else if !response.status().is_success() {
-            return Err(PaperError::ProviderUnavailable(format!(
-                "CORE returned {}",
-                response.status()
-            )));
         }
+        check_response(&response, "core")?;
 
         let body: CoreResponse = response
             .json()
@@ -237,12 +217,8 @@ impl PaperProvider for CoreProvider {
             return Err(PaperError::ProviderUnavailable(
                 "CORE API key required or invalid. Set providers.core.api_key in config.".into(),
             ));
-        } else if !response.status().is_success() {
-            return Err(PaperError::ProviderUnavailable(format!(
-                "CORE returned {}",
-                response.status()
-            )));
         }
+        check_response(&response, "core")?;
 
         let body: CoreResponse = response
             .json()

@@ -12,6 +12,15 @@ pub fn print_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+fn format_authors(paper: &Paper) -> String {
+    paper
+        .authors
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Print search results as a human-readable list.
 pub fn print_search_result(
     result: &SearchResult,
@@ -42,13 +51,7 @@ pub fn print_search_result(
 }
 
 fn print_paper_row(index: usize, paper: &Paper, styles: &Styles, show_abstract: bool, query: &str) {
-    let authors = paper
-        .authors
-        .iter()
-        .map(|a| a.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-
+    let authors = format_authors(paper);
     let date = paper
         .publication_date
         .map(|d| d.to_string())
@@ -78,13 +81,7 @@ fn print_paper_row(index: usize, paper: &Paper, styles: &Styles, show_abstract: 
 
 /// Print a single paper in human-readable format.
 pub fn print_paper(paper: &Paper, styles: &Styles) {
-    let authors = paper
-        .authors
-        .iter()
-        .map(|a| a.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-
+    let authors = format_authors(paper);
     println!(
         "{} {}",
         "Title:".style(styles.label),

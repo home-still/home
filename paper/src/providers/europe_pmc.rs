@@ -8,6 +8,7 @@ use crate::config::EuropePmcConfig;
 use crate::error::PaperError;
 use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType, SortBy};
 use crate::ports::provider::PaperProvider;
+use crate::providers::response::check_response;
 
 #[derive(Debug, Deserialize)]
 struct EpmcResponse {
@@ -170,31 +171,11 @@ impl PaperProvider for EuropePmcProvider {
         ]
     }
 
-    async fn search(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
-        if matches!(query.search_type, SearchType::DOI) {
-            let paper = self.get_by_doi(&query.query).await?;
-            return Ok(SearchResult {
-                total_results: if paper.is_some() { 1 } else { 0 },
-                papers: paper.into_iter().collect(),
-                next_offset: None,
-                provider: String::from("europe_pmc"),
-            });
-        }
-
+    async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
         let url = self.build_search_url(query);
         let response = self.client.get(&url).send().await?;
 
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(PaperError::RateLimited {
-                provider: String::from("europe_pmc"),
-                retry_after: None,
-            });
-        } else if !response.status().is_success() {
-            return Err(PaperError::ProviderUnavailable(format!(
-                "Europe PMC returned {}",
-                response.status()
-            )));
-        }
+        check_response(&response, "europe_pmc")?;
 
         let body: EpmcResponse = response.json().await.map_err(|e| {
             PaperError::ParseError(format!("Failed to parse Europe PMC response: {}", e))
@@ -231,12 +212,7 @@ impl PaperProvider for EuropePmcProvider {
 
         let response = self.client.get(&url).send().await?;
 
-        if !response.status().is_success() {
-            return Err(PaperError::ProviderUnavailable(format!(
-                "Europe PMC returned {}",
-                response.status()
-            )));
-        }
+        check_response(&response, "europe_pmc")?;
 
         let body: EpmcResponse = response.json().await.map_err(|e| {
             PaperError::ParseError(format!("Failed to parse Europe PMC response: {}", e))
