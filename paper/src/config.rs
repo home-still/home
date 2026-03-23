@@ -153,6 +153,46 @@ impl Default for EuropePmcConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrossRefConfig {
+    pub base_url: String,
+    pub mailto: Option<String>,
+    pub timeout_secs: u64,
+    pub rate_limit_interval_ms: u64,
+}
+
+impl Default for CrossRefConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::from("https://api.crossref.org"),
+            mailto: None,
+            timeout_secs: 30,
+            rate_limit_interval_ms: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CoreConfig {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub timeout_secs: u64,
+    pub rate_limit_interval_ms: u64,
+}
+
+impl Default for CoreConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::from("https://api.core.ac.uk"),
+            api_key: None,
+            timeout_secs: 30,
+            rate_limit_interval_ms: 2100, // 5 req/10s
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ProvidersConfig {
@@ -160,6 +200,8 @@ pub struct ProvidersConfig {
     pub openalex: OpenAlexConfig,
     pub semantic_scholar: SemanticScholarConfig,
     pub europe_pmc: EuropePmcConfig,
+    pub crossref: CrossRefConfig,
+    pub core: CoreConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

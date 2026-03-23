@@ -1,4 +1,6 @@
 pub mod arxiv;
+pub mod core;
+pub mod crossref;
 pub mod downloader;
 pub mod europe_pmc;
 pub mod openalex;

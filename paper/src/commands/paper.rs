@@ -11,6 +11,8 @@ use crate::models::SearchQuery;
 use crate::models::SortBy;
 use crate::ports::provider::PaperProvider;
 use crate::providers::arxiv::ArxivProvider;
+use crate::providers::core::CoreProvider;
+use crate::providers::crossref::CrossRefProvider;
 use crate::providers::downloader::PaperDownloader;
 use crate::providers::europe_pmc::EuropePmcProvider;
 use crate::providers::openalex::OpenAlexProvider;
@@ -346,6 +348,24 @@ fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn Pape
                 ResilientProvider::new(Box::new(inner), interval, cb, config.resilience.clone());
             Ok(Box::new(resilient))
         }
+        ProviderArg::CrossRef => {
+            let inner = CrossRefProvider::new(&config.providers.crossref)
+                .context("Failed to create CrossRef provider")?;
+            let interval = Duration::from_millis(config.providers.crossref.rate_limit_interval_ms);
+            let cb = new_circuit_breaker(&config.resilience);
+            let resilient =
+                ResilientProvider::new(Box::new(inner), interval, cb, config.resilience.clone());
+            Ok(Box::new(resilient))
+        }
+        ProviderArg::Core => {
+            let inner = CoreProvider::new(&config.providers.core)
+                .context("Failed to create CORE provider")?;
+            let interval = Duration::from_millis(config.providers.core.rate_limit_interval_ms);
+            let cb = new_circuit_breaker(&config.resilience);
+            let resilient =
+                ResilientProvider::new(Box::new(inner), interval, cb, config.resilience.clone());
+            Ok(Box::new(resilient))
+        }
         ProviderArg::All => {
             // Arxiv
             let arxiv_inner = ArxivProvider::new(&config.providers.arxiv)
@@ -399,9 +419,41 @@ fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn Pape
                 config.resilience.clone(),
             ));
 
+            // CrossRef
+            let cr_inner = CrossRefProvider::new(&config.providers.crossref)
+                .context("Failed to create CrossRef provider")?;
+            let cr_interval =
+                Duration::from_millis(config.providers.crossref.rate_limit_interval_ms);
+            let cr_cb = new_circuit_breaker(&config.resilience);
+            let crossref: Box<dyn PaperProvider> = Box::new(ResilientProvider::new(
+                Box::new(cr_inner),
+                cr_interval,
+                cr_cb,
+                config.resilience.clone(),
+            ));
+
+            // CORE
+            let core_inner = CoreProvider::new(&config.providers.core)
+                .context("Failed to create CORE provider")?;
+            let core_interval = Duration::from_millis(config.providers.core.rate_limit_interval_ms);
+            let core_cb = new_circuit_breaker(&config.resilience);
+            let core: Box<dyn PaperProvider> = Box::new(ResilientProvider::new(
+                Box::new(core_inner),
+                core_interval,
+                core_cb,
+                config.resilience.clone(),
+            ));
+
             let timeout = Duration::from_secs(30);
             let aggregate = AggregateProvider::new(
-                vec![arxiv, openalex, semantic_scholar, europe_pmc],
+                vec![
+                    arxiv,
+                    openalex,
+                    semantic_scholar,
+                    europe_pmc,
+                    crossref,
+                    core,
+                ],
                 timeout,
             );
 

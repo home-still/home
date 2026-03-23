@@ -127,6 +127,8 @@ pub enum ProviderArg {
     OpenAlex,
     SemanticScholar,
     EuropePmc,
+    CrossRef,
+    Core,
 }
 
 impl From<SearchTypeArg> for crate::models::SearchType {
