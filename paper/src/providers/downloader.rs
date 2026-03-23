@@ -11,6 +11,7 @@ use crate::config::DownloadConfig;
 use crate::error::PaperError;
 use crate::models::DownloadResult;
 use crate::ports::download_service::DownloadService;
+use crate::ports::provider::PaperProvider;
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -24,66 +25,19 @@ struct UnpaywallLocation {
     url_for_pdf: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct SemanticScholarResponse {
-    #[serde(rename = "openAccessPdf")]
-    open_access_pdf: Option<SemanticScholarPdf>,
-}
-
-#[derive(Deserialize)]
-struct SemanticScholarPdf {
-    url: String,
-}
-
-#[derive(Deserialize)]
-struct EuropePmcResponse {
-    #[serde(rename = "resultList")]
-    result_list: EuropePmcResultList,
-}
-
-#[derive(Deserialize)]
-struct EuropePmcResultList {
-    result: Vec<EuropePmcResult>,
-}
-
-#[derive(Deserialize)]
-struct EuropePmcResult {
-    #[serde(rename = "fullTextUrlList")]
-    full_text_url_list: Option<EuropePmcUrlList>,
-}
-
-#[derive(Deserialize)]
-struct EuropePmcUrlList {
-    #[serde(rename = "fullTextUrl")]
-    full_text_url: Vec<EuropePmcUrl>,
-}
-
-#[derive(Deserialize)]
-struct EuropePmcUrl {
-    #[serde(rename = "documentStyle")]
-    document_style: Option<String>,
-    url: String,
-}
-
-#[derive(Deserialize)]
-struct CoreSearchResponse {
-    results: Vec<CoreOutput>,
-}
-
-#[derive(Deserialize)]
-struct CoreOutput {
-    #[serde(rename = "downloadUrl")]
-    download_url: Option<String>,
-}
 pub struct PaperDownloader {
     client: Client,
     download_path: PathBuf,
     unpaywall_email: Option<String>,
-    core_api_key: Option<String>,
+    resolvers: Vec<Box<dyn PaperProvider>>,
 }
 
 impl PaperDownloader {
-    pub fn new(download_path: PathBuf, config: &DownloadConfig) -> Result<Self, PaperError> {
+    pub fn new(
+        download_path: PathBuf,
+        config: &DownloadConfig,
+        resolvers: Vec<Box<dyn PaperProvider>>,
+    ) -> Result<Self, PaperError> {
         let user_agent = match &config.unpaywall_email {
             Some(email) => format!(
                 "{}/{} (mailto:{})",
@@ -110,7 +64,7 @@ impl PaperDownloader {
             client,
             download_path,
             unpaywall_email: config.unpaywall_email.clone(),
-            core_api_key: config.core_api_key.clone(),
+            resolvers,
         })
     }
 
@@ -122,51 +76,15 @@ impl PaperDownloader {
         data.best_oa_location?.url_for_pdf
     }
 
-    async fn resolve_semantic_scholar(&self, doi: &str) -> Option<String> {
-        let url = format!(
-            "https://api.semanticscholar.org/graph/v1/paper/DOI:{}?fields=openAccessPdf",
-            doi
-        );
-        let response = self.client.get(&url).send().await.ok()?;
-        let data: SemanticScholarResponse = response.json().await.ok()?;
-        let pdf_url = data.open_access_pdf?.url;
-        if pdf_url.is_empty() {
-            None
-        } else {
-            Some(pdf_url)
+    async fn resolve_via_providers(&self, doi: &str) -> Option<String> {
+        for resolver in &self.resolvers {
+            if let Ok(Some(paper)) = resolver.get_by_doi(doi).await {
+                if let Some(url) = paper.download_urls.into_iter().next() {
+                    return Some(url);
+                }
+            }
         }
-    }
-
-    async fn resolve_europe_pmc(&self, doi: &str) -> Option<String> {
-        let url = format!(
-            "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:{}&format=json&resultType=core",
-            doi
-        );
-        let response = self.client.get(&url).send().await.ok()?;
-        let data: EuropePmcResponse = response.json().await.ok()?;
-        let result = data.result_list.result.into_iter().next()?;
-        let urls = result.full_text_url_list?;
-        urls.full_text_url
-            .into_iter()
-            .find(|u| u.document_style.as_deref() == Some("pdf"))
-            .map(|u| u.url)
-    }
-
-    async fn resolve_core(&self, doi: &str) -> Option<String> {
-        let api_key = self.core_api_key.as_ref()?;
-        let url = format!(
-            "https://api.core.ac.uk/v3/search/outputs/?q=doi:\"{}\"&limit=1",
-            doi
-        );
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .send()
-            .await
-            .ok()?;
-        let data: CoreSearchResponse = response.json().await.ok()?;
-        data.results.into_iter().next()?.download_url
+        None
     }
 }
 
@@ -190,28 +108,14 @@ impl DownloadService for PaperDownloader {
             }
         }
 
-        // 3. Semantic Scholar lookup
-        if let Some(pdf_url) = self.resolve_semantic_scholar(doi).await {
+        // 3. Provider-based resolution (Semantic Scholar, Europe PMC, CORE, etc.)
+        if let Some(pdf_url) = self.resolve_via_providers(doi).await {
             if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
                 return Ok(result);
             }
         }
 
-        // 4. Europe PMC lookup
-        if let Some(pdf_url) = self.resolve_europe_pmc(doi).await {
-            if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
-                return Ok(result);
-            }
-        }
-
-        // 5. CORE lookup
-        if let Some(pdf_url) = self.resolve_core(doi).await {
-            if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
-                return Ok(result);
-            }
-        }
-
-        // 6. No resolver found
+        // 4. No resolver found
         let detail = if self.unpaywall_email.is_some() {
             format!("No open-access PDF found for DOI: {}", doi)
         } else {

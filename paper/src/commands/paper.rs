@@ -142,8 +142,23 @@ pub async fn run_download(
 ) -> Result<()> {
     let config = Config::load().context("Failed to load config")?;
 
-    let downloader = PaperDownloader::new(config.download_path.clone(), &config.download)
-        .context("Failed to create downloader")?;
+    // Build lightweight provider instances for PDF resolution
+    let mut resolvers: Vec<Box<dyn PaperProvider>> = Vec::new();
+    if let Ok(s2) = SemanticScholarProvider::new(&config.providers.semantic_scholar) {
+        resolvers.push(Box::new(s2));
+    }
+    if let Ok(epmc) = EuropePmcProvider::new(&config.providers.europe_pmc) {
+        resolvers.push(Box::new(epmc));
+    }
+    if config.providers.core.api_key.is_some() {
+        if let Ok(core) = CoreProvider::new(&config.providers.core) {
+            resolvers.push(Box::new(core));
+        }
+    }
+
+    let downloader =
+        PaperDownloader::new(config.download_path.clone(), &config.download, resolvers)
+            .context("Failed to create downloader")?;
     let downloader: Arc<dyn crate::ports::download_service::DownloadService> = Arc::new(downloader);
 
     if let Some(doi_str) = doi {

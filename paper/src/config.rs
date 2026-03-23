@@ -213,8 +213,6 @@ pub struct DownloadConfig {
     pub timeout_secs: u64,
     /// Unpaywall email address
     pub unpaywall_email: Option<String>,
-    /// Core API Key
-    pub core_api_key: Option<String>,
 }
 
 impl Default for DownloadConfig {
@@ -223,7 +221,6 @@ impl Default for DownloadConfig {
             max_concurrent: 4,
             timeout_secs: 120,
             unpaywall_email: None,
-            core_api_key: None,
         }
     }
 }

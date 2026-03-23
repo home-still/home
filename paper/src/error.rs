@@ -47,11 +47,22 @@ impl PaperError {
             Self::InvalidInput(_) => ErrorCategory::Permanent,
             Self::NotFound(_) => ErrorCategory::Permanent,
             Self::ParseError(_) => ErrorCategory::Permanent,
+            Self::NoDownloadUrl(_) => ErrorCategory::Permanent,
             Self::Http(e) if e.is_timeout() => ErrorCategory::Transient,
+            Self::Http(e) => match e.status().map(|s| s.as_u16()) {
+                Some(429) => ErrorCategory::RateLimited,
+                Some(500..=599) => ErrorCategory::Transient,
+                Some(_) => ErrorCategory::Permanent,
+                None => ErrorCategory::Transient, // connection errors
+            },
+            Self::Io(e) => match e.kind() {
+                std::io::ErrorKind::NotFound => ErrorCategory::Permanent,
+                std::io::ErrorKind::PermissionDenied => ErrorCategory::Permanent,
+                _ => ErrorCategory::Transient,
+            },
             Self::ProviderUnavailable(_) => ErrorCategory::Transient,
             Self::RateLimited { .. } => ErrorCategory::RateLimited,
             Self::CircuitBreakerOpen(_) => ErrorCategory::CircuitBreaker,
-            _ => ErrorCategory::Transient,
         }
     }
 

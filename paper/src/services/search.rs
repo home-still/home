@@ -64,8 +64,12 @@ impl PaperProvider for AggregateProvider {
                     total_results += sr.total_results;
                     source_results.push((name.to_string(), sr.papers));
                 }
-                Ok(Err(_e)) => {} // provider error - skip
-                Err(_) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(provider = %name, error = %e, "provider failed");
+                }
+                Err(_) => {
+                    tracing::warn!(provider = %name, "provider timed out");
+                }
             }
         }
 

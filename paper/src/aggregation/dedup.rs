@@ -1,5 +1,6 @@
 // DOI-first deduplication with fuzzy title matching
-use crate::models::{DedupStats, Paper};
+use super::types::DedupStats;
+use crate::models::Paper;
 use std::collections::HashMap;
 use strsim::normalized_levenshtein;
 

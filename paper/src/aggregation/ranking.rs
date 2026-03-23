@@ -1,7 +1,8 @@
 // Reciprocal Rank Fusion with boost signals
 use super::dedup::DedupGroup;
 use super::merge::contributing_sources;
-use crate::models::{Paper, RankedPaper};
+use super::types::RankedPaper;
+use crate::models::Paper;
 
 // Smoothing constant for Reciprocal Rank Fusion. Standard value from the
 // original RRF paper (Cormack et al. 2009). Higher values reduce the impact
