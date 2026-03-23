@@ -167,3 +167,87 @@ let class_names = vec![
 
 **Last Updated:** 2025-10-18 (Session 006)
 **Maintainer:** Session journals in `slop/journal/`
+
+---
+---
+
+# Paper Provider Audit — TODO
+
+Audit date: 2026-03-23. Post-walkthrough review of all 6 providers.
+
+## Provider feature support matrix (current state)
+
+| Provider | Relevance | Sort:Date | Sort:Citations | Date Filter |
+|---|---|---|---|---|
+| arXiv | ok | ok | **broken** (silent→Relevance) | ok |
+| OpenAlex | ok | ok | ok | ok |
+| Semantic Scholar | ok (default) | ok | ok | year-only (lossy) |
+| Europe PMC | **missing** | **missing** | **missing** | **missing** |
+| CrossRef | ok (default) | ok | ok | **missing** |
+| CORE | **missing** | **missing** | **missing** | **missing** |
+
+---
+
+## Tier 1: Feature gaps — providers silently ignoring query params
+
+- [ ] **1.1** Europe PMC: add sort + date filter
+  - File: `paper/src/providers/europe_pmc.rs` — `build_search_url()`
+  - Sort: EPMC supports `sort=CITED+desc` and `sort=DATE+desc`
+  - Date: append `FIRST_PDATE:[YYYY-MM-DD TO YYYY-MM-DD]` to query
+
+- [ ] **1.2** CrossRef: add date filter
+  - File: `paper/src/providers/crossref.rs` — `build_search_url()`
+  - Date: add `filter=from-pub-date:YYYY-MM-DD,until-pub-date:YYYY-MM-DD` param
+
+- [ ] **1.3** CORE: add sort + date filter
+  - File: `paper/src/providers/core.rs` — `build_search_url()`
+  - Sort: CORE v3 supports `sort` param (verify exact values)
+  - Date: query syntax for `yearPublished` (may be year-only)
+
+- [ ] **1.4** arXiv: fix Citations sort silently mapping to Relevance
+  - File: `paper/src/providers/arxiv.rs` — line 61
+  - arXiv has no citation sort. Log a warning or remove from supported sorts.
+
+## Tier 2: DRY — high-value extractions
+
+- [ ] **2.1** Extract DOI-dispatch from `search()` — 5 providers have identical 8-line block
+  - Files: `ports/provider.rs` + openalex, semantic_scholar, europe_pmc, crossref, core
+  - Options: default trait method, or free function `doi_dispatch()`
+
+- [ ] **2.2** Extract `parse_date_arg()` helper — identical 4-line block in `run_search` and `run_download`
+  - File: `paper/src/commands/paper.rs` — lines 51 and 178
+
+- [ ] **2.3** Extract HTTP response validation helper — 429/error check duplicated 6x
+  - Files: all 6 providers
+  - `fn check_response(response, provider_name) -> Result<(), PaperError>`
+
+- [ ] **2.4** Extract `format_authors()` — identical in `print_paper_row` and `print_paper`
+  - File: `paper/src/output.rs`
+
+## Tier 3: Correctness
+
+- [ ] **3.1** Fix error categorization catch-all in `error.rs`
+  - File: `paper/src/error.rs` — `category()` line 54
+  - `_ => Transient` miscategorizes Http(404), Io(PermissionDenied), NoDownloadUrl
+  - Impact: retry logic retries permanent failures
+
+- [ ] **3.2** Log provider errors in AggregateProvider (currently silent)
+  - File: `paper/src/services/search.rs` — lines 67-68
+  - Add `tracing::warn!` for failed/timed-out providers
+
+## Tier 4: Lower priority / higher risk
+
+- [ ] **4.1** Consolidate download resolvers with provider `get_by_doi()`
+  - `downloader.rs` resolve_semantic_scholar/europe_pmc/core hit same APIs as providers
+  - Invasive: downloader needs provider instances
+
+- [ ] **4.2** Move aggregation types from `models.rs` to `aggregation/types.rs`
+  - `AggregatedSearchResult`, `RankedPaper`, `SourceStatus`, `SourceState`, `DedupStats`
+
+## Not worth doing
+
+- next_offset: subtly different per provider (openalex 10k cap, epmc uses `papers.len()`)
+- SearchResult construction: 4 lines, different field names
+- Provider registry pattern: match is explicit and compile-checked
+
+**Last Updated:** 2026-03-23
