@@ -1,5 +1,6 @@
 use clap::Parser;
 use dialoguer::{Confirm, Input};
+use hs_style::CONFIG_REL_PATH;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -49,7 +50,7 @@ fn main() -> ExitCode {
     let result = rt.block_on(async {
         match cli.command {
             TopCmd::Paper { command } => {
-                paper::commands::dispatch(command, &cli.global, &reporter, &styles).await
+                paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode).await
             }
             TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
         }
@@ -73,17 +74,21 @@ async fn handle_config(
         cli::ConfigAction::Init { force } => {
             let home = dirs::home_dir()
                 .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-            let config_path = home.join(".home-still/config.yaml");
+            let config_path = home.join(CONFIG_REL_PATH);
 
             if config_path.exists() && !force {
-                let overwrite = Confirm::new()
-                    .with_prompt("Config already exists.  Overwrite?")
-                    .default(false)
-                    .interact()?;
+                if global.yes {
+                    // --yes: overwrite without asking
+                } else {
+                    let overwrite = Confirm::new()
+                        .with_prompt("Config already exists.  Overwrite?")
+                        .default(false)
+                        .interact()?;
 
-                if !overwrite {
-                    reporter.status("Skipped", "config unchanged");
-                    return Ok(());
+                    if !overwrite {
+                        reporter.status("Skipped", "config unchanged");
+                        return Ok(());
+                    }
                 }
             }
 
@@ -121,7 +126,7 @@ async fn handle_config(
         cli::ConfigAction::Path => {
             let home = dirs::home_dir()
                 .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-            let path = home.join(".home-still/config.yaml");
+            let path = home.join(CONFIG_REL_PATH);
             println!("{}", path.display());
             Ok(())
         }

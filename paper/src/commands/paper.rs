@@ -41,6 +41,7 @@ pub async fn run_search(
     global: &GlobalArgs,
     reporter: &Arc<dyn Reporter>,
     styles: &Styles,
+    mode: &hs_style::mode::OutputMode,
 ) -> Result<()> {
     let config = Config::load().context("Failed to load config")?;
     let provider = make_provider(&provider, &config)?;
@@ -77,8 +78,15 @@ pub async fn run_search(
 
     stage.finish_and_clear();
 
+    if result.papers.is_empty() && !global.is_json() {
+        reporter.warn("No papers found. Try broadening your query or removing filters.");
+        return Ok(());
+    }
+
     if global.is_json() {
         output::print_json(&result)?;
+    } else if matches!(mode, hs_style::mode::OutputMode::Pipe) {
+        output::print_search_result_pipe(&result);
     } else {
         output::print_search_result(
             &result,
@@ -207,6 +215,9 @@ pub async fn run_download(
         let paper_count = search_result.papers.len();
         if paper_count == 0 {
             reporter.warn("No papers found.");
+            if !matches!(provider, ProviderArg::All) {
+                reporter.warn("Try --provider all to search all sources.");
+            }
             return Ok(());
         }
 

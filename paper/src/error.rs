@@ -2,25 +2,25 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum PaperError {
-    #[error("Invalid input: {0}")]
+    #[error("Invalid input: {0}. See: hs paper search --help")]
     InvalidInput(String),
 
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
-    #[error("Provider unavailable: {0}")]
+    #[error("Provider unavailable: {0}. Try a different provider with --provider")]
     ProviderUnavailable(String),
 
-    #[error("Rate limited: {provider}, retry after {retry_after:?}")]
+    #[error("Rate limited by {provider}. Retry after {retry_after:?}. Consider --concurrency 1")]
     RateLimited {
         provider: String,
         retry_after: Option<std::time::Duration>,
     },
 
-    #[error("Circuit breaker open: {0}")]
+    #[error("Circuit breaker open for {0}. Provider has failed repeatedly; try again later")]
     CircuitBreakerOpen(String),
 
-    #[error("Not found: {0}")]
+    #[error("Not found: {0}. Check the identifier or try: hs paper search")]
     NotFound(String),
 
     #[error("Parse error: {0}")]
@@ -29,7 +29,7 @@ pub enum PaperError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("No download URL for paper: {0}")]
+    #[error("No download URL for paper: {0}. Try --provider to search a different source")]
     NoDownloadUrl(String),
 }
 
@@ -71,5 +71,49 @@ impl PaperError {
             PaperError::RateLimited { retry_after, .. } => *retry_after,
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_found_suggests_search() {
+        let err = PaperError::NotFound("10.1234/test".into());
+        assert!(err.to_string().contains("hs paper search"));
+    }
+
+    #[test]
+    fn invalid_input_suggests_help() {
+        let err = PaperError::InvalidInput("bad query".into());
+        assert!(err.to_string().contains("--help"));
+    }
+
+    #[test]
+    fn provider_unavailable_suggests_flag() {
+        let err = PaperError::ProviderUnavailable("arxiv".into());
+        assert!(err.to_string().contains("--provider"));
+    }
+
+    #[test]
+    fn rate_limited_suggests_concurrency() {
+        let err = PaperError::RateLimited {
+            provider: "arxiv".into(),
+            retry_after: Some(std::time::Duration::from_secs(5)),
+        };
+        assert!(err.to_string().contains("--concurrency"));
+    }
+
+    #[test]
+    fn circuit_breaker_suggests_retry() {
+        let err = PaperError::CircuitBreakerOpen("arxiv".into());
+        assert!(err.to_string().contains("try again later"));
+    }
+
+    #[test]
+    fn no_download_url_suggests_provider() {
+        let err = PaperError::NoDownloadUrl("Some Paper Title".into());
+        assert!(err.to_string().contains("--provider"));
     }
 }

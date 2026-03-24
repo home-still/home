@@ -4,6 +4,7 @@ use figment::{
     providers::{Env, Format, Yaml},
     Figment,
 };
+use hs_style::CONFIG_REL_PATH;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -45,7 +46,7 @@ impl Default for Config {
 
 impl Config {
     pub fn config_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".home-still/config.yaml"))
+        dirs::home_dir().map(|h| h.join(CONFIG_REL_PATH))
     }
 
     pub fn load() -> anyhow::Result<Self> {
@@ -57,7 +58,7 @@ impl Config {
         }
 
         if let Some(home) = dirs::home_dir() {
-            let user_path = home.join(".home-still/config.yaml");
+            let user_path = home.join(CONFIG_REL_PATH);
             if user_path.exists() {
                 figment = figment.merge(Yaml::file(&user_path));
             }
@@ -65,10 +66,12 @@ impl Config {
 
         figment = figment.merge(Env::prefixed("HOME_STILL_").split("_"));
 
-        let mut config: Config = figment
-            .focus("paper")
-            .extract()
-            .context("Failed to load configuration")?;
+        let mut config: Config = figment.focus("paper").extract().context(format!(
+            "Failed to parse config ({}).  Run: hs config init",
+            Config::config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| CONFIG_REL_PATH.into())
+        ))?;
 
         config.download_path = expand_tilde(&config.download_path);
         config.cache_path = expand_tilde(&config.cache_path);

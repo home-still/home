@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use hs_style::global_args::GlobalArgs;
+use hs_style::mode::OutputMode;
 use hs_style::reporter::Reporter;
 use hs_style::styles::Styles;
 
@@ -15,6 +16,7 @@ pub async fn dispatch(
     global: &GlobalArgs,
     reporter: &Arc<dyn Reporter>,
     styles: &Styles,
+    mode: &OutputMode,
 ) -> Result<()> {
     match cmd {
         PaperCmd::Search {
@@ -39,6 +41,7 @@ pub async fn dispatch(
                 global,
                 reporter,
                 styles,
+                mode,
             )
             .await
         }

@@ -3,10 +3,10 @@ use clap::{Subcommand, ValueEnum};
 #[derive(Subcommand, Debug)]
 pub enum PaperCmd {
     /// Search for papers across providers
-    ///
-    /// Examples:
-    ///   paper search "transformer attention"
-    ///   paper search --type author "Hinton" -n 5
+    #[command(after_help = "\
+  Examples:
+    hs paper search \"transformer attention\"
+    hs paper search --type author \"Hinton\" -n 5")]
     Search {
         /// Search query string
         query: String,

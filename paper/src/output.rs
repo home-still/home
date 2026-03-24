@@ -50,6 +50,26 @@ pub fn print_search_result(
     }
 }
 
+/// Format search results as one-line-per-result tab-separated text.
+pub fn format_search_result_pipe(result: &SearchResult) -> String {
+    let mut out = String::new();
+    for paper in &result.papers {
+        let authors = format_authors(paper);
+        let date = paper
+            .publication_date
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        let doi = paper.doi.as_deref().unwrap_or("-");
+        out.push_str(&format!("{}\t{}\t{}\t{}\n", paper.title, authors, date, doi));
+    }
+    out
+}
+
+/// Print search results as one-line-per-result for piped output.
+pub fn print_search_result_pipe(result: &SearchResult) {
+    print!("{}", format_search_result_pipe(result));
+}
+
 fn print_paper_row(index: usize, paper: &Paper, styles: &Styles, show_abstract: bool, query: &str) {
     let authors = format_authors(paper);
     let date = paper
@@ -120,4 +140,75 @@ fn highlight_keywords(text: &str, query: &str, styles: &Styles) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Author, Paper, SearchResult};
+    use chrono::NaiveDate;
+
+    fn make_paper(title: &str, doi: Option<&str>, date: Option<&str>) -> Paper {
+        Paper {
+            id: "test-id".into(),
+            title: title.into(),
+            authors: vec![
+                Author { name: "Smith J".into(), affiliations: vec![] },
+                Author { name: "Zhang Y".into(), affiliations: vec![] },
+            ],
+            abstract_text: None,
+            publication_date: date.map(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap()),
+            doi: doi.map(String::from),
+            download_urls: vec![],
+            cited_by_count: None,
+            source: "test".into(),
+        }
+    }
+
+    fn make_result(papers: Vec<Paper>) -> SearchResult {
+        SearchResult {
+            total_results: papers.len(),
+            next_offset: None,
+            provider: "test".into(),
+            papers,
+        }
+    }
+
+    #[test]
+    fn pipe_format_tab_separated() {
+        let result = make_result(vec![
+            make_paper("CRISPR Review", Some("10.1234/test"), Some("2024-06-15")),
+        ]);
+        let out = format_search_result_pipe(&result);
+        let fields: Vec<&str> = out.trim().split('\t').collect();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0], "CRISPR Review");
+        assert_eq!(fields[1], "Smith J, Zhang Y");
+        assert_eq!(fields[2], "2024-06-15");
+        assert_eq!(fields[3], "10.1234/test");
+    }
+
+    #[test]
+    fn pipe_format_missing_fields() {
+        let result = make_result(vec![
+            make_paper("No DOI Paper", None, None),
+        ]);
+        let out = format_search_result_pipe(&result);
+        let fields: Vec<&str> = out.trim().split('\t').collect();
+        assert_eq!(fields[2], ""); // missing date
+        assert_eq!(fields[3], "-"); // missing doi
+    }
+
+    #[test]
+    fn pipe_format_multiple_papers() {
+        let result = make_result(vec![
+            make_paper("Paper One", Some("10.1/a"), Some("2024-01-01")),
+            make_paper("Paper Two", Some("10.1/b"), Some("2023-06-15")),
+        ]);
+        let out = format_search_result_pipe(&result);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("Paper One"));
+        assert!(lines[1].starts_with("Paper Two"));
+    }
 }
