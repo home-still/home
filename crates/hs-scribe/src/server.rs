@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use crate::pipeline::processor::Processor;
 use axum::{
-    extract::{Multipart, State},
+    extract::{DefaultBodyLimit, Multipart, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -19,6 +19,7 @@ pub fn app(state: Arc<ServerState>) -> Router {
         .route("/scribe", post(handle_scribe))
         .route("/health", get(handle_health))
         .route("/info", get(handle_info))
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256MB
         .with_state(state)
 }
 
