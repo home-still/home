@@ -17,6 +17,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum TopCmd {
+    /// PDF-to-markdown via scribe server
+    Scribe {
+        #[command(subcommand)]
+        command: super::scribe_cmd::ScribeCmd,
+    },
     /// Academic paper search, lookup, and download
     #[command(after_help = "\
   Examples:

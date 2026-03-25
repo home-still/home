@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 mod cli;
+mod scribe_cmd;
 
 use cli::{Cli, TopCmd};
 use hs_style::mode::{self, OutputMode};
@@ -43,6 +44,7 @@ fn main() -> ExitCode {
     let exit_code_mapper: fn(&anyhow::Error) -> ExitCode = match &cli.command {
         TopCmd::Paper { .. } => paper::exit_codes::from_error,
         TopCmd::Config { .. } => |_| ExitCode::FAILURE,
+        TopCmd::Scribe { .. } => |_| ExitCode::FAILURE,
     };
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio  runtime");
@@ -53,6 +55,7 @@ fn main() -> ExitCode {
                 paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode).await
             }
             TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
+            TopCmd::Scribe { command } => scribe_cmd::dispatch(command).await,
         }
     });
 

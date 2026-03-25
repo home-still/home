@@ -26,7 +26,12 @@ jobs:
       
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo fmt -p hs -p paper -p hs-style --check
-      # TODO: Get pdf-mash building too
-      - run: cargo clippy --workspace --exclude pdf-mash --all-targets -- -D warnings
-      - run: cargo test --workspace --exclude pdf-mash
+      - run: cargo fmt -p hs -p paper -p hs-style -p hs-scribe --check      
+      - run: cargo clippy --workspace --all-targets -- -D warnings          
+        if: matrix.os == 'ubuntu-latest'                                    
+      - run: cargo clippy --workspace --exclude hs-scribe --all-targets -- -D warnings                                                                 
+        if: matrix.os != 'ubuntu-latest'                        
+      - run: cargo test --workspace --exclude hs-scribe                     
+      - run: cargo test -p hs-scribe --features server          
+        if: matrix.os == 'ubuntu-latest'                                    
+  

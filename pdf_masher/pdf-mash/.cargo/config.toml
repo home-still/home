@@ -1,6 +1,0 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
-
-[env]
-# CUDA 12 libs (from sglang venv) for ONNX Runtime CUDA EP
-LD_LIBRARY_PATH = { value = "/home/ladvien/cuda12-libs:/opt/cuda/lib64", force = false }

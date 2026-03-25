@@ -3,6 +3,7 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum BackendChoice {
@@ -32,12 +33,12 @@ pub struct AppConfig {
     pub parallel: usize,
     pub pipeline_mode: PipelineMode,
     pub layout_model_path: String,
+    pub table_model_path: String,
     pub region_parallel: usize,
     pub use_cuda: bool,
     pub max_image_dim: u32,
     pub vlm_concurrency: usize,
 }
-
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -51,7 +52,8 @@ impl Default for AppConfig {
             dpi: 200,
             parallel: 1,
             pipeline_mode: PipelineMode::PerRegion,
-            layout_model_path: "models/pp-doclayoutv3.onnx".into(),
+            layout_model_path: "pp-doclayoutv3.onnx".into(),
+            table_model_path: "slanet-plus.onnx".into(),
             region_parallel: 4,
             use_cuda: true,
             max_image_dim: 1800,
@@ -63,12 +65,39 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn load() -> Result<Self, Box<figment::Error>> {
         let config_path = dirs::config_dir()
-            .map(|d| d.join("pdf-masher").join("config.yaml"))
+            .map(|d| d.join("home-still").join("config.yaml"))
             .unwrap_or_default();
 
         Figment::from(Serialized::defaults(AppConfig::default()))
-            .merge(Yaml::file(config_path))
-            .merge(Env::prefixed("PDF_MASHER_"))
-            .extract().map_err(Box::new)
+            .merge(Yaml::file_exact(config_path).nested())
+            .merge(Env::prefixed("HS_SCRIBE_"))
+            .extract()
+            .map_err(Box::new)
+    }
+
+    /// Resolve a model filename to an absolute path.
+    /// If already absolute and exists, use as-is.                          
+    /// Otherwise look in `~/.local/share/home-still/models/`.              
+    pub fn resolve_model_path(name: &str) -> PathBuf {
+        let p = PathBuf::from(name);
+        if p.is_absolute() && p.exists() {
+            return p;
+        }
+        if p.exists() {
+            return p;
+        }
+        let data_dir = dirs::data_dir()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"))
+            .join("home-still")
+            .join("models");
+        data_dir.join(name)
+    }
+
+    pub fn resolved_layout_model_path(&self) -> PathBuf {
+        Self::resolve_model_path(&self.layout_model_path)
+    }
+
+    pub fn resolved_table_model_path(&self) -> PathBuf {
+        Self::resolve_model_path(&self.table_model_path)
     }
 }

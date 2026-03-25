@@ -56,7 +56,6 @@ enum PreparedPage {
 }
 
 pub struct Processor {
-    pdf_parser: PdfParser,
     ocr: Arc<OcrEngine>,
     layout_detector: Option<Arc<std::sync::Mutex<LayoutDetector>>>,
     table_recognizer: Option<Arc<std::sync::Mutex<TableStructureRecognizer>>>,
@@ -68,10 +67,12 @@ impl Processor {
         let ocr = Arc::new(OcrEngine::from_config(&config));
 
         let layout_detector = if config.pipeline_mode == PipelineMode::PerRegion {
-            if std::path::Path::new(&config.layout_model_path).exists() {
-                match LayoutDetector::new(&config.layout_model_path, config.use_cuda) {
+            let layout_path = config.resolved_layout_model_path();
+            if layout_path.exists() {
+                match LayoutDetector::new(layout_path.to_str().unwrap_or_default(), config.use_cuda)
+                {
                     Ok(det) => {
-                        tracing::info!("Layout detector loaded from {}", config.layout_model_path);
+                        tracing::info!("Layout detector loaded from {}", layout_path.display());
                         Some(Arc::new(std::sync::Mutex::new(det)))
                     }
                     Err(e) => {
@@ -84,7 +85,7 @@ impl Processor {
             } else {
                 tracing::warn!(
                     "Layout model not found at {}. Falling back to FullPage mode.",
-                    config.layout_model_path
+                    layout_path.display()
                 );
                 None
             }
@@ -93,9 +94,12 @@ impl Processor {
         };
 
         let table_recognizer = if config.pipeline_mode == PipelineMode::PerRegion {
-            let slanet_path = "models/slanet-plus.onnx";
-            if std::path::Path::new(slanet_path).exists() {
-                match TableStructureRecognizer::new(slanet_path, config.use_cuda) {
+            let slanet_path = config.resolved_table_model_path();
+            if slanet_path.exists() {
+                match TableStructureRecognizer::new(
+                    slanet_path.to_str().unwrap_or_default(),
+                    config.use_cuda,
+                ) {
                     Ok(r) => {
                         tracing::info!("Table structure recognizer loaded (SLANet-Plus)");
                         Some(Arc::new(std::sync::Mutex::new(r)))
@@ -106,7 +110,10 @@ impl Processor {
                     }
                 }
             } else {
-                tracing::info!("SLANet-Plus model not found at {slanet_path}, tables go to VLM");
+                tracing::info!(
+                    "SLANet-Plus model not found at {}, tables go to VLM",
+                    slanet_path.display()
+                );
                 None
             }
         } else {
@@ -114,7 +121,6 @@ impl Processor {
         };
 
         Ok(Self {
-            pdf_parser: PdfParser::new()?,
             ocr,
             layout_detector,
             table_recognizer,
@@ -129,6 +135,14 @@ impl Processor {
     /// Is this processor running in per-region mode (i.e., has a layout detector)?
     fn is_per_region(&self) -> bool {
         self.layout_detector.is_some()
+    }
+
+    pub fn has_layout_detector(&self) -> bool {
+        self.layout_detector.is_some()
+    }
+
+    pub fn has_table_recognizer(&self) -> bool {
+        self.table_recognizer.is_some()
     }
 
     pub async fn process_image(&self, image: &DynamicImage) -> Result<String> {
@@ -233,39 +247,36 @@ impl Processor {
         let ocr = Arc::clone(&self.ocr);
         let image_arc = Arc::new(image.clone());
 
-        let region_results: Vec<Result<(BBox, String)>> =
-            stream::iter(other_bboxes.into_iter())
-                .map(|bbox| {
-                    let ocr = Arc::clone(&ocr);
-                    let image = Arc::clone(&image_arc);
-                    async move {
-                        let region_type = RegionType::from_class(&bbox.class_name);
+        let region_results: Vec<Result<(BBox, String)>> = stream::iter(other_bboxes.into_iter())
+            .map(|bbox| {
+                let ocr = Arc::clone(&ocr);
+                let image = Arc::clone(&image_arc);
+                async move {
+                    let region_type = RegionType::from_class(&bbox.class_name);
 
-                        if region_type == RegionType::Figure
-                            || region_type == RegionType::Skip
-                        {
-                            return Ok((bbox, String::new()));
-                        }
-
-                        let crop = crop_bbox(&image, &bbox);
-                        let image_bytes = encode_jpeg(&crop)?;
-
-                        tracing::debug!(
-                            "Region {:?} '{}' ({}x{}) -> {:?}",
-                            bbox.class_name,
-                            bbox.confidence,
-                            crop.width(),
-                            crop.height(),
-                            region_type,
-                        );
-
-                        let text = ocr.recognize_region(&image_bytes, region_type).await?;
-                        Ok((bbox, text))
+                    if region_type == RegionType::Figure || region_type == RegionType::Skip {
+                        return Ok((bbox, String::new()));
                     }
-                })
-                .buffered(region_parallel)
-                .collect()
-                .await;
+
+                    let crop = crop_bbox(&image, &bbox);
+                    let image_bytes = encode_jpeg(&crop)?;
+
+                    tracing::debug!(
+                        "Region {:?} '{}' ({}x{}) -> {:?}",
+                        bbox.class_name,
+                        bbox.confidence,
+                        crop.width(),
+                        crop.height(),
+                        region_type,
+                    );
+
+                    let text = ocr.recognize_region(&image_bytes, region_type).await?;
+                    Ok((bbox, text))
+                }
+            })
+            .buffered(region_parallel)
+            .collect()
+            .await;
 
         let mut regions: Vec<(BBox, String)> =
             region_results.into_iter().collect::<Result<Vec<_>>>()?;
@@ -283,9 +294,7 @@ impl Processor {
             .enumerate()
             .map(|(pos, &id)| (id, pos))
             .collect();
-        regions.sort_by_key(|(bbox, _)| {
-            *order_map.get(&bbox.unique_id).unwrap_or(&usize::MAX)
-        });
+        regions.sort_by_key(|(bbox, _)| *order_map.get(&bbox.unique_id).unwrap_or(&usize::MAX));
 
         let region_results: Vec<RegionResult> = regions
             .iter()
@@ -334,15 +343,13 @@ impl Processor {
                     let h = ((y2 - y1) as u32).max(1);
                     let cell_crop = table_img.crop_imm(x1 as u32, y1 as u32, w, h);
                     match encode_jpeg(&cell_crop) {
-                        Ok(bytes) => {
-                            match ocr.recognize_region(&bytes, RegionType::Text).await {
-                                Ok(text) => text.trim().to_string(),
-                                Err(e) => {
-                                    tracing::warn!("Cell OCR failed: {e}");
-                                    String::new()
-                                }
+                        Ok(bytes) => match ocr.recognize_region(&bytes, RegionType::Text).await {
+                            Ok(text) => text.trim().to_string(),
+                            Err(e) => {
+                                tracing::warn!("Cell OCR failed: {e}");
+                                String::new()
                             }
-                        }
+                        },
                         Err(e) => {
                             tracing::warn!("Cell JPEG encode failed: {e}");
                             String::new()
@@ -358,7 +365,10 @@ impl Processor {
     }
 
     pub async fn process_pdf(&self, pdf_path: &str) -> Result<String> {
-        let pages = self.pdf_parser.parse_to_pages(pdf_path, self.config.dpi)?;
+        let pages = {
+            let pdf_parser = PdfParser::new()?;
+            pdf_parser.parse_to_pages(pdf_path, self.config.dpi)?
+        };
         let total = pages.len();
 
         if !self.is_per_region() {
@@ -366,27 +376,26 @@ impl Processor {
             let ocr = Arc::clone(&self.ocr);
             let max_dim = self.config.max_image_dim;
             let parallel = self.config.parallel;
-            let page_markdowns: Vec<Result<String>> =
-                stream::iter(pages.into_iter().enumerate())
-                    .map(|(i, page)| {
-                        let ocr = Arc::clone(&ocr);
-                        async move {
-                            let downscaled = maybe_downscale(&page.image, max_dim);
-                            let image_bytes = encode_jpeg(&downscaled)?;
-                            tracing::info!(
-                                "Processing page {}/{} ({}x{}, {} bytes JPEG)",
-                                i + 1,
-                                total,
-                                page.image.width(),
-                                page.image.height(),
-                                image_bytes.len()
-                            );
-                            ocr.recognize(&image_bytes).await
-                        }
-                    })
-                    .buffered(parallel)
-                    .collect()
-                    .await;
+            let page_markdowns: Vec<Result<String>> = stream::iter(pages.into_iter().enumerate())
+                .map(|(i, page)| {
+                    let ocr = Arc::clone(&ocr);
+                    async move {
+                        let downscaled = maybe_downscale(&page.image, max_dim);
+                        let image_bytes = encode_jpeg(&downscaled)?;
+                        tracing::info!(
+                            "Processing page {}/{} ({}x{}, {} bytes JPEG)",
+                            i + 1,
+                            total,
+                            page.image.width(),
+                            page.image.height(),
+                            image_bytes.len()
+                        );
+                        ocr.recognize(&image_bytes).await
+                    }
+                })
+                .buffered(parallel)
+                .collect()
+                .await;
 
             let markdowns: Vec<String> = page_markdowns.into_iter().collect::<Result<Vec<_>>>()?;
             return Ok(join_pages(&markdowns));
@@ -428,9 +437,9 @@ impl Processor {
         while let Some(prepared) = rx.recv().await {
             let ocr = Arc::clone(&ocr);
             let sem = Arc::clone(&vlm_sem);
-            tasks.spawn(async move {
-                execute_vlm_for_page(prepared, ocr, sem, region_parallel).await
-            });
+            tasks.spawn(
+                async move { execute_vlm_for_page(prepared, ocr, sem, region_parallel).await },
+            );
         }
 
         // Collect results, sort by page index
@@ -484,10 +493,16 @@ fn prepare_page(
     let bboxes = filter_contained_regions(bboxes);
 
     if bboxes.is_empty() {
-        tracing::info!("Page {}: no layout detections → full-page VLM", page_idx + 1);
+        tracing::info!(
+            "Page {}: no layout detections → full-page VLM",
+            page_idx + 1
+        );
         let downscaled = maybe_downscale(image, config.max_image_dim);
         let jpeg_bytes = encode_jpeg(&downscaled)?;
-        return Ok(PreparedPage::FullPage { page_idx, jpeg_bytes });
+        return Ok(PreparedPage::FullPage {
+            page_idx,
+            jpeg_bytes,
+        });
     }
 
     // Filter out Skip regions
@@ -510,7 +525,10 @@ fn prepare_page(
         tracing::info!("Page {}: text-only → full-page VLM", page_idx + 1);
         let downscaled = maybe_downscale(image, config.max_image_dim);
         let jpeg_bytes = encode_jpeg(&downscaled)?;
-        return Ok(PreparedPage::FullPage { page_idx, jpeg_bytes });
+        return Ok(PreparedPage::FullPage {
+            page_idx,
+            jpeg_bytes,
+        });
     }
 
     let detection_order: Vec<usize> = bboxes.iter().map(|b| b.unique_id).collect();
@@ -593,8 +611,13 @@ async fn execute_vlm_for_page(
     region_parallel: usize,
 ) -> Result<(usize, String)> {
     match prepared {
-        PreparedPage::FullPage { page_idx, jpeg_bytes } => {
-            let _permit = sem.acquire().await
+        PreparedPage::FullPage {
+            page_idx,
+            jpeg_bytes,
+        } => {
+            let _permit = sem
+                .acquire()
+                .await
                 .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
             let text = ocr.recognize(&jpeg_bytes).await?;
             Ok((page_idx, text))
@@ -617,11 +640,11 @@ async fn execute_vlm_for_page(
                             {
                                 return Ok((r.bbox, String::new()));
                             }
-                            let _permit = sem.acquire().await
+                            let _permit = sem
+                                .acquire()
+                                .await
                                 .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
-                            let text = ocr
-                                .recognize_region(&r.jpeg_bytes, r.region_type)
-                                .await?;
+                            let text = ocr.recognize_region(&r.jpeg_bytes, r.region_type).await?;
                             Ok((r.bbox, text))
                         }
                     })
@@ -634,28 +657,29 @@ async fn execute_vlm_for_page(
 
             // Process table cells with semaphore-gated concurrency
             for table in table_regions {
-                let cell_texts: Vec<String> =
-                    stream::iter(table.cell_jpegs.into_iter())
-                        .map(|jpeg| {
-                            let ocr = Arc::clone(&ocr);
-                            let sem = Arc::clone(&sem);
-                            async move {
-                                let _permit = sem.acquire().await
-                                    .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
-                                match ocr.recognize_region(&jpeg, RegionType::Text).await {
-                                    Ok(text) => Ok(text.trim().to_string()),
-                                    Err(e) => {
-                                        tracing::warn!("Cell OCR failed: {e}");
-                                        Ok(String::new())
-                                    }
+                let cell_texts: Vec<String> = stream::iter(table.cell_jpegs.into_iter())
+                    .map(|jpeg| {
+                        let ocr = Arc::clone(&ocr);
+                        let sem = Arc::clone(&sem);
+                        async move {
+                            let _permit = sem
+                                .acquire()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
+                            match ocr.recognize_region(&jpeg, RegionType::Text).await {
+                                Ok(text) => Ok(text.trim().to_string()),
+                                Err(e) => {
+                                    tracing::warn!("Cell OCR failed: {e}");
+                                    Ok(String::new())
                                 }
                             }
-                        })
-                        .buffer_unordered(region_parallel)
-                        .collect::<Vec<Result<String>>>()
-                        .await
-                        .into_iter()
-                        .collect::<Result<Vec<_>>>()?;
+                        }
+                    })
+                    .buffer_unordered(region_parallel)
+                    .collect::<Vec<Result<String>>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()?;
 
                 let html = build_html_from_structure(&table.structure, &cell_texts);
                 regions.push((table.bbox, html));
@@ -667,9 +691,7 @@ async fn execute_vlm_for_page(
                 .enumerate()
                 .map(|(pos, &id)| (id, pos))
                 .collect();
-            regions.sort_by_key(|(bbox, _)| {
-                *order_map.get(&bbox.unique_id).unwrap_or(&usize::MAX)
-            });
+            regions.sort_by_key(|(bbox, _)| *order_map.get(&bbox.unique_id).unwrap_or(&usize::MAX));
 
             Ok((page_idx, assemble_page_markdown(&regions)))
         }

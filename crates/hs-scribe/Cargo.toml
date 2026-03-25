@@ -1,0 +1,62 @@
+
+[package]
+name = "hs-scribe"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["client"]
+client = []
+server = [
+    "dep:axum",
+    "dep:tempfile",
+    "dep:pdfium-render",
+    "dep:ort",
+    "dep:ndarray",
+    "dep:image",
+    "dep:ollama-rs",
+    "dep:base64",
+    "dep:futures",
+    "dep:notify",
+    "dep:notify-debouncer-full",
+    "dep:ctrlc",
+    "dep:tracing-subscriber",
+]
+cuda = ["server", "ort/cuda"]
+eval = ["server", "dep:edit-distance"]
+
+[dependencies]
+# Client and Server
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = "0.1"
+tokio = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
+figment = { workspace = true }
+dirs = "6"
+
+# Server Only
+axum = { version = "0.8", optional = true, features = ["multipart"] }
+tempfile = { version = "3", optional = true }
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+], optional = true }
+pdfium-render = { version = "0.8.35", optional = true }
+image = { version = "0.25", optional = true }
+ort = { version = "=2.0.0-rc.12", features = ["ndarray"], optional = true }
+ndarray = { version = "0.17", optional = true }
+ollama-rs = { version = "0.3", features = ["stream"], optional = true }
+base64 = { version = "0.22", optional = true }
+futures = { version = "0.3", optional = true }
+notify = { version = "8", optional = true }
+notify-debouncer-full = { version = "0.4", optional = true }
+ctrlc = { version = "3", optional = true }
+edit-distance = { version = "2.1", optional = true }
+
+[[bin]]
+name = "hs-scribe-server"
+path = "src/server_main.rs"
+required-features = ["server"]

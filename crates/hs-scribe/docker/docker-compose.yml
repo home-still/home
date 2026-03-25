@@ -1,0 +1,37 @@
+services:
+  scribe:
+    build:
+      context: ../../..
+      dockerfile: crates/hs-scribe/docker/Dockerfile
+    ports:
+      - "7432:7432"
+    volumes:
+      - ${HOME}/.local/share/home-still/models:/models:ro
+    environment:
+      HS_SCRIBE_BACKEND: sglang
+      HS_SCRIBE_OPENAI_URL: http://vlm:8080
+      HS_SCRIBE_USE_CUDA: "false"
+    depends_on:
+      vlm:
+        condition: service_healthy
+    restart: unless-stopped
+
+  vlm:
+    image: lmsysorg/sglang:latest-runtime
+    command: >
+      bash -c "python3 -m sglang.launch_server
+        --model zai-org/GLM-OCR
+        --host 0.0.0.0 --port 8080
+        --served-model-name glm-ocr"
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    ports:
+      - "8080:8080"
+    shm_size: "16g"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
