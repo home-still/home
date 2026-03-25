@@ -24,6 +24,7 @@ services:
     environment:
       HS_SCRIBE_BACKEND: Ollama
       HS_SCRIBE_OLLAMA_URL: http://ollama:11434
+      HS_SCRIBE_MODEL: moondream
       HS_SCRIBE_LAYOUT_MODEL_PATH: /models/pp-doclayoutv3.onnx
       HS_SCRIBE_USE_CUDA: "false"
       HS_SCRIBE_VLM_CONCURRENCY: "1"

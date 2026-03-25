@@ -85,10 +85,10 @@ jobs:
             sleep 5
           done
 
-      - name: Pull glm-ocr model
+      - name: Pull VLM model
         run: |
-          echo "Pulling glm-ocr model (~2.5GB, may take several minutes)..."
-          docker exec ollama-e2e ollama pull glm-ocr
+          echo "Pulling moondream model (~1GB, fast on CPU)..."
+          docker exec ollama-e2e ollama pull moondream
           echo "Model pull complete:"
           docker exec ollama-e2e ollama list
 
