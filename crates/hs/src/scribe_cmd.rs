@@ -26,15 +26,11 @@ const COMPOSE_YAML: &str = r#"services:
 
   vlm:
     image: docker.io/lmsysorg/sglang:latest-runtime
-    command: >
-      bash -c "python3 -m sglang.launch_server
-        --model zai-org/GLM-OCR
-        --host 0.0.0.0 --port 8080
-        --served-model-name glm-ocr"
+    command: ["bash", "-c", "pip install 'transformers>=5.3.0' -q && python3 -m sglang.launch_server --model zai-org/GLM-OCR --host 0.0.0.0 --port 8080 --served-model-name glm-ocr"]
+    devices:
+      - nvidia.com/gpu=all
     volumes:
       - ${HF_CACHE}:/root/.cache/huggingface
-    ports:
-      - "8080:8080"
     shm_size: "16g"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

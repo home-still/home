@@ -4,7 +4,7 @@ COPY . .
 RUN cargo build --release -p hs-scribe \
     --features server --bin hs-scribe-server
 
-FROM docker.io/library/debian:bookworm-slim
+FROM docker.io/library/debian:trixie-slim
 
 ARG PDFIUM_VERSION=6611
 RUN apt-get update \
