@@ -17,7 +17,6 @@ permissions:
 env:
   SCRIBE_IMAGE: ghcr.io/home-still/hs-scribe-server
   LAYOUT_MODEL_URL: https://github.com/home-still/home/releases/download/v0.0.1-rc.39/pp-doclayoutv3.onnx
-  TEST_PDF_URL: https://arxiv.org/pdf/2301.00001
 
 jobs:
   e2e:
@@ -41,9 +40,28 @@ jobs:
           curl -fSL -o /tmp/models/pp-doclayoutv3.onnx "$LAYOUT_MODEL_URL"
           ls -lh /tmp/models/pp-doclayoutv3.onnx
 
-      - name: Download test PDF
+      - name: Create test PDF
         run: |
-          curl -fSL -o /tmp/test.pdf "$TEST_PDF_URL"
+          # Generate a minimal 1-page PDF with text content
+          sudo apt-get update -qq && sudo apt-get install -y -qq ghostscript >/dev/null 2>&1
+          cat > /tmp/test.ps << 'POSTSCRIPT'
+          %!PS
+          /Helvetica findfont 24 scalefont setfont
+          72 700 moveto (Attention Is All You Need) show
+          /Helvetica findfont 14 scalefont setfont
+          72 660 moveto (Ashish Vaswani, Noam Shazeer, Niki Parmar) show
+          72 640 moveto (Google Brain) show
+          /Helvetica findfont 11 scalefont setfont
+          72 600 moveto (Abstract) show
+          72 580 moveto (The dominant sequence transduction models are based on) show
+          72 565 moveto (complex recurrent or convolutional neural networks that) show
+          72 550 moveto (include an encoder and a decoder. We propose a new simple) show
+          72 535 moveto (network architecture, the Transformer, based solely on) show
+          72 520 moveto (attention mechanisms.) show
+          showpage
+          POSTSCRIPT
+          gs -sDEVICE=pdfwrite -dNOPAUSE -dBATCH -dQUIET \
+            -sOutputFile=/tmp/test.pdf /tmp/test.ps
           ls -lh /tmp/test.pdf
 
       - name: Start services
