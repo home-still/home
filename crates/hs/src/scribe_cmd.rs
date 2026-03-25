@@ -16,7 +16,7 @@ const COMPOSE_YAML: &str = r#"services:
       - ${MODELS_DIR}:/models:ro
     environment:
       HS_SCRIBE_LAYOUT_MODEL_PATH: /models/pp-doclayoutv3.onnx
-      HS_SCRIBE_BACKEND: ollama
+      HS_SCRIBE_BACKEND: Ollama
       HS_SCRIBE_OLLAMA_URL: http://vlm:11434
       HS_SCRIBE_USE_CUDA: "${USE_CUDA}"
     depends_on:
@@ -45,9 +45,9 @@ pub enum ScribeCmd {
     Convert {
         /// Input PDF file
         input: PathBuf,
-        /// Output file (default: stdout)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
+        /// Write markdown to file (default: stdout)
+        #[arg(short = 'o', long = "out")]
+        out_file: Option<PathBuf>,
         /// Server URL override
         #[arg(long)]
         server: Option<String>,
@@ -87,9 +87,9 @@ pub async fn dispatch(cmd: ScribeCmd) -> Result<()> {
     match cmd {
         ScribeCmd::Convert {
             input,
-            output,
+            out_file,
             server,
-        } => cmd_convert(input, output, server).await,
+        } => cmd_convert(input, out_file, server).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
         ScribeCmd::Server { action } => cmd_server(action).await,
     }
@@ -99,7 +99,7 @@ pub async fn dispatch(cmd: ScribeCmd) -> Result<()> {
 
 async fn cmd_convert(
     input: PathBuf,
-    output: Option<PathBuf>,
+    out_file: Option<PathBuf>,
     server: Option<String>,
 ) -> Result<()> {
     let url = server.as_deref().unwrap_or(DEFAULT_SERVER);
@@ -107,7 +107,7 @@ async fn cmd_convert(
     let pdf_bytes = std::fs::read(&input)
         .with_context(|| format!("Cannot read {}", input.display()))?;
     let md = client.convert(pdf_bytes).await?;
-    match output {
+    match out_file {
         Some(path) => std::fs::write(&path, &md)?,
         None => print!("{md}"),
     }

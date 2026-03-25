@@ -12,7 +12,7 @@ RUN apt-get update \
        ca-certificates curl libgcc-s1 \
     && curl -fsSL \
        "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F${PDFIUM_VERSION}/pdfium-linux-x64.tgz" \
-       | tar -xz -C /usr/lib \
+       | tar -xz -C /usr \
     && ldconfig \
     && apt-get remove -y curl \
     && apt-get autoremove -y \
