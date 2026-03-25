@@ -16,29 +16,27 @@ const COMPOSE_YAML: &str = r#"services:
       - ${MODELS_DIR}:/models:ro
     environment:
       HS_SCRIBE_LAYOUT_MODEL_PATH: /models/pp-doclayoutv3.onnx
-      HS_SCRIBE_BACKEND: openai
-      HS_SCRIBE_OPENAI_URL: http://vlm:8080
+      HS_SCRIBE_BACKEND: ollama
+      HS_SCRIBE_OLLAMA_URL: http://vlm:11434
       HS_SCRIBE_USE_CUDA: "${USE_CUDA}"
     depends_on:
       vlm:
         condition: service_healthy
-    restart: unless-stopped
+    restart: on-failure:3
 
   vlm:
-    image: docker.io/lmsysorg/sglang:latest-runtime
-    command: ["bash", "-c", "pip install 'transformers>=5.3.0' -q && python3 -m sglang.launch_server --model zai-org/GLM-OCR --host 0.0.0.0 --port 8080 --served-model-name glm-ocr"]
+    image: docker.io/ollama/ollama
     devices:
       - nvidia.com/gpu=all
     volumes:
-      - ${HF_CACHE}:/root/.cache/huggingface
-    shm_size: "16g"
+      - ${OLLAMA_DATA}:/root/.ollama
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "ollama", "list"]
       interval: 10s
       timeout: 5s
       retries: 30
-      start_period: 120s
-    restart: unless-stopped
+      start_period: 30s
+    restart: on-failure:3
 "#;
 
 #[derive(Subcommand, Debug)]
@@ -175,12 +173,9 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         std::fs::write(&compose_path, COMPOSE_YAML)?;
 
         let env_contents = format!(
-            "MODELS_DIR={}\nHF_CACHE={}\nUSE_CUDA={}\n",
+            "MODELS_DIR={}\nOLLAMA_DATA={}\nUSE_CUDA={}\n",
             models_dir.display(),
-            dirs::cache_dir()
-                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
-                .join("huggingface")
-                .display(),
+            data_dir().join("ollama").display(),
             has_gpu,
         );
         std::fs::write(&env_path, env_contents)?;
@@ -216,9 +211,28 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         anyhow::bail!("docker compose up failed");
     }
 
-    // Wait for health
-    eprintln!("       Waiting for VLM backend (first run downloads ~4GB model)...");
-    wait_for_health(DEFAULT_SERVER, 300).await?;
+    // Wait for Ollama to be ready, then pull the model
+    eprintln!("       Waiting for Ollama...");
+    wait_for_ollama(compose_path.to_str().unwrap_or_default(), 60).await?;
+    eprintln!("       Pulling GLM-OCR model (first run downloads ~2.5GB)...");
+    let pull_status = tokio::process::Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            compose_path.to_str().unwrap_or_default(),
+            "exec",
+            "vlm",
+            "ollama",
+            "pull",
+            "glm-ocr",
+        ])
+        .status()
+        .await?;
+    if !pull_status.success() {
+        anyhow::bail!("Failed to pull glm-ocr model into Ollama");
+    }
+    eprintln!("       Waiting for scribe server...");
+    wait_for_health(DEFAULT_SERVER, 120).await?;
     eprintln!("       Scribe server: OK");
 
     eprintln!();
@@ -322,6 +336,33 @@ async fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
 async fn health_check(server_url: &str) -> Result<hs_scribe::client::HealthResponse> {
     let client = hs_scribe::client::ScribeClient::new(server_url);
     client.health().await
+}
+
+async fn wait_for_ollama(compose_file: &str, timeout_secs: u64) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            anyhow::bail!("Timed out waiting for Ollama to start");
+        }
+        let status = tokio::process::Command::new("docker")
+            .args([
+                "compose",
+                "-f",
+                compose_file,
+                "exec",
+                "vlm",
+                "ollama",
+                "list",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        if status.map(|s| s.success()).unwrap_or(false) {
+            return Ok(());
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    }
 }
 
 async fn wait_for_health(server_url: &str, timeout_secs: u64) -> Result<()> {
