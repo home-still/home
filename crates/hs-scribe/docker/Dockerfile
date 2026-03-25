@@ -11,7 +11,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates curl libgcc-s1 \
     && curl -fsSL \
-       "https://github.com/nicholasgasior/pdfium-binaries/releases/download/chromium/${PDFIUM_VERSION}/pdfium-linux-x64.tgz" \
+       "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F${PDFIUM_VERSION}/pdfium-linux-x64.tgz" \
        | tar -xz -C /usr/lib \
     && ldconfig \
     && apt-get remove -y curl \
