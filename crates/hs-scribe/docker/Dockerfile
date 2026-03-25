@@ -1,4 +1,4 @@
-FROM docker.io/library/rust:1.86-bookworm AS builder
+FROM docker.io/library/rust:latest AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release -p hs-scribe \
