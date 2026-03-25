@@ -6,7 +6,7 @@ RUN cargo build --release -p hs-scribe \
 
 FROM docker.io/library/debian:trixie-slim
 
-ARG PDFIUM_VERSION=6611
+ARG PDFIUM_VERSION=7749
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates curl libgcc-s1 \
