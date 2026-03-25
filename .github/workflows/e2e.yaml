@@ -1,0 +1,153 @@
+name: Scribe E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "scribe-server image tag"
+        default: "latest"
+        type: string
+  schedule:
+    - cron: "0 4 * * 1"  # Weekly Monday 04:00 UTC
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  SCRIBE_IMAGE: ghcr.io/home-still/hs-scribe-server
+  LAYOUT_MODEL_URL: https://github.com/home-still/home/releases/download/v0.0.1-rc.39/pp-doclayoutv3.onnx
+  TEST_PDF_URL: https://arxiv.org/pdf/2301.00001
+
+jobs:
+  e2e:
+    name: Scribe end-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download layout model
+        run: |
+          mkdir -p /tmp/models
+          curl -fSL -o /tmp/models/pp-doclayoutv3.onnx "$LAYOUT_MODEL_URL"
+          ls -lh /tmp/models/pp-doclayoutv3.onnx
+
+      - name: Download test PDF
+        run: |
+          curl -fSL -o /tmp/test.pdf "$TEST_PDF_URL"
+          ls -lh /tmp/test.pdf
+
+      - name: Start services
+        run: |
+          TAG="${{ inputs.image_tag || 'latest' }}"
+          export SCRIBE_TAG="$TAG"
+          export MODELS_DIR=/tmp/models
+          docker compose \
+            -f crates/hs-scribe/docker/docker-compose.e2e.yml \
+            up -d
+
+      - name: Wait for Ollama
+        run: |
+          echo "Waiting for Ollama..."
+          for i in $(seq 1 30); do
+            if docker exec ollama-e2e ollama list >/dev/null 2>&1; then
+              echo "Ollama is up"
+              break
+            fi
+            echo "  attempt $i/30..."
+            sleep 5
+          done
+
+      - name: Pull glm-ocr model
+        run: |
+          echo "Pulling glm-ocr model (~2.5GB, may take several minutes)..."
+          docker exec ollama-e2e ollama pull glm-ocr
+          echo "Model pull complete:"
+          docker exec ollama-e2e ollama list
+
+      - name: Wait for scribe-server health
+        run: |
+          echo "Waiting for scribe-server..."
+          for i in $(seq 1 30); do
+            RESP=$(curl -sf http://localhost:7432/health 2>/dev/null || true)
+            if echo "$RESP" | grep -q '"status":"ok"'; then
+              echo "scribe-server healthy: $RESP"
+              break
+            fi
+            echo "  attempt $i/30..."
+            sleep 5
+          done
+          # Hard fail if not healthy
+          curl -sf http://localhost:7432/health | grep '"status":"ok"'
+
+      - name: Convert test PDF
+        run: |
+          echo "Sending test PDF to /scribe..."
+          HTTP_CODE=$(curl -sf -o /tmp/result.md -w "%{http_code}" \
+            -X POST http://localhost:7432/scribe \
+            -F "pdf=@/tmp/test.pdf" \
+            --max-time 600)
+          echo "HTTP status: $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "FAIL: expected 200, got $HTTP_CODE"
+            cat /tmp/result.md || true
+            exit 1
+          fi
+          echo "--- Output (first 50 lines) ---"
+          head -50 /tmp/result.md
+
+      - name: Validate output
+        run: |
+          if [ ! -s /tmp/result.md ]; then
+            echo "FAIL: output is empty"
+            exit 1
+          fi
+
+          CHARS=$(wc -c < /tmp/result.md)
+          echo "Output size: $CHARS bytes"
+          if [ "$CHARS" -lt 100 ]; then
+            echo "FAIL: output too short ($CHARS bytes)"
+            cat /tmp/result.md
+            exit 1
+          fi
+
+          if grep -qE '^#|[a-zA-Z]{4,}' /tmp/result.md; then
+            echo "PASS: output contains text content"
+          else
+            echo "FAIL: output does not look like markdown"
+            cat /tmp/result.md
+            exit 1
+          fi
+
+          echo "E2E test passed."
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scribe-e2e-output
+          path: /tmp/result.md
+          retention-days: 7
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          docker compose \
+            -f crates/hs-scribe/docker/docker-compose.e2e.yml \
+            logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose \
+            -f crates/hs-scribe/docker/docker-compose.e2e.yml \
+            down -v --remove-orphans
