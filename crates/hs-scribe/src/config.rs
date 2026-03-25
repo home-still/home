@@ -69,7 +69,7 @@ impl AppConfig {
             .unwrap_or_default();
 
         Figment::from(Serialized::defaults(AppConfig::default()))
-            .merge(Yaml::file_exact(config_path).nested())
+            .merge(Yaml::file(config_path).nested())
             .merge(Env::prefixed("HS_SCRIBE_"))
             .extract()
             .map_err(Box::new)
