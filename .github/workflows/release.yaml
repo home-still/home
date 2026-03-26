@@ -134,12 +134,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: docker/setup-qemu-action@v3
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/build-push-action@v5
         with:
           context: .
           file: crates/hs-scribe/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}

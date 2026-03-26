@@ -7,11 +7,13 @@ RUN cargo build --release -p hs-scribe \
 FROM docker.io/library/debian:trixie-slim
 
 ARG PDFIUM_VERSION=7749
+ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates curl libgcc-s1 \
+    && PDFIUM_ARCH=$(case "$TARGETARCH" in arm64) echo "arm64";; *) echo "x64";; esac) \
     && curl -fsSL \
-       "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F${PDFIUM_VERSION}/pdfium-linux-x64.tgz" \
+       "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F${PDFIUM_VERSION}/pdfium-linux-${PDFIUM_ARCH}.tgz" \
        | tar -xz -C /usr \
     && ldconfig \
     && apt-get remove -y curl \

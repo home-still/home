@@ -122,10 +122,21 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
     let docker_ok = check_command("docker", &["--version"]).await;
     let compose_ok = check_command("docker", &["compose", "version"]).await;
     if !docker_ok || !compose_ok {
-        anyhow::bail!(
-            "Docker or Docker Compose not found.\n\
-             Install: https://docs.docker.com/get-docker/"
-        );
+        let instructions = if cfg!(target_os = "macos") {
+            "Docker/Podman not found. Install with:\n\n  \
+             brew install podman docker docker-compose\n  \
+             podman machine init\n  \
+             podman machine start\n  \
+             sudo podman-mac-helper install\n"
+        } else if cfg!(target_os = "linux") {
+            "Docker/Podman not found. Install with:\n\n  \
+             Arch:   sudo pacman -S podman podman-compose podman-docker\n  \
+             Ubuntu: https://docs.docker.com/get-docker/\n  \
+             Fedora: sudo dnf install podman podman-compose podman-docker\n"
+        } else {
+            "Docker not found.\n  Install: https://docs.docker.com/get-docker/\n"
+        };
+        anyhow::bail!("{}", instructions);
     }
     eprintln!("       OK");
 
