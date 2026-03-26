@@ -117,14 +117,13 @@ async fn cmd_convert(
 // ── Init ────────────────────────────────────────────────────────
 
 async fn cmd_init(force: bool, check: bool) -> Result<()> {
-    // Step 1: Check Docker
-    eprintln!("[1/5] Checking Docker...");
-    let docker_ok = check_command("docker", &["--version"]).await;
-    let compose_ok = check_command("docker", &["compose", "version"]).await;
-    if !docker_ok || !compose_ok {
+    // Step 1: Check container runtime
+    eprintln!("[1/5] Checking container runtime...");
+    let compose = ComposeCmd::detect().await;
+    if compose.is_none() {
         let instructions = if cfg!(target_os = "macos") {
             "Docker/Podman not found. Install with:\n\n  \
-             brew install podman docker docker-compose\n  \
+             brew install podman docker-compose\n  \
              podman machine init\n  \
              podman machine start\n  \
              sudo podman-mac-helper install\n"
@@ -138,7 +137,8 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         };
         anyhow::bail!("{}", instructions);
     }
-    eprintln!("       OK");
+    let compose = compose.unwrap();
+    eprintln!("       OK ({} {})", compose.bin, compose.args_prefix.join(" "));
 
     // Step 2: Detect GPU
     eprintln!("[2/5] Detecting GPU...");
@@ -208,37 +208,17 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
 
     // Step 5: Start services
     eprintln!("[5/5] Starting services...");
-    let status = tokio::process::Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            compose_path.to_str().unwrap_or_default(),
-            "up",
-            "-d",
-        ])
-        .status()
-        .await?;
+    let cf = compose_path.to_str().unwrap_or_default();
+    let status = compose.run(&["-f", cf, "up", "-d"]).await?;
     if !status.success() {
-        anyhow::bail!("docker compose up failed");
+        anyhow::bail!("compose up failed");
     }
 
     // Wait for Ollama to be ready, then pull the model
     eprintln!("       Waiting for Ollama...");
-    wait_for_ollama(compose_path.to_str().unwrap_or_default(), 60).await?;
+    wait_for_ollama(&compose, cf, 60).await?;
     eprintln!("       Pulling GLM-OCR model (first run downloads ~2.5GB)...");
-    let pull_status = tokio::process::Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            compose_path.to_str().unwrap_or_default(),
-            "exec",
-            "vlm",
-            "ollama",
-            "pull",
-            "glm-ocr",
-        ])
-        .status()
-        .await?;
+    let pull_status = compose.exec_run(cf, "vlm", &["ollama", "pull", "glm-ocr"]).await?;
     if !pull_status.success() {
         anyhow::bail!("Failed to pull glm-ocr model into Ollama");
     }
@@ -261,14 +241,13 @@ async fn cmd_server(action: ServerAction) -> Result<()> {
     if !compose_path.exists() {
         anyhow::bail!("No compose config found. Run `hs scribe init` first.");
     }
+    let compose = ComposeCmd::detect().await
+        .ok_or_else(|| anyhow::anyhow!("No container runtime found"))?;
     let cf = compose_path.to_str().unwrap_or_default();
 
     match action {
         ServerAction::List => {
-            let _ = tokio::process::Command::new("docker")
-                .args(["compose", "-f", cf, "ps"])
-                .status()
-                .await?;
+            let _ = compose.run(&["-f", cf, "ps"]).await?;
             eprintln!();
             match health_check(DEFAULT_SERVER).await {
                 Ok(h) => eprintln!(
@@ -279,19 +258,13 @@ async fn cmd_server(action: ServerAction) -> Result<()> {
             }
         }
         ServerAction::Start => {
-            tokio::process::Command::new("docker")
-                .args(["compose", "-f", cf, "up", "-d"])
-                .status()
-                .await?;
+            compose.run(&["-f", cf, "up", "-d"]).await?;
             eprintln!("Waiting for services...");
             wait_for_health(DEFAULT_SERVER, 300).await?;
             eprintln!("Ready.");
         }
         ServerAction::Stop => {
-            tokio::process::Command::new("docker")
-                .args(["compose", "-f", cf, "down"])
-                .status()
-                .await?;
+            compose.run(&["-f", cf, "down"]).await?;
             eprintln!("Stopped.");
         }
         ServerAction::Ping { url } => {
@@ -322,6 +295,76 @@ fn config_dir() -> PathBuf {
         .join("home-still")
 }
 
+/// Detected compose command: "docker compose", "docker-compose", or "podman-compose"
+struct ComposeCmd {
+    bin: String,
+    args_prefix: Vec<String>,
+}
+
+impl ComposeCmd {
+    async fn detect() -> Option<Self> {
+        // docker compose (v2 plugin)
+        if check_command("docker", &["compose", "version"]).await {
+            return Some(Self {
+                bin: "docker".into(),
+                args_prefix: vec!["compose".into()],
+            });
+        }
+        // podman compose (delegates to external provider)
+        if check_command("podman", &["compose", "version"]).await {
+            return Some(Self {
+                bin: "podman".into(),
+                args_prefix: vec!["compose".into()],
+            });
+        }
+        // docker-compose standalone
+        if check_command("docker-compose", &["version"]).await {
+            return Some(Self {
+                bin: "docker-compose".into(),
+                args_prefix: vec![],
+            });
+        }
+        // podman-compose standalone
+        if check_command("podman-compose", &["version"]).await {
+            return Some(Self {
+                bin: "podman-compose".into(),
+                args_prefix: vec![],
+            });
+        }
+        None
+    }
+
+    async fn run(&self, args: &[&str]) -> Result<std::process::ExitStatus> {
+        let mut full_args: Vec<&str> = self.args_prefix.iter().map(|s| s.as_str()).collect();
+        full_args.extend_from_slice(args);
+        let status = tokio::process::Command::new(&self.bin)
+            .args(&full_args)
+            .status()
+            .await?;
+        Ok(status)
+    }
+
+    async fn run_silent(&self, args: &[&str]) -> bool {
+        let mut full_args: Vec<&str> = self.args_prefix.iter().map(|s| s.as_str()).collect();
+        full_args.extend_from_slice(args);
+        tokio::process::Command::new(&self.bin)
+            .args(&full_args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Run "exec <service> <cmd...>" via compose
+    async fn exec_run(&self, compose_file: &str, service: &str, cmd: &[&str]) -> Result<std::process::ExitStatus> {
+        let mut args = vec!["-f", compose_file, "exec", service];
+        args.extend_from_slice(cmd);
+        self.run(&args).await
+    }
+}
+
 async fn check_command(cmd: &str, args: &[&str]) -> bool {
     tokio::process::Command::new(cmd)
         .args(args)
@@ -349,27 +392,13 @@ async fn health_check(server_url: &str) -> Result<hs_scribe::client::HealthRespo
     client.health().await
 }
 
-async fn wait_for_ollama(compose_file: &str, timeout_secs: u64) -> Result<()> {
+async fn wait_for_ollama(compose: &ComposeCmd, compose_file: &str, timeout_secs: u64) -> Result<()> {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
     loop {
         if tokio::time::Instant::now() > deadline {
             anyhow::bail!("Timed out waiting for Ollama to start");
         }
-        let status = tokio::process::Command::new("docker")
-            .args([
-                "compose",
-                "-f",
-                compose_file,
-                "exec",
-                "vlm",
-                "ollama",
-                "list",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-        if status.map(|s| s.success()).unwrap_or(false) {
+        if compose.run_silent(&["-f", compose_file, "exec", "vlm", "ollama", "list"]).await {
             return Ok(());
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
