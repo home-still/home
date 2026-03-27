@@ -267,8 +267,27 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
     // Step 5: Start services
     eprintln!("[5/5] Starting services...");
     let cf = compose_path.to_str().unwrap_or_default();
-    let status = compose.run(&["-f", cf, "up", "-d"]).await?;
-    if !status.success() {
+    let output = compose.run_capture(&["-f", cf, "up", "-d"]).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("docker-credential-") && stderr.contains("not found") {
+            anyhow::bail!(
+                "Docker credential helper not found.\n\n\
+                 Fix: edit ~/.docker/config.json and change\n\
+                 \x20 \"credsStore\": \"desktop\"\n\
+                 to\n\
+                 \x20 \"credsStore\": \"\"\n\n\
+                 Then re-run: hs scribe init"
+            );
+        }
+        // Print captured output so the user sees what happened
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.is_empty() {
+            eprint!("{stdout}");
+        }
+        if !stderr.is_empty() {
+            eprint!("{stderr}");
+        }
         anyhow::bail!("compose up failed");
     }
 
@@ -416,6 +435,17 @@ impl ComposeCmd {
             .await
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    /// Run and capture stdout+stderr (for error diagnosis).
+    async fn run_capture(&self, args: &[&str]) -> Result<std::process::Output> {
+        let mut full_args: Vec<&str> = self.args_prefix.iter().map(|s| s.as_str()).collect();
+        full_args.extend_from_slice(args);
+        let output = tokio::process::Command::new(&self.bin)
+            .args(&full_args)
+            .output()
+            .await?;
+        Ok(output)
     }
 
     /// Run "exec <service> <cmd...>" via compose
