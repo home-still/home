@@ -117,16 +117,36 @@ async fn cmd_convert(
 // ── Init ────────────────────────────────────────────────────────
 
 async fn cmd_init(force: bool, check: bool) -> Result<()> {
-    // Step 1: Check container runtime
+    // Step 1: Check container runtime (auto-install on macOS)
     eprintln!("[1/5] Checking container runtime...");
-    let compose = ComposeCmd::detect().await;
+    let mut compose = ComposeCmd::detect().await;
+
+    if compose.is_none() {
+        if cfg!(target_os = "macos") && check_command("brew", &["--version"]).await {
+            eprintln!("       Not found — installing via Homebrew...");
+            let steps: &[(&str, &[&str])] = &[
+                ("brew", &["install", "podman", "docker-compose"]),
+                ("podman", &["machine", "init", "--now"]),
+            ];
+            for (cmd, args) in steps {
+                eprintln!("       Running: {} {}", cmd, args.join(" "));
+                let status = tokio::process::Command::new(cmd)
+                    .args(*args)
+                    .status()
+                    .await?;
+                if !status.success() {
+                    anyhow::bail!("{} {} failed", cmd, args[0]);
+                }
+            }
+            compose = ComposeCmd::detect().await;
+        }
+    }
+
     if compose.is_none() {
         let instructions = if cfg!(target_os = "macos") {
-            "Docker/Podman not found. Install with:\n\n  \
-             brew install podman docker-compose\n  \
-             podman machine init\n  \
-             podman machine start\n  \
-             sudo podman-mac-helper install\n"
+            "Container runtime not found. Install Homebrew first:\n  \
+             https://brew.sh\n\n\
+             Then re-run: hs scribe init\n"
         } else if cfg!(target_os = "linux") {
             "Docker/Podman not found. Install with:\n\n  \
              Arch:   sudo pacman -S podman podman-compose podman-docker\n  \
@@ -138,6 +158,19 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         anyhow::bail!("{}", instructions);
     }
     let compose = compose.unwrap();
+
+    // On macOS, ensure podman machine is running
+    if cfg!(target_os = "macos") && check_command("podman", &["--version"]).await {
+        let machine_running = check_command("podman", &["machine", "info"]).await;
+        if !machine_running {
+            eprintln!("       Starting podman machine...");
+            let _ = tokio::process::Command::new("podman")
+                .args(["machine", "init", "--now"])
+                .status()
+                .await;
+        }
+    }
+
     eprintln!("       OK ({} {})", compose.bin, compose.args_prefix.join(" "));
 
     // Step 2: Detect GPU
