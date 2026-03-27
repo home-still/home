@@ -7,18 +7,25 @@ const DEFAULT_SERVER: &str = "http://localhost:7432";
 const LAYOUT_MODEL_URL: &str =
     "https://github.com/home-still/home/releases/download/v0.0.1-rc.39/pp-doclayoutv3.onnx";
 
-const COMPOSE_YAML: &str = r#"services:
+fn compose_yaml(has_gpu: bool) -> String {
+    let gpu_section = if has_gpu {
+        "    devices:\n      - nvidia.com/gpu=all\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"services:
   scribe:
     image: ghcr.io/home-still/hs-scribe-server:latest
     ports:
       - "7432:7432"
     volumes:
-      - ${MODELS_DIR}:/models:ro
+      - ${{MODELS_DIR}}:/models:ro
     environment:
       HS_SCRIBE_LAYOUT_MODEL_PATH: /models/pp-doclayoutv3.onnx
       HS_SCRIBE_BACKEND: Ollama
       HS_SCRIBE_OLLAMA_URL: http://vlm:11434
-      HS_SCRIBE_USE_CUDA: "${USE_CUDA}"
+      HS_SCRIBE_USE_CUDA: "{use_cuda}"
     depends_on:
       vlm:
         condition: service_healthy
@@ -26,10 +33,8 @@ const COMPOSE_YAML: &str = r#"services:
 
   vlm:
     image: docker.io/ollama/ollama
-    devices:
-      - nvidia.com/gpu=all
-    volumes:
-      - ${OLLAMA_DATA}:/root/.ollama
+{gpu}    volumes:
+      - ${{OLLAMA_DATA}}:/root/.ollama
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -37,7 +42,11 @@ const COMPOSE_YAML: &str = r#"services:
       retries: 30
       start_period: 30s
     restart: on-failure:3
-"#;
+"#,
+        use_cuda = has_gpu,
+        gpu = gpu_section,
+    )
+}
 
 #[derive(Subcommand, Debug)]
 pub enum ScribeCmd {
@@ -214,7 +223,7 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         }
     } else {
         std::fs::create_dir_all(&config_dir)?;
-        std::fs::write(&compose_path, COMPOSE_YAML)?;
+        std::fs::write(&compose_path, compose_yaml(has_gpu))?;
 
         let env_contents = format!(
             "MODELS_DIR={}\nOLLAMA_DATA={}\nUSE_CUDA={}\n",
