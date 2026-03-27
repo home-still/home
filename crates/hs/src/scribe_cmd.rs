@@ -294,6 +294,23 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
                  \x20 hs scribe init --force"
             );
         }
+        if stderr.contains("certificate signed by unknown authority")
+            || stderr.contains("x509: certificate")
+        {
+            anyhow::bail!(
+                "TLS certificate error — likely a corporate VPN/proxy (e.g. Netskope, Zscaler)\n\
+                 doing SSL inspection.\n\n\
+                 Fix for Docker Desktop (macOS):\n\
+                 \x20 1. Open Docker Desktop → Settings → General\n\
+                 \x20 2. Enable \"Use system certificates\"\n\
+                 \x20 3. Restart Docker Desktop\n\n\
+                 If that option isn't available, manually trust the proxy CA:\n\
+                 \x20 1. Find the CA cert (Netskope: /Library/Application Support/Netskope/STAgent/data/nscacert.pem)\n\
+                 \x20 2. mkdir -p ~/.docker/certs.d/ghcr.io && cp <ca.pem> ~/.docker/certs.d/ghcr.io/ca.crt\n\
+                 \x20 3. Repeat for docker.io if needed\n\n\
+                 Then re-run: hs scribe init --force"
+            );
+        }
         // Print captured output so the user sees what happened
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.is_empty() {
