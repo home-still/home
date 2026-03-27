@@ -21,6 +21,7 @@ server = [
     "dep:notify-debouncer-full",
     "dep:ctrlc",
     "dep:tracing-subscriber",
+    "dep:tokio-stream",
 ]
 cuda = ["server", "ort/cuda"]
 eval = ["server", "dep:edit-distance"]
@@ -34,7 +35,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = "0.1"
 tokio = { workspace = true }
-reqwest = { workspace = true, features = ["multipart"] }
+reqwest = { workspace = true, features = ["multipart", "stream"] }
 figment = { workspace = true }
 dirs = "6"
 
@@ -54,6 +55,7 @@ futures = { version = "0.3", optional = true }
 notify = { version = "8", optional = true }
 notify-debouncer-full = { version = "0.4", optional = true }
 ctrlc = { version = "3", optional = true }
+tokio-stream = { version = "0.1", optional = true }
 edit-distance = { version = "2.1", optional = true }
 
 [[bin]]

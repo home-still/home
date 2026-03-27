@@ -90,6 +90,44 @@ impl Reporter for TtyReporter {
             pb,
             use_color: self.use_color,
             prefix_width: bar_prefix_width(),
+            counted: false,
+        })
+    }
+
+    fn begin_counted_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
+        let pb = match total {
+            Some(len) => {
+                let pb = self.mp.add(ProgressBar::new(len));
+                let prefix_width = bar_prefix_width();
+                let template = if self.use_color {
+                    format!("{{prefix:{prefix_width}.bold.green}} {{wide_bar:.cyan/dim}} {{pos:>5}}/{{len:<5}} {{msg}}")
+                } else {
+                    format!("{{prefix:{prefix_width}}} {{wide_bar}} {{pos:>5}}/{{len:<5}} {{msg}}")
+                };
+                pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
+                pb.set_prefix(truncate_name(name, prefix_width));
+                pb
+            }
+            None => {
+                let pb = self.mp.add(ProgressBar::new_spinner());
+                let prefix_width = bar_prefix_width();
+                let template = if self.use_color {
+                    format!("{{prefix:{prefix_width}.bold.green}} {{spinner:.cyan}} {{msg}}")
+                } else {
+                    format!("{{prefix:{prefix_width}}} {{spinner}} {{msg}}")
+                };
+                pb.set_style(make_spinner_style(&template));
+                pb.set_prefix(truncate_name(name, bar_prefix_width()));
+                pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
+                pb
+            }
+        };
+
+        Box::new(IndicatifStageHandle {
+            pb,
+            use_color: self.use_color,
+            prefix_width: bar_prefix_width(),
+            counted: true,
         })
     }
 
@@ -108,6 +146,7 @@ struct IndicatifStageHandle {
     pb: ProgressBar,
     use_color: bool,
     prefix_width: usize,
+    counted: bool,
 }
 
 impl StageHandle for IndicatifStageHandle {
@@ -115,7 +154,13 @@ impl StageHandle for IndicatifStageHandle {
         self.pb.disable_steady_tick();
         self.pb.set_length(total);
         let pw = self.prefix_width;
-        let template = if self.use_color {
+        let template = if self.counted {
+            if self.use_color {
+                format!("{{prefix:{pw}.bold.green}} {{wide_bar:.cyan/dim}} {{pos:>5}}/{{len:<5}} {{msg}}")
+            } else {
+                format!("{{prefix:{pw}}} {{wide_bar}} {{pos:>5}}/{{len:<5}} {{msg}}")
+            }
+        } else if self.use_color {
             format!("{{prefix:{pw}.bold.green}} {{wide_bar:.cyan/dim}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
         } else {
             format!("{{prefix:{pw}}} {{wide_bar}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")

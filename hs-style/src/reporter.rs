@@ -4,7 +4,12 @@ pub trait Reporter: Send + Sync {
     fn status(&self, verb: &str, message: &str);
     fn warn(&self, message: &str);
     fn error(&self, message: &str);
+    /// Begin a byte-oriented progress stage (uses bytes/total_bytes display).
     fn begin_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle>;
+    /// Begin a counted-item progress stage (uses pos/len display, e.g. "3/12").
+    fn begin_counted_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
+        self.begin_stage(name, total)
+    }
     fn finish(&self, summary: &str);
 }
 

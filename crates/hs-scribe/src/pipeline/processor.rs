@@ -8,10 +8,12 @@ use crate::ocr::OcrEngine;
 use crate::pipeline::markdown_generator::{assemble_page_markdown, join_pages};
 use crate::pipeline::PdfParser;
 use crate::utils::deduplication::{deduplicate_boxes, filter_contained_regions};
+use crate::client::ProgressEvent;
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use image::DynamicImage;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// A single region's OCR output with its layout classification.
@@ -362,6 +364,141 @@ impl Processor {
             .await;
 
         Ok(build_html_from_structure(&structure, &cell_texts))
+    }
+
+    pub async fn process_pdf_with_progress<F>(
+        &self,
+        pdf_path: &str,
+        on_progress: F,
+    ) -> Result<String>
+    where
+        F: Fn(ProgressEvent) + Send + Sync + 'static,
+    {
+        let on_progress = Arc::new(on_progress);
+
+        let pages = {
+            let pdf_parser = PdfParser::new()?;
+            pdf_parser.parse_to_pages(pdf_path, self.config.dpi)?
+        };
+        let total = pages.len() as u64;
+
+        // Emit parse-complete event
+        on_progress(ProgressEvent {
+            stage: "parse".into(),
+            page: 0,
+            total_pages: total,
+            message: format!("Parsed {total} pages"),
+        });
+
+        if !self.is_per_region() {
+            let ocr = Arc::clone(&self.ocr);
+            let max_dim = self.config.max_image_dim;
+            let parallel = self.config.parallel;
+            let completed = Arc::new(AtomicU64::new(0));
+
+            let page_markdowns: Vec<Result<String>> =
+                stream::iter(pages.into_iter().enumerate())
+                    .map(|(i, page)| {
+                        let ocr = Arc::clone(&ocr);
+                        let on_progress = Arc::clone(&on_progress);
+                        let completed = Arc::clone(&completed);
+                        async move {
+                            let downscaled = maybe_downscale(&page.image, max_dim);
+                            let image_bytes = encode_jpeg(&downscaled)?;
+                            tracing::info!(
+                                "Processing page {}/{} ({}x{}, {} bytes JPEG)",
+                                i + 1,
+                                total,
+                                page.image.width(),
+                                page.image.height(),
+                                image_bytes.len()
+                            );
+                            let text = ocr.recognize(&image_bytes).await?;
+                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            on_progress(ProgressEvent {
+                                stage: "vlm".into(),
+                                page: done,
+                                total_pages: total,
+                                message: format!("OCR page {done}/{total}"),
+                            });
+                            Ok(text)
+                        }
+                    })
+                    .buffered(parallel)
+                    .collect()
+                    .await;
+
+            let markdowns: Vec<String> = page_markdowns.into_iter().collect::<Result<Vec<_>>>()?;
+            return Ok(join_pages(&markdowns));
+        }
+
+        // Per-region mode: 2-stage async pipeline
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<PreparedPage>(3);
+        let vlm_sem = Arc::new(tokio::sync::Semaphore::new(self.config.vlm_concurrency));
+
+        let layout = self.layout_detector.clone();
+        let table = self.table_recognizer.clone();
+        let config = self.config.clone();
+        let on_progress_s1 = Arc::clone(&on_progress);
+
+        let stage1 = tokio::task::spawn_blocking(move || {
+            for (idx, page) in pages.into_iter().enumerate() {
+                tracing::info!(
+                    "Preparing page {}/{} ({}x{}, per-region)",
+                    idx + 1,
+                    total,
+                    page.image.width(),
+                    page.image.height(),
+                );
+                let prepared = prepare_page(idx, &page.image, &layout, &table, &config)?;
+                on_progress_s1(ProgressEvent {
+                    stage: "layout".into(),
+                    page: (idx + 1) as u64,
+                    total_pages: total,
+                    message: format!("Layout page {}/{total}", idx + 1),
+                });
+                if tx.blocking_send(prepared).is_err() {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+
+        // Stage 2: VLM inference
+        let ocr = Arc::clone(&self.ocr);
+        let region_parallel = self.config.region_parallel;
+        let vlm_completed = Arc::new(AtomicU64::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        while let Some(prepared) = rx.recv().await {
+            let ocr = Arc::clone(&ocr);
+            let sem = Arc::clone(&vlm_sem);
+            let on_progress = Arc::clone(&on_progress);
+            let vlm_completed = Arc::clone(&vlm_completed);
+            tasks.spawn(async move {
+                let result =
+                    execute_vlm_for_page(prepared, ocr, sem, region_parallel).await;
+                let done = vlm_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                on_progress(ProgressEvent {
+                    stage: "vlm".into(),
+                    page: done,
+                    total_pages: total,
+                    message: format!("OCR page {done}/{total}"),
+                });
+                result
+            });
+        }
+
+        let mut results: Vec<(usize, String)> = Vec::with_capacity(total as usize);
+        while let Some(res) = tasks.join_next().await {
+            results.push(res??);
+        }
+        results.sort_by_key(|(idx, _)| *idx);
+
+        stage1.await??;
+        Ok(join_pages(
+            &results.into_iter().map(|(_, md)| md).collect::<Vec<_>>(),
+        ))
     }
 
     pub async fn process_pdf(&self, pdf_path: &str) -> Result<String> {

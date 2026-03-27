@@ -1,31 +1,26 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use hs_style::reporter::Reporter;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 const DEFAULT_SERVER: &str = "http://localhost:7432";
 const LAYOUT_MODEL_URL: &str =
     "https://github.com/home-still/home/releases/download/v0.0.1-rc.39/pp-doclayoutv3.onnx";
 
-fn compose_yaml(has_gpu: bool) -> String {
-    let gpu_section = if has_gpu {
-        "    devices:\n      - nvidia.com/gpu=all\n"
-    } else {
-        ""
-    };
-    format!(
-        r#"services:
+const COMPOSE_YAML: &str = r#"services:
   scribe:
     image: ghcr.io/home-still/hs-scribe-server:latest
     ports:
       - "7432:7432"
     volumes:
-      - ${{MODELS_DIR}}:/models:ro
+      - ${MODELS_DIR}:/models:ro
     environment:
       HS_SCRIBE_LAYOUT_MODEL_PATH: /models/pp-doclayoutv3.onnx
       HS_SCRIBE_BACKEND: Ollama
       HS_SCRIBE_OLLAMA_URL: http://vlm:11434
-      HS_SCRIBE_USE_CUDA: "{use_cuda}"
+      HS_SCRIBE_USE_CUDA: "${USE_CUDA}"
     depends_on:
       vlm:
         condition: service_healthy
@@ -33,8 +28,10 @@ fn compose_yaml(has_gpu: bool) -> String {
 
   vlm:
     image: docker.io/ollama/ollama
-{gpu}    volumes:
-      - ${{OLLAMA_DATA}}:/root/.ollama
+    devices:
+      - nvidia.com/gpu=all
+    volumes:
+      - ${OLLAMA_DATA}:/root/.ollama
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -42,11 +39,7 @@ fn compose_yaml(has_gpu: bool) -> String {
       retries: 30
       start_period: 30s
     restart: on-failure:3
-"#,
-        use_cuda = has_gpu,
-        gpu = gpu_section,
-    )
-}
+"#;
 
 #[derive(Subcommand, Debug)]
 pub enum ScribeCmd {
@@ -92,13 +85,13 @@ pub enum ServerAction {
     },
 }
 
-pub async fn dispatch(cmd: ScribeCmd) -> Result<()> {
+pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
     match cmd {
         ScribeCmd::Convert {
             input,
             out_file,
             server,
-        } => cmd_convert(input, out_file, server).await,
+        } => cmd_convert(input, out_file, server, reporter).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
         ScribeCmd::Server { action } => cmd_server(action).await,
     }
@@ -110,12 +103,31 @@ async fn cmd_convert(
     input: PathBuf,
     out_file: Option<PathBuf>,
     server: Option<String>,
+    reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
     let url = server.as_deref().unwrap_or(DEFAULT_SERVER);
     let client = hs_scribe::client::ScribeClient::new(url);
     let pdf_bytes = std::fs::read(&input)
         .with_context(|| format!("Cannot read {}", input.display()))?;
-    let md = client.convert(pdf_bytes).await?;
+
+    let stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
+        Arc::new(reporter.begin_counted_stage("Converting", None));
+    let stage_cb = Arc::clone(&stage);
+
+    let md = client
+        .convert_with_progress(pdf_bytes, move |event| {
+            stage_cb.set_length(event.total_pages);
+            stage_cb.set_position(event.page);
+            stage_cb.set_message(&event.message);
+        })
+        .await;
+
+    match &md {
+        Ok(_) => stage.finish_with_message("done"),
+        Err(e) => stage.finish_failed(&format!("{e:#}")),
+    }
+
+    let md = md?;
     match out_file {
         Some(path) => std::fs::write(&path, &md)?,
         None => print!("{md}"),
@@ -223,7 +235,7 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         }
     } else {
         std::fs::create_dir_all(&config_dir)?;
-        std::fs::write(&compose_path, compose_yaml(has_gpu))?;
+        std::fs::write(&compose_path, COMPOSE_YAML)?;
 
         let env_contents = format!(
             "MODELS_DIR={}\nOLLAMA_DATA={}\nUSE_CUDA={}\n",

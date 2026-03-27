@@ -55,7 +55,7 @@ fn main() -> ExitCode {
                 paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode).await
             }
             TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
-            TopCmd::Scribe { command } => scribe_cmd::dispatch(command).await,
+            TopCmd::Scribe { command } => scribe_cmd::dispatch(command, &reporter).await,
         }
     });
 
