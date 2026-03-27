@@ -51,7 +51,6 @@ impl BBox {
             0.0
         }
     }
-
 }
 
 /// PP-DocLayout-V3 class names (25 classes, from Paddle config.json label_list)
@@ -165,17 +164,13 @@ impl LayoutDetector {
             }
         }
 
-        let im_shape = ndarray::Array2::<f32>::from_shape_vec(
-            (1, 2),
-            vec![800.0, 800.0],
-        )?;
+        let im_shape = ndarray::Array2::<f32>::from_shape_vec((1, 2), vec![800.0, 800.0])?;
         let scale_factor = ndarray::Array2::<f32>::from_shape_vec(
             (1, 2),
             vec![800.0 / orig_h as f32, 800.0 / orig_w as f32],
         )?;
 
-        let image_val =
-            ort::value::Value::from_array(array).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let image_val = ort::value::Value::from_array(array).map_err(|e| anyhow::anyhow!("{e}"))?;
         let im_shape_val =
             ort::value::Value::from_array(im_shape).map_err(|e| anyhow::anyhow!("{e}"))?;
         let scale_val =
@@ -280,7 +275,8 @@ mod tests {
     fn test_bbox_area() {
         assert!((make_bbox(0.0, 0.0, 10.0, 20.0).area() - 200.0).abs() < f32::EPSILON);
         assert!((make_bbox(5.0, 5.0, 5.0, 10.0).area() - 0.0).abs() < f32::EPSILON); // zero-width
-        assert!((make_bbox(5.0, 5.0, 10.0, 5.0).area() - 0.0).abs() < f32::EPSILON); // zero-height
+        assert!((make_bbox(5.0, 5.0, 10.0, 5.0).area() - 0.0).abs() < f32::EPSILON);
+        // zero-height
     }
 
     #[test]

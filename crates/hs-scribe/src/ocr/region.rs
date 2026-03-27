@@ -38,18 +38,19 @@ impl RegionType {
     /// Map a PP-DocLayout-V3 class name to a RegionType.
     pub fn from_class(class_name: &str) -> Self {
         match class_name {
-            "text" | "paragraph_title" | "doc_title" | "abstract" | "content"
-            | "reference" | "reference_content" | "footnote" | "vision_footnote"
-            | "aside_text" | "vertical_text" | "figure_title" | "algorithm" => RegionType::Text,
+            "text" | "paragraph_title" | "doc_title" | "abstract" | "content" | "reference"
+            | "reference_content" | "footnote" | "vision_footnote" | "aside_text"
+            | "vertical_text" | "figure_title" | "algorithm" => RegionType::Text,
             "table" => RegionType::Table,
             "display_formula" => RegionType::Formula,
             "inline_formula" => RegionType::InlineFormula,
             "image" | "chart" | "seal" => RegionType::Figure,
-            "header" | "footer" | "header_image" | "footer_image" | "number"
-            | "formula_number" => RegionType::Skip,
+            "header" | "footer" | "header_image" | "footer_image" | "number" | "formula_number" => {
+                RegionType::Skip
+            }
             // Legacy DocLayout-YOLO class names (fallback)
-            "title" | "plain text" | "figure_caption" | "table_caption"
-            | "table_footnote" | "formula_caption" => RegionType::Text,
+            "title" | "plain text" | "figure_caption" | "table_caption" | "table_footnote"
+            | "formula_caption" => RegionType::Text,
             "isolate_formula" => RegionType::Formula,
             "figure" => RegionType::Figure,
             "abandon" => RegionType::Skip,

@@ -1,10 +1,8 @@
 use super::region::RegionType;
 use anyhow::Result;
 use ollama_rs::{
-    generation::completion::request::GenerationRequest,
-    generation::images::Image,
-    models::ModelOptions,
-    Ollama,
+    generation::completion::request::GenerationRequest, generation::images::Image,
+    models::ModelOptions, Ollama,
 };
 use reqwest::Url;
 
@@ -21,8 +19,13 @@ impl OllamaBackend {
                  for parallel processing: OLLAMA_NUM_PARALLEL=2 ollama serve"
             );
         }
-        let parsed = Url::parse(url).unwrap_or_else(|_| Url::parse("http://localhost:11434").unwrap());
-        let host = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or("localhost"));
+        let parsed =
+            Url::parse(url).unwrap_or_else(|_| Url::parse("http://localhost:11434").unwrap());
+        let host = format!(
+            "{}://{}",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or("localhost")
+        );
         let port = parsed.port().unwrap_or(11434);
         Self {
             client: Ollama::new(host, port),
@@ -31,7 +34,8 @@ impl OllamaBackend {
     }
 
     pub async fn recognize(&self, image_bytes: &[u8]) -> Result<String> {
-        self.recognize_region(image_bytes, RegionType::FullPage).await
+        self.recognize_region(image_bytes, RegionType::FullPage)
+            .await
     }
 
     pub async fn recognize_region(
@@ -50,12 +54,14 @@ impl OllamaBackend {
             .num_predict(4096)
             .num_ctx(8192);
 
-        let request =
-            GenerationRequest::new(self.model.clone(), region_type.prompt().to_string())
-                .images(vec![image])
-                .options(options);
+        let request = GenerationRequest::new(self.model.clone(), region_type.prompt().to_string())
+            .images(vec![image])
+            .options(options);
 
-        let response = self.client.generate(request).await
+        let response = self
+            .client
+            .generate(request)
+            .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         Ok(response.response)

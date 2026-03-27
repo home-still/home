@@ -1,3 +1,4 @@
+use crate::client::ProgressEvent;
 use crate::config::{AppConfig, PipelineMode};
 use crate::models::layout::{BBox, LayoutDetector};
 use crate::models::table_structure::{
@@ -8,7 +9,6 @@ use crate::ocr::OcrEngine;
 use crate::pipeline::markdown_generator::{assemble_page_markdown, join_pages};
 use crate::pipeline::PdfParser;
 use crate::utils::deduplication::{deduplicate_boxes, filter_contained_regions};
-use crate::client::ProgressEvent;
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use image::DynamicImage;
@@ -396,37 +396,36 @@ impl Processor {
             let parallel = self.config.parallel;
             let completed = Arc::new(AtomicU64::new(0));
 
-            let page_markdowns: Vec<Result<String>> =
-                stream::iter(pages.into_iter().enumerate())
-                    .map(|(i, page)| {
-                        let ocr = Arc::clone(&ocr);
-                        let on_progress = Arc::clone(&on_progress);
-                        let completed = Arc::clone(&completed);
-                        async move {
-                            let downscaled = maybe_downscale(&page.image, max_dim);
-                            let image_bytes = encode_jpeg(&downscaled)?;
-                            tracing::info!(
-                                "Processing page {}/{} ({}x{}, {} bytes JPEG)",
-                                i + 1,
-                                total,
-                                page.image.width(),
-                                page.image.height(),
-                                image_bytes.len()
-                            );
-                            let text = ocr.recognize(&image_bytes).await?;
-                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                            on_progress(ProgressEvent {
-                                stage: "vlm".into(),
-                                page: done,
-                                total_pages: total,
-                                message: format!("OCR page {done}/{total}"),
-                            });
-                            Ok(text)
-                        }
-                    })
-                    .buffered(parallel)
-                    .collect()
-                    .await;
+            let page_markdowns: Vec<Result<String>> = stream::iter(pages.into_iter().enumerate())
+                .map(|(i, page)| {
+                    let ocr = Arc::clone(&ocr);
+                    let on_progress = Arc::clone(&on_progress);
+                    let completed = Arc::clone(&completed);
+                    async move {
+                        let downscaled = maybe_downscale(&page.image, max_dim);
+                        let image_bytes = encode_jpeg(&downscaled)?;
+                        tracing::info!(
+                            "Processing page {}/{} ({}x{}, {} bytes JPEG)",
+                            i + 1,
+                            total,
+                            page.image.width(),
+                            page.image.height(),
+                            image_bytes.len()
+                        );
+                        let text = ocr.recognize(&image_bytes).await?;
+                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        on_progress(ProgressEvent {
+                            stage: "vlm".into(),
+                            page: done,
+                            total_pages: total,
+                            message: format!("OCR page {done}/{total}"),
+                        });
+                        Ok(text)
+                    }
+                })
+                .buffered(parallel)
+                .collect()
+                .await;
 
             let markdowns: Vec<String> = page_markdowns.into_iter().collect::<Result<Vec<_>>>()?;
             return Ok(join_pages(&markdowns));
@@ -476,8 +475,7 @@ impl Processor {
             let on_progress = Arc::clone(&on_progress);
             let vlm_completed = Arc::clone(&vlm_completed);
             tasks.spawn(async move {
-                let result =
-                    execute_vlm_for_page(prepared, ocr, sem, region_parallel).await;
+                let result = execute_vlm_for_page(prepared, ocr, sem, region_parallel).await;
                 let done = vlm_completed.fetch_add(1, Ordering::Relaxed) + 1;
                 on_progress(ProgressEvent {
                     stage: "vlm".into(),

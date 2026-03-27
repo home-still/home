@@ -8,10 +8,10 @@
 
 #[derive(Debug, Clone)]
 struct TreeNode {
-    tag: String,              // e.g. "table", "tr", "td", "th", "thead", "tbody"
+    tag: String, // e.g. "table", "tr", "td", "th", "thead", "tbody"
     colspan: usize,
     rowspan: usize,
-    content: String,          // text content (only meaningful for td/th)
+    content: String, // text content (only meaningful for td/th)
     children: Vec<TreeNode>,
 }
 
@@ -178,7 +178,11 @@ fn tokenize_html(html: &str) -> Vec<HtmlToken> {
                 // Split tag name from attributes
                 let parts: Vec<&str> = trimmed.splitn(2, |c: char| c.is_whitespace()).collect();
                 let tag_name = parts[0].trim_end_matches('/').to_string();
-                let attrs = if parts.len() > 1 { parts[1].to_string() } else { String::new() };
+                let attrs = if parts.len() > 1 {
+                    parts[1].to_string()
+                } else {
+                    String::new()
+                };
                 tokens.push(HtmlToken::OpenTag(tag_name, attrs));
             }
         } else {
@@ -369,9 +373,9 @@ fn tree_edit_distance(t1: &IndexedTree, t2: &IndexedTree) -> f64 {
                     if li == l1 && lj == l2 {
                         // Both are in the same "leftmost path" → tree distance
                         let cost = rename_cost(&t1.nodes[node_i], &t2.nodes[node_j]);
-                        fd[i][j] = (fd[i - 1][j] + 1.0)           // delete
-                            .min(fd[i][j - 1] + 1.0)               // insert
-                            .min(fd[i - 1][j - 1] + cost);         // rename
+                        fd[i][j] = (fd[i - 1][j] + 1.0) // delete
+                            .min(fd[i][j - 1] + 1.0) // insert
+                            .min(fd[i - 1][j - 1] + cost); // rename
                         td[node_i + 1][node_j + 1] = fd[i][j];
                     } else {
                         // Forest distance → use previously computed tree distances
@@ -435,9 +439,13 @@ pub fn teds_score(reference_html: &str, hypothesis_html: &str) -> Option<f64> {
         let mut best_i = 0;
         let mut best_j = 0;
         for (i, row) in scores_matrix.iter().enumerate() {
-            if used_ref[i] { continue; }
+            if used_ref[i] {
+                continue;
+            }
             for (j, &s) in row.iter().enumerate() {
-                if used_hyp[j] { continue; }
+                if used_hyp[j] {
+                    continue;
+                }
                 if s > best_score {
                     best_score = s;
                     best_i = i;
@@ -518,18 +526,17 @@ fn split_tables(html: &str) -> Vec<String> {
     tables
 }
 
-
 /// Decode common HTML entities in text content.
 fn decode_html_entities(s: &str) -> String {
     s.replace("&amp;", "&")
-     .replace("&lt;", "<")
-     .replace("&gt;", ">")
-     .replace("&quot;", "\"")
-     .replace("&#x27;", "'")
-     .replace("&#39;", "'")
-     .replace("&apos;", "'")
-     .replace("&#x2019;", "\u{2019}")
-     .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&#x2019;", "\u{2019}")
+        .replace("&nbsp;", " ")
 }
 
 /// Official OmniDocBench table HTML normalization.
@@ -542,7 +549,9 @@ fn normalize_table_html(html: &str) -> String {
     s = remove_tag_pair(&s, "colgroup");
 
     // Remove formatting tags (keep their content): sub, sup, span, div, p, li, ul, ol, i, b, em, strong
-    for tag in &["sub", "sup", "span", "div", "p", "li", "ul", "ol", "i", "b", "em", "strong"] {
+    for tag in &[
+        "sub", "sup", "span", "div", "p", "li", "ul", "ol", "i", "b", "em", "strong",
+    ] {
         s = strip_tag_keep_content(&s, tag);
     }
 
@@ -552,7 +561,10 @@ fn normalize_table_html(html: &str) -> String {
     }
 
     // Remove style/height/width/align/class/border attributes from remaining tags
-    s = strip_html_attributes(&s, &["style", "height", "width", "align", "class", "border"]);
+    s = strip_html_attributes(
+        &s,
+        &["style", "height", "width", "align", "class", "border"],
+    );
 
     s
 }
@@ -646,7 +658,8 @@ fn strip_html_attributes(html: &str, attrs: &[&str]) -> String {
                 break;
             }
             // Strip one leading space if present
-            let actual_start = if attr_start > 0 && result.is_char_boundary(attr_start - 1)
+            let actual_start = if attr_start > 0
+                && result.is_char_boundary(attr_start - 1)
                 && result.as_bytes()[attr_start - 1] == b' '
             {
                 attr_start - 1
@@ -709,8 +722,12 @@ fn edit_distance(a: &str, b: &str) -> usize {
     let m = a.len();
     let n = b.len();
 
-    if m == 0 { return n; }
-    if n == 0 { return m; }
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
 
     let mut prev = vec![0usize; n + 1];
     let mut curr = vec![0usize; n + 1];
@@ -723,9 +740,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
         curr[0] = i;
         for j in 1..=n {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -773,7 +788,8 @@ mod tests {
 
     #[test]
     fn test_colspan_difference() {
-        let ref_html = r#"<table><tr><td colspan="2">Header</td></tr><tr><td>A</td><td>B</td></tr></table>"#;
+        let ref_html =
+            r#"<table><tr><td colspan="2">Header</td></tr><tr><td>A</td><td>B</td></tr></table>"#;
         let hyp_html = "<table><tr><td>Header</td></tr><tr><td>A</td><td>B</td></tr></table>";
         let score = teds_score(ref_html, hyp_html).unwrap();
         // Same structure but different colspan on first td → cost 1 for that node
@@ -782,7 +798,8 @@ mod tests {
 
     #[test]
     fn test_parse_simple_table() {
-        let html = "<table><tr><th>Name</th><th>Age</th></tr><tr><td>Alice</td><td>30</td></tr></table>";
+        let html =
+            "<table><tr><th>Name</th><th>Age</th></tr><tr><td>Alice</td><td>30</td></tr></table>";
         let tree = parse_html_table(html).unwrap();
         assert_eq!(tree.tag, "table");
         assert_eq!(tree.children.len(), 2); // 2 rows
@@ -793,7 +810,8 @@ mod tests {
     #[test]
     fn test_parse_with_thead_tbody() {
         // thead/tbody should be flattened — rows promoted to table level
-        let html = "<table><thead><tr><th>H</th></tr></thead><tbody><tr><td>D</td></tr></tbody></table>";
+        let html =
+            "<table><thead><tr><th>H</th></tr></thead><tbody><tr><td>D</td></tr></tbody></table>";
         let tree = parse_html_table(html).unwrap();
         assert_eq!(tree.tag, "table");
         assert_eq!(tree.children.len(), 2); // 2 rows (flattened from thead + tbody)
@@ -803,7 +821,8 @@ mod tests {
 
     #[test]
     fn test_multi_table_split() {
-        let tables = split_tables("<table><tr><td>A</td></tr></table>\n<table><tr><td>B</td></tr></table>");
+        let tables =
+            split_tables("<table><tr><td>A</td></tr></table>\n<table><tr><td>B</td></tr></table>");
         assert_eq!(tables.len(), 2);
         assert!(tables[0].contains("A"));
         assert!(tables[1].contains("B"));
@@ -821,9 +840,13 @@ mod tests {
     fn test_thead_tbody_equivalence() {
         // Table with thead/tbody should score 100 against same table without wrappers
         let with_wrappers = "<table><thead><tr><td>H1</td><td>H2</td></tr></thead><tbody><tr><td>A</td><td>B</td></tr></tbody></table>";
-        let without_wrappers = "<table><tr><td>H1</td><td>H2</td></tr><tr><td>A</td><td>B</td></tr></table>";
+        let without_wrappers =
+            "<table><tr><td>H1</td><td>H2</td></tr><tr><td>A</td><td>B</td></tr></table>";
         let score = teds_score(with_wrappers, without_wrappers).unwrap();
-        assert_eq!(score, 100.0, "thead/tbody flattening should give identical trees");
+        assert_eq!(
+            score, 100.0,
+            "thead/tbody flattening should give identical trees"
+        );
     }
 
     #[test]
@@ -842,7 +865,10 @@ mod tests {
         let with_style = r#"<table border="1"><tr><td style="width: 100px">A</td></tr></table>"#;
         let without_style = "<table><tr><td>A</td></tr></table>";
         let score = teds_score(with_style, without_style).unwrap();
-        assert_eq!(score, 100.0, "style attr stripping should give identical trees");
+        assert_eq!(
+            score, 100.0,
+            "style attr stripping should give identical trees"
+        );
     }
 
     #[test]
@@ -851,7 +877,10 @@ mod tests {
         let with_sub = "<table><tr><td>H<sub>2</sub>O</td></tr></table>";
         let without_sub = "<table><tr><td>H2O</td></tr></table>";
         let score = teds_score(with_sub, without_sub).unwrap();
-        assert_eq!(score, 100.0, "sub/sup stripping should give identical trees");
+        assert_eq!(
+            score, 100.0,
+            "sub/sup stripping should give identical trees"
+        );
     }
 
     #[test]
@@ -860,7 +889,10 @@ mod tests {
         let wrapped = "<html><body><table><tr><td>X</td></tr></table></body></html>";
         let clean = "<table><tr><td>X</td></tr></table>";
         let score = teds_score(wrapped, clean).unwrap();
-        assert_eq!(score, 100.0, "html/body wrapper stripping should give identical trees");
+        assert_eq!(
+            score, 100.0,
+            "html/body wrapper stripping should give identical trees"
+        );
     }
 
     #[test]
@@ -878,7 +910,10 @@ mod tests {
         let html_a = "<table><tr><td>ζ-potential</td><td>α value</td></tr></table>";
         let html_b = "<table><tr><td>ζ-potential</td><td>α value</td></tr></table>";
         let score = teds_score(html_a, html_b).unwrap();
-        assert_eq!(score, 100.0, "identical tables with Unicode should score 100");
+        assert_eq!(
+            score, 100.0,
+            "identical tables with Unicode should score 100"
+        );
     }
 
     #[test]
@@ -889,5 +924,4 @@ mod tests {
         let score = teds_score(html_with_sub, html_clean).unwrap();
         assert_eq!(score, 100.0, "sub stripping with Unicode should work");
     }
-
 }

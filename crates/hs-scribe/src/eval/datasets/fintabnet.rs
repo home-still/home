@@ -7,10 +7,7 @@ use std::path::PathBuf;
 ///   fintabnet/FinTabNet.c-PDF_Annotations/<TICKER>_<YEAR>_page_<N>_tables.json
 ///   fintabnet/FinTabNet.c-Structure/{train,val,test}/<TICKER>_<YEAR>_page_<N>_table_<M>.xml
 ///   fintabnet/FinTabNet.c-Structure/images/<TICKER>_<YEAR>_page_<N>_table_<M>.jpg
-pub fn load_fintabnet_samples(
-    split: &str,
-    limit: Option<usize>,
-) -> Result<Vec<GroundTruthSample>> {
+pub fn load_fintabnet_samples(split: &str, limit: Option<usize>) -> Result<Vec<GroundTruthSample>> {
     let base = fintabnet_dir();
     let structure_dir = base.join("FinTabNet.c-Structure").join(split);
     let annotations_dir = base.join("FinTabNet.c-PDF_Annotations");
@@ -59,7 +56,9 @@ pub fn load_fintabnet_samples(
         let annotation_path = annotations_dir.join(format!("{}_tables.json", page_stem));
 
         let table_html = if annotation_path.exists() {
-            build_table_html(&annotation_path, table_index).ok().flatten()
+            build_table_html(&annotation_path, table_index)
+                .ok()
+                .flatten()
         } else {
             None
         };
@@ -171,10 +170,7 @@ fn build_table_html(path: &PathBuf, table_index: usize) -> Result<Option<String>
         let start_col = *cols.iter().min().unwrap();
         let rowspan = rows.len();
         let colspan = cols.len();
-        let text = cell["json_text_content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let text = cell["json_text_content"].as_str().unwrap_or("").to_string();
         let is_header = cell["is_column_header"].as_bool().unwrap_or(false);
 
         cell_infos.push(CellInfo {

@@ -18,16 +18,16 @@ const IMAGE_SCALE: f32 = 1.0 / 255.0;
 /// Character dictionary for SLANet-Plus.
 /// Order: "sos" + 48 tokens from model metadata + "eos" = 50 total.
 const CHAR_DICT: &[&str] = &[
-    "sos",        // 0 - BOS
-    "<thead>",    // 1
-    "</thead>",   // 2
-    "<tbody>",    // 3
-    "</tbody>",   // 4
-    "<tr>",       // 5
-    "</tr>",      // 6
-    "<td",        // 7  (partial: followed by attributes then ">")
-    ">",          // 8
-    "</td>",      // 9
+    "sos",             // 0 - BOS
+    "<thead>",         // 1
+    "</thead>",        // 2
+    "<tbody>",         // 3
+    "</tbody>",        // 4
+    "<tr>",            // 5
+    "</tr>",           // 6
+    "<td",             // 7  (partial: followed by attributes then ">")
+    ">",               // 8
+    "</td>",           // 9
     " colspan=\"2\"",  // 10
     " colspan=\"3\"",  // 11
     " colspan=\"4\"",  // 12
@@ -66,8 +66,8 @@ const CHAR_DICT: &[&str] = &[
     " rowspan=\"18\"", // 45
     " rowspan=\"19\"", // 46
     " rowspan=\"20\"", // 47
-    "<td></td>",  // 48 - standalone empty cell
-    "eos",        // 49 - EOS
+    "<td></td>",       // 48 - standalone empty cell
+    "eos",             // 49 - EOS
 ];
 
 /// Tokens that indicate a cell (and should have an associated bbox).
@@ -267,12 +267,18 @@ mod tests {
     fn test_build_html_simple() {
         let structure = TableStructure {
             tokens: vec![
-                "<thead>".into(), "<tr>".into(),
-                "<td></td>".into(), "<td></td>".into(),
-                "</tr>".into(), "</thead>".into(),
-                "<tbody>".into(), "<tr>".into(),
-                "<td></td>".into(), "<td></td>".into(),
-                "</tr>".into(), "</tbody>".into(),
+                "<thead>".into(),
+                "<tr>".into(),
+                "<td></td>".into(),
+                "<td></td>".into(),
+                "</tr>".into(),
+                "</thead>".into(),
+                "<tbody>".into(),
+                "<tr>".into(),
+                "<td></td>".into(),
+                "<td></td>".into(),
+                "</tr>".into(),
+                "</tbody>".into(),
             ],
             cells: vec![],
             confidence: 0.95,
@@ -289,7 +295,10 @@ mod tests {
         let structure = TableStructure {
             tokens: vec![
                 "<tr>".into(),
-                "<td".into(), " colspan=\"2\"".into(), ">".into(), "</td>".into(),
+                "<td".into(),
+                " colspan=\"2\"".into(),
+                ">".into(),
+                "</td>".into(),
                 "</tr>".into(),
             ],
             cells: vec![],

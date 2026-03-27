@@ -24,10 +24,13 @@ pub fn load_omnidocbench_samples(
     limit: Option<usize>,
     language: LanguageFilter,
 ) -> Result<Vec<GroundTruthSample>> {
-    load_omnidocbench_filtered(limit, &SampleFilter {
-        language: Some(language),
-        ..Default::default()
-    })
+    load_omnidocbench_filtered(
+        limit,
+        &SampleFilter {
+            language: Some(language),
+            ..Default::default()
+        },
+    )
 }
 
 pub fn load_omnidocbench_filtered(
@@ -76,10 +79,7 @@ pub fn load_omnidocbench_filtered(
             }
         }
 
-        let image_name = page_info["image_path"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let image_name = page_info["image_path"].as_str().unwrap_or("").to_string();
         let page_idx = page_info["page_no"].as_u64().map(|n| n as usize);
 
         let image_path = resolve_image_path(&base, &image_name);
@@ -158,7 +158,11 @@ fn extract_text_annotations(entry: &serde_json::Value) -> (Option<String>, Optio
     } else {
         items.sort_by_key(|(order, _)| *order);
         let blocks: Vec<String> = items.iter().map(|(_, t)| t.clone()).collect();
-        let joined = items.into_iter().map(|(_, t)| t).collect::<Vec<_>>().join("\n");
+        let joined = items
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect::<Vec<_>>()
+            .join("\n");
         (Some(joined), Some(blocks))
     }
 }
@@ -178,7 +182,13 @@ fn extract_table_annotations(entry: &serde_json::Value) -> Option<String> {
         None
     } else {
         entries.sort_by_key(|(order, _)| *order);
-        Some(entries.into_iter().map(|(_, s)| s).collect::<Vec<_>>().join("\n"))
+        Some(
+            entries
+                .into_iter()
+                .map(|(_, s)| s)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 }
 

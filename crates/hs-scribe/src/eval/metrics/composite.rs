@@ -35,13 +35,13 @@ pub fn omnidocbench_composite(
     let teds = match (reference_table_html, hypothesis_table_html) {
         (Some(r), Some(h)) => teds_score(r, h),
         (Some(_), None) => Some(0.0), // ref has table, we extracted nothing
-        _ => None, // no ref table = not scored
+        _ => None,                    // no ref table = not scored
     };
 
     let cdm = match (reference_formula_latex, hypothesis_formula_latex) {
         (Some(r), Some(h)) => cdm_score_multi(r, h),
         (Some(_), None) => Some(0.0), // ref has formula, we extracted nothing
-        _ => None, // no ref formula = not scored
+        _ => None,                    // no ref formula = not scored
     };
 
     // Text score: None when reference has no text annotations at all.
@@ -102,7 +102,17 @@ mod tests {
 
     #[test]
     fn test_text_only_composite() {
-        let score = omnidocbench_composite("hello world", "hello world", None, None, None, None, None, None, true);
+        let score = omnidocbench_composite(
+            "hello world",
+            "hello world",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
         assert_eq!(score.text_score, Some(100.0));
         assert_eq!(score.composite, 100.0);
         assert!(score.teds_score.is_none());
@@ -119,7 +129,17 @@ mod tests {
     #[test]
     fn test_no_text_ref_composite() {
         // Page with no text annotations — text_score should be None
-        let score = omnidocbench_composite("", "lots of text here", None, None, None, None, None, None, false);
+        let score = omnidocbench_composite(
+            "",
+            "lots of text here",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
         assert_eq!(score.text_score, None);
         // With no metrics at all, composite falls back to 0
         assert_eq!(score.composite, 0.0);
@@ -129,11 +149,15 @@ mod tests {
     fn test_no_text_ref_with_table() {
         // Table-only page — text excluded, composite = TEDS only
         let score = omnidocbench_composite(
-            "", "extracted text",
-            None, None,
+            "",
+            "extracted text",
+            None,
+            None,
             Some("<table><tr><td>a</td></tr></table>"),
             Some("<table><tr><td>a</td></tr></table>"),
-            None, None, false,
+            None,
+            None,
+            false,
         );
         assert_eq!(score.text_score, None);
         assert!(score.teds_score.is_some());
@@ -145,9 +169,15 @@ mod tests {
         let ref_blocks = vec!["hello world".to_string(), "foo bar".to_string()];
         let hyp_blocks = vec!["hello world".to_string(), "foo bar".to_string()];
         let score = omnidocbench_composite(
-            "hello world\nfoo bar", "hello world\nfoo bar",
-            Some(&ref_blocks), Some(&hyp_blocks),
-            None, None, None, None, true,
+            "hello world\nfoo bar",
+            "hello world\nfoo bar",
+            Some(&ref_blocks),
+            Some(&hyp_blocks),
+            None,
+            None,
+            None,
+            None,
+            true,
         );
         assert_eq!(score.text_score, Some(100.0));
     }
@@ -156,9 +186,15 @@ mod tests {
     fn test_fallback_to_concatenated() {
         // No blocks → falls back to concatenated
         let score = omnidocbench_composite(
-            "hello world foo bar", "hello world foo bar",
-            None, None,
-            None, None, None, None, true,
+            "hello world foo bar",
+            "hello world foo bar",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
         );
         assert_eq!(score.text_score, Some(100.0));
     }

@@ -218,13 +218,8 @@ pub async fn run_eval(
             hyp_blocks,
             sample.table_html.as_deref(),
             extracted_table_html.as_deref(),
-            sample
-                .formula_latex
-                .as_deref()
-                .map(|v| v as &[String]),
-            extracted_formula_latex
-                .as_deref()
-                .map(|v| v as &[String]),
+            sample.formula_latex.as_deref().map(|v| v as &[String]),
+            extracted_formula_latex.as_deref().map(|v| v as &[String]),
             has_text_ref,
         );
 
@@ -267,11 +262,7 @@ pub async fn run_eval(
         (
             pages.iter().map(|p| p.ned).sum::<f64>() / num_samples as f64,
             pages.iter().map(|p| p.bleu).sum::<f64>() / num_samples as f64,
-            pages
-                .iter()
-                .map(|p| p.composite.composite)
-                .sum::<f64>()
-                / num_samples as f64,
+            pages.iter().map(|p| p.composite.composite).sum::<f64>() / num_samples as f64,
         )
     } else {
         (0.0, 0.0, 0.0)
@@ -298,10 +289,7 @@ pub async fn run_eval(
     } else {
         teds_pages.iter().sum::<f64>() / teds_pages.len() as f64
     };
-    let cdm_pages: Vec<f64> = pages
-        .iter()
-        .filter_map(|p| p.composite.cdm_score)
-        .collect();
+    let cdm_pages: Vec<f64> = pages.iter().filter_map(|p| p.composite.cdm_score).collect();
     let avg_cdm = if cdm_pages.is_empty() {
         0.0
     } else {
@@ -310,9 +298,7 @@ pub async fn run_eval(
     let official_overall = (avg_text_score + avg_teds + avg_cdm) / 3.0;
 
     if num_failures > 0 {
-        eprintln!(
-            "WARNING: {num_failures}/{num_samples} samples failed and were scored as zero"
-        );
+        eprintln!("WARNING: {num_failures}/{num_samples} samples failed and were scored as zero");
     }
 
     eprintln!(

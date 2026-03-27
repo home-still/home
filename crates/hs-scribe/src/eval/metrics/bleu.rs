@@ -33,9 +33,7 @@ pub fn bleu4(reference: &str, hypothesis: &str) -> f64 {
 }
 
 fn tokenize(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .map(|s| s.to_lowercase())
-        .collect()
+    text.split_whitespace().map(|s| s.to_lowercase()).collect()
 }
 
 fn ngrams(tokens: &[String], n: usize) -> HashMap<Vec<String>, usize> {
@@ -108,7 +106,11 @@ mod tests {
         let reference = "the quick brown fox jumps over the lazy dog in the park";
         let hypothesis = "the quick brown cat jumps over the lazy dog in the garden";
         let score = bleu4(reference, hypothesis);
-        assert!(score > 0.0 && score < 1.0, "Expected partial score, got {}", score);
+        assert!(
+            score > 0.0 && score < 1.0,
+            "Expected partial score, got {}",
+            score
+        );
     }
 
     #[test]

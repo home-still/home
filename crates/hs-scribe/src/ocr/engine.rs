@@ -29,7 +29,8 @@ impl OcrEngine {
     }
 
     pub async fn recognize(&self, image_bytes: &[u8]) -> Result<String> {
-        self.recognize_region(image_bytes, RegionType::FullPage).await
+        self.recognize_region(image_bytes, RegionType::FullPage)
+            .await
     }
 
     pub async fn recognize_region(

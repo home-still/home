@@ -18,8 +18,7 @@ pub async fn watch_directory(dir: &Path, config: AppConfig) -> Result<()> {
 
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = new_debouncer(Duration::from_millis(500), None, tx)?;
-    debouncer
-        .watch(dir, RecursiveMode::Recursive)?;
+    debouncer.watch(dir, RecursiveMode::Recursive)?;
 
     let processor = Processor::new(config)?;
 
@@ -51,7 +50,10 @@ async fn process_event(event: &DebouncedEvent, processor: &Processor) {
         if path.extension().is_some_and(|ext| ext == "pdf") {
             tracing::info!("Detected: {}", path.display());
             let output = path.with_extension("md");
-            match processor.process_pdf(path.to_str().unwrap_or_default()).await {
+            match processor
+                .process_pdf(path.to_str().unwrap_or_default())
+                .await
+            {
                 Ok(markdown) => {
                     if let Err(e) = std::fs::write(&output, &markdown) {
                         tracing::error!("Failed to write {}: {e}", output.display());

@@ -122,9 +122,8 @@ fn class_priority(class: &str) -> u8 {
         "doc_title" | "paragraph_title" | "figure_title" => 1,
         "image" | "chart" | "table" | "seal" => 2,
         "display_formula" | "inline_formula" => 3,
-        "text" | "abstract" | "content" | "reference" | "reference_content"
-        | "footnote" | "vision_footnote" | "aside_text" | "vertical_text"
-        | "algorithm" => 4,
+        "text" | "abstract" | "content" | "reference" | "reference_content" | "footnote"
+        | "vision_footnote" | "aside_text" | "vertical_text" | "algorithm" => 4,
         // Legacy YOLO names
         "title" | "caption" | "section_header" => 1,
         "figure" | "equation" => 2,

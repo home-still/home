@@ -130,9 +130,13 @@ pub fn cdm_score_multi(ref_formulas: &[String], hyp_formulas: &[String]) -> Opti
         let mut best_i = 0;
         let mut best_j = 0;
         for (i, row) in scores.iter().enumerate() {
-            if used_ref[i] { continue; }
+            if used_ref[i] {
+                continue;
+            }
             for (j, &s) in row.iter().enumerate() {
-                if used_hyp[j] { continue; }
+                if used_hyp[j] {
+                    continue;
+                }
                 if s > best_score {
                     best_score = s;
                     best_i = i;
@@ -197,14 +201,42 @@ fn normalize_formula(latex: &str) -> String {
 /// Formatting commands stripped by the official OmniDocBench normalization.
 /// These are pure formatting — structural commands like \frac, \alpha, \sum are KEPT.
 const FILTER_COMMANDS: &[&str] = &[
-    "\\mathbf", "\\mathrm", "\\mathnormal", "\\mathit", "\\mathbb",
-    "\\mathcal", "\\mathscr", "\\mathfrak", "\\mathsf", "\\mathtt",
-    "\\textbf", "\\text", "\\boldmath", "\\boldsymbol", "\\operatorname", "\\bm",
-    "\\symbfit", "\\mathbfcal", "\\symbf", "\\scriptscriptstyle", "\\notag",
-    "\\setlength", "\\coloneqq", "\\space", "\\thickspace", "\\thinspace",
-    "\\medspace", "\\nobreakspace", "\\negmedspace",
-    "\\quad", "\\qquad", "\\enspace", "\\substackw",
-    "\\left", "\\right", "\\displaystyle",
+    "\\mathbf",
+    "\\mathrm",
+    "\\mathnormal",
+    "\\mathit",
+    "\\mathbb",
+    "\\mathcal",
+    "\\mathscr",
+    "\\mathfrak",
+    "\\mathsf",
+    "\\mathtt",
+    "\\textbf",
+    "\\text",
+    "\\boldmath",
+    "\\boldsymbol",
+    "\\operatorname",
+    "\\bm",
+    "\\symbfit",
+    "\\mathbfcal",
+    "\\symbf",
+    "\\scriptscriptstyle",
+    "\\notag",
+    "\\setlength",
+    "\\coloneqq",
+    "\\space",
+    "\\thickspace",
+    "\\thinspace",
+    "\\medspace",
+    "\\nobreakspace",
+    "\\negmedspace",
+    "\\quad",
+    "\\qquad",
+    "\\enspace",
+    "\\substackw",
+    "\\left",
+    "\\right",
+    "\\displaystyle",
 ];
 
 /// Strip \[...\] display math wrapper, keeping inner content.
@@ -265,18 +297,39 @@ fn find_matching_brace(s: &str) -> Option<usize> {
 
 /// Map Unicode Greek letters to their LaTeX command form so both normalize identically.
 fn unicode_greek_to_latex(s: &str) -> String {
-    s.replace('α', "\\alpha").replace('β', "\\beta").replace('γ', "\\gamma")
-     .replace('δ', "\\delta").replace('ε', "\\epsilon").replace('ζ', "\\zeta")
-     .replace('η', "\\eta").replace('θ', "\\theta").replace('ι', "\\iota")
-     .replace('κ', "\\kappa").replace('λ', "\\lambda").replace('μ', "\\mu")
-     .replace('ν', "\\nu").replace('ξ', "\\xi").replace('π', "\\pi")
-     .replace('ρ', "\\rho").replace('σ', "\\sigma").replace('τ', "\\tau")
-     .replace('υ', "\\upsilon").replace('φ', "\\phi").replace('χ', "\\chi")
-     .replace('ψ', "\\psi").replace('ω', "\\omega")
-     // Uppercase
-     .replace('Γ', "\\Gamma").replace('Δ', "\\Delta").replace('Θ', "\\Theta")
-     .replace('Λ', "\\Lambda").replace('Π', "\\Pi").replace('Σ', "\\Sigma")
-     .replace('Φ', "\\Phi").replace('Ψ', "\\Psi").replace('Ω', "\\Omega")
+    s.replace('α', "\\alpha")
+        .replace('β', "\\beta")
+        .replace('γ', "\\gamma")
+        .replace('δ', "\\delta")
+        .replace('ε', "\\epsilon")
+        .replace('ζ', "\\zeta")
+        .replace('η', "\\eta")
+        .replace('θ', "\\theta")
+        .replace('ι', "\\iota")
+        .replace('κ', "\\kappa")
+        .replace('λ', "\\lambda")
+        .replace('μ', "\\mu")
+        .replace('ν', "\\nu")
+        .replace('ξ', "\\xi")
+        .replace('π', "\\pi")
+        .replace('ρ', "\\rho")
+        .replace('σ', "\\sigma")
+        .replace('τ', "\\tau")
+        .replace('υ', "\\upsilon")
+        .replace('φ', "\\phi")
+        .replace('χ', "\\chi")
+        .replace('ψ', "\\psi")
+        .replace('ω', "\\omega")
+        // Uppercase
+        .replace('Γ', "\\Gamma")
+        .replace('Δ', "\\Delta")
+        .replace('Θ', "\\Theta")
+        .replace('Λ', "\\Lambda")
+        .replace('Π', "\\Pi")
+        .replace('Σ', "\\Sigma")
+        .replace('Φ', "\\Phi")
+        .replace('Ψ', "\\Psi")
+        .replace('Ω', "\\Omega")
 }
 
 #[cfg(test)]
@@ -302,7 +355,10 @@ mod tests {
     #[test]
     fn test_tokenize_latex() {
         let tokens = tokenize_latex("\\frac{a}{b}+c");
-        assert_eq!(tokens, vec!["\\frac", "{", "a", "}", "{", "b", "}", "+", "c"]);
+        assert_eq!(
+            tokens,
+            vec!["\\frac", "{", "a", "}", "{", "b", "}", "+", "c"]
+        );
 
         let tokens = tokenize_latex("x^{2}+y");
         assert_eq!(tokens, vec!["x", "^", "{", "2", "}", "+", "y"]);
@@ -359,7 +415,10 @@ mod tests {
     #[test]
     fn test_greek_symmetry() {
         // Unicode Greek and LaTeX commands must normalize identically
-        assert_eq!(normalize_formula("\\alpha + \\beta"), normalize_formula("α + β"));
+        assert_eq!(
+            normalize_formula("\\alpha + \\beta"),
+            normalize_formula("α + β")
+        );
         assert_eq!(normalize_formula("\\Gamma"), normalize_formula("Γ"));
     }
 

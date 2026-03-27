@@ -60,7 +60,10 @@ pub fn format_search_result_pipe(result: &SearchResult) -> String {
             .map(|d| d.to_string())
             .unwrap_or_default();
         let doi = paper.doi.as_deref().unwrap_or("-");
-        out.push_str(&format!("{}\t{}\t{}\t{}\n", paper.title, authors, date, doi));
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            paper.title, authors, date, doi
+        ));
     }
     out
 }
@@ -153,8 +156,14 @@ mod tests {
             id: "test-id".into(),
             title: title.into(),
             authors: vec![
-                Author { name: "Smith J".into(), affiliations: vec![] },
-                Author { name: "Zhang Y".into(), affiliations: vec![] },
+                Author {
+                    name: "Smith J".into(),
+                    affiliations: vec![],
+                },
+                Author {
+                    name: "Zhang Y".into(),
+                    affiliations: vec![],
+                },
             ],
             abstract_text: None,
             publication_date: date.map(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap()),
@@ -176,9 +185,11 @@ mod tests {
 
     #[test]
     fn pipe_format_tab_separated() {
-        let result = make_result(vec![
-            make_paper("CRISPR Review", Some("10.1234/test"), Some("2024-06-15")),
-        ]);
+        let result = make_result(vec![make_paper(
+            "CRISPR Review",
+            Some("10.1234/test"),
+            Some("2024-06-15"),
+        )]);
         let out = format_search_result_pipe(&result);
         let fields: Vec<&str> = out.trim().split('\t').collect();
         assert_eq!(fields.len(), 4);
@@ -190,9 +201,7 @@ mod tests {
 
     #[test]
     fn pipe_format_missing_fields() {
-        let result = make_result(vec![
-            make_paper("No DOI Paper", None, None),
-        ]);
+        let result = make_result(vec![make_paper("No DOI Paper", None, None)]);
         let out = format_search_result_pipe(&result);
         let fields: Vec<&str> = out.trim().split('\t').collect();
         assert_eq!(fields[2], ""); // missing date

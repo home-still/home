@@ -20,20 +20,11 @@ pub fn print_summary(results: &EvalResults) {
     println!("Git commit: {}", results.git_commit);
     println!("Samples evaluated: {}", results.num_samples);
     if results.num_failures > 0 {
-        println!(
-            "Failures: {} (scored as zero)",
-            results.num_failures
-        );
+        println!("Failures: {} (scored as zero)", results.num_failures);
     }
     println!("---");
-    println!(
-        "Avg NED:       {:.4} (lower is better)",
-        results.avg_ned
-    );
-    println!(
-        "Avg BLEU-4:    {:.4} (higher is better)",
-        results.avg_bleu
-    );
+    println!("Avg NED:       {:.4} (lower is better)", results.avg_ned);
+    println!("Avg BLEU-4:    {:.4} (higher is better)", results.avg_bleu);
     println!(
         "Avg Composite: {:.2} (higher is better, max 100)",
         results.avg_composite

@@ -62,8 +62,7 @@ pub fn assemble_page_markdown(regions: &[(BBox, String)]) -> String {
                 }
             }
             // Skip classes (defensive — should already be filtered)
-            "header" | "footer" | "header_image" | "footer_image" | "number"
-            | "formula_number" => {
+            "header" | "footer" | "header_image" | "footer_image" | "number" | "formula_number" => {
                 continue;
             }
             // text, abstract, content, reference, reference_content, footnote,

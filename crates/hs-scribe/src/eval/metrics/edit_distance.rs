@@ -41,44 +41,44 @@ pub fn normalize_for_ned(text: &str) -> String {
 
         // Normalize Unicode variants that OCR may produce differently
         l = l
-            .replace('\u{2013}', "-")  // en-dash → hyphen
-            .replace('\u{2014}', "-")  // em-dash → hyphen
-            .replace('\u{2018}', "'")  // left single quote
-            .replace('\u{2019}', "'")  // right single quote / apostrophe
+            .replace('\u{2013}', "-") // en-dash → hyphen
+            .replace('\u{2014}', "-") // em-dash → hyphen
+            .replace('\u{2018}', "'") // left single quote
+            .replace('\u{2019}', "'") // right single quote / apostrophe
             .replace('\u{201C}', "\"") // left double quote
             .replace('\u{201D}', "\"") // right double quote
-            .replace('\u{00A0}', " ")  // non-breaking space
-            .replace('\u{2009}', " ")  // thin space
-            .replace('\u{200B}', "")   // zero-width space
-            .replace('\u{FEFF}', "")   // BOM
-            .replace('\u{00B7}', ".")  // middle dot
-            .replace('\u{2022}', "-")  // bullet
-            .replace('\u{00D7}', "x")  // multiplication sign → x
-            .replace('\u{2212}', "-")  // minus sign → hyphen
+            .replace('\u{00A0}', " ") // non-breaking space
+            .replace('\u{2009}', " ") // thin space
+            .replace('\u{200B}', "") // zero-width space
+            .replace('\u{FEFF}', "") // BOM
+            .replace('\u{00B7}', ".") // middle dot
+            .replace('\u{2022}', "-") // bullet
+            .replace('\u{00D7}', "x") // multiplication sign → x
+            .replace('\u{2212}', "-") // minus sign → hyphen
             .replace('\u{2264}', "<=") // ≤
             .replace('\u{2265}', ">=") // ≥
             .replace('\u{00B1}', "+-") // ±
-            .replace('\u{00AD}', "")   // soft hyphen (PDF line-break hint)
-            .replace('\u{200C}', "")   // zero-width non-joiner
-            .replace('\u{200D}', "")   // zero-width joiner
-            .replace('\u{2002}', " ")  // en space
-            .replace('\u{2003}', " ")  // em space
-            .replace('\u{2004}', " ")  // three-per-em space
-            .replace('\u{2005}', " ")  // four-per-em space
-            .replace('\u{2006}', " ")  // six-per-em space
-            .replace('\u{2007}', " ")  // figure space
+            .replace('\u{00AD}', "") // soft hyphen (PDF line-break hint)
+            .replace('\u{200C}', "") // zero-width non-joiner
+            .replace('\u{200D}', "") // zero-width joiner
+            .replace('\u{2002}', " ") // en space
+            .replace('\u{2003}', " ") // em space
+            .replace('\u{2004}', " ") // three-per-em space
+            .replace('\u{2005}', " ") // four-per-em space
+            .replace('\u{2006}', " ") // six-per-em space
+            .replace('\u{2007}', " ") // figure space
             .replace('\u{2008}', " ") // punctuation space
             // Fullwidth forms → ASCII equivalents
-            .replace('\u{FF08}', "(")  // fullwidth left paren
-            .replace('\u{FF09}', ")")  // fullwidth right paren
-            .replace('\u{FF0C}', ",")  // fullwidth comma
-            .replace('\u{FF0E}', ".")  // fullwidth period
-            .replace('\u{FF1A}', ":")  // fullwidth colon
-            .replace('\u{FF1B}', ";")  // fullwidth semicolon
-            .replace('\u{FF01}', "!")  // fullwidth exclamation
-            .replace('\u{FF1F}', "?")  // fullwidth question mark
-            .replace('\u{3001}', ",")  // ideographic comma
-            .replace('\u{3002}', ".")  // ideographic period
+            .replace('\u{FF08}', "(") // fullwidth left paren
+            .replace('\u{FF09}', ")") // fullwidth right paren
+            .replace('\u{FF0C}', ",") // fullwidth comma
+            .replace('\u{FF0E}', ".") // fullwidth period
+            .replace('\u{FF1A}', ":") // fullwidth colon
+            .replace('\u{FF1B}', ";") // fullwidth semicolon
+            .replace('\u{FF01}', "!") // fullwidth exclamation
+            .replace('\u{FF1F}', "?") // fullwidth question mark
+            .replace('\u{3001}', ",") // ideographic comma
+            .replace('\u{3002}', ".") // ideographic period
             .replace('\u{201E}', "\"") // double low-9 quote
             .replace('\u{2033}', "\"") // double prime → quote
             .replace('\u{2032}', "'"); // prime → apostrophe
@@ -122,31 +122,34 @@ pub fn normalize_for_ned(text: &str) -> String {
 
     // Normalize common OCR confusions that both ref and hyp may have differently
     let joined = joined
-        .replace('\u{FB01}', "fi")   // fi ligature
-        .replace('\u{FB02}', "fl")   // fl ligature
-        .replace('\u{FB00}', "ff")   // ff ligature
-        .replace('\u{FB03}', "ffi")  // ffi ligature
-        .replace('\u{FB04}', "ffl")  // ffl ligature
-        .replace('\u{0152}', "OE")   // Œ
-        .replace('\u{0153}', "oe")   // œ
-        .replace('\u{00C6}', "AE")   // Æ
-        .replace('\u{00E6}', "ae")   // æ
-        .replace('\u{2026}', "...")   // ellipsis
+        .replace('\u{FB01}', "fi") // fi ligature
+        .replace('\u{FB02}', "fl") // fl ligature
+        .replace('\u{FB00}', "ff") // ff ligature
+        .replace('\u{FB03}', "ffi") // ffi ligature
+        .replace('\u{FB04}', "ffl") // ffl ligature
+        .replace('\u{0152}', "OE") // Œ
+        .replace('\u{0153}', "oe") // œ
+        .replace('\u{00C6}', "AE") // Æ
+        .replace('\u{00E6}', "ae") // æ
+        .replace('\u{2026}', "...") // ellipsis
         .replace('\u{00B0}', " deg") // degree sign
         .replace('\u{2103}', " degC") // degree C
-        .replace('\u{00BC}', "1/4")  // ¼
-        .replace('\u{00BD}', "1/2")  // ½
-        .replace('\u{00BE}', "3/4")  // ¾
-        .replace('\u{00B2}', "2")    // superscript 2
-        .replace('\u{00B3}', "3")    // superscript 3
-        .replace('\u{00B9}', "1");   // superscript 1
+        .replace('\u{00BC}', "1/4") // ¼
+        .replace('\u{00BD}', "1/2") // ½
+        .replace('\u{00BE}', "3/4") // ¾
+        .replace('\u{00B2}', "2") // superscript 2
+        .replace('\u{00B3}', "3") // superscript 3
+        .replace('\u{00B9}', "1"); // superscript 1
 
     // No Greek-to-Latin conversion needed: strip_latex maps \alpha → α (Unicode),
     // and is_alphanumeric() keeps Unicode Greek. Aligns with official textblock2unicode()
     // which converts $\alpha$ → α. Missing Greek costs 1 char, not 5 ("alpha").
 
     // Strip all non-word chars: keep alphanumeric + underscore (matches official \w regex)
-    let joined: String = joined.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+    let joined: String = joined
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
 
     // Official clean_string does NOT lowercase — text ED is case-sensitive
     joined
@@ -225,10 +228,27 @@ fn strip_latex(text: &str) -> String {
             // Commands that wrap content — keep the content
             let keep_content = matches!(
                 cmd.as_str(),
-                "mathbf" | "mathrm" | "textbf" | "textit" | "textrm" | "text"
-                    | "mathit" | "boldsymbol" | "operatorname" | "hat" | "bar"
-                    | "tilde" | "vec" | "dot" | "ddot" | "overline" | "underline"
-                    | "sqrt" | "widetilde" | "widehat" | "overleftarrow"
+                "mathbf"
+                    | "mathrm"
+                    | "textbf"
+                    | "textit"
+                    | "textrm"
+                    | "text"
+                    | "mathit"
+                    | "boldsymbol"
+                    | "operatorname"
+                    | "hat"
+                    | "bar"
+                    | "tilde"
+                    | "vec"
+                    | "dot"
+                    | "ddot"
+                    | "overline"
+                    | "underline"
+                    | "sqrt"
+                    | "widetilde"
+                    | "widehat"
+                    | "overleftarrow"
                     | "overrightarrow"
             );
 
@@ -419,10 +439,7 @@ pub fn omnidocbench_text_score(reference: &str, hypothesis: &str) -> f64 {
 /// 3. Reject matches with NED > 0.7 (treat as unmatched)
 /// 4. Fuzzy substring matching for remaining unmatched GT blocks
 /// 5. Final score: (1 - sum(ED)/sum(max_len)) * 100
-pub fn omnidocbench_text_score_blocks(
-    ref_blocks: &[String],
-    hyp_blocks: &[String],
-) -> f64 {
+pub fn omnidocbench_text_score_blocks(ref_blocks: &[String], hyp_blocks: &[String]) -> f64 {
     if ref_blocks.is_empty() && hyp_blocks.is_empty() {
         return 100.0;
     }
@@ -468,7 +485,11 @@ pub fn omnidocbench_text_score_blocks(
     // Performance guard: skip per-block scoring for very large pages.
     // Relaxed to n*m>2500 (50×50) since per-block always improves on concat.
     // The merge step guard (below) separately limits expensive merging.
-    let total_chars: usize = ref_normed.iter().chain(hyp_normed.iter()).map(|s| s.len()).sum();
+    let total_chars: usize = ref_normed
+        .iter()
+        .chain(hyp_normed.iter())
+        .map(|s| s.len())
+        .sum();
     if n * m > 2500 || total_chars > 50000 {
         return concat_score;
     }
@@ -556,7 +577,8 @@ pub fn omnidocbench_text_score_blocks(
                     while offset + win_size <= hyp_chars.len() {
                         let window: String = hyp_chars[offset..offset + win_size].iter().collect();
                         let max_len = ref_len.max(window.len());
-                        let ned = edit_distance::edit_distance(&ref_normed[i], &window) as f64 / max_len as f64;
+                        let ned = edit_distance::edit_distance(&ref_normed[i], &window) as f64
+                            / max_len as f64;
                         if ned < best_ned {
                             best_ned = ned;
                             best_j = Some(j);
@@ -642,14 +664,22 @@ pub fn omnidocbench_text_score_blocks(
 
 /// Compute NED matrix between ref and hyp blocks.
 fn compute_ned_matrix(ref_normed: &[String], hyp_normed: &[String]) -> Vec<Vec<f64>> {
-    ref_normed.iter().map(|r| {
-        hyp_normed.iter().map(|h| {
-            let max_len = r.len().max(h.len());
-            if max_len == 0 { 0.0 } else {
-                edit_distance::edit_distance(r, h) as f64 / max_len as f64
-            }
-        }).collect()
-    }).collect()
+    ref_normed
+        .iter()
+        .map(|r| {
+            hyp_normed
+                .iter()
+                .map(|h| {
+                    let max_len = r.len().max(h.len());
+                    if max_len == 0 {
+                        0.0
+                    } else {
+                        edit_distance::edit_distance(r, h) as f64 / max_len as f64
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Try merging consecutive hyp blocks for ref blocks that have no good single match.
@@ -666,7 +696,11 @@ fn try_merge_consecutive_hyp(
     // Skip merge step for large block counts or long strings.
     // The merge step is O(unmatched_ref * m * max_merge * edit_dist_cost).
     // For 15 blocks of 500 chars each, that's ~15*15*5*500^2 = 28M ops.
-    let total_chars: usize = ref_normed.iter().chain(hyp_normed.iter()).map(|s| s.len()).sum();
+    let total_chars: usize = ref_normed
+        .iter()
+        .chain(hyp_normed.iter())
+        .map(|s| s.len())
+        .sum();
     if n > 50 || m > 50 || total_chars > 50000 {
         let merge_map: Vec<Vec<usize>> = (0..m).map(|i| vec![i]).collect();
         return (hyp_normed.to_vec(), merge_map);
@@ -675,7 +709,12 @@ fn try_merge_consecutive_hyp(
     // Find ref blocks with a good single-block match (NED < 0.25)
     let mut well_matched_hyp: Vec<bool> = vec![false; m];
     for (_i, row) in ned_matrix.iter().enumerate() {
-        if let Some(best) = row.iter().copied().enumerate().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
+        if let Some(best) = row
+            .iter()
+            .copied()
+            .enumerate()
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        {
             if best.1 < 0.25 {
                 well_matched_hyp[best.0] = true;
             }
@@ -709,10 +748,15 @@ fn try_merge_consecutive_hyp(
                 indices.push(end);
 
                 let max_len = ref_normed[i].len().max(merged.len());
-                if max_len == 0 { continue; }
-                let ned = edit_distance::edit_distance(&ref_normed[i], &merged) as f64 / max_len as f64;
+                if max_len == 0 {
+                    continue;
+                }
+                let ned =
+                    edit_distance::edit_distance(&ref_normed[i], &merged) as f64 / max_len as f64;
 
-                if ned < best_single && (best_merge.is_none() || ned < best_merge.as_ref().unwrap().1) {
+                if ned < best_single
+                    && (best_merge.is_none() || ned < best_merge.as_ref().unwrap().1)
+                {
                     best_merge = Some((indices.clone(), ned));
                 }
 
@@ -948,7 +992,11 @@ mod tests {
         let hyp_blocks = vec!["Hello world".to_string(), "this is a test".to_string()];
         let score = omnidocbench_text_score_blocks(&ref_blocks, &hyp_blocks);
         // After merging, should be a near-perfect match
-        assert!(score > 90.0, "Merged blocks should score >90, got {}", score);
+        assert!(
+            score > 90.0,
+            "Merged blocks should score >90, got {}",
+            score
+        );
     }
 
     #[test]
@@ -973,7 +1021,11 @@ mod tests {
             "fourth line".to_string(),
         ];
         let score = omnidocbench_text_score_blocks(&ref_blocks, &hyp_blocks);
-        assert!(score > 80.0, "Finer-grained hyp should still score >80, got {}", score);
+        assert!(
+            score > 80.0,
+            "Finer-grained hyp should still score >80, got {}",
+            score
+        );
     }
 
     #[test]
@@ -985,10 +1037,15 @@ mod tests {
             "over the lazy dog today".to_string(),
         ];
         let hyp_blocks = vec![
-            "The quick brown fox jumps over the lazy dog today and more extra text here".to_string(),
+            "The quick brown fox jumps over the lazy dog today and more extra text here"
+                .to_string(),
         ];
         let score = omnidocbench_text_score_blocks(&ref_blocks, &hyp_blocks);
         // Should find both ref blocks as substrings, scoring much better than block-level NED
-        assert!(score > 40.0, "Substring match should score >40, got {}", score);
+        assert!(
+            score > 40.0,
+            "Substring match should score >40, got {}",
+            score
+        );
     }
 }

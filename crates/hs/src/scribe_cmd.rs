@@ -107,8 +107,8 @@ async fn cmd_convert(
 ) -> Result<()> {
     let url = server.as_deref().unwrap_or(DEFAULT_SERVER);
     let client = hs_scribe::client::ScribeClient::new(url);
-    let pdf_bytes = std::fs::read(&input)
-        .with_context(|| format!("Cannot read {}", input.display()))?;
+    let pdf_bytes =
+        std::fs::read(&input).with_context(|| format!("Cannot read {}", input.display()))?;
 
     let stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
         Arc::new(reporter.begin_counted_stage("Converting", None));
@@ -192,7 +192,11 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         }
     }
 
-    eprintln!("       OK ({} {})", compose.bin, compose.args_prefix.join(" "));
+    eprintln!(
+        "       OK ({} {})",
+        compose.bin,
+        compose.args_prefix.join(" ")
+    );
 
     // Step 2: Detect GPU
     eprintln!("[2/5] Detecting GPU...");
@@ -272,7 +276,9 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
     eprintln!("       Waiting for Ollama...");
     wait_for_ollama(&compose, cf, 60).await?;
     eprintln!("       Pulling GLM-OCR model (first run downloads ~2.5GB)...");
-    let pull_status = compose.exec_run(cf, "vlm", &["ollama", "pull", "glm-ocr"]).await?;
+    let pull_status = compose
+        .exec_run(cf, "vlm", &["ollama", "pull", "glm-ocr"])
+        .await?;
     if !pull_status.success() {
         anyhow::bail!("Failed to pull glm-ocr model into Ollama");
     }
@@ -295,7 +301,8 @@ async fn cmd_server(action: ServerAction) -> Result<()> {
     if !compose_path.exists() {
         anyhow::bail!("No compose config found. Run `hs scribe init` first.");
     }
-    let compose = ComposeCmd::detect().await
+    let compose = ComposeCmd::detect()
+        .await
         .ok_or_else(|| anyhow::anyhow!("No container runtime found"))?;
     let cf = compose_path.to_str().unwrap_or_default();
 
@@ -412,7 +419,12 @@ impl ComposeCmd {
     }
 
     /// Run "exec <service> <cmd...>" via compose
-    async fn exec_run(&self, compose_file: &str, service: &str, cmd: &[&str]) -> Result<std::process::ExitStatus> {
+    async fn exec_run(
+        &self,
+        compose_file: &str,
+        service: &str,
+        cmd: &[&str],
+    ) -> Result<std::process::ExitStatus> {
         let mut args = vec!["-f", compose_file, "exec", service];
         args.extend_from_slice(cmd);
         self.run(&args).await
@@ -446,13 +458,20 @@ async fn health_check(server_url: &str) -> Result<hs_scribe::client::HealthRespo
     client.health().await
 }
 
-async fn wait_for_ollama(compose: &ComposeCmd, compose_file: &str, timeout_secs: u64) -> Result<()> {
+async fn wait_for_ollama(
+    compose: &ComposeCmd,
+    compose_file: &str,
+    timeout_secs: u64,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
     loop {
         if tokio::time::Instant::now() > deadline {
             anyhow::bail!("Timed out waiting for Ollama to start");
         }
-        if compose.run_silent(&["-f", compose_file, "exec", "vlm", "ollama", "list"]).await {
+        if compose
+            .run_silent(&["-f", compose_file, "exec", "vlm", "ollama", "list"])
+            .await
+        {
             return Ok(());
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;

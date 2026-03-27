@@ -68,10 +68,7 @@ fn write_tmp_pdf(pdf_bytes: &[u8]) -> Result<tempfile::NamedTempFile, Response> 
     Ok(tmp)
 }
 
-async fn handle_scribe(
-    State(state): State<Arc<ServerState>>,
-    multipart: Multipart,
-) -> Response {
+async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipart) -> Response {
     let pdf_bytes = match extract_pdf(multipart).await {
         Ok(b) => b,
         Err(resp) => return resp,
