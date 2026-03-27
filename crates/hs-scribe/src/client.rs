@@ -76,13 +76,15 @@ impl ScribeClient {
     }
 
     /// Convert a PDF with streaming progress updates via NDJSON.
+    /// Falls back to the plain `/scribe` endpoint if the server doesn't
+    /// support streaming (404).
     pub async fn convert_with_progress(
         &self,
         pdf_bytes: Vec<u8>,
         on_progress: impl Fn(ProgressEvent),
     ) -> Result<String> {
         let url = format!("{}/scribe/stream", self.server_url);
-        let part = reqwest::multipart::Part::bytes(pdf_bytes).file_name("input.pdf");
+        let part = reqwest::multipart::Part::bytes(pdf_bytes.clone()).file_name("input.pdf");
         let form = reqwest::multipart::Form::new().part("pdf", part);
 
         let mut resp = self
@@ -92,6 +94,11 @@ impl ScribeClient {
             .send()
             .await
             .context("Failed to send PDF")?;
+
+        // Server doesn't support streaming — fall back to plain endpoint
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return self.convert(pdf_bytes).await;
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
