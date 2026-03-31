@@ -11,8 +11,6 @@ const MIN_PREFIX_WIDTH: usize = 30;
 // Reserve space for the right-side info: {bytes:>10}/{total_bytes:<10} {msg}
 // 10 + 1 + 10 + 1 + ~10 (msg like "  3.6 MB") + padding = ~35
 const RIGHT_SIDE_COLS: usize = 35;
-// Compact prefix width for status verbs / spinners (matches status() right-align width)
-const SPINNER_PREFIX_WIDTH: usize = 12;
 const SPINNER_TICK_MS: u64 = 120;
 
 const PROGRESS_BAR_CHARS: &str = "-> ";
@@ -70,10 +68,11 @@ impl Reporter for TtyReporter {
     }
 
     fn begin_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
+        let prefix_width = bar_prefix_width();
+        let truncated_title = truncate_name(name, prefix_width);
+
         match total {
             Some(len) => {
-                let prefix_width = bar_prefix_width();
-                let truncated_title = truncate_name(name, prefix_width);
                 let pb = self.mp.add(ProgressBar::new(len));
                 let template = if self.use_color {
                     format!("{{prefix:{prefix_width}}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
@@ -96,32 +95,37 @@ impl Reporter for TtyReporter {
                 })
             }
             None => {
-                let spw = SPINNER_PREFIX_WIDTH;
                 let pb = self.mp.add(ProgressBar::new_spinner());
                 let template = if self.use_color {
-                    format!("{{prefix:>{spw}.bold.green}} {{spinner:.cyan}} {{msg}}")
+                    format!("{{prefix:{prefix_width}}} {{spinner:.cyan}} {{msg}}")
                 } else {
-                    format!("{{prefix:>{spw}}} {{spinner}} {{msg}}")
+                    format!("{{prefix:{prefix_width}}} {{spinner}} {{msg}}")
                 };
                 pb.set_style(make_spinner_style(&template));
-                pb.set_prefix(truncate_name(name, spw));
+                let initial = if self.use_color {
+                    color_split_prefix(&truncated_title, 0.0, prefix_width)
+                } else {
+                    truncated_title.clone()
+                };
+                pb.set_prefix(initial);
                 pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
                 Box::new(IndicatifStageHandle {
                     pb,
                     use_color: self.use_color,
-                    prefix_width: bar_prefix_width(),
+                    prefix_width,
                     counted: false,
-                    title: truncate_name(name, bar_prefix_width()),
+                    title: truncated_title,
                 })
             }
         }
     }
 
     fn begin_counted_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
+        let prefix_width = bar_prefix_width();
+        let truncated_title = truncate_name(name, prefix_width);
+
         match total {
             Some(len) => {
-                let prefix_width = bar_prefix_width();
-                let truncated_title = truncate_name(name, prefix_width);
                 let pb = self.mp.add(ProgressBar::new(len));
                 let template = if self.use_color {
                     format!("{{prefix:{prefix_width}}} {{pos:>5}}/{{len:<5}} {{msg}}")
@@ -144,22 +148,26 @@ impl Reporter for TtyReporter {
                 })
             }
             None => {
-                let spw = SPINNER_PREFIX_WIDTH;
                 let pb = self.mp.add(ProgressBar::new_spinner());
                 let template = if self.use_color {
-                    format!("{{prefix:>{spw}.bold.green}} {{spinner:.cyan}} {{msg}}")
+                    format!("{{prefix:{prefix_width}}} {{spinner:.cyan}} {{msg}}")
                 } else {
-                    format!("{{prefix:>{spw}}} {{spinner}} {{msg}}")
+                    format!("{{prefix:{prefix_width}}} {{spinner}} {{msg}}")
                 };
                 pb.set_style(make_spinner_style(&template));
-                pb.set_prefix(truncate_name(name, spw));
+                let initial = if self.use_color {
+                    color_split_prefix(&truncated_title, 0.0, prefix_width)
+                } else {
+                    truncated_title.clone()
+                };
+                pb.set_prefix(initial);
                 pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
                 Box::new(IndicatifStageHandle {
                     pb,
                     use_color: self.use_color,
-                    prefix_width: bar_prefix_width(),
+                    prefix_width,
                     counted: true,
-                    title: truncate_name(name, bar_prefix_width()),
+                    title: truncated_title,
                 })
             }
         }
