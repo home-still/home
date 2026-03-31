@@ -34,13 +34,18 @@ impl ArxivProvider {
             _ => "all:",
         };
 
-        let search_query = query
-            .query
-            .split_whitespace()
-            .map(|term| format!("{}{}", search_prefix, term))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-
+        let search_query = if super::query_utils::is_phrase_query(&query.query) {
+            // Send multi-wrd queries as a quoted phrase: all:"autistic female"
+            format!("{}\"{}\"", search_prefix, query.query)
+        } else {
+            // Single word or explicit boolean: split and prefix each term
+            query
+                .query
+                .split_whitespace()
+                .map(|term| format!("{}{}", search_prefix, term))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
         let search_query = if let Some(ref df) = query.date_filter {
             let from = df
                 .after
@@ -225,6 +230,7 @@ impl PaperProvider for ArxivProvider {
             offset: 0,
             date_filter: None,
             sort_by: SortBy::default(),
+            min_citations: None,
         };
 
         let result = self.search_by_query(&query).await?;
@@ -252,6 +258,7 @@ mod tests {
             offset: 0,
             date_filter: None,
             sort_by: SortBy::default(),
+            min_citations: None,
         };
         let url = p.build_search_url(&query).expect("Failed to build URL");
         assert!(url.contains("search_query=ti%3A"));

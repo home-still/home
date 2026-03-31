@@ -1,9 +1,8 @@
 // Aggregating search service — fan-out, dedup, merge, rank
+use async_trait::async_trait;
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
-
-use crate::aggregation::{dedup, merge, ranking};
+use crate::aggregation::{dedup, merge, quality, ranking};
 use crate::error::PaperError;
 use crate::models::{Paper, SearchQuery, SearchResult, SearchType};
 use crate::ports::provider::PaperProvider;
@@ -82,7 +81,19 @@ impl PaperProvider for AggregateProvider {
         // Dedup --> merge --> rank
         let (groups, _stats) = dedup::deduplicate(source_results);
         let merged: Vec<Paper> = groups.iter().map(merge::merge_group).collect();
-        let ranked = ranking::rank_papers(&groups, merged);
+        let ranked = ranking::rank_papers(&groups, merged, &query.query);
+        let ranked = quality::filter_quality(ranked);
+        let ranked: Vec<_> = if let Some(min) = query.min_citations {
+            ranked
+                .into_iter()
+                .filter(|rp| match rp.paper.cited_by_count {
+                    Some(count) => count >= min,
+                    None => true, // Unknown citation count, keep the paper
+                })
+                .collect()
+        } else {
+            ranked
+        };
 
         // Convert back to Papers, truncate to max_results
         let papers: Vec<Paper> = ranked

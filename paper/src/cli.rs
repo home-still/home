@@ -38,6 +38,10 @@ pub enum PaperCmd {
         /// Sort result by: relevance (default), date, citations
         #[arg(short = 's', long = "sort", default_value = "relevance")]
         sort_by: SortByArg,
+
+        /// Minimum citation count to include a result
+        #[arg(long)]
+        min_citations: Option<u64>,
     },
     /// Get a single paper by DOI
     ///

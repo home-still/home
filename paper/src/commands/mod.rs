@@ -28,6 +28,7 @@ pub async fn dispatch(
             offset,
             provider,
             sort_by,
+            min_citations,
         } => {
             paper::run_search(
                 query,
@@ -38,6 +39,7 @@ pub async fn dispatch(
                 offset,
                 provider,
                 show_abstract,
+                min_citations,
                 global,
                 reporter,
                 styles,

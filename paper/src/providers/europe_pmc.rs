@@ -115,7 +115,7 @@ impl EuropePmcProvider {
         let search_query = match query.search_type {
             SearchType::Title => format!("TITLE:\"{}\"", query.query),
             SearchType::Author => format!("AUTH:\"{}\"", query.query),
-            _ => query.query.clone(),
+            _ => super::query_utils::maybe_quote_phrase(&query.query),
         };
 
         let search_query = if let Some(ref df) = query.date_filter {

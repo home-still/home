@@ -95,7 +95,7 @@ impl CoreProvider {
         let q = match query.search_type {
             SearchType::Title => format!("title:\"{}\"", query.query),
             SearchType::Author => format!("authors:\"{}\"", query.query),
-            _ => query.query.clone(),
+            _ => super::query_utils::maybe_quote_phrase(&query.query),
         };
 
         // Date filter (year-only precision) — must come before q moves into params

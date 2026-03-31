@@ -165,6 +165,7 @@ pub struct SearchQuery {
     pub offset: usize,
     pub date_filter: Option<DateFilter>,
     pub sort_by: SortBy,
+    pub min_citations: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

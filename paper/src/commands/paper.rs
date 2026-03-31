@@ -38,6 +38,7 @@ pub async fn run_search(
     offset: usize,
     provider: ProviderArg,
     show_abstract: bool,
+    min_citations: Option<u64>,
     global: &GlobalArgs,
     reporter: &Arc<dyn Reporter>,
     styles: &Styles,
@@ -69,6 +70,7 @@ pub async fn run_search(
         offset,
         date_filter,
         sort_by: sort_by.into(),
+        min_citations,
     };
 
     let result = provider
@@ -203,6 +205,7 @@ pub async fn run_download(
             offset: 0,
             date_filter,
             sort_by: SortBy::default(),
+            min_citations: None,
         };
 
         let search_result = provider_impl
