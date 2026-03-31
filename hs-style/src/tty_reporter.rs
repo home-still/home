@@ -68,22 +68,26 @@ impl Reporter for TtyReporter {
     }
 
     fn begin_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
-        let prefix_width = bar_prefix_width();
-        let truncated_title = truncate_name(name, prefix_width);
+        let title = sanitize_name(name);
+        let title_width = display_width(&title);
+        let min_width = bar_prefix_width();
+        // Use the larger of title width or min_width for consistent alignment
+        let prefix_width = title_width.max(min_width);
+        let padded_title = pad_to_width(&title, prefix_width);
 
         match total {
             Some(len) => {
                 let pb = self.mp.add(ProgressBar::new(len));
                 let template = if self.use_color {
-                    format!("{{prefix:{prefix_width}}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
+                    format!("{{prefix}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
                 } else {
-                    format!("{{prefix:{prefix_width}}} {{wide_bar}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
+                    format!("{{prefix}} {{wide_bar}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
                 };
                 pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
                 let initial = if self.use_color {
-                    color_split_prefix(&truncated_title, 0.0, prefix_width)
+                    color_split_prefix(&padded_title, 0.0, prefix_width)
                 } else {
-                    truncated_title.clone()
+                    padded_title.clone()
                 };
                 pb.set_prefix(initial);
                 Box::new(IndicatifStageHandle {
@@ -91,21 +95,21 @@ impl Reporter for TtyReporter {
                     use_color: self.use_color,
                     prefix_width,
                     counted: false,
-                    title: truncated_title,
+                    title: padded_title,
                 })
             }
             None => {
                 let pb = self.mp.add(ProgressBar::new_spinner());
                 let template = if self.use_color {
-                    format!("{{prefix:{prefix_width}}} {{spinner:.cyan}} {{msg}}")
+                    format!("{{prefix}} {{spinner:.cyan}} {{msg}}")
                 } else {
-                    format!("{{prefix:{prefix_width}}} {{spinner}} {{msg}}")
+                    format!("{{prefix}} {{spinner}} {{msg}}")
                 };
                 pb.set_style(make_spinner_style(&template));
                 let initial = if self.use_color {
-                    color_split_prefix(&truncated_title, 0.0, prefix_width)
+                    color_split_prefix(&padded_title, 0.0, prefix_width)
                 } else {
-                    truncated_title.clone()
+                    padded_title.clone()
                 };
                 pb.set_prefix(initial);
                 pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
@@ -114,29 +118,32 @@ impl Reporter for TtyReporter {
                     use_color: self.use_color,
                     prefix_width,
                     counted: false,
-                    title: truncated_title,
+                    title: padded_title,
                 })
             }
         }
     }
 
     fn begin_counted_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
-        let prefix_width = bar_prefix_width();
-        let truncated_title = truncate_name(name, prefix_width);
+        let title = sanitize_name(name);
+        let title_width = display_width(&title);
+        let min_width = bar_prefix_width();
+        let prefix_width = title_width.max(min_width);
+        let padded_title = pad_to_width(&title, prefix_width);
 
         match total {
             Some(len) => {
                 let pb = self.mp.add(ProgressBar::new(len));
                 let template = if self.use_color {
-                    format!("{{prefix:{prefix_width}}} {{pos:>5}}/{{len:<5}} {{msg}}")
+                    format!("{{prefix}} {{pos:>5}}/{{len:<5}} {{msg}}")
                 } else {
-                    format!("{{prefix:{prefix_width}}} {{wide_bar}} {{pos:>5}}/{{len:<5}} {{msg}}")
+                    format!("{{prefix}} {{wide_bar}} {{pos:>5}}/{{len:<5}} {{msg}}")
                 };
                 pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
                 let initial = if self.use_color {
-                    color_split_prefix(&truncated_title, 0.0, prefix_width)
+                    color_split_prefix(&padded_title, 0.0, prefix_width)
                 } else {
-                    truncated_title.clone()
+                    padded_title.clone()
                 };
                 pb.set_prefix(initial);
                 Box::new(IndicatifStageHandle {
@@ -144,21 +151,21 @@ impl Reporter for TtyReporter {
                     use_color: self.use_color,
                     prefix_width,
                     counted: true,
-                    title: truncated_title,
+                    title: padded_title,
                 })
             }
             None => {
                 let pb = self.mp.add(ProgressBar::new_spinner());
                 let template = if self.use_color {
-                    format!("{{prefix:{prefix_width}}} {{spinner:.cyan}} {{msg}}")
+                    format!("{{prefix}} {{spinner:.cyan}} {{msg}}")
                 } else {
-                    format!("{{prefix:{prefix_width}}} {{spinner}} {{msg}}")
+                    format!("{{prefix}} {{spinner}} {{msg}}")
                 };
                 pb.set_style(make_spinner_style(&template));
                 let initial = if self.use_color {
-                    color_split_prefix(&truncated_title, 0.0, prefix_width)
+                    color_split_prefix(&padded_title, 0.0, prefix_width)
                 } else {
-                    truncated_title.clone()
+                    padded_title.clone()
                 };
                 pb.set_prefix(initial);
                 pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
@@ -167,7 +174,7 @@ impl Reporter for TtyReporter {
                     use_color: self.use_color,
                     prefix_width,
                     counted: true,
-                    title: truncated_title,
+                    title: padded_title,
                 })
             }
         }
@@ -196,17 +203,16 @@ impl StageHandle for IndicatifStageHandle {
     fn set_length(&self, total: u64) {
         self.pb.disable_steady_tick();
         self.pb.set_length(total);
-        let pw = self.prefix_width;
         let template = if self.counted {
             if self.use_color {
-                format!("{{prefix:{pw}}} {{pos:>5}}/{{len:<5}} {{msg}}")
+                "{{prefix}} {{pos:>5}}/{{len:<5}} {{msg}}".to_string()
             } else {
-                format!("{{prefix:{pw}}} {{wide_bar}} {{pos:>5}}/{{len:<5}} {{msg}}")
+                "{{prefix}} {{wide_bar}} {{pos:>5}}/{{len:<5}} {{msg}}".to_string()
             }
         } else if self.use_color {
-            format!("{{prefix:{pw}}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
+            "{{prefix}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}".to_string()
         } else {
-            format!("{{prefix:{pw}}} {{wide_bar}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
+            "{{prefix}} {{wide_bar}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}".to_string()
         };
         self.pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
 
@@ -261,49 +267,33 @@ impl StageHandle for IndicatifStageHandle {
     }
 
     fn finish_failed(&self, msg: &str) {
-        let pw = self.prefix_width;
-        let term_width = terminal_size::terminal_size()
-            .map(|(w, _)| w.0 as usize)
-            .unwrap_or(DEFAULT_TERM_WIDTH);
-        let max_msg = term_width.saturating_sub(pw + 1);
-        let truncated = if msg.len() > max_msg {
-            format!("{}...", &msg[..max_msg.saturating_sub(3)])
-        } else {
-            String::from(msg)
-        };
-
         if self.use_color {
-            let red_prefix = color_full_prefix(&self.title, ANSI_BOLD_RED, pw);
+            let red_prefix = color_full_prefix(&self.title, ANSI_BOLD_RED, self.prefix_width);
             self.pb.set_prefix(red_prefix);
-            let template = format!("{{prefix:{pw}}} {{msg}}");
             self.pb.set_style(
-                ProgressStyle::with_template(&template)
+                ProgressStyle::with_template("{prefix} {msg}")
                     .unwrap_or_else(|_| ProgressStyle::default_bar()),
             );
         } else {
-            let template = format!("{{prefix:{pw}}} FAILED: {{msg}}");
             self.pb.set_style(
-                ProgressStyle::with_template(&template)
+                ProgressStyle::with_template("{prefix} FAILED: {msg}")
                     .unwrap_or_else(|_| ProgressStyle::default_bar()),
             );
         }
-        self.pb.finish_with_message(truncated);
+        self.pb.finish_with_message(String::from(msg));
     }
 
     fn finish_skipped(&self, msg: &str) {
-        let pw = self.prefix_width;
         if self.use_color {
-            let blue_prefix = color_full_prefix(&self.title, ANSI_BLUE, pw);
+            let blue_prefix = color_full_prefix(&self.title, ANSI_BLUE, self.prefix_width);
             self.pb.set_prefix(blue_prefix);
-            let template = format!("{{prefix:{pw}}} {{msg:.blue}}");
             self.pb.set_style(
-                ProgressStyle::with_template(&template)
+                ProgressStyle::with_template("{prefix} {msg:.blue}")
                     .unwrap_or_else(|_| ProgressStyle::default_bar()),
             );
         } else {
-            let template = format!("{{prefix:{pw}}} SKIPPED: {{msg}}");
             self.pb.set_style(
-                ProgressStyle::with_template(&template)
+                ProgressStyle::with_template("{prefix} SKIPPED: {msg}")
                     .unwrap_or_else(|_| ProgressStyle::default_bar()),
             );
         }
@@ -328,51 +318,29 @@ pub fn bar_prefix_width() -> usize {
     term_width.saturating_sub(RIGHT_SIDE_COLS).max(MIN_PREFIX_WIDTH)
 }
 
-/// Truncate a name to fit within `max` display columns, using unicode-aware
-/// width measurement. Always pads with trailing spaces to exactly `max` columns.
-fn truncate_name(name: &str, max: usize) -> String {
-    // Sanitize control characters (newlines, tabs, etc.) to spaces
-    let name: String = name
-        .chars()
+/// Sanitize control characters in a name (newlines, tabs, etc.) to spaces.
+fn sanitize_name(name: &str) -> String {
+    name.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let name = name.as_str();
+        .collect()
+}
 
-    // First pass: check if the name fits as-is
-    let total_width: usize = name.chars().map(|c| c.width().unwrap_or(0)).sum();
-    if total_width <= max {
-        let mut result = String::from(name);
-        let mut w = total_width;
-        while w < max {
-            result.push(' ');
-            w += 1;
-        }
-        return result;
+/// Calculate the display width of a string in terminal columns.
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Pad a string with trailing spaces to reach exactly `target_width` display columns.
+/// If the string is already wider, returns it unchanged.
+fn pad_to_width(s: &str, target_width: usize) -> String {
+    let w = display_width(s);
+    if w >= target_width {
+        return String::from(s);
     }
-
-    // Name is too long — truncate and add ellipsis
-    let mut result = String::new();
-    let mut width = 0;
-    let ellipsis_width = 1; // '…' is 1 column
-
-    for ch in name.chars() {
-        let ch_width = ch.width().unwrap_or(0);
-        if width + ch_width + ellipsis_width > max {
-            break;
-        }
-        result.push(ch);
-        width += ch_width;
-    }
-
-    result.push('\u{2026}'); // …
-    width += ellipsis_width;
-
-    // Pad to exact width (needed if a 2-col char was skipped)
-    while width < max {
+    let mut result = String::from(s);
+    for _ in 0..(target_width - w) {
         result.push(' ');
-        width += 1;
     }
-
     result
 }
 

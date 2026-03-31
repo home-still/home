@@ -23,8 +23,8 @@ pub enum PaperCmd {
         #[arg(short = 'd', long = "date")]
         date: Option<String>,
 
-        /// Maximum number of results (1-100)
-        #[arg(short = 'n', long, default_value = "10", value_parser = clap::value_parser!(u16).range(1..=100))]
+        /// Maximum number of results
+        #[arg(short = 'n', long, default_value = "10")]
         max_results: u16,
 
         /// Pagination offset
@@ -73,8 +73,8 @@ pub enum PaperCmd {
         #[arg(long, conflicts_with = "query")]
         doi: Option<String>,
 
-        /// Maximum number of papers to download (1-100)
-        #[arg(short = 'n', long, default_value = "10", value_parser = clap::value_parser!(u16).range(1..=100))]
+        /// Maximum number of papers to download
+        #[arg(short = 'n', long, default_value = "10")]
         max_results: u16,
 
         /// Maximum concurrent downloads

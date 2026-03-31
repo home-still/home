@@ -7,8 +7,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::models::SearchQuery;
-use crate::models::SortBy;
+use crate::models::{Paper, SearchQuery, SearchResult, SortBy};
 use crate::ports::provider::PaperProvider;
 use crate::providers::arxiv::ArxivProvider;
 use crate::providers::core::CoreProvider;
@@ -198,10 +197,12 @@ pub async fn run_download(
 
         let date_filter = parse_date_arg(date)?;
 
+        // Over-request by 50% to compensate for papers without download URLs
+        let fetch_count = (max_results as usize).saturating_mul(3) / 2;
         let search_query = SearchQuery {
             query: query_str,
             search_type: search_type.into(),
-            max_results: max_results as usize,
+            max_results: fetch_count,
             offset: 0,
             date_filter,
             sort_by: SortBy::default(),
@@ -215,8 +216,8 @@ pub async fn run_download(
 
         search_stage.finish_and_clear();
 
-        let paper_count = search_result.papers.len();
-        if paper_count == 0 {
+        let total_found = search_result.papers.len();
+        if total_found == 0 {
             reporter.warn("No papers found.");
             if !matches!(provider, ProviderArg::All) {
                 reporter.warn("Try --provider all to search all sources.");
@@ -224,13 +225,49 @@ pub async fn run_download(
             return Ok(());
         }
 
-        reporter.status(
-            "Found",
-            &format!(
-                "{} papers, downloading (concurrency={})...",
-                paper_count, concurrency
-            ),
-        );
+        // Filter out papers with no download path (no URLs and no DOI),
+        // then cap to the requested max_results
+        let downloadable: Vec<Paper> = search_result
+            .papers
+            .into_iter()
+            .filter(|p| !p.download_urls.is_empty() || p.doi.is_some())
+            .take(max_results as usize)
+            .collect();
+
+        let skipped_count = total_found - downloadable.len();
+        if downloadable.is_empty() {
+            reporter.warn(&format!(
+                "Found {} papers but none have download URLs or DOIs.",
+                total_found
+            ));
+            return Ok(());
+        }
+
+        if skipped_count > 0 {
+            reporter.status(
+                "Found",
+                &format!(
+                    "{} downloadable papers ({} without URLs skipped), downloading (concurrency={})...",
+                    downloadable.len(), skipped_count, concurrency
+                ),
+            );
+        } else {
+            reporter.status(
+                "Found",
+                &format!(
+                    "{} papers, downloading (concurrency={})...",
+                    downloadable.len(), concurrency
+                ),
+            );
+        }
+
+        // Replace search_result.papers with filtered list
+        let search_result = SearchResult {
+            papers: downloadable,
+            total_results: search_result.total_results,
+            next_offset: search_result.next_offset,
+            provider: search_result.provider,
+        };
 
         let bars: Arc<Mutex<HashMap<usize, Box<dyn hs_style::reporter::StageHandle>>>> =
             Arc::new(Mutex::new(HashMap::new()));
