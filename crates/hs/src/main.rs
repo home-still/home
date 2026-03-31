@@ -50,12 +50,22 @@ fn main() -> ExitCode {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio  runtime");
 
     let result = rt.block_on(async {
-        match cli.command {
-            TopCmd::Paper { command } => {
-                paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode).await
+        let work = async {
+            match cli.command {
+                TopCmd::Paper { command } => {
+                    paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode).await
+                }
+                TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
+                TopCmd::Scribe { command } => scribe_cmd::dispatch(command, &reporter).await,
             }
-            TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
-            TopCmd::Scribe { command } => scribe_cmd::dispatch(command, &reporter).await,
+        };
+
+        tokio::select! {
+            result = work => result,
+            _ = tokio::signal::ctrl_c() => {
+                reporter.finish("");
+                Err(anyhow::anyhow!("interrupted"))
+            }
         }
     });
 

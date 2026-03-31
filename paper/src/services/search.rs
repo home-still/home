@@ -21,7 +21,7 @@ impl AggregateProvider {
 #[async_trait]
 impl PaperProvider for AggregateProvider {
     fn name(&self) -> &'static str {
-        "aggregate"
+        "all providers"
     }
 
     fn priority(&self) -> u8 {
@@ -106,7 +106,7 @@ impl PaperProvider for AggregateProvider {
             papers,
             total_results,
             next_offset: None,
-            provider: String::from("aggregate"),
+            provider: String::from("all providers"),
         })
     }
 

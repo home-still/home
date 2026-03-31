@@ -48,7 +48,7 @@ pub async fn run_search(
     let provider = make_provider(&provider, &config)?;
 
     let stage = reporter.begin_stage("Searching", None);
-    stage.set_message(&format!("{} for:{}", provider.name(), query));
+    stage.set_message(&format!("{} for '{}'", provider.name(), query));
     let date_filter = parse_date_arg(date)?;
 
     if looks_like_doi(&query) {
@@ -194,7 +194,7 @@ pub async fn run_download(
         let provider_impl = make_provider(&provider, &config)?;
 
         let search_stage = reporter.begin_stage("Searching", None);
-        search_stage.set_message(&format!("{} for {}", provider_impl.name(), query_str));
+        search_stage.set_message(&format!("{} for '{}'", provider_impl.name(), query_str));
 
         let date_filter = parse_date_arg(date)?;
 

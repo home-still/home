@@ -1213,6 +1213,7 @@ dependencies = [
  "owo-colors",
  "supports-color 3.0.2",
  "terminal_size",
+ "unicode-width",
 ]
 
 [[package]]
