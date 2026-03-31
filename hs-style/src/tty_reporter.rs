@@ -205,14 +205,14 @@ impl StageHandle for IndicatifStageHandle {
         self.pb.set_length(total);
         let template = if self.counted {
             if self.use_color {
-                "{{prefix}} {{pos:>5}}/{{len:<5}} {{msg}}".to_string()
+                "{prefix} {pos:>5}/{len:<5} {msg}".to_string()
             } else {
-                "{{prefix}} {{wide_bar}} {{pos:>5}}/{{len:<5}} {{msg}}".to_string()
+                "{prefix} {wide_bar} {pos:>5}/{len:<5} {msg}".to_string()
             }
         } else if self.use_color {
-            "{{prefix}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}".to_string()
+            "{prefix} {bytes:>10}/{total_bytes:<10} {msg}".to_string()
         } else {
-            "{{prefix}} {{wide_bar}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}".to_string()
+            "{prefix} {wide_bar} {bytes:>10}/{total_bytes:<10} {msg}".to_string()
         };
         self.pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
 
