@@ -136,62 +136,70 @@ jobs:
           draft: false
           fail_on_unmatched_files: true
 
-  docker:
-    name: Publish Docker Image
+  docker-amd64:
+    name: Docker (amd64)
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/setup-qemu-action@v3
-
       - uses: docker/setup-buildx-action@v3
-
-      # Pre-built amd64 binary avoids Rust compilation in Docker for that arch
       - uses: actions/download-artifact@v4
         with:
           name: scribe-x86_64-unknown-linux-gnu
           path: docker-context/amd64/
-
-      - name: Stage amd64 binary
-        run: chmod +x docker-context/amd64/hs-scribe-server
-
-      # Build amd64 image from pre-built binary (fast, no Rust compile)
+      - run: chmod +x docker-context/amd64/hs-scribe-server
       - uses: docker/build-push-action@v5
         with:
           context: docker-context
           file: crates/hs-scribe/docker/Dockerfile.prebuilt
           platforms: linux/amd64
           push: true
-          tags: |
-            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-amd64
+          cache-from: type=gha,scope=docker-amd64
+          cache-to: type=gha,mode=max,scope=docker-amd64
 
-      # Build arm64 image from source via QEMU (ort-sys C++ deps prevent cross-compile)
+  docker-arm64:
+    name: Docker (arm64)
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v5
         with:
           context: .
           file: crates/hs-scribe/docker/Dockerfile
           platforms: linux/arm64
           push: true
-          tags: |
-            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-arm64
+          cache-from: type=gha,scope=docker-arm64
+          cache-to: type=gha,mode=max,scope=docker-arm64
 
-      # Create multi-arch manifest combining both images
+  docker-manifest:
+    name: Docker Manifest
+    needs: [docker-amd64, docker-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
       - name: Create multi-arch manifest
         run: |
-          docker buildx imagetools create -t ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }} \
-            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-amd64 \
-            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-arm64
-          docker buildx imagetools create -t ghcr.io/home-still/hs-scribe-server:latest \
+          docker buildx imagetools create \
+            -t ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }} \
+            -t ghcr.io/home-still/hs-scribe-server:latest \
             ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-amd64 \
             ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-arm64
