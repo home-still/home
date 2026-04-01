@@ -13,7 +13,7 @@ const MIN_PREFIX_WIDTH: usize = 30;
 const MAX_PREFIX_WIDTH: usize = 120;
 const SPINNER_TICK_MS: u64 = 120;
 
-const PROGRESS_BAR_CHARS: &str = "-> ";
+const PROGRESS_BAR_CHARS: &str = "━╸ ";
 
 // ANSI escape codes for title-as-progress coloring
 const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
@@ -121,8 +121,12 @@ impl Reporter for TtyReporter {
     }
 
     fn begin_counted_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
-        let prefix_width = bar_prefix_width();
-        let title = truncate_to_width(&sanitize_name(name), prefix_width);
+        // Counted stages (e.g. "Downloading", "Converting") use a compact prefix
+        // so the wide_bar gets more screen space
+        let clean = sanitize_name(name);
+        let name_width = display_width(&clean);
+        let prefix_width = name_width.max(MIN_PREFIX_WIDTH);
+        let title = truncate_to_width(&clean, prefix_width);
 
         match total {
             Some(len) => {
