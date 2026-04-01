@@ -103,6 +103,12 @@ impl ScribeClient {
 
         // Server doesn't support streaming — fall back to plain endpoint
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            on_progress(ProgressEvent {
+                stage: "info".into(),
+                page: 0,
+                total_pages: 0,
+                message: "server does not support progress (update server image)".into(),
+            });
             return self.convert(pdf_bytes).await;
         }
 
