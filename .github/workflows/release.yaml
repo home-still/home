@@ -36,7 +36,6 @@ jobs:
             runner: ubuntu-latest
             archive: tar.gz
             use_zigbuild: true
-            build_scribe: true
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             archive: zip
@@ -73,16 +72,8 @@ jobs:
           --target ${{ matrix.target }}
           -p ${{ env.CRATE }}
 
-      - name: Build scribe server (zigbuild)
-        if: matrix.build_scribe && matrix.use_zigbuild
-        run: >
-          OPENSSL_NO_VENDOR=0
-          cargo zigbuild --release
-          --target ${{ matrix.target }}.2.28
-          -p hs-scribe --features server,openssl-vendored --bin hs-scribe-server
-
       - name: Build scribe server (native)
-        if: matrix.build_scribe && !matrix.use_zigbuild
+        if: matrix.build_scribe
         run: >
           cargo build --release
           --target ${{ matrix.target }}
@@ -162,29 +153,45 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      # Download pre-built scribe binaries from the build job
+      # Pre-built amd64 binary avoids Rust compilation in Docker for that arch
       - uses: actions/download-artifact@v4
         with:
           name: scribe-x86_64-unknown-linux-gnu
           path: docker-context/amd64/
-      - uses: actions/download-artifact@v4
-        with:
-          name: scribe-aarch64-unknown-linux-gnu
-          path: docker-context/arm64/
 
-      - name: Stage binaries
-        run: |
-          chmod +x docker-context/amd64/hs-scribe-server
-          chmod +x docker-context/arm64/hs-scribe-server
+      - name: Stage amd64 binary
+        run: chmod +x docker-context/amd64/hs-scribe-server
 
+      # Build amd64 image from pre-built binary (fast, no Rust compile)
       - uses: docker/build-push-action@v5
         with:
           context: docker-context
           file: crates/hs-scribe/docker/Dockerfile.prebuilt
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}
-            ghcr.io/home-still/hs-scribe-server:latest
+            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Build arm64 image from source via QEMU (ort-sys C++ deps prevent cross-compile)
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: crates/hs-scribe/docker/Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Create multi-arch manifest combining both images
+      - name: Create multi-arch manifest
+        run: |
+          docker buildx imagetools create -t ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }} \
+            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-amd64 \
+            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-arm64
+          docker buildx imagetools create -t ghcr.io/home-still/hs-scribe-server:latest \
+            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-amd64 \
+            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-arm64
