@@ -190,10 +190,25 @@ pub async fn run_download(
             ));
         }
     } else if let Some(query_str) = query {
-        let provider_impl = make_provider(&provider, &config)?;
+        // For aggregate search, show a counted progress bar; for single provider, a spinner
+        let search_total = if matches!(provider, ProviderArg::All) {
+            Some(6u64)
+        } else {
+            None
+        };
+        let search_stage: Arc<Box<dyn hs_style::reporter::StageHandle>> = Arc::new(
+            reporter.begin_counted_stage("Searching", search_total),
+        );
+        search_stage.set_message(&format!("for '{}'", query_str));
 
-        let search_stage = reporter.begin_stage("Searching", None);
-        search_stage.set_message(&format!("{} for '{}'", provider_impl.name(), query_str));
+        let search_stage_cb = Arc::clone(&search_stage);
+        let on_provider_done = Arc::new(move |name: &str| {
+            search_stage_cb.set_message(&format!("{} done", name));
+            search_stage_cb.inc(1);
+        });
+
+        let provider_impl =
+            make_provider_with_search_progress(&provider, &config, on_provider_done)?;
 
         let date_filter = parse_date_arg(date)?;
 
@@ -385,6 +400,22 @@ fn make_resilient<P: PaperProvider + 'static>(
 }
 
 fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn PaperProvider>> {
+    make_provider_inner(provider, config, None)
+}
+
+fn make_provider_with_search_progress(
+    provider: &ProviderArg,
+    config: &Config,
+    on_done: crate::services::search::OnProviderDone,
+) -> Result<Box<dyn PaperProvider>> {
+    make_provider_inner(provider, config, Some(on_done))
+}
+
+fn make_provider_inner(
+    provider: &ProviderArg,
+    config: &Config,
+    on_done: Option<crate::services::search::OnProviderDone>,
+) -> Result<Box<dyn PaperProvider>> {
     let r = &config.resilience;
     let p = &config.providers;
 
@@ -459,6 +490,11 @@ fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn Pape
                 ],
                 timeout,
             );
+            let aggregate = if let Some(cb) = on_done {
+                aggregate.on_provider_done(cb)
+            } else {
+                aggregate
+            };
             Ok(Box::new(aggregate))
         }
     }

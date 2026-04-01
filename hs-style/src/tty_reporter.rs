@@ -341,7 +341,6 @@ fn truncate_to_width(name: &str, max: usize) -> String {
         width += ch_width;
     }
     result.push('\u{2026}'); // …
-    width += 1;
     pad_to_width(&result, max)
 }
 
