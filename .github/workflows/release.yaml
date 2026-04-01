@@ -76,9 +76,10 @@ jobs:
       - name: Build scribe server (zigbuild)
         if: matrix.build_scribe && matrix.use_zigbuild
         run: >
+          OPENSSL_NO_VENDOR=0
           cargo zigbuild --release
           --target ${{ matrix.target }}.2.28
-          -p hs-scribe --features server --bin hs-scribe-server
+          -p hs-scribe --features server,openssl-vendored --bin hs-scribe-server
 
       - name: Build scribe server (native)
         if: matrix.build_scribe && !matrix.use_zigbuild
