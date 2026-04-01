@@ -113,7 +113,7 @@ async fn handle_scribe_stream(
         let on_progress = move |event: crate::client::ProgressEvent| {
             let line = StreamLine::Progress(event);
             if let Ok(json) = serde_json::to_string(&line) {
-                let _ = tx_progress.blocking_send(Ok(format!("{json}\n")));
+                let _ = tx_progress.try_send(Ok(format!("{json}\n")));
             }
         };
 
