@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -36,8 +38,12 @@ pub struct ScribeClient {
 
 impl ScribeClient {
     pub fn new(server_url: &str) -> Self {
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            http: Client::new(),
+            http,
             server_url: server_url.trim_end_matches('/').to_string(),
         }
     }

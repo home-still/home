@@ -114,18 +114,33 @@ async fn cmd_convert(
 ) -> Result<()> {
     let url = server.as_deref().unwrap_or(DEFAULT_SERVER);
     let client = hs_scribe::client::ScribeClient::new(url);
+
+    // Quick health check so we fail fast if server isn't running
+    let check_stage = reporter.begin_stage("Connecting", None);
+    check_stage.set_message(&format!("server at {url}"));
+    match client.health().await {
+        Ok(_) => check_stage.finish_and_clear(),
+        Err(e) => {
+            check_stage.finish_failed("server not reachable");
+            anyhow::bail!(
+                "Cannot reach scribe server at {url}: {e:#}\n\nRun `hs scribe init` to set up the server."
+            );
+        }
+    }
+
     let pdf_bytes =
         std::fs::read(&input).with_context(|| format!("Cannot read {}", input.display()))?;
 
     let stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
         Arc::new(reporter.begin_counted_stage("Converting", None));
+    stage.set_message("sending PDF to server...");
     let stage_cb = Arc::clone(&stage);
 
     let md = client
         .convert_with_progress(pdf_bytes, move |event| {
             stage_cb.set_length(event.total_pages);
             stage_cb.set_position(event.page);
-            stage_cb.set_message(&event.message);
+            stage_cb.set_message(&format!("[{}] {}", event.stage, event.message));
         })
         .await;
 
