@@ -31,17 +31,19 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             archive: tar.gz
+            build_scribe: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             archive: tar.gz
             use_zigbuild: true
+            build_scribe: true
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             archive: zip
 
     steps:
       - uses: actions/checkout@v4
-      
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -57,19 +59,33 @@ jobs:
       - name: Add target
         run: rustup target add ${{ matrix.target }}
 
-      - name: Build (zigbuild)
+      - name: Build CLI (zigbuild)
         if: matrix.use_zigbuild
         run: >
           cargo zigbuild --release
           --target ${{ matrix.target }}.2.28
           -p ${{ env.CRATE }}
 
-      - name: Build (natives)
+      - name: Build CLI (native)
         if: ${{ !matrix.use_zigbuild }}
         run: >
           cargo build --release
           --target ${{ matrix.target }}
           -p ${{ env.CRATE }}
+
+      - name: Build scribe server (zigbuild)
+        if: matrix.build_scribe && matrix.use_zigbuild
+        run: >
+          cargo zigbuild --release
+          --target ${{ matrix.target }}.2.28
+          -p hs-scribe --features server --bin hs-scribe-server
+
+      - name: Build scribe server (native)
+        if: matrix.build_scribe && !matrix.use_zigbuild
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          -p hs-scribe --features server --bin hs-scribe-server
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
@@ -99,7 +115,14 @@ jobs:
           path: |
             ${{ env.ASSET }}
             ${{ env.ASSET }}.sha256
-            
+
+      - name: Upload scribe server binary
+        if: matrix.build_scribe
+        uses: actions/upload-artifact@v4
+        with:
+          name: scribe-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/hs-scribe-server
+
   release:
     name: Publish Github Release
     needs: build
@@ -138,10 +161,25 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # Download pre-built scribe binaries from the build job
+      - uses: actions/download-artifact@v4
+        with:
+          name: scribe-x86_64-unknown-linux-gnu
+          path: docker-context/amd64/
+      - uses: actions/download-artifact@v4
+        with:
+          name: scribe-aarch64-unknown-linux-gnu
+          path: docker-context/arm64/
+
+      - name: Stage binaries
+        run: |
+          chmod +x docker-context/amd64/hs-scribe-server
+          chmod +x docker-context/arm64/hs-scribe-server
+
       - uses: docker/build-push-action@v5
         with:
-          context: .
-          file: crates/hs-scribe/docker/Dockerfile
+          context: docker-context
+          file: crates/hs-scribe/docker/Dockerfile.prebuilt
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
