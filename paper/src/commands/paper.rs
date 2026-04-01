@@ -269,10 +269,18 @@ pub async fn run_download(
             provider: search_result.provider,
         };
 
+        // Overall progress counter (ephemeral — cleared when done)
+        let total_papers = search_result.papers.len();
+        let overall: Arc<Box<dyn hs_style::reporter::StageHandle>> = Arc::new(
+            reporter.begin_counted_stage("Downloading", Some(total_papers as u64)),
+        );
+
+        // Per-download progress bars (ephemeral — cleared on completion)
         let bars: Arc<Mutex<HashMap<usize, Box<dyn hs_style::reporter::StageHandle>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let bars_ref = Arc::clone(&bars);
         let reporter_ref = Arc::clone(reporter);
+        let overall_ref = Arc::clone(&overall);
 
         let progress: Option<OnProgress> =
             Some(Arc::new(move |event: DownloadEvent| match event {
@@ -297,58 +305,53 @@ pub async fn run_download(
                         }
                     }
                 }
-                DownloadEvent::Completed {
-                    index, size_bytes, ..
-                } => {
+                DownloadEvent::Completed { index, .. } => {
                     if let Ok(mut bars) = bars_ref.lock() {
                         if let Some(bar) = bars.remove(&index) {
-                            bar.finish_with_message(&format_bytes(size_bytes));
+                            bar.finish_and_clear();
                         }
                     }
+                    overall_ref.inc(1);
                 }
-                DownloadEvent::Failed { index, error, .. } => {
+                DownloadEvent::Failed { index, .. } => {
                     if let Ok(mut bars) = bars_ref.lock() {
                         if let Some(bar) = bars.remove(&index) {
-                            if error.starts_with("Not found:") {
-                                bar.finish_and_clear();
-                            } else {
-                                let max_err = hs_style::tty_reporter::bar_prefix_width();
-                                let short = if error.len() > max_err {
-                                    format!("{}...", &error[..max_err - 3])
-                                } else {
-                                    error.clone()
-                                };
-                                bar.finish_failed(&short);
-                            }
+                            bar.finish_and_clear();
                         }
                     }
+                    overall_ref.inc(1);
                 }
-                DownloadEvent::Skipped {
-                    index, size_bytes, ..
-                } => {
+                DownloadEvent::Skipped { index, .. } => {
                     if let Ok(mut bars) = bars_ref.lock() {
                         if let Some(bar) = bars.remove(&index) {
-                            bar.finish_skipped(&format!(
-                                "Already Downloaded ({})",
-                                format_bytes(size_bytes)
-                            ));
+                            bar.finish_and_clear();
                         }
                     }
+                    overall_ref.inc(1);
                 }
             }));
 
         let batch_result =
             download_batch(downloader, search_result.papers, concurrency, progress).await;
 
+        overall.finish_and_clear();
+
         if global.is_json() {
             output::print_json(&batch_result)?;
         } else {
+            let total_bytes: u64 = batch_result
+                .succeeded
+                .iter()
+                .chain(batch_result.skipped.iter())
+                .map(|r| r.size_bytes)
+                .sum();
             reporter.finish(&format!(
-                "\nCompleted: {}/{} downloaded, {} already exist, {} unavailable",
+                "\n{}/{} downloaded, {} already exist, {} unavailable ({})",
                 batch_result.succeeded.len(),
                 batch_result.total_requested,
                 batch_result.skipped.len(),
                 batch_result.failed.len(),
+                format_bytes(total_bytes),
             ));
         }
 

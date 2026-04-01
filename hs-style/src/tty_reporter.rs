@@ -7,10 +7,10 @@ use unicode_width::UnicodeWidthChar;
 use crate::reporter::{Reporter, StageHandle};
 
 const DEFAULT_TERM_WIDTH: usize = 80;
+const PREFIX_WIDTH_RATIO: usize = 2; // numerator — 40% of terminal width
+const PREFIX_WIDTH_DENOM: usize = 5; // denominator
 const MIN_PREFIX_WIDTH: usize = 30;
-// Reserve space for the right-side info: {bytes:>10}/{total_bytes:<10} {msg}
-// 10 + 1 + 10 + 1 + ~10 (msg like "  3.6 MB") + padding = ~35
-const RIGHT_SIDE_COLS: usize = 35;
+const MAX_PREFIX_WIDTH: usize = 80;
 const SPINNER_TICK_MS: u64 = 120;
 
 const PROGRESS_BAR_CHARS: &str = "-> ";
@@ -68,12 +68,8 @@ impl Reporter for TtyReporter {
     }
 
     fn begin_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
-        let title = sanitize_name(name);
-        let title_width = display_width(&title);
-        let min_width = bar_prefix_width();
-        // Use the larger of title width or min_width for consistent alignment
-        let prefix_width = title_width.max(min_width);
-        let padded_title = pad_to_width(&title, prefix_width);
+        let prefix_width = bar_prefix_width();
+        let title = truncate_to_width(&sanitize_name(name), prefix_width);
 
         match total {
             Some(len) => {
@@ -85,9 +81,9 @@ impl Reporter for TtyReporter {
                 };
                 pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
                 let initial = if self.use_color {
-                    color_split_prefix(&padded_title, 0.0, prefix_width)
+                    color_split_prefix(&title, 0.0, prefix_width)
                 } else {
-                    padded_title.clone()
+                    title.clone()
                 };
                 pb.set_prefix(initial);
                 Box::new(IndicatifStageHandle {
@@ -95,7 +91,7 @@ impl Reporter for TtyReporter {
                     use_color: self.use_color,
                     prefix_width,
                     counted: false,
-                    title: padded_title,
+                    title,
                 })
             }
             None => {
@@ -107,9 +103,9 @@ impl Reporter for TtyReporter {
                 };
                 pb.set_style(make_spinner_style(&template));
                 let initial = if self.use_color {
-                    color_split_prefix(&padded_title, 0.0, prefix_width)
+                    color_split_prefix(&title, 0.0, prefix_width)
                 } else {
-                    padded_title.clone()
+                    title.clone()
                 };
                 pb.set_prefix(initial);
                 pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
@@ -118,18 +114,15 @@ impl Reporter for TtyReporter {
                     use_color: self.use_color,
                     prefix_width,
                     counted: false,
-                    title: padded_title,
+                    title,
                 })
             }
         }
     }
 
     fn begin_counted_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
-        let title = sanitize_name(name);
-        let title_width = display_width(&title);
-        let min_width = bar_prefix_width();
-        let prefix_width = title_width.max(min_width);
-        let padded_title = pad_to_width(&title, prefix_width);
+        let prefix_width = bar_prefix_width();
+        let title = truncate_to_width(&sanitize_name(name), prefix_width);
 
         match total {
             Some(len) => {
@@ -141,9 +134,9 @@ impl Reporter for TtyReporter {
                 };
                 pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
                 let initial = if self.use_color {
-                    color_split_prefix(&padded_title, 0.0, prefix_width)
+                    color_split_prefix(&title, 0.0, prefix_width)
                 } else {
-                    padded_title.clone()
+                    title.clone()
                 };
                 pb.set_prefix(initial);
                 Box::new(IndicatifStageHandle {
@@ -151,7 +144,7 @@ impl Reporter for TtyReporter {
                     use_color: self.use_color,
                     prefix_width,
                     counted: true,
-                    title: padded_title,
+                    title: title,
                 })
             }
             None => {
@@ -163,9 +156,9 @@ impl Reporter for TtyReporter {
                 };
                 pb.set_style(make_spinner_style(&template));
                 let initial = if self.use_color {
-                    color_split_prefix(&padded_title, 0.0, prefix_width)
+                    color_split_prefix(&title, 0.0, prefix_width)
                 } else {
-                    padded_title.clone()
+                    title.clone()
                 };
                 pb.set_prefix(initial);
                 pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
@@ -174,7 +167,7 @@ impl Reporter for TtyReporter {
                     use_color: self.use_color,
                     prefix_width,
                     counted: true,
-                    title: padded_title,
+                    title: title,
                 })
             }
         }
@@ -315,7 +308,7 @@ pub fn bar_prefix_width() -> usize {
     let term_width = terminal_size::terminal_size()
         .map(|(w, _)| w.0 as usize)
         .unwrap_or(DEFAULT_TERM_WIDTH);
-    term_width.saturating_sub(RIGHT_SIDE_COLS).max(MIN_PREFIX_WIDTH)
+    (term_width * PREFIX_WIDTH_RATIO / PREFIX_WIDTH_DENOM).clamp(MIN_PREFIX_WIDTH, MAX_PREFIX_WIDTH)
 }
 
 /// Sanitize control characters in a name (newlines, tabs, etc.) to spaces.
@@ -328,6 +321,28 @@ fn sanitize_name(name: &str) -> String {
 /// Calculate the display width of a string in terminal columns.
 fn display_width(s: &str) -> usize {
     s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Truncate a string to fit within `max` display columns, adding ellipsis if needed.
+/// Always pads with trailing spaces to exactly `max` columns.
+fn truncate_to_width(name: &str, max: usize) -> String {
+    let total_width: usize = name.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total_width <= max {
+        return pad_to_width(name, max);
+    }
+    let mut result = String::new();
+    let mut width = 0;
+    for ch in name.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if width + ch_width + 1 > max {
+            break;
+        }
+        result.push(ch);
+        width += ch_width;
+    }
+    result.push('\u{2026}'); // …
+    width += 1;
+    pad_to_width(&result, max)
 }
 
 /// Pad a string with trailing spaces to reach exactly `target_width` display columns.
