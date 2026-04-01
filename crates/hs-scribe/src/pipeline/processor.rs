@@ -374,7 +374,14 @@ impl Processor {
     where
         F: Fn(ProgressEvent) + Send + Sync + 'static,
     {
-        let on_progress = Arc::new(on_progress);
+        let on_progress: Arc<dyn Fn(ProgressEvent) + Send + Sync> = Arc::new(on_progress);
+
+        on_progress(ProgressEvent {
+            stage: "parse".into(),
+            page: 0,
+            total_pages: 0,
+            message: "Parsing PDF...".into(),
+        });
 
         let pages = {
             let pdf_parser = PdfParser::new()?;
@@ -382,7 +389,6 @@ impl Processor {
         };
         let total = pages.len() as u64;
 
-        // Emit parse-complete event
         on_progress(ProgressEvent {
             stage: "parse".into(),
             page: 0,
@@ -402,6 +408,12 @@ impl Processor {
                     let on_progress = Arc::clone(&on_progress);
                     let completed = Arc::clone(&completed);
                     async move {
+                        on_progress(ProgressEvent {
+                            stage: "vlm".into(),
+                            page: i as u64,
+                            total_pages: total,
+                            message: format!("Starting OCR page {}/{total}", i + 1),
+                        });
                         let downscaled = maybe_downscale(&page.image, max_dim);
                         let image_bytes = encode_jpeg(&downscaled)?;
                         tracing::info!(
@@ -442,6 +454,12 @@ impl Processor {
 
         let stage1 = tokio::task::spawn_blocking(move || {
             for (idx, page) in pages.into_iter().enumerate() {
+                on_progress_s1(ProgressEvent {
+                    stage: "layout".into(),
+                    page: idx as u64,
+                    total_pages: total,
+                    message: format!("Detecting layout page {}/{total}", idx + 1),
+                });
                 tracing::info!(
                     "Preparing page {}/{} ({}x{}, per-region)",
                     idx + 1,
@@ -454,7 +472,7 @@ impl Processor {
                     stage: "layout".into(),
                     page: (idx + 1) as u64,
                     total_pages: total,
-                    message: format!("Layout page {}/{total}", idx + 1),
+                    message: format!("Layout done page {}/{total}", idx + 1),
                 });
                 if tx.blocking_send(prepared).is_err() {
                     break;
@@ -475,13 +493,22 @@ impl Processor {
             let on_progress = Arc::clone(&on_progress);
             let vlm_completed = Arc::clone(&vlm_completed);
             tasks.spawn(async move {
-                let result = execute_vlm_for_page(prepared, ocr, sem, region_parallel).await;
                 let done = vlm_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let result = execute_vlm_for_page(
+                    prepared,
+                    ocr,
+                    sem,
+                    region_parallel,
+                    Arc::clone(&on_progress),
+                    done,
+                    total,
+                )
+                .await;
                 on_progress(ProgressEvent {
                     stage: "vlm".into(),
                     page: done,
                     total_pages: total,
-                    message: format!("OCR page {done}/{total}"),
+                    message: format!("Completed page {done}/{total}"),
                 });
                 result
             });
@@ -494,6 +521,14 @@ impl Processor {
         results.sort_by_key(|(idx, _)| *idx);
 
         stage1.await??;
+
+        on_progress(ProgressEvent {
+            stage: "done".into(),
+            page: total,
+            total_pages: total,
+            message: "Assembling markdown...".into(),
+        });
+
         Ok(join_pages(
             &results.into_iter().map(|(_, md)| md).collect::<Vec<_>>(),
         ))
@@ -572,9 +607,10 @@ impl Processor {
         while let Some(prepared) = rx.recv().await {
             let ocr = Arc::clone(&ocr);
             let sem = Arc::clone(&vlm_sem);
-            tasks.spawn(
-                async move { execute_vlm_for_page(prepared, ocr, sem, region_parallel).await },
-            );
+            let noop: Arc<dyn Fn(ProgressEvent) + Send + Sync> = Arc::new(|_| {});
+            tasks.spawn(async move {
+                execute_vlm_for_page(prepared, ocr, sem, region_parallel, noop, 0, 0).await
+            });
         }
 
         // Collect results, sort by page index
@@ -744,6 +780,9 @@ async fn execute_vlm_for_page(
     ocr: Arc<OcrEngine>,
     sem: Arc<tokio::sync::Semaphore>,
     region_parallel: usize,
+    on_progress: Arc<dyn Fn(ProgressEvent) + Send + Sync>,
+    page_num: u64,
+    total_pages: u64,
 ) -> Result<(usize, String)> {
     match prepared {
         PreparedPage::FullPage {
@@ -763,16 +802,32 @@ async fn execute_vlm_for_page(
             text_regions,
             table_regions,
         } => {
+            let total_regions = text_regions.len();
+            let region_done = Arc::new(AtomicU64::new(0));
+
+            on_progress(ProgressEvent {
+                stage: "vlm".into(),
+                page: page_num,
+                total_pages,
+                message: format!(
+                    "OCR page {page_num}/{total_pages} ({total_regions} regions, {} tables)",
+                    table_regions.len()
+                ),
+            });
+
             // Process text regions with semaphore-gated concurrency
             let region_results: Vec<Result<(BBox, String)>> =
                 stream::iter(text_regions.into_iter())
                     .map(|r| {
                         let ocr = Arc::clone(&ocr);
                         let sem = Arc::clone(&sem);
+                        let on_progress = Arc::clone(&on_progress);
+                        let region_done = Arc::clone(&region_done);
                         async move {
                             if r.region_type == RegionType::Figure
                                 || r.region_type == RegionType::Skip
                             {
+                                region_done.fetch_add(1, Ordering::Relaxed);
                                 return Ok((r.bbox, String::new()));
                             }
                             let _permit = sem
@@ -780,6 +835,13 @@ async fn execute_vlm_for_page(
                                 .await
                                 .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
                             let text = ocr.recognize_region(&r.jpeg_bytes, r.region_type).await?;
+                            let done = region_done.fetch_add(1, Ordering::Relaxed) + 1;
+                            on_progress(ProgressEvent {
+                                stage: "vlm".into(),
+                                page: page_num,
+                                total_pages,
+                                message: format!("OCR region {done}/{total_regions} on page {page_num}"),
+                            });
                             Ok((r.bbox, text))
                         }
                     })
@@ -791,23 +853,43 @@ async fn execute_vlm_for_page(
                 region_results.into_iter().collect::<Result<Vec<_>>>()?;
 
             // Process table cells with semaphore-gated concurrency
-            for table in table_regions {
+            for (t_idx, table) in table_regions.into_iter().enumerate() {
+                let total_cells = table.cell_jpegs.len();
+                let cell_done = Arc::new(AtomicU64::new(0));
+
+                on_progress(ProgressEvent {
+                    stage: "vlm".into(),
+                    page: page_num,
+                    total_pages,
+                    message: format!("OCR table {}/{} ({total_cells} cells) on page {page_num}", t_idx + 1, t_idx + 1),
+                });
+
                 let cell_texts: Vec<String> = stream::iter(table.cell_jpegs.into_iter())
                     .map(|jpeg| {
                         let ocr = Arc::clone(&ocr);
                         let sem = Arc::clone(&sem);
+                        let on_progress = Arc::clone(&on_progress);
+                        let cell_done = Arc::clone(&cell_done);
                         async move {
                             let _permit = sem
                                 .acquire()
                                 .await
                                 .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
-                            match ocr.recognize_region(&jpeg, RegionType::Text).await {
+                            let result = match ocr.recognize_region(&jpeg, RegionType::Text).await {
                                 Ok(text) => Ok(text.trim().to_string()),
                                 Err(e) => {
                                     tracing::warn!("Cell OCR failed: {e}");
                                     Ok(String::new())
                                 }
-                            }
+                            };
+                            let done = cell_done.fetch_add(1, Ordering::Relaxed) + 1;
+                            on_progress(ProgressEvent {
+                                stage: "vlm".into(),
+                                page: page_num,
+                                total_pages,
+                                message: format!("OCR table cell {done}/{total_cells} on page {page_num}"),
+                            });
+                            result
                         }
                     })
                     .buffer_unordered(region_parallel)
