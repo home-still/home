@@ -160,8 +160,10 @@ async fn cmd_convert(
 
     let md = client
         .convert_with_progress(pdf_bytes, move |event| {
-            stage_cb.set_length(event.total_pages);
-            stage_cb.set_position(event.page);
+            if event.total_pages > 0 {
+                stage_cb.set_length(event.total_pages);
+                stage_cb.set_position(event.page);
+            }
             stage_cb.set_message(&format!("[{}] {}", event.stage, event.message));
         })
         .await;
