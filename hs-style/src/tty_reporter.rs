@@ -7,10 +7,10 @@ use unicode_width::UnicodeWidthChar;
 use crate::reporter::{Reporter, StageHandle};
 
 const DEFAULT_TERM_WIDTH: usize = 80;
-const PREFIX_WIDTH_RATIO: usize = 2; // numerator — 40% of terminal width
+const PREFIX_WIDTH_RATIO: usize = 3; // numerator — 60% of terminal width
 const PREFIX_WIDTH_DENOM: usize = 5; // denominator
 const MIN_PREFIX_WIDTH: usize = 30;
-const MAX_PREFIX_WIDTH: usize = 80;
+const MAX_PREFIX_WIDTH: usize = 120;
 const SPINNER_TICK_MS: u64 = 120;
 
 const PROGRESS_BAR_CHARS: &str = "-> ";
@@ -128,7 +128,7 @@ impl Reporter for TtyReporter {
             Some(len) => {
                 let pb = self.mp.add(ProgressBar::new(len));
                 let template = if self.use_color {
-                    format!("{{prefix}} {{pos:>5}}/{{len:<5}} {{msg}}")
+                    format!("{{prefix}} {{wide_bar:.cyan/dim}} {{pos:>5}}/{{len:<5}} {{msg}}")
                 } else {
                     format!("{{prefix}} {{wide_bar}} {{pos:>5}}/{{len:<5}} {{msg}}")
                 };
@@ -198,7 +198,7 @@ impl StageHandle for IndicatifStageHandle {
         self.pb.set_length(total);
         let template = if self.counted {
             if self.use_color {
-                "{prefix} {pos:>5}/{len:<5} {msg}".to_string()
+                "{prefix} {wide_bar:.cyan/dim} {pos:>5}/{len:<5} {msg}".to_string()
             } else {
                 "{prefix} {wide_bar} {pos:>5}/{len:<5} {msg}".to_string()
             }
