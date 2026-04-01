@@ -48,6 +48,28 @@ fn compose_yaml(has_gpu: bool) -> String {
     )
 }
 
+/// Compose config for macOS Apple Silicon: native Ollama (Metal GPU) on host,
+/// only the scribe server runs in a container.
+fn compose_yaml_native_ollama() -> String {
+    r#"services:
+  scribe:
+    image: ghcr.io/home-still/hs-scribe-server:latest
+    ports:
+      - "7432:7432"
+    volumes:
+      - ${MODELS_DIR}:/models:ro
+    environment:
+      HS_SCRIBE_LAYOUT_MODEL_PATH: /models/pp-doclayoutv3.onnx
+      HS_SCRIBE_BACKEND: Ollama
+      HS_SCRIBE_OLLAMA_URL: http://host.docker.internal:11434
+      HS_SCRIBE_USE_CUDA: "false"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: on-failure:3
+"#
+    .to_string()
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ScribeCmd {
     /// Convert a PDF to markdown (sends to scribe server)
@@ -220,13 +242,52 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         compose.args_prefix.join(" ")
     );
 
-    // Step 2: Detect GPU
-    eprintln!("[2/5] Detecting GPU...");
-    let has_gpu = check_command("nvidia-smi", &[]).await;
-    if has_gpu {
-        eprintln!("       NVIDIA GPU detected (CUDA enabled)");
+    // Step 2: Detect GPU / Apple Silicon
+    let use_native_ollama = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    let has_gpu;
+
+    if use_native_ollama {
+        has_gpu = false; // No CUDA on macOS — Metal is used by native Ollama
+        eprintln!("[2/5] Apple Silicon detected — using native Ollama (Metal GPU)...");
+
+        // Install Ollama if not present
+        if !check_command("ollama", &["--version"]).await {
+            if check_command("brew", &["--version"]).await {
+                eprintln!("       Installing Ollama via Homebrew...");
+                let status = tokio::process::Command::new("brew")
+                    .args(["install", "ollama"])
+                    .status()
+                    .await?;
+                if !status.success() {
+                    anyhow::bail!("Failed to install Ollama via Homebrew");
+                }
+            } else {
+                anyhow::bail!(
+                    "Ollama not found. Install from https://ollama.com or via:\n  brew install ollama"
+                );
+            }
+        }
+
+        // Start ollama serve if not already running
+        if !check_ollama_running().await {
+            eprintln!("       Starting Ollama...");
+            tokio::process::Command::new("ollama")
+                .arg("serve")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .context("Failed to start ollama serve")?;
+            wait_for_ollama_native(30).await?;
+        }
+        eprintln!("       OK (native Ollama with Metal)");
     } else {
-        eprintln!("       No NVIDIA GPU (CPU mode)");
+        eprintln!("[2/5] Detecting GPU...");
+        has_gpu = check_command("nvidia-smi", &[]).await;
+        if has_gpu {
+            eprintln!("       NVIDIA GPU detected (CUDA enabled)");
+        } else {
+            eprintln!("       No NVIDIA GPU (CPU mode)");
+        }
     }
 
     // Step 3: Download layout model
@@ -261,7 +322,12 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         }
     } else {
         std::fs::create_dir_all(&config_dir)?;
-        std::fs::write(&compose_path, compose_yaml(has_gpu))?;
+        let compose_content = if use_native_ollama {
+            compose_yaml_native_ollama()
+        } else {
+            compose_yaml(has_gpu)
+        };
+        std::fs::write(&compose_path, compose_content)?;
 
         let env_contents = format!(
             "MODELS_DIR={}\nOLLAMA_DATA={}\nUSE_CUDA={}\n",
@@ -337,15 +403,27 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         anyhow::bail!("compose up failed");
     }
 
-    // Wait for Ollama to be ready, then pull the model
-    eprintln!("       Waiting for Ollama...");
-    wait_for_ollama(&compose, cf, 60).await?;
-    eprintln!("       Pulling GLM-OCR model (first run downloads ~2.5GB)...");
-    let pull_status = compose
-        .exec_run(cf, "vlm", &["ollama", "pull", "glm-ocr"])
-        .await?;
-    if !pull_status.success() {
-        anyhow::bail!("Failed to pull glm-ocr model into Ollama");
+    // Wait for Ollama and pull model
+    if use_native_ollama {
+        // Native Ollama should already be running from Step 2
+        eprintln!("       Pulling GLM-OCR model (first run downloads ~2.5GB)...");
+        let pull_status = tokio::process::Command::new("ollama")
+            .args(["pull", "glm-ocr"])
+            .status()
+            .await?;
+        if !pull_status.success() {
+            anyhow::bail!("Failed to pull glm-ocr model");
+        }
+    } else {
+        eprintln!("       Waiting for Ollama...");
+        wait_for_ollama(&compose, cf, 60).await?;
+        eprintln!("       Pulling GLM-OCR model (first run downloads ~2.5GB)...");
+        let pull_status = compose
+            .exec_run(cf, "vlm", &["ollama", "pull", "glm-ocr"])
+            .await?;
+        if !pull_status.success() {
+            anyhow::bail!("Failed to pull glm-ocr model into Ollama");
+        }
     }
     eprintln!("       Waiting for scribe server...");
     wait_for_health(DEFAULT_SERVER, 120).await?;
@@ -384,6 +462,18 @@ async fn cmd_server(action: ServerAction) -> Result<()> {
             }
         }
         ServerAction::Start => {
+            // On Apple Silicon, ensure native Ollama is running
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                if !check_ollama_running().await {
+                    eprintln!("Starting native Ollama...");
+                    let _ = tokio::process::Command::new("ollama")
+                        .arg("serve")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    wait_for_ollama_native(30).await?;
+                }
+            }
             compose.run(&["-f", cf, "up", "-d"]).await?;
             eprintln!("Waiting for services...");
             wait_for_health(DEFAULT_SERVER, 300).await?;
@@ -516,6 +606,31 @@ async fn check_command(cmd: &str, args: &[&str]) -> bool {
         .await
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+async fn check_ollama_running() -> bool {
+    reqwest::Client::new()
+        .get("http://localhost:11434/api/tags")
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok()
+}
+
+async fn wait_for_ollama_native(timeout_secs: u64) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "Timed out waiting for native Ollama to start.\n\
+                 Try running manually: ollama serve"
+            );
+        }
+        if check_ollama_running().await {
+            return Ok(());
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
 }
 
 async fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
