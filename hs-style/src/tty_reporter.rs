@@ -134,7 +134,8 @@ impl Reporter for TtyReporter {
                 let template = if self.use_color {
                     "{prefix} {wide_bar:.cyan/dim} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}".to_string()
                 } else {
-                    "{prefix} {wide_bar} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}".to_string()
+                    "{prefix} {wide_bar} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}"
+                        .to_string()
                 };
                 pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
                 let initial = if self.use_color {
