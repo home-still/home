@@ -93,7 +93,7 @@ pub enum ScribeCmd {
         /// Input PDF file
         input: PathBuf,
         /// Write markdown to file (default: stdout)
-        #[arg(short = 'o', long = "out")]
+        #[arg(long = "out")]
         out_file: Option<PathBuf>,
         /// Server URL override
         #[arg(long)]
@@ -114,7 +114,7 @@ pub enum ScribeCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Output directory for markdown files (default: <dir>/markdown)
-        #[arg(short = 'o', long)]
+        #[arg(long)]
         output: Option<PathBuf>,
         /// Server URL override
         #[arg(long)]
