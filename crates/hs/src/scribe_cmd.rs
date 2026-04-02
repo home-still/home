@@ -319,25 +319,24 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
     eprintln!("[1/5] Checking container runtime...");
     let mut compose = ComposeCmd::detect().await;
 
-    if compose.is_none() {
-        if cfg!(target_os = "macos") && check_command("brew", &["--version"]).await {
-            eprintln!("       Not found — installing via Homebrew...");
-            let steps: &[(&str, &[&str])] = &[
-                ("brew", &["install", "podman", "docker-compose"]),
-                ("podman", &["machine", "init", "--now"]),
-            ];
-            for (cmd, args) in steps {
-                eprintln!("       Running: {} {}", cmd, args.join(" "));
-                let status = tokio::process::Command::new(cmd)
-                    .args(*args)
-                    .status()
-                    .await?;
-                if !status.success() {
-                    anyhow::bail!("{} {} failed", cmd, args[0]);
-                }
+    if compose.is_none() && cfg!(target_os = "macos") && check_command("brew", &["--version"]).await
+    {
+        eprintln!("       Not found — installing via Homebrew...");
+        let steps: &[(&str, &[&str])] = &[
+            ("brew", &["install", "podman", "docker-compose"]),
+            ("podman", &["machine", "init", "--now"]),
+        ];
+        for (cmd, args) in steps {
+            eprintln!("       Running: {} {}", cmd, args.join(" "));
+            let status = tokio::process::Command::new(cmd)
+                .args(*args)
+                .status()
+                .await?;
+            if !status.success() {
+                anyhow::bail!("{} {} failed", cmd, args[0]);
             }
-            compose = ComposeCmd::detect().await;
         }
+        compose = ComposeCmd::detect().await;
     }
 
     if compose.is_none() {
@@ -596,16 +595,16 @@ async fn cmd_server(action: ServerAction) -> Result<()> {
         }
         ServerAction::Start => {
             // On Apple Silicon, ensure native Ollama is running
-            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                if !check_ollama_running().await {
-                    eprintln!("Starting native Ollama...");
-                    let _ = tokio::process::Command::new("ollama")
-                        .arg("serve")
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
-                    wait_for_ollama_native(30).await?;
-                }
+            if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                && !check_ollama_running().await
+            {
+                eprintln!("Starting native Ollama...");
+                let _ = tokio::process::Command::new("ollama")
+                    .arg("serve")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                wait_for_ollama_native(30).await?;
             }
             compose.run(&["-f", cf, "up", "-d"]).await?;
             eprintln!("Waiting for services...");

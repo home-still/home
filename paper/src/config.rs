@@ -228,11 +228,11 @@ impl Default for DownloadConfig {
     }
 }
 
-fn expand_tilde(path: &PathBuf) -> PathBuf {
+fn expand_tilde(path: &std::path::Path) -> PathBuf {
     if let Ok(stripped) = path.strip_prefix("~") {
         if let Some(home) = dirs::home_dir() {
             return home.join(stripped);
         }
     }
-    path.clone()
+    path.to_path_buf()
 }
