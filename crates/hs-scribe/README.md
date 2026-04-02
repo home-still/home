@@ -1,134 +1,246 @@
 # hs-scribe
 
-PDF-to-markdown converter using ONNX layout detection and vision-language model OCR. Part of [home-still](../../README.md).
+Turn academic PDFs into clean markdown. Layout-aware, table-aware, GPU-accelerated.
+
+Part of [home-still](../../README.md) -- free tools for knowledge acquisition and distillation.
 
 ## How it works
 
-1. **Layout detection** -- PP-DocLayout-V3 via ONNX Runtime classifies page regions into 10 types: title, plain text, figures, tables, formulas, headers, footers, captions, references, equations.
-2. **Table structure recognition** -- SLANet-Plus detects table cell boundaries for structured table extraction.
-3. **VLM OCR** -- Detected regions and table cells are sent to a vision-language model (GLM-OCR) for text extraction.
-4. **Markdown assembly** -- Regions are ordered by reading position and assembled into section-aware markdown with heading hierarchy, figure/table captions, and HTML tables.
+hs-scribe uses a multi-stage pipeline to understand the structure of each page before extracting text:
 
-## Architecture
+1. **PDF rendering** -- Pages are rendered to images at configurable DPI (default 200) using PDFium.
+2. **Layout detection** -- PP-DocLayout-V3 via ONNX Runtime identifies 25 region types on each page: titles, paragraphs, figures, tables, formulas, references, footnotes, and more. Regions are returned with native reading order.
+3. **Table structure** -- For table regions, SLANet-Plus detects cell boundaries so each cell can be OCR'd individually and reassembled as HTML.
+4. **VLM OCR** -- Each region is sent to a vision-language model (GLM-OCR by default) with a task-specific prompt. Text regions get `"OCR:"`, tables get `"Table Recognition:"`, formulas get `"Formula Recognition:"`.
+5. **Markdown assembly** -- Regions are sorted by reading order and assembled into section-aware markdown with heading hierarchy, HTML tables, and formula blocks.
 
-Client-server model:
-- **Server** (`hs-scribe-server`): Runs in a Docker/Podman container. Hosts the ONNX models and communicates with the VLM backend (Ollama). Streams NDJSON progress events during processing.
-- **Client** (in `hs` CLI): Sends PDFs to the server, receives streaming progress and the final markdown.
+The pipeline has two modes:
+- **PerRegion** (default): Full layout detection + per-region OCR. Best quality for complex academic papers.
+- **FullPage**: Skip layout detection, send the entire page to the VLM. Faster, uses less memory, but no table structure or region-specific prompts.
 
-```
-hs scribe convert paper.pdf
-    |
-    v
-ScribeClient (HTTP multipart upload)
-    |
-    v
-hs-scribe-server (Docker container)
-    |--- PDF parsing (pdfium)
-    |--- Layout detection (ONNX: PP-DocLayout-V3)
-    |--- Table structure (ONNX: SLANet-Plus)
-    |--- VLM OCR (Ollama: GLM-OCR)  <-- Metal GPU on macOS
-    |
-    v
-NDJSON progress stream -> markdown result
+## Quick start
+
+```sh
+# One-time setup (downloads models, starts services)
+hs scribe init
+
+# Convert a PDF
+hs scribe convert paper.pdf -o paper.md
+
+# Watch a folder and auto-convert new PDFs
+hs scribe watch --dir ~/papers --output ~/papers/markdown
 ```
 
 ## Setup
 
 ```sh
-hs scribe init    # auto-detects platform, downloads models, starts services
+hs scribe init
 ```
 
-### Platform-specific behavior
+This single command handles everything:
 
-| Platform | VLM Backend | GPU |
+1. **Detects your container runtime** (Docker or Podman). On macOS, auto-installs via Homebrew if needed.
+2. **Detects your hardware**:
+   - Apple Silicon? Installs Ollama natively for Metal GPU acceleration.
+   - NVIDIA GPU? Enables CUDA in the container config.
+   - Neither? Falls back to CPU mode.
+3. **Downloads the layout model** (~125 MB ONNX file).
+4. **Writes the Docker Compose config** tailored to your platform.
+5. **Starts services and pulls the VLM model** (~2.5 GB on first run).
+
+Use `hs scribe init --force` to regenerate everything, or `hs scribe init --check` for a dry-run status report.
+
+### Platform behavior
+
+| Platform | VLM runs on | GPU acceleration |
 |---|---|---|
-| macOS Apple Silicon | Native Ollama (installed via Homebrew) | Metal GPU |
-| Linux + NVIDIA | Containerized Ollama | CUDA |
-| Linux / macOS Intel | Containerized Ollama | CPU only |
+| macOS Apple Silicon | Host (native Ollama) | Metal GPU |
+| Linux + NVIDIA | Container (Ollama) | CUDA |
+| Linux / macOS Intel | Container (Ollama) | CPU only |
 
-On Apple Silicon, `hs scribe init` installs Ollama natively so it can use Metal GPU acceleration. The scribe server still runs in a container but connects to the host Ollama via `host.docker.internal`.
-
-## VLM backends
-
-| Backend | Config | Use case |
-|---|---|---|
-| Ollama | `HS_SCRIBE_BACKEND=Ollama` | Default. Local inference via Ollama |
-| OpenAI-compatible | `HS_SCRIBE_BACKEND=OpenAi` | vLLM, sglang, MLX serving |
-| Cloud | `HS_SCRIBE_BACKEND=Cloud` | Remote API providers |
+On Apple Silicon, the scribe server runs in a container but connects back to Ollama on the host via `host.docker.internal:11434`. This gives the VLM access to Metal, which is dramatically faster than CPU inference inside a Linux VM.
 
 ## Commands
 
+### Convert a PDF
+
 ```sh
-# Convert a single PDF
-hs scribe convert paper.pdf -o paper.md
-
-# Watch a directory for new PDFs
-hs scribe watch --dir ~/papers --output ~/papers/markdown
-
-# Server management
-hs scribe server start
-hs scribe server stop
-hs scribe server list
-hs scribe server ping
+hs scribe convert paper.pdf              # markdown to stdout
+hs scribe convert paper.pdf -o paper.md  # markdown to file
+hs scribe convert paper.pdf --server http://remote:7432  # use a remote server
 ```
+
+During conversion, you'll see a live progress bar with elapsed time and ETA:
+
+```
+Converting ━━━━━━━━━━━━━━╸              22/43  00:01:30 ETA 00:00:42  [vlm] OCR region 5/12 on page 22
+```
+
+### Watch a directory
+
+```sh
+hs scribe watch --dir ~/papers --output ~/papers/markdown
+hs scribe watch   # watches current dir, outputs to ./markdown/
+```
+
+Watches recursively for new or modified `.pdf` files. Skips PDFs that already have up-to-date markdown (compares file modification times). Runs until CTRL+C.
+
+### Manage the server
+
+```sh
+hs scribe server start   # start containers
+hs scribe server stop    # stop containers
+hs scribe server list    # show status + health
+hs scribe server ping    # quick health check
+hs scribe server ping http://remote:7432  # check a specific server
+```
+
+## Architecture
+
+```
+hs scribe convert paper.pdf
+    |
+    v
+ScribeClient (HTTP multipart upload to localhost:7432)
+    |
+    v
+hs-scribe-server (Docker container)
+    |--- PDF rendering (PDFium, configurable DPI)
+    |--- Layout detection (ONNX: PP-DocLayout-V3, 25 region types)
+    |--- Table structure (ONNX: SLANet-Plus, cell boundaries)
+    |--- VLM OCR (Ollama / OpenAI-compat / Cloud)
+    |         |
+    |         +-- Metal GPU on macOS (native Ollama)
+    |         +-- CUDA on Linux (containerized Ollama)
+    |
+    v
+NDJSON progress stream --> final markdown
+```
+
+The server streams progress as newline-delimited JSON so the CLI can show real-time updates:
+- `[parse]` Parsing PDF pages
+- `[layout]` Detecting layout on each page (region count, table count)
+- `[vlm]` OCR per region and per table cell with counts
+- `[done]` Assembling final markdown
+
+## VLM backends
+
+| Backend | Environment variable | Use case |
+|---|---|---|
+| **Ollama** (default) | `HS_SCRIBE_BACKEND=Ollama` | Local inference. Uses Metal on macOS, CPU/CUDA on Linux |
+| **OpenAI-compatible** | `HS_SCRIBE_BACKEND=OpenAi` | vLLM, sglang, MLX-LM, or any `/v1/chat/completions` server |
+| **Cloud** | `HS_SCRIBE_BACKEND=Cloud` | Remote API with bearer token auth |
 
 ## Configuration
 
-Environment variables (prefix `HS_SCRIBE_`):
+All settings use environment variables with the `HS_SCRIBE_` prefix. They can also be set in `~/.config/home-still/config.yaml` under the `scribe` section.
+
+### Core settings
 
 | Variable | Default | Description |
 |---|---|---|
-| `HS_SCRIBE_BACKEND` | Ollama | VLM backend choice |
-| `HS_SCRIBE_OLLAMA_URL` | http://localhost:11434 | Ollama server URL |
-| `HS_SCRIBE_MODEL` | glm-ocr:latest | VLM model name |
-| `HS_SCRIBE_DPI` | 200 | PDF rendering DPI |
-| `HS_SCRIBE_VLM_CONCURRENCY` | 4 | Concurrent VLM requests |
-| `HS_SCRIBE_PIPELINE_MODE` | PerRegion | PerRegion or FullPage |
-| `HS_SCRIBE_USE_CUDA` | true | Enable CUDA if available |
-| `HS_SCRIBE_MAX_IMAGE_DIM` | 1800 | Max image dimension for downscaling |
+| `HS_SCRIBE_BACKEND` | `Ollama` | VLM backend: `Ollama`, `OpenAi`, or `Cloud` |
+| `HS_SCRIBE_MODEL` | `glm-ocr:latest` | Model name for Ollama/OpenAI backends |
+| `HS_SCRIBE_PIPELINE_MODE` | `PerRegion` | `PerRegion` (layout + per-region OCR) or `FullPage` (whole-page OCR) |
+| `HS_SCRIBE_DPI` | `200` | PDF rendering resolution. Lower = faster but less detail |
 
-## Progress reporting
+### Connection settings
 
-The server streams NDJSON progress events during conversion:
-- `[parse]` -- PDF page extraction
-- `[layout]` -- Per-page layout detection
-- `[vlm]` -- Per-region and per-table-cell OCR with counts
-- `[done]` -- Final markdown assembly
+| Variable | Default | Description |
+|---|---|---|
+| `HS_SCRIBE_OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
+| `HS_SCRIBE_OPENAI_URL` | `http://localhost:8080` | OpenAI-compatible server URL |
+| `HS_SCRIBE_CLOUD_URL` | `https://api.z.ai/...` | Cloud API endpoint |
+| `HS_SCRIBE_CLOUD_API_KEY` | *(none)* | Bearer token for cloud backend |
+| `HS_SCRIBE_TIMEOUT_SECS` | `120` | VLM request timeout |
 
-The CLI displays these as a progress bar with elapsed time and ETA.
+### Performance tuning
+
+| Variable | Default | Description |
+|---|---|---|
+| `HS_SCRIBE_VLM_CONCURRENCY` | `4` | Max concurrent VLM requests across pages |
+| `HS_SCRIBE_REGION_PARALLEL` | `4` | Max concurrent regions within one page |
+| `HS_SCRIBE_PARALLEL` | `1` | Max concurrent pages in FullPage mode |
+| `HS_SCRIBE_USE_CUDA` | `true` | Enable CUDA for ONNX layout detection |
+| `HS_SCRIBE_MAX_IMAGE_DIM` | `1800` | Downscale images larger than this (pixels) |
+
+### Model paths
+
+| Variable | Default | Description |
+|---|---|---|
+| `HS_SCRIBE_LAYOUT_MODEL_PATH` | `pp-doclayoutv3.onnx` | PP-DocLayout-V3 ONNX model |
+| `HS_SCRIBE_TABLE_MODEL_PATH` | `slanet-plus.onnx` | SLANet-Plus ONNX model |
+
+Model paths are resolved relative to `~/.local/share/home-still/models/` if not absolute.
 
 ## Models
 
 | Model | Size | Purpose |
 |---|---|---|
-| PP-DocLayout-V3 | ~125 MB | Document layout detection (ONNX) |
-| SLANet-Plus | ~8 MB | Table structure recognition (ONNX) |
-| GLM-OCR | ~2.5 GB | Vision-language model for OCR (Ollama) |
+| [PP-DocLayout-V3](https://github.com/opendatalab/DocLayout-YOLO) | ~125 MB | Document layout detection. 25 region types with reading order. ONNX format, runs on CPU or CUDA. |
+| [SLANet-Plus](https://github.com/PaddlePaddle/PaddleOCR) | ~8 MB | Table structure recognition. Detects cell boundaries in table regions. ONNX format. |
+| [GLM-OCR](https://ollama.com/library/glm-ocr) | ~2.5 GB | Vision-language model for text extraction. Runs on Ollama with Metal (macOS) or CPU/CUDA (Linux). |
+
+## Region types
+
+PP-DocLayout-V3 detects 25 region classes. hs-scribe maps them to 6 processing types:
+
+| Processing type | PP-DocLayout-V3 classes | Behavior |
+|---|---|---|
+| **Text** | text, paragraph_title, doc_title, abstract, content, reference, reference_content, footnote, vision_footnote, aside_text, vertical_text, figure_title, algorithm | OCR with `"OCR:"` prompt |
+| **Table** | table | Structure detection + per-cell OCR, assembled as HTML |
+| **Formula** | display_formula | OCR with `"Formula Recognition:"` prompt |
+| **InlineFormula** | inline_formula | OCR with `"Formula Recognition:"` prompt |
+| **Figure** | image, chart, seal | Skipped (placeholder in output) |
+| **Skip** | header, footer, header_image, footer_image, number, formula_number | Omitted entirely |
 
 ## Build
 
 ```sh
-# Client only (used by hs CLI)
+# Client library (used by the hs CLI)
 cargo check -p hs-scribe
 
-# Server (requires server feature)
+# Server binary
 cargo build --release -p hs-scribe --features server --bin hs-scribe-server
 
-# With CUDA support
+# With CUDA
 cargo build --release -p hs-scribe --features server,cuda --bin hs-scribe-server
 
-# With evaluation harness
+# With evaluation harness (BLEU, TED, edit distance metrics)
 cargo build --release -p hs-scribe --features eval --bin hs-scribe-server
 ```
 
 ## Docker
 
-The server image is published to `ghcr.io/home-still/hs-scribe-server:latest` for both amd64 and arm64.
+Multi-arch images (amd64 + arm64) are published to GHCR on every release:
 
 ```sh
-# Pull and run manually
 docker pull ghcr.io/home-still/hs-scribe-server:latest
-docker run -p 7432:7432 -v /path/to/models:/models:ro ghcr.io/home-still/hs-scribe-server:latest
+docker run -p 7432:7432 -v ~/.local/share/home-still/models:/models:ro \
+  -e HS_SCRIBE_OLLAMA_URL=http://host.docker.internal:11434 \
+  ghcr.io/home-still/hs-scribe-server:latest
 ```
 
-Or use `hs scribe init` which sets everything up automatically.
+Or just use `hs scribe init` which handles all of this automatically.
+
+### Health check
+
+```sh
+curl http://localhost:7432/health
+# {"status":"ok","layout_model":true,"table_model":true}
+```
+
+### Streaming API
+
+```sh
+curl -X POST http://localhost:7432/scribe/stream \
+  -F 'pdf=@paper.pdf' \
+  --no-buffer
+# {"progress":{"stage":"parse","page":0,"total_pages":10,"message":"Parsed 10 pages"}}
+# {"progress":{"stage":"layout","page":1,"total_pages":10,"message":"Layout done page 1/10"}}
+# {"progress":{"stage":"vlm","page":1,"total_pages":10,"message":"OCR region 3/8 on page 1"}}
+# ...
+# {"result":{"markdown":"# Title\n\nContent..."}}
+```
+
+Max upload size: 256 MB.
