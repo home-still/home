@@ -259,6 +259,27 @@ async fn cmd_convert(
 
 const STATUS_FILE: &str = ".scribe-watch-status.json";
 
+/// Check if a path is a valid PDF to process (not a macOS resource fork, not a temp file).
+fn is_processable_pdf(path: &std::path::Path) -> bool {
+    if path.extension() != Some(std::ffi::OsStr::new("pdf")) {
+        return false;
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    // Skip macOS resource forks (._filename.pdf)
+    if name.starts_with("._") {
+        return false;
+    }
+    // Skip temp files from atomic downloads
+    if name.ends_with(".tmp") {
+        return false;
+    }
+    // Skip if .tmp companion exists (download in progress)
+    if path.with_extension("pdf.tmp").exists() {
+        return false;
+    }
+    true
+}
+
 /// Atomic file write: write to temp file in same directory, then rename.
 /// Safe on NFS — rename within same directory is atomic.
 fn atomic_write(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
@@ -390,10 +411,7 @@ async fn cmd_watch(
     if let Ok(entries) = std::fs::read_dir(&watch_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension() != Some(std::ffi::OsStr::new("pdf")) {
-                continue;
-            }
-            if path.to_string_lossy().ends_with(".tmp") {
+            if !is_processable_pdf(&path) {
                 continue;
             }
             let stem = path.file_stem().unwrap_or_default();
@@ -408,9 +426,6 @@ async fn cmd_watch(
                         continue;
                     }
                 }
-            }
-            if path.with_extension("pdf.tmp").exists() {
-                continue;
             }
             stats
                 .queued
@@ -442,17 +457,12 @@ async fn cmd_watch(
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(event)) => {
                 for path in &event.paths {
-                    if path.extension() != Some(std::ffi::OsStr::new("pdf")) {
-                        continue;
-                    }
-                    // Skip .tmp files (in-progress downloads)
-                    if path.to_string_lossy().ends_with(".tmp") {
+                    if !is_processable_pdf(path) {
                         continue;
                     }
                     let stem = path.file_stem().unwrap_or_default();
                     let md_path = output_dir.join(format!("{}.md", stem.to_string_lossy()));
                     if md_path.exists() {
-                        // Force NFS attribute cache refresh by opening files
                         let _ = std::fs::File::open(path);
                         let _ = std::fs::File::open(&md_path);
                         let pdf_mod = std::fs::metadata(path).and_then(|m| m.modified()).ok();
@@ -462,10 +472,6 @@ async fn cmd_watch(
                                 continue;
                             }
                         }
-                    }
-                    // Skip if .tmp companion exists (still being downloaded)
-                    if path.with_extension("pdf.tmp").exists() {
-                        continue;
                     }
                     stats
                         .queued
