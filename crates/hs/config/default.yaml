@@ -1,16 +1,19 @@
 # home-still configuration
+#
+# Two directories:
+#   ~/.home-still/     — config, cache, models (hidden, always local)
+#   ~/home-still/      — papers, markdown (visible, your research project)
 
 # --- General settings ---
 home:
-  # log_level: info
+  # Project directory — your research data (papers, markdown)
+  # May point to an NFS mount or symlink
+  # project_dir: ~/home-still
 
 # --- Paper search & download ---
 paper:
-  # Where downloaded PDFs are saved
-  download_path: ~/Downloads/home-still/papers
-
-  # Metadata and search result cache
-  cache_path: ~/.home-still/paper/cache
+  # Where downloaded PDFs are saved (default: ~/home-still/papers)
+  # download_path: ~/home-still/papers
 
   # Search providers
   providers:
@@ -42,3 +45,15 @@ paper:
     retry_max_attempts: 5
     retry_min_backoff_ms: 100
     retry_max_backoff_secs: 30
+
+# --- Scribe PDF conversion ---
+scribe:
+  # Output directory for converted markdown (default: ~/home-still/markdown)
+  # output_dir: ~/home-still/markdown
+
+  # Directory to watch for new PDFs (default: ~/home-still/papers)
+  # watch_dir: ~/home-still/papers
+
+  # Scribe servers (PDFs are load-balanced across all servers)
+  servers:
+    - http://localhost:7433

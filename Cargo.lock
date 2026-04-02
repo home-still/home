@@ -1167,12 +1167,12 @@ dependencies = [
  "hs-scribe",
  "hs-style",
  "notify 8.2.0",
- "notify-debouncer-full",
  "owo-colors",
  "paper",
  "reqwest",
  "serde_json",
  "serde_yaml_ng",
+ "tempfile",
  "tokio",
 ]
 

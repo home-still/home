@@ -259,6 +259,18 @@ async fn cmd_convert(
 
 const STATUS_FILE: &str = ".scribe-watch-status.json";
 
+/// Atomic file write: write to temp file in same directory, then rename.
+/// Safe on NFS — rename within same directory is atomic.
+fn atomic_write(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(content)?;
+    tmp.flush()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 struct WatchStats {
     processing: std::sync::atomic::AtomicUsize,
     queued: std::sync::atomic::AtomicUsize,
@@ -296,9 +308,11 @@ impl WatchStats {
             "watch_dir": watch_dir,
             "output_dir": output_dir,
         });
-        let _ = std::fs::write(
+        let _ = atomic_write(
             path,
-            serde_json::to_string_pretty(&json).unwrap_or_default(),
+            serde_json::to_string_pretty(&json)
+                .unwrap_or_default()
+                .as_bytes(),
         );
     }
 }
@@ -309,7 +323,7 @@ async fn cmd_watch(
     server: Option<String>,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    use notify_debouncer_full::{new_debouncer, notify::RecursiveMode};
+    use notify::{PollWatcher, RecursiveMode, Watcher};
     use std::time::Duration;
 
     let servers = resolve_servers(server.as_deref());
@@ -365,55 +379,59 @@ async fn cmd_watch(
     // Write initial status file
     stats.write_status_file(&status_path, &watch_dir_str, &output_dir_str);
 
+    // PollWatcher works on NFS/CIFS/FUSE — inotify only works on local filesystems
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut debouncer = new_debouncer(Duration::from_millis(500), None, tx)?;
-    debouncer.watch(&watch_dir, RecursiveMode::Recursive)?;
+    let poll_config = notify::Config::default().with_poll_interval(Duration::from_secs(5));
+    let mut watcher = PollWatcher::new(tx, poll_config)?;
+    watcher.watch(&watch_dir, RecursiveMode::Recursive)?;
 
     let mut last_summary = String::new();
     let mut ticks_since_status_write: u32 = 0;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(Ok(events)) => {
-                for event in events {
-                    for path in &event.paths {
-                        if path.extension().is_some_and(|ext| ext == "pdf") {
-                            let stem = path.file_stem().unwrap_or_default();
-                            let md_path = output_dir.join(format!("{}.md", stem.to_string_lossy()));
-                            if md_path.exists() {
-                                let pdf_mod =
-                                    std::fs::metadata(path).and_then(|m| m.modified()).ok();
-                                let md_mod =
-                                    std::fs::metadata(&md_path).and_then(|m| m.modified()).ok();
-                                if let (Some(p), Some(m)) = (pdf_mod, md_mod) {
-                                    if m >= p {
-                                        continue;
-                                    }
-                                }
+            Ok(Ok(event)) => {
+                for path in &event.paths {
+                    if path.extension() != Some(std::ffi::OsStr::new("pdf")) {
+                        continue;
+                    }
+                    // Skip .tmp files (in-progress downloads)
+                    if path.to_string_lossy().ends_with(".tmp") {
+                        continue;
+                    }
+                    let stem = path.file_stem().unwrap_or_default();
+                    let md_path = output_dir.join(format!("{}.md", stem.to_string_lossy()));
+                    if md_path.exists() {
+                        // Force NFS attribute cache refresh by opening files
+                        let _ = std::fs::File::open(path);
+                        let _ = std::fs::File::open(&md_path);
+                        let pdf_mod = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+                        let md_mod = std::fs::metadata(&md_path).and_then(|m| m.modified()).ok();
+                        if let (Some(p), Some(m)) = (pdf_mod, md_mod) {
+                            if m >= p {
+                                continue;
                             }
-                            // Track queued
-                            stats
-                                .queued
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                            // Dispatch via pool (parallel across servers)
-                            let pool = Arc::clone(&pool);
-                            let path = path.clone();
-                            let output_dir = output_dir.clone();
-                            let reporter = Arc::clone(reporter);
-                            let stats = Arc::clone(&stats);
-                            tokio::spawn(async move {
-                                convert_and_save_pool(&pool, &path, &output_dir, &reporter, &stats)
-                                    .await;
-                            });
                         }
                     }
+                    // Skip if .tmp companion exists (still being downloaded)
+                    if path.with_extension("pdf.tmp").exists() {
+                        continue;
+                    }
+                    stats
+                        .queued
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let pool = Arc::clone(&pool);
+                    let path = path.clone();
+                    let output_dir = output_dir.clone();
+                    let reporter = Arc::clone(reporter);
+                    let stats = Arc::clone(&stats);
+                    tokio::spawn(async move {
+                        convert_and_save_pool(&pool, &path, &output_dir, &reporter, &stats).await;
+                    });
                 }
             }
-            Ok(Err(errs)) => {
-                for e in errs {
-                    reporter.warn(&format!("Watch error: {e}"));
-                }
+            Ok(Err(e)) => {
+                reporter.warn(&format!("Watch error: {e}"));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -484,7 +502,7 @@ async fn convert_and_save_pool(
     stats.processing.fetch_sub(1, Relaxed);
     match result {
         Ok(md) => {
-            if let Err(e) = std::fs::write(&output_path, &md) {
+            if let Err(e) = atomic_write(&output_path, md.as_bytes()) {
                 stage.finish_failed(&format!("Write failed: {e}"));
                 stats.failed.fetch_add(1, Relaxed);
             } else {
@@ -651,7 +669,7 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
     }
 
     // Step 3: Download layout model
-    let models_dir = data_dir().join("models");
+    let models_dir = hidden_dir().join("models");
     let layout_path = models_dir.join("pp-doclayoutv3.onnx");
 
     eprintln!("[3/5] Layout model...");
@@ -667,7 +685,7 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
     }
 
     // Step 4: Write compose config
-    let config_dir = config_dir();
+    let config_dir = hidden_dir();
     let compose_path = config_dir.join("docker-compose.yml");
     let env_path = config_dir.join(".env");
 
@@ -692,7 +710,7 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         let env_contents = format!(
             "MODELS_DIR={}\nOLLAMA_DATA={}\nUSE_CUDA={}\n",
             models_dir.display(),
-            data_dir().join("ollama").display(),
+            hidden_dir().join("ollama").display(),
             has_gpu,
         );
         std::fs::write(&env_path, env_contents)?;
@@ -800,7 +818,7 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
 // ── Server ──────────────────────────────────────────────────────
 
 async fn cmd_server(action: ServerAction) -> Result<()> {
-    let compose_path = config_dir().join("docker-compose.yml");
+    let compose_path = hidden_dir().join("docker-compose.yml");
     if !compose_path.exists() {
         anyhow::bail!("No compose config found. Run `hs scribe init` first.");
     }
@@ -859,16 +877,11 @@ async fn cmd_server(action: ServerAction) -> Result<()> {
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-fn data_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"))
-        .join("home-still")
-}
-
-fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
-        .join("home-still")
+/// Hidden directory for config, cache, models, compose (~/.home-still)
+fn hidden_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(hs_style::HIDDEN_DIR)
 }
 
 /// Detected compose command: "docker compose", "docker-compose", or "podman-compose"

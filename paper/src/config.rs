@@ -33,10 +33,10 @@ impl Default for Config {
         Self {
             resilience: ResilienceConfig::default(),
             download_path: dirs::home_dir()
-                .map(|h| h.join("Downloads/home-still/papers"))
-                .unwrap_or_else(|| PathBuf::from("./downloads")),
+                .map(|h| h.join(hs_style::PROJECT_DIR_DEFAULT).join("papers"))
+                .unwrap_or_else(|| PathBuf::from("./papers")),
             cache_path: dirs::home_dir()
-                .map(|h| h.join(".home-still/paper/cache"))
+                .map(|h| h.join(hs_style::HIDDEN_DIR).join("cache"))
                 .unwrap_or_else(|| PathBuf::from("./cache")),
             providers: ProvidersConfig::default(),
             download: DownloadConfig::default(),

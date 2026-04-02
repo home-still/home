@@ -137,8 +137,9 @@ impl DownloadService for PaperDownloader {
         tokio::fs::create_dir_all(&self.download_path).await?;
 
         let file_path = self.download_path.join(filename);
+        let tmp_path = self.download_path.join(format!("{filename}.tmp"));
 
-        // Skip if already downloaded
+        // Skip if already downloaded (final file exists)
         if file_path.exists() {
             let metadata = tokio::fs::metadata(&file_path).await?;
             return Ok(DownloadResult {
@@ -150,13 +151,13 @@ impl DownloadService for PaperDownloader {
             });
         }
 
-        // Stream the response
+        // Stream to temp file, then atomic rename
         let response = self.client.get(url).send().await?.error_for_status()?;
 
         let content_length = response.content_length();
 
         let mut stream = response.bytes_stream();
-        let mut file = tokio::fs::File::create(&file_path).await?;
+        let mut file = tokio::fs::File::create(&tmp_path).await?;
         let mut hasher = Sha256::new();
         let mut size_bytes: u64 = 0;
 
@@ -166,13 +167,16 @@ impl DownloadService for PaperDownloader {
             size_bytes += bytes.len() as u64;
             file.write_all(&bytes).await?;
 
-            // Report byte level progress
             if let Some(cb) = &on_progress {
                 cb(size_bytes, content_length);
             }
         }
 
         file.flush().await?;
+        drop(file); // close before rename
+
+        // Atomic rename — safe on NFS within same directory
+        tokio::fs::rename(&tmp_path, &file_path).await?;
 
         let sha256 = format!("{:x}", hasher.finalize());
 

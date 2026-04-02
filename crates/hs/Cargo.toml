@@ -21,5 +21,5 @@ serde_yaml_ng = { workspace = true }
 dialoguer = { workspace = true }
 reqwest = { workspace = true }
 notify = "8"
-notify-debouncer-full = "0.4"
 futures = "0.3"
+tempfile = "3"

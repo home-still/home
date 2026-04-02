@@ -76,8 +76,8 @@ impl AppConfig {
     }
 
     /// Resolve a model filename to an absolute path.
-    /// If already absolute and exists, use as-is.                          
-    /// Otherwise look in `~/.local/share/home-still/models/`.              
+    /// If already absolute and exists, use as-is.
+    /// Otherwise look in `~/.home-still/models/`.
     pub fn resolve_model_path(name: &str) -> PathBuf {
         let p = PathBuf::from(name);
         if p.is_absolute() && p.exists() {
@@ -86,11 +86,11 @@ impl AppConfig {
         if p.exists() {
             return p;
         }
-        let data_dir = dirs::data_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"))
-            .join("home-still")
+        let models_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".home-still")
             .join("models");
-        data_dir.join(name)
+        models_dir.join(name)
     }
 
     pub fn resolved_layout_model_path(&self) -> PathBuf {
@@ -115,8 +115,12 @@ pub struct ScribeConfig {
 impl Default for ScribeConfig {
     fn default() -> Self {
         Self {
-            output_dir: PathBuf::from("markdown"),
-            watch_dir: PathBuf::from("."),
+            output_dir: dirs::home_dir()
+                .map(|h| h.join("home-still/markdown"))
+                .unwrap_or_else(|| PathBuf::from("markdown")),
+            watch_dir: dirs::home_dir()
+                .map(|h| h.join("home-still/papers"))
+                .unwrap_or_else(|| PathBuf::from(".")),
             servers: vec!["http://localhost:7433".into()],
         }
     }
