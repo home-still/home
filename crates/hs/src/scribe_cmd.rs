@@ -123,7 +123,7 @@ pub enum ScribeCmd {
     /// Show status of a running watch service
     Status {
         /// Output directory to read status from
-        #[arg(short = 'o', long)]
+        #[arg(long)]
         output: Option<PathBuf>,
     },
     /// Manage the scribe server (Docker services)
