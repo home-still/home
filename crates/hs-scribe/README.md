@@ -80,7 +80,7 @@ Converting ━━━━━━━━━━━━━━╸              22/43  00:
 
 ```sh
 hs scribe watch --dir ~/papers --output ~/papers/markdown
-hs scribe watch   # watches current dir, outputs to ./markdown/
+hs scribe watch   # uses watch_dir/output_dir from config, or current dir
 ```
 
 Watches recursively for new or modified `.pdf` files. Skips PDFs that already have up-to-date markdown (compares file modification times). Runs until CTRL+C.
@@ -133,7 +133,25 @@ The server streams progress as newline-delimited JSON so the CLI can show real-t
 
 ## Configuration
 
-All settings use environment variables with the `HS_SCRIBE_` prefix. They can also be set in `~/.config/home-still/config.yaml` under the `scribe` section.
+### Client config (`~/.home-still/config.yaml`)
+
+The `scribe` section configures the CLI client — where to save output, where to watch, and which servers to use:
+
+```yaml
+scribe:
+  output_dir: ~/markdown
+  watch_dir: ~/papers
+  servers:
+    - http://localhost:7432
+    - http://gpu-server:7432
+    - http://pi-cluster:7432
+```
+
+With multiple servers, `hs scribe convert` and `hs scribe watch` automatically load-balance across them. The CLI queries each server's `/readiness` endpoint and routes each PDF to the server with the most available VLM slots.
+
+### Server config (environment variables)
+
+Server-side settings use environment variables with the `HS_SCRIBE_` prefix. They can also be set in `~/.config/home-still/config.yaml`.
 
 ### Core settings
 

@@ -163,7 +163,20 @@ paper:
       # mailto: you@example.com
   download:
     # unpaywall_email: you@example.com  # enables more download sources
+
+scribe:
+  # Default output directory for converted markdown
+  output_dir: ~/markdown
+  # Directory to watch for new PDFs
+  watch_dir: ~/papers
+  # Scribe servers (PDFs are load-balanced across all servers)
+  servers:
+    - http://localhost:7432
+    # - http://gpu-server:7432
+    # - http://pi-cluster:7432
 ```
+
+With multiple servers configured, `hs scribe watch` distributes PDFs across them in parallel, routing each to whichever server has the most available capacity. Each server exposes a `/readiness` endpoint so the client knows which ones can accept work.
 
 Override with environment variables: `HOME_STILL_PAPER_DOWNLOAD_PATH=/tmp/papers`
 
