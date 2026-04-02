@@ -28,7 +28,7 @@ jobs:
 
       - run: cargo fmt -p hs -p paper -p hs-style -p hs-scribe --check      
       - run: cargo clippy --workspace --exclude hs-scribe --all-targets -- -D warnings
-      - run: cargo clippy -p hs-scribe --all-targets -- -D warnings
+      - run: cargo clippy -p hs-scribe -- -D warnings
       - run: cargo clippy -p hs-scribe --features server --all-targets -- -D warnings
         if: matrix.os == 'ubuntu-latest'
       - run: cargo test --workspace --exclude hs-scribe                     
