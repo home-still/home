@@ -42,6 +42,7 @@ fn compose_yaml(has_gpu: bool) -> String {
       HS_SCRIBE_BACKEND: Ollama
       HS_SCRIBE_OLLAMA_URL: http://vlm:11434
       HS_SCRIBE_USE_CUDA: "{has_gpu}"
+    command: ["hs-scribe-server", "--host", "0.0.0.0", "--port", "7433"]
     depends_on:
       vlm:
         condition: service_healthy
@@ -77,6 +78,7 @@ fn compose_yaml_native_ollama() -> String {
       HS_SCRIBE_BACKEND: Ollama
       HS_SCRIBE_OLLAMA_URL: http://host.docker.internal:11434
       HS_SCRIBE_USE_CUDA: "false"
+    command: ["hs-scribe-server", "--host", "0.0.0.0", "--port", "7433"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: on-failure:3
