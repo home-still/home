@@ -117,7 +117,7 @@ impl Default for ScribeConfig {
         Self {
             output_dir: PathBuf::from("markdown"),
             watch_dir: PathBuf::from("."),
-            servers: vec!["http://localhost:7432".into()],
+            servers: vec!["http://localhost:7433".into()],
         }
     }
 }

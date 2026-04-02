@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::scribe_pool::ScribePool;
 
-const DEFAULT_SERVER: &str = "http://localhost:7432";
+const DEFAULT_SERVER: &str = "http://localhost:7433";
 
 /// Resolve the server list from CLI flag, config file, or default.
 fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
@@ -34,7 +34,7 @@ fn compose_yaml(has_gpu: bool) -> String {
   scribe:
     image: ghcr.io/home-still/hs-scribe-server:latest
     ports:
-      - "7432:7432"
+      - "7433:7433"
     volumes:
       - ${{MODELS_DIR}}:/models:ro
     environment:
@@ -69,7 +69,7 @@ fn compose_yaml_native_ollama() -> String {
   scribe:
     image: ghcr.io/home-still/hs-scribe-server:latest
     ports:
-      - "7432:7432"
+      - "7433:7433"
     volumes:
       - ${MODELS_DIR}:/models:ro
     environment:
@@ -135,7 +135,7 @@ pub enum ServerAction {
     Stop,
     /// Health-check one or all servers
     Ping {
-        /// Server URL (default: localhost:7432)
+        /// Server URL (default: localhost:7433)
         url: Option<String>,
     },
 }

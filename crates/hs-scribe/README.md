@@ -67,7 +67,7 @@ On Apple Silicon, the scribe server runs in a container but connects back to Oll
 ```sh
 hs scribe convert paper.pdf              # markdown to stdout
 hs scribe convert paper.pdf -o paper.md  # markdown to file
-hs scribe convert paper.pdf --server http://remote:7432  # use a remote server
+hs scribe convert paper.pdf --server http://remote:7433  # use a remote server
 ```
 
 During conversion, you'll see a live progress bar with elapsed time and ETA:
@@ -92,7 +92,7 @@ hs scribe server start   # start containers
 hs scribe server stop    # stop containers
 hs scribe server list    # show status + health
 hs scribe server ping    # quick health check
-hs scribe server ping http://remote:7432  # check a specific server
+hs scribe server ping http://remote:7433  # check a specific server
 ```
 
 ## Architecture
@@ -101,7 +101,7 @@ hs scribe server ping http://remote:7432  # check a specific server
 hs scribe convert paper.pdf
     |
     v
-ScribeClient (HTTP multipart upload to localhost:7432)
+ScribeClient (HTTP multipart upload to localhost:7433)
     |
     v
 hs-scribe-server (Docker container)
@@ -142,9 +142,9 @@ scribe:
   output_dir: ~/markdown
   watch_dir: ~/papers
   servers:
-    - http://localhost:7432
-    - http://gpu-server:7432
-    - http://pi-cluster:7432
+    - http://localhost:7433
+    - http://gpu-server:7433
+    - http://pi-cluster:7433
 ```
 
 With multiple servers, `hs scribe convert` and `hs scribe watch` automatically load-balance across them. The CLI queries each server's `/readiness` endpoint and routes each PDF to the server with the most available VLM slots.
@@ -234,7 +234,7 @@ Multi-arch images (amd64 + arm64) are published to GHCR on every release:
 
 ```sh
 docker pull ghcr.io/home-still/hs-scribe-server:latest
-docker run -p 7432:7432 -v ~/.local/share/home-still/models:/models:ro \
+docker run -p 7433:7433 -v ~/.local/share/home-still/models:/models:ro \
   -e HS_SCRIBE_OLLAMA_URL=http://host.docker.internal:11434 \
   ghcr.io/home-still/hs-scribe-server:latest
 ```
@@ -244,14 +244,14 @@ Or just use `hs scribe init` which handles all of this automatically.
 ### Health check
 
 ```sh
-curl http://localhost:7432/health
+curl http://localhost:7433/health
 # {"status":"ok","layout_model":true,"table_model":true}
 ```
 
 ### Streaming API
 
 ```sh
-curl -X POST http://localhost:7432/scribe/stream \
+curl -X POST http://localhost:7433/scribe/stream \
   -F 'pdf=@paper.pdf' \
   --no-buffer
 # {"progress":{"stage":"parse","page":0,"total_pages":10,"message":"Parsed 10 pages"}}

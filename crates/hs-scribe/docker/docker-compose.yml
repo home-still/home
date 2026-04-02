@@ -4,7 +4,7 @@ services:
       context: ../../..
       dockerfile: crates/hs-scribe/docker/Dockerfile
     ports:
-      - "7432:7432"
+      - "7433:7433"
     volumes:
       - ${HOME}/.local/share/home-still/models:/models:ro
     environment:

@@ -12,7 +12,7 @@ use hs_scribe::server::{app, ServerState};
 struct Args {
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
-    #[arg(long, default_value = "7432")]
+    #[arg(long, default_value = "7433")]
     port: u16,
 }
 
