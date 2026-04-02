@@ -149,7 +149,7 @@ impl Reporter for TtyReporter {
                     use_color: self.use_color,
                     prefix_width,
                     counted: true,
-                    title: title,
+                    title,
                 })
             }
             None => {
@@ -172,7 +172,7 @@ impl Reporter for TtyReporter {
                     use_color: self.use_color,
                     prefix_width,
                     counted: true,
-                    title: title,
+                    title,
                 })
             }
         }
