@@ -16,7 +16,7 @@ fn resolve_project_dir() -> PathBuf {
             if t.starts_with('#') || t.is_empty() {
                 continue;
             }
-            if !t.starts_with(' ') && !t.starts_with('\t') {
+            if !line.starts_with(' ') && !line.starts_with('\t') {
                 in_home = t.starts_with("home:");
             }
             if in_home {

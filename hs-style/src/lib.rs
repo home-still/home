@@ -24,21 +24,21 @@ pub fn resolve_project_dir() -> std::path::PathBuf {
         let mut in_home_section = false;
         for line in contents.lines() {
             let trimmed = line.trim();
-            // Track YAML sections (top-level keys ending with :)
-            if !trimmed.starts_with('#') && !trimmed.is_empty() {
-                if !trimmed.starts_with(' ') && !trimmed.starts_with('\t') {
-                    in_home_section = trimmed.starts_with("home:");
-                }
-                if in_home_section {
-                    if let Some(val) = trimmed.strip_prefix("project_dir:") {
-                        let val = val.trim().trim_matches('"').trim_matches('\'');
-                        if !val.is_empty() {
-                            // Expand ~ to home dir
-                            if let Some(rest) = val.strip_prefix("~/") {
-                                return home.join(rest);
-                            }
-                            return std::path::PathBuf::from(val);
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                continue;
+            }
+            // Track YAML sections: top-level keys have no leading whitespace
+            if !line.starts_with(' ') && !line.starts_with('\t') {
+                in_home_section = trimmed.starts_with("home:");
+            }
+            if in_home_section {
+                if let Some(val) = trimmed.strip_prefix("project_dir:") {
+                    let val = val.trim().trim_matches('"').trim_matches('\'');
+                    if !val.is_empty() {
+                        if let Some(rest) = val.strip_prefix("~/") {
+                            return home.join(rest);
                         }
+                        return std::path::PathBuf::from(val);
                     }
                 }
             }
