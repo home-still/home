@@ -379,6 +379,13 @@ async fn cmd_watch(
     // Write initial status file
     stats.write_status_file(&status_path, &watch_dir_str, &output_dir_str);
 
+    // CTRL+C handler — sets flag so the blocking recv_timeout loop can exit
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_flag = Arc::clone(&shutdown);
+    let _ = ctrlc::set_handler(move || {
+        shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
     // PollWatcher works on NFS/CIFS/FUSE — inotify only works on local filesystems
     let (tx, rx) = std::sync::mpsc::channel();
     let poll_config = notify::Config::default().with_poll_interval(Duration::from_secs(5));
@@ -389,6 +396,10 @@ async fn cmd_watch(
     let mut ticks_since_status_write: u32 = 0;
 
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            reporter.status("Watch", "shutting down...");
+            break;
+        }
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(event)) => {
                 for path in &event.paths {

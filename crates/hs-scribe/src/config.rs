@@ -158,7 +158,15 @@ impl ScribeConfig {
             .map(|d| d.join(".home-still").join("config.yaml"))
             .unwrap_or_default();
 
-        let result = Figment::from(Serialized::defaults(ScribeConfig::default()))
+        // Nest defaults under "scribe" key so they merge correctly with YAML
+        let defaults = serde_json::json!({
+            "scribe": {
+                "output_dir": ScribeConfig::default().output_dir,
+                "watch_dir": ScribeConfig::default().watch_dir,
+                "servers": ScribeConfig::default().servers,
+            }
+        });
+        let result = Figment::from(Serialized::defaults(defaults))
             .merge(Yaml::file(config_path).nested())
             .merge(Env::prefixed("HS_SCRIBE_"))
             .focus("scribe")
