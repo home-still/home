@@ -60,6 +60,7 @@ async fn extract_pdf(mut multipart: Multipart) -> Result<Vec<u8>, Response> {
 }
 
 /// Write PDF bytes to a temp file and return the handle (keeps file alive).
+#[allow(clippy::result_large_err)]
 fn write_tmp_pdf(pdf_bytes: &[u8]) -> Result<tempfile::NamedTempFile, Response> {
     let tmp = tempfile::NamedTempFile::new()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response())?;
