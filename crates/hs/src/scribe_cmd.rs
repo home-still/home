@@ -239,15 +239,12 @@ async fn cmd_watch(
                         if path.extension().is_some_and(|ext| ext == "pdf") {
                             // Skip if markdown already exists and is newer
                             let stem = path.file_stem().unwrap_or_default();
-                            let md_path =
-                                output_dir.join(format!("{}.md", stem.to_string_lossy()));
+                            let md_path = output_dir.join(format!("{}.md", stem.to_string_lossy()));
                             if md_path.exists() {
-                                let pdf_mod = std::fs::metadata(path)
-                                    .and_then(|m| m.modified())
-                                    .ok();
-                                let md_mod = std::fs::metadata(&md_path)
-                                    .and_then(|m| m.modified())
-                                    .ok();
+                                let pdf_mod =
+                                    std::fs::metadata(path).and_then(|m| m.modified()).ok();
+                                let md_mod =
+                                    std::fs::metadata(&md_path).and_then(|m| m.modified()).ok();
                                 if let (Some(p), Some(m)) = (pdf_mod, md_mod) {
                                     if m >= p {
                                         continue; // markdown is up to date
@@ -277,10 +274,7 @@ async fn convert_and_save(
     output_dir: &std::path::Path,
     reporter: &Arc<dyn Reporter>,
 ) {
-    let stem = pdf_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let stem = pdf_path.file_stem().unwrap_or_default().to_string_lossy();
     let output_path = output_dir.join(format!("{stem}.md"));
 
     let stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =

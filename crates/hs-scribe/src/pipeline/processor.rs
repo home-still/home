@@ -840,7 +840,9 @@ async fn execute_vlm_for_page(
                                 stage: "vlm".into(),
                                 page: page_num,
                                 total_pages,
-                                message: format!("OCR region {done}/{total_regions} on page {page_num}"),
+                                message: format!(
+                                    "OCR region {done}/{total_regions} on page {page_num}"
+                                ),
                             });
                             Ok((r.bbox, text))
                         }
@@ -861,7 +863,11 @@ async fn execute_vlm_for_page(
                     stage: "vlm".into(),
                     page: page_num,
                     total_pages,
-                    message: format!("OCR table {}/{} ({total_cells} cells) on page {page_num}", t_idx + 1, t_idx + 1),
+                    message: format!(
+                        "OCR table {}/{} ({total_cells} cells) on page {page_num}",
+                        t_idx + 1,
+                        t_idx + 1
+                    ),
                 });
 
                 let cell_texts: Vec<String> = stream::iter(table.cell_jpegs.into_iter())
@@ -887,7 +893,9 @@ async fn execute_vlm_for_page(
                                 stage: "vlm".into(),
                                 page: page_num,
                                 total_pages,
-                                message: format!("OCR table cell {done}/{total_cells} on page {page_num}"),
+                                message: format!(
+                                    "OCR table cell {done}/{total_cells} on page {page_num}"
+                                ),
                             });
                             result
                         }

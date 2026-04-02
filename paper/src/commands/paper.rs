@@ -196,9 +196,8 @@ pub async fn run_download(
         } else {
             None
         };
-        let search_stage: Arc<Box<dyn hs_style::reporter::StageHandle>> = Arc::new(
-            reporter.begin_counted_stage("Searching", search_total),
-        );
+        let search_stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
+            Arc::new(reporter.begin_counted_stage("Searching", search_total));
         search_stage.set_message(&format!("for '{}'", query_str));
 
         let search_stage_cb = Arc::clone(&search_stage);
@@ -271,7 +270,8 @@ pub async fn run_download(
                 "Found",
                 &format!(
                     "{} papers, downloading (concurrency={})...",
-                    downloadable.len(), concurrency
+                    downloadable.len(),
+                    concurrency
                 ),
             );
         }
@@ -286,9 +286,8 @@ pub async fn run_download(
 
         // Overall progress counter (ephemeral — cleared when done)
         let total_papers = search_result.papers.len();
-        let overall: Arc<Box<dyn hs_style::reporter::StageHandle>> = Arc::new(
-            reporter.begin_counted_stage("Downloading", Some(total_papers as u64)),
-        );
+        let overall: Arc<Box<dyn hs_style::reporter::StageHandle>> =
+            Arc::new(reporter.begin_counted_stage("Downloading", Some(total_papers as u64)));
 
         // Per-download progress bars (ephemeral — cleared on completion)
         let bars: Arc<Mutex<HashMap<usize, Box<dyn hs_style::reporter::StageHandle>>>> =

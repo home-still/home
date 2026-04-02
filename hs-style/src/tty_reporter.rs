@@ -202,9 +202,11 @@ impl StageHandle for IndicatifStageHandle {
         self.pb.set_length(total);
         let template = if self.counted {
             if self.use_color {
-                "{prefix} {wide_bar:.cyan/dim} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}".to_string()
+                "{prefix} {wide_bar:.cyan/dim} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}"
+                    .to_string()
             } else {
-                "{prefix} {wide_bar} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}".to_string()
+                "{prefix} {wide_bar} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}"
+                    .to_string()
             }
         } else if self.use_color {
             "{prefix} {bytes:>10}/{total_bytes:<10} {msg}".to_string()
