@@ -123,8 +123,8 @@ pub enum ScribeCmd {
     /// Show status of a running watch service
     Status {
         /// Output directory to read status from
-        #[arg(long)]
-        output: Option<PathBuf>,
+        #[arg(long = "dir")]
+        status_dir: Option<PathBuf>,
     },
     /// Manage the scribe server (Docker services)
     Server {
@@ -160,7 +160,7 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
             output,
             server,
         } => cmd_watch(dir, output, server, reporter).await,
-        ScribeCmd::Status { output } => cmd_status(output, reporter).await,
+        ScribeCmd::Status { status_dir } => cmd_status(status_dir, reporter).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
         ScribeCmd::Server { action } => cmd_server(action).await,
     }
