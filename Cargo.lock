@@ -1163,6 +1163,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "dirs",
+ "futures",
  "hs-scribe",
  "hs-style",
  "notify 8.2.0",

@@ -22,3 +22,4 @@ dialoguer = { workspace = true }
 reqwest = { workspace = true }
 notify = "8"
 notify-debouncer-full = "0.4"
+futures = "0.3"

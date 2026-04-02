@@ -534,6 +534,29 @@ impl Processor {
         ))
     }
 
+    /// Process PDF with progress and a shared VLM semaphore from ServerState.
+    /// TODO: Wire shared semaphore into pipeline internals for true cross-request limiting.
+    pub async fn process_pdf_with_progress_and_sem<F>(
+        &self,
+        pdf_path: &str,
+        on_progress: F,
+        _vlm_sem: Arc<tokio::sync::Semaphore>,
+    ) -> Result<String>
+    where
+        F: Fn(ProgressEvent) + Send + Sync + 'static,
+    {
+        self.process_pdf_with_progress(pdf_path, on_progress).await
+    }
+
+    /// Process PDF with a shared VLM semaphore from ServerState.
+    pub async fn process_pdf_with_shared_sem(
+        &self,
+        pdf_path: &str,
+        _vlm_sem: Arc<tokio::sync::Semaphore>,
+    ) -> Result<String> {
+        self.process_pdf(pdf_path).await
+    }
+
     pub async fn process_pdf(&self, pdf_path: &str) -> Result<String> {
         let pages = {
             let pdf_parser = PdfParser::new()?;

@@ -1,11 +1,25 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use hs_scribe::config::ScribeConfig;
 use hs_style::reporter::Reporter;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
+use crate::scribe_pool::ScribePool;
+
 const DEFAULT_SERVER: &str = "http://localhost:7432";
+
+/// Resolve the server list from CLI flag, config file, or default.
+fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
+    if let Some(s) = cli_server {
+        return vec![s.to_string()];
+    }
+    match ScribeConfig::load() {
+        Ok(cfg) if !cfg.servers.is_empty() => cfg.servers,
+        _ => vec![DEFAULT_SERVER.to_string()],
+    }
+}
 const LAYOUT_MODEL_URL: &str =
     "https://github.com/home-still/home/releases/download/v0.0.1-rc.39/pp-doclayoutv3.onnx";
 
@@ -151,20 +165,33 @@ async fn cmd_convert(
     server: Option<String>,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    let url = server.as_deref().unwrap_or(DEFAULT_SERVER);
-    let client = hs_scribe::client::ScribeClient::new(url);
+    let servers = resolve_servers(server.as_deref());
 
-    // Quick health check so we fail fast if server isn't running
+    // Health check
     let check_stage = reporter.begin_stage("Connecting", None);
-    check_stage.set_message(&format!("server at {url}"));
-    match client.health().await {
-        Ok(_) => check_stage.finish_and_clear(),
-        Err(e) => {
-            check_stage.finish_failed("server not reachable");
-            anyhow::bail!(
-                "Cannot reach scribe server at {url}: {e:#}\n\nRun `hs scribe init` to set up the server."
-            );
+    if servers.len() == 1 {
+        let url = &servers[0];
+        check_stage.set_message(&format!("server at {url}"));
+        let client = hs_scribe::client::ScribeClient::new(url);
+        match client.health().await {
+            Ok(_) => check_stage.finish_and_clear(),
+            Err(e) => {
+                check_stage.finish_failed("server not reachable");
+                anyhow::bail!(
+                    "Cannot reach scribe server at {url}: {e:#}\n\nRun `hs scribe init` to set up the server."
+                );
+            }
         }
+    } else {
+        check_stage.set_message(&format!("{} servers", servers.len()));
+        let pool = ScribePool::new(&servers);
+        let results = pool.check_all().await;
+        let reachable = results.iter().filter(|(_, ok)| *ok).count();
+        if reachable == 0 {
+            check_stage.finish_failed("no servers reachable");
+            anyhow::bail!("No scribe servers are reachable. Check your config.");
+        }
+        check_stage.finish_and_clear();
     }
 
     let pdf_bytes =
@@ -175,15 +202,21 @@ async fn cmd_convert(
     stage.set_message("sending PDF to server...");
     let stage_cb = Arc::clone(&stage);
 
-    let md = client
-        .convert_with_progress(pdf_bytes, move |event| {
-            if event.total_pages > 0 {
-                stage_cb.set_length(event.total_pages);
-                stage_cb.set_position(event.page);
-            }
-            stage_cb.set_message(&format!("[{}] {}", event.stage, event.message));
-        })
-        .await;
+    let on_progress = move |event: hs_scribe::client::ProgressEvent| {
+        if event.total_pages > 0 {
+            stage_cb.set_length(event.total_pages);
+            stage_cb.set_position(event.page);
+        }
+        stage_cb.set_message(&format!("[{}] {}", event.stage, event.message));
+    };
+
+    let md = if servers.len() == 1 {
+        let client = hs_scribe::client::ScribeClient::new(&servers[0]);
+        client.convert_with_progress(pdf_bytes, on_progress).await
+    } else {
+        let pool = ScribePool::new(&servers);
+        pool.convert_one(pdf_bytes, on_progress).await
+    };
 
     match &md {
         Ok(_) => stage.finish_with_message("done"),
@@ -191,7 +224,22 @@ async fn cmd_convert(
     }
 
     let md = md?;
-    match out_file {
+
+    // Resolve output: CLI flag > config output_dir > stdout
+    let out = out_file.or_else(|| {
+        ScribeConfig::load().ok().and_then(|cfg| {
+            let dir = &cfg.output_dir;
+            if dir.as_os_str().is_empty() || dir == std::path::Path::new(".") {
+                None
+            } else {
+                let stem = input.file_stem()?;
+                std::fs::create_dir_all(dir).ok()?;
+                Some(dir.join(format!("{}.md", stem.to_string_lossy())))
+            }
+        })
+    });
+
+    match out {
         Some(path) => std::fs::write(&path, &md)?,
         None => print!("{md}"),
     }
@@ -209,22 +257,49 @@ async fn cmd_watch(
     use notify_debouncer_full::{new_debouncer, notify::RecursiveMode};
     use std::time::Duration;
 
-    let url = server.as_deref().unwrap_or(DEFAULT_SERVER);
-    let client = hs_scribe::client::ScribeClient::new(url);
+    let servers = resolve_servers(server.as_deref());
+    let scribe_cfg = ScribeConfig::load().unwrap_or_default();
+
+    // Resolve dirs: CLI flag > config > defaults
+    let watch_dir = dir
+        .or_else(|| {
+            let d = &scribe_cfg.watch_dir;
+            if d.as_os_str().is_empty() || d == std::path::Path::new(".") {
+                None
+            } else {
+                Some(d.clone())
+            }
+        })
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let output_dir = output
+        .or_else(|| {
+            let d = &scribe_cfg.output_dir;
+            if d.as_os_str().is_empty() || d == std::path::Path::new("markdown") {
+                None
+            } else {
+                Some(d.clone())
+            }
+        })
+        .unwrap_or_else(|| watch_dir.join("markdown"));
+    std::fs::create_dir_all(&output_dir)?;
 
     // Health check
-    client
-        .health()
-        .await
-        .context("Scribe server not reachable. Run `hs scribe server start` first.")?;
-
-    let watch_dir = dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let output_dir = output.unwrap_or_else(|| watch_dir.join("markdown"));
-    std::fs::create_dir_all(&output_dir)?;
+    let pool = Arc::new(ScribePool::new(&servers));
+    let results = pool.check_all().await;
+    let reachable = results.iter().filter(|(_, ok)| *ok).count();
+    if reachable == 0 {
+        anyhow::bail!("No scribe servers reachable. Run `hs scribe server start` first.");
+    }
 
     reporter.status(
         "Watching",
-        &format!("{} → {}", watch_dir.display(), output_dir.display()),
+        &format!(
+            "{} → {} ({} server{})",
+            watch_dir.display(),
+            output_dir.display(),
+            reachable,
+            if reachable == 1 { "" } else { "s" }
+        ),
     );
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -237,7 +312,6 @@ async fn cmd_watch(
                 for event in events {
                     for path in &event.paths {
                         if path.extension().is_some_and(|ext| ext == "pdf") {
-                            // Skip if markdown already exists and is newer
                             let stem = path.file_stem().unwrap_or_default();
                             let md_path = output_dir.join(format!("{}.md", stem.to_string_lossy()));
                             if md_path.exists() {
@@ -247,11 +321,18 @@ async fn cmd_watch(
                                     std::fs::metadata(&md_path).and_then(|m| m.modified()).ok();
                                 if let (Some(p), Some(m)) = (pdf_mod, md_mod) {
                                     if m >= p {
-                                        continue; // markdown is up to date
+                                        continue;
                                     }
                                 }
                             }
-                            convert_and_save(&client, path, &output_dir, reporter).await;
+                            // Dispatch via pool (parallel across servers)
+                            let pool = Arc::clone(&pool);
+                            let path = path.clone();
+                            let output_dir = output_dir.clone();
+                            let reporter = Arc::clone(reporter);
+                            tokio::spawn(async move {
+                                convert_and_save_pool(&pool, &path, &output_dir, &reporter).await;
+                            });
                         }
                     }
                 }
@@ -268,8 +349,8 @@ async fn cmd_watch(
     Ok(())
 }
 
-async fn convert_and_save(
-    client: &hs_scribe::client::ScribeClient,
+async fn convert_and_save_pool(
+    pool: &ScribePool,
     pdf_path: &std::path::Path,
     output_dir: &std::path::Path,
     reporter: &Arc<dyn Reporter>,
@@ -279,7 +360,7 @@ async fn convert_and_save(
 
     let stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
         Arc::new(reporter.begin_counted_stage(&stem, None));
-    stage.set_message("reading PDF...");
+    stage.set_message("queuing...");
     let stage_cb = Arc::clone(&stage);
 
     let pdf_bytes = match std::fs::read(pdf_path) {
@@ -290,8 +371,8 @@ async fn convert_and_save(
         }
     };
 
-    let result = client
-        .convert_with_progress(pdf_bytes, move |event| {
+    let result = pool
+        .convert_one(pdf_bytes, move |event| {
             if event.total_pages > 0 {
                 stage_cb.set_length(event.total_pages);
                 stage_cb.set_position(event.page);

@@ -101,3 +101,42 @@ impl AppConfig {
         Self::resolve_model_path(&self.table_model_path)
     }
 }
+
+/// Client-side scribe configuration (server list, directories).
+/// Loaded from ~/.home-still/config.yaml under the "scribe" section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScribeConfig {
+    pub output_dir: PathBuf,
+    pub watch_dir: PathBuf,
+    pub servers: Vec<String>,
+}
+
+impl Default for ScribeConfig {
+    fn default() -> Self {
+        Self {
+            output_dir: PathBuf::from("markdown"),
+            watch_dir: PathBuf::from("."),
+            servers: vec!["http://localhost:7432".into()],
+        }
+    }
+}
+
+impl ScribeConfig {
+    pub fn load() -> Result<Self, Box<figment::Error>> {
+        let config_path = dirs::home_dir()
+            .map(|d| d.join(".home-still").join("config.yaml"))
+            .unwrap_or_default();
+
+        let result = Figment::from(Serialized::defaults(ScribeConfig::default()))
+            .merge(Yaml::file(config_path).nested())
+            .merge(Env::prefixed("HS_SCRIBE_"))
+            .focus("scribe")
+            .extract::<ScribeConfig>();
+
+        match result {
+            Ok(cfg) => Ok(cfg),
+            Err(_) => Ok(ScribeConfig::default()),
+        }
+    }
+}

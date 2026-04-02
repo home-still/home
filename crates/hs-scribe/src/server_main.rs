@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use hs_scribe::config::AppConfig;
@@ -25,8 +26,14 @@ async fn main() -> Result<()> {
         AppConfig::default()
     });
 
+    let vlm_sem = Arc::new(tokio::sync::Semaphore::new(config.vlm_concurrency));
     let processor = Processor::new(config.clone())?;
-    let state = Arc::new(ServerState { processor, config });
+    let state = Arc::new(ServerState {
+        processor,
+        config,
+        vlm_sem,
+        in_flight: Arc::new(AtomicUsize::new(0)),
+    });
 
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("Listening on {addr}");

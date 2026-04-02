@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 mod cli;
 mod scribe_cmd;
+mod scribe_pool;
 
 use cli::{Cli, TopCmd};
 use hs_style::mode::{self, OutputMode};

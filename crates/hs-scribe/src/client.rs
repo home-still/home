@@ -31,6 +31,14 @@ pub struct HealthResponse {
     pub table_model: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReadinessResponse {
+    pub ready: bool,
+    pub vlm_slots_total: usize,
+    pub vlm_slots_available: usize,
+    pub in_flight_conversions: usize,
+}
+
 pub struct ScribeClient {
     http: Client,
     server_url: String,
@@ -48,6 +56,10 @@ impl ScribeClient {
         }
     }
 
+    pub fn url(&self) -> &str {
+        &self.server_url
+    }
+
     pub async fn health(&self) -> Result<HealthResponse> {
         let url = format!("{}/health", self.server_url);
         let resp = self
@@ -57,6 +69,27 @@ impl ScribeClient {
             .await
             .context("Failed to reach server")?;
         resp.json().await.context("Invalid health response")
+    }
+
+    pub async fn readiness(&self) -> Result<ReadinessResponse> {
+        let url = format!("{}/readiness", self.server_url);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .context("Failed to reach server")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            // Old server without /readiness — treat as always ready
+            return Ok(ReadinessResponse {
+                ready: true,
+                vlm_slots_total: 0,
+                vlm_slots_available: 1,
+                in_flight_conversions: 0,
+            });
+        }
+        resp.json().await.context("Invalid readiness response")
     }
 
     pub async fn convert(&self, pdf_bytes: Vec<u8>) -> Result<String> {

@@ -9,12 +9,15 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 
 pub struct ServerState {
     pub processor: Processor,
     pub config: AppConfig,
+    pub vlm_sem: Arc<tokio::sync::Semaphore>,
+    pub in_flight: Arc<AtomicUsize>,
 }
 
 pub fn app(state: Arc<ServerState>) -> Router {
@@ -22,6 +25,7 @@ pub fn app(state: Arc<ServerState>) -> Router {
         .route("/scribe", post(handle_scribe))
         .route("/scribe/stream", post(handle_scribe_stream))
         .route("/health", get(handle_health))
+        .route("/readiness", get(handle_readiness))
         .route("/info", get(handle_info))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256MB
         .with_state(state)
@@ -31,6 +35,18 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoRespon
     axum::Json(serde_json::json!({
         "status": "ok", "layout_model": state.processor.has_layout_detector(),
         "table_model": state.processor.has_table_recognizer()
+    }))
+}
+
+async fn handle_readiness(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    let total = state.config.vlm_concurrency;
+    let available = state.vlm_sem.available_permits();
+    let in_flight = state.in_flight.load(Ordering::Relaxed);
+    axum::Json(serde_json::json!({
+        "ready": available > 0,
+        "vlm_slots_total": total,
+        "vlm_slots_available": available,
+        "in_flight_conversions": in_flight,
     }))
 }
 
@@ -69,7 +85,18 @@ fn write_tmp_pdf(pdf_bytes: &[u8]) -> Result<tempfile::NamedTempFile, Response> 
     Ok(tmp)
 }
 
+/// Drop guard that decrements in_flight counter when request completes.
+struct InFlightGuard(Arc<AtomicUsize>);
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipart) -> Response {
+    state.in_flight.fetch_add(1, Ordering::Relaxed);
+    let _guard = InFlightGuard(Arc::clone(&state.in_flight));
+
     let pdf_bytes = match extract_pdf(multipart).await {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -81,7 +108,11 @@ async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipa
     };
 
     let path = tmp.path().to_str().unwrap_or_default();
-    match state.processor.process_pdf(path).await {
+    match state
+        .processor
+        .process_pdf_with_shared_sem(path, Arc::clone(&state.vlm_sem))
+        .await
+    {
         Ok(md) => (StatusCode::OK, md).into_response(),
         Err(e) => {
             tracing::error!("Processing failed: {e:#}");
@@ -104,11 +135,16 @@ async fn handle_scribe_stream(
         Err(resp) => return resp,
     };
 
+    state.in_flight.fetch_add(1, Ordering::Relaxed);
+    let in_flight = Arc::clone(&state.in_flight);
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
     let path = tmp.path().to_string_lossy().to_string();
+    let vlm_sem = Arc::clone(&state.vlm_sem);
 
     tokio::spawn(async move {
         let _tmp = tmp; // keep temp file alive for the duration of processing
+        let _guard = InFlightGuard(in_flight);
 
         let tx_progress = tx.clone();
         let on_progress = move |event: crate::client::ProgressEvent| {
@@ -120,7 +156,7 @@ async fn handle_scribe_stream(
 
         match state
             .processor
-            .process_pdf_with_progress(&path, on_progress)
+            .process_pdf_with_progress_and_sem(&path, on_progress, vlm_sem)
             .await
         {
             Ok(md) => {
