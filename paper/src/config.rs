@@ -32,9 +32,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             resilience: ResilienceConfig::default(),
-            download_path: dirs::home_dir()
-                .map(|h| h.join(hs_style::PROJECT_DIR_DEFAULT).join("papers"))
-                .unwrap_or_else(|| PathBuf::from("./papers")),
+            download_path: hs_style::resolve_project_dir().join("papers"),
             cache_path: dirs::home_dir()
                 .map(|h| h.join(hs_style::HIDDEN_DIR).join("cache"))
                 .unwrap_or_else(|| PathBuf::from("./cache")),

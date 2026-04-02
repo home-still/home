@@ -5,6 +5,36 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Resolve project_dir from ~/.home-still/config.yaml or default to ~/home-still.
+fn resolve_project_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    let config_path = home.join(".home-still/config.yaml");
+    if let Ok(contents) = std::fs::read_to_string(&config_path) {
+        let mut in_home = false;
+        for line in contents.lines() {
+            let t = line.trim();
+            if t.starts_with('#') || t.is_empty() {
+                continue;
+            }
+            if !t.starts_with(' ') && !t.starts_with('\t') {
+                in_home = t.starts_with("home:");
+            }
+            if in_home {
+                if let Some(val) = t.strip_prefix("project_dir:") {
+                    let val = val.trim().trim_matches('"').trim_matches('\'');
+                    if !val.is_empty() {
+                        if let Some(rest) = val.strip_prefix("~/") {
+                            return home.join(rest);
+                        }
+                        return PathBuf::from(val);
+                    }
+                }
+            }
+        }
+    }
+    home.join("home-still")
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum BackendChoice {
     #[default]
@@ -115,12 +145,8 @@ pub struct ScribeConfig {
 impl Default for ScribeConfig {
     fn default() -> Self {
         Self {
-            output_dir: dirs::home_dir()
-                .map(|h| h.join("home-still/markdown"))
-                .unwrap_or_else(|| PathBuf::from("markdown")),
-            watch_dir: dirs::home_dir()
-                .map(|h| h.join("home-still/papers"))
-                .unwrap_or_else(|| PathBuf::from(".")),
+            output_dir: resolve_project_dir().join("markdown"),
+            watch_dir: resolve_project_dir().join("papers"),
             servers: vec!["http://localhost:7433".into()],
         }
     }
