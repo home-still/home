@@ -75,9 +75,9 @@ impl Reporter for TtyReporter {
             Some(len) => {
                 let pb = self.mp.add(ProgressBar::new(len));
                 let template = if self.use_color {
-                    format!("{{prefix}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
+                    "{prefix} {bytes:>10}/{total_bytes:<10} {msg}".to_string()
                 } else {
-                    format!("{{prefix}} {{wide_bar}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
+                    "{prefix} {wide_bar} {bytes:>10}/{total_bytes:<10} {msg}".to_string()
                 };
                 pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
                 let initial = if self.use_color {
@@ -97,9 +97,9 @@ impl Reporter for TtyReporter {
             None => {
                 let pb = self.mp.add(ProgressBar::new_spinner());
                 let template = if self.use_color {
-                    format!("{{prefix}} {{spinner:.cyan}} {{msg}}")
+                    "{prefix} {spinner:.cyan} {msg}".to_string()
                 } else {
-                    format!("{{prefix}} {{spinner}} {{msg}}")
+                    "{prefix} {spinner} {msg}".to_string()
                 };
                 pb.set_style(make_spinner_style(&template));
                 let initial = if self.use_color {
@@ -132,9 +132,9 @@ impl Reporter for TtyReporter {
             Some(len) => {
                 let pb = self.mp.add(ProgressBar::new(len));
                 let template = if self.use_color {
-                    format!("{{prefix}} {{wide_bar:.cyan/dim}} {{pos:>5}}/{{len:<5}} {{elapsed_precise}} ETA {{eta}} {{msg}}")
+                    "{prefix} {wide_bar:.cyan/dim} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}".to_string()
                 } else {
-                    format!("{{prefix}} {{wide_bar}} {{pos:>5}}/{{len:<5}} {{elapsed_precise}} ETA {{eta}} {{msg}}")
+                    "{prefix} {wide_bar} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}".to_string()
                 };
                 pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
                 let initial = if self.use_color {
@@ -154,9 +154,9 @@ impl Reporter for TtyReporter {
             None => {
                 let pb = self.mp.add(ProgressBar::new_spinner());
                 let template = if self.use_color {
-                    format!("{{prefix}} {{spinner:.cyan}} {{msg}}")
+                    "{prefix} {spinner:.cyan} {msg}".to_string()
                 } else {
-                    format!("{{prefix}} {{spinner}} {{msg}}")
+                    "{prefix} {spinner} {msg}".to_string()
                 };
                 pb.set_style(make_spinner_style(&template));
                 let initial = if self.use_color {
