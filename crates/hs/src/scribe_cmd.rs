@@ -386,6 +386,45 @@ async fn cmd_watch(
         shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
+    // Initial scan: queue existing PDFs that don't have up-to-date markdown
+    if let Ok(entries) = std::fs::read_dir(&watch_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension() != Some(std::ffi::OsStr::new("pdf")) {
+                continue;
+            }
+            if path.to_string_lossy().ends_with(".tmp") {
+                continue;
+            }
+            let stem = path.file_stem().unwrap_or_default();
+            let md_path = output_dir.join(format!("{}.md", stem.to_string_lossy()));
+            if md_path.exists() {
+                let _ = std::fs::File::open(&path);
+                let _ = std::fs::File::open(&md_path);
+                let pdf_mod = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let md_mod = std::fs::metadata(&md_path).and_then(|m| m.modified()).ok();
+                if let (Some(p), Some(m)) = (pdf_mod, md_mod) {
+                    if m >= p {
+                        continue;
+                    }
+                }
+            }
+            if path.with_extension("pdf.tmp").exists() {
+                continue;
+            }
+            stats
+                .queued
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let pool = Arc::clone(&pool);
+            let output_dir = output_dir.clone();
+            let reporter = Arc::clone(reporter);
+            let stats = Arc::clone(&stats);
+            tokio::spawn(async move {
+                convert_and_save_pool(&pool, &path, &output_dir, &reporter, &stats).await;
+            });
+        }
+    }
+
     // PollWatcher works on NFS/CIFS/FUSE — inotify only works on local filesystems
     let (tx, rx) = std::sync::mpsc::channel();
     let poll_config = notify::Config::default().with_poll_interval(Duration::from_secs(5));
