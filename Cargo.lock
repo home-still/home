@@ -1165,6 +1165,8 @@ dependencies = [
  "dirs",
  "hs-scribe",
  "hs-style",
+ "notify 8.2.0",
+ "notify-debouncer-full",
  "owo-colors",
  "paper",
  "reqwest",

@@ -20,3 +20,5 @@ serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 dialoguer = { workspace = true }
 reqwest = { workspace = true }
+notify = "8"
+notify-debouncer-full = "0.4"

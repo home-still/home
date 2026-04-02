@@ -92,6 +92,18 @@ pub enum ScribeCmd {
         #[arg(long)]
         check: bool,
     },
+    /// Watch a directory for new PDFs and auto-convert to markdown
+    Watch {
+        /// Directory to watch for PDFs (default: current directory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Output directory for markdown files (default: <dir>/markdown)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+        /// Server URL override
+        #[arg(long)]
+        server: Option<String>,
+    },
     /// Manage the scribe server (Docker services)
     Server {
         #[command(subcommand)]
@@ -121,6 +133,11 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
             out_file,
             server,
         } => cmd_convert(input, out_file, server, reporter).await,
+        ScribeCmd::Watch {
+            dir,
+            output,
+            server,
+        } => cmd_watch(dir, output, server, reporter).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
         ScribeCmd::Server { action } => cmd_server(action).await,
     }
@@ -179,6 +196,126 @@ async fn cmd_convert(
         None => print!("{md}"),
     }
     Ok(())
+}
+
+// ── Watch ───────────────────────────────────────────────────────
+
+async fn cmd_watch(
+    dir: Option<PathBuf>,
+    output: Option<PathBuf>,
+    server: Option<String>,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    use notify_debouncer_full::{new_debouncer, notify::RecursiveMode};
+    use std::time::Duration;
+
+    let url = server.as_deref().unwrap_or(DEFAULT_SERVER);
+    let client = hs_scribe::client::ScribeClient::new(url);
+
+    // Health check
+    client
+        .health()
+        .await
+        .context("Scribe server not reachable. Run `hs scribe server start` first.")?;
+
+    let watch_dir = dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let output_dir = output.unwrap_or_else(|| watch_dir.join("markdown"));
+    std::fs::create_dir_all(&output_dir)?;
+
+    reporter.status(
+        "Watching",
+        &format!("{} → {}", watch_dir.display(), output_dir.display()),
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut debouncer = new_debouncer(Duration::from_millis(500), None, tx)?;
+    debouncer.watch(&watch_dir, RecursiveMode::Recursive)?;
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Ok(events)) => {
+                for event in events {
+                    for path in &event.paths {
+                        if path.extension().is_some_and(|ext| ext == "pdf") {
+                            // Skip if markdown already exists and is newer
+                            let stem = path.file_stem().unwrap_or_default();
+                            let md_path =
+                                output_dir.join(format!("{}.md", stem.to_string_lossy()));
+                            if md_path.exists() {
+                                let pdf_mod = std::fs::metadata(path)
+                                    .and_then(|m| m.modified())
+                                    .ok();
+                                let md_mod = std::fs::metadata(&md_path)
+                                    .and_then(|m| m.modified())
+                                    .ok();
+                                if let (Some(p), Some(m)) = (pdf_mod, md_mod) {
+                                    if m >= p {
+                                        continue; // markdown is up to date
+                                    }
+                                }
+                            }
+                            convert_and_save(&client, path, &output_dir, reporter).await;
+                        }
+                    }
+                }
+            }
+            Ok(Err(errs)) => {
+                for e in errs {
+                    reporter.warn(&format!("Watch error: {e}"));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
+}
+
+async fn convert_and_save(
+    client: &hs_scribe::client::ScribeClient,
+    pdf_path: &std::path::Path,
+    output_dir: &std::path::Path,
+    reporter: &Arc<dyn Reporter>,
+) {
+    let stem = pdf_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let output_path = output_dir.join(format!("{stem}.md"));
+
+    let stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
+        Arc::new(reporter.begin_counted_stage(&stem, None));
+    stage.set_message("reading PDF...");
+    let stage_cb = Arc::clone(&stage);
+
+    let pdf_bytes = match std::fs::read(pdf_path) {
+        Ok(b) => b,
+        Err(e) => {
+            stage.finish_failed(&format!("Cannot read: {e}"));
+            return;
+        }
+    };
+
+    let result = client
+        .convert_with_progress(pdf_bytes, move |event| {
+            if event.total_pages > 0 {
+                stage_cb.set_length(event.total_pages);
+                stage_cb.set_position(event.page);
+            }
+            stage_cb.set_message(&format!("[{}] {}", event.stage, event.message));
+        })
+        .await;
+
+    match result {
+        Ok(md) => {
+            if let Err(e) = std::fs::write(&output_path, &md) {
+                stage.finish_failed(&format!("Write failed: {e}"));
+            } else {
+                stage.finish_with_message(&format!("→ {}", output_path.display()));
+            }
+        }
+        Err(e) => stage.finish_failed(&format!("{e:#}")),
+    }
 }
 
 // ── Init ────────────────────────────────────────────────────────
