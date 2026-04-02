@@ -114,8 +114,8 @@ pub enum ScribeCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Output directory for markdown files (default: <dir>/markdown)
-        #[arg(long)]
-        output: Option<PathBuf>,
+        #[arg(long = "outdir")]
+        outdir: Option<PathBuf>,
         /// Server URL override
         #[arg(long)]
         server: Option<String>,
@@ -157,9 +157,9 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         } => cmd_convert(input, out_file, server, reporter).await,
         ScribeCmd::Watch {
             dir,
-            output,
+            outdir,
             server,
-        } => cmd_watch(dir, output, server, reporter).await,
+        } => cmd_watch(dir, outdir, server, reporter).await,
         ScribeCmd::Status { status_dir } => cmd_status(status_dir, reporter).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
         ScribeCmd::Server { action } => cmd_server(action).await,
