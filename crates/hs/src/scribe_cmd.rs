@@ -120,6 +120,12 @@ pub enum ScribeCmd {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Show status of a running watch service
+    Status {
+        /// Output directory to read status from
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
     /// Manage the scribe server (Docker services)
     Server {
         #[command(subcommand)]
@@ -154,6 +160,7 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
             output,
             server,
         } => cmd_watch(dir, output, server, reporter).await,
+        ScribeCmd::Status { output } => cmd_status(output, reporter).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
         ScribeCmd::Server { action } => cmd_server(action).await,
     }
@@ -250,6 +257,52 @@ async fn cmd_convert(
 
 // ── Watch ───────────────────────────────────────────────────────
 
+const STATUS_FILE: &str = ".scribe-watch-status.json";
+
+struct WatchStats {
+    processing: std::sync::atomic::AtomicUsize,
+    queued: std::sync::atomic::AtomicUsize,
+    completed: std::sync::atomic::AtomicUsize,
+    failed: std::sync::atomic::AtomicUsize,
+}
+
+impl WatchStats {
+    fn new() -> Self {
+        use std::sync::atomic::AtomicUsize;
+        Self {
+            processing: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
+        }
+    }
+
+    fn summary(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = self.processing.load(Relaxed);
+        let q = self.queued.load(Relaxed);
+        let c = self.completed.load(Relaxed);
+        let f = self.failed.load(Relaxed);
+        format!("{p} processing, {q} queued, {c} completed, {f} failed")
+    }
+
+    fn write_status_file(&self, path: &std::path::Path, watch_dir: &str, output_dir: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let json = serde_json::json!({
+            "processing": self.processing.load(Relaxed),
+            "queued": self.queued.load(Relaxed),
+            "completed": self.completed.load(Relaxed),
+            "failed": self.failed.load(Relaxed),
+            "watch_dir": watch_dir,
+            "output_dir": output_dir,
+        });
+        let _ = std::fs::write(
+            path,
+            serde_json::to_string_pretty(&json).unwrap_or_default(),
+        );
+    }
+}
+
 async fn cmd_watch(
     dir: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -293,6 +346,11 @@ async fn cmd_watch(
         anyhow::bail!("No scribe servers reachable. Run `hs scribe server start` first.");
     }
 
+    let stats = Arc::new(WatchStats::new());
+    let status_path = output_dir.join(STATUS_FILE);
+    let watch_dir_str = watch_dir.display().to_string();
+    let output_dir_str = output_dir.display().to_string();
+
     reporter.status(
         "Watching",
         &format!(
@@ -304,9 +362,15 @@ async fn cmd_watch(
         ),
     );
 
+    // Write initial status file
+    stats.write_status_file(&status_path, &watch_dir_str, &output_dir_str);
+
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = new_debouncer(Duration::from_millis(500), None, tx)?;
     debouncer.watch(&watch_dir, RecursiveMode::Recursive)?;
+
+    let mut last_summary = String::new();
+    let mut ticks_since_status_write: u32 = 0;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
@@ -327,13 +391,20 @@ async fn cmd_watch(
                                     }
                                 }
                             }
+                            // Track queued
+                            stats
+                                .queued
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                             // Dispatch via pool (parallel across servers)
                             let pool = Arc::clone(&pool);
                             let path = path.clone();
                             let output_dir = output_dir.clone();
                             let reporter = Arc::clone(reporter);
+                            let stats = Arc::clone(&stats);
                             tokio::spawn(async move {
-                                convert_and_save_pool(&pool, &path, &output_dir, &reporter).await;
+                                convert_and_save_pool(&pool, &path, &output_dir, &reporter, &stats)
+                                    .await;
                             });
                         }
                     }
@@ -344,10 +415,28 @@ async fn cmd_watch(
                     reporter.warn(&format!("Watch error: {e}"));
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+
+        // Update summary line if stats changed
+        let summary = stats.summary();
+        if summary != last_summary {
+            reporter.status("Watch", &summary);
+            last_summary = summary;
+            ticks_since_status_write = 0;
+        }
+
+        // Write status file every ~2 seconds (4 ticks at 500ms)
+        ticks_since_status_write += 1;
+        if ticks_since_status_write >= 4 {
+            stats.write_status_file(&status_path, &watch_dir_str, &output_dir_str);
+            ticks_since_status_write = 0;
+        }
     }
+
+    // Final status write
+    stats.write_status_file(&status_path, &watch_dir_str, &output_dir_str);
     Ok(())
 }
 
@@ -356,19 +445,28 @@ async fn convert_and_save_pool(
     pdf_path: &std::path::Path,
     output_dir: &std::path::Path,
     reporter: &Arc<dyn Reporter>,
+    stats: &WatchStats,
 ) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // queued → processing
+    stats.queued.fetch_sub(1, Relaxed);
+    stats.processing.fetch_add(1, Relaxed);
+
     let stem = pdf_path.file_stem().unwrap_or_default().to_string_lossy();
     let output_path = output_dir.join(format!("{stem}.md"));
 
     let stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
         Arc::new(reporter.begin_counted_stage(&stem, None));
-    stage.set_message("queuing...");
+    stage.set_message("converting...");
     let stage_cb = Arc::clone(&stage);
 
     let pdf_bytes = match std::fs::read(pdf_path) {
         Ok(b) => b,
         Err(e) => {
             stage.finish_failed(&format!("Cannot read: {e}"));
+            stats.processing.fetch_sub(1, Relaxed);
+            stats.failed.fetch_add(1, Relaxed);
             return;
         }
     };
@@ -383,16 +481,63 @@ async fn convert_and_save_pool(
         })
         .await;
 
+    stats.processing.fetch_sub(1, Relaxed);
     match result {
         Ok(md) => {
             if let Err(e) = std::fs::write(&output_path, &md) {
                 stage.finish_failed(&format!("Write failed: {e}"));
+                stats.failed.fetch_add(1, Relaxed);
             } else {
                 stage.finish_with_message(&format!("→ {}", output_path.display()));
+                stats.completed.fetch_add(1, Relaxed);
             }
         }
-        Err(e) => stage.finish_failed(&format!("{e:#}")),
+        Err(e) => {
+            stage.finish_failed(&format!("{e:#}"));
+            stats.failed.fetch_add(1, Relaxed);
+        }
     }
+}
+
+// ── Status ──────────────────────────────────────────────────────
+
+async fn cmd_status(output: Option<PathBuf>, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let scribe_cfg = ScribeConfig::load().unwrap_or_default();
+    let output_dir = output.unwrap_or(scribe_cfg.output_dir);
+    let status_path = output_dir.join(STATUS_FILE);
+
+    if !status_path.exists() {
+        reporter.warn("No watch service status found.");
+        reporter.warn(&format!(
+            "Expected status file at: {}",
+            status_path.display()
+        ));
+        reporter.warn("Start a watch service with: hs scribe watch");
+        return Ok(());
+    }
+
+    let contents = std::fs::read_to_string(&status_path)
+        .with_context(|| format!("Cannot read {}", status_path.display()))?;
+    let status: serde_json::Value =
+        serde_json::from_str(&contents).context("Invalid status file")?;
+
+    let processing = status["processing"].as_u64().unwrap_or(0);
+    let queued = status["queued"].as_u64().unwrap_or(0);
+    let completed = status["completed"].as_u64().unwrap_or(0);
+    let failed = status["failed"].as_u64().unwrap_or(0);
+    let watch_dir = status["watch_dir"].as_str().unwrap_or("?");
+    let out_dir = status["output_dir"].as_str().unwrap_or("?");
+
+    reporter.status("Watch dir", watch_dir);
+    reporter.status("Output dir", out_dir);
+    reporter.status(
+        "Status",
+        &format!(
+            "{processing} processing, {queued} queued, {completed} completed, {failed} failed"
+        ),
+    );
+
+    Ok(())
 }
 
 // ── Init ────────────────────────────────────────────────────────
