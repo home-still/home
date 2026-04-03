@@ -9,6 +9,7 @@ home:
   # Project directory — your research data (papers, markdown)
   # May point to an NFS mount or symlink
   # project_dir: ~/home-still
+  # log_dir: ~/home-still/logs  # default: {project_dir}/logs
 
 # --- Paper search & download ---
 paper:

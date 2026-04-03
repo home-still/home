@@ -16,8 +16,45 @@ use hs_style::tty_reporter::TtyReporter;
 
 const DEFAULT_CONFIG: &str = include_str!("../config/default.yaml");
 
+fn init_logging(verbose: bool, quiet: bool) {
+    use tracing_subscriber::{
+        fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+    };
+
+    let log_dir = hs_style::resolve_log_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    // Stderr layer: human-readable, respects --verbose/--quiet
+    let stderr_filter = if quiet {
+        "error"
+    } else if verbose {
+        "debug"
+    } else {
+        "warn"
+    };
+    let stderr_layer = fmt::layer()
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .with_filter(EnvFilter::new(stderr_filter));
+
+    // File layer: always INFO+, appended to hs.log
+    let file_appender = tracing_appender::rolling::never(&log_dir, "hs.log");
+    let file_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let file_layer = fmt::layer()
+        .with_ansi(false)
+        .with_writer(file_appender)
+        .with_filter(file_filter);
+
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
+        .init();
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    init_logging(cli.global.verbose, cli.global.quiet);
 
     let mode = mode::detect(cli.global.color_str(), cli.global.is_json());
 
