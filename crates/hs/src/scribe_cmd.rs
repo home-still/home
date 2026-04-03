@@ -581,7 +581,8 @@ async fn convert_and_save_pool(
 
     // Validate PDF structure before sending to server
     if !validate_pdf_bytes(&pdf_bytes) {
-        stage.finish_failed("invalid PDF (corrupt or not a PDF)");
+        stage.finish_and_clear();
+        reporter.warn(&format!("{stem}: invalid PDF → quarantined"));
         quarantine_file(pdf_path, corrupted_dir);
         stats.processing.fetch_sub(1, Relaxed);
         stats.failed.fetch_add(1, Relaxed);
@@ -620,11 +621,14 @@ async fn convert_and_save_pool(
         }
         Err(e) => {
             let msg = format!("{e:#}");
-            stage.finish_failed(&msg);
             stats.failed.fetch_add(1, Relaxed);
-            // Quarantine if server says the PDF is invalid
             if msg.contains("FormatError") || msg.contains("PdfiumLibrary") {
+                // Quarantine corrupt PDFs — clear bar, show brief warning
+                stage.finish_and_clear();
+                reporter.warn(&format!("{stem}: server rejected PDF → quarantined"));
                 quarantine_file(pdf_path, corrupted_dir);
+            } else {
+                stage.finish_failed(&msg);
             }
         }
     }
