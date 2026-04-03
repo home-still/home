@@ -122,11 +122,9 @@ impl Reporter for TtyReporter {
 
     fn begin_counted_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
         // Counted stages (e.g. "Downloading", "Converting") use a compact prefix
-        // so the wide_bar gets more screen space
-        let clean = sanitize_name(name);
-        let name_width = display_width(&clean);
-        let prefix_width = name_width.max(MIN_PREFIX_WIDTH);
-        let title = truncate_to_width(&clean, prefix_width);
+        // Use the standard bar prefix width for consistent alignment
+        let prefix_width = bar_prefix_width();
+        let title = truncate_to_width(&sanitize_name(name), prefix_width);
 
         match total {
             Some(len) => {
