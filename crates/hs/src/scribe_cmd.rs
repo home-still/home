@@ -65,25 +65,26 @@ fn compose_yaml(has_gpu: bool) -> String {
 
 /// Compose config for macOS Apple Silicon: native Ollama (Metal GPU) on host,
 /// only the scribe server runs in a container.
-fn compose_yaml_native_ollama() -> String {
-    r#"services:
+fn compose_yaml_native_ollama(use_cuda: bool) -> String {
+    format!(
+        r#"services:
   scribe:
     image: ghcr.io/home-still/hs-scribe-server:latest
     ports:
       - "7433:7433"
     volumes:
-      - ${MODELS_DIR}:/models:ro
+      - ${{MODELS_DIR}}:/models:ro
     environment:
       HS_SCRIBE_LAYOUT_MODEL_PATH: /models/pp-doclayoutv3.onnx
       HS_SCRIBE_BACKEND: Ollama
       HS_SCRIBE_OLLAMA_URL: http://host.docker.internal:11434
-      HS_SCRIBE_USE_CUDA: "false"
+      HS_SCRIBE_USE_CUDA: "{use_cuda}"
     command: ["hs-scribe-server", "--host", "0.0.0.0", "--port", "7433"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: on-failure:3
 "#
-    .to_string()
+    )
 }
 
 #[derive(Subcommand, Debug)]
@@ -737,49 +738,81 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         compose.args_prefix.join(" ")
     );
 
-    // Step 2: Detect GPU / Apple Silicon
-    let use_native_ollama = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    // Step 2: Detect GPU / Apple Silicon / Linux NVIDIA
+    let has_nvidia = check_command("nvidia-smi", &[]).await;
+    let use_native_ollama = should_use_native_ollama(has_nvidia);
     let has_gpu;
 
     if use_native_ollama {
-        has_gpu = false; // No CUDA on macOS — Metal is used by native Ollama
-        eprintln!("[2/5] Apple Silicon detected — using native Ollama (Metal GPU)...");
+        if cfg!(target_os = "linux") {
+            // Linux + NVIDIA GPU: native Ollama with CUDA
+            has_gpu = true;
+            eprintln!("[2/5] NVIDIA GPU detected — using native Ollama (CUDA)...");
 
-        // Install Ollama if not present
-        if !check_command("ollama", &["--version"]).await {
-            if check_command("brew", &["--version"]).await {
-                eprintln!("       Installing Ollama via Homebrew...");
-                let status = tokio::process::Command::new("brew")
-                    .args(["install", "ollama"])
-                    .status()
-                    .await?;
-                if !status.success() {
-                    anyhow::bail!("Failed to install Ollama via Homebrew");
+            // Check VRAM
+            if let Some(free_vram) = check_nvidia_vram_mib().await {
+                if free_vram < 3000 {
+                    anyhow::bail!(
+                        "Insufficient GPU VRAM: {} MiB free, need ≥3000 MiB for GLM-OCR.\n\
+                         Free VRAM by closing other GPU applications or use a larger GPU.",
+                        free_vram
+                    );
                 }
-            } else {
-                anyhow::bail!(
-                    "Ollama not found. Install from https://ollama.com or via:\n  brew install ollama"
-                );
+                eprintln!("       {} MiB VRAM available", free_vram);
             }
-        }
 
-        // Start ollama serve if not already running
-        if !check_ollama_running().await {
-            eprintln!("       Starting Ollama...");
-            tokio::process::Command::new("ollama")
-                .arg("serve")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .context("Failed to start ollama serve")?;
-            wait_for_ollama_native(30).await?;
+            // Install Ollama if not present
+            if !check_command("ollama", &["--version"]).await {
+                install_ollama_linux().await?;
+            }
+
+            // Configure auto-unload
+            configure_ollama_keepalive().await?;
+
+            // Start systemd service
+            if !check_ollama_running().await {
+                ensure_ollama_systemd().await?;
+            }
+            eprintln!("       OK (native Ollama with CUDA)");
+        } else {
+            // macOS Apple Silicon: native Ollama with Metal
+            has_gpu = false;
+            eprintln!("[2/5] Apple Silicon detected — using native Ollama (Metal GPU)...");
+
+            if !check_command("ollama", &["--version"]).await {
+                if check_command("brew", &["--version"]).await {
+                    eprintln!("       Installing Ollama via Homebrew...");
+                    let status = tokio::process::Command::new("brew")
+                        .args(["install", "ollama"])
+                        .status()
+                        .await?;
+                    if !status.success() {
+                        anyhow::bail!("Failed to install Ollama via Homebrew");
+                    }
+                } else {
+                    anyhow::bail!(
+                        "Ollama not found. Install from https://ollama.com or via:\n  brew install ollama"
+                    );
+                }
+            }
+
+            if !check_ollama_running().await {
+                eprintln!("       Starting Ollama...");
+                tokio::process::Command::new("ollama")
+                    .arg("serve")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .context("Failed to start ollama serve")?;
+                wait_for_ollama_native(30).await?;
+            }
+            eprintln!("       OK (native Ollama with Metal)");
         }
-        eprintln!("       OK (native Ollama with Metal)");
     } else {
         eprintln!("[2/5] Detecting GPU...");
-        has_gpu = check_command("nvidia-smi", &[]).await;
+        has_gpu = has_nvidia;
         if has_gpu {
-            eprintln!("       NVIDIA GPU detected (CUDA enabled)");
+            eprintln!("       NVIDIA GPU detected (CUDA enabled, containerized Ollama)");
         } else {
             eprintln!("       No NVIDIA GPU (CPU mode)");
         }
@@ -818,7 +851,7 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
     } else {
         std::fs::create_dir_all(&config_dir)?;
         let compose_content = if use_native_ollama {
-            compose_yaml_native_ollama()
+            compose_yaml_native_ollama(has_gpu)
         } else {
             compose_yaml(has_gpu)
         };
@@ -957,17 +990,20 @@ async fn cmd_server(action: ServerAction) -> Result<()> {
             }
         }
         ServerAction::Start => {
-            // On Apple Silicon, ensure native Ollama is running
-            if cfg!(all(target_os = "macos", target_arch = "aarch64"))
-                && !check_ollama_running().await
-            {
-                eprintln!("Starting native Ollama...");
-                let _ = tokio::process::Command::new("ollama")
-                    .arg("serve")
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-                wait_for_ollama_native(30).await?;
+            let has_nvidia = check_command("nvidia-smi", &[]).await;
+            if should_use_native_ollama(has_nvidia) && !check_ollama_running().await {
+                if cfg!(target_os = "linux") {
+                    eprintln!("Starting Ollama systemd service...");
+                    ensure_ollama_systemd().await?;
+                } else {
+                    eprintln!("Starting native Ollama...");
+                    let _ = tokio::process::Command::new("ollama")
+                        .arg("serve")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    wait_for_ollama_native(30).await?;
+                }
             }
             compose.run(&["-f", cf, "up", "-d"]).await?;
             eprintln!("Waiting for services...");
@@ -976,6 +1012,11 @@ async fn cmd_server(action: ServerAction) -> Result<()> {
         }
         ServerAction::Stop => {
             compose.run(&["-f", cf, "down"]).await?;
+            let has_nvidia = check_command("nvidia-smi", &[]).await;
+            if should_use_native_ollama(has_nvidia) {
+                eprintln!("Unloading model from VRAM...");
+                unload_ollama_model("glm-ocr").await;
+            }
             eprintln!("Stopped.");
         }
         ServerAction::Ping { url } => {
@@ -1096,6 +1137,98 @@ async fn check_command(cmd: &str, args: &[&str]) -> bool {
         .await
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Determine if we should use native Ollama (macOS Apple Silicon or Linux with NVIDIA GPU).
+fn should_use_native_ollama(has_nvidia: bool) -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        || (cfg!(target_os = "linux") && has_nvidia)
+}
+
+/// Check available GPU VRAM in MiB via nvidia-smi.
+async fn check_nvidia_vram_mib() -> Option<u64> {
+    let output = tokio::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .await
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim().lines().next()?.trim().parse().ok()
+}
+
+/// Install Ollama on Linux via the official install script.
+async fn install_ollama_linux() -> Result<()> {
+    eprintln!("       Installing Ollama...");
+    let status = tokio::process::Command::new("sh")
+        .args(["-c", "curl -fsSL https://ollama.com/install.sh | sh"])
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("Failed to install Ollama. Install manually: https://ollama.com");
+    }
+    Ok(())
+}
+
+/// Configure Ollama systemd service for 5-minute auto-unload.
+async fn configure_ollama_keepalive() -> Result<()> {
+    eprintln!("       Configuring auto-unload (OLLAMA_KEEP_ALIVE=5m)...");
+    let override_dir = "/etc/systemd/system/ollama.service.d";
+    let override_path = format!("{override_dir}/override.conf");
+    let override_content = "[Service]\nEnvironment=\"OLLAMA_KEEP_ALIVE=5m\"";
+
+    let status = tokio::process::Command::new("sudo")
+        .args(["mkdir", "-p", override_dir])
+        .status()
+        .await?;
+    if !status.success() {
+        eprintln!("       warning: Could not create systemd override (no sudo?)");
+        eprintln!("       Set OLLAMA_KEEP_ALIVE=5m manually in {override_path}");
+        return Ok(());
+    }
+
+    let status = tokio::process::Command::new("sudo")
+        .args([
+            "sh",
+            "-c",
+            &format!("echo '{override_content}' > {override_path}"),
+        ])
+        .status()
+        .await?;
+    if status.success() {
+        let _ = tokio::process::Command::new("sudo")
+            .args(["systemctl", "daemon-reload"])
+            .status()
+            .await;
+    }
+    Ok(())
+}
+
+/// Start Ollama via systemd (Linux).
+async fn ensure_ollama_systemd() -> Result<()> {
+    let status = tokio::process::Command::new("sudo")
+        .args(["systemctl", "start", "ollama"])
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!(
+            "Failed to start Ollama systemd service.\n\
+             Check: sudo systemctl status ollama"
+        );
+    }
+    wait_for_ollama_native(30).await
+}
+
+/// Unload a model from Ollama VRAM by setting keep_alive=0.
+async fn unload_ollama_model(model: &str) {
+    let _ = reqwest::Client::new()
+        .post("http://localhost:11434/api/generate")
+        .json(&serde_json::json!({
+            "model": model,
+            "keep_alive": 0
+        }))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await;
 }
 
 async fn check_ollama_running() -> bool {
