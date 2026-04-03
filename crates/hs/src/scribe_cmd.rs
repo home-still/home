@@ -381,6 +381,7 @@ async fn cmd_watch(
     let servers = resolve_servers(server.as_deref());
     let scribe_cfg = ScribeConfig::load().unwrap_or_default();
     let corrupted_dir = scribe_cfg.corrupted_dir.clone();
+    let catalog_dir = scribe_cfg.catalog_dir.clone();
 
     // Resolve dirs: CLI flag > config > defaults
     let watch_dir = dir
@@ -469,14 +470,22 @@ async fn cmd_watch(
             let pool = Arc::clone(&pool);
             let output_dir = output_dir.clone();
             let corrupted_dir = corrupted_dir.clone();
+            let catalog_dir = catalog_dir.clone();
             let reporter = Arc::clone(reporter);
             let stats = Arc::clone(&stats);
             let sem = Arc::clone(&spawn_sem);
             tokio::spawn(async move {
-                // Acquire permit inside spawn — blocks this task, not the scan loop
                 let _permit = sem.acquire_owned().await;
-                convert_and_save_pool(&pool, &path, &output_dir, &corrupted_dir, &reporter, &stats)
-                    .await;
+                convert_and_save_pool(
+                    &pool,
+                    &path,
+                    &output_dir,
+                    &corrupted_dir,
+                    &catalog_dir,
+                    &reporter,
+                    &stats,
+                )
+                .await;
             });
         }
     }
@@ -521,6 +530,7 @@ async fn cmd_watch(
                     let path = path.clone();
                     let output_dir = output_dir.clone();
                     let corrupted_dir = corrupted_dir.clone();
+                    let catalog_dir = catalog_dir.clone();
                     let reporter = Arc::clone(reporter);
                     let stats = Arc::clone(&stats);
                     let sem = Arc::clone(&spawn_sem);
@@ -531,6 +541,7 @@ async fn cmd_watch(
                             &path,
                             &output_dir,
                             &corrupted_dir,
+                            &catalog_dir,
                             &reporter,
                             &stats,
                         )
@@ -571,6 +582,7 @@ async fn convert_and_save_pool(
     pdf_path: &std::path::Path,
     output_dir: &std::path::Path,
     corrupted_dir: &std::path::Path,
+    catalog_dir: &std::path::Path,
     reporter: &Arc<dyn Reporter>,
     stats: &WatchStats,
 ) {
@@ -607,8 +619,10 @@ async fn convert_and_save_pool(
     let stage: Arc<std::sync::Mutex<Option<Box<dyn hs_style::reporter::StageHandle>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let server_tag: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
+    let total_pages_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stage_cb = Arc::clone(&stage);
     let server_tag_cb = Arc::clone(&server_tag);
+    let total_pages_cb = Arc::clone(&total_pages_counter);
     let reporter_cb = Arc::clone(reporter);
     let stem_cb = stem.to_string();
 
@@ -627,6 +641,7 @@ async fn convert_and_save_pool(
                 if event.total_pages > 0 {
                     s.set_length(event.total_pages);
                     s.set_position(event.page);
+                    total_pages_cb.store(event.total_pages, std::sync::atomic::Ordering::Relaxed);
                 }
                 let tag = server_tag_cb.lock().unwrap();
                 // Keep message short to avoid wrapping: server + stage only
@@ -678,6 +693,19 @@ async fn convert_and_save_pool(
                     s.finish_with_message(&format!("→ {out_name} [{short_server}] ({duration})"));
                 }
                 stats.completed.fetch_add(1, Relaxed);
+
+                // Write catalog entry with conversion metadata
+                let page_offsets = crate::catalog::compute_page_offsets(&md);
+                let total_pages = total_pages_counter.load(std::sync::atomic::Ordering::Relaxed);
+                crate::catalog::update_conversion_catalog(
+                    catalog_dir,
+                    &stem,
+                    short_server,
+                    start_time.elapsed().as_secs(),
+                    total_pages,
+                    page_offsets,
+                    &format!("markdown/{stem}.md"),
+                );
             }
         }
         Err(e) => {

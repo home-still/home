@@ -4,6 +4,7 @@ use hs_style::CONFIG_REL_PATH;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+pub mod catalog;
 mod cli;
 mod scribe_cmd;
 mod scribe_pool;

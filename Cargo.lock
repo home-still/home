@@ -1178,6 +1178,7 @@ name = "hs"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "ctrlc",
  "dialoguer",
@@ -1189,6 +1190,7 @@ dependencies = [
  "owo-colors",
  "paper",
  "reqwest",
+ "serde",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
