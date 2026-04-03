@@ -16,8 +16,17 @@ fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
         return vec![s.to_string()];
     }
     match ScribeConfig::load() {
-        Ok(cfg) if !cfg.servers.is_empty() => cfg.servers,
-        _ => vec![DEFAULT_SERVER.to_string()],
+        Ok(cfg) => {
+            if cfg.servers.is_empty() {
+                vec![DEFAULT_SERVER.to_string()]
+            } else {
+                cfg.servers
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: Failed to load scribe config: {e}, using default server");
+            vec![DEFAULT_SERVER.to_string()]
+        }
     }
 }
 const LAYOUT_MODEL_URL: &str =
@@ -397,6 +406,9 @@ async fn cmd_watch(
     std::fs::create_dir_all(&output_dir)?;
 
     // Health check
+    for s in &servers {
+        reporter.status("Server", s);
+    }
     let pool = Arc::new(ScribePool::new(&servers));
     let results = pool.check_all().await;
     let reachable = results.iter().filter(|(_, ok)| *ok).count();
