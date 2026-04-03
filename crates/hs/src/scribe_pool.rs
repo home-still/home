@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use hs_scribe::client::{ProgressEvent, ScribeClient};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
