@@ -570,37 +570,36 @@ async fn convert_and_save_pool(
 ) {
     use std::sync::atomic::Ordering::Relaxed;
 
-    // queued → processing
-    stats.queued.fetch_sub(1, Relaxed);
-    stats.processing.fetch_add(1, Relaxed);
-
     let stem = pdf_path.file_stem().unwrap_or_default().to_string_lossy();
     let output_path = output_dir.join(format!("{stem}.md"));
 
-    let stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
-        Arc::new(reporter.begin_counted_stage(&stem, None));
-    stage.set_message("converting...");
-    let stage_cb = Arc::clone(&stage);
-
+    // Read and validate while still in "queued" state (no progress bar yet)
     let pdf_bytes = match std::fs::read(pdf_path) {
         Ok(b) => b,
         Err(e) => {
-            stage.finish_failed(&format!("Cannot read: {e}"));
-            stats.processing.fetch_sub(1, Relaxed);
+            reporter.warn(&format!("{stem}: Cannot read: {e}"));
+            stats.queued.fetch_sub(1, Relaxed);
             stats.failed.fetch_add(1, Relaxed);
             return;
         }
     };
 
-    // Validate PDF structure before sending to server
     if !validate_pdf_bytes(&pdf_bytes) {
-        stage.finish_and_clear();
         reporter.warn(&format!("{stem}: invalid PDF → quarantined"));
         quarantine_file(pdf_path, corrupted_dir);
-        stats.processing.fetch_sub(1, Relaxed);
+        stats.queued.fetch_sub(1, Relaxed);
         stats.failed.fetch_add(1, Relaxed);
         return;
     }
+
+    // queued → processing (progress bar appears now)
+    stats.queued.fetch_sub(1, Relaxed);
+    stats.processing.fetch_add(1, Relaxed);
+
+    let stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
+        Arc::new(reporter.begin_counted_stage(&stem, None));
+    stage.set_message("waiting for server...");
+    let stage_cb = Arc::clone(&stage);
 
     let result = pool
         .convert_one(pdf_bytes, move |event| {
@@ -619,7 +618,6 @@ async fn convert_and_save_pool(
                 stage.finish_failed(&format!("Write failed: {e}"));
                 stats.failed.fetch_add(1, Relaxed);
             } else {
-                // Extract short server name (just host:port)
                 let short_server = server_url
                     .strip_prefix("http://")
                     .or_else(|| server_url.strip_prefix("https://"))
@@ -636,7 +634,6 @@ async fn convert_and_save_pool(
             let msg = format!("{e:#}");
             stats.failed.fetch_add(1, Relaxed);
             if msg.contains("FormatError") || msg.contains("PdfiumLibrary") {
-                // Quarantine corrupt PDFs — clear bar, show brief warning
                 stage.finish_and_clear();
                 reporter.warn(&format!("{stem}: server rejected PDF → quarantined"));
                 quarantine_file(pdf_path, corrupted_dir);
