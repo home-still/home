@@ -16,9 +16,9 @@ impl ScribePool {
         }
     }
 
-    /// Number of servers in the pool (used for external dispatch limiting).
-    pub fn server_count(&self) -> usize {
-        self.clients.len().max(1)
+    /// Number of concurrent conversions to allow (2 per server).
+    pub fn concurrency(&self) -> usize {
+        (self.clients.len() * 2).max(1)
     }
 
     /// Pick the least-loaded ready server with round-robin tie-breaking.

@@ -410,7 +410,7 @@ async fn cmd_watch(
         reporter.status("Server", s);
     }
     let pool = Arc::new(ScribePool::new(&servers));
-    let spawn_sem = Arc::new(tokio::sync::Semaphore::new(pool.server_count()));
+    let spawn_sem = Arc::new(tokio::sync::Semaphore::new(pool.concurrency()));
     let results = pool.check_all().await;
     let reachable = results.iter().filter(|(_, ok)| *ok).count();
     if reachable == 0 {
