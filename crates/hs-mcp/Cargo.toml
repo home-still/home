@@ -1,0 +1,17 @@
+[package]
+name = "hs-mcp"
+version = "0.0.1"
+edition = "2021"
+
+[[bin]]
+name = "hs-mcp"
+path = "src/main.rs"
+
+[dependencies]
+hs-style = { workspace = true }
+rmcp = { version = "1.3", features = ["server", "transport-io"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
