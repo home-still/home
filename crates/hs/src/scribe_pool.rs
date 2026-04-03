@@ -43,11 +43,13 @@ impl ScribePool {
 
     /// Convert one PDF via the best available server.
     /// Acquires a dispatch permit to limit parallelism to server count.
+    /// Convert one PDF via the best available server.
+    /// Returns (server_url, markdown) on success.
     pub async fn convert_one(
         &self,
         pdf_bytes: Vec<u8>,
         on_progress: impl Fn(ProgressEvent) + Send + Sync + 'static,
-    ) -> Result<String> {
+    ) -> Result<(String, String)> {
         let _permit = self
             .dispatch_sem
             .acquire()
@@ -59,7 +61,9 @@ impl ScribePool {
         for attempt in 0..3 {
             match self.pick_server().await {
                 Ok(client) => {
-                    return client.convert_with_progress(pdf_bytes, on_progress).await;
+                    let url = client.url().to_string();
+                    let md = client.convert_with_progress(pdf_bytes, on_progress).await?;
+                    return Ok((url, md));
                 }
                 Err(e) => {
                     last_err = Some(e);

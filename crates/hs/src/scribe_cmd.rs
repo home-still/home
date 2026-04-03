@@ -219,20 +219,23 @@ async fn cmd_convert(
         stage_cb.set_message(&format!("[{}] {}", event.stage, event.message));
     };
 
-    let md = if servers.len() == 1 {
+    let result = if servers.len() == 1 {
         let client = hs_scribe::client::ScribeClient::new(&servers[0]);
-        client.convert_with_progress(pdf_bytes, on_progress).await
+        client
+            .convert_with_progress(pdf_bytes, on_progress)
+            .await
+            .map(|md| (servers[0].clone(), md))
     } else {
         let pool = ScribePool::new(&servers);
         pool.convert_one(pdf_bytes, on_progress).await
     };
 
-    match &md {
+    match &result {
         Ok(_) => stage.finish_with_message("done"),
         Err(e) => stage.finish_failed(&format!("{e:#}")),
     }
 
-    let md = md?;
+    let (_server, md) = result?;
 
     // Resolve output: CLI flag > config output_dir > stdout
     let out = out_file.or_else(|| {
@@ -597,12 +600,21 @@ async fn convert_and_save_pool(
 
     stats.processing.fetch_sub(1, Relaxed);
     match result {
-        Ok(md) => {
+        Ok((server_url, md)) => {
             if let Err(e) = atomic_write(&output_path, md.as_bytes()) {
                 stage.finish_failed(&format!("Write failed: {e}"));
                 stats.failed.fetch_add(1, Relaxed);
             } else {
-                stage.finish_with_message(&format!("→ {}", output_path.display()));
+                // Extract short server name (just host:port)
+                let short_server = server_url
+                    .strip_prefix("http://")
+                    .or_else(|| server_url.strip_prefix("https://"))
+                    .unwrap_or(&server_url);
+                stage.finish_with_message(&format!(
+                    "→ {} [{}]",
+                    output_path.display(),
+                    short_server
+                ));
                 stats.completed.fetch_add(1, Relaxed);
             }
         }
