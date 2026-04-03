@@ -410,6 +410,7 @@ async fn cmd_watch(
         reporter.status("Server", s);
     }
     let pool = Arc::new(ScribePool::new(&servers));
+    let spawn_sem = Arc::new(tokio::sync::Semaphore::new(pool.server_count()));
     let results = pool.check_all().await;
     let reachable = results.iter().filter(|(_, ok)| *ok).count();
     if reachable == 0 {
@@ -470,7 +471,10 @@ async fn cmd_watch(
             let corrupted_dir = corrupted_dir.clone();
             let reporter = Arc::clone(reporter);
             let stats = Arc::clone(&stats);
+            let sem = Arc::clone(&spawn_sem);
             tokio::spawn(async move {
+                // Acquire permit inside spawn — blocks this task, not the scan loop
+                let _permit = sem.acquire_owned().await;
                 convert_and_save_pool(&pool, &path, &output_dir, &corrupted_dir, &reporter, &stats)
                     .await;
             });
@@ -519,7 +523,9 @@ async fn cmd_watch(
                     let corrupted_dir = corrupted_dir.clone();
                     let reporter = Arc::clone(reporter);
                     let stats = Arc::clone(&stats);
+                    let sem = Arc::clone(&spawn_sem);
                     tokio::spawn(async move {
+                        let _permit = sem.acquire_owned().await;
                         convert_and_save_pool(
                             &pool,
                             &path,

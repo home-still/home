@@ -1,23 +1,24 @@
 use anyhow::Result;
 use hs_scribe::client::{ProgressEvent, ScribeClient};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 pub struct ScribePool {
     clients: Vec<ScribeClient>,
-    dispatch_sem: Arc<tokio::sync::Semaphore>,
     next_server: AtomicUsize,
 }
 
 impl ScribePool {
     pub fn new(servers: &[String]) -> Self {
         let clients: Vec<ScribeClient> = servers.iter().map(|url| ScribeClient::new(url)).collect();
-        let dispatch_sem = Arc::new(tokio::sync::Semaphore::new(clients.len().max(1)));
         Self {
             clients,
-            dispatch_sem,
             next_server: AtomicUsize::new(0),
         }
+    }
+
+    /// Number of servers in the pool (used for external dispatch limiting).
+    pub fn server_count(&self) -> usize {
+        self.clients.len().max(1)
     }
 
     /// Pick the least-loaded ready server with round-robin tie-breaking.
@@ -29,7 +30,6 @@ impl ScribePool {
             .collect();
         let results = futures::future::join_all(futures).await;
 
-        // Find the highest available slot count among ready servers
         let max_avail = results
             .iter()
             .filter_map(|(_, r)| r.as_ref().ok())
@@ -41,7 +41,6 @@ impl ScribePool {
             anyhow::bail!("No scribe servers are ready");
         };
 
-        // Collect all servers tied at the max
         let candidates: Vec<&ScribeClient> = results
             .iter()
             .filter_map(|(c, r)| {
@@ -58,26 +57,18 @@ impl ScribePool {
             anyhow::bail!("No scribe servers are ready");
         }
 
-        // Round-robin among tied candidates
         let idx = self.next_server.fetch_add(1, Ordering::Relaxed) % candidates.len();
         Ok(candidates[idx])
     }
 
     /// Convert one PDF via the best available server.
-    /// Acquires a dispatch permit to limit parallelism to server count.
+    /// Caller is responsible for limiting concurrency (e.g. via a semaphore).
     /// Returns (server_url, markdown) on success.
     pub async fn convert_one(
         &self,
         pdf_bytes: Vec<u8>,
         on_progress: impl Fn(ProgressEvent) + Send + Sync + 'static,
     ) -> Result<(String, String)> {
-        let _permit = self
-            .dispatch_sem
-            .acquire()
-            .await
-            .map_err(|e| anyhow::anyhow!("Dispatch semaphore closed: {e}"))?;
-
-        // Try up to 3 times to find a ready server
         let mut last_err = None;
         for attempt in 0..3 {
             match self.pick_server().await {
