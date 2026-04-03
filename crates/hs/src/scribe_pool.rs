@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use hs_scribe::client::{ProgressEvent, ScribeClient};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub struct ScribePool {
     clients: Vec<ScribeClient>,
     dispatch_sem: Arc<tokio::sync::Semaphore>,
+    next_server: AtomicUsize,
 }
 
 impl ScribePool {
@@ -14,10 +16,11 @@ impl ScribePool {
         Self {
             clients,
             dispatch_sem,
+            next_server: AtomicUsize::new(0),
         }
     }
 
-    /// Pick the least-loaded ready server by querying /readiness on all servers.
+    /// Pick the least-loaded ready server with round-robin tie-breaking.
     async fn pick_server(&self) -> Result<&ScribeClient> {
         let futures: Vec<_> = self
             .clients
@@ -26,24 +29,42 @@ impl ScribePool {
             .collect();
         let results = futures::future::join_all(futures).await;
 
-        let mut best: Option<(&ScribeClient, usize)> = None;
-        for (client, result) in &results {
-            match result {
-                Ok(r) if r.ready => match best {
-                    Some((_, best_avail)) if r.vlm_slots_available <= best_avail => {}
-                    _ => best = Some((client, r.vlm_slots_available)),
-                },
-                Ok(_) => {}  // not ready
-                Err(_) => {} // unreachable
-            }
+        // Find the highest available slot count among ready servers
+        let max_avail = results
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok())
+            .filter(|r| r.ready)
+            .map(|r| r.vlm_slots_available)
+            .max();
+
+        let Some(max_avail) = max_avail else {
+            anyhow::bail!("No scribe servers are ready");
+        };
+
+        // Collect all servers tied at the max
+        let candidates: Vec<&ScribeClient> = results
+            .iter()
+            .filter_map(|(c, r)| {
+                if let Ok(r) = r {
+                    if r.ready && r.vlm_slots_available == max_avail {
+                        return Some(*c);
+                    }
+                }
+                None
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            anyhow::bail!("No scribe servers are ready");
         }
 
-        best.map(|(c, _)| c).context("No scribe servers are ready")
+        // Round-robin among tied candidates
+        let idx = self.next_server.fetch_add(1, Ordering::Relaxed) % candidates.len();
+        Ok(candidates[idx])
     }
 
     /// Convert one PDF via the best available server.
     /// Acquires a dispatch permit to limit parallelism to server count.
-    /// Convert one PDF via the best available server.
     /// Returns (server_url, markdown) on success.
     pub async fn convert_one(
         &self,
