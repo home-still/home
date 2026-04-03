@@ -600,13 +600,20 @@ async fn convert_and_save_pool(
 
     let stage: Arc<std::sync::Mutex<Option<Box<dyn hs_style::reporter::StageHandle>>>> =
         Arc::new(std::sync::Mutex::new(None));
+    let server_tag: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
     let stage_cb = Arc::clone(&stage);
+    let server_tag_cb = Arc::clone(&server_tag);
     let reporter_cb = Arc::clone(reporter);
     let stem_cb = stem.to_string();
 
     let result = pool
         .convert_one(pdf_bytes, move |event| {
             let mut guard = stage_cb.lock().unwrap();
+            // Capture server assignment from the first "server" event
+            if event.stage == "server" {
+                let mut tag = server_tag_cb.lock().unwrap();
+                *tag = event.message.clone(); // "→ host:port"
+            }
             if guard.is_none() {
                 *guard = Some(reporter_cb.begin_counted_stage(&stem_cb, None));
             }
@@ -615,7 +622,12 @@ async fn convert_and_save_pool(
                     s.set_length(event.total_pages);
                     s.set_position(event.page);
                 }
-                s.set_message(&format!("[{}] {}", event.stage, event.message));
+                let tag = server_tag_cb.lock().unwrap();
+                if tag.is_empty() {
+                    s.set_message(&format!("[{}] {}", event.stage, event.message));
+                } else {
+                    s.set_message(&format!("{} [{}] {}", tag, event.stage, event.message));
+                }
             }
         })
         .await;
