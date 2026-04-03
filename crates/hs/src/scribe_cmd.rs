@@ -660,11 +660,11 @@ async fn convert_and_save_pool(
                     } else {
                         format!("{secs}s")
                     };
-                    s.finish_with_message(&format!(
-                        "→ {} [{}] ({duration})",
-                        output_path.display(),
-                        short_server
-                    ));
+                    let out_name = output_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    s.finish_with_message(&format!("→ {out_name} [{short_server}] ({duration})"));
                 }
                 stats.completed.fetch_add(1, Relaxed);
             }
