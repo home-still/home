@@ -570,6 +570,7 @@ async fn convert_and_save_pool(
 ) {
     use std::sync::atomic::Ordering::Relaxed;
 
+    let start_time = std::time::Instant::now();
     let stem = pdf_path.file_stem().unwrap_or_default().to_string_lossy();
     let output_path = output_dir.join(format!("{stem}.md"));
 
@@ -634,8 +635,15 @@ async fn convert_and_save_pool(
                     .or_else(|| server_url.strip_prefix("https://"))
                     .unwrap_or(&server_url);
                 if let Some(ref s) = *stage_guard {
+                    let elapsed = start_time.elapsed();
+                    let secs = elapsed.as_secs();
+                    let duration = if secs >= 60 {
+                        format!("{}m{}s", secs / 60, secs % 60)
+                    } else {
+                        format!("{secs}s")
+                    };
                     s.finish_with_message(&format!(
-                        "→ {} [{}]",
+                        "→ {} [{}] ({duration})",
                         output_path.display(),
                         short_server
                     ));
