@@ -1198,7 +1198,8 @@ async fn configure_ollama_keepalive() -> Result<()> {
     eprintln!("       Configuring auto-unload (OLLAMA_KEEP_ALIVE=5m)...");
     let override_dir = "/etc/systemd/system/ollama.service.d";
     let override_path = format!("{override_dir}/override.conf");
-    let override_content = "[Service]\nEnvironment=\"OLLAMA_KEEP_ALIVE=5m\"";
+    let override_content =
+        "[Service]\nEnvironment=\"OLLAMA_KEEP_ALIVE=5m\"\nEnvironment=\"OLLAMA_HOST=0.0.0.0\"";
 
     let status = tokio::process::Command::new("sudo")
         .args(["mkdir", "-p", override_dir])
