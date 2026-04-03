@@ -751,9 +751,9 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
 
             // Check VRAM
             if let Some(free_vram) = check_nvidia_vram_mib().await {
-                if free_vram < 3000 {
+                if free_vram < 2500 {
                     anyhow::bail!(
-                        "Insufficient GPU VRAM: {} MiB free, need ≥3000 MiB for GLM-OCR.\n\
+                        "Insufficient GPU VRAM: {} MiB free, need ≥2500 MiB for GLM-OCR.\n\
                          Free VRAM by closing other GPU applications or use a larger GPU.",
                         free_vram
                     );
