@@ -62,6 +62,16 @@ impl ScribePool {
             match self.pick_server().await {
                 Ok(client) => {
                     let url = client.url().to_string();
+                    let short = url
+                        .strip_prefix("http://")
+                        .or_else(|| url.strip_prefix("https://"))
+                        .unwrap_or(&url);
+                    on_progress(ProgressEvent {
+                        stage: "server".into(),
+                        page: 0,
+                        total_pages: 0,
+                        message: format!("→ {short}"),
+                    });
                     let md = client.convert_with_progress(pdf_bytes, on_progress).await?;
                     return Ok((url, md));
                 }
