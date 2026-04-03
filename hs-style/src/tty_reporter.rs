@@ -70,14 +70,17 @@ impl Reporter for TtyReporter {
     fn begin_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
         let prefix_width = bar_prefix_width();
         let title = truncate_to_width(&sanitize_name(name), prefix_width);
+        let pw = prefix_width;
 
         match total {
             Some(len) => {
                 let pb = self.mp.add(ProgressBar::new(len));
                 let template = if self.use_color {
-                    "{prefix} {bytes:>10}/{total_bytes:<10} {msg}".to_string()
+                    format!("{{prefix:{pw}}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
                 } else {
-                    "{prefix} {wide_bar} {bytes:>10}/{total_bytes:<10} {msg}".to_string()
+                    format!(
+                        "{{prefix:{pw}}} {{wide_bar}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}"
+                    )
                 };
                 pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
                 let initial = if self.use_color {
@@ -97,9 +100,9 @@ impl Reporter for TtyReporter {
             None => {
                 let pb = self.mp.add(ProgressBar::new_spinner());
                 let template = if self.use_color {
-                    "{prefix} {spinner:.cyan} {msg}".to_string()
+                    format!("{{prefix:{pw}}} {{spinner:.cyan}} {{msg}}")
                 } else {
-                    "{prefix} {spinner} {msg}".to_string()
+                    format!("{{prefix:{pw}}} {{spinner}} {{msg}}")
                 };
                 pb.set_style(make_spinner_style(&template));
                 let initial = if self.use_color {
@@ -121,19 +124,17 @@ impl Reporter for TtyReporter {
     }
 
     fn begin_counted_stage(&self, name: &str, total: Option<u64>) -> Box<dyn StageHandle> {
-        // Counted stages (e.g. "Downloading", "Converting") use a compact prefix
-        // Use the standard bar prefix width for consistent alignment
         let prefix_width = bar_prefix_width();
         let title = truncate_to_width(&sanitize_name(name), prefix_width);
+        let pw = prefix_width;
 
         match total {
             Some(len) => {
                 let pb = self.mp.add(ProgressBar::new(len));
                 let template = if self.use_color {
-                    "{prefix} {wide_bar:.cyan/dim} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}".to_string()
+                    format!("{{prefix:{pw}}} {{wide_bar:.cyan/dim}} {{pos:>5}}/{{len:<5}} {{elapsed_precise}} ETA {{eta}} {{msg}}")
                 } else {
-                    "{prefix} {wide_bar} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}"
-                        .to_string()
+                    format!("{{prefix:{pw}}} {{wide_bar}} {{pos:>5}}/{{len:<5}} {{elapsed_precise}} ETA {{eta}} {{msg}}")
                 };
                 pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
                 let initial = if self.use_color {
@@ -153,9 +154,9 @@ impl Reporter for TtyReporter {
             None => {
                 let pb = self.mp.add(ProgressBar::new_spinner());
                 let template = if self.use_color {
-                    "{prefix} {spinner:.cyan} {msg}".to_string()
+                    format!("{{prefix:{pw}}} {{spinner:.cyan}} {{msg}}")
                 } else {
-                    "{prefix} {spinner} {msg}".to_string()
+                    format!("{{prefix:{pw}}} {{spinner}} {{msg}}")
                 };
                 pb.set_style(make_spinner_style(&template));
                 let initial = if self.use_color {
@@ -199,18 +200,17 @@ impl StageHandle for IndicatifStageHandle {
     fn set_length(&self, total: u64) {
         self.pb.disable_steady_tick();
         self.pb.set_length(total);
+        let pw = self.prefix_width;
         let template = if self.counted {
             if self.use_color {
-                "{prefix} {wide_bar:.cyan/dim} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}"
-                    .to_string()
+                format!("{{prefix:{pw}}} {{wide_bar:.cyan/dim}} {{pos:>5}}/{{len:<5}} {{elapsed_precise}} ETA {{eta}} {{msg}}")
             } else {
-                "{prefix} {wide_bar} {pos:>5}/{len:<5} {elapsed_precise} ETA {eta} {msg}"
-                    .to_string()
+                format!("{{prefix:{pw}}} {{wide_bar}} {{pos:>5}}/{{len:<5}} {{elapsed_precise}} ETA {{eta}} {{msg}}")
             }
         } else if self.use_color {
-            "{prefix} {bytes:>10}/{total_bytes:<10} {msg}".to_string()
+            format!("{{prefix:{pw}}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
         } else {
-            "{prefix} {wide_bar} {bytes:>10}/{total_bytes:<10} {msg}".to_string()
+            format!("{{prefix:{pw}}} {{wide_bar}} {{bytes:>10}}/{{total_bytes:<10}} {{msg}}")
         };
         self.pb.set_style(make_style(&template, PROGRESS_BAR_CHARS));
 
