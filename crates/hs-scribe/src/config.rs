@@ -139,6 +139,7 @@ impl AppConfig {
 pub struct ScribeConfig {
     pub output_dir: PathBuf,
     pub watch_dir: PathBuf,
+    pub corrupted_dir: PathBuf,
     pub servers: Vec<String>,
 }
 
@@ -147,6 +148,7 @@ impl Default for ScribeConfig {
         Self {
             output_dir: resolve_project_dir().join("markdown"),
             watch_dir: resolve_project_dir().join("papers"),
+            corrupted_dir: resolve_project_dir().join("corrupted"),
             servers: vec!["http://localhost:7433".into()],
         }
     }
@@ -163,6 +165,7 @@ impl ScribeConfig {
             "scribe": {
                 "output_dir": ScribeConfig::default().output_dir,
                 "watch_dir": ScribeConfig::default().watch_dir,
+                "corrupted_dir": ScribeConfig::default().corrupted_dir,
                 "servers": ScribeConfig::default().servers,
             }
         });

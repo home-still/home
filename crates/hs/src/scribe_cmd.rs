@@ -277,7 +277,25 @@ fn is_processable_pdf(path: &std::path::Path) -> bool {
     if path.with_extension("pdf.tmp").exists() {
         return false;
     }
+    // Skip files already in a corrupted/ directory
+    if path.to_string_lossy().contains("/corrupted/") {
+        return false;
+    }
     true
+}
+
+/// Quick validation: check PDF magic bytes and minimum size.
+fn validate_pdf_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= 100 && bytes.starts_with(b"%PDF")
+}
+
+/// Move a corrupt/invalid file to the corrupted directory.
+fn quarantine_file(path: &std::path::Path, corrupted_dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(corrupted_dir);
+    let dest = corrupted_dir.join(path.file_name().unwrap_or_default());
+    if let Err(e) = std::fs::rename(path, &dest) {
+        eprintln!("warning: Failed to quarantine {}: {e}", path.display());
+    }
 }
 
 /// Atomic file write: write to temp file in same directory, then rename.
@@ -349,6 +367,7 @@ async fn cmd_watch(
 
     let servers = resolve_servers(server.as_deref());
     let scribe_cfg = ScribeConfig::load().unwrap_or_default();
+    let corrupted_dir = scribe_cfg.corrupted_dir.clone();
 
     // Resolve dirs: CLI flag > config > defaults
     let watch_dir = dir
@@ -432,10 +451,12 @@ async fn cmd_watch(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let pool = Arc::clone(&pool);
             let output_dir = output_dir.clone();
+            let corrupted_dir = corrupted_dir.clone();
             let reporter = Arc::clone(reporter);
             let stats = Arc::clone(&stats);
             tokio::spawn(async move {
-                convert_and_save_pool(&pool, &path, &output_dir, &reporter, &stats).await;
+                convert_and_save_pool(&pool, &path, &output_dir, &corrupted_dir, &reporter, &stats)
+                    .await;
             });
         }
     }
@@ -479,10 +500,19 @@ async fn cmd_watch(
                     let pool = Arc::clone(&pool);
                     let path = path.clone();
                     let output_dir = output_dir.clone();
+                    let corrupted_dir = corrupted_dir.clone();
                     let reporter = Arc::clone(reporter);
                     let stats = Arc::clone(&stats);
                     tokio::spawn(async move {
-                        convert_and_save_pool(&pool, &path, &output_dir, &reporter, &stats).await;
+                        convert_and_save_pool(
+                            &pool,
+                            &path,
+                            &output_dir,
+                            &corrupted_dir,
+                            &reporter,
+                            &stats,
+                        )
+                        .await;
                     });
                 }
             }
@@ -518,6 +548,7 @@ async fn convert_and_save_pool(
     pool: &ScribePool,
     pdf_path: &std::path::Path,
     output_dir: &std::path::Path,
+    corrupted_dir: &std::path::Path,
     reporter: &Arc<dyn Reporter>,
     stats: &WatchStats,
 ) {
@@ -545,6 +576,15 @@ async fn convert_and_save_pool(
         }
     };
 
+    // Validate PDF structure before sending to server
+    if !validate_pdf_bytes(&pdf_bytes) {
+        stage.finish_failed("invalid PDF (corrupt or not a PDF)");
+        quarantine_file(pdf_path, corrupted_dir);
+        stats.processing.fetch_sub(1, Relaxed);
+        stats.failed.fetch_add(1, Relaxed);
+        return;
+    }
+
     let result = pool
         .convert_one(pdf_bytes, move |event| {
             if event.total_pages > 0 {
@@ -567,8 +607,13 @@ async fn convert_and_save_pool(
             }
         }
         Err(e) => {
-            stage.finish_failed(&format!("{e:#}"));
+            let msg = format!("{e:#}");
+            stage.finish_failed(&msg);
             stats.failed.fetch_add(1, Relaxed);
+            // Quarantine if server says the PDF is invalid
+            if msg.contains("FormatError") || msg.contains("PdfiumLibrary") {
+                quarantine_file(pdf_path, corrupted_dir);
+            }
         }
     }
 }
