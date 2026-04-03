@@ -629,10 +629,21 @@ async fn convert_and_save_pool(
                     s.set_position(event.page);
                 }
                 let tag = server_tag_cb.lock().unwrap();
+                // Keep message short to avoid wrapping: server + stage only
+                let short_stage = match event.stage.as_str() {
+                    "layout" => "layout",
+                    "vlm" => "vlm",
+                    "parse" => "parse",
+                    "done" => "done",
+                    "server" => "",
+                    other => other,
+                };
                 if tag.is_empty() {
-                    s.set_message(&format!("[{}] {}", event.stage, event.message));
+                    s.set_message(short_stage);
+                } else if short_stage.is_empty() {
+                    s.set_message(&tag);
                 } else {
-                    s.set_message(&format!("{} [{}] {}", tag, event.stage, event.message));
+                    s.set_message(&format!("{tag} {short_stage}"));
                 }
             }
         })
