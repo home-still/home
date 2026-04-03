@@ -26,6 +26,13 @@ async fn main() -> Result<()> {
         AppConfig::default()
     });
 
+    tracing::info!(
+        "Backend: {:?}, Ollama URL: {}, Model: {}, VLM concurrency: {}",
+        config.backend,
+        config.ollama_url,
+        config.model,
+        config.vlm_concurrency
+    );
     let vlm_sem = Arc::new(tokio::sync::Semaphore::new(config.vlm_concurrency));
     let processor = Processor::new(config.clone())?;
     let state = Arc::new(ServerState {

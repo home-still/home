@@ -116,6 +116,7 @@ async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipa
         Ok(md) => (StatusCode::OK, md).into_response(),
         Err(e) => {
             tracing::error!("Processing failed: {e:#}");
+            tracing::debug!("Full error chain: {e:?}");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
         }
     }
@@ -167,6 +168,7 @@ async fn handle_scribe_stream(
             }
             Err(e) => {
                 tracing::error!("Processing failed: {e:#}");
+                tracing::debug!("Full error chain: {e:?}");
                 let line = StreamLine::Error(format!("{e:#}"));
                 if let Ok(json) = serde_json::to_string(&line) {
                     let _ = tx.send(Ok(format!("{json}\n"))).await;

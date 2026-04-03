@@ -58,11 +58,13 @@ impl OllamaBackend {
             .images(vec![image])
             .options(options);
 
-        let response = self
-            .client
-            .generate(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let response = self.client.generate(request).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Ollama VLM request failed (model={}, url={}): {e}",
+                self.model,
+                self.client.uri()
+            )
+        })?;
 
         Ok(response.response)
     }
