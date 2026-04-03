@@ -592,41 +592,54 @@ async fn convert_and_save_pool(
         return;
     }
 
-    // queued → processing (progress bar appears now)
+    // Queued → processing happens here (before pool.convert_one blocks on semaphore)
+    // But we DON'T create a progress bar — it's created lazily on first progress event
     stats.queued.fetch_sub(1, Relaxed);
     stats.processing.fetch_add(1, Relaxed);
 
-    let stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
-        Arc::new(reporter.begin_counted_stage(&stem, None));
-    stage.set_message("waiting for server...");
+    let stage: Arc<std::sync::Mutex<Option<Box<dyn hs_style::reporter::StageHandle>>>> =
+        Arc::new(std::sync::Mutex::new(None));
     let stage_cb = Arc::clone(&stage);
+    let reporter_cb = Arc::clone(reporter);
+    let stem_cb = stem.to_string();
 
     let result = pool
         .convert_one(pdf_bytes, move |event| {
-            if event.total_pages > 0 {
-                stage_cb.set_length(event.total_pages);
-                stage_cb.set_position(event.page);
+            let mut guard = stage_cb.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(reporter_cb.begin_counted_stage(&stem_cb, None));
             }
-            stage_cb.set_message(&format!("[{}] {}", event.stage, event.message));
+            if let Some(ref s) = *guard {
+                if event.total_pages > 0 {
+                    s.set_length(event.total_pages);
+                    s.set_position(event.page);
+                }
+                s.set_message(&format!("[{}] {}", event.stage, event.message));
+            }
         })
         .await;
 
     stats.processing.fetch_sub(1, Relaxed);
+    let stage_guard = stage.lock().unwrap();
     match result {
         Ok((server_url, md)) => {
             if let Err(e) = atomic_write(&output_path, md.as_bytes()) {
-                stage.finish_failed(&format!("Write failed: {e}"));
+                if let Some(ref s) = *stage_guard {
+                    s.finish_failed(&format!("Write failed: {e}"));
+                }
                 stats.failed.fetch_add(1, Relaxed);
             } else {
                 let short_server = server_url
                     .strip_prefix("http://")
                     .or_else(|| server_url.strip_prefix("https://"))
                     .unwrap_or(&server_url);
-                stage.finish_with_message(&format!(
-                    "→ {} [{}]",
-                    output_path.display(),
-                    short_server
-                ));
+                if let Some(ref s) = *stage_guard {
+                    s.finish_with_message(&format!(
+                        "→ {} [{}]",
+                        output_path.display(),
+                        short_server
+                    ));
+                }
                 stats.completed.fetch_add(1, Relaxed);
             }
         }
@@ -634,11 +647,13 @@ async fn convert_and_save_pool(
             let msg = format!("{e:#}");
             stats.failed.fetch_add(1, Relaxed);
             if msg.contains("FormatError") || msg.contains("PdfiumLibrary") {
-                stage.finish_and_clear();
+                if let Some(ref s) = *stage_guard {
+                    s.finish_and_clear();
+                }
                 reporter.warn(&format!("{stem}: server rejected PDF → quarantined"));
                 quarantine_file(pdf_path, corrupted_dir);
-            } else {
-                stage.finish_failed(&msg);
+            } else if let Some(ref s) = *stage_guard {
+                s.finish_failed(&msg);
             }
         }
     }
