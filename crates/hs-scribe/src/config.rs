@@ -170,7 +170,7 @@ impl ScribeConfig {
             }
         });
         let result = Figment::from(Serialized::defaults(defaults))
-            .merge(Yaml::file(config_path).nested())
+            .merge(Yaml::file(config_path))
             .merge(Env::prefixed("HS_SCRIBE_"))
             .focus("scribe")
             .extract::<ScribeConfig>();
