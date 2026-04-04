@@ -103,6 +103,8 @@ fn main() -> ExitCode {
         tokio::select! {
             result = work => result,
             _ = tokio::signal::ctrl_c() => {
+                // Restore terminal in case raw mode was enabled (e.g. watch attach)
+                let _ = crossterm::terminal::disable_raw_mode();
                 reporter.finish("");
                 Err(anyhow::anyhow!("interrupted"))
             }

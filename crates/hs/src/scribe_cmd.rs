@@ -404,34 +404,88 @@ async fn cmd_watch_attach(
     let output_dir = outdir.unwrap_or(scribe_cfg.output_dir);
     let status_path = output_dir.join(STATUS_FILE);
 
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    // Enable raw mode for keypress detection
+    let raw_enabled = crossterm::terminal::enable_raw_mode().is_ok();
 
-        // Check if daemon is still alive
-        if !crate::daemon::is_process_alive(daemon_pid) {
-            reporter.status("Watch", "daemon exited");
-            break;
-        }
+    let result = async {
+        loop {
+            // Poll for keypress (non-blocking)
+            if raw_enabled {
+                while crossterm::event::poll(std::time::Duration::from_millis(0))
+                    .unwrap_or(false)
+                {
+                    if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
+                        use crossterm::event::KeyCode;
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                // Disable raw mode before printing
+                                let _ = crossterm::terminal::disable_raw_mode();
+                                reporter.status(
+                                    "Watch",
+                                    &format!(
+                                        "detached. Daemon running in background (PID {daemon_pid})"
+                                    ),
+                                );
+                                // Return without re-enabling; cleanup below is a no-op
+                                return Ok(());
+                            }
+                            KeyCode::Char('c')
+                                if key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            {
+                                let _ = crossterm::terminal::disable_raw_mode();
+                                reporter.status("Watch", "stopping daemon...");
+                                let _ = crate::daemon::stop_daemon(&watch_dir);
+                                reporter.status("Watch", "daemon stopped");
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
 
-        // Read and display status
-        if let Ok(contents) = std::fs::read_to_string(&status_path) {
-            if let Ok(status) = serde_json::from_str::<serde_json::Value>(&contents) {
-                let p = status["processing"].as_u64().unwrap_or(0);
-                let q = status["queued"].as_u64().unwrap_or(0);
-                let c = status["completed"].as_u64().unwrap_or(0);
-                let f = status["failed"].as_u64().unwrap_or(0);
-                reporter.status(
-                    "Watch",
-                    &format!("{p} processing, {q} queued, {c} completed, {f} failed"),
-                );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            // Check if daemon is still alive
+            if !crate::daemon::is_process_alive(daemon_pid) {
+                reporter.status("Watch", "daemon exited");
+                break;
+            }
+
+            // Read and display status
+            if let Ok(contents) = std::fs::read_to_string(&status_path) {
+                if let Ok(status) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    let p = status["processing"].as_u64().unwrap_or(0);
+                    let q = status["queued"].as_u64().unwrap_or(0);
+                    let c = status["completed"].as_u64().unwrap_or(0);
+                    let f = status["failed"].as_u64().unwrap_or(0);
+                    // Temporarily disable raw mode so reporter output renders correctly
+                    if raw_enabled {
+                        let _ = crossterm::terminal::disable_raw_mode();
+                    }
+                    reporter.status(
+                        "Watch",
+                        &format!("{p} processing, {q} queued, {c} completed, {f} failed"),
+                    );
+                    if raw_enabled {
+                        let _ = crossterm::terminal::enable_raw_mode();
+                    }
+                }
             }
         }
 
-        // TODO: check for 'q' keypress to detach (requires raw terminal mode)
-        // For now, CTRL+C (handled by tokio::select in main.rs) will exit
+        Ok(())
+    }
+    .await;
+
+    // Always restore terminal mode
+    if raw_enabled {
+        let _ = crossterm::terminal::disable_raw_mode();
     }
 
-    Ok(())
+    result
 }
 
 /// Check if a path is a valid PDF to process (not a macOS resource fork, not a temp file).
@@ -596,9 +650,6 @@ async fn cmd_watch(
         ),
     );
 
-    // Write initial status file
-    stats.write_status_file(&status_path, &watch_dir_str, &output_dir_str);
-
     // CTRL+C handler — sets flag so the blocking recv_timeout loop can exit
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_flag = Arc::clone(&shutdown);
@@ -651,6 +702,9 @@ async fn cmd_watch(
             });
         }
     }
+
+    // Write initial status after scan so counts are populated
+    stats.write_status_file(&status_path, &watch_dir_str, &output_dir_str);
 
     // PollWatcher works on NFS/CIFS/FUSE — inotify only works on local filesystems
     let (tx, rx) = std::sync::mpsc::channel();
