@@ -128,13 +128,15 @@ impl DistillClient {
         resp.json().await.context("Invalid readiness response")
     }
 
-    /// Index a markdown file (non-streaming).
+    /// Index a markdown file (non-streaming). Reads the file locally and sends content to server.
     pub async fn index_file(&self, markdown_path: &str) -> Result<IndexResult> {
+        let content = std::fs::read_to_string(markdown_path)
+            .context(format!("Failed to read {markdown_path}"))?;
         let url = format!("{}/distill", self.server_url);
         let resp = self
             .http
             .post(&url)
-            .json(&serde_json::json!({ "path": markdown_path }))
+            .json(&serde_json::json!({ "path": markdown_path, "content": content }))
             .send()
             .await
             .context("Failed to send index request")?;
@@ -149,16 +151,19 @@ impl DistillClient {
     }
 
     /// Index a markdown file with streaming progress via NDJSON.
+    /// Reads the file locally and sends content to the server.
     pub async fn index_file_with_progress(
         &self,
         markdown_path: &str,
         on_progress: impl Fn(DistillProgress),
     ) -> Result<IndexResult> {
+        let content = std::fs::read_to_string(markdown_path)
+            .context(format!("Failed to read {markdown_path}"))?;
         let url = format!("{}/distill/stream", self.server_url);
         let resp = self
             .http
             .post(&url)
-            .json(&serde_json::json!({ "path": markdown_path }))
+            .json(&serde_json::json!({ "path": markdown_path, "content": content }))
             .send()
             .await
             .context("Failed to send index request")?;

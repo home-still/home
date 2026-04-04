@@ -11,9 +11,11 @@ use crate::metadata::extract_rule_based;
 use crate::qdrant;
 use crate::types::EmbeddedChunk;
 
-/// Index a single markdown file: chunk -> metadata -> embed -> upsert.
+/// Index a single markdown document: chunk -> metadata -> embed -> upsert.
+/// If `content` is provided, uses it directly instead of reading from disk.
 pub async fn index_document(
     markdown_path: &Path,
+    content: Option<&str>,
     config: &DistillServerConfig,
     embedder: &dyn Embedder,
     qdrant_client: &qdrant_client::Qdrant,
@@ -34,8 +36,11 @@ pub async fn index_document(
         message: format!("Reading {stem}"),
     });
 
-    // Read the markdown file
-    let markdown = std::fs::read_to_string(markdown_path).map_err(|e| DistillError::Io(e))?;
+    // Use provided content or read from disk
+    let markdown = match content {
+        Some(c) => c.to_string(),
+        None => std::fs::read_to_string(markdown_path).map_err(DistillError::Io)?,
+    };
 
     if markdown.trim().is_empty() {
         tracing::warn!("Skipping empty document: {}", stem);

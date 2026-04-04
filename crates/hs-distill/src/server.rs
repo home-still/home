@@ -73,7 +73,10 @@ async fn handle_status(State(state): State<Arc<DistillServerState>>) -> impl Int
 
 #[derive(Deserialize)]
 struct IndexRequest {
+    /// Filename (stem used as doc_id)
     path: String,
+    /// If provided, use this content instead of reading from disk
+    content: Option<String>,
 }
 
 async fn handle_distill(
@@ -85,6 +88,7 @@ async fn handle_distill(
     let path = std::path::Path::new(&req.path);
     match crate::pipeline::index_document(
         path,
+        req.content.as_deref(),
         &state.config,
         state.embedder.as_ref(),
         &state.qdrant,
@@ -117,6 +121,7 @@ async fn handle_distill_stream(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
     let path = req.path.clone();
+    let content = req.content.clone();
 
     tokio::spawn(async move {
         let _guard = guard;
@@ -132,6 +137,7 @@ async fn handle_distill_stream(
         let doc_path = std::path::Path::new(&path);
         match crate::pipeline::index_document(
             doc_path,
+            content.as_deref(),
             &state.config,
             state.embedder.as_ref(),
             &state.qdrant,
