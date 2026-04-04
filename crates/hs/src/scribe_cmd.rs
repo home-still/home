@@ -454,23 +454,25 @@ async fn cmd_watch_attach(
                 break;
             }
 
-            // Read and display status
+            // Read and display status — only show updates from our daemon
             if let Ok(contents) = std::fs::read_to_string(&status_path) {
                 if let Ok(status) = serde_json::from_str::<serde_json::Value>(&contents) {
-                    let p = status["processing"].as_u64().unwrap_or(0);
-                    let q = status["queued"].as_u64().unwrap_or(0);
-                    let c = status["completed"].as_u64().unwrap_or(0);
-                    let f = status["failed"].as_u64().unwrap_or(0);
-                    // Temporarily disable raw mode so reporter output renders correctly
-                    if raw_enabled {
-                        let _ = crossterm::terminal::disable_raw_mode();
-                    }
-                    reporter.status(
-                        "Watch",
-                        &format!("{p} processing, {q} queued, {c} completed, {f} failed"),
-                    );
-                    if raw_enabled {
-                        let _ = crossterm::terminal::enable_raw_mode();
+                    let file_pid = status["pid"].as_u64().unwrap_or(0) as u32;
+                    if file_pid == daemon_pid {
+                        let p = status["processing"].as_u64().unwrap_or(0);
+                        let q = status["queued"].as_u64().unwrap_or(0);
+                        let c = status["completed"].as_u64().unwrap_or(0);
+                        let f = status["failed"].as_u64().unwrap_or(0);
+                        if raw_enabled {
+                            let _ = crossterm::terminal::disable_raw_mode();
+                        }
+                        reporter.status(
+                            "Watch",
+                            &format!("{p} processing, {q} queued, {c} completed, {f} failed"),
+                        );
+                        if raw_enabled {
+                            let _ = crossterm::terminal::enable_raw_mode();
+                        }
                     }
                 }
             }
@@ -569,6 +571,7 @@ impl WatchStats {
     fn write_status_file(&self, path: &std::path::Path, watch_dir: &str, output_dir: &str) {
         use std::sync::atomic::Ordering::Relaxed;
         let json = serde_json::json!({
+            "pid": std::process::id(),
             "processing": self.processing.load(Relaxed),
             "queued": self.queued.load(Relaxed),
             "completed": self.completed.load(Relaxed),
