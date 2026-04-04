@@ -41,10 +41,6 @@ fn distill_compose_path() -> PathBuf {
     hidden_dir().join("docker-compose-distill.yml")
 }
 
-fn distill_env_path() -> PathBuf {
-    hidden_dir().join(".env-distill")
-}
-
 fn distill_pid_path() -> PathBuf {
     hidden_dir().join("distill-server.pid")
 }
@@ -57,7 +53,7 @@ fn qdrant_rest_from_grpc(grpc_url: &str) -> String {
     )
 }
 
-fn distill_compose_yaml() -> String {
+fn distill_compose_yaml(data_dir: &std::path::Path) -> String {
     format!(
         r#"services:
   qdrant:
@@ -66,9 +62,10 @@ fn distill_compose_yaml() -> String {
       - "{QDRANT_REST_PORT}:{QDRANT_REST_PORT}"
       - "{QDRANT_GRPC_PORT}:{QDRANT_GRPC_PORT}"
     volumes:
-      - ${{QDRANT_DATA}}:/qdrant/storage
+      - {}:/qdrant/storage
     restart: on-failure:3
-"#
+"#,
+        data_dir.display()
     )
 }
 
@@ -163,17 +160,13 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
         // Step 2: Write compose config
         reporter.status("Step 2/3", "Docker Compose config");
         let compose_path = distill_compose_path();
-        let env_path = distill_env_path();
 
         if compose_path.exists() && !force {
             reporter.status("Config", "already exists");
         } else {
             std::fs::create_dir_all(hidden_dir())?;
-            std::fs::write(&compose_path, distill_compose_yaml())?;
-
-            let data_dir = &config.qdrant_data_dir;
-            std::fs::create_dir_all(data_dir)?;
-            std::fs::write(&env_path, format!("QDRANT_DATA={}\n", data_dir.display()))?;
+            std::fs::create_dir_all(&config.qdrant_data_dir)?;
+            std::fs::write(&compose_path, distill_compose_yaml(&config.qdrant_data_dir))?;
 
             reporter.status("Written", &format!("{}", compose_path.display()));
         }
@@ -181,10 +174,7 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
         // Step 3: Start Qdrant
         reporter.status("Step 3/3", "Starting Qdrant");
         let cf = compose_path.to_string_lossy().to_string();
-        let ef = env_path.to_string_lossy().to_string();
-        compose
-            .run(&["-f", &cf, "--env-file", &ef, "up", "-d"])
-            .await?;
+        compose.run(&["-f", &cf, "up", "-d"]).await?;
         wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
         reporter.status("Qdrant", "OK");
     }
@@ -232,10 +222,7 @@ async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
             .await
             .ok_or_else(|| anyhow::anyhow!("No container runtime found. Run: hs distill init"))?;
         let cf = compose_path.to_string_lossy().to_string();
-        let ef = distill_env_path().to_string_lossy().to_string();
-        compose
-            .run(&["-f", &cf, "--env-file", &ef, "up", "-d"])
-            .await?;
+        compose.run(&["-f", &cf, "up", "-d"]).await?;
         wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
         reporter.status("Qdrant", "OK");
     } else {
@@ -343,8 +330,7 @@ async fn cmd_server_stop(reporter: &Arc<dyn Reporter>) -> Result<()> {
     if compose_path.exists() {
         if let Some(compose) = ComposeCmd::detect().await {
             let cf = compose_path.to_string_lossy().to_string();
-            let ef = distill_env_path().to_string_lossy().to_string();
-            compose.run(&["-f", &cf, "--env-file", &ef, "down"]).await?;
+            compose.run(&["-f", &cf, "down"]).await?;
             reporter.status("Qdrant", "stopped");
         }
     }
@@ -402,8 +388,7 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
     if compose_path.exists() {
         if let Some(compose) = ComposeCmd::detect().await {
             let cf = compose_path.to_string_lossy().to_string();
-            let ef = distill_env_path().to_string_lossy().to_string();
-            let _ = compose.run(&["-f", &cf, "--env-file", &ef, "ps"]).await;
+            let _ = compose.run(&["-f", &cf, "ps"]).await;
         }
     }
 
