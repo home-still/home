@@ -121,6 +121,20 @@ fn split_at_pages(text: &str) -> Vec<&str> {
     text.split(PAGE_SEPARATOR).collect()
 }
 
+/// Snap a byte offset to the nearest char boundary at or after `pos`.
+fn snap_to_char_boundary(text: &str, pos: usize) -> usize {
+    let pos = pos.min(text.len());
+    if text.is_char_boundary(pos) {
+        return pos;
+    }
+    // Walk forward to find the next char boundary
+    let mut p = pos;
+    while p < text.len() && !text.is_char_boundary(p) {
+        p += 1;
+    }
+    p
+}
+
 /// Split a text segment into chunks respecting sentence boundaries.
 fn split_segment(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<String> {
     if text.len() <= max_chars {
@@ -135,7 +149,7 @@ fn split_segment(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Stri
     let mut start = 0;
 
     while start < text.len() {
-        let end = (start + max_chars).min(text.len());
+        let end = snap_to_char_boundary(text, (start + max_chars).min(text.len()));
 
         // Look for sentence boundary going backwards from end
         let actual_end = if end < text.len() {
@@ -150,7 +164,7 @@ fn split_segment(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Stri
         }
 
         // Advance with overlap
-        let advance = actual_end.saturating_sub(overlap_chars);
+        let advance = snap_to_char_boundary(text, actual_end.saturating_sub(overlap_chars));
         if advance <= start {
             start = actual_end; // force progress
         } else {
@@ -165,7 +179,8 @@ fn split_segment(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Stri
 /// Searches back 20% of the chunk size.
 fn find_sentence_boundary(text: &str, start: usize, end: usize) -> Option<usize> {
     let lookback = (end - start) / 5;
-    let search_start = end.saturating_sub(lookback);
+    let search_start = snap_to_char_boundary(text, end.saturating_sub(lookback));
+    let end = snap_to_char_boundary(text, end);
 
     let search_region = &text[search_start..end];
 
