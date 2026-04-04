@@ -1220,6 +1220,7 @@ dependencies = [
  "futures",
  "hs-scribe",
  "hs-style",
+ "libc",
  "notify 8.2.0",
  "owo-colors",
  "paper",

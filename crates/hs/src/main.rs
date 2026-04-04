@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 pub mod catalog;
 mod cli;
+pub mod daemon;
 mod scribe_cmd;
 mod scribe_pool;
 

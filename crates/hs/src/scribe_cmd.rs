@@ -120,6 +120,8 @@ pub enum ScribeCmd {
     },
     /// Watch a directory for new PDFs and auto-convert to markdown
     Watch {
+        #[command(subcommand)]
+        action: Option<WatchAction>,
         /// Directory to watch for PDFs (default: current directory)
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -129,6 +131,9 @@ pub enum ScribeCmd {
         /// Server URL override
         #[arg(long)]
         server: Option<String>,
+        /// Internal: daemon child process (hidden)
+        #[arg(long, hide = true)]
+        daemon_child: bool,
     },
     /// Show status of a running watch service
     Status {
@@ -141,6 +146,14 @@ pub enum ScribeCmd {
         #[command(subcommand)]
         action: ServerAction,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WatchAction {
+    /// Start the watch daemon without showing the panel
+    Start,
+    /// Stop a running watch daemon
+    Stop,
 }
 
 #[derive(Subcommand, Debug)]
@@ -166,10 +179,37 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
             server,
         } => cmd_convert(input, out_file, server, reporter).await,
         ScribeCmd::Watch {
+            action: Some(WatchAction::Start),
             dir,
             outdir,
             server,
-        } => cmd_watch(dir, outdir, server, reporter).await,
+            ..
+        } => cmd_daemon_start(dir, outdir, server, reporter).await,
+        ScribeCmd::Watch {
+            action: Some(WatchAction::Stop),
+            dir,
+            ..
+        } => cmd_daemon_stop(dir, reporter).await,
+        ScribeCmd::Watch {
+            action: None,
+            dir,
+            outdir,
+            server,
+            daemon_child,
+        } => {
+            if daemon_child {
+                // Internal: running as daemon child process
+                let watch_dir =
+                    resolve_watch_dir(dir.as_ref().map(|p| p.to_str().unwrap_or_default()));
+                crate::daemon::setup_daemon_child(&watch_dir)?;
+                let result = cmd_watch(Some(watch_dir.clone()), outdir, server, reporter).await;
+                crate::daemon::cleanup_daemon(&watch_dir);
+                result
+            } else {
+                // Default: start daemon + attach live panel
+                cmd_watch_attach(dir, outdir, server, reporter).await
+            }
+        }
         ScribeCmd::Status { status_dir } => cmd_status(status_dir, reporter).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
         ScribeCmd::Server { action } => cmd_server(action).await,
@@ -268,9 +308,131 @@ async fn cmd_convert(
     Ok(())
 }
 
-// ── Watch ───────────────────────────────────────────────────────
+// ── Watch Daemon ────────────────────────────────────────────────
 
 const STATUS_FILE: &str = ".scribe-watch-status.json";
+
+fn resolve_watch_dir(dir: Option<&str>) -> PathBuf {
+    dir.map(PathBuf::from).unwrap_or_else(|| {
+        let cfg = ScribeConfig::load().unwrap_or_default();
+        cfg.watch_dir
+    })
+}
+
+async fn cmd_daemon_start(
+    dir: Option<PathBuf>,
+    outdir: Option<PathBuf>,
+    server: Option<String>,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    let watch_dir = resolve_watch_dir(dir.as_ref().map(|p| p.to_str().unwrap_or_default()));
+
+    match crate::daemon::acquire_instance_lock(&watch_dir) {
+        Ok(()) => {}
+        Err(pid) => {
+            reporter.status("Watch", &format!("daemon already running (PID {pid})"));
+            return Ok(());
+        }
+    }
+
+    let pid = crate::daemon::spawn_daemon(
+        dir.as_ref().map(|p| p.to_str().unwrap_or_default()),
+        outdir.as_ref().map(|p| p.to_str().unwrap_or_default()),
+        server.as_deref(),
+    )?;
+
+    // Wait for PID file to appear (confirms child started)
+    let pid_path = crate::daemon::pid_file_path(&watch_dir);
+    for _ in 0..30 {
+        if pid_path.exists() {
+            reporter.status("Watch", &format!("daemon started (PID {pid})"));
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    reporter.warn("Daemon may not have started. Check logs at ~/.home-still/scribe-watch.log");
+    Ok(())
+}
+
+async fn cmd_daemon_stop(dir: Option<PathBuf>, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let watch_dir = resolve_watch_dir(dir.as_ref().map(|p| p.to_str().unwrap_or_default()));
+
+    match crate::daemon::stop_daemon(&watch_dir)? {
+        Some(pid) => reporter.status("Watch", &format!("daemon stopped (PID {pid})")),
+        None => reporter.warn("No watch daemon running"),
+    }
+    Ok(())
+}
+
+async fn cmd_watch_attach(
+    dir: Option<PathBuf>,
+    outdir: Option<PathBuf>,
+    server: Option<String>,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    let watch_dir = resolve_watch_dir(dir.as_ref().map(|p| p.to_str().unwrap_or_default()));
+
+    // Start daemon if not running
+    let daemon_pid = match crate::daemon::acquire_instance_lock(&watch_dir) {
+        Ok(()) => {
+            let pid = crate::daemon::spawn_daemon(
+                dir.as_ref().map(|p| p.to_str().unwrap_or_default()),
+                outdir.as_ref().map(|p| p.to_str().unwrap_or_default()),
+                server.as_deref(),
+            )?;
+            // Wait for PID file
+            let pid_path = crate::daemon::pid_file_path(&watch_dir);
+            for _ in 0..30 {
+                if pid_path.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            pid
+        }
+        Err(pid) => pid, // already running
+    };
+
+    reporter.status(
+        "Watch",
+        &format!("attached to daemon (PID {daemon_pid}). Press q to detach, CTRL+C to stop."),
+    );
+
+    // Read and display status in a loop
+    let scribe_cfg = ScribeConfig::load().unwrap_or_default();
+    let output_dir = outdir.unwrap_or(scribe_cfg.output_dir);
+    let status_path = output_dir.join(STATUS_FILE);
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Check if daemon is still alive
+        if !crate::daemon::is_process_alive(daemon_pid) {
+            reporter.status("Watch", "daemon exited");
+            break;
+        }
+
+        // Read and display status
+        if let Ok(contents) = std::fs::read_to_string(&status_path) {
+            if let Ok(status) = serde_json::from_str::<serde_json::Value>(&contents) {
+                let p = status["processing"].as_u64().unwrap_or(0);
+                let q = status["queued"].as_u64().unwrap_or(0);
+                let c = status["completed"].as_u64().unwrap_or(0);
+                let f = status["failed"].as_u64().unwrap_or(0);
+                reporter.status(
+                    "Watch",
+                    &format!("{p} processing, {q} queued, {c} completed, {f} failed"),
+                );
+            }
+        }
+
+        // TODO: check for 'q' keypress to detach (requires raw terminal mode)
+        // For now, CTRL+C (handled by tokio::select in main.rs) will exit
+    }
+
+    Ok(())
+}
 
 /// Check if a path is a valid PDF to process (not a macOS resource fork, not a temp file).
 fn is_processable_pdf(path: &std::path::Path) -> bool {
