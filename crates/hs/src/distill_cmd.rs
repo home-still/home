@@ -442,10 +442,38 @@ async fn cmd_index(
         return Ok(());
     }
 
-    reporter.status("Found", &format!("{} files to index", paths.len()));
+    reporter.status(
+        "Found",
+        &format!("{} files to index (press q to stop early)", paths.len()),
+    );
+
+    // Enable raw mode for keypress detection
+    let raw_enabled = crossterm::terminal::enable_raw_mode().is_ok();
 
     let mut total_chunks = 0u32;
+    let mut indexed_count = 0usize;
+    let mut stopped_early = false;
+
     for path in &paths {
+        // Check for 'q' keypress
+        if raw_enabled {
+            while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+                if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
+                    if key.kind == crossterm::event::KeyEventKind::Press
+                        && matches!(
+                            key.code,
+                            crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc
+                        )
+                    {
+                        stopped_early = true;
+                    }
+                }
+            }
+        }
+        if stopped_early {
+            break;
+        }
+
         let path_str = path.to_string_lossy().to_string();
         let stem = path
             .file_stem()
@@ -467,6 +495,7 @@ async fn cmd_index(
         {
             Ok(result) => {
                 total_chunks += result.chunks_indexed;
+                indexed_count += 1;
                 stage.finish_with_message(&format!(
                     "{}: {} chunks ({})",
                     stem, result.chunks_indexed, result.embedding_device
@@ -478,11 +507,25 @@ async fn cmd_index(
         }
     }
 
-    reporter.finish(&format!(
-        "Indexed {} files, {} total chunks",
-        paths.len(),
-        total_chunks
-    ));
+    if raw_enabled {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+
+    let summary = if stopped_early {
+        format!(
+            "Stopped: indexed {}/{} files, {} chunks",
+            indexed_count,
+            paths.len(),
+            total_chunks
+        )
+    } else {
+        format!(
+            "Indexed {} files, {} total chunks",
+            paths.len(),
+            total_chunks
+        )
+    };
+    reporter.finish(&summary);
 
     Ok(())
 }
