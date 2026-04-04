@@ -35,8 +35,7 @@ pub async fn index_document(
     });
 
     // Read the markdown file
-    let markdown =
-        std::fs::read_to_string(markdown_path).map_err(|e| DistillError::Io(e))?;
+    let markdown = std::fs::read_to_string(markdown_path).map_err(|e| DistillError::Io(e))?;
 
     if markdown.trim().is_empty() {
         tracing::warn!("Skipping empty document: {}", stem);

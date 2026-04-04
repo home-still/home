@@ -102,7 +102,6 @@ impl ScribeClient {
         }
         resp.json().await.context("Invalid readiness response")
     }
-
 }
 
 #[async_trait]

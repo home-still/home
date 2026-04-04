@@ -118,8 +118,7 @@ async fn handle_distill_stream(
         let tx_progress = tx.clone();
 
         let on_progress = move |event: DistillProgress| {
-            let line: DistillStreamLine =
-                hs_common::service::protocol::StreamLine::Progress(event);
+            let line: DistillStreamLine = hs_common::service::protocol::StreamLine::Progress(event);
             if let Ok(json) = serde_json::to_string(&line) {
                 let _ = tx_progress.try_send(Ok(format!("{json}\n")));
             }
@@ -187,7 +186,10 @@ async fn handle_search(
     let embeddings = match state.embedder.embed_batch(&query_texts).await {
         Ok(e) => e,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding failed: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Embedding failed: {e}"),
+            )
                 .into_response()
         }
     };
@@ -250,6 +252,10 @@ async fn handle_search(
 
             Json(hits).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Search failed: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Search failed: {e}"),
+        )
+            .into_response(),
     }
 }

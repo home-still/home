@@ -66,7 +66,11 @@ impl ReadinessInfo for ReadinessResponse {
         self.ready
     }
     fn available_slots(&self) -> usize {
-        if self.ready { 1 } else { 0 }
+        if self.ready {
+            1
+        } else {
+            0
+        }
     }
 }
 
@@ -78,8 +82,7 @@ pub struct StatusResponse {
     pub compute_device: String,
 }
 
-pub type DistillStreamLine =
-    hs_common::service::protocol::StreamLine<DistillProgress, IndexResult>;
+pub type DistillStreamLine = hs_common::service::protocol::StreamLine<DistillProgress, IndexResult>;
 
 // ── Client ─────────────────────────────────────────────────────
 

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use hs_scribe::config::ScribeConfig;
 use hs_common::reporter::Reporter;
+use hs_scribe::config::ScribeConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -411,9 +411,7 @@ async fn cmd_watch_attach(
         loop {
             // Poll for keypress (non-blocking)
             if raw_enabled {
-                while crossterm::event::poll(std::time::Duration::from_millis(0))
-                    .unwrap_or(false)
-                {
+                while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
                     if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
                         use crossterm::event::KeyCode;
                         match key.code {
