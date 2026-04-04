@@ -256,7 +256,9 @@ async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
         )
     })?;
 
-    let log_path = hidden_dir().join("distill-server.log");
+    let log_dir = hs_common::resolve_log_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("distill-server.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
