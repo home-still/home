@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use hs_common::reporter::Reporter;
 use hs_distill::cli::DistillCmd;
 use hs_distill::client::DistillClient;
@@ -55,7 +55,10 @@ async fn cmd_index(
     let client = DistillClient::new(&servers[0]);
 
     // Health check
-    let health = client.health().await?;
+    let health = client
+        .health()
+        .await
+        .context(format!("Is hs-distill-server running at {}?", servers[0]))?;
     reporter.status(
         "Connected",
         &format!("distill server ({})", health.compute_device),
@@ -140,7 +143,10 @@ async fn cmd_search(
     let client = DistillClient::new(&servers[0]);
 
     let filters = hs_distill::client::SearchFilters { year, topic };
-    let hits = client.search(query, limit, filters).await?;
+    let hits = client
+        .search(query, limit, filters)
+        .await
+        .context(format!("Is hs-distill-server running at {}?", servers[0]))?;
 
     if hits.is_empty() {
         println!("No results found.");
@@ -173,7 +179,10 @@ async fn cmd_status(server: Option<&str>) -> Result<()> {
     let servers = resolve_servers(server);
     let client = DistillClient::new(&servers[0]);
 
-    let status = client.status().await?;
+    let status = client
+        .status()
+        .await
+        .context(format!("Is hs-distill-server running at {}?", servers[0]))?;
 
     println!("Collection: {}", status.collection);
     println!("Points: {}", status.points_count);
