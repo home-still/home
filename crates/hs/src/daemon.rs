@@ -24,8 +24,14 @@ pub fn read_pid(path: &Path) -> Option<u32> {
 }
 
 /// Check if a process with the given PID is alive.
+#[cfg(unix)]
 pub fn is_process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+pub fn is_process_alive(_pid: u32) -> bool {
+    false // daemon mode not supported on Windows
 }
 
 /// Write PID to file.
@@ -105,6 +111,7 @@ pub fn spawn_daemon(dir: Option<&str>, outdir: Option<&str>, server: Option<&str
 }
 
 /// Send SIGTERM to the daemon, wait for exit, fallback to SIGKILL.
+#[cfg(unix)]
 pub fn stop_daemon(watch_dir: &Path) -> Result<Option<u32>> {
     let pid_path = pid_file_path(watch_dir);
     let pid = match read_pid(&pid_path) {
@@ -138,6 +145,13 @@ pub fn stop_daemon(watch_dir: &Path) -> Result<Option<u32>> {
     std::thread::sleep(std::time::Duration::from_millis(100));
     remove_pid_file(&pid_path);
     Ok(Some(pid))
+}
+
+#[cfg(not(unix))]
+pub fn stop_daemon(watch_dir: &Path) -> Result<Option<u32>> {
+    let pid_path = pid_file_path(watch_dir);
+    remove_pid_file(&pid_path);
+    Ok(None)
 }
 
 /// Set up the daemon child process: write PID file.
