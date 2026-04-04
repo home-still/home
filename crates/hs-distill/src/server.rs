@@ -55,10 +55,15 @@ async fn handle_readiness(State(state): State<Arc<DistillServerState>>) -> impl 
 }
 
 async fn handle_status(State(state): State<Arc<DistillServerState>>) -> impl IntoResponse {
-    match crate::qdrant::collection_info(&state.qdrant, &state.config.collection_name).await {
-        Ok(count) => Json(StatusResponse {
-            collection: state.config.collection_name.clone(),
-            points_count: count,
+    let collection = &state.config.collection_name;
+    let points = crate::qdrant::collection_info(&state.qdrant, collection).await;
+    let docs = crate::qdrant::distinct_doc_count(&state.qdrant, collection).await;
+
+    match points {
+        Ok(points_count) => Json(StatusResponse {
+            collection: collection.clone(),
+            points_count,
+            documents_count: docs.unwrap_or(0),
             compute_device: state.embedder.device().to_string(),
         })
         .into_response(),

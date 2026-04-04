@@ -79,6 +79,8 @@ impl ReadinessInfo for ReadinessResponse {
 pub struct StatusResponse {
     pub collection: String,
     pub points_count: u64,
+    #[serde(default)]
+    pub documents_count: u64,
     pub compute_device: String,
 }
 

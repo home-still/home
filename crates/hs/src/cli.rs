@@ -38,6 +38,8 @@ pub enum TopCmd {
         #[command(subcommand)]
         command: hs_distill::cli::DistillCmd,
     },
+    /// Live dashboard — pipeline health, services, recent activity
+    Status,
     /// View and manage configuration
     Config {
         #[command(subcommand)]

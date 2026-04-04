@@ -1,6 +1,6 @@
 use qdrant_client::qdrant::{
-    CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, Distance, FieldType,
-    HnswConfigDiffBuilder, PointStruct, QueryPointsBuilder, SearchParamsBuilder,
+    CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, Distance, FacetCountsBuilder,
+    FieldType, HnswConfigDiffBuilder, PointStruct, QueryPointsBuilder, SearchParamsBuilder,
     UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
@@ -182,6 +182,19 @@ pub async fn collection_info(client: &Qdrant, collection_name: &str) -> Result<u
         .result
         .map(|r| r.points_count.unwrap_or(0))
         .unwrap_or(0))
+}
+
+/// Count distinct documents in a collection via facet on doc_id.
+pub async fn distinct_doc_count(
+    client: &Qdrant,
+    collection_name: &str,
+) -> Result<u64, DistillError> {
+    let response = client
+        .facet(FacetCountsBuilder::new(collection_name, "doc_id"))
+        .await
+        .map_err(|e| DistillError::Qdrant(format!("Failed to count documents: {e}")))?;
+
+    Ok(response.hits.len() as u64)
 }
 
 #[cfg(test)]
