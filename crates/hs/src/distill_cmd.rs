@@ -73,6 +73,23 @@ fn distill_compose_yaml() -> String {
 }
 
 fn find_distill_binary() -> Option<PathBuf> {
+    // Check ~/.local/bin (install script location)
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".local/bin/hs-distill-server");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    // Check next to the current binary (same install dir)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let path = dir.join("hs-distill-server");
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    // Check cargo target dirs (dev builds)
     let project = hs_common::resolve_project_dir();
     for profile in ["release", "debug"] {
         let path = project
@@ -81,15 +98,6 @@ fn find_distill_binary() -> Option<PathBuf> {
             .join("hs-distill-server");
         if path.exists() {
             return Some(path);
-        }
-    }
-    // Check in the same directory as the current binary
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let path = dir.join("hs-distill-server");
-            if path.exists() {
-                return Some(path);
-            }
         }
     }
     None

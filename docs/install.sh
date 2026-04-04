@@ -43,6 +43,15 @@ chmod +x "${INSTALL_DIR}/${TOOL}"
 
 echo "Installed ${TOOL} to ${INSTALL_DIR}/${TOOL}"
 
+# Install hs-distill-server if available for this platform
+DISTILL_ARCHIVE="hs-distill-server-${VERSION}-${TARGET}.tar.gz"
+DISTILL_URL="https://github.com/${REPO}/releases/download/${VERSION}/${DISTILL_ARCHIVE}"
+if curl -fsSL -o /dev/null --head "${DISTILL_URL}" 2>/dev/null; then
+    curl -fsSL "${DISTILL_URL}" | tar -xz -C "${INSTALL_DIR}"
+    chmod +x "${INSTALL_DIR}/hs-distill-server"
+    echo "Installed hs-distill-server to ${INSTALL_DIR}/hs-distill-server"
+fi
+
 # Check if INSTALL_DIR is in PATH
 case ":${PATH}:" in
     *":${INSTALL_DIR}:"*) ;;
