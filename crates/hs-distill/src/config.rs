@@ -41,7 +41,7 @@ impl Default for DistillServerConfig {
 }
 
 impl DistillServerConfig {
-    pub fn load() -> Result<Self, figment::Error> {
+    pub fn load() -> Result<Self, Box<figment::Error>> {
         let home = dirs::home_dir().unwrap_or_default();
         let config_path = home.join(hs_common::CONFIG_REL_PATH);
 
@@ -50,6 +50,7 @@ impl DistillServerConfig {
             .merge(Env::prefixed("HS_DISTILL_"))
             .select("distill_server")
             .extract()
+            .map_err(Box::new)
     }
 }
 
@@ -95,7 +96,7 @@ impl Default for DistillClientConfig {
 }
 
 impl DistillClientConfig {
-    pub fn load() -> Result<Self, figment::Error> {
+    pub fn load() -> Result<Self, Box<figment::Error>> {
         let home = dirs::home_dir().unwrap_or_default();
         let config_path = home.join(hs_common::CONFIG_REL_PATH);
 
@@ -104,5 +105,6 @@ impl DistillClientConfig {
             .merge(Env::prefixed("HS_DISTILL_"))
             .select("distill")
             .extract()
+            .map_err(Box::new)
     }
 }
