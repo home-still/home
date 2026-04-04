@@ -14,15 +14,20 @@ use crate::ports::download_service::DownloadService;
 use crate::ports::provider::PaperProvider;
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct UnpaywallResponse {
     is_oa: bool,
     best_oa_location: Option<UnpaywallLocation>,
+    oa_locations: Option<Vec<UnpaywallLocation>>,
 }
 
 #[derive(Deserialize)]
 struct UnpaywallLocation {
     url_for_pdf: Option<String>,
+    url_for_landing_page: Option<String>,
+    #[allow(dead_code)]
+    version: Option<String>,
+    #[allow(dead_code)]
+    license: Option<String>,
 }
 
 pub struct PaperDownloader {
@@ -71,9 +76,62 @@ impl PaperDownloader {
     async fn resolve_unpaywall(&self, doi: &str) -> Option<String> {
         let email = self.unpaywall_email.as_ref()?;
         let url = format!("https://api.unpaywall.org/v2/{}?email={}", doi, email);
-        let response = self.client.get(&url).send().await.ok()?;
-        let data: UnpaywallResponse = response.json().await.ok()?;
-        data.best_oa_location?.url_for_pdf
+        tracing::debug!(doi, "Unpaywall lookup");
+
+        let response = match self.client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(doi, error = %e, "Unpaywall request failed");
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(doi, status = %response.status(), "Unpaywall returned error");
+            return None;
+        }
+
+        let data: UnpaywallResponse = match response.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(doi, error = %e, "Unpaywall response parse failed");
+                return None;
+            }
+        };
+
+        if !data.is_oa {
+            tracing::debug!(doi, "Unpaywall: not open access");
+            return None;
+        }
+
+        // 1. Best OA location PDF
+        if let Some(ref loc) = data.best_oa_location {
+            if let Some(ref pdf_url) = loc.url_for_pdf {
+                tracing::debug!(doi, url = %pdf_url, "Unpaywall: best OA PDF");
+                return Some(pdf_url.clone());
+            }
+        }
+
+        // 2. Try all OA locations
+        if let Some(locations) = &data.oa_locations {
+            for loc in locations {
+                if let Some(ref pdf_url) = loc.url_for_pdf {
+                    tracing::debug!(doi, url = %pdf_url, version = ?loc.version, "Unpaywall: alternate OA PDF");
+                    return Some(pdf_url.clone());
+                }
+            }
+        }
+
+        // 3. Landing page fallback (best location only)
+        if let Some(ref loc) = data.best_oa_location {
+            if let Some(ref landing) = loc.url_for_landing_page {
+                tracing::debug!(doi, url = %landing, "Unpaywall: landing page fallback");
+                return Some(landing.clone());
+            }
+        }
+
+        tracing::debug!(doi, "Unpaywall: OA but no usable URL found");
+        None
     }
 
     async fn resolve_via_providers(&self, doi: &str) -> Option<String> {
