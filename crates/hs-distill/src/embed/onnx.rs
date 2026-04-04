@@ -23,8 +23,7 @@ impl OnnxEmbedder {
         });
 
         let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::BGESmallENV15) // TODO: Use BGE-M3 when available
-                .with_show_download_progress(true),
+            InitOptions::new(EmbeddingModel::BGEM3).with_show_download_progress(true),
         )
         .map_err(|e| DistillError::Embedding(format!("Failed to load model: {e}")))?;
 
