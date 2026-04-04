@@ -14,6 +14,7 @@ pub struct DistillServerConfig {
     pub host: String,
     pub port: u16,
     pub qdrant_url: String,
+    pub qdrant_data_dir: PathBuf,
     pub collection_name: String,
     pub embedding: EmbeddingConfig,
     pub chunk_max_tokens: usize,
@@ -25,10 +26,12 @@ pub struct DistillServerConfig {
 
 impl Default for DistillServerConfig {
     fn default() -> Self {
+        let project = hs_common::resolve_project_dir();
         Self {
             host: "0.0.0.0".into(),
             port: 7434,
             qdrant_url: "http://localhost:6334".into(),
+            qdrant_data_dir: project.join("data").join("qdrant"),
             collection_name: "academic_papers".into(),
             embedding: EmbeddingConfig::default(),
             chunk_max_tokens: 1000,

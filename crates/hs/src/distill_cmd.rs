@@ -171,8 +171,8 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
             std::fs::create_dir_all(hidden_dir())?;
             std::fs::write(&compose_path, distill_compose_yaml())?;
 
-            let data_dir = hs_common::resolve_project_dir().join("data").join("qdrant");
-            std::fs::create_dir_all(&data_dir)?;
+            let data_dir = &config.qdrant_data_dir;
+            std::fs::create_dir_all(data_dir)?;
             std::fs::write(&env_path, format!("QDRANT_DATA={}\n", data_dir.display()))?;
 
             reporter.status("Written", &format!("{}", compose_path.display()));
