@@ -55,14 +55,19 @@ async fn cmd_index(
     let client = DistillClient::new(&servers[0]);
 
     // Health check
-    let health = client
-        .health()
-        .await
-        .context(format!("Is hs-distill-server running at {}?", servers[0]))?;
-    reporter.status(
-        "Connected",
-        &format!("distill server ({})", health.compute_device),
-    );
+    let stage = reporter.begin_stage(&format!("Connecting to {}", servers[0]), None);
+    match client.health().await {
+        Ok(h) => {
+            stage.finish_with_message(&format!("distill server ({})", h.compute_device));
+        }
+        Err(e) => {
+            stage.finish_failed("unreachable");
+            return Err(e).context(format!(
+                "Is hs-distill-server running at {}?",
+                servers[0]
+            ));
+        }
+    };
 
     // Determine files to index
     let config = DistillClientConfig::load().unwrap_or_default();
