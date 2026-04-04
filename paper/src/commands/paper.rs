@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use hs_style::reporter::Reporter;
-use hs_style::styles::Styles;
+use hs_common::reporter::Reporter;
+use hs_common::styles::Styles;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -25,7 +25,7 @@ use crate::services::search::AggregateProvider;
 use crate::cli::SortByArg;
 use crate::cli::{ProviderArg, SearchTypeArg};
 use crate::output;
-use hs_style::global_args::GlobalArgs;
+use hs_common::global_args::GlobalArgs;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_search(
@@ -41,7 +41,7 @@ pub async fn run_search(
     global: &GlobalArgs,
     reporter: &Arc<dyn Reporter>,
     styles: &Styles,
-    mode: &hs_style::mode::OutputMode,
+    mode: &hs_common::mode::OutputMode,
 ) -> Result<()> {
     let config = Config::load().context("Failed to load config")?;
     let provider = make_provider(&provider, &config)?;
@@ -86,7 +86,7 @@ pub async fn run_search(
 
     if global.is_json() {
         output::print_json(&result)?;
-    } else if matches!(mode, hs_style::mode::OutputMode::Pipe) {
+    } else if matches!(mode, hs_common::mode::OutputMode::Pipe) {
         output::print_search_result_pipe(&result);
     } else {
         output::print_search_result(
@@ -196,7 +196,7 @@ pub async fn run_download(
         } else {
             None
         };
-        let search_stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
+        let search_stage: Arc<Box<dyn hs_common::reporter::StageHandle>> =
             Arc::new(reporter.begin_counted_stage("Searching", search_total));
         search_stage.set_message(&format!("for '{}'", query_str));
 
@@ -286,11 +286,11 @@ pub async fn run_download(
 
         // Overall progress counter (ephemeral — cleared when done)
         let total_papers = search_result.papers.len();
-        let overall: Arc<Box<dyn hs_style::reporter::StageHandle>> =
+        let overall: Arc<Box<dyn hs_common::reporter::StageHandle>> =
             Arc::new(reporter.begin_counted_stage("Downloading", Some(total_papers as u64)));
 
         // Per-download progress bars (ephemeral — cleared on completion)
-        let bars: Arc<Mutex<HashMap<usize, Box<dyn hs_style::reporter::StageHandle>>>> =
+        let bars: Arc<Mutex<HashMap<usize, Box<dyn hs_common::reporter::StageHandle>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let bars_ref = Arc::clone(&bars);
         let reporter_ref = Arc::clone(reporter);
@@ -513,7 +513,7 @@ async fn lookup_and_display(
     query: &str,
     label: &str,
     provider: &dyn PaperProvider,
-    stage: Box<dyn hs_style::reporter::StageHandle>,
+    stage: Box<dyn hs_common::reporter::StageHandle>,
     global: &GlobalArgs,
     reporter: &Arc<dyn Reporter>,
     styles: &Styles,

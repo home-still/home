@@ -9,7 +9,7 @@ hs paper download --doi \"10.48550/arXiv.2301.00001\"
 hs config init")]
 pub struct Cli {
     #[command(flatten)]
-    pub global: hs_style::global_args::GlobalArgs,
+    pub global: hs_common::global_args::GlobalArgs,
 
     #[command(subcommand)]
     pub command: TopCmd,
@@ -32,6 +32,11 @@ pub enum TopCmd {
     Paper {
         #[command(subcommand)]
         command: paper::cli::PaperCmd,
+    },
+    /// Distill markdown into vector embeddings for semantic search
+    Distill {
+        #[command(subcommand)]
+        command: hs_distill::cli::DistillCmd,
     },
     /// View and manage configuration
     Config {

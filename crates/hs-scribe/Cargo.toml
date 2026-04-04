@@ -39,6 +39,8 @@ tokio = { workspace = true }
 reqwest = { workspace = true, features = ["multipart", "stream"] }
 figment = { workspace = true }
 dirs = "6"
+hs-common = { workspace = true, features = ["service"] }
+async-trait = "0.1"
 
 # Server Only
 axum = { version = "0.8", optional = true, features = ["multipart"] }
@@ -48,7 +50,7 @@ tracing-subscriber = { version = "0.3", features = [
 ], optional = true }
 pdfium-render = { version = "0.8.35", optional = true }
 image = { version = "0.25", optional = true }
-ort = { version = "=2.0.0-rc.12", features = ["ndarray"], optional = true }
+ort = { version = "=2.0.0-rc.11", features = ["ndarray"], optional = true }
 ndarray = { version = "0.17", optional = true }
 ollama-rs = { version = "0.3", features = ["stream"], optional = true }
 base64 = { version = "0.22", optional = true }

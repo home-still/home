@@ -87,3 +87,9 @@ pub mod global_args;
 pub mod styles;
 #[cfg(feature = "cli")]
 pub mod tty_reporter;
+
+#[cfg(feature = "service")]
+pub mod service;
+
+#[cfg(feature = "catalog")]
+pub mod catalog;

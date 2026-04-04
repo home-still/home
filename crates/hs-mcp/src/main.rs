@@ -169,7 +169,7 @@ impl ServerHandler for HomeStillMcp {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let catalog_dir = hs_style::resolve_project_dir().join("catalog");
+    let catalog_dir = hs_common::resolve_project_dir().join("catalog");
     let server = HomeStillMcp::new(catalog_dir);
 
     let transport = rmcp::transport::io::stdio();

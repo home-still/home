@@ -85,17 +85,10 @@ fn write_tmp_pdf(pdf_bytes: &[u8]) -> Result<tempfile::NamedTempFile, Response> 
     Ok(tmp)
 }
 
-/// Drop guard that decrements in_flight counter when request completes.
-struct InFlightGuard(Arc<AtomicUsize>);
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
+use hs_common::service::inflight::InFlightGuard;
 
 async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipart) -> Response {
-    state.in_flight.fetch_add(1, Ordering::Relaxed);
-    let _guard = InFlightGuard(Arc::clone(&state.in_flight));
+    let _guard = InFlightGuard::new(&state.in_flight);
 
     let pdf_bytes = match extract_pdf(multipart).await {
         Ok(b) => b,
@@ -136,8 +129,7 @@ async fn handle_scribe_stream(
         Err(resp) => return resp,
     };
 
-    state.in_flight.fetch_add(1, Ordering::Relaxed);
-    let in_flight = Arc::clone(&state.in_flight);
+    let in_flight_guard = InFlightGuard::new(&state.in_flight);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
     let path = tmp.path().to_string_lossy().to_string();
@@ -145,7 +137,7 @@ async fn handle_scribe_stream(
 
     tokio::spawn(async move {
         let _tmp = tmp; // keep temp file alive for the duration of processing
-        let _guard = InFlightGuard(in_flight);
+        let _guard = in_flight_guard;
 
         let tx_progress = tx.clone();
         let on_progress = move |event: crate::client::ProgressEvent| {

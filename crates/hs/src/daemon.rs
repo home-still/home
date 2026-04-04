@@ -14,7 +14,7 @@ pub fn pid_file_path(watch_dir: &Path) -> PathBuf {
     let hash = format!("{:016x}", hasher.finish());
     dirs::home_dir()
         .unwrap_or_default()
-        .join(hs_style::HIDDEN_DIR)
+        .join(hs_common::HIDDEN_DIR)
         .join(format!("scribe-watch-{hash}.pid"))
 }
 
@@ -86,7 +86,7 @@ pub fn spawn_daemon(dir: Option<&str>, outdir: Option<&str>, server: Option<&str
 
     let log_path = dirs::home_dir()
         .unwrap_or_default()
-        .join(hs_style::HIDDEN_DIR)
+        .join(hs_common::HIDDEN_DIR)
         .join("scribe-watch.log");
     let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(Path::new(".")));
 

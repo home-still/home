@@ -1,6 +1,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use hs_common::service::protocol::{ReadinessInfo, ServiceClient};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +39,15 @@ pub struct ReadinessResponse {
     pub vlm_slots_total: usize,
     pub vlm_slots_available: usize,
     pub in_flight_conversions: usize,
+}
+
+impl ReadinessInfo for ReadinessResponse {
+    fn is_ready(&self) -> bool {
+        self.ready
+    }
+    fn available_slots(&self) -> usize {
+        self.vlm_slots_available
+    }
 }
 
 pub struct ScribeClient {
@@ -92,6 +103,27 @@ impl ScribeClient {
         resp.json().await.context("Invalid readiness response")
     }
 
+}
+
+#[async_trait]
+impl ServiceClient for ScribeClient {
+    type Health = HealthResponse;
+    type Readiness = ReadinessResponse;
+
+    fn url(&self) -> &str {
+        &self.server_url
+    }
+
+    async fn health(&self) -> Result<Self::Health> {
+        ScribeClient::health(self).await
+    }
+
+    async fn readiness(&self) -> Result<Self::Readiness> {
+        ScribeClient::readiness(self).await
+    }
+}
+
+impl ScribeClient {
     pub async fn convert(&self, pdf_bytes: Vec<u8>) -> Result<String> {
         let url = format!("{}/scribe", self.server_url);
         let part = reqwest::multipart::Part::bytes(pdf_bytes).file_name("input.pdf");

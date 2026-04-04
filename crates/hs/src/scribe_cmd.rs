@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use hs_scribe::config::ScribeConfig;
-use hs_style::reporter::Reporter;
+use hs_common::reporter::Reporter;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -256,7 +256,7 @@ async fn cmd_convert(
     let pdf_bytes =
         std::fs::read(&input).with_context(|| format!("Cannot read {}", input.display()))?;
 
-    let stage: Arc<Box<dyn hs_style::reporter::StageHandle>> =
+    let stage: Arc<Box<dyn hs_common::reporter::StageHandle>> =
         Arc::new(reporter.begin_counted_stage("Converting", None));
     stage.set_message("sending PDF to server...");
     let stage_cb = Arc::clone(&stage);
@@ -835,7 +835,7 @@ async fn convert_and_save_pool(
     stats.queued.fetch_sub(1, Relaxed);
     stats.processing.fetch_add(1, Relaxed);
 
-    let stage: Arc<std::sync::Mutex<Option<Box<dyn hs_style::reporter::StageHandle>>>> =
+    let stage: Arc<std::sync::Mutex<Option<Box<dyn hs_common::reporter::StageHandle>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let server_tag: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
     let total_pages_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1347,7 +1347,7 @@ async fn cmd_server(action: ServerAction) -> Result<()> {
 fn hidden_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_default()
-        .join(hs_style::HIDDEN_DIR)
+        .join(hs_common::HIDDEN_DIR)
 }
 
 /// Detected compose command: "docker compose", "docker-compose", or "podman-compose"

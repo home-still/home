@@ -9,10 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 hs-scribe = { path = "../hs-scribe", features = ["client"] }
+hs-distill = { path = "../hs-distill", features = ["client"] }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-hs-style = { workspace = true, features = ["cli"] }
+hs-common = { workspace = true, features = ["cli", "service", "catalog"] }
 owo-colors = { workspace = true }
 paper = { path = "../../paper" }
 dirs = { workspace = true }

@@ -1,20 +1,21 @@
 use clap::Parser;
 use dialoguer::{Confirm, Input};
-use hs_style::CONFIG_REL_PATH;
+use hs_common::CONFIG_REL_PATH;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-pub mod catalog;
+pub use hs_common::catalog;
 mod cli;
 pub mod daemon;
+mod distill_cmd;
 mod scribe_cmd;
 mod scribe_pool;
 
 use cli::{Cli, TopCmd};
-use hs_style::mode::{self, OutputMode};
-use hs_style::reporter::{Reporter, SilentReporter};
-use hs_style::styles::Styles;
-use hs_style::tty_reporter::TtyReporter;
+use hs_common::mode::{self, OutputMode};
+use hs_common::reporter::{Reporter, SilentReporter};
+use hs_common::styles::Styles;
+use hs_common::tty_reporter::TtyReporter;
 
 const DEFAULT_CONFIG: &str = include_str!("../config/default.yaml");
 
@@ -23,7 +24,7 @@ fn init_logging(verbose: bool, quiet: bool) {
         fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
     };
 
-    let log_dir = hs_style::resolve_log_dir();
+    let log_dir = hs_common::resolve_log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
 
     // Stderr layer: human-readable, respects --verbose/--quiet
@@ -71,7 +72,7 @@ fn main() -> ExitCode {
         match mode {
             OutputMode::Rich => Arc::new(TtyReporter::new(true)),
             OutputMode::Plain => Arc::new(TtyReporter::new(false)),
-            OutputMode::Pipe => Arc::new(hs_style::pipe_reporter::PipeReporter),
+            OutputMode::Pipe => Arc::new(hs_common::pipe_reporter::PipeReporter),
         }
     };
 
@@ -85,6 +86,7 @@ fn main() -> ExitCode {
         TopCmd::Paper { .. } => paper::exit_codes::from_error,
         TopCmd::Config { .. } => |_| ExitCode::FAILURE,
         TopCmd::Scribe { .. } => |_| ExitCode::FAILURE,
+        TopCmd::Distill { .. } => |_| ExitCode::FAILURE,
     };
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio  runtime");
@@ -97,6 +99,7 @@ fn main() -> ExitCode {
                 }
                 TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
                 TopCmd::Scribe { command } => scribe_cmd::dispatch(command, &reporter).await,
+                TopCmd::Distill { command } => distill_cmd::dispatch(command, &reporter).await,
             }
         };
 
@@ -122,8 +125,8 @@ fn main() -> ExitCode {
 
 async fn handle_config(
     action: cli::ConfigAction,
-    global: &hs_style::global_args::GlobalArgs,
-    reporter: &std::sync::Arc<dyn hs_style::reporter::Reporter>,
+    global: &hs_common::global_args::GlobalArgs,
+    reporter: &std::sync::Arc<dyn hs_common::reporter::Reporter>,
 ) -> anyhow::Result<()> {
     match action {
         cli::ConfigAction::Init { force } => {

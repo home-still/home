@@ -4,7 +4,7 @@ use figment::{
     providers::{Env, Format, Yaml},
     Figment,
 };
-use hs_style::CONFIG_REL_PATH;
+use hs_common::CONFIG_REL_PATH;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -32,9 +32,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             resilience: ResilienceConfig::default(),
-            download_path: hs_style::resolve_project_dir().join("papers"),
+            download_path: hs_common::resolve_project_dir().join("papers"),
             cache_path: dirs::home_dir()
-                .map(|h| h.join(hs_style::HIDDEN_DIR).join("cache"))
+                .map(|h| h.join(hs_common::HIDDEN_DIR).join("cache"))
                 .unwrap_or_else(|| PathBuf::from("./cache")),
             providers: ProvidersConfig::default(),
             download: DownloadConfig::default(),

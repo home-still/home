@@ -1,64 +1,22 @@
 use anyhow::Result;
+use hs_common::service::pool::ServicePool;
 use hs_scribe::client::{ProgressEvent, ScribeClient};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct ScribePool {
-    clients: Vec<ScribeClient>,
-    next_server: AtomicUsize,
+    inner: ServicePool<ScribeClient>,
 }
 
 impl ScribePool {
     pub fn new(servers: &[String]) -> Self {
         let clients: Vec<ScribeClient> = servers.iter().map(|url| ScribeClient::new(url)).collect();
         Self {
-            clients,
-            next_server: AtomicUsize::new(0),
+            inner: ServicePool::new(clients),
         }
     }
 
     /// Number of concurrent conversions to allow (2 per server).
     pub fn concurrency(&self) -> usize {
-        (self.clients.len() * 2).max(1)
-    }
-
-    /// Pick the least-loaded ready server with round-robin tie-breaking.
-    async fn pick_server(&self) -> Result<&ScribeClient> {
-        let futures: Vec<_> = self
-            .clients
-            .iter()
-            .map(|c| async move { (c, c.readiness().await) })
-            .collect();
-        let results = futures::future::join_all(futures).await;
-
-        let max_avail = results
-            .iter()
-            .filter_map(|(_, r)| r.as_ref().ok())
-            .filter(|r| r.ready)
-            .map(|r| r.vlm_slots_available)
-            .max();
-
-        let Some(max_avail) = max_avail else {
-            anyhow::bail!("No scribe servers are ready");
-        };
-
-        let candidates: Vec<&ScribeClient> = results
-            .iter()
-            .filter_map(|(c, r)| {
-                if let Ok(r) = r {
-                    if r.ready && r.vlm_slots_available == max_avail {
-                        return Some(*c);
-                    }
-                }
-                None
-            })
-            .collect();
-
-        if candidates.is_empty() {
-            anyhow::bail!("No scribe servers are ready");
-        }
-
-        let idx = self.next_server.fetch_add(1, Ordering::Relaxed) % candidates.len();
-        Ok(candidates[idx])
+        self.inner.concurrency()
     }
 
     /// Convert one PDF via the best available server.
@@ -71,7 +29,7 @@ impl ScribePool {
     ) -> Result<(String, String)> {
         let mut last_err = None;
         for attempt in 0..3 {
-            match self.pick_server().await {
+            match self.inner.pick_server().await {
                 Ok(client) => {
                     let url = client.url().to_string();
                     let short = url
@@ -101,11 +59,6 @@ impl ScribePool {
 
     /// Health check all servers. Returns (url, reachable) pairs.
     pub async fn check_all(&self) -> Vec<(String, bool)> {
-        let futures: Vec<_> = self
-            .clients
-            .iter()
-            .map(|c| async move { (c.url().to_string(), c.health().await.is_ok()) })
-            .collect();
-        futures::future::join_all(futures).await
+        self.inner.check_all().await
     }
 }

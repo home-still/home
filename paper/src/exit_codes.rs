@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use hs_style::exit_codes::*;
+use hs_common::exit_codes::*;
 
 pub fn from_error(err: &anyhow::Error) -> ExitCode {
     for cause in err.chain() {
