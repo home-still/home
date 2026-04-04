@@ -447,16 +447,14 @@ async fn cmd_index(
         &format!("{} files to index (press q to stop early)", paths.len()),
     );
 
-    // Enable raw mode for keypress detection
-    let raw_enabled = crossterm::terminal::enable_raw_mode().is_ok();
-
     let mut total_chunks = 0u32;
     let mut indexed_count = 0usize;
     let mut stopped_early = false;
 
     for path in &paths {
-        // Check for 'q' keypress
-        if raw_enabled {
+        // Briefly enable raw mode to check for 'q' keypress, then disable
+        // so indicatif progress bars render correctly
+        if crossterm::terminal::enable_raw_mode().is_ok() {
             while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
                 if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
                     if key.kind == crossterm::event::KeyEventKind::Press
@@ -469,6 +467,7 @@ async fn cmd_index(
                     }
                 }
             }
+            let _ = crossterm::terminal::disable_raw_mode();
         }
         if stopped_early {
             break;
@@ -505,10 +504,6 @@ async fn cmd_index(
                 stage.finish_failed(&format!("{stem}: {e}"));
             }
         }
-    }
-
-    if raw_enabled {
-        let _ = crossterm::terminal::disable_raw_mode();
     }
 
     let summary = if stopped_early {
