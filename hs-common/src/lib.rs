@@ -93,3 +93,6 @@ pub mod service;
 
 #[cfg(feature = "catalog")]
 pub mod catalog;
+
+#[cfg(feature = "compose")]
+pub mod compose;

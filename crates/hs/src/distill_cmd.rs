@@ -2,12 +2,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use hs_common::compose::{check_command, wait_for_url, ComposeCmd};
 use hs_common::reporter::Reporter;
-use hs_distill::cli::DistillCmd;
+use hs_distill::cli::{DistillCmd, DistillServerAction};
 use hs_distill::client::DistillClient;
-use hs_distill::config::DistillClientConfig;
+use hs_distill::config::{DistillClientConfig, DistillServerConfig};
 
 const DEFAULT_SERVER: &str = "http://localhost:7434";
+const QDRANT_REST_PORT: u16 = 6333;
+const QDRANT_GRPC_PORT: u16 = 6334;
 
 fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
     if let Some(s) = cli_server {
@@ -28,8 +31,74 @@ fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
     }
 }
 
+fn hidden_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(hs_common::HIDDEN_DIR)
+}
+
+fn distill_compose_path() -> PathBuf {
+    hidden_dir().join("docker-compose-distill.yml")
+}
+
+fn distill_env_path() -> PathBuf {
+    hidden_dir().join(".env-distill")
+}
+
+fn distill_pid_path() -> PathBuf {
+    hidden_dir().join("distill-server.pid")
+}
+
+/// Convert Qdrant gRPC URL (:6334) to REST URL (:6333) for health checks.
+fn qdrant_rest_from_grpc(grpc_url: &str) -> String {
+    grpc_url.replace(
+        &format!(":{QDRANT_GRPC_PORT}"),
+        &format!(":{QDRANT_REST_PORT}"),
+    )
+}
+
+fn distill_compose_yaml() -> String {
+    format!(
+        r#"services:
+  qdrant:
+    image: docker.io/qdrant/qdrant:latest
+    ports:
+      - "{QDRANT_REST_PORT}:{QDRANT_REST_PORT}"
+      - "{QDRANT_GRPC_PORT}:{QDRANT_GRPC_PORT}"
+    volumes:
+      - ${{QDRANT_DATA}}:/qdrant/storage
+    restart: on-failure:3
+"#
+    )
+}
+
+fn find_distill_binary() -> Option<PathBuf> {
+    let project = hs_common::resolve_project_dir();
+    for profile in ["release", "debug"] {
+        let path = project
+            .join("target")
+            .join(profile)
+            .join("hs-distill-server");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    // Check in the same directory as the current binary
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let path = dir.join("hs-distill-server");
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 pub async fn dispatch(cmd: DistillCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
     match cmd {
+        DistillCmd::Init { force } => cmd_init(force, reporter).await,
+        DistillCmd::Server { action } => cmd_server(action, reporter).await,
         DistillCmd::Index {
             force: _,
             file,
@@ -42,9 +111,298 @@ pub async fn dispatch(cmd: DistillCmd, reporter: &Arc<dyn Reporter>) -> Result<(
             topic,
             server,
         } => cmd_search(&query, limit, year, topic, server.as_deref()).await,
-        DistillCmd::Status { server } => cmd_status(server.as_deref()).await,
+        DistillCmd::Status { server } => cmd_status(server.as_deref(), reporter).await,
     }
 }
+
+// ── Init ────────────────────────────────────────────────────────
+
+async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let config = DistillServerConfig::load().unwrap_or_default();
+    let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
+
+    // Step 1: Check Qdrant availability
+    reporter.status("Step 1/3", "Checking Qdrant availability");
+    let qdrant_reachable = reqwest::get(&format!("{qdrant_rest}/healthz"))
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+
+    if qdrant_reachable && !force {
+        reporter.status("Qdrant", &format!("already reachable at {qdrant_rest}"));
+    } else {
+        // Need Docker for Qdrant
+        let compose = ComposeCmd::detect().await;
+        if compose.is_none() {
+            if cfg!(target_os = "macos") && check_command("brew", &["--version"]).await {
+                anyhow::bail!(
+                    "No container runtime found. Install with:\n  \
+                     brew install podman docker-compose\n  \
+                     podman machine init && podman machine start"
+                );
+            }
+            anyhow::bail!(
+                "No container runtime found. Install Docker or Podman:\n  \
+                 https://docs.docker.com/get-docker/"
+            );
+        }
+        let compose = compose.unwrap();
+        reporter.status(
+            "Runtime",
+            &format!("{} {}", compose.bin, compose.args_prefix.join(" ")),
+        );
+
+        // Step 2: Write compose config
+        reporter.status("Step 2/3", "Docker Compose config");
+        let compose_path = distill_compose_path();
+        let env_path = distill_env_path();
+
+        if compose_path.exists() && !force {
+            reporter.status("Config", "already exists");
+        } else {
+            std::fs::create_dir_all(hidden_dir())?;
+            std::fs::write(&compose_path, distill_compose_yaml())?;
+
+            let data_dir = hs_common::resolve_project_dir().join("data").join("qdrant");
+            std::fs::create_dir_all(&data_dir)?;
+            std::fs::write(&env_path, format!("QDRANT_DATA={}\n", data_dir.display()))?;
+
+            reporter.status("Written", &format!("{}", compose_path.display()));
+        }
+
+        // Step 3: Start Qdrant
+        reporter.status("Step 3/3", "Starting Qdrant");
+        let cf = compose_path.to_string_lossy().to_string();
+        let ef = env_path.to_string_lossy().to_string();
+        compose
+            .run(&["-f", &cf, "--env-file", &ef, "up", "-d"])
+            .await?;
+        wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
+        reporter.status("Qdrant", "OK");
+    }
+
+    // Check for distill binary
+    if find_distill_binary().is_none() {
+        reporter.warn(
+            "hs-distill-server binary not found. Build with:\n  \
+             cargo build --release -p hs-distill --features server",
+        );
+    } else {
+        reporter.status("Binary", "hs-distill-server found");
+    }
+
+    reporter.finish("Ready! Run: hs distill server start");
+    Ok(())
+}
+
+// ── Server ──────────────────────────────────────────────────────
+
+async fn cmd_server(action: DistillServerAction, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    match action {
+        DistillServerAction::Start => cmd_server_start(reporter).await,
+        DistillServerAction::Stop => cmd_server_stop(reporter).await,
+        DistillServerAction::Ping { url } => {
+            let target = url.as_deref().unwrap_or(DEFAULT_SERVER);
+            let client = DistillClient::new(target);
+            match client.health().await {
+                Ok(h) => reporter.status("OK", &format!("{target} ({})", h.compute_device)),
+                Err(e) => reporter.error(&format!("{target}: {e}")),
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let config = DistillServerConfig::load().unwrap_or_default();
+    let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
+
+    // 1. Start Qdrant container if compose file exists
+    let compose_path = distill_compose_path();
+    if compose_path.exists() {
+        let compose = ComposeCmd::detect()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No container runtime found. Run: hs distill init"))?;
+        let cf = compose_path.to_string_lossy().to_string();
+        let ef = distill_env_path().to_string_lossy().to_string();
+        compose
+            .run(&["-f", &cf, "--env-file", &ef, "up", "-d"])
+            .await?;
+        wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
+        reporter.status("Qdrant", "OK");
+    } else {
+        // No compose file — check if Qdrant is reachable anyway
+        let reachable = reqwest::get(&format!("{qdrant_rest}/healthz"))
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if !reachable {
+            anyhow::bail!(
+                "Qdrant not reachable at {qdrant_rest} and no compose config found.\n\
+                 Run: hs distill init"
+            );
+        }
+        reporter.status("Qdrant", &format!("reachable at {qdrant_rest}"));
+    }
+
+    // 2. Start native distill server
+    let pid_path = distill_pid_path();
+    if let Some(pid) = crate::daemon::read_pid(&pid_path) {
+        if crate::daemon::is_process_alive(pid) {
+            reporter.status("Distill", &format!("already running (PID {pid})"));
+            return Ok(());
+        }
+    }
+
+    let binary = find_distill_binary().ok_or_else(|| {
+        anyhow::anyhow!(
+            "hs-distill-server binary not found. Build with:\n  \
+             cargo build --release -p hs-distill --features server"
+        )
+    })?;
+
+    let log_path = hidden_dir().join("distill-server.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log_err = log_file.try_clone()?;
+
+    let child = std::process::Command::new(&binary)
+        .stdout(log_file)
+        .stderr(log_err)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to start distill server")?;
+
+    let pid = child.id();
+    std::fs::write(&pid_path, pid.to_string())?;
+
+    let distill_url = format!("http://{}:{}/health", config.host, config.port);
+    // Server binds to 0.0.0.0 but we check on localhost
+    let check_url = format!("http://localhost:{}/health", config.port);
+    wait_for_url(&check_url, 60, "distill server")
+        .await
+        .context(format!(
+            "Distill server started (PID {pid}) but health check failed.\n\
+         Check logs: {}",
+            log_path.display()
+        ))?;
+
+    reporter.status("Distill", &format!("OK (PID {pid})"));
+    reporter.finish(&format!(
+        "Listening on {distill_url}\nLogs: {}",
+        log_path.display()
+    ));
+    Ok(())
+}
+
+async fn cmd_server_stop(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    // 1. Stop native distill server
+    let pid_path = distill_pid_path();
+    if let Some(pid) = crate::daemon::read_pid(&pid_path) {
+        if crate::daemon::is_process_alive(pid) {
+            #[cfg(unix)]
+            {
+                // SIGTERM first, then wait, then SIGKILL
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+                for _ in 0..50 {
+                    if !crate::daemon::is_process_alive(pid) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if crate::daemon::is_process_alive(pid) {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
+            }
+            crate::daemon::remove_pid_file(&pid_path);
+            reporter.status("Distill", &format!("stopped (PID {pid})"));
+        } else {
+            crate::daemon::remove_pid_file(&pid_path);
+            reporter.status("Distill", "not running (stale PID removed)");
+        }
+    } else {
+        reporter.status("Distill", "not running");
+    }
+
+    // 2. Stop Qdrant container
+    let compose_path = distill_compose_path();
+    if compose_path.exists() {
+        if let Some(compose) = ComposeCmd::detect().await {
+            let cf = compose_path.to_string_lossy().to_string();
+            let ef = distill_env_path().to_string_lossy().to_string();
+            compose.run(&["-f", &cf, "--env-file", &ef, "down"]).await?;
+            reporter.status("Qdrant", "stopped");
+        }
+    }
+
+    Ok(())
+}
+
+// ── Status ──────────────────────────────────────────────────────
+
+async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let config = DistillServerConfig::load().unwrap_or_default();
+    let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
+
+    // Qdrant health
+    let qdrant_ok = reqwest::get(&format!("{qdrant_rest}/healthz"))
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    if qdrant_ok {
+        reporter.status("Qdrant", &format!("OK ({qdrant_rest})"));
+    } else {
+        reporter.error(&format!("Qdrant: not reachable at {qdrant_rest}"));
+    }
+
+    // Distill server PID
+    let pid_path = distill_pid_path();
+    match crate::daemon::read_pid(&pid_path) {
+        Some(pid) if crate::daemon::is_process_alive(pid) => {
+            reporter.status("Server", &format!("running (PID {pid})"));
+        }
+        _ => {
+            reporter.status("Server", "not running");
+        }
+    }
+
+    // Collection info (if server is reachable)
+    let servers = resolve_servers(server);
+    let client = DistillClient::new(&servers[0]);
+    match client.status().await {
+        Ok(status) => {
+            reporter.status("Collection", &status.collection);
+            reporter.status("Points", &status.points_count.to_string());
+            reporter.status("Device", &status.compute_device);
+        }
+        Err(_) => {
+            reporter.status(
+                "Collection",
+                &format!("unavailable (server at {} not reachable)", servers[0]),
+            );
+        }
+    }
+
+    // Compose status if available
+    let compose_path = distill_compose_path();
+    if compose_path.exists() {
+        if let Some(compose) = ComposeCmd::detect().await {
+            let cf = compose_path.to_string_lossy().to_string();
+            let ef = distill_env_path().to_string_lossy().to_string();
+            let _ = compose.run(&["-f", &cf, "--env-file", &ef, "ps"]).await;
+        }
+    }
+
+    Ok(())
+}
+
+// ── Index ───────────────────────────────────────────────────────
 
 async fn cmd_index(
     files: Option<Vec<PathBuf>>,
@@ -62,10 +420,7 @@ async fn cmd_index(
         }
         Err(e) => {
             stage.finish_failed("unreachable");
-            return Err(e).context(format!(
-                "Is hs-distill-server running at {}?",
-                servers[0]
-            ));
+            return Err(e).context(format!("Is hs-distill-server running at {}?", servers[0]));
         }
     };
 
@@ -137,6 +492,8 @@ async fn cmd_index(
     Ok(())
 }
 
+// ── Search ──────────────────────────────────────────────────────
+
 async fn cmd_search(
     query: &str,
     limit: u64,
@@ -176,22 +533,6 @@ async fn cmd_search(
         let preview: String = hit.chunk_text.chars().take(200).collect();
         println!("   {preview}...");
     }
-
-    Ok(())
-}
-
-async fn cmd_status(server: Option<&str>) -> Result<()> {
-    let servers = resolve_servers(server);
-    let client = DistillClient::new(&servers[0]);
-
-    let status = client
-        .status()
-        .await
-        .context(format!("Is hs-distill-server running at {}?", servers[0]))?;
-
-    println!("Collection: {}", status.collection);
-    println!("Points: {}", status.points_count);
-    println!("Device: {}", status.compute_device);
 
     Ok(())
 }

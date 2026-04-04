@@ -4,6 +4,17 @@ use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
 pub enum DistillCmd {
+    /// Set up Qdrant and distill server environment
+    Init {
+        /// Re-create compose config even if it exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Manage the distill server (Qdrant + native binary)
+    Server {
+        #[command(subcommand)]
+        action: DistillServerAction,
+    },
     /// Index markdown files into Qdrant via distill server
     Index {
         /// Re-index all documents (ignore cache)
@@ -39,10 +50,23 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
     },
-    /// Show index status (collection info, document count)
+    /// Show distill system status (Qdrant, server, collection)
     Status {
         /// Override server URL
         #[arg(long)]
         server: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DistillServerAction {
+    /// Start Qdrant container and distill server
+    Start,
+    /// Stop Qdrant container and distill server
+    Stop,
+    /// Health-check the distill server
+    Ping {
+        /// Server URL (default: localhost:7434)
+        url: Option<String>,
     },
 }

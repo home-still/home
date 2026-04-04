@@ -1348,102 +1348,7 @@ fn hidden_dir() -> PathBuf {
         .join(hs_common::HIDDEN_DIR)
 }
 
-/// Detected compose command: "docker compose", "docker-compose", or "podman-compose"
-struct ComposeCmd {
-    bin: String,
-    args_prefix: Vec<String>,
-}
-
-impl ComposeCmd {
-    async fn detect() -> Option<Self> {
-        // docker compose (v2 plugin)
-        if check_command("docker", &["compose", "version"]).await {
-            return Some(Self {
-                bin: "docker".into(),
-                args_prefix: vec!["compose".into()],
-            });
-        }
-        // podman compose (delegates to external provider)
-        if check_command("podman", &["compose", "version"]).await {
-            return Some(Self {
-                bin: "podman".into(),
-                args_prefix: vec!["compose".into()],
-            });
-        }
-        // docker-compose standalone
-        if check_command("docker-compose", &["version"]).await {
-            return Some(Self {
-                bin: "docker-compose".into(),
-                args_prefix: vec![],
-            });
-        }
-        // podman-compose standalone
-        if check_command("podman-compose", &["version"]).await {
-            return Some(Self {
-                bin: "podman-compose".into(),
-                args_prefix: vec![],
-            });
-        }
-        None
-    }
-
-    async fn run(&self, args: &[&str]) -> Result<std::process::ExitStatus> {
-        let mut full_args: Vec<&str> = self.args_prefix.iter().map(|s| s.as_str()).collect();
-        full_args.extend_from_slice(args);
-        let status = tokio::process::Command::new(&self.bin)
-            .args(&full_args)
-            .status()
-            .await?;
-        Ok(status)
-    }
-
-    async fn run_silent(&self, args: &[&str]) -> bool {
-        let mut full_args: Vec<&str> = self.args_prefix.iter().map(|s| s.as_str()).collect();
-        full_args.extend_from_slice(args);
-        tokio::process::Command::new(&self.bin)
-            .args(&full_args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-
-    /// Run and capture stdout+stderr (for error diagnosis).
-    async fn run_capture(&self, args: &[&str]) -> Result<std::process::Output> {
-        let mut full_args: Vec<&str> = self.args_prefix.iter().map(|s| s.as_str()).collect();
-        full_args.extend_from_slice(args);
-        let output = tokio::process::Command::new(&self.bin)
-            .args(&full_args)
-            .output()
-            .await?;
-        Ok(output)
-    }
-
-    /// Run "exec <service> <cmd...>" via compose
-    async fn exec_run(
-        &self,
-        compose_file: &str,
-        service: &str,
-        cmd: &[&str],
-    ) -> Result<std::process::ExitStatus> {
-        let mut args = vec!["-f", compose_file, "exec", service];
-        args.extend_from_slice(cmd);
-        self.run(&args).await
-    }
-}
-
-async fn check_command(cmd: &str, args: &[&str]) -> bool {
-    tokio::process::Command::new(cmd)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+use hs_common::compose::{check_command, ComposeCmd};
 
 /// Determine if we should use native Ollama (macOS Apple Silicon or Linux with NVIDIA GPU).
 fn should_use_native_ollama(has_nvidia: bool) -> bool {
@@ -1600,19 +1505,6 @@ async fn wait_for_ollama(
 }
 
 async fn wait_for_health(server_url: &str, timeout_secs: u64) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
-    loop {
-        if tokio::time::Instant::now() > deadline {
-            anyhow::bail!(
-                "Timed out waiting for server at {} ({}s). \
-                 Check `docker compose logs` for errors.",
-                server_url,
-                timeout_secs
-            );
-        }
-        if health_check(server_url).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-    }
+    let url = format!("{server_url}/health");
+    hs_common::compose::wait_for_url(&url, timeout_secs, "scribe server").await
 }
