@@ -343,7 +343,11 @@ async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
             continue;
         }
 
-        reporter.status("Restarting", &format!("{name} containers..."));
+        reporter.status("Stopping", &format!("{name} containers..."));
+        // down first to avoid podman pod conflicts on recreate
+        let _ = compose.run(&["-f", cf_str, "down"]).await;
+
+        reporter.status("Starting", &format!("{name} containers..."));
         let up = compose.run(&["-f", cf_str, "up", "-d"]).await?;
         if !up.success() {
             reporter.warn(&format!("Failed to restart {name} containers"));
