@@ -302,12 +302,29 @@ async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
             ld_path.push_str(&cache_dir);
         }
     }
-    // Also include /usr/local/lib in case the user copied libs there
-    if !ld_path.contains("/usr/local/lib") {
-        if !ld_path.is_empty() {
-            ld_path.push(':');
+    // Include standard CUDA and local lib paths
+    for extra in [
+        "/usr/local/lib",
+        "/opt/cuda/lib64",
+        "/opt/cuda/targets/x86_64-linux/lib",
+    ] {
+        if !ld_path.contains(extra) {
+            if !ld_path.is_empty() {
+                ld_path.push(':');
+            }
+            ld_path.push_str(extra);
         }
-        ld_path.push_str("/usr/local/lib");
+    }
+    // Include ~/.local/lib for user-created compat symlinks
+    if let Some(home) = dirs::home_dir() {
+        let user_lib = home.join(".local/lib");
+        let user_lib_str = user_lib.to_string_lossy().to_string();
+        if !ld_path.contains(&user_lib_str) {
+            if !ld_path.is_empty() {
+                ld_path.push(':');
+            }
+            ld_path.push_str(&user_lib_str);
+        }
     }
 
     let child = std::process::Command::new(&binary)
