@@ -11,6 +11,7 @@ mod distill_cmd;
 mod scribe_cmd;
 mod scribe_pool;
 mod status_cmd;
+mod upgrade_cmd;
 
 use cli::{Cli, TopCmd};
 use hs_common::mode::{self, OutputMode};
@@ -89,6 +90,7 @@ fn main() -> ExitCode {
         TopCmd::Scribe { .. } => |_| ExitCode::FAILURE,
         TopCmd::Distill { .. } => |_| ExitCode::FAILURE,
         TopCmd::Status => |_| ExitCode::FAILURE,
+        TopCmd::Upgrade { .. } => |_| ExitCode::FAILURE,
     };
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio  runtime");
@@ -103,6 +105,9 @@ fn main() -> ExitCode {
                 TopCmd::Scribe { command } => scribe_cmd::dispatch(command, &reporter).await,
                 TopCmd::Distill { command } => distill_cmd::dispatch(command, &reporter).await,
                 TopCmd::Status => status_cmd::run().await,
+                TopCmd::Upgrade { check } => {
+                    upgrade_cmd::run(check, &cli.global, &reporter).await
+                }
             }
         };
 

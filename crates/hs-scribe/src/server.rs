@@ -34,7 +34,8 @@ pub fn app(state: Arc<ServerState>) -> Router {
 async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok", "layout_model": state.processor.has_layout_detector(),
-        "table_model": state.processor.has_table_recognizer()
+        "table_model": state.processor.has_table_recognizer(),
+        "version": env!("HS_VERSION"),
     }))
 }
 

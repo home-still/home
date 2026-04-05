@@ -31,6 +31,8 @@ pub struct HealthResponse {
     pub status: String,
     pub layout_model: bool,
     pub table_model: bool,
+    #[serde(default)]
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

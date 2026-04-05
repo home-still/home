@@ -34,7 +34,8 @@ struct DashboardData {
 struct ServiceStatus {
     url: String,
     healthy: bool,
-    detail: String, // e.g. "(Cpu)" or model info
+    detail: String,  // e.g. "(Cpu)" or model info
+    version: String, // server version from /health
 }
 
 struct RecentConversion {
@@ -100,6 +101,14 @@ async fn collect_data() -> DashboardData {
     // Scribe server health + readiness checks
     let mut scribe_servers = Vec::new();
     for url in &scribe_cfg.servers {
+        let health_version: String = async {
+            let resp = http.get(format!("{url}/health")).send().await.ok()?;
+            let data: serde_json::Value = resp.json().await.ok()?;
+            data["version"].as_str().map(|s| s.to_string())
+        }
+        .await
+        .unwrap_or_default();
+
         let readiness: Option<serde_json::Value> = async {
             let resp = http.get(format!("{url}/readiness")).send().await.ok()?;
             if !resp.status().is_success() {
@@ -120,12 +129,14 @@ async fn collect_data() -> DashboardData {
                 url: url.clone(),
                 healthy: true,
                 detail,
+                version: health_version,
             });
         } else {
             scribe_servers.push(ServiceStatus {
                 url: url.clone(),
                 healthy: false,
                 detail: String::new(),
+                version: String::new(),
             });
         }
     }
@@ -139,7 +150,12 @@ async fn collect_data() -> DashboardData {
 
     for url in &distill_cfg.servers {
         let client = hs_distill::client::DistillClient::new(url);
-        let healthy = client.health().await.is_ok();
+        let health = client.health().await.ok();
+        let health_version = health
+            .as_ref()
+            .map(|h| h.version.clone())
+            .unwrap_or_default();
+        let healthy = health.is_some();
 
         // Always try to get status (for embedded counts) even if health is slow
         if let Ok(s) = client.status().await {
@@ -154,18 +170,21 @@ async fn collect_data() -> DashboardData {
                 url: url.clone(),
                 healthy: true,
                 detail: format!("({})", s.compute_device),
+                version: health_version,
             });
         } else if healthy {
             distill_servers.push(ServiceStatus {
                 url: url.clone(),
                 healthy: true,
                 detail: String::new(),
+                version: health_version,
             });
         } else {
             distill_servers.push(ServiceStatus {
                 url: url.clone(),
                 healthy: false,
                 detail: String::new(),
+                version: String::new(),
             });
         }
     }
@@ -397,6 +416,7 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Cell::from(indicator).style(style),
             Cell::from(if svc.healthy { "running" } else { "stopped" }.to_string()),
             Cell::from(svc.url.clone()),
+            Cell::from(svc.version.clone()).style(Style::default().fg(Color::DarkGray)),
         ]));
     }
 
@@ -416,6 +436,7 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Cell::from(indicator).style(style),
             Cell::from(if svc.healthy { "running" } else { "stopped" }.to_string()),
             Cell::from(detail),
+            Cell::from(svc.version.clone()).style(Style::default().fg(Color::DarkGray)),
         ]));
     }
 
@@ -436,6 +457,7 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
             .to_string(),
         ),
         Cell::from(data.qdrant_url.clone()),
+        Cell::from(""),
     ]));
 
     let table = Table::new(
@@ -444,6 +466,7 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Constraint::Length(16),
             Constraint::Length(2),
             Constraint::Length(8),
+            Constraint::Length(30),
             Constraint::Min(10),
         ],
     );

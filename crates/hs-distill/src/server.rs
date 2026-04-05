@@ -44,6 +44,7 @@ async fn handle_health(State(state): State<Arc<DistillServerState>>) -> impl Int
         status: "ok".into(),
         compute_device: state.embedder.device().to_string(),
         collection: state.config.collection_name.clone(),
+        version: env!("HS_VERSION").to_string(),
     })
 }
 

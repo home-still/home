@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 
 /// hs - home-still research
 #[derive(Parser, Debug)]
-#[command(name = "hs", version, about, long_about = None, after_help = "\
+#[command(name = "hs", version = env!("HS_VERSION"), about, long_about = None, after_help = "\
 Examples:                                                                   
 hs paper search \"transformers\"                                          
 hs paper download --doi \"10.48550/arXiv.2301.00001\"                     
@@ -40,6 +40,12 @@ pub enum TopCmd {
     },
     /// Live dashboard — pipeline health, services, recent activity
     Status,
+    /// Check for updates and upgrade hs + managed services
+    Upgrade {
+        /// Only check if an update is available; do not install
+        #[arg(long)]
+        check: bool,
+    },
     /// View and manage configuration
     Config {
         #[command(subcommand)]
