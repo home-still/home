@@ -24,7 +24,7 @@ esac
 TARGET="${arch}-${os}"
 
 # Get latest version from GitHub API
-VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)"
+VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
 
 if [ -z "${VERSION}" ]; then
     echo "Failed to fetch latest version"
