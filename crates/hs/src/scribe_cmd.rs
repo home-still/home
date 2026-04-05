@@ -146,6 +146,8 @@ pub enum ScribeCmd {
         #[command(subcommand)]
         action: ServerAction,
     },
+    /// Backfill catalog entries for markdown files that were converted before the catalog feature
+    CatalogBackfill,
 }
 
 #[derive(Subcommand, Debug)]
@@ -213,6 +215,7 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         ScribeCmd::Status { status_dir } => cmd_status(status_dir, reporter).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
         ScribeCmd::Server { action } => cmd_server(action).await,
+        ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
     }
 }
 
@@ -1507,4 +1510,84 @@ async fn wait_for_ollama(
 async fn wait_for_health(server_url: &str, timeout_secs: u64) -> Result<()> {
     let url = format!("{server_url}/health");
     hs_common::compose::wait_for_url(&url, timeout_secs, "scribe server").await
+}
+
+const PAGE_SEPARATOR: &str = "\n\n---\n\n";
+
+async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let scribe_cfg = ScribeConfig::load().unwrap_or_default();
+    let markdown_dir = &scribe_cfg.output_dir;
+    let catalog_dir = &scribe_cfg.catalog_dir;
+    let papers_dir = &scribe_cfg.watch_dir;
+
+    let entries = std::fs::read_dir(markdown_dir)
+        .map(|e| {
+            e.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut created = 0u32;
+    let mut skipped = 0u32;
+
+    for md_path in &entries {
+        let stem = md_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+
+        // Skip if catalog entry already exists
+        if hs_common::catalog::read_catalog_entry(catalog_dir, stem).is_some() {
+            skipped += 1;
+            continue;
+        }
+
+        // Read markdown to extract metadata
+        let content = match std::fs::read_to_string(md_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Extract title from first line if it looks like a heading
+        let title = content
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim_start_matches('#').trim().to_string())
+            .filter(|t| !t.is_empty());
+
+        // Count pages
+        let total_pages = content.split(PAGE_SEPARATOR).count() as u64;
+
+        // Look for matching PDF
+        let pdf_path = papers_dir.join(format!("{stem}.pdf"));
+        let pdf_exists = pdf_path.exists();
+
+        let entry = hs_common::catalog::CatalogEntry {
+            title,
+            pdf_path: if pdf_exists {
+                Some(pdf_path.to_string_lossy().to_string())
+            } else {
+                None
+            },
+            markdown_path: Some(md_path.to_string_lossy().to_string()),
+            conversion: Some(hs_common::catalog::ConversionMeta {
+                server: "backfill".to_string(),
+                duration_secs: 0,
+                total_pages,
+                converted_at: chrono::Utc::now().to_rfc3339(),
+                pages: hs_common::catalog::compute_page_offsets(&content),
+            }),
+            ..Default::default()
+        };
+
+        hs_common::catalog::write_catalog_entry(catalog_dir, stem, &entry);
+        created += 1;
+    }
+
+    reporter.finish(&format!(
+        "Backfill complete: {created} created, {skipped} already existed"
+    ));
+    Ok(())
 }
