@@ -100,6 +100,25 @@ fn find_distill_binary() -> Option<PathBuf> {
     None
 }
 
+/// Find the ort cache directory containing CUDA provider .so files.
+fn find_ort_cuda_libs() -> Option<String> {
+    let cache = dirs::home_dir()?.join(".cache/ort.pyke.io/dfbin");
+    if !cache.exists() {
+        return None;
+    }
+    // Walk into the platform-specific subdir to find libonnxruntime_providers_cuda.so
+    for entry in std::fs::read_dir(&cache).ok()?.flatten() {
+        let platform_dir = entry.path();
+        for hash_entry in std::fs::read_dir(&platform_dir).ok()?.flatten() {
+            let dir = hash_entry.path();
+            if dir.join("libonnxruntime_providers_cuda.so").exists() {
+                return Some(dir.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
 pub async fn dispatch(cmd: DistillCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
     match cmd {
         DistillCmd::Init { force } => cmd_init(force, reporter).await,
@@ -272,7 +291,27 @@ async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
         .open(&log_path)?;
     let log_err = log_file.try_clone()?;
 
+    // Ensure ONNX Runtime CUDA provider .so files can be found at runtime.
+    // They live in the ort cache dir alongside the static lib.
+    let mut ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    if let Some(cache_dir) = find_ort_cuda_libs() {
+        if !ld_path.contains(&cache_dir) {
+            if !ld_path.is_empty() {
+                ld_path.push(':');
+            }
+            ld_path.push_str(&cache_dir);
+        }
+    }
+    // Also include /usr/local/lib in case the user copied libs there
+    if !ld_path.contains("/usr/local/lib") {
+        if !ld_path.is_empty() {
+            ld_path.push(':');
+        }
+        ld_path.push_str("/usr/local/lib");
+    }
+
     let child = std::process::Command::new(&binary)
+        .env("LD_LIBRARY_PATH", &ld_path)
         .stdout(log_file)
         .stderr(log_err)
         .stdin(std::process::Stdio::null())
