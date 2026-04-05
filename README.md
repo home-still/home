@@ -192,13 +192,42 @@ Available on all commands:
 | `--verbose` | debug-level output | off |
 | `-y, --yes` | skip interactive prompts | off |
 
+## Network ports
+
+When running services across multiple machines, ensure these ports are open in your firewall:
+
+| Port | Service | Direction | Notes |
+|------|---------|-----------|-------|
+| **7433** | Scribe server | Client → Server | PDF-to-markdown conversion |
+| **7434** | Distill server | Client → Server | Embedding and semantic search |
+| **6333** | Qdrant REST | Server internal | Vector DB HTTP API (used by distill server) |
+| **6334** | Qdrant gRPC | Server internal | Vector DB gRPC (used by distill server) |
+| **11434** | Ollama | Server internal | VLM for OCR (used by scribe server) |
+
+**Client machines** (e.g., MacBook) need outbound access to ports 7433 and 7434 on the server.
+**Server machines** (e.g., big) need ports 7433, 7434 open for inbound connections. Ports 6333, 6334, and 11434 are typically localhost-only.
+
+Example (Linux firewall):
+```sh
+sudo ufw allow 7433/tcp   # scribe
+sudo ufw allow 7434/tcp   # distill
+```
+
+Example (macOS):
+```sh
+# Allow incoming connections in System Settings > Network > Firewall
+# Or add to /etc/pf.conf:
+pass in proto tcp to port { 7433, 7434 }
+```
+
 ## Architecture
 
 ```
-crates/hs/          Unified CLI binary (hs paper, hs scribe, hs config)
-paper/              Academic paper meta-search library (6 providers, aggregation)
+crates/hs/          Unified CLI binary (hs paper, hs scribe, hs distill, hs status)
+crates/hs-distill/  Vector embedding + semantic search (ONNX embeddings, Qdrant, client/server)
 crates/hs-scribe/   PDF-to-markdown (ONNX layout detection + VLM OCR, client/server)
-hs-style/           Shared CLI styling (Reporter trait, progress bars, colors)
+paper/              Academic paper meta-search library (6 providers, aggregation)
+hs-common/          Shared infrastructure (reporter, service pool, catalog, compose)
 ```
 
 ## Build
