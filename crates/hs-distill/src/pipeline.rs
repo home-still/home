@@ -72,6 +72,16 @@ pub async fn index_document(
 
     let mut meta = extract_rule_based(&markdown, stem, &markdown_path_str, catalog_entry.as_ref());
 
+    // Fallback: infer pdf_path from sibling papers/ directory
+    if meta.pdf_path.is_none() {
+        if let Some(parent) = markdown_path.parent().and_then(|p| p.parent()) {
+            let pdf_candidate = parent.join("papers").join(format!("{stem}.pdf"));
+            if pdf_candidate.exists() {
+                meta.pdf_path = Some(pdf_candidate.to_string_lossy().to_string());
+            }
+        }
+    }
+
     // Optional LLM metadata extraction
     if config.llm_metadata {
         match crate::metadata::extract_llm_metadata(
@@ -107,6 +117,18 @@ pub async fn index_document(
     };
 
     let chunks = chunk_markdown(&markdown, &meta, &page_offsets, &chunker_config);
+
+    // Filter out low-quality chunks (repetition loops, garbled text, etc.)
+    let pre_filter = chunks.len();
+    let chunks: Vec<_> = chunks
+        .into_iter()
+        .filter(|c| !crate::quality::is_low_quality(&c.raw_text))
+        .collect();
+    let filtered = pre_filter - chunks.len();
+    if filtered > 0 {
+        tracing::info!("{}: skipped {} low-quality chunk(s)", stem, filtered);
+    }
+
     let total_chunks = chunks.len() as u32;
 
     if chunks.is_empty() {

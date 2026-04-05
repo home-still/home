@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use hs_common::compose::{check_command, wait_for_url, ComposeCmd};
+use hs_common::global_args::{GlobalArgs, OutputFormat};
 use hs_common::reporter::Reporter;
 use hs_distill::cli::{DistillCmd, DistillServerAction};
 use hs_distill::client::DistillClient;
@@ -119,7 +120,11 @@ fn find_ort_cuda_libs() -> Option<String> {
     None
 }
 
-pub async fn dispatch(cmd: DistillCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
+pub async fn dispatch(
+    cmd: DistillCmd,
+    global: &GlobalArgs,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
     match cmd {
         DistillCmd::Init { force } => cmd_init(force, reporter).await,
         DistillCmd::Server { action } => cmd_server(action, reporter).await,
@@ -142,7 +147,7 @@ pub async fn dispatch(cmd: DistillCmd, reporter: &Arc<dyn Reporter>) -> Result<(
             year,
             topic,
             server,
-        } => cmd_search(&query, limit, year, topic, server.as_deref()).await,
+        } => cmd_search(&query, limit, year, topic, server.as_deref(), global).await,
         DistillCmd::Status { server } => cmd_status(server.as_deref(), reporter).await,
     }
 }
@@ -768,7 +773,12 @@ async fn cmd_search(
     year: Option<String>,
     topic: Option<String>,
     server: Option<&str>,
+    global: &GlobalArgs,
 ) -> Result<()> {
+    if query.trim().is_empty() {
+        anyhow::bail!("Search query cannot be empty");
+    }
+
     let servers = resolve_servers(server);
     let client = DistillClient::new(&servers[0]);
 
@@ -778,28 +788,55 @@ async fn cmd_search(
         .await
         .context(format!("Is hs-distill-server running at {}?", servers[0]))?;
 
-    if hits.is_empty() {
-        println!("No results found.");
-        return Ok(());
-    }
+    match global.output {
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&hits)?;
+            println!("{json}");
+        }
+        OutputFormat::Ndjson => {
+            for hit in &hits {
+                let line = serde_json::to_string(hit)?;
+                println!("{line}");
+            }
+        }
+        OutputFormat::Text => {
+            if hits.is_empty() {
+                println!("No results found.");
+                return Ok(());
+            }
 
-    for (i, hit) in hits.iter().enumerate() {
-        let title = hit.title.as_deref().unwrap_or(&hit.doc_id);
-        let page_info = hit
-            .page
-            .map(|p| format!(" (page {})", p))
-            .unwrap_or_default();
-        let pdf = hit.pdf_path.as_deref().unwrap_or("?");
+            for (i, hit) in hits.iter().enumerate() {
+                let title = hit.title.as_deref().unwrap_or(&hit.doc_id);
+                let authors = if hit.authors.is_empty() {
+                    String::new()
+                } else {
+                    format!(" by {}", hit.authors.join(", "))
+                };
+                let year_str = hit.year.map(|y| format!(" ({})", y)).unwrap_or_default();
+                let page_info = hit
+                    .page
+                    .map(|p| format!(" (page {})", p))
+                    .unwrap_or_default();
+                let pdf = hit.pdf_path.as_deref().unwrap_or("?");
 
-        println!("\n{}. {} [score: {:.3}]", i + 1, title, hit.score);
-        println!(
-            "   {}:{}–{}{}",
-            hit.doc_id, hit.line_start, hit.line_end, page_info
-        );
-        println!("   PDF: {pdf}");
+                println!(
+                    "\n{}. {}{} [score: {:.3}]{}",
+                    i + 1,
+                    title,
+                    authors,
+                    hit.score,
+                    year_str
+                );
+                println!(
+                    "   {}:{}-{}{}",
+                    hit.doc_id, hit.line_start, hit.line_end, page_info
+                );
+                println!("   PDF: {pdf}");
 
-        let preview: String = hit.chunk_text.chars().take(200).collect();
-        println!("   {preview}...");
+                let preview: String = hit.chunk_text.chars().take(200).collect();
+                println!("   {preview}...");
+            }
+        }
     }
 
     Ok(())

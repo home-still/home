@@ -103,7 +103,9 @@ fn main() -> ExitCode {
                 }
                 TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
                 TopCmd::Scribe { command } => scribe_cmd::dispatch(command, &reporter).await,
-                TopCmd::Distill { command } => distill_cmd::dispatch(command, &reporter).await,
+                TopCmd::Distill { command } => {
+                    distill_cmd::dispatch(command, &cli.global, &reporter).await
+                }
                 TopCmd::Status => status_cmd::run().await,
                 TopCmd::Upgrade { check } => upgrade_cmd::run(check, &cli.global, &reporter).await,
             }

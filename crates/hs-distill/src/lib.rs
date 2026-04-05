@@ -15,4 +15,6 @@ pub mod pipeline;
 #[cfg(feature = "server")]
 pub mod qdrant;
 #[cfg(feature = "server")]
+pub mod quality;
+#[cfg(feature = "server")]
 pub mod server;

@@ -206,6 +206,10 @@ async fn handle_search(
     State(state): State<Arc<DistillServerState>>,
     Json(req): Json<SearchRequest>,
 ) -> Response {
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "Search query cannot be empty").into_response();
+    }
+
     // Embed the query
     let query_texts = vec![req.query.clone()];
     let embeddings = match state.embedder.embed_batch(&query_texts).await {
@@ -228,11 +232,17 @@ async fn handle_search(
 
     let limit = req.limit.unwrap_or(10);
 
+    let filter = req
+        .filters
+        .as_ref()
+        .and_then(|f| crate::qdrant::build_filter(f.year.as_deref(), f.topic.as_deref()));
+
     match crate::qdrant::search(
         &state.qdrant,
         &state.config.collection_name,
         query_vector,
         limit,
+        filter,
     )
     .await
     {
@@ -249,6 +259,22 @@ async fn handle_search(
                             .unwrap_or_default(),
                         title: payload
                             .get("title")
+                            .and_then(|v| v.as_str().map(|s| s.to_string())),
+                        authors: payload
+                            .get("authors")
+                            .and_then(|v| v.as_list())
+                            .map(|list| {
+                                list.iter()
+                                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        year: payload
+                            .get("year")
+                            .and_then(|v| v.as_integer())
+                            .map(|v| v as u64),
+                        doi: payload
+                            .get("doi")
                             .and_then(|v| v.as_str().map(|s| s.to_string())),
                         chunk_text: payload
                             .get("chunk_text")?

@@ -289,6 +289,10 @@ async fn cmd_convert(
     }
 
     let (_server, md) = result?;
+    let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
+    if truncations > 0 {
+        tracing::info!("Cleaned {} repetition site(s)", truncations);
+    }
 
     // Resolve output: CLI flag > config output_dir > stdout
     let out = out_file.or_else(|| {
@@ -888,6 +892,14 @@ async fn convert_and_save_pool(
     let stage_guard = stage.lock().unwrap();
     match result {
         Ok((server_url, md)) => {
+            let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
+            if truncations > 0 {
+                tracing::info!(
+                    "{}: cleaned {} repetition site(s)",
+                    output_path.display(),
+                    truncations
+                );
+            }
             if let Err(e) = atomic_write(&output_path, md.as_bytes()) {
                 if let Some(ref s) = *stage_guard {
                     s.finish_failed(&format!("Write failed: {e}"));

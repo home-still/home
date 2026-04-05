@@ -150,25 +150,99 @@ pub async fn upsert_chunks(
     Ok(())
 }
 
-/// Search the collection with a query vector.
+/// Search the collection with a query vector and optional filters.
 pub async fn search(
     client: &Qdrant,
     collection_name: &str,
     query_vector: Vec<f32>,
     limit: u64,
+    filter: Option<Filter>,
 ) -> Result<Vec<qdrant_client::qdrant::ScoredPoint>, DistillError> {
+    let mut builder = QueryPointsBuilder::new(collection_name)
+        .query(qdrant_client::qdrant::Query::from(query_vector))
+        .limit(limit)
+        .with_payload(true)
+        .params(SearchParamsBuilder::default().hnsw_ef(128));
+
+    if let Some(f) = filter {
+        builder = builder.filter(f);
+    }
+
     let results = client
-        .query(
-            QueryPointsBuilder::new(collection_name)
-                .query(qdrant_client::qdrant::Query::from(query_vector))
-                .limit(limit)
-                .with_payload(true)
-                .params(SearchParamsBuilder::default().hnsw_ef(128)),
-        )
+        .query(builder)
         .await
         .map_err(|e| DistillError::Qdrant(format!("Search failed: {e}")))?;
 
     Ok(results.result)
+}
+
+/// Build a Qdrant Filter from search filter strings.
+pub fn build_filter(year: Option<&str>, topic: Option<&str>) -> Option<Filter> {
+    let mut conditions = Vec::new();
+
+    if let Some(year_str) = year {
+        if let Some(cond) = parse_year_condition(year_str) {
+            conditions.push(cond);
+        }
+    }
+
+    if let Some(topic_str) = topic {
+        conditions.push(Condition::matches("topics", topic_str.to_string()));
+    }
+
+    if conditions.is_empty() {
+        None
+    } else {
+        Some(Filter::must(conditions))
+    }
+}
+
+/// Parse a year filter string like ">2020", "<2019", ">=2021", "2023" into a Qdrant Condition.
+fn parse_year_condition(s: &str) -> Option<Condition> {
+    use qdrant_client::qdrant::Range;
+    let s = s.trim();
+
+    if let Some(rest) = s.strip_prefix(">=") {
+        let year: f64 = rest.trim().parse().ok()?;
+        Some(Condition::range(
+            "year",
+            Range {
+                gte: Some(year),
+                ..Default::default()
+            },
+        ))
+    } else if let Some(rest) = s.strip_prefix('>') {
+        let year: f64 = rest.trim().parse().ok()?;
+        Some(Condition::range(
+            "year",
+            Range {
+                gt: Some(year),
+                ..Default::default()
+            },
+        ))
+    } else if let Some(rest) = s.strip_prefix("<=") {
+        let year: f64 = rest.trim().parse().ok()?;
+        Some(Condition::range(
+            "year",
+            Range {
+                lte: Some(year),
+                ..Default::default()
+            },
+        ))
+    } else if let Some(rest) = s.strip_prefix('<') {
+        let year: f64 = rest.trim().parse().ok()?;
+        Some(Condition::range(
+            "year",
+            Range {
+                lt: Some(year),
+                ..Default::default()
+            },
+        ))
+    } else {
+        // Exact match: "2023"
+        let year: i64 = s.parse().ok()?;
+        Some(Condition::matches("year", year))
+    }
 }
 
 /// Get the number of points in a collection.

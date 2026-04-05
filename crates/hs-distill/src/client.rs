@@ -31,6 +31,12 @@ pub struct IndexResult {
 pub struct SearchHit {
     pub doc_id: String,
     pub title: Option<String>,
+    #[serde(default)]
+    pub authors: Vec<String>,
+    #[serde(default)]
+    pub year: Option<u64>,
+    #[serde(default)]
+    pub doi: Option<String>,
     pub chunk_text: String,
     pub score: f32,
     pub pdf_path: Option<String>,
