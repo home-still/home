@@ -197,7 +197,11 @@ async fn download_and_replace_binary(
         .await
         .context("Download failed")?;
     if !resp.status().is_success() {
-        anyhow::bail!("Download failed ({}): {}", resp.status(), asset.browser_download_url);
+        anyhow::bail!(
+            "Download failed ({}): {}",
+            resp.status(),
+            asset.browser_download_url
+        );
     }
 
     let bytes = resp.bytes().await.context("Failed to read download")?;
@@ -222,8 +226,8 @@ async fn download_and_replace_binary(
         }
     }
 
-    let binary_data =
-        binary_data.ok_or_else(|| anyhow::anyhow!("Binary '{binary_name}' not found in archive"))?;
+    let binary_data = binary_data
+        .ok_or_else(|| anyhow::anyhow!("Binary '{binary_name}' not found in archive"))?;
 
     // Determine install location
     let install_path = install_path_for(binary_name)?;
@@ -261,9 +265,8 @@ fn install_path_for(binary_name: &str) -> Result<PathBuf> {
         std::env::current_exe().context("Could not determine current executable path")
     } else {
         // For hs-distill-server, use the same location where it's currently installed
-        find_distill_binary().ok_or_else(|| {
-            anyhow::anyhow!("{binary_name} not found on this system")
-        })
+        find_distill_binary()
+            .ok_or_else(|| anyhow::anyhow!("{binary_name} not found on this system"))
     }
 }
 
