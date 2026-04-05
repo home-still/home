@@ -347,7 +347,7 @@ async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let distill_url = format!("http://{}:{}/health", config.host, config.port);
     // Server binds to 0.0.0.0 but we check on localhost
     let check_url = format!("http://localhost:{}/health", config.port);
-    wait_for_url(&check_url, 60, "distill server")
+    wait_for_url(&check_url, 300, "distill server")
         .await
         .context(format!(
             "Distill server started (PID {pid}) but health check failed.\n\
