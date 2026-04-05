@@ -45,6 +45,10 @@ pub enum TopCmd {
         /// Only check if an update is available; do not install
         #[arg(long)]
         check: bool,
+
+        /// Force reinstall even if already on the latest version
+        #[arg(long)]
+        force: bool,
     },
     /// View and manage configuration
     Config {

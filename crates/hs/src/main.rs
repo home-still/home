@@ -107,7 +107,9 @@ fn main() -> ExitCode {
                     distill_cmd::dispatch(command, &cli.global, &reporter).await
                 }
                 TopCmd::Status => status_cmd::run().await,
-                TopCmd::Upgrade { check } => upgrade_cmd::run(check, &cli.global, &reporter).await,
+                TopCmd::Upgrade { check, force } => {
+                    upgrade_cmd::run(check, force, &cli.global, &reporter).await
+                }
             }
         };
 

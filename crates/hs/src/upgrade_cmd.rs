@@ -27,6 +27,7 @@ struct GitHubAsset {
 
 pub async fn run(
     check_only: bool,
+    force: bool,
     global: &GlobalArgs,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
@@ -37,12 +38,16 @@ pub async fn run(
     let release = fetch_latest_release(reporter).await?;
     let latest = parse_release_version(&release.tag_name)?;
 
-    if latest <= current {
+    if latest <= current && !force {
         reporter.finish(&format!("Already up to date ({current})"));
         return Ok(());
     }
 
-    reporter.status("Available", &format!("{current} → {latest}"));
+    if force && latest <= current {
+        reporter.status("Force", &format!("reinstalling {latest}"));
+    } else {
+        reporter.status("Available", &format!("{current} → {latest}"));
+    }
 
     if check_only {
         return Ok(());
@@ -50,8 +55,13 @@ pub async fn run(
 
     // Phase 2: confirm
     if !global.yes {
+        let prompt = if force && latest <= current {
+            format!("Force reinstall hs {latest}?")
+        } else {
+            format!("Upgrade hs from {current} to {latest}?")
+        };
         let proceed = dialoguer::Confirm::new()
-            .with_prompt(format!("Upgrade hs from {current} to {latest}?"))
+            .with_prompt(prompt)
             .default(true)
             .interact()?;
         if !proceed {
