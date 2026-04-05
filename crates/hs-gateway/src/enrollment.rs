@@ -185,3 +185,61 @@ pub async fn handle_refresh(
 
     Json(RefreshResponse { access_token }).into_response()
 }
+
+// ── Admin endpoints (localhost only) ───────────────────────────
+
+#[derive(Deserialize)]
+pub struct AdminInviteRequest {
+    device_name: String,
+    #[serde(default = "default_scopes")]
+    scopes: Vec<String>,
+}
+
+fn default_scopes() -> Vec<String> {
+    vec!["scribe".into(), "distill".into()]
+}
+
+#[derive(Serialize)]
+pub struct AdminInviteResponse {
+    code: String,
+    expires_in_secs: u64,
+}
+
+/// POST /cloud/admin/invite — create an enrollment code (admin, localhost only).
+pub async fn handle_admin_invite(
+    State(state): State<Arc<GatewayState>>,
+    req: axum::http::Request<axum::body::Body>,
+) -> impl IntoResponse {
+    // Only allow from localhost
+    let is_local = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(true); // if no ConnectInfo, assume behind reverse proxy (localhost)
+
+    if !is_local {
+        return (StatusCode::FORBIDDEN, "Admin endpoints are localhost-only").into_response();
+    }
+
+    let body = match axum::body::to_bytes(req.into_body(), 4096).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid body").into_response(),
+    };
+
+    let invite_req: AdminInviteRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response(),
+    };
+
+    let code = register_enrollment(
+        &state.enrollments,
+        &invite_req.device_name,
+        invite_req.scopes,
+    );
+
+    Json(AdminInviteResponse {
+        code,
+        expires_in_secs: 300,
+    })
+    .into_response()
+}

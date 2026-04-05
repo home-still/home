@@ -64,6 +64,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(handle_health))
         .route("/cloud/enroll", post(enrollment::handle_enroll))
         .route("/cloud/refresh", post(enrollment::handle_refresh))
+        // Admin: register enrollment codes (only accessible from localhost)
+        .route("/cloud/admin/invite", post(enrollment::handle_admin_invite))
         // Authenticated proxy — catch all remaining paths
         .fallback(any(proxy::proxy_handler))
         .with_state(state);

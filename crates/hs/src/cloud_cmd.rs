@@ -73,30 +73,43 @@ async fn cmd_init(reporter: &Arc<dyn Reporter>) -> Result<()> {
 // ── Invite ──────────────────────────────────────────────────────
 
 async fn cmd_invite(device_name: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    // This generates a code locally. In a full deployment, this would
-    // POST to the running gateway. For now, it creates a code file.
-    let code = token::generate_enrollment_code();
+    // POST to the running gateway's admin endpoint
+    let gateway_local = "http://127.0.0.1:7440";
 
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;
-    let code_path = home
-        .join(hs_common::HIDDEN_DIR)
-        .join("pending-enrollment.json");
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()?;
 
-    let data = serde_json::json!({
-        "code": code,
-        "device_name": device_name,
-        "created_at": token::now_epoch(),
-        "expires_at": token::now_epoch() + 300,
-    });
+    let resp = http
+        .post(format!("{gateway_local}/cloud/admin/invite"))
+        .json(&serde_json::json!({
+            "device_name": device_name,
+            "scopes": ["scribe", "distill"],
+        }))
+        .send()
+        .await
+        .context("Is hs-gateway running? Start with: sudo systemctl start hs-gateway")?;
 
-    std::fs::write(&code_path, serde_json::to_string_pretty(&data)?)?;
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Failed to create enrollment: {body}");
+    }
 
-    reporter.status("Enrollment code", &code);
-    reporter.status("Expires", "5 minutes");
+    #[derive(serde::Deserialize)]
+    struct InviteResponse {
+        code: String,
+        expires_in_secs: u64,
+    }
+
+    let body: InviteResponse = resp.json().await?;
+
+    reporter.status("Enrollment code", &body.code);
+    reporter.status("Expires", &format!("{} seconds", body.expires_in_secs));
     reporter.status(
         "Usage",
         &format!(
-            "On the remote device, run:\n  hs cloud enroll --gateway <gateway-url>\n  then enter code: {code}"
+            "On the remote device, run:\n  hs cloud enroll --gateway <gateway-url>\n  then enter code: {}",
+            body.code
         ),
     );
 

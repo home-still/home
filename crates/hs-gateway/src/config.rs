@@ -73,21 +73,22 @@ fn default_rotation_days() -> u64 {
 impl GatewayConfig {
     /// Load from the cloud.gateway section of ~/.home-still/config.yaml.
     pub fn load() -> anyhow::Result<Self> {
-        use figment::providers::{Format, Yaml};
-        use figment::Figment;
-
         let home = dirs::home_dir().unwrap_or_default();
         let config_path = home.join(hs_common::CONFIG_REL_PATH);
 
-        let figment = Figment::new().merge(Yaml::file(&config_path).nested());
+        let contents = std::fs::read_to_string(&config_path).unwrap_or_default();
+        let root: serde_json::Value =
+            serde_yaml_ng::from_str(&contents).unwrap_or(serde_json::Value::Null);
 
-        // Try to extract cloud.gateway section
-        let config: Self = figment
-            .select("cloud.gateway")
-            .extract()
-            .unwrap_or_default();
+        let gateway_section = root.get("cloud").and_then(|c| c.get("gateway"));
 
-        Ok(config)
+        match gateway_section {
+            Some(section) => {
+                let config: Self = serde_json::from_value(section.clone()).unwrap_or_default();
+                Ok(config)
+            }
+            None => Ok(Self::default()),
+        }
     }
 
     /// Load the HMAC secret from disk, or generate + save if missing.
