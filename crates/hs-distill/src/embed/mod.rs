@@ -9,12 +9,14 @@ use crate::types::EmbeddingOutput;
 #[derive(Debug, Clone)]
 pub enum ComputeDevice {
     Cpu,
+    Cuda,
 }
 
 impl std::fmt::Display for ComputeDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ComputeDevice::Cpu => write!(f, "Cpu"),
+            ComputeDevice::Cuda => write!(f, "Cuda"),
         }
     }
 }
@@ -30,7 +32,16 @@ pub trait Embedder: Send + Sync {
 
 /// Detect available compute device at startup.
 pub fn detect_device() -> ComputeDevice {
-    // TODO: Add CUDA/Metal detection when those features are implemented
+    // Check for NVIDIA GPU via nvidia-smi
+    if std::process::Command::new("nvidia-smi")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return ComputeDevice::Cuda;
+    }
     ComputeDevice::Cpu
 }
 
@@ -52,12 +63,23 @@ impl FallbackEmbedder {
     }
 
     /// Build the right embedder configuration based on detected device.
+    /// If GPU is detected, builds GPU primary with CPU fallback.
     pub fn build(config: &crate::config::EmbeddingConfig) -> Result<Self, DistillError> {
         let device = detect_device();
         tracing::info!("Detected compute device: {}", device);
 
-        let primary = onnx::OnnxEmbedder::new(config, device.clone())?;
-        Ok(Self::new(Box::new(primary), None))
+        match device {
+            ComputeDevice::Cuda => {
+                let primary = onnx::OnnxEmbedder::new(config, ComputeDevice::Cuda)?;
+                let fallback = onnx::OnnxEmbedder::new(config, ComputeDevice::Cpu)?;
+                tracing::info!("GPU embedder with CPU fallback");
+                Ok(Self::new(Box::new(primary), Some(Box::new(fallback))))
+            }
+            ComputeDevice::Cpu => {
+                let primary = onnx::OnnxEmbedder::new(config, ComputeDevice::Cpu)?;
+                Ok(Self::new(Box::new(primary), None))
+            }
+        }
     }
 }
 

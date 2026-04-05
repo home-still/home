@@ -20,12 +20,18 @@ impl OnnxEmbedder {
     pub fn new(config: &EmbeddingConfig, device: ComputeDevice) -> Result<Self, DistillError> {
         let batch_size = config.batch_size.unwrap_or(match &device {
             ComputeDevice::Cpu => 8,
+            ComputeDevice::Cuda => 32,
         });
 
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::BGEM3).with_show_download_progress(true),
-        )
-        .map_err(|e| DistillError::Embedding(format!("Failed to load model: {e}")))?;
+        let mut opts = InitOptions::new(EmbeddingModel::BGEM3).with_show_download_progress(true);
+
+        if matches!(device, ComputeDevice::Cuda) {
+            use ort::execution_providers::CUDAExecutionProvider;
+            opts = opts.with_execution_providers(vec![CUDAExecutionProvider::default().build()]);
+        }
+
+        let model = TextEmbedding::try_new(opts)
+            .map_err(|e| DistillError::Embedding(format!("Failed to load model: {e}")))?;
 
         Ok(Self {
             model: Mutex::new(model),
