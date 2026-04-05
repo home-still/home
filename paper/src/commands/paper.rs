@@ -398,7 +398,7 @@ fn make_resilient<P: PaperProvider + 'static>(
     ))
 }
 
-fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn PaperProvider>> {
+pub fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn PaperProvider>> {
     make_provider_inner(provider, config, None)
 }
 

@@ -79,7 +79,9 @@ fn resolve_service(path: &str) -> (String, String) {
     // /search -> service="distill", backend_path="/search"
     // /health -> service="health", backend_path="/health" (handled separately)
 
-    if path.starts_with("/scribe") {
+    if path.starts_with("/mcp") {
+        ("mcp".into(), path.into())
+    } else if path.starts_with("/scribe") {
         ("scribe".into(), path.into())
     } else if path.starts_with("/distill") || path == "/search" || path.starts_with("/exists/") {
         ("distill".into(), path.into())

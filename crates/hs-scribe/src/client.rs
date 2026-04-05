@@ -26,7 +26,7 @@ pub struct ProgressEvent {
     pub message: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
     pub layout_model: bool,
@@ -35,7 +35,7 @@ pub struct HealthResponse {
     pub version: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadinessResponse {
     pub ready: bool,
     pub vlm_slots_total: usize,

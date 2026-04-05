@@ -84,7 +84,7 @@ async fn cmd_invite(device_name: &str, reporter: &Arc<dyn Reporter>) -> Result<(
         .post(format!("{gateway_local}/cloud/admin/invite"))
         .json(&serde_json::json!({
             "device_name": device_name,
-            "scopes": ["scribe", "distill"],
+            "scopes": ["scribe", "distill", "mcp"],
         }))
         .send()
         .await

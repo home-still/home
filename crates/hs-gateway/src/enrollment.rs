@@ -196,7 +196,7 @@ pub struct AdminInviteRequest {
 }
 
 fn default_scopes() -> Vec<String> {
-    vec!["scribe".into(), "distill".into()]
+    vec!["scribe".into(), "distill".into(), "mcp".into()]
 }
 
 #[derive(Serialize)]
