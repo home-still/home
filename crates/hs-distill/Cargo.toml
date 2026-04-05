@@ -19,7 +19,7 @@ server = [
     "dep:tempfile",
     "dep:tracing-subscriber",
 ]
-cuda = ["server", "ort/cuda"]
+cuda = ["server", "ort/cuda", "ort/load-dynamic"]
 
 [[bin]]
 name = "hs-distill-server"
