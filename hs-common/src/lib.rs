@@ -96,3 +96,6 @@ pub mod catalog;
 
 #[cfg(feature = "compose")]
 pub mod compose;
+
+#[cfg(all(feature = "compose", feature = "service"))]
+pub mod gpu_priority;
