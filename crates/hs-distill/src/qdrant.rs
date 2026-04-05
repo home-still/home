@@ -1,7 +1,7 @@
 use qdrant_client::qdrant::{
-    CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, Distance, FacetCountsBuilder,
-    FieldType, HnswConfigDiffBuilder, PointStruct, QueryPointsBuilder, SearchParamsBuilder,
-    UpsertPointsBuilder, VectorParamsBuilder,
+    Condition, CountPointsBuilder, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
+    Distance, FacetCountsBuilder, FieldType, Filter, HnswConfigDiffBuilder, PointStruct,
+    QueryPointsBuilder, SearchParamsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use uuid::Uuid;
@@ -182,6 +182,26 @@ pub async fn collection_info(client: &Qdrant, collection_name: &str) -> Result<u
         .result
         .map(|r| r.points_count.unwrap_or(0))
         .unwrap_or(0))
+}
+
+/// Check if a document has any chunks in the collection.
+pub async fn doc_exists(
+    client: &Qdrant,
+    collection_name: &str,
+    doc_id: &str,
+) -> Result<(bool, u64), DistillError> {
+    let filter = Filter::must([Condition::matches("doc_id", doc_id.to_string())]);
+    let response = client
+        .count(
+            CountPointsBuilder::new(collection_name)
+                .filter(filter)
+                .exact(true),
+        )
+        .await
+        .map_err(|e| DistillError::Qdrant(format!("Failed to check doc existence: {e}")))?;
+
+    let count = response.result.map(|r| r.count).unwrap_or(0);
+    Ok((count > 0, count))
 }
 
 /// Count distinct documents in a collection via facet on doc_id.

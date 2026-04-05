@@ -221,6 +221,19 @@ impl DistillClient {
             .context("Failed to reach distill server")?;
         resp.json().await.context("Invalid status response")
     }
+
+    /// Check if a document is already indexed.
+    pub async fn doc_exists(&self, doc_id: &str) -> Result<bool> {
+        let url = format!("{}/exists/{}", self.server_url, doc_id);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to reach distill server")?;
+        let data: serde_json::Value = resp.json().await.context("Invalid exists response")?;
+        Ok(data["exists"].as_bool().unwrap_or(false))
+    }
 }
 
 #[async_trait]

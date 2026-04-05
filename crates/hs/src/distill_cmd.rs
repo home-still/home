@@ -124,16 +124,16 @@ pub async fn dispatch(cmd: DistillCmd, reporter: &Arc<dyn Reporter>) -> Result<(
         DistillCmd::Init { force } => cmd_init(force, reporter).await,
         DistillCmd::Server { action } => cmd_server(action, reporter).await,
         DistillCmd::Index {
-            force: _,
+            force,
             file,
             server,
             no_yield,
             daemon_child,
         } => {
             if daemon_child {
-                cmd_index_daemon(file, server.as_deref(), no_yield).await
+                cmd_index_daemon(file, server.as_deref(), no_yield, force).await
             } else {
-                cmd_index(file, server.as_deref(), no_yield, reporter).await
+                cmd_index(file, server.as_deref(), no_yield, force, reporter).await
             }
         }
         DistillCmd::Search {
@@ -506,6 +506,7 @@ fn spawn_index_daemon(
     files: &Option<Vec<PathBuf>>,
     server: Option<&str>,
     no_yield: bool,
+    force: bool,
 ) -> Result<u32> {
     let exe = std::env::current_exe().context("Cannot find current executable")?;
 
@@ -516,6 +517,9 @@ fn spawn_index_daemon(
     ];
     if no_yield {
         args.push("--no-yield".to_string());
+    }
+    if force {
+        args.push("--force".to_string());
     }
     if let Some(s) = server {
         args.push("--server".to_string());
@@ -554,6 +558,7 @@ async fn cmd_index(
     files: Option<Vec<PathBuf>>,
     server: Option<&str>,
     no_yield: bool,
+    force: bool,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
     // Check if daemon already running
@@ -583,7 +588,7 @@ async fn cmd_index(
     };
 
     // Spawn daemon
-    let pid = spawn_index_daemon(&files, server, no_yield)?;
+    let pid = spawn_index_daemon(&files, server, no_yield, force)?;
     reporter.status(
         "Index",
         &format!("daemon started (PID {pid}). Press q to detach."),
@@ -668,6 +673,7 @@ async fn cmd_index_daemon(
     files: Option<Vec<PathBuf>>,
     server: Option<&str>,
     no_yield: bool,
+    force: bool,
 ) -> Result<()> {
     // Write PID
     let pid_path = index_pid_path();
@@ -726,6 +732,13 @@ async fn cmd_index_daemon(
 
         status.current_file = stem.to_string();
         write_index_status(&status);
+
+        // Skip if already indexed (unless --force)
+        if !force && client.doc_exists(stem).await.unwrap_or(false) {
+            status.indexed += 1;
+            write_index_status(&status);
+            continue;
+        }
 
         match client.index_file_with_progress(&path_str, |_| {}).await {
             Ok(result) => {

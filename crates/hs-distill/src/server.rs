@@ -35,6 +35,7 @@ pub fn app(state: Arc<DistillServerState>) -> Router {
         .route("/health", get(handle_health))
         .route("/readiness", get(handle_readiness))
         .route("/status", get(handle_status))
+        .route("/exists/:doc_id", get(handle_exists))
         .with_state(state)
 }
 
@@ -67,6 +68,18 @@ async fn handle_status(State(state): State<Arc<DistillServerState>>) -> impl Int
             compute_device: state.embedder.device().to_string(),
         })
         .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+async fn handle_exists(
+    State(state): State<Arc<DistillServerState>>,
+    axum::extract::Path(doc_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match crate::qdrant::doc_exists(&state.qdrant, &state.config.collection_name, &doc_id).await {
+        Ok((exists, chunks)) => {
+            Json(serde_json::json!({"exists": exists, "chunks": chunks})).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }
