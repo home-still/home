@@ -210,7 +210,11 @@ pub async fn distinct_doc_count(
     collection_name: &str,
 ) -> Result<u64, DistillError> {
     let response = client
-        .facet(FacetCountsBuilder::new(collection_name, "doc_id"))
+        .facet(
+            FacetCountsBuilder::new(collection_name, "doc_id")
+                .limit(100_000)
+                .exact(true),
+        )
         .await
         .map_err(|e| DistillError::Qdrant(format!("Failed to count documents: {e}")))?;
 
