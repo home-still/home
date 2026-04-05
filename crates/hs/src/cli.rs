@@ -50,6 +50,11 @@ pub enum TopCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Remote cloud access — enrollment, gateway management
+    Cloud {
+        #[command(subcommand)]
+        command: super::cloud_cmd::CloudCmd,
+    },
     /// View and manage configuration
     Config {
         #[command(subcommand)]

@@ -13,7 +13,7 @@ hs-distill = { path = "../hs-distill", features = ["client"] }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-hs-common = { workspace = true, features = ["cli", "service", "catalog", "compose"] }
+hs-common = { workspace = true, features = ["cli", "service", "catalog", "compose", "auth"] }
 owo-colors = { workspace = true }
 paper = { path = "../../paper" }
 dirs = { workspace = true }

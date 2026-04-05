@@ -113,6 +113,14 @@ impl DistillClient {
         }
     }
 
+    /// Create a client with a pre-configured reqwest Client (e.g., with auth headers).
+    pub fn new_with_client(server_url: &str, http: Client) -> Self {
+        Self {
+            http,
+            server_url: server_url.trim_end_matches('/').to_string(),
+        }
+    }
+
     pub async fn health(&self) -> Result<HealthResponse> {
         let url = format!("{}/health", self.server_url);
         let resp = self

@@ -97,5 +97,8 @@ pub mod catalog;
 #[cfg(feature = "compose")]
 pub mod compose;
 
+#[cfg(feature = "auth")]
+pub mod auth;
+
 #[cfg(all(feature = "compose", feature = "service"))]
 pub mod gpu_priority;

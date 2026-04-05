@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 pub use hs_common::catalog;
 mod cli;
+mod cloud_cmd;
 pub mod daemon;
 mod distill_cmd;
 mod scribe_cmd;
@@ -91,6 +92,7 @@ fn main() -> ExitCode {
         TopCmd::Distill { .. } => |_| ExitCode::FAILURE,
         TopCmd::Status => |_| ExitCode::FAILURE,
         TopCmd::Upgrade { .. } => |_| ExitCode::FAILURE,
+        TopCmd::Cloud { .. } => |_| ExitCode::FAILURE,
     };
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio  runtime");
@@ -107,6 +109,7 @@ fn main() -> ExitCode {
                     distill_cmd::dispatch(command, &cli.global, &reporter).await
                 }
                 TopCmd::Status => status_cmd::run().await,
+                TopCmd::Cloud { command } => cloud_cmd::dispatch(command, &reporter).await,
                 TopCmd::Upgrade { check, force } => {
                     upgrade_cmd::run(check, force, &cli.global, &reporter).await
                 }
