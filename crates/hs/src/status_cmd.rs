@@ -61,10 +61,32 @@ fn count_dir(dir: &Path, ext: &str) -> (u64, u64) {
     (count, bytes)
 }
 
+/// Recursive version of count_dir — walks subdirectories.
+/// Used for watch_dir since scribe processes PDFs recursively.
+fn count_dir_recursive(dir: &Path, ext: &str) -> (u64, u64) {
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    fn walk(dir: &Path, ext: &str, count: &mut u64, bytes: &mut u64) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, ext, count, bytes);
+                } else if path.extension().is_some_and(|e| e == ext) {
+                    *count += 1;
+                    *bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+    }
+    walk(dir, ext, &mut count, &mut bytes);
+    (count, bytes)
+}
+
 async fn collect_data() -> DashboardData {
     let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
     let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
-    let (pdf_count, pdf_bytes) = count_dir(&scribe_cfg.watch_dir, "pdf");
+    let (pdf_count, pdf_bytes) = count_dir_recursive(&scribe_cfg.watch_dir, "pdf");
     let (markdown_count, markdown_bytes) = count_dir(&scribe_cfg.output_dir, "md");
     let (catalog_count, _) = count_dir(&scribe_cfg.catalog_dir, "yaml");
     let (corrupted_count, _) = count_dir(&scribe_cfg.corrupted_dir, "pdf");
