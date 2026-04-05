@@ -233,8 +233,40 @@ impl DownloadService for PaperDownloader {
         file.flush().await?;
         drop(file); // close before rename
 
-        // Atomic rename — safe on NFS within same directory
-        tokio::fs::rename(&tmp_path, &file_path).await?;
+        // Validate downloaded content before committing
+        let header = tokio::fs::read(&tmp_path)
+            .await
+            .map(|b| b[..b.len().min(4096)].to_vec())
+            .unwrap_or_default();
+
+        if header.starts_with(b"%PDF") {
+            // Valid PDF — rename to final path
+            tokio::fs::rename(&tmp_path, &file_path).await?;
+        } else if looks_like_html(&header) {
+            // HTML content — classify as paper or paywall
+            let raw = tokio::fs::read(&tmp_path).await.unwrap_or_default();
+            let content = String::from_utf8_lossy(&raw).to_string();
+            if is_paywall_html(&content) {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(PaperError::NotFound(format!(
+                    "Server returned a paywall/login page instead of PDF for {url}"
+                )));
+            }
+            // Looks like a real HTML paper — save as .html
+            let html_filename = filename.replace(".pdf", ".html");
+            let html_path = self.download_path.join(&html_filename);
+            tokio::fs::rename(&tmp_path, &html_path).await?;
+            return Ok(DownloadResult {
+                file_path: html_path,
+                doi: None,
+                sha256: format!("{:x}", hasher.finalize()),
+                size_bytes,
+                skipped: false,
+            });
+        } else {
+            // Unknown format — keep it as-is (might be a valid binary format)
+            tokio::fs::rename(&tmp_path, &file_path).await?;
+        }
 
         let sha256 = format!("{:x}", hasher.finalize());
 
@@ -246,4 +278,39 @@ impl DownloadService for PaperDownloader {
             skipped: false,
         })
     }
+}
+
+fn looks_like_html(header: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(&header[..header.len().min(512)]).to_lowercase();
+    s.contains("<!doctype html") || s.contains("<html") || s.contains("<head")
+}
+
+fn is_paywall_html(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    let len = content.len();
+
+    // Paywall indicators
+    let has_login = lower.contains("sign in")
+        || lower.contains("log in")
+        || lower.contains("access denied")
+        || lower.contains("403 forbidden")
+        || lower.contains("subscription required")
+        || lower.contains("purchase this article")
+        || lower.contains("institutional access");
+
+    // Paper indicators
+    let has_article =
+        lower.contains("<article") || (lower.contains("abstract") && lower.contains("references"));
+
+    // Short pages with login prompts are almost certainly paywalls
+    if has_login && len < 100_000 {
+        return true;
+    }
+
+    // If it has login indicators but no article structure, it's a paywall
+    if has_login && !has_article {
+        return true;
+    }
+
+    false
 }
