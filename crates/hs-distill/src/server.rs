@@ -35,7 +35,7 @@ pub fn app(state: Arc<DistillServerState>) -> Router {
         .route("/health", get(handle_health))
         .route("/readiness", get(handle_readiness))
         .route("/status", get(handle_status))
-        .route("/exists/:doc_id", get(handle_exists))
+        .route("/exists/{doc_id}", get(handle_exists))
         .with_state(state)
 }
 
