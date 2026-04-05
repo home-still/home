@@ -64,13 +64,7 @@ pub async fn run(
     let target = detect_target()?;
     reporter.status("Platform", target);
 
-    let hs_installed = download_and_replace_binary(
-        &release,
-        "hs",
-        target,
-        reporter,
-    )
-    .await?;
+    let hs_installed = download_and_replace_binary(&release, "hs", target, reporter).await?;
 
     if hs_installed {
         reporter.status("Upgraded", &format!("hs → {latest}"));
@@ -78,13 +72,8 @@ pub async fn run(
 
     // Also upgrade hs-distill-server if it's already installed
     if find_distill_binary().is_some() {
-        let distill_installed = download_and_replace_binary(
-            &release,
-            "hs-distill-server",
-            target,
-            reporter,
-        )
-        .await?;
+        let distill_installed =
+            download_and_replace_binary(&release, "hs-distill-server", target, reporter).await?;
         if distill_installed {
             reporter.status("Upgraded", &format!("hs-distill-server → {latest}"));
         } else {
@@ -101,7 +90,9 @@ pub async fn run(
     // Phase 5: health check
     post_upgrade_health_check(reporter).await;
 
-    reporter.finish(&format!("Upgraded to {latest}. Run `hs status` for full dashboard."));
+    reporter.finish(&format!(
+        "Upgraded to {latest}. Run `hs status` for full dashboard."
+    ));
     Ok(())
 }
 
@@ -134,15 +125,25 @@ fn parse_release_version(tag: &str) -> Result<semver::Version> {
 
 fn detect_target() -> Result<&'static str> {
     #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-    { return Ok("x86_64-apple-darwin"); }
+    {
+        return Ok("x86_64-apple-darwin");
+    }
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    { return Ok("aarch64-apple-darwin"); }
+    {
+        return Ok("aarch64-apple-darwin");
+    }
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    { return Ok("x86_64-unknown-linux-gnu"); }
+    {
+        return Ok("x86_64-unknown-linux-gnu");
+    }
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    { return Ok("aarch64-unknown-linux-gnu"); }
+    {
+        return Ok("aarch64-unknown-linux-gnu");
+    }
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    { return Ok("x86_64-pc-windows-msvc"); }
+    {
+        return Ok("x86_64-pc-windows-msvc");
+    }
     #[allow(unreachable_code)]
     Err(anyhow::anyhow!("Unsupported platform for self-update"))
 }
@@ -165,9 +166,7 @@ async fn fetch_latest_release(reporter: &Arc<dyn Reporter>) -> Result<GitHubRele
     let resp = builder.send().await.context("Failed to reach GitHub API")?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!(
-            "GitHub API rate limit exceeded. Set GITHUB_TOKEN env var to authenticate."
-        );
+        anyhow::bail!("GitHub API rate limit exceeded. Set GITHUB_TOKEN env var to authenticate.");
     }
     if !resp.status().is_success() {
         anyhow::bail!("GitHub API returned {}", resp.status());
