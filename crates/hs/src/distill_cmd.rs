@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use hs_common::auth::client::is_cloud_url;
 use hs_common::compose::{check_command, wait_for_url, ComposeCmd};
 use hs_common::global_args::{GlobalArgs, OutputFormat};
 use hs_common::reporter::Reporter;
@@ -10,6 +11,18 @@ use hs_distill::client::DistillClient;
 use hs_distill::config::{DistillClientConfig, DistillServerConfig};
 
 const DEFAULT_SERVER: &str = "http://localhost:7434";
+
+/// Create a DistillClient, with auth headers if the URL is a cloud gateway.
+async fn make_distill_client(url: &str) -> Result<DistillClient> {
+    if is_cloud_url(url) {
+        let auth = hs_common::auth::client::AuthenticatedClient::from_default_path()
+            .context("Cloud credentials not found. Run `hs cloud enroll` first.")?;
+        let http = auth.build_reqwest_client().await?;
+        Ok(DistillClient::new_with_client(url, http))
+    } else {
+        Ok(DistillClient::new(url))
+    }
+}
 const QDRANT_REST_PORT: u16 = 6333;
 const QDRANT_GRPC_PORT: u16 = 6334;
 
@@ -780,7 +793,7 @@ async fn cmd_search(
     }
 
     let servers = resolve_servers(server);
-    let client = DistillClient::new(&servers[0]);
+    let client = make_distill_client(&servers[0]).await?;
 
     let filters = hs_distill::client::SearchFilters { year, topic };
     let hits = client

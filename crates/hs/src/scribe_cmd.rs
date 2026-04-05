@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use hs_common::auth::client::is_cloud_url;
 use hs_common::reporter::Reporter;
 use hs_scribe::config::ScribeConfig;
 use std::path::PathBuf;
@@ -9,6 +10,18 @@ use tokio::io::AsyncWriteExt;
 use crate::scribe_pool::ScribePool;
 
 const DEFAULT_SERVER: &str = "http://localhost:7433";
+
+/// Create a ScribeClient, with auth headers if the URL is a cloud gateway.
+async fn make_scribe_client(url: &str) -> Result<hs_scribe::client::ScribeClient> {
+    if is_cloud_url(url) {
+        let auth = hs_common::auth::client::AuthenticatedClient::from_default_path()
+            .context("Cloud credentials not found. Run `hs cloud enroll` first.")?;
+        let http = auth.build_reqwest_client().await?;
+        Ok(hs_scribe::client::ScribeClient::new_with_client(url, http))
+    } else {
+        Ok(hs_scribe::client::ScribeClient::new(url))
+    }
+}
 
 /// Resolve the server list from CLI flag, config file, or default.
 fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
@@ -234,7 +247,7 @@ async fn cmd_convert(
     if servers.len() == 1 {
         let url = &servers[0];
         check_stage.set_message(&format!("server at {url}"));
-        let client = hs_scribe::client::ScribeClient::new(url);
+        let client = make_scribe_client(url).await?;
         match client.health().await {
             Ok(_) => check_stage.finish_and_clear(),
             Err(e) => {
@@ -273,7 +286,7 @@ async fn cmd_convert(
     };
 
     let result = if servers.len() == 1 {
-        let client = hs_scribe::client::ScribeClient::new(&servers[0]);
+        let client = make_scribe_client(&servers[0]).await?;
         client
             .convert_with_progress(pdf_bytes, on_progress)
             .await

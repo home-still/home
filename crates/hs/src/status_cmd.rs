@@ -149,7 +149,17 @@ async fn collect_data() -> DashboardData {
     let mut qdrant_url = String::new();
 
     for url in &distill_cfg.servers {
-        let client = hs_distill::client::DistillClient::new(url);
+        let client = if hs_common::auth::client::is_cloud_url(url) {
+            match hs_common::auth::client::AuthenticatedClient::from_default_path() {
+                Ok(auth) => match auth.build_reqwest_client().await {
+                    Ok(http) => hs_distill::client::DistillClient::new_with_client(url, http),
+                    Err(_) => hs_distill::client::DistillClient::new(url),
+                },
+                Err(_) => hs_distill::client::DistillClient::new(url),
+            }
+        } else {
+            hs_distill::client::DistillClient::new(url)
+        };
         let health = client.health().await.ok();
         let health_version = health
             .as_ref()
