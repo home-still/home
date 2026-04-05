@@ -408,13 +408,14 @@ async fn cmd_index(
     let client = DistillClient::new(&servers[0]);
 
     // Health check
-    let stage = reporter.begin_stage(&format!("Connecting to {}", servers[0]), None);
     match client.health().await {
         Ok(h) => {
-            stage.finish_with_message(&format!("distill server ({})", h.compute_device));
+            reporter.status(
+                "Connected",
+                &format!("{} ({})", servers[0], h.compute_device),
+            );
         }
         Err(e) => {
-            stage.finish_failed("unreachable");
             return Err(e).context(format!("Is hs-distill-server running at {}?", servers[0]));
         }
     };
@@ -479,29 +480,28 @@ async fn cmd_index(
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
 
-        let stage = reporter.begin_stage(&format!("Indexing {stem}"), None);
-
         match client
-            .index_file_with_progress(&path_str, |progress| {
-                tracing::debug!(
-                    "[{}] {}: {}",
-                    progress.stage,
-                    progress.doc,
-                    progress.message
-                );
-            })
+            .index_file_with_progress(&path_str, |_progress| {})
             .await
         {
             Ok(result) => {
                 total_chunks += result.chunks_indexed;
                 indexed_count += 1;
-                stage.finish_with_message(&format!(
-                    "{}: {} chunks ({})",
-                    stem, result.chunks_indexed, result.embedding_device
-                ));
+                eprintln!(
+                    "  [{}/{}] {} — {} chunks",
+                    indexed_count,
+                    paths.len(),
+                    stem,
+                    result.chunks_indexed
+                );
             }
             Err(e) => {
-                stage.finish_failed(&format!("{stem}: {e}"));
+                eprintln!(
+                    "  [{}/{}] {} — error: {e}",
+                    indexed_count + 1,
+                    paths.len(),
+                    stem
+                );
             }
         }
     }

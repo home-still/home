@@ -23,14 +23,18 @@ struct DashboardData {
     embedded_docs: u64,
     embedded_chunks: u64,
 
-    scribe_pid: Option<u32>,
-    scribe_alive: bool,
-    distill_pid: Option<u32>,
-    distill_alive: bool,
+    scribe_servers: Vec<ServiceStatus>,
+    distill_servers: Vec<ServiceStatus>,
     qdrant_healthy: bool,
     qdrant_url: String,
 
     recent: Vec<RecentConversion>,
+}
+
+struct ServiceStatus {
+    url: String,
+    healthy: bool,
+    detail: String, // e.g. "(Cpu)" or model info
 }
 
 struct RecentConversion {
@@ -67,57 +71,67 @@ async fn collect_data() -> DashboardData {
     let (catalog_count, _) = count_dir(&scribe_cfg.catalog_dir, "yaml");
     let (corrupted_count, _) = count_dir(&scribe_cfg.corrupted_dir, "pdf");
 
-    // Scribe watch PID
-    let status_path = scribe_cfg.output_dir.join(".scribe-watch-status.json");
-    let scribe_pid = std::fs::read_to_string(&status_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v["pid"].as_u64())
-        .map(|p| p as u32);
-    let scribe_alive = scribe_pid
-        .map(crate::daemon::is_process_alive)
-        .unwrap_or(false);
-
-    // Distill PID
-    let distill_pid_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(hs_common::HIDDEN_DIR)
-        .join("distill-server.pid");
-    let distill_pid = crate::daemon::read_pid(&distill_pid_path);
-    let distill_alive = distill_pid
-        .map(crate::daemon::is_process_alive)
-        .unwrap_or(false);
-
-    // Qdrant health (short timeout)
-    let qdrant_rest = distill_server_cfg.qdrant_url.replace(":6334", ":6333");
-    let qdrant_healthy = reqwest::Client::builder()
+    let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(3))
         .build()
-        .ok()
-        .map(|c| c.get(format!("{qdrant_rest}/healthz")))
-        .and_then(|req| {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(async { req.send().await.map(|r| r.status().is_success()).ok() })
-            })
-        })
-        .unwrap_or(false);
+        .unwrap_or_else(|_| reqwest::Client::new());
 
-    // Distill status (short timeout)
-    let (embedded_docs, embedded_chunks) = if distill_alive {
-        let server_url = distill_cfg
-            .servers
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "http://localhost:7434".into());
-        let client = hs_distill::client::DistillClient::new(&server_url);
-        match client.status().await {
-            Ok(s) => (s.documents_count, s.points_count),
-            Err(_) => (0, 0),
+    // Scribe server health checks
+    let mut scribe_servers = Vec::new();
+    for url in &scribe_cfg.servers {
+        let healthy = http
+            .get(format!("{url}/health"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        scribe_servers.push(ServiceStatus {
+            url: url.clone(),
+            healthy,
+            detail: String::new(),
+        });
+    }
+
+    // Distill server health checks
+    let mut distill_servers = Vec::new();
+    let mut embedded_docs = 0u64;
+    let mut embedded_chunks = 0u64;
+    for url in &distill_cfg.servers {
+        let client = hs_distill::client::DistillClient::new(url);
+        match client.health().await {
+            Ok(h) => {
+                // Also grab status from the first healthy server
+                if embedded_docs == 0 {
+                    if let Ok(s) = client.status().await {
+                        embedded_docs = s.documents_count;
+                        embedded_chunks = s.points_count;
+                    }
+                }
+                distill_servers.push(ServiceStatus {
+                    url: url.clone(),
+                    healthy: true,
+                    detail: format!("({})", h.compute_device),
+                });
+            }
+            Err(_) => {
+                distill_servers.push(ServiceStatus {
+                    url: url.clone(),
+                    healthy: false,
+                    detail: String::new(),
+                });
+            }
         }
-    } else {
-        (0, 0)
-    };
+    }
+
+    // Qdrant health
+    let qdrant_rest = distill_server_cfg.qdrant_url.replace(":6334", ":6333");
+    let qdrant_healthy = http
+        .get(format!("{qdrant_rest}/healthz"))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
 
     // Recent conversions from catalog
     let recent = load_recent_conversions(&scribe_cfg.catalog_dir, 5);
@@ -131,10 +145,8 @@ async fn collect_data() -> DashboardData {
         corrupted_count,
         embedded_docs,
         embedded_chunks,
-        scribe_pid,
-        scribe_alive,
-        distill_pid,
-        distill_alive,
+        scribe_servers,
+        distill_servers,
         qdrant_healthy,
         qdrant_url: qdrant_rest,
         recent,
@@ -221,7 +233,7 @@ fn render(frame: &mut Frame, data: &DashboardData) {
         Constraint::Length(1), // title
         Constraint::Length(8), // pipeline
         Constraint::Length(1), // spacer
-        Constraint::Length(6), // services
+        Constraint::Length((data.scribe_servers.len() + data.distill_servers.len() + 3) as u16), // services
         Constraint::Length(1), // spacer
         Constraint::Min(4),    // recent
         Constraint::Length(1), // footer
@@ -301,7 +313,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Cell::from(format!("{:>5.1}%", md_to_embed * 100.0)),
         ]),
         Row::new(vec![
-            Cell::from("Corrupted").style(Style::default().fg(Color::Red)),
+            Cell::from("Corrupted PDFs").style(Style::default().fg(Color::Red)),
             Cell::from(format!("{:>6}", data.corrupted_count))
                 .style(Style::default().fg(Color::Red)),
             Cell::from(""),
@@ -312,7 +324,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(12),
+            Constraint::Length(16),
             Constraint::Length(8),
             Constraint::Length(14),
             Constraint::Min(8),
@@ -335,41 +347,59 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let svc_row = |name: &'static str, alive: bool, detail: String| -> Row<'static> {
-        let (indicator, style) = if alive {
+    let mut rows = Vec::new();
+
+    for svc in &data.scribe_servers {
+        let (indicator, style) = if svc.healthy {
             ("●", Style::default().fg(Color::Green))
         } else {
             ("○", Style::default().fg(Color::Red))
         };
-        Row::new(vec![
-            Cell::from(name),
+        rows.push(Row::new(vec![
+            Cell::from("Scribe".to_string()),
             Cell::from(indicator).style(style),
-            Cell::from(if alive {
-                "running".to_string()
-            } else {
-                "stopped".to_string()
-            }),
-            Cell::from(detail),
-        ])
-    };
+            Cell::from(if svc.healthy { "running" } else { "stopped" }.to_string()),
+            Cell::from(svc.url.clone()),
+        ]));
+    }
 
-    let rows = vec![
-        svc_row(
-            "Scribe watch",
-            data.scribe_alive,
-            data.scribe_pid
-                .map(|p| format!("PID {p}"))
-                .unwrap_or_default(),
+    for svc in &data.distill_servers {
+        let (indicator, style) = if svc.healthy {
+            ("●", Style::default().fg(Color::Green))
+        } else {
+            ("○", Style::default().fg(Color::Red))
+        };
+        let detail = if svc.detail.is_empty() {
+            svc.url.clone()
+        } else {
+            format!("{} {}", svc.url, svc.detail)
+        };
+        rows.push(Row::new(vec![
+            Cell::from("Distill".to_string()),
+            Cell::from(indicator).style(style),
+            Cell::from(if svc.healthy { "running" } else { "stopped" }.to_string()),
+            Cell::from(detail),
+        ]));
+    }
+
+    let (q_indicator, q_style) = if data.qdrant_healthy {
+        ("●", Style::default().fg(Color::Green))
+    } else {
+        ("○", Style::default().fg(Color::Red))
+    };
+    rows.push(Row::new(vec![
+        Cell::from("Qdrant".to_string()),
+        Cell::from(q_indicator).style(q_style),
+        Cell::from(
+            if data.qdrant_healthy {
+                "healthy"
+            } else {
+                "stopped"
+            }
+            .to_string(),
         ),
-        svc_row(
-            "Distill server",
-            data.distill_alive,
-            data.distill_pid
-                .map(|p| format!("PID {p}"))
-                .unwrap_or_default(),
-        ),
-        svc_row("Qdrant", data.qdrant_healthy, data.qdrant_url.clone()),
-    ];
+        Cell::from(data.qdrant_url.clone()),
+    ]));
 
     let table = Table::new(
         rows,
@@ -406,7 +436,7 @@ fn render_recent(frame: &mut Frame, area: Rect, data: &DashboardData) {
             let ago = r.converted_at.as_ref().map(fmt_ago).unwrap_or_default();
             Row::new(vec![
                 Cell::from(title),
-                Cell::from(format!("{:>3}pp", r.pages)),
+                Cell::from(format!("{:>3}pg", r.pages)),
                 Cell::from(format!("{:.1}s", r.duration_secs)),
                 Cell::from(ago),
             ])
@@ -444,10 +474,8 @@ pub async fn run() -> Result<()> {
         corrupted_count: 0,
         embedded_docs: 0,
         embedded_chunks: 0,
-        scribe_pid: None,
-        scribe_alive: false,
-        distill_pid: None,
-        distill_alive: false,
+        scribe_servers: vec![],
+        distill_servers: vec![],
         qdrant_healthy: false,
         qdrant_url: String::new(),
         recent: vec![],
