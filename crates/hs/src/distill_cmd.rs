@@ -327,8 +327,13 @@ async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
         }
     }
 
+    // For ort load-dynamic: tell it where to find libonnxruntime.so
+    let ort_dylib = std::env::var("ORT_DYLIB_PATH")
+        .unwrap_or_else(|_| "/usr/lib/libonnxruntime.so".to_string());
+
     let child = std::process::Command::new(&binary)
         .env("LD_LIBRARY_PATH", &ld_path)
+        .env("ORT_DYLIB_PATH", &ort_dylib)
         .stdout(log_file)
         .stderr(log_err)
         .stdin(std::process::Stdio::null())
