@@ -64,16 +64,14 @@ fn count_dir(dir: &Path, ext: &str) -> (u64, u64) {
 async fn collect_data() -> DashboardData {
     let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
     let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
-    let distill_server_cfg = hs_distill::config::DistillServerConfig::load().unwrap_or_default();
-
     let (pdf_count, pdf_bytes) = count_dir(&scribe_cfg.watch_dir, "pdf");
     let (markdown_count, markdown_bytes) = count_dir(&scribe_cfg.output_dir, "md");
     let (catalog_count, _) = count_dir(&scribe_cfg.catalog_dir, "yaml");
     let (corrupted_count, _) = count_dir(&scribe_cfg.corrupted_dir, "pdf");
 
     let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(3))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -93,45 +91,45 @@ async fn collect_data() -> DashboardData {
         });
     }
 
-    // Distill server health checks
+    // Distill server health checks + embedded counts
     let mut distill_servers = Vec::new();
     let mut embedded_docs = 0u64;
     let mut embedded_chunks = 0u64;
+    let mut qdrant_healthy = false;
+    let mut qdrant_url = String::new();
+
     for url in &distill_cfg.servers {
         let client = hs_distill::client::DistillClient::new(url);
-        match client.health().await {
-            Ok(h) => {
-                // Also grab status from the first healthy server
-                if embedded_docs == 0 {
-                    if let Ok(s) = client.status().await {
-                        embedded_docs = s.documents_count;
-                        embedded_chunks = s.points_count;
-                    }
-                }
-                distill_servers.push(ServiceStatus {
-                    url: url.clone(),
-                    healthy: true,
-                    detail: format!("({})", h.compute_device),
-                });
+        let healthy = client.health().await.is_ok();
+
+        // Always try to get status (for embedded counts) even if health is slow
+        if let Ok(s) = client.status().await {
+            if embedded_docs == 0 {
+                embedded_docs = s.documents_count;
+                embedded_chunks = s.points_count;
             }
-            Err(_) => {
-                distill_servers.push(ServiceStatus {
-                    url: url.clone(),
-                    healthy: false,
-                    detail: String::new(),
-                });
-            }
+            // If we got a status response, Qdrant must be healthy
+            qdrant_healthy = true;
+            qdrant_url = format!("{url} → {}", s.collection);
+            distill_servers.push(ServiceStatus {
+                url: url.clone(),
+                healthy: true,
+                detail: format!("({})", s.compute_device),
+            });
+        } else if healthy {
+            distill_servers.push(ServiceStatus {
+                url: url.clone(),
+                healthy: true,
+                detail: String::new(),
+            });
+        } else {
+            distill_servers.push(ServiceStatus {
+                url: url.clone(),
+                healthy: false,
+                detail: String::new(),
+            });
         }
     }
-
-    // Qdrant health
-    let qdrant_rest = distill_server_cfg.qdrant_url.replace(":6334", ":6333");
-    let qdrant_healthy = http
-        .get(format!("{qdrant_rest}/healthz"))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
 
     // Recent conversions from catalog
     let recent = load_recent_conversions(&scribe_cfg.catalog_dir, 5);
@@ -148,7 +146,7 @@ async fn collect_data() -> DashboardData {
         scribe_servers,
         distill_servers,
         qdrant_healthy,
-        qdrant_url: qdrant_rest,
+        qdrant_url,
         recent,
     }
 }
