@@ -97,20 +97,37 @@ async fn collect_data() -> DashboardData {
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    // Scribe server health checks
+    // Scribe server health + readiness checks
     let mut scribe_servers = Vec::new();
     for url in &scribe_cfg.servers {
-        let healthy = http
-            .get(format!("{url}/health"))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
-        scribe_servers.push(ServiceStatus {
-            url: url.clone(),
-            healthy,
-            detail: String::new(),
-        });
+        let readiness: Option<serde_json::Value> = async {
+            let resp = http.get(format!("{url}/readiness")).send().await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            resp.json().await.ok()
+        }
+        .await;
+
+        if let Some(data) = readiness {
+            let in_flight = data["in_flight_conversions"].as_u64().unwrap_or(0);
+            let detail = if in_flight > 0 {
+                format!("{in_flight} converting")
+            } else {
+                "idle".to_string()
+            };
+            scribe_servers.push(ServiceStatus {
+                url: url.clone(),
+                healthy: true,
+                detail,
+            });
+        } else {
+            scribe_servers.push(ServiceStatus {
+                url: url.clone(),
+                healthy: false,
+                detail: String::new(),
+            });
+        }
     }
 
     // Distill server health checks + embedded counts
