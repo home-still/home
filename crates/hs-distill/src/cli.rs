@@ -28,6 +28,10 @@ pub enum DistillCmd {
         /// Override server URL
         #[arg(long)]
         server: Option<String>,
+
+        /// Internal: run as daemon child process
+        #[arg(long, hide = true)]
+        daemon_child: bool,
     },
     /// Semantic search across indexed documents
     Search {

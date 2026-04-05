@@ -1590,6 +1590,7 @@ dependencies = [
  "figment",
  "hs-common",
  "ollama-rs",
+ "ort",
  "qdrant-client",
  "regex",
  "reqwest",

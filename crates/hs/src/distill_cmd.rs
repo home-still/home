@@ -108,7 +108,14 @@ pub async fn dispatch(cmd: DistillCmd, reporter: &Arc<dyn Reporter>) -> Result<(
             force: _,
             file,
             server,
-        } => cmd_index(file, server.as_deref(), reporter).await,
+            daemon_child,
+        } => {
+            if daemon_child {
+                cmd_index_daemon(file, server.as_deref()).await
+            } else {
+                cmd_index(file, server.as_deref(), reporter).await
+            }
+        }
         DistillCmd::Search {
             query,
             limit,
@@ -399,28 +406,201 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
 
 // ── Index ───────────────────────────────────────────────────────
 
+const INDEX_STATUS_FILE: &str = "distill-index-status.json";
+
+fn index_pid_path() -> PathBuf {
+    hidden_dir().join("distill-index.pid")
+}
+
+fn index_status_path() -> PathBuf {
+    hidden_dir().join(INDEX_STATUS_FILE)
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct IndexStatus {
+    pid: u32,
+    total_files: usize,
+    indexed: usize,
+    failed: usize,
+    total_chunks: u32,
+    current_file: String,
+    done: bool,
+}
+
+fn read_index_status() -> Option<IndexStatus> {
+    let contents = std::fs::read_to_string(index_status_path()).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn write_index_status(status: &IndexStatus) {
+    if let Ok(json) = serde_json::to_string(status) {
+        let _ = std::fs::write(index_status_path(), json);
+    }
+}
+
+/// Spawn the index daemon as a background process.
+fn spawn_index_daemon(files: &Option<Vec<PathBuf>>, server: Option<&str>) -> Result<u32> {
+    let exe = std::env::current_exe().context("Cannot find current executable")?;
+
+    let mut args = vec![
+        "distill".to_string(),
+        "index".to_string(),
+        "--daemon-child".to_string(),
+    ];
+    if let Some(s) = server {
+        args.push("--server".to_string());
+        args.push(s.to_string());
+    }
+    if let Some(file_list) = files {
+        for f in file_list {
+            args.push("--file".to_string());
+            args.push(f.to_string_lossy().to_string());
+        }
+    }
+
+    let log_path = hs_common::resolve_log_dir().join("distill-index.log");
+    let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .context("Cannot open daemon log file")?;
+    let log_err = log_file.try_clone()?;
+
+    let child = std::process::Command::new(exe)
+        .args(&args)
+        .stdout(log_file)
+        .stderr(log_err)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to spawn index daemon")?;
+
+    Ok(child.id())
+}
+
+/// Foreground: spawn daemon, then attach to its progress.
 async fn cmd_index(
     files: Option<Vec<PathBuf>>,
     server: Option<&str>,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
+    // Check if daemon already running
+    let pid_path = index_pid_path();
+    if let Some(pid) = crate::daemon::read_pid(&pid_path) {
+        if crate::daemon::is_process_alive(pid) {
+            reporter.status(
+                "Index",
+                &format!("already running (PID {pid}). Attaching..."),
+            );
+            return attach_index(reporter).await;
+        }
+        crate::daemon::remove_pid_file(&pid_path);
+    }
+
+    // Health check before spawning
     let servers = resolve_servers(server);
     let client = DistillClient::new(&servers[0]);
-
-    // Health check
     match client.health().await {
-        Ok(h) => {
-            reporter.status(
-                "Connected",
-                &format!("{} ({})", servers[0], h.compute_device),
-            );
-        }
+        Ok(h) => reporter.status(
+            "Connected",
+            &format!("{} ({})", servers[0], h.compute_device),
+        ),
         Err(e) => {
             return Err(e).context(format!("Is hs-distill-server running at {}?", servers[0]));
         }
     };
 
-    // Determine files to index
+    // Spawn daemon
+    let pid = spawn_index_daemon(&files, server)?;
+    reporter.status(
+        "Index",
+        &format!("daemon started (PID {pid}). Press q to detach."),
+    );
+
+    // Wait briefly for status file to appear
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    attach_index(reporter).await
+}
+
+/// Attach to a running index daemon — display progress, q to detach.
+async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let raw_enabled = crossterm::terminal::enable_raw_mode().is_ok();
+    let mut last_indexed = 0usize;
+
+    loop {
+        // Check for q/Esc
+        if raw_enabled {
+            while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+                if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
+                    if key.kind == crossterm::event::KeyEventKind::Press
+                        && matches!(
+                            key.code,
+                            crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc
+                        )
+                    {
+                        let _ = crossterm::terminal::disable_raw_mode();
+                        reporter.status("Index", "detached. Daemon continues in background.");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // Read status
+        if let Some(status) = read_index_status() {
+            // Print new entries since last check
+            if status.indexed > last_indexed {
+                let _ = crossterm::terminal::disable_raw_mode();
+                eprintln!(
+                    "  [{}/{}] {} — {} chunks total",
+                    status.indexed, status.total_files, status.current_file, status.total_chunks
+                );
+                let _ = crossterm::terminal::enable_raw_mode();
+                last_indexed = status.indexed;
+            }
+
+            if status.done {
+                let _ = crossterm::terminal::disable_raw_mode();
+                reporter.finish(&format!(
+                    "Indexed {}/{} files, {} chunks ({} failed)",
+                    status.indexed, status.total_files, status.total_chunks, status.failed
+                ));
+                // Clean up
+                let _ = std::fs::remove_file(index_status_path());
+                crate::daemon::remove_pid_file(&index_pid_path());
+                return Ok(());
+            }
+
+            // Check if daemon died
+            if !crate::daemon::is_process_alive(status.pid) {
+                let _ = crossterm::terminal::disable_raw_mode();
+                reporter.error("Index daemon exited unexpectedly. Check logs.");
+                return Ok(());
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// Daemon child: run the actual indexing loop, write status file.
+async fn cmd_index_daemon(files: Option<Vec<PathBuf>>, server: Option<&str>) -> Result<()> {
+    // Write PID
+    let pid_path = index_pid_path();
+    crate::daemon::write_pid_file(&pid_path)?;
+
+    let servers = resolve_servers(server);
+    let client = DistillClient::new(&servers[0]);
+
+    // Health check
+    client
+        .health()
+        .await
+        .context(format!("Is hs-distill-server running at {}?", servers[0]))?;
+
+    // Determine files
     let config = DistillClientConfig::load().unwrap_or_default();
     let markdown_dir = config.markdown_dir;
 
@@ -438,90 +618,40 @@ async fn cmd_index(
             .unwrap_or_default()
     };
 
-    if paths.is_empty() {
-        reporter.warn("No markdown files found to index");
-        return Ok(());
-    }
-
-    reporter.status(
-        "Found",
-        &format!("{} files to index (press q to stop early)", paths.len()),
-    );
-
-    let mut total_chunks = 0u32;
-    let mut indexed_count = 0usize;
-    let mut stopped_early = false;
+    let mut status = IndexStatus {
+        pid: std::process::id(),
+        total_files: paths.len(),
+        ..Default::default()
+    };
+    write_index_status(&status);
 
     for path in &paths {
-        // Briefly enable raw mode to check for 'q' keypress, then disable
-        // so indicatif progress bars render correctly
-        if crossterm::terminal::enable_raw_mode().is_ok() {
-            while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
-                if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
-                    if key.kind == crossterm::event::KeyEventKind::Press
-                        && matches!(
-                            key.code,
-                            crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc
-                        )
-                    {
-                        stopped_early = true;
-                    }
-                }
-            }
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-        if stopped_early {
-            break;
-        }
-
         let path_str = path.to_string_lossy().to_string();
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
 
-        match client
-            .index_file_with_progress(&path_str, |_progress| {})
-            .await
-        {
+        status.current_file = stem.to_string();
+        write_index_status(&status);
+
+        match client.index_file_with_progress(&path_str, |_| {}).await {
             Ok(result) => {
-                total_chunks += result.chunks_indexed;
-                indexed_count += 1;
-                eprintln!(
-                    "  [{}/{}] {} — {} chunks",
-                    indexed_count,
-                    paths.len(),
-                    stem,
-                    result.chunks_indexed
-                );
+                status.total_chunks += result.chunks_indexed;
+                status.indexed += 1;
             }
             Err(e) => {
-                eprintln!(
-                    "  [{}/{}] {} — error: {e}",
-                    indexed_count + 1,
-                    paths.len(),
-                    stem
-                );
+                status.failed += 1;
+                tracing::error!("{stem}: {e}");
             }
         }
+        write_index_status(&status);
     }
 
-    let summary = if stopped_early {
-        format!(
-            "Stopped: indexed {}/{} files, {} chunks",
-            indexed_count,
-            paths.len(),
-            total_chunks
-        )
-    } else {
-        format!(
-            "Indexed {} files, {} total chunks",
-            paths.len(),
-            total_chunks
-        )
-    };
-    reporter.finish(&summary);
+    status.done = true;
+    write_index_status(&status);
 
+    crate::daemon::remove_pid_file(&pid_path);
     Ok(())
 }
 
