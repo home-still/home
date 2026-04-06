@@ -162,18 +162,26 @@ async fn install_service(
     port: u16,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    let ip = local_ip_hint();
-    let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
-    let hs_path = hs_bin.display();
-
-    #[cfg(target_os = "linux")]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let user = std::env::var("USER").unwrap_or_else(|_| "ladvien".into());
-        let service_name = format!("hs-serve-{service_type}");
-        let unit_path = format!("/etc/systemd/system/{service_name}.service");
+        let _ = (service_type, port, reporter);
+        anyhow::bail!("--install is only supported on Linux (systemd) and macOS (launchd)");
+    }
 
-        let unit = format!(
-            r#"[Unit]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let ip = local_ip_hint();
+        let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
+        let hs_path = hs_bin.display();
+
+        #[cfg(target_os = "linux")]
+        {
+            let user = std::env::var("USER").unwrap_or_else(|_| "ladvien".into());
+            let service_name = format!("hs-serve-{service_type}");
+            let unit_path = format!("/etc/systemd/system/{service_name}.service");
+
+            let unit = format!(
+                r#"[Unit]
 Description=Home-Still {service_type} server
 After=network.target
 
@@ -188,61 +196,61 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 "#
-        );
+            );
 
-        reporter.status("Install", &format!("writing {unit_path}"));
+            reporter.status("Install", &format!("writing {unit_path}"));
 
-        // Write unit file (needs sudo)
-        let tmp = format!("/tmp/{service_name}.service");
-        std::fs::write(&tmp, &unit).context("Failed to write temp unit file")?;
+            // Write unit file (needs sudo)
+            let tmp = format!("/tmp/{service_name}.service");
+            std::fs::write(&tmp, &unit).context("Failed to write temp unit file")?;
 
-        let status = tokio::process::Command::new("sudo")
-            .args(["cp", &tmp, &unit_path])
-            .status()
-            .await
-            .context("sudo cp failed")?;
-        if !status.success() {
-            anyhow::bail!("Failed to install systemd unit (sudo cp)");
-        }
-        let _ = std::fs::remove_file(&tmp);
+            let status = tokio::process::Command::new("sudo")
+                .args(["cp", &tmp, &unit_path])
+                .status()
+                .await
+                .context("sudo cp failed")?;
+            if !status.success() {
+                anyhow::bail!("Failed to install systemd unit (sudo cp)");
+            }
+            let _ = std::fs::remove_file(&tmp);
 
-        reporter.status("Enable", &format!("{service_name}.service"));
-        let status = tokio::process::Command::new("sudo")
-            .args(["systemctl", "daemon-reload"])
-            .status()
-            .await?;
-        if !status.success() {
-            anyhow::bail!("systemctl daemon-reload failed");
-        }
+            reporter.status("Enable", &format!("{service_name}.service"));
+            let status = tokio::process::Command::new("sudo")
+                .args(["systemctl", "daemon-reload"])
+                .status()
+                .await?;
+            if !status.success() {
+                anyhow::bail!("systemctl daemon-reload failed");
+            }
 
-        let status = tokio::process::Command::new("sudo")
-            .args(["systemctl", "enable", "--now", &service_name])
-            .status()
-            .await?;
-        if !status.success() {
-            anyhow::bail!("systemctl enable --now failed");
-        }
+            let status = tokio::process::Command::new("sudo")
+                .args(["systemctl", "enable", "--now", &service_name])
+                .status()
+                .await?;
+            if !status.success() {
+                anyhow::bail!("systemctl enable --now failed");
+            }
 
-        reporter.finish(&format!(
-            "Installed and started {service_name}\n\
+            reporter.finish(&format!(
+                "Installed and started {service_name}\n\
              View logs: journalctl -u {service_name} -f\n\
              Stop:      sudo systemctl stop {service_name}\n\
              Disable:   sudo systemctl disable {service_name}"
-        ));
-    }
+            ));
+        }
 
-    #[cfg(target_os = "macos")]
-    {
-        let label = format!("com.home-still.{service_type}");
-        let plist_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
-            .join("Library/LaunchAgents");
-        let plist_path = plist_dir.join(format!("{label}.plist"));
+        #[cfg(target_os = "macos")]
+        {
+            let label = format!("com.home-still.{service_type}");
+            let plist_dir = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+                .join("Library/LaunchAgents");
+            let plist_path = plist_dir.join(format!("{label}.plist"));
 
-        std::fs::create_dir_all(&plist_dir)?;
+            std::fs::create_dir_all(&plist_dir)?;
 
-        let plist = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
+            let plist = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://schemas.apple.com/dtds/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -272,42 +280,38 @@ WantedBy=multi-user.target
 </dict>
 </plist>
 "#
-        );
+            );
 
-        reporter.status("Install", &format!("{}", plist_path.display()));
-        std::fs::write(&plist_path, &plist)?;
+            reporter.status("Install", &format!("{}", plist_path.display()));
+            std::fs::write(&plist_path, &plist)?;
 
-        reporter.status("Load", &label);
-        // Unload first in case it's already loaded (ignore errors)
-        let _ = tokio::process::Command::new("launchctl")
-            .args(["unload", &plist_path.to_string_lossy()])
-            .status()
-            .await;
+            reporter.status("Load", &label);
+            // Unload first in case it's already loaded (ignore errors)
+            let _ = tokio::process::Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .status()
+                .await;
 
-        let status = tokio::process::Command::new("launchctl")
-            .args(["load", &plist_path.to_string_lossy()])
-            .status()
-            .await?;
-        if !status.success() {
-            anyhow::bail!("launchctl load failed");
-        }
+            let status = tokio::process::Command::new("launchctl")
+                .args(["load", &plist_path.to_string_lossy()])
+                .status()
+                .await?;
+            if !status.success() {
+                anyhow::bail!("launchctl load failed");
+            }
 
-        reporter.finish(&format!(
-            "Installed and started {label}\n\
+            reporter.finish(&format!(
+                "Installed and started {label}\n\
              View logs: tail -f /tmp/hs-{service_type}.log\n\
              Stop:      launchctl unload {}\n\
              Remove:    rm {}",
-            plist_path.display(),
-            plist_path.display()
-        ));
-    }
+                plist_path.display(),
+                plist_path.display()
+            ));
+        }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        anyhow::bail!("--install is only supported on Linux (systemd) and macOS (launchd)");
-    }
-
-    Ok(())
+        Ok(())
+    } // cfg(any(linux, macos))
 }
 
 // ── Registry Integration ───────────────────────────────────────
