@@ -59,7 +59,7 @@ fn default_secret_path() -> PathBuf {
 }
 
 fn default_token_ttl() -> u64 {
-    3600
+    14400 // 4 hours
 }
 
 fn default_refresh_ttl() -> u64 {

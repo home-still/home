@@ -26,6 +26,8 @@ pub enum CloudCmd {
     },
     /// Show cloud connection status
     Status,
+    /// Print a fresh access token (for MCP server config, CI, etc.)
+    Token,
 }
 
 pub async fn dispatch(cmd: CloudCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -34,6 +36,7 @@ pub async fn dispatch(cmd: CloudCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
         CloudCmd::Invite { name } => cmd_invite(&name, reporter).await,
         CloudCmd::Enroll { gateway } => cmd_enroll(&gateway, reporter).await,
         CloudCmd::Status => cmd_status(reporter).await,
+        CloudCmd::Token => cmd_token(reporter).await,
     }
 }
 
@@ -206,6 +209,28 @@ async fn cmd_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
         Ok(_) => reporter.status("Connection", "OK (token refreshed)"),
         Err(e) => reporter.warn(&format!("Connection failed: {e}")),
     }
+
+    Ok(())
+}
+
+// ── Token ───────────────────────────────────────────────────────
+
+async fn cmd_token(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let cred_path = CloudCredentials::default_path();
+    if !cred_path.exists() {
+        anyhow::bail!("Not enrolled. Run `hs cloud enroll --gateway <url>` first.");
+    }
+
+    let creds = CloudCredentials::load(&cred_path)?;
+    let auth_client = hs_common::auth::client::AuthenticatedClient::new(creds);
+    let access_token = auth_client
+        .get_access_token()
+        .await
+        .context("Failed to get access token")?;
+
+    // Print just the token to stdout (for piping/copying)
+    println!("{access_token}");
+    reporter.status("Expires", "4 hours");
 
     Ok(())
 }
