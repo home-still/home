@@ -215,6 +215,12 @@ async fn install_service(
             let service_name = format!("hs-serve-{service_type}");
             let unit_path = format!("/etc/systemd/system/{service_name}.service");
 
+            let home_dir = dirs::home_dir().unwrap_or_default();
+            let fastembed_cache = hs_bin
+                .parent()
+                .unwrap_or(home_dir.as_path())
+                .join(".fastembed_cache");
+
             let unit = format!(
                 r#"[Unit]
 Description=Home-Still {service_type} server
@@ -223,14 +229,18 @@ After=network.target
 [Service]
 Type=simple
 User={user}
+WorkingDirectory={home}
 Environment=HS_ADVERTISE_IP={ip}
+Environment=FASTEMBED_CACHE_PATH={cache}
 ExecStart={hs_path} serve {service_type} --port {port}
 Restart=on-failure
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-"#
+"#,
+                home = home_dir.display(),
+                cache = fastembed_cache.display(),
             );
 
             reporter.status("Install", &format!("writing {unit_path}"));
