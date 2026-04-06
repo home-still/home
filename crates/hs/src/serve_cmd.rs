@@ -165,10 +165,10 @@ async fn install_service(
     let ip = local_ip_hint();
     let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
     let hs_path = hs_bin.display();
-    let user = std::env::var("USER").unwrap_or_else(|_| "ladvien".into());
 
     #[cfg(target_os = "linux")]
     {
+        let user = std::env::var("USER").unwrap_or_else(|_| "ladvien".into());
         let service_name = format!("hs-serve-{service_type}");
         let unit_path = format!("/etc/systemd/system/{service_name}.service");
 
