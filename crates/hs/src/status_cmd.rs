@@ -93,14 +93,22 @@ async fn collect_data() -> DashboardData {
     let (corrupted_count, _) = count_dir(&scribe_cfg.corrupted_dir, "pdf");
 
     let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(3))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
+    // Discover servers from gateway registry, falling back to config
+    let scribe_urls =
+        hs_common::service::registry::discover_or_fallback("scribe", scribe_cfg.servers.clone())
+            .await;
+    let distill_urls =
+        hs_common::service::registry::discover_or_fallback("distill", distill_cfg.servers.clone())
+            .await;
+
     // Scribe server health + readiness checks
     let mut scribe_servers = Vec::new();
-    for url in &scribe_cfg.servers {
+    for url in &scribe_urls {
         let health_version: String = async {
             let resp = http.get(format!("{url}/health")).send().await.ok()?;
             let data: serde_json::Value = resp.json().await.ok()?;
@@ -148,7 +156,7 @@ async fn collect_data() -> DashboardData {
     let mut qdrant_healthy = false;
     let mut qdrant_url = String::new();
 
-    for url in &distill_cfg.servers {
+    for url in &distill_urls {
         let client = if hs_common::auth::client::is_cloud_url(url) {
             match hs_common::auth::client::AuthenticatedClient::from_default_path() {
                 Ok(auth) => match auth.build_reqwest_client().await {
@@ -576,11 +584,24 @@ pub async fn run() -> Result<()> {
         history: vec![],
     };
 
+    let mut collect_task: Option<tokio::task::JoinHandle<DashboardData>> = None;
+
     loop {
-        // Refresh data every 3 seconds
-        if last_collect.elapsed() >= Duration::from_secs(3) {
-            data = collect_data().await;
+        // Kick off data collection in background (non-blocking)
+        if last_collect.elapsed() >= Duration::from_secs(3) && collect_task.is_none() {
+            collect_task = Some(tokio::spawn(collect_data()));
             last_collect = Instant::now();
+        }
+
+        // Check if background collection finished
+        if let Some(ref task) = collect_task {
+            if task.is_finished() {
+                if let Some(task) = collect_task.take() {
+                    if let Ok(new_data) = task.await {
+                        data = new_data;
+                    }
+                }
+            }
         }
 
         terminal.draw(|frame| render(frame, &data))?;
@@ -596,6 +617,11 @@ pub async fn run() -> Result<()> {
                 }
             }
         }
+    }
+
+    // Cancel any in-flight collection
+    if let Some(task) = collect_task {
+        task.abort();
     }
 
     // Restore terminal
