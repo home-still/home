@@ -20,8 +20,11 @@ pub enum ServeCmd {
         #[arg(long, default_value_t = DEFAULT_SCRIBE_PORT)]
         port: u16,
         /// Install as a system service (systemd on Linux, launchd on macOS) and start it
-        #[arg(long)]
+        #[arg(long, conflicts_with = "uninstall")]
         install: bool,
+        /// Stop and remove the system service
+        #[arg(long, conflicts_with = "install")]
+        uninstall: bool,
     },
     /// Run a distill server (auto-init, foreground, registers with gateway)
     Distill {
@@ -29,8 +32,11 @@ pub enum ServeCmd {
         #[arg(long, default_value_t = DEFAULT_DISTILL_PORT)]
         port: u16,
         /// Install as a system service and start it
-        #[arg(long)]
+        #[arg(long, conflicts_with = "uninstall")]
         install: bool,
+        /// Stop and remove the system service
+        #[arg(long, conflicts_with = "install")]
+        uninstall: bool,
     },
     /// Run an MCP server (foreground, registers with gateway)
     Mcp {
@@ -38,23 +44,52 @@ pub enum ServeCmd {
         #[arg(long, default_value_t = DEFAULT_MCP_PORT)]
         port: u16,
         /// Install as a system service and start it
-        #[arg(long)]
+        #[arg(long, conflicts_with = "uninstall")]
         install: bool,
+        /// Stop and remove the system service
+        #[arg(long, conflicts_with = "install")]
+        uninstall: bool,
     },
 }
 
 pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
     match cmd {
-        ServeCmd::Scribe { port, install } if install => {
-            install_service("scribe", port, reporter).await
+        ServeCmd::Scribe {
+            install: true,
+            port,
+            ..
+        } => install_service("scribe", port, reporter).await,
+        ServeCmd::Distill {
+            install: true,
+            port,
+            ..
+        } => install_service("distill", port, reporter).await,
+        ServeCmd::Mcp {
+            install: true,
+            port,
+            ..
+        } => install_service("mcp", port, reporter).await,
+        ServeCmd::Scribe {
+            uninstall: true, ..
+        } => uninstall_service("scribe", reporter).await,
+        ServeCmd::Distill {
+            uninstall: true, ..
+        } => uninstall_service("distill", reporter).await,
+        ServeCmd::Mcp {
+            uninstall: true, ..
+        } => uninstall_service("mcp", reporter).await,
+        ServeCmd::Scribe { port, .. } => {
+            check_system_service_conflict("scribe")?;
+            serve_scribe(port, reporter).await
         }
-        ServeCmd::Distill { port, install } if install => {
-            install_service("distill", port, reporter).await
+        ServeCmd::Distill { port, .. } => {
+            check_system_service_conflict("distill")?;
+            serve_distill(port, reporter).await
         }
-        ServeCmd::Mcp { port, install } if install => install_service("mcp", port, reporter).await,
-        ServeCmd::Scribe { port, .. } => serve_scribe(port, reporter).await,
-        ServeCmd::Distill { port, .. } => serve_distill(port, reporter).await,
-        ServeCmd::Mcp { port, .. } => serve_mcp(port, reporter).await,
+        ServeCmd::Mcp { port, .. } => {
+            check_system_service_conflict("mcp")?;
+            serve_mcp(port, reporter).await
+        }
     }
 }
 
@@ -314,6 +349,105 @@ WantedBy=multi-user.target
 
         Ok(())
     } // cfg(any(linux, macos))
+}
+
+async fn uninstall_service(service_type: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let service_name = format!("hs-serve-{service_type}");
+        let unit_path = format!("/etc/systemd/system/{service_name}.service");
+
+        reporter.status("Stop", &service_name);
+        let _ = tokio::process::Command::new("sudo")
+            .args(["systemctl", "stop", &service_name])
+            .status()
+            .await;
+        let _ = tokio::process::Command::new("sudo")
+            .args(["systemctl", "disable", &service_name])
+            .status()
+            .await;
+        let _ = tokio::process::Command::new("sudo")
+            .args(["rm", "-f", &unit_path])
+            .status()
+            .await;
+        let _ = tokio::process::Command::new("sudo")
+            .args(["systemctl", "daemon-reload"])
+            .status()
+            .await;
+
+        reporter.finish(&format!("Removed {service_name}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let label = format!("com.home-still.{service_type}");
+        let plist_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join("Library/LaunchAgents")
+            .join(format!("{label}.plist"));
+
+        reporter.status("Unload", &label);
+        let _ = tokio::process::Command::new("launchctl")
+            .args(["unload", &plist_path.to_string_lossy()])
+            .status()
+            .await;
+        let _ = std::fs::remove_file(&plist_path);
+
+        reporter.finish(&format!("Removed {label}"));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (service_type, reporter);
+        anyhow::bail!("--uninstall is only supported on Linux and macOS");
+    }
+
+    Ok(())
+}
+
+/// Check if a system service is already running for this service type.
+/// Prevents conflicts when running `hs serve` in foreground.
+fn check_system_service_conflict(service_type: &str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let service_name = format!("hs-serve-{service_type}");
+        if let Ok(output) = std::process::Command::new("systemctl")
+            .args(["is-active", &service_name])
+            .output()
+        {
+            let status = String::from_utf8_lossy(&output.stdout);
+            if status.trim() == "active" {
+                anyhow::bail!(
+                    "{service_name} is already running via systemd.\n\
+                     Stop it first:  sudo systemctl stop {service_name}\n\
+                     Or uninstall:   hs serve {service_type} --uninstall"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let label = format!("com.home-still.{service_type}");
+        if let Ok(output) = std::process::Command::new("launchctl")
+            .args(["list"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains(&label) {
+                anyhow::bail!(
+                    "{label} is already running via launchd.\n\
+                     Stop it first:  launchctl unload ~/Library/LaunchAgents/{label}.plist\n\
+                     Or uninstall:   hs serve {service_type} --uninstall"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = service_type;
+
+    Ok(())
 }
 
 // ── Registry Integration ───────────────────────────────────────

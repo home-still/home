@@ -28,7 +28,23 @@ struct DashboardData {
     qdrant_healthy: bool,
     qdrant_url: String,
 
+    watcher: WatcherInfo,
+
     history: Vec<HistoryEvent>,
+}
+
+enum WatcherInfo {
+    /// Watcher is running (PID alive)
+    Running {
+        processing: u64,
+        queued: u64,
+        completed: u64,
+        failed: u64,
+    },
+    /// Status file exists but PID is dead — watcher finished or crashed
+    Finished { completed: u64, failed: u64 },
+    /// No status file, no PID file — watcher never started
+    Stopped,
 }
 
 struct ServiceStatus {
@@ -207,6 +223,9 @@ async fn collect_data() -> DashboardData {
         }
     }
 
+    // Watcher status
+    let watcher = read_watcher_status(&scribe_cfg.output_dir, &scribe_cfg.watch_dir);
+
     // Build history from catalog entries
     let history = load_history(&scribe_cfg.catalog_dir, 15);
 
@@ -223,8 +242,49 @@ async fn collect_data() -> DashboardData {
         distill_servers,
         qdrant_healthy,
         qdrant_url,
+        watcher,
         history,
     }
+}
+
+fn read_watcher_status(output_dir: &Path, watch_dir: &Path) -> WatcherInfo {
+    let status_path = output_dir.join(".scribe-watch-status.json");
+
+    if let Ok(contents) = std::fs::read_to_string(&status_path) {
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&contents) {
+            let pid = data["pid"].as_u64().unwrap_or(0) as u32;
+            let processing = data["processing"].as_u64().unwrap_or(0);
+            let queued = data["queued"].as_u64().unwrap_or(0);
+            let completed = data["completed"].as_u64().unwrap_or(0);
+            let failed = data["failed"].as_u64().unwrap_or(0);
+
+            if pid > 0 && crate::daemon::is_process_alive(pid) {
+                return WatcherInfo::Running {
+                    processing,
+                    queued,
+                    completed,
+                    failed,
+                };
+            } else {
+                return WatcherInfo::Finished { completed, failed };
+            }
+        }
+    }
+
+    // No status file — check PID file
+    let pid_path = crate::daemon::pid_file_path(watch_dir);
+    if let Some(pid) = crate::daemon::read_pid(&pid_path) {
+        if crate::daemon::is_process_alive(pid) {
+            return WatcherInfo::Running {
+                processing: 0,
+                queued: 0,
+                completed: 0,
+                failed: 0,
+            };
+        }
+    }
+
+    WatcherInfo::Stopped
 }
 
 fn load_history(catalog_dir: &Path, limit: usize) -> Vec<HistoryEvent> {
@@ -325,7 +385,7 @@ fn fmt_ago(dt: &chrono::DateTime<chrono::Utc>) -> String {
 fn render(frame: &mut Frame, data: &DashboardData) {
     let outer = Layout::vertical([
         Constraint::Length(1), // title
-        Constraint::Length(8), // pipeline
+        Constraint::Length(9), // pipeline (includes watcher row)
         Constraint::Length(1), // spacer
         Constraint::Length((data.scribe_servers.len() + data.distill_servers.len() + 3) as u16), // services
         Constraint::Length(1), // spacer
@@ -413,6 +473,40 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Cell::from(""),
             Cell::from(""),
         ]),
+        match &data.watcher {
+            WatcherInfo::Running {
+                processing,
+                queued,
+                completed,
+                failed,
+            } => {
+                let detail = if *processing > 0 || *queued > 0 {
+                    format!("{processing} active, {queued} queued")
+                } else {
+                    format!("{completed} done, {failed} failed")
+                };
+                Row::new(vec![
+                    Cell::from("Watcher").style(Style::default().fg(Color::Green)),
+                    Cell::from("●".to_string()).style(Style::default().fg(Color::Green)),
+                    Cell::from(if *processing > 0 { "working" } else { "idle" }),
+                    Cell::from(detail),
+                ])
+            }
+            WatcherInfo::Finished {
+                completed, failed, ..
+            } => Row::new(vec![
+                Cell::from("Watcher").style(Style::default().fg(Color::Yellow)),
+                Cell::from("○".to_string()).style(Style::default().fg(Color::Yellow)),
+                Cell::from("done"),
+                Cell::from(format!("{completed} done, {failed} failed")),
+            ]),
+            WatcherInfo::Stopped => Row::new(vec![
+                Cell::from("Watcher").style(Style::default().fg(Color::DarkGray)),
+                Cell::from("○".to_string()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from("stopped"),
+                Cell::from(""),
+            ]),
+        },
     ];
 
     let table = Table::new(
@@ -581,6 +675,7 @@ pub async fn run() -> Result<()> {
         distill_servers: vec![],
         qdrant_healthy: false,
         qdrant_url: String::new(),
+        watcher: WatcherInfo::Stopped,
         history: vec![],
     };
 
