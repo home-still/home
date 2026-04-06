@@ -8,6 +8,7 @@ use hs_common::global_args::GlobalArgs;
 use hs_common::reporter::Reporter;
 
 const GITHUB_API_LATEST: &str = "https://api.github.com/repos/home-still/home/releases/latest";
+const GITHUB_API_RELEASES: &str = "https://api.github.com/repos/home-still/home/releases";
 
 // ── GitHub API types ────────────────────────────────────────────
 
@@ -28,14 +29,19 @@ struct GitHubAsset {
 pub async fn run(
     check_only: bool,
     force: bool,
+    include_pre: bool,
     global: &GlobalArgs,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
     let current = current_version();
     reporter.status("Current", &format!("hs {current}"));
 
-    // Phase 1: fetch latest release
-    let release = fetch_latest_release(reporter).await?;
+    // Phase 1: fetch latest release (including pre-releases if --pre)
+    let release = if include_pre {
+        fetch_latest_release_including_pre(reporter).await?
+    } else {
+        fetch_latest_release(reporter).await?
+    };
     let latest = parse_release_version(&release.tag_name)?;
 
     if latest <= current && !force {
@@ -80,17 +86,25 @@ pub async fn run(
         reporter.status("Upgraded", &format!("hs → {latest}"));
     }
 
-    // Also upgrade hs-distill-server if it's already installed
-    if find_distill_binary().is_some() {
-        let distill_installed =
-            download_and_replace_binary(&release, "hs-distill-server", target, reporter).await?;
-        if distill_installed {
-            reporter.status("Upgraded", &format!("hs-distill-server → {latest}"));
-        } else {
-            reporter.status(
-                "Skipped",
-                "hs-distill-server (no release asset for this platform)",
-            );
+    // Upgrade companion binaries if they're already installed
+    for (name, finder) in [
+        (
+            "hs-distill-server",
+            find_companion_binary("hs-distill-server"),
+        ),
+        ("hs-gateway", find_companion_binary("hs-gateway")),
+        ("hs-mcp", find_companion_binary("hs-mcp")),
+    ] {
+        if finder.is_some() {
+            let installed = download_and_replace_binary(&release, name, target, reporter).await?;
+            if installed {
+                reporter.status("Upgraded", &format!("{name} → {latest}"));
+            } else {
+                reporter.status(
+                    "Skipped",
+                    &format!("{name} (no release asset for this platform)"),
+                );
+            }
         }
     }
 
@@ -185,6 +199,39 @@ async fn fetch_latest_release(reporter: &Arc<dyn Reporter>) -> Result<GitHubRele
     resp.json().await.context("Failed to parse release JSON")
 }
 
+/// Fetch the latest release including pre-releases (rc candidates).
+async fn fetch_latest_release_including_pre(reporter: &Arc<dyn Reporter>) -> Result<GitHubRelease> {
+    reporter.status(
+        "Checking",
+        "GitHub for latest release (including pre-releases)...",
+    );
+
+    let mut builder = reqwest::Client::builder()
+        .user_agent(format!("hs/{}", env!("HS_VERSION")))
+        .build()?
+        .get(format!("{GITHUB_API_RELEASES}?per_page=1"));
+
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        builder = builder.bearer_auth(token);
+    }
+
+    let resp = builder.send().await.context("Failed to reach GitHub API")?;
+
+    if resp.status() == reqwest::StatusCode::FORBIDDEN {
+        anyhow::bail!("GitHub API rate limit exceeded. Set GITHUB_TOKEN env var to authenticate.");
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!("GitHub API returned {}", resp.status());
+    }
+
+    let releases: Vec<GitHubRelease> =
+        resp.json().await.context("Failed to parse releases JSON")?;
+    releases
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No releases found"))
+}
+
 // ── Binary download & replacement ───────────────────────────────
 
 async fn download_and_replace_binary(
@@ -273,22 +320,24 @@ fn install_path_for(binary_name: &str) -> Result<PathBuf> {
     if binary_name == "hs" {
         std::env::current_exe().context("Could not determine current executable path")
     } else {
-        // For hs-distill-server, use the same location where it's currently installed
-        find_distill_binary()
+        find_companion_binary(binary_name)
             .ok_or_else(|| anyhow::anyhow!("{binary_name} not found on this system"))
     }
 }
 
-fn find_distill_binary() -> Option<PathBuf> {
+/// Find a companion binary (hs-distill-server, hs-gateway, hs-mcp) on disk.
+fn find_companion_binary(name: &str) -> Option<PathBuf> {
+    // Check ~/.local/bin
     if let Some(home) = dirs::home_dir() {
-        let path = home.join(".local/bin/hs-distill-server");
+        let path = home.join(".local/bin").join(name);
         if path.exists() {
             return Some(path);
         }
     }
+    // Check next to the current hs binary
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let path = dir.join("hs-distill-server");
+            let path = dir.join(name);
             if path.exists() {
                 return Some(path);
             }

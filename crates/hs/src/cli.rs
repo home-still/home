@@ -49,6 +49,10 @@ pub enum TopCmd {
         /// Force reinstall even if already on the latest version
         #[arg(long)]
         force: bool,
+
+        /// Include pre-release versions (e.g. rc candidates)
+        #[arg(long)]
+        pre: bool,
     },
     /// Run a service on this machine (scribe, distill, or mcp)
     Serve {

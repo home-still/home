@@ -124,8 +124,8 @@ fn main() -> ExitCode {
                 }
                 TopCmd::Status => status_cmd::run().await,
                 TopCmd::Cloud { command } => cloud_cmd::dispatch(command, &reporter).await,
-                TopCmd::Upgrade { check, force } => {
-                    upgrade_cmd::run(check, force, &cli.global, &reporter).await
+                TopCmd::Upgrade { check, force, pre } => {
+                    upgrade_cmd::run(check, force, pre, &cli.global, &reporter).await
                 }
             }
         };

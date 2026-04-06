@@ -87,6 +87,34 @@ jobs:
           --target ${{ matrix.target }}
           -p hs-distill --features server --bin hs-distill-server
 
+      - name: Build gateway (zigbuild)
+        if: matrix.use_zigbuild
+        run: >
+          cargo zigbuild --release
+          --target ${{ matrix.target }}.2.28
+          -p hs-gateway
+
+      - name: Build gateway (native)
+        if: ${{ !matrix.use_zigbuild }}
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          -p hs-gateway
+
+      - name: Build MCP server (zigbuild)
+        if: matrix.use_zigbuild
+        run: >
+          cargo zigbuild --release
+          --target ${{ matrix.target }}.2.28
+          -p hs-mcp
+
+      - name: Build MCP server (native)
+        if: ${{ !matrix.use_zigbuild }}
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          -p hs-mcp
+
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -141,6 +169,44 @@ jobs:
           path: |
             ${{ env.DISTILL_ASSET }}
             ${{ env.DISTILL_ASSET }}.sha256
+
+      - name: Package gateway
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          GW_ASSET="hs-gateway-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$GW_ASSET" \
+            -C "target/${{ matrix.target }}/release" "hs-gateway"
+          shasum -a 256 "$GW_ASSET" > "$GW_ASSET.sha256"
+          echo "GW_ASSET=$GW_ASSET" >> $GITHUB_ENV
+
+      - name: Upload gateway
+        if: matrix.archive == 'tar.gz'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-${{ matrix.target }}
+          path: |
+            ${{ env.GW_ASSET }}
+            ${{ env.GW_ASSET }}.sha256
+
+      - name: Package MCP server
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          MCP_ASSET="hs-mcp-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$MCP_ASSET" \
+            -C "target/${{ matrix.target }}/release" "hs-mcp"
+          shasum -a 256 "$MCP_ASSET" > "$MCP_ASSET.sha256"
+          echo "MCP_ASSET=$MCP_ASSET" >> $GITHUB_ENV
+
+      - name: Upload MCP server
+        if: matrix.archive == 'tar.gz'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-${{ matrix.target }}
+          path: |
+            ${{ env.MCP_ASSET }}
+            ${{ env.MCP_ASSET }}.sha256
 
   release:
     name: Publish Github Release
