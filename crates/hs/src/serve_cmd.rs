@@ -268,6 +268,8 @@ WantedBy=multi-user.target
     <dict>
         <key>HS_ADVERTISE_IP</key>
         <string>{ip}</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>KeepAlive</key>
     <true/>
