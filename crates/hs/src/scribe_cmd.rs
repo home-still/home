@@ -1373,9 +1373,7 @@ pub fn ensure_watcher_running(reporter: &Arc<dyn Reporter>) {
     // Don't auto-start if scribe hasn't been initialized
     let compose_path = hidden_dir().join("docker-compose.yml");
     if !compose_path.exists() {
-        reporter.warn(
-            "Scribe not initialized — run `hs scribe init` to enable auto-conversion",
-        );
+        reporter.warn("Scribe not initialized — run `hs scribe init` to enable auto-conversion");
         return;
     }
 
@@ -1413,10 +1411,7 @@ pub async fn ensure_init(force: bool) -> Result<()> {
 /// Note: the scribe server port is determined by the Docker compose config
 /// generated during `hs scribe init`. The `port` parameter is currently used
 /// only for gateway registration (the URL advertised to the registry).
-pub async fn start_server_foreground(
-    _port: u16,
-    reporter: &Arc<dyn Reporter>,
-) -> Result<()> {
+pub async fn start_server_foreground(_port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let compose_path = hidden_dir().join("docker-compose.yml");
     if !compose_path.exists() {
         anyhow::bail!("No compose config found. Run `hs scribe init` or `hs serve scribe` first.");
@@ -1445,7 +1440,9 @@ pub async fn start_server_foreground(
 
     // Start compose in foreground (no -d) — blocks until Ctrl+C
     reporter.status("Scribe", "running (Ctrl+C to stop)");
-    let status = compose.run(&["-f", cf, "up", "--abort-on-container-exit"]).await?;
+    let status = compose
+        .run(&["-f", cf, "up", "--abort-on-container-exit"])
+        .await?;
     if !status.success() {
         anyhow::bail!("scribe compose exited with {status}");
     }

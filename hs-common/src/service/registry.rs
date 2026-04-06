@@ -64,12 +64,10 @@ pub async fn discover_or_fallback(
 ) -> Vec<String> {
     match AuthenticatedClient::from_default_path() {
         Ok(auth) => {
-            let result: Result<Vec<String>, _> = tokio::time::timeout(
-                DISCOVERY_TIMEOUT,
-                discover_servers(&auth, service_type),
-            )
-            .await
-            .unwrap_or(Err(anyhow::anyhow!("timeout")));
+            let result: Result<Vec<String>, _> =
+                tokio::time::timeout(DISCOVERY_TIMEOUT, discover_servers(&auth, service_type))
+                    .await
+                    .unwrap_or(Err(anyhow::anyhow!("timeout")));
 
             match result {
                 Ok(urls) if !urls.is_empty() => urls,

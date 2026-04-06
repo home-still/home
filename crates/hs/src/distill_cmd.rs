@@ -429,10 +429,7 @@ pub async fn ensure_init(reporter: &Arc<dyn Reporter>) -> Result<()> {
 
 /// Start the distill server in the foreground (blocks until shutdown).
 /// Runs the native binary directly instead of as a background daemon.
-pub async fn start_server_foreground(
-    port: u16,
-    reporter: &Arc<dyn Reporter>,
-) -> Result<()> {
+pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let config = DistillServerConfig::load().unwrap_or_default();
     let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
 
@@ -502,7 +499,10 @@ pub async fn start_server_foreground(
     let ort_dylib = std::env::var("ORT_DYLIB_PATH")
         .unwrap_or_else(|_| "/usr/lib/libonnxruntime.so".to_string());
 
-    reporter.status("Distill", &format!("running on port {port} (Ctrl+C to stop)"));
+    reporter.status(
+        "Distill",
+        &format!("running on port {port} (Ctrl+C to stop)"),
+    );
 
     // Run in foreground — inherit stdout/stderr, block until exit
     let status = tokio::process::Command::new(&binary)

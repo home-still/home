@@ -59,31 +59,19 @@ fn validate_args(service_type: &str, url: &str) -> Result<()> {
 pub async fn dispatch(cmd: ServerCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
     match cmd {
         ServerCmd::List => cmd_list(reporter).await,
-        ServerCmd::Add {
-            service_type,
-            url,
-        } => {
+        ServerCmd::Add { service_type, url } => {
             validate_args(&service_type, &url)?;
             cmd_add(&service_type, &url, reporter).await
         }
-        ServerCmd::Remove {
-            service_type,
-            url,
-        } => {
+        ServerCmd::Remove { service_type, url } => {
             validate_args(&service_type, &url)?;
             cmd_remove(&service_type, &url, reporter).await
         }
-        ServerCmd::Disable {
-            service_type,
-            url,
-        } => {
+        ServerCmd::Disable { service_type, url } => {
             validate_args(&service_type, &url)?;
             cmd_set_enabled(&service_type, &url, false, reporter).await
         }
-        ServerCmd::Enable {
-            service_type,
-            url,
-        } => {
+        ServerCmd::Enable { service_type, url } => {
             validate_args(&service_type, &url)?;
             cmd_set_enabled(&service_type, &url, true, reporter).await
         }
@@ -153,11 +141,7 @@ async fn cmd_list(reporter: &Arc<dyn Reporter>) -> Result<()> {
         } else {
             "stale"
         };
-        let compute = svc
-            .metadata
-            .compute_device
-            .as_deref()
-            .unwrap_or("—");
+        let compute = svc.metadata.compute_device.as_deref().unwrap_or("—");
         let heartbeat = format!("{}s ago", svc.last_heartbeat_secs_ago);
 
         println!(

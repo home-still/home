@@ -75,8 +75,7 @@ impl ServiceRegistry {
         let services = Arc::clone(&registry.services);
         let timeout = registry.stale_timeout;
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(REAP_INTERVAL_SECS));
+            let mut interval = tokio::time::interval(Duration::from_secs(REAP_INTERVAL_SECS));
             loop {
                 interval.tick().await;
                 let mut map = services.write().await;
@@ -433,7 +432,13 @@ pub async fn handle_set_enabled(
         .await;
     if found {
         let action = if req.enabled { "enabled" } else { "disabled" };
-        tracing::info!("{} {}/{} by {}", action, req.service_type, req.url, claims.sub);
+        tracing::info!(
+            "{} {}/{} by {}",
+            action,
+            req.service_type,
+            req.url,
+            claims.sub
+        );
         (StatusCode::OK, "ok").into_response()
     } else {
         (StatusCode::NOT_FOUND, "service not registered").into_response()

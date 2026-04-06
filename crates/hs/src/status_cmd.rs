@@ -252,10 +252,7 @@ fn load_history(catalog_dir: &Path, limit: usize) -> Vec<HistoryEvent> {
         // Download event
         if let Some(ref dl_at) = entry.downloaded_at {
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(dl_at) {
-                let size = entry
-                    .file_size_bytes
-                    .map(fmt_bytes)
-                    .unwrap_or_default();
+                let size = entry.file_size_bytes.map(fmt_bytes).unwrap_or_default();
                 events.push(HistoryEvent {
                     activity: "Download",
                     name: short_name.clone(),

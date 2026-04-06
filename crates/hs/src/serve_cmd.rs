@@ -222,7 +222,10 @@ impl RegistryGuard {
 
         match resp {
             Ok(r) if r.status().is_success() => {
-                reporter.status("Registry", &format!("registered as {service_type} at {url}"));
+                reporter.status(
+                    "Registry",
+                    &format!("registered as {service_type} at {url}"),
+                );
             }
             Ok(r) => {
                 reporter.warn(&format!("Registry registration failed ({})", r.status()));

@@ -106,7 +106,9 @@ fn main() -> ExitCode {
             match cli.command {
                 TopCmd::Paper { command } => {
                     let is_download = matches!(&command, paper::cli::PaperCmd::Download { .. });
-                    let result = paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode).await;
+                    let result =
+                        paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode)
+                            .await;
                     // Auto-trigger: start scribe watcher after successful download
                     if is_download && result.is_ok() {
                         scribe_cmd::ensure_watcher_running(&reporter);

@@ -89,7 +89,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/cloud/admin/invite", post(enrollment::handle_admin_invite))
         // Service registry
         .route("/registry/register", post(registry::handle_register))
-        .route("/registry/deregister", axum::routing::delete(registry::handle_deregister))
+        .route(
+            "/registry/deregister",
+            axum::routing::delete(registry::handle_deregister),
+        )
         .route("/registry/heartbeat", post(registry::handle_heartbeat))
         .route("/registry/services", get(registry::handle_services))
         .route("/registry/set-enabled", post(registry::handle_set_enabled))
