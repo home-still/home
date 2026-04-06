@@ -40,9 +40,11 @@ struct ServiceStatus {
 
 struct RecentConversion {
     title: String,
+    doc_id: String,
     pages: u64,
     duration_secs: f64,
     converted_at: Option<chrono::DateTime<chrono::Utc>>,
+    embedded: bool,
 }
 
 // ── Data collection ─────────────────────────────────────────────
@@ -200,7 +202,30 @@ async fn collect_data() -> DashboardData {
     }
 
     // Recent conversions from catalog
-    let recent = load_recent_conversions(&scribe_cfg.catalog_dir, 5);
+    let mut recent = load_recent_conversions(&scribe_cfg.catalog_dir, 5);
+
+    // Check embedding status for recent conversions (if distill is reachable)
+    if !distill_cfg.servers.is_empty() {
+        let distill_url = &distill_cfg.servers[0];
+        let client = if hs_common::auth::client::is_cloud_url(distill_url) {
+            match hs_common::auth::client::AuthenticatedClient::from_default_path() {
+                Ok(auth) => match auth.build_reqwest_client().await {
+                    Ok(http) => {
+                        hs_distill::client::DistillClient::new_with_client(distill_url, http)
+                    }
+                    Err(_) => hs_distill::client::DistillClient::new(distill_url),
+                },
+                Err(_) => hs_distill::client::DistillClient::new(distill_url),
+            }
+        } else {
+            hs_distill::client::DistillClient::new(distill_url)
+        };
+        for r in &mut recent {
+            if let Ok(exists) = client.doc_exists(&r.doc_id).await {
+                r.embedded = exists;
+            }
+        }
+    }
 
     DashboardData {
         pdf_count,
@@ -251,14 +276,21 @@ fn load_recent_conversions(catalog_dir: &Path, limit: usize) -> Vec<RecentConver
                     .to_string_lossy()
                     .into()
             });
+            let doc_id = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             let converted_at = chrono::DateTime::parse_from_rfc3339(&conversion.converted_at)
                 .ok()
                 .map(|dt| dt.with_timezone(&chrono::Utc));
             Some(RecentConversion {
                 title,
+                doc_id,
                 pages: conversion.total_pages,
                 duration_secs: conversion.duration_secs as f64,
                 converted_at,
+                embedded: false, // updated below
             })
         })
         .collect()
@@ -504,11 +536,17 @@ fn render_recent(frame: &mut Frame, area: Rect, data: &DashboardData) {
         .map(|r| {
             let title: String = r.title.chars().take(30).collect();
             let ago = r.converted_at.as_ref().map(fmt_ago).unwrap_or_default();
+            let (embed_icon, embed_style) = if r.embedded {
+                ("●", Style::default().fg(Color::Green))
+            } else {
+                ("○", Style::default().fg(Color::DarkGray))
+            };
             Row::new(vec![
                 Cell::from(title),
                 Cell::from(format!("{:>3}pg", r.pages)),
                 Cell::from(format!("{:.1}s", r.duration_secs)),
                 Cell::from(ago),
+                Cell::from(embed_icon).style(embed_style),
             ])
         })
         .collect();
@@ -520,6 +558,7 @@ fn render_recent(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Constraint::Length(6),
             Constraint::Length(8),
             Constraint::Length(10),
+            Constraint::Length(3),
         ],
     );
 
