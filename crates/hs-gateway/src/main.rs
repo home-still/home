@@ -9,6 +9,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 mod config;
 mod enrollment;
+mod oauth;
 mod proxy;
 mod state;
 
@@ -57,9 +58,27 @@ async fn main() -> anyhow::Result<()> {
         gateway_url,
         cf_access_client_id: None,     // TODO: load from config
         cf_access_client_secret: None, // TODO: load from config
+        auth_codes: oauth::new_auth_code_store(),
+        oauth_clients: oauth::new_client_store(),
     });
 
     let app = Router::new()
+        // OAuth 2.1 discovery endpoints
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth::handle_protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth::handle_auth_server_metadata),
+        )
+        // OAuth 2.1 authorization + token + registration
+        .route(
+            "/authorize",
+            get(oauth::handle_authorize_get).post(oauth::handle_authorize_post),
+        )
+        .route("/token", post(oauth::handle_token))
+        .route("/register", post(oauth::handle_register))
         // Unauthenticated endpoints
         .route("/health", get(handle_health))
         .route("/cloud/enroll", post(enrollment::handle_enroll))

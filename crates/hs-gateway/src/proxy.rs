@@ -26,7 +26,7 @@ pub async fn proxy_handler(State(state): State<Arc<GatewayState>>, req: Request<
     let token_str = match auth_header {
         Some(t) => t.to_string(),
         None => {
-            return (StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response();
+            return unauthorized_response(&state.gateway_url);
         }
     };
 
@@ -34,10 +34,10 @@ pub async fn proxy_handler(State(state): State<Arc<GatewayState>>, req: Request<
     let claims = match token::validate_token(&state.secret, &token_str, false) {
         Ok(c) => c,
         Err(TokenError::Expired) => {
-            return (StatusCode::UNAUTHORIZED, "Token expired").into_response();
+            return unauthorized_response(&state.gateway_url);
         }
         Err(_) => {
-            return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+            return unauthorized_response(&state.gateway_url);
         }
     };
 
@@ -160,6 +160,21 @@ async fn forward_request(
     response.body(body).unwrap_or_else(|_| {
         (StatusCode::INTERNAL_SERVER_ERROR, "Response build failed").into_response()
     })
+}
+
+/// Build a 401 response with WWW-Authenticate header for OAuth discovery.
+fn unauthorized_response(gateway_url: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(
+            "WWW-Authenticate",
+            format!(
+                r#"Bearer resource_metadata="{}/.well-known/oauth-protected-resource""#,
+                gateway_url
+            ),
+        )
+        .body(Body::from("Unauthorized"))
+        .unwrap_or_else(|_| (StatusCode::UNAUTHORIZED, "Unauthorized").into_response())
 }
 
 #[cfg(test)]

@@ -22,3 +22,5 @@ dirs = { workspace = true }
 figment = { workspace = true }
 serde_yaml_ng = { workspace = true }
 rand = "0.9"
+sha2 = "0.10"
+base64 = "0.22"

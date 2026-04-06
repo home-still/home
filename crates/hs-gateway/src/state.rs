@@ -2,6 +2,7 @@
 
 use crate::config::GatewayConfig;
 use crate::enrollment::EnrollmentStore;
+use crate::oauth::{AuthCodeStore, ClientStore};
 
 /// Shared state for the gateway server.
 pub struct GatewayState {
@@ -14,4 +15,8 @@ pub struct GatewayState {
     /// Optional Cloudflare Access credentials to distribute during enrollment
     pub cf_access_client_id: Option<String>,
     pub cf_access_client_secret: Option<String>,
+    /// OAuth authorization codes pending exchange
+    pub auth_codes: AuthCodeStore,
+    /// Dynamically registered OAuth clients
+    pub oauth_clients: ClientStore,
 }
