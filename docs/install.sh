@@ -4,6 +4,15 @@ set -eu
 REPO="home-still/home"
 TOOL="hs"
 INSTALL_DIR="${HOME}/.local/bin"
+PRE=false
+
+# Parse flags
+for arg in "$@"; do
+    case "$arg" in
+        --pre) PRE=true ;;
+        *)     echo "Usage: install.sh [--pre]"; exit 1 ;;
+    esac
+done
 
 # Detect platform
 OS="$(uname -s)"
@@ -23,8 +32,12 @@ esac
 
 TARGET="${arch}-${os}"
 
-# Get latest version from GitHub API
-VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
+# Get version from GitHub API (--pre includes release candidates)
+if [ "$PRE" = true ]; then
+    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+else
+    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
+fi
 
 if [ -z "${VERSION}" ]; then
     echo "Failed to fetch latest version"
@@ -43,14 +56,16 @@ chmod +x "${INSTALL_DIR}/${TOOL}"
 
 echo "Installed ${TOOL} to ${INSTALL_DIR}/${TOOL}"
 
-# Install hs-distill-server if available for this platform
-DISTILL_ARCHIVE="hs-distill-server-${VERSION}-${TARGET}.tar.gz"
-DISTILL_URL="https://github.com/${REPO}/releases/download/${VERSION}/${DISTILL_ARCHIVE}"
-if curl -fsSL -o /dev/null --head "${DISTILL_URL}" 2>/dev/null; then
-    curl -fsSL "${DISTILL_URL}" | tar -xz -C "${INSTALL_DIR}"
-    chmod +x "${INSTALL_DIR}/hs-distill-server"
-    echo "Installed hs-distill-server to ${INSTALL_DIR}/hs-distill-server"
-fi
+# Install companion binaries if available for this platform
+for COMPANION in hs-distill-server hs-gateway hs-mcp; do
+    COMP_ARCHIVE="${COMPANION}-${VERSION}-${TARGET}.tar.gz"
+    COMP_URL="https://github.com/${REPO}/releases/download/${VERSION}/${COMP_ARCHIVE}"
+    if curl -fsSL -o /dev/null --head "${COMP_URL}" 2>/dev/null; then
+        curl -fsSL "${COMP_URL}" | tar -xz -C "${INSTALL_DIR}"
+        chmod +x "${INSTALL_DIR}/${COMPANION}"
+        echo "Installed ${COMPANION} to ${INSTALL_DIR}/${COMPANION}"
+    fi
+done
 
 # Check if INSTALL_DIR is in PATH
 case ":${PATH}:" in
