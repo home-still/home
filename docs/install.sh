@@ -34,7 +34,8 @@ TARGET="${arch}-${os}"
 
 # Get version from GitHub API (--pre includes release candidates)
 if [ "$PRE" = true ]; then
-    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+    # Fetch all recent tags, extract versions, sort by semver, pick highest
+    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=10" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -1)"
 else
     VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
 fi

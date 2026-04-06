@@ -209,7 +209,7 @@ async fn fetch_latest_release_including_pre(reporter: &Arc<dyn Reporter>) -> Res
     let mut builder = reqwest::Client::builder()
         .user_agent(format!("hs/{}", env!("HS_VERSION")))
         .build()?
-        .get(format!("{GITHUB_API_RELEASES}?per_page=1"));
+        .get(format!("{GITHUB_API_RELEASES}?per_page=10"));
 
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         builder = builder.bearer_auth(token);
@@ -224,8 +224,16 @@ async fn fetch_latest_release_including_pre(reporter: &Arc<dyn Reporter>) -> Res
         anyhow::bail!("GitHub API returned {}", resp.status());
     }
 
-    let releases: Vec<GitHubRelease> =
+    let mut releases: Vec<GitHubRelease> =
         resp.json().await.context("Failed to parse releases JSON")?;
+
+    // Sort by semver descending (API order is by creation date, not version)
+    releases.sort_by(|a, b| {
+        let va = parse_release_version(&a.tag_name).unwrap_or(semver::Version::new(0, 0, 0));
+        let vb = parse_release_version(&b.tag_name).unwrap_or(semver::Version::new(0, 0, 0));
+        vb.cmp(&va)
+    });
+
     releases
         .into_iter()
         .next()
