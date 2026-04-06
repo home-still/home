@@ -1010,6 +1010,10 @@ async fn cmd_status(output: Option<PathBuf>, reporter: &Arc<dyn Reporter>) -> Re
 // ── Init ────────────────────────────────────────────────────────
 
 async fn cmd_init(force: bool, check: bool) -> Result<()> {
+    cmd_init_inner(force, check, false).await
+}
+
+async fn cmd_init_inner(force: bool, check: bool, prereqs_only: bool) -> Result<()> {
     // Step 1: Check container runtime (auto-install on macOS)
     eprintln!("[1/5] Checking container runtime...");
     let mut compose = ComposeCmd::detect().await;
@@ -1211,6 +1215,11 @@ async fn cmd_init(force: bool, check: bool) -> Result<()> {
         return Ok(());
     }
 
+    if prereqs_only {
+        eprintln!("[5/5] Prerequisites ready (skipping service start)");
+        return Ok(());
+    }
+
     // Step 5: Start services
     eprintln!("[5/5] Starting services...");
     let cf = compose_path.to_str().unwrap_or_default();
@@ -1398,11 +1407,10 @@ pub fn ensure_watcher_running(reporter: &Arc<dyn Reporter>) {
     }
 }
 
-/// Idempotent prereq check + init. Ensures container runtime, models, and
-/// compose config exist. Skips steps that are already done.
-/// Note: cmd_init step 5 starts services — this is intentional for `hs serve`.
+/// Idempotent prereq check: ensures container runtime, models, and compose
+/// config exist. Does NOT start services — `start_server_foreground` handles that.
 pub async fn ensure_init(force: bool) -> Result<()> {
-    cmd_init(force, false).await
+    cmd_init_inner(force, false, true).await
 }
 
 /// Start the scribe server in the foreground (blocks until shutdown).
