@@ -28,7 +28,7 @@ struct DashboardData {
     qdrant_healthy: bool,
     qdrant_url: String,
 
-    recent: Vec<RecentConversion>,
+    history: Vec<HistoryEvent>,
 }
 
 struct ServiceStatus {
@@ -38,13 +38,11 @@ struct ServiceStatus {
     version: String, // server version from /health
 }
 
-struct RecentConversion {
-    title: String,
-    doc_id: String,
-    pages: u64,
-    duration_secs: f64,
-    converted_at: Option<chrono::DateTime<chrono::Utc>>,
-    embedded: bool,
+struct HistoryEvent {
+    activity: &'static str, // "Downloaded", "Converted", "Embedded"
+    name: String,
+    detail: String, // e.g. "12pg 193s" or "27 chunks" or "1.2 MB"
+    when: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ── Data collection ─────────────────────────────────────────────
@@ -201,31 +199,8 @@ async fn collect_data() -> DashboardData {
         }
     }
 
-    // Recent conversions from catalog
-    let mut recent = load_recent_conversions(&scribe_cfg.catalog_dir, 5);
-
-    // Check embedding status for recent conversions (if distill is reachable)
-    if !distill_cfg.servers.is_empty() {
-        let distill_url = &distill_cfg.servers[0];
-        let client = if hs_common::auth::client::is_cloud_url(distill_url) {
-            match hs_common::auth::client::AuthenticatedClient::from_default_path() {
-                Ok(auth) => match auth.build_reqwest_client().await {
-                    Ok(http) => {
-                        hs_distill::client::DistillClient::new_with_client(distill_url, http)
-                    }
-                    Err(_) => hs_distill::client::DistillClient::new(distill_url),
-                },
-                Err(_) => hs_distill::client::DistillClient::new(distill_url),
-            }
-        } else {
-            hs_distill::client::DistillClient::new(distill_url)
-        };
-        for r in &mut recent {
-            if let Ok(exists) = client.doc_exists(&r.doc_id).await {
-                r.embedded = exists;
-            }
-        }
-    }
+    // Build history from catalog entries
+    let history = load_history(&scribe_cfg.catalog_dir, 15);
 
     DashboardData {
         pdf_count,
@@ -240,12 +215,14 @@ async fn collect_data() -> DashboardData {
         distill_servers,
         qdrant_healthy,
         qdrant_url,
-        recent,
+        history,
     }
 }
 
-fn load_recent_conversions(catalog_dir: &Path, limit: usize) -> Vec<RecentConversion> {
-    let mut entries: Vec<_> = std::fs::read_dir(catalog_dir)
+fn load_history(catalog_dir: &Path, limit: usize) -> Vec<HistoryEvent> {
+    let mut events = Vec::new();
+
+    let catalog_entries: Vec<_> = std::fs::read_dir(catalog_dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -255,45 +232,59 @@ fn load_recent_conversions(catalog_dir: &Path, limit: usize) -> Vec<RecentConver
                 .is_some_and(|ext| ext == "yaml" || ext == "yml")
         })
         .filter_map(|e| {
-            let mtime = e.metadata().ok()?.modified().ok()?;
-            Some((e.path(), mtime))
-        })
-        .collect();
-
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
-    entries.truncate(limit);
-
-    entries
-        .into_iter()
-        .filter_map(|(path, _)| {
-            let contents = std::fs::read_to_string(&path).ok()?;
+            let contents = std::fs::read_to_string(e.path()).ok()?;
             let entry: hs_common::catalog::CatalogEntry =
                 serde_yaml_ng::from_str(&contents).ok()?;
-            let conversion = entry.conversion.as_ref()?;
-            let title = entry.title.unwrap_or_else(|| {
-                path.file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into()
-            });
-            let doc_id = path
+            let stem = e
+                .path()
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let converted_at = chrono::DateTime::parse_from_rfc3339(&conversion.converted_at)
-                .ok()
-                .map(|dt| dt.with_timezone(&chrono::Utc));
-            Some(RecentConversion {
-                title,
-                doc_id,
-                pages: conversion.total_pages,
-                duration_secs: conversion.duration_secs as f64,
-                converted_at,
-                embedded: false, // updated below
-            })
+            Some((stem, entry))
         })
-        .collect()
+        .collect();
+
+    for (stem, entry) in &catalog_entries {
+        let name = entry.title.as_deref().unwrap_or(stem);
+        let short_name: String = name.chars().take(40).collect();
+
+        // Download event
+        if let Some(ref dl_at) = entry.downloaded_at {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(dl_at) {
+                let size = entry
+                    .file_size_bytes
+                    .map(fmt_bytes)
+                    .unwrap_or_default();
+                events.push(HistoryEvent {
+                    activity: "Download",
+                    name: short_name.clone(),
+                    detail: size,
+                    when: Some(dt.with_timezone(&chrono::Utc)),
+                });
+            }
+        }
+
+        // Conversion event
+        if let Some(ref conv) = entry.conversion {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&conv.converted_at) {
+                events.push(HistoryEvent {
+                    activity: "Convert",
+                    name: short_name.clone(),
+                    detail: format!("{}pg {:.0}s", conv.total_pages, conv.duration_secs),
+                    when: Some(dt.with_timezone(&chrono::Utc)),
+                });
+            }
+        }
+    }
+
+    events.sort_by(|a, b| {
+        let a_ts = a.when.unwrap_or(chrono::DateTime::UNIX_EPOCH);
+        let b_ts = b.when.unwrap_or(chrono::DateTime::UNIX_EPOCH);
+        b_ts.cmp(&a_ts)
+    });
+    events.truncate(limit);
+    events
 }
 
 // ── Formatting helpers ──────────────────────────────────────────
@@ -348,7 +339,7 @@ fn render(frame: &mut Frame, data: &DashboardData) {
     render_services(frame, outer[3], data);
 
     // Recent conversions
-    render_recent(frame, outer[5], data);
+    render_history(frame, outer[5], data);
 
     // Footer
     frame.render_widget(
@@ -516,37 +507,36 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
     frame.render_widget(table, inner);
 }
 
-fn render_recent(frame: &mut Frame, area: Rect, data: &DashboardData) {
+fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let block = Block::new()
-        .title(" Recent conversions ")
+        .title(" History ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if data.recent.is_empty() {
-        frame.render_widget(Line::from("  No conversions yet").dim(), inner);
+    if data.history.is_empty() {
+        frame.render_widget(Line::from("  No activity yet").dim(), inner);
         return;
     }
 
     let rows: Vec<Row> = data
-        .recent
+        .history
         .iter()
-        .map(|r| {
-            let title: String = r.title.chars().take(30).collect();
-            let ago = r.converted_at.as_ref().map(fmt_ago).unwrap_or_default();
-            let (embed_icon, embed_style) = if r.embedded {
-                ("●", Style::default().fg(Color::Green))
-            } else {
-                ("○", Style::default().fg(Color::DarkGray))
+        .map(|e| {
+            let activity_style = match e.activity {
+                "Download" => Style::default().fg(Color::Cyan),
+                "Convert" => Style::default().fg(Color::Yellow),
+                "Embed" => Style::default().fg(Color::Green),
+                _ => Style::default(),
             };
+            let ago = e.when.as_ref().map(fmt_ago).unwrap_or_default();
             Row::new(vec![
-                Cell::from(title),
-                Cell::from(format!("{:>3}pg", r.pages)),
-                Cell::from(format!("{:.1}s", r.duration_secs)),
+                Cell::from(e.activity).style(activity_style),
+                Cell::from(e.name.clone()),
+                Cell::from(e.detail.clone()).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(ago),
-                Cell::from(embed_icon).style(embed_style),
             ])
         })
         .collect();
@@ -554,11 +544,10 @@ fn render_recent(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let table = Table::new(
         rows,
         [
-            Constraint::Min(20),
-            Constraint::Length(6),
-            Constraint::Length(8),
             Constraint::Length(10),
-            Constraint::Length(3),
+            Constraint::Min(20),
+            Constraint::Length(14),
+            Constraint::Length(10),
         ],
     );
 
@@ -587,7 +576,7 @@ pub async fn run() -> Result<()> {
         distill_servers: vec![],
         qdrant_healthy: false,
         qdrant_url: String::new(),
-        recent: vec![],
+        history: vec![],
     };
 
     loop {
