@@ -19,26 +19,42 @@ pub enum ServeCmd {
         /// Port to listen on
         #[arg(long, default_value_t = DEFAULT_SCRIBE_PORT)]
         port: u16,
+        /// Install as a system service (systemd on Linux, launchd on macOS) and start it
+        #[arg(long)]
+        install: bool,
     },
     /// Run a distill server (auto-init, foreground, registers with gateway)
     Distill {
         /// Port to listen on
         #[arg(long, default_value_t = DEFAULT_DISTILL_PORT)]
         port: u16,
+        /// Install as a system service and start it
+        #[arg(long)]
+        install: bool,
     },
     /// Run an MCP server (foreground, registers with gateway)
     Mcp {
         /// Port to listen on
         #[arg(long, default_value_t = DEFAULT_MCP_PORT)]
         port: u16,
+        /// Install as a system service and start it
+        #[arg(long)]
+        install: bool,
     },
 }
 
 pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
     match cmd {
-        ServeCmd::Scribe { port } => serve_scribe(port, reporter).await,
-        ServeCmd::Distill { port } => serve_distill(port, reporter).await,
-        ServeCmd::Mcp { port } => serve_mcp(port, reporter).await,
+        ServeCmd::Scribe { port, install } if install => {
+            install_service("scribe", port, reporter).await
+        }
+        ServeCmd::Distill { port, install } if install => {
+            install_service("distill", port, reporter).await
+        }
+        ServeCmd::Mcp { port, install } if install => install_service("mcp", port, reporter).await,
+        ServeCmd::Scribe { port, .. } => serve_scribe(port, reporter).await,
+        ServeCmd::Distill { port, .. } => serve_distill(port, reporter).await,
+        ServeCmd::Mcp { port, .. } => serve_mcp(port, reporter).await,
     }
 }
 
@@ -136,6 +152,161 @@ async fn serve_mcp(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     reporter.finish("mcp server stopped");
+    Ok(())
+}
+
+// ── Service Installation ───────────────────────────────────────
+
+async fn install_service(
+    service_type: &str,
+    port: u16,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    let ip = local_ip_hint();
+    let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
+    let hs_path = hs_bin.display();
+    let user = std::env::var("USER").unwrap_or_else(|_| "ladvien".into());
+
+    #[cfg(target_os = "linux")]
+    {
+        let service_name = format!("hs-serve-{service_type}");
+        let unit_path = format!("/etc/systemd/system/{service_name}.service");
+
+        let unit = format!(
+            r#"[Unit]
+Description=Home-Still {service_type} server
+After=network.target
+
+[Service]
+Type=simple
+User={user}
+Environment=HS_ADVERTISE_IP={ip}
+ExecStart={hs_path} serve {service_type} --port {port}
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+"#
+        );
+
+        reporter.status("Install", &format!("writing {unit_path}"));
+
+        // Write unit file (needs sudo)
+        let tmp = format!("/tmp/{service_name}.service");
+        std::fs::write(&tmp, &unit).context("Failed to write temp unit file")?;
+
+        let status = tokio::process::Command::new("sudo")
+            .args(["cp", &tmp, &unit_path])
+            .status()
+            .await
+            .context("sudo cp failed")?;
+        if !status.success() {
+            anyhow::bail!("Failed to install systemd unit (sudo cp)");
+        }
+        let _ = std::fs::remove_file(&tmp);
+
+        reporter.status("Enable", &format!("{service_name}.service"));
+        let status = tokio::process::Command::new("sudo")
+            .args(["systemctl", "daemon-reload"])
+            .status()
+            .await?;
+        if !status.success() {
+            anyhow::bail!("systemctl daemon-reload failed");
+        }
+
+        let status = tokio::process::Command::new("sudo")
+            .args(["systemctl", "enable", "--now", &service_name])
+            .status()
+            .await?;
+        if !status.success() {
+            anyhow::bail!("systemctl enable --now failed");
+        }
+
+        reporter.finish(&format!(
+            "Installed and started {service_name}\n\
+             View logs: journalctl -u {service_name} -f\n\
+             Stop:      sudo systemctl stop {service_name}\n\
+             Disable:   sudo systemctl disable {service_name}"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let label = format!("com.home-still.{service_type}");
+        let plist_dir = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+            .join("Library/LaunchAgents");
+        let plist_path = plist_dir.join(format!("{label}.plist"));
+
+        std::fs::create_dir_all(&plist_dir)?;
+
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://schemas.apple.com/dtds/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{hs_path}</string>
+        <string>serve</string>
+        <string>{service_type}</string>
+        <string>--port</string>
+        <string>{port}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HS_ADVERTISE_IP</key>
+        <string>{ip}</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/hs-{service_type}.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/hs-{service_type}.log</string>
+</dict>
+</plist>
+"#
+        );
+
+        reporter.status("Install", &format!("{}", plist_path.display()));
+        std::fs::write(&plist_path, &plist)?;
+
+        reporter.status("Load", &label);
+        // Unload first in case it's already loaded (ignore errors)
+        let _ = tokio::process::Command::new("launchctl")
+            .args(["unload", &plist_path.to_string_lossy()])
+            .status()
+            .await;
+
+        let status = tokio::process::Command::new("launchctl")
+            .args(["load", &plist_path.to_string_lossy()])
+            .status()
+            .await?;
+        if !status.success() {
+            anyhow::bail!("launchctl load failed");
+        }
+
+        reporter.finish(&format!(
+            "Installed and started {label}\n\
+             View logs: tail -f /tmp/hs-{service_type}.log\n\
+             Stop:      launchctl unload {}\n\
+             Remove:    rm {}",
+            plist_path.display(),
+            plist_path.display()
+        ));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        anyhow::bail!("--install is only supported on Linux (systemd) and macOS (launchd)");
+    }
+
     Ok(())
 }
 
