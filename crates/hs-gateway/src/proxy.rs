@@ -1,5 +1,6 @@
 //! Reverse proxy — forward authenticated requests to LAN backend services.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -10,6 +11,9 @@ use axum::response::{IntoResponse, Response};
 use hs_common::auth::token::{self, TokenError};
 
 use crate::state::GatewayState;
+
+/// Round-robin counter for load balancing across registry backends.
+static PROXY_RR: AtomicUsize = AtomicUsize::new(0);
 
 /// Generic proxy handler for service routes.
 ///
@@ -54,16 +58,19 @@ pub async fn proxy_handler(State(state): State<Arc<GatewayState>>, req: Request<
             .into_response();
     }
 
-    // Resolve backend URL
-    let backend_base = match state.config.backend_for(&service_name) {
-        Some(url) => url.to_string(),
-        None => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("No backend configured for service: {service_name}"),
-            )
-                .into_response();
-        }
+    // Resolve backend URL: registry first (round-robin), then static config fallback
+    let registry_urls = state.registry.healthy_services(&service_name).await;
+    let backend_base = if !registry_urls.is_empty() {
+        let idx = PROXY_RR.fetch_add(1, Ordering::Relaxed) % registry_urls.len();
+        registry_urls[idx].clone()
+    } else if let Some(url) = state.config.backend_for(&service_name) {
+        url.to_string()
+    } else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("No backend configured for service: {service_name}"),
+        )
+            .into_response();
     };
 
     let backend_url = format!("{backend_base}{backend_path}");

@@ -122,6 +122,38 @@ All other paths are proxied to backend services based on path prefix:
 
 Unauthenticated requests return `401` with a `WWW-Authenticate` header pointing to the OAuth discovery endpoint, triggering the OAuth flow in Claude Desktop.
 
+### Service Registry (bearer token required)
+
+Backend services register themselves at startup and maintain presence with periodic heartbeats. The proxy queries the registry before falling back to the static `routes` config, so registered services take priority.
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/registry/register` | POST | Server announces itself (bearer token must have scope for the service type) |
+| `/registry/deregister` | DELETE | Server removes itself from the registry |
+| `/registry/heartbeat` | POST | Server sends periodic heartbeat (every 30s) |
+| `/registry/services` | GET | Client queries available servers |
+| `/registry/set-enabled` | POST | Enable or disable a server |
+
+**`GET /registry/services` response:**
+
+```json
+[
+  {
+    "service_type": "scribe",
+    "url": "http://gpu-server:7433",
+    "device_name": "big",
+    "enabled": true,
+    "healthy": true,
+    "last_heartbeat_secs_ago": 12,
+    "metadata": {}
+  }
+]
+```
+
+**Registration protocol:** Services use their existing cloud enrollment credentials (the same bearer token obtained via `hs cloud enroll`) to authenticate when calling `/registry/register`. The token's scopes determine which service types the device is allowed to register.
+
+**Dynamic routing:** When a proxied request arrives, the gateway first checks the service registry for a healthy, enabled instance matching the path prefix. If no registry entry is found, it falls back to the static `routes` map in `config.yaml`.
+
 ## Enrolling devices
 
 **On the gateway host:**

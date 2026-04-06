@@ -8,7 +8,7 @@ name = "hs-mcp"
 path = "src/main.rs"
 
 [dependencies]
-hs-common = { workspace = true, features = ["cli", "service", "catalog"] }
+hs-common = { workspace = true, features = ["cli", "service", "catalog", "auth"] }
 hs-scribe = { path = "../hs-scribe", features = ["client"] }
 hs-distill = { path = "../hs-distill", features = ["client"] }
 paper = { path = "../../paper" }

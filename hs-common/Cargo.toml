@@ -41,6 +41,7 @@ auth = [
     "dep:serde_json",
     "dep:anyhow",
     "dep:reqwest",
+    "dep:tokio",
 ]
 
 [dependencies]

@@ -11,6 +11,7 @@ mod config;
 mod enrollment;
 mod oauth;
 mod proxy;
+pub mod registry;
 mod state;
 
 use config::GatewayConfig;
@@ -60,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         cf_access_client_secret: None, // TODO: load from config
         auth_codes: oauth::new_auth_code_store(),
         oauth_clients: oauth::new_client_store(),
+        registry: registry::ServiceRegistry::new(),
     });
 
     let app = Router::new()
@@ -85,6 +87,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/cloud/refresh", post(enrollment::handle_refresh))
         // Admin: register enrollment codes (only accessible from localhost)
         .route("/cloud/admin/invite", post(enrollment::handle_admin_invite))
+        // Service registry
+        .route("/registry/register", post(registry::handle_register))
+        .route("/registry/deregister", axum::routing::delete(registry::handle_deregister))
+        .route("/registry/heartbeat", post(registry::handle_heartbeat))
+        .route("/registry/services", get(registry::handle_services))
+        .route("/registry/set-enabled", post(registry::handle_set_enabled))
         // Authenticated proxy — catch all remaining paths
         .fallback(any(proxy::proxy_handler))
         .with_state(state);

@@ -26,23 +26,15 @@ async fn make_distill_client(url: &str) -> Result<DistillClient> {
 const QDRANT_REST_PORT: u16 = 6333;
 const QDRANT_GRPC_PORT: u16 = 6334;
 
-fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
+async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
     if let Some(s) = cli_server {
         return vec![s.to_string()];
     }
-    match DistillClientConfig::load() {
-        Ok(cfg) => {
-            if cfg.servers.is_empty() {
-                vec![DEFAULT_SERVER.to_string()]
-            } else {
-                cfg.servers
-            }
-        }
-        Err(e) => {
-            eprintln!("warning: Failed to load distill config: {e}, using default server");
-            vec![DEFAULT_SERVER.to_string()]
-        }
-    }
+    let config_servers = match DistillClientConfig::load() {
+        Ok(cfg) if !cfg.servers.is_empty() => cfg.servers,
+        _ => vec![DEFAULT_SERVER.to_string()],
+    };
+    hs_common::service::registry::discover_or_fallback("distill", config_servers).await
 }
 
 fn hidden_dir() -> PathBuf {
@@ -427,7 +419,152 @@ async fn cmd_server_stop(reporter: &Arc<dyn Reporter>) -> Result<()> {
     Ok(())
 }
 
+// ── Public API for `hs serve` ──────────────────────────────────
+
+/// Idempotent init: ensures Qdrant and compose config are ready.
+/// Skips steps that are already done. Does NOT start the distill server.
+pub async fn ensure_init(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    cmd_init(false, reporter).await
+}
+
+/// Start the distill server in the foreground (blocks until shutdown).
+/// Runs the native binary directly instead of as a background daemon.
+pub async fn start_server_foreground(
+    port: u16,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    let config = DistillServerConfig::load().unwrap_or_default();
+    let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
+
+    // Ensure Qdrant is running
+    let compose_path = distill_compose_path();
+    if compose_path.exists() {
+        let compose = ComposeCmd::detect()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No container runtime found. Run: hs distill init"))?;
+        let cf = compose_path.to_string_lossy().to_string();
+        compose.run(&["-f", &cf, "up", "-d"]).await?;
+        hs_common::compose::wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
+        reporter.status("Qdrant", "OK");
+    } else {
+        let reachable = reqwest::get(&format!("{qdrant_rest}/healthz"))
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if !reachable {
+            anyhow::bail!(
+                "Qdrant not reachable at {qdrant_rest} and no compose config found.\n\
+                 Run: hs distill init"
+            );
+        }
+    }
+
+    let binary = find_distill_binary().ok_or_else(|| {
+        anyhow::anyhow!(
+            "hs-distill-server binary not found. Build with:\n  \
+             cargo build --release -p hs-distill --features server"
+        )
+    })?;
+
+    // Build environment (same logic as cmd_server_start)
+    let mut ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    if let Some(cache_dir) = find_ort_cuda_libs() {
+        if !ld_path.contains(&cache_dir) {
+            if !ld_path.is_empty() {
+                ld_path.push(':');
+            }
+            ld_path.push_str(&cache_dir);
+        }
+    }
+    for extra in [
+        "/usr/local/lib",
+        "/opt/cuda/lib64",
+        "/opt/cuda/targets/x86_64-linux/lib",
+    ] {
+        if !ld_path.contains(extra) {
+            if !ld_path.is_empty() {
+                ld_path.push(':');
+            }
+            ld_path.push_str(extra);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let user_lib = home.join(".local/lib");
+        let user_lib_str = user_lib.to_string_lossy().to_string();
+        if !ld_path.contains(&user_lib_str) {
+            if !ld_path.is_empty() {
+                ld_path.push(':');
+            }
+            ld_path.push_str(&user_lib_str);
+        }
+    }
+
+    let ort_dylib = std::env::var("ORT_DYLIB_PATH")
+        .unwrap_or_else(|_| "/usr/lib/libonnxruntime.so".to_string());
+
+    reporter.status("Distill", &format!("running on port {port} (Ctrl+C to stop)"));
+
+    // Run in foreground — inherit stdout/stderr, block until exit
+    let status = tokio::process::Command::new(&binary)
+        .env("LD_LIBRARY_PATH", &ld_path)
+        .env("ORT_DYLIB_PATH", &ort_dylib)
+        .env("HS_DISTILL_PORT", port.to_string())
+        .kill_on_drop(true)
+        .status()
+        .await
+        .context("Failed to start distill server")?;
+
+    if !status.success() {
+        anyhow::bail!("distill server exited with {status}");
+    }
+
+    Ok(())
+}
+
 // ── Status ──────────────────────────────────────────────────────
+
+/// Ensure the index daemon is running. Spawns it if not already active.
+/// Used by the pipeline auto-trigger: scribe watch → distill index.
+/// Skips if distill server is not reachable (avoids spawning a daemon that
+/// will immediately fail its health check).
+pub fn ensure_index_running() -> bool {
+    let pid_path = index_pid_path();
+    if let Some(pid) = crate::daemon::read_pid(&pid_path) {
+        if crate::daemon::is_process_alive(pid) {
+            return true; // already running
+        }
+        crate::daemon::remove_pid_file(&pid_path);
+    }
+
+    // Quick check: is the distill server binary available?
+    if find_distill_binary().is_none() {
+        tracing::debug!("Skipping auto-index: hs-distill-server binary not found");
+        return false;
+    }
+
+    // Quick check: is the distill server PID alive? (doesn't guarantee health,
+    // but avoids spawning a daemon when the server clearly isn't running)
+    let server_pid_path = distill_pid_path();
+    let server_running = crate::daemon::read_pid(&server_pid_path)
+        .map(crate::daemon::is_process_alive)
+        .unwrap_or(false);
+    if !server_running {
+        tracing::debug!("Skipping auto-index: distill server not running");
+        return false;
+    }
+
+    // Spawn index daemon with defaults (no specific files, no force)
+    match spawn_index_daemon(&None, None, false, false) {
+        Ok(pid) => {
+            tracing::info!("Auto-started index daemon (PID {pid})");
+            true
+        }
+        Err(e) => {
+            tracing::warn!("Failed to auto-start index daemon: {e}");
+            false
+        }
+    }
+}
 
 async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let config = DistillServerConfig::load().unwrap_or_default();
@@ -456,7 +593,7 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
     }
 
     // Collection info (if server is reachable)
-    let servers = resolve_servers(server);
+    let servers = resolve_servers(server).await;
     let client = DistillClient::new(&servers[0]);
     match client.status().await {
         Ok(status) => {
@@ -593,7 +730,7 @@ async fn cmd_index(
     }
 
     // Health check before spawning
-    let servers = resolve_servers(server);
+    let servers = resolve_servers(server).await;
     let client = DistillClient::new(&servers[0]);
     match client.health().await {
         Ok(h) => reporter.status(
@@ -697,7 +834,7 @@ async fn cmd_index_daemon(
     let pid_path = index_pid_path();
     crate::daemon::write_pid_file(&pid_path)?;
 
-    let servers = resolve_servers(server);
+    let servers = resolve_servers(server).await;
     let client = DistillClient::new(&servers[0]);
 
     // Health check
@@ -792,7 +929,7 @@ async fn cmd_search(
         anyhow::bail!("Search query cannot be empty");
     }
 
-    let servers = resolve_servers(server);
+    let servers = resolve_servers(server).await;
     let client = make_distill_client(&servers[0]).await?;
 
     let filters = hs_distill::client::SearchFilters { year, topic };

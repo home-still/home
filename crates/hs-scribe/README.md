@@ -149,6 +149,8 @@ scribe:
 
 With multiple servers, `hs scribe convert` and `hs scribe watch` automatically load-balance across them. The CLI queries each server's `/readiness` endpoint and routes each PDF to the server with the most available VLM slots.
 
+Server discovery uses the gateway service registry when available, falling back to the configured server list.
+
 ### Server config (environment variables)
 
 Server-side settings use environment variables with the `HS_SCRIBE_` prefix. They can also be set in `~/.config/home-still/config.yaml`.

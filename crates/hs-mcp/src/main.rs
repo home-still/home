@@ -81,16 +81,28 @@ struct HomeStillMcp {
 }
 
 impl HomeStillMcp {
-    fn new() -> Self {
+    async fn new() -> Self {
         let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
         let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
+
+        // Discover servers from gateway registry, falling back to config
+        let scribe_servers = hs_common::service::registry::discover_or_fallback(
+            "scribe",
+            scribe_cfg.servers.clone(),
+        )
+        .await;
+        let distill_servers = hs_common::service::registry::discover_or_fallback(
+            "distill",
+            distill_cfg.servers.clone(),
+        )
+        .await;
 
         Self {
             catalog_dir: scribe_cfg.catalog_dir.clone(),
             markdown_dir: scribe_cfg.output_dir.clone(),
             papers_dir: scribe_cfg.watch_dir.clone(),
-            scribe_servers: scribe_cfg.servers,
-            distill_servers: distill_cfg.servers,
+            scribe_servers,
+            distill_servers,
             tool_router: Self::tool_router(),
         }
     }
@@ -467,7 +479,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let server = HomeStillMcp::new();
+    let server = HomeStillMcp::new().await;
 
     if let Some(addr) = args.serve {
         // SSE mode: Streamable HTTP transport

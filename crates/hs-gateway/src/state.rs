@@ -3,6 +3,7 @@
 use crate::config::GatewayConfig;
 use crate::enrollment::EnrollmentStore;
 use crate::oauth::{AuthCodeStore, ClientStore};
+use crate::registry::ServiceRegistry;
 
 /// Shared state for the gateway server.
 pub struct GatewayState {
@@ -19,4 +20,6 @@ pub struct GatewayState {
     pub auth_codes: AuthCodeStore,
     /// Dynamically registered OAuth clients
     pub oauth_clients: ClientStore,
+    /// Dynamic service registry (scribe, distill, mcp servers)
+    pub registry: ServiceRegistry,
 }

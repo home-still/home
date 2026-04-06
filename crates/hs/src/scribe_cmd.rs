@@ -23,24 +23,16 @@ async fn make_scribe_client(url: &str) -> Result<hs_scribe::client::ScribeClient
     }
 }
 
-/// Resolve the server list from CLI flag, config file, or default.
-fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
+/// Resolve the server list from CLI flag, gateway registry, config file, or default.
+async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
     if let Some(s) = cli_server {
         return vec![s.to_string()];
     }
-    match ScribeConfig::load() {
-        Ok(cfg) => {
-            if cfg.servers.is_empty() {
-                vec![DEFAULT_SERVER.to_string()]
-            } else {
-                cfg.servers
-            }
-        }
-        Err(e) => {
-            eprintln!("warning: Failed to load scribe config: {e}, using default server");
-            vec![DEFAULT_SERVER.to_string()]
-        }
-    }
+    let config_servers = match ScribeConfig::load() {
+        Ok(cfg) if !cfg.servers.is_empty() => cfg.servers,
+        _ => vec![DEFAULT_SERVER.to_string()],
+    };
+    hs_common::service::registry::discover_or_fallback("scribe", config_servers).await
 }
 const LAYOUT_MODEL_URL: &str =
     "https://github.com/home-still/home/releases/download/v0.0.1-rc.39/pp-doclayoutv3.onnx";
@@ -240,7 +232,7 @@ async fn cmd_convert(
     server: Option<String>,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    let servers = resolve_servers(server.as_deref());
+    let servers = resolve_servers(server.as_deref()).await;
 
     // Health check
     let check_stage = reporter.begin_stage("Connecting", None);
@@ -615,7 +607,7 @@ async fn cmd_watch(
     use notify::{PollWatcher, RecursiveMode, Watcher};
     use std::time::Duration;
 
-    let servers = resolve_servers(server.as_deref());
+    let servers = resolve_servers(server.as_deref()).await;
     let scribe_cfg = ScribeConfig::load().unwrap_or_default();
     let corrupted_dir = scribe_cfg.corrupted_dir.clone();
     let catalog_dir = scribe_cfg.catalog_dir.clone();
@@ -653,6 +645,11 @@ async fn cmd_watch(
     let reachable = results.iter().filter(|(_, ok)| *ok).count();
     if reachable == 0 {
         anyhow::bail!("No scribe servers reachable. Run `hs scribe server start` first.");
+    }
+
+    // Auto-trigger: ensure distill index daemon is running
+    if crate::distill_cmd::ensure_index_running() {
+        reporter.status("Pipeline", "distill indexer running");
     }
 
     let stats = Arc::new(WatchStats::new());
@@ -1364,6 +1361,100 @@ async fn cmd_server(action: ServerAction) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+// ── Public API ─────────────────────────────────────────────────
+
+/// Ensure the scribe watch daemon is running. Spawns it if not already active.
+/// Used by the pipeline auto-trigger: paper download → scribe watch.
+/// Skips silently if scribe is not initialized (compose config missing).
+pub fn ensure_watcher_running(reporter: &Arc<dyn Reporter>) {
+    // Don't auto-start if scribe hasn't been initialized
+    let compose_path = hidden_dir().join("docker-compose.yml");
+    if !compose_path.exists() {
+        reporter.warn(
+            "Scribe not initialized — run `hs scribe init` to enable auto-conversion",
+        );
+        return;
+    }
+
+    let watch_dir = resolve_watch_dir(None);
+
+    match crate::daemon::acquire_instance_lock(&watch_dir) {
+        Ok(()) => {
+            // Not running — start it
+            match crate::daemon::spawn_daemon(None, None, None) {
+                Ok(pid) => {
+                    reporter.status("Pipeline", &format!("scribe watcher started (PID {pid})"));
+                }
+                Err(e) => {
+                    reporter.warn(&format!("Could not auto-start scribe watcher: {e}"));
+                }
+            }
+        }
+        Err(pid) => {
+            // Already running
+            tracing::debug!("Scribe watcher already running (PID {pid})");
+        }
+    }
+}
+
+/// Idempotent prereq check + init. Ensures container runtime, models, and
+/// compose config exist. Skips steps that are already done.
+/// Note: cmd_init step 5 starts services — this is intentional for `hs serve`.
+pub async fn ensure_init(force: bool) -> Result<()> {
+    cmd_init(force, false).await
+}
+
+/// Start the scribe server in the foreground (blocks until shutdown).
+/// Runs `compose up` without `-d` so the process stays attached.
+///
+/// Note: the scribe server port is determined by the Docker compose config
+/// generated during `hs scribe init`. The `port` parameter is currently used
+/// only for gateway registration (the URL advertised to the registry).
+pub async fn start_server_foreground(
+    _port: u16,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    let compose_path = hidden_dir().join("docker-compose.yml");
+    if !compose_path.exists() {
+        anyhow::bail!("No compose config found. Run `hs scribe init` or `hs serve scribe` first.");
+    }
+    let compose = ComposeCmd::detect()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("No container runtime found"))?;
+    let cf = compose_path.to_str().unwrap_or_default();
+
+    // Ensure native Ollama is running if needed
+    let has_nvidia = check_command("nvidia-smi", &[]).await;
+    if should_use_native_ollama(has_nvidia) && !check_ollama_running().await {
+        if cfg!(target_os = "linux") {
+            reporter.status("Ollama", "starting systemd service");
+            ensure_ollama_systemd().await?;
+        } else {
+            reporter.status("Ollama", "starting native");
+            let _ = tokio::process::Command::new("ollama")
+                .arg("serve")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            wait_for_ollama_native(30).await?;
+        }
+    }
+
+    // Start compose in foreground (no -d) — blocks until Ctrl+C
+    reporter.status("Scribe", "running (Ctrl+C to stop)");
+    let status = compose.run(&["-f", cf, "up", "--abort-on-container-exit"]).await?;
+    if !status.success() {
+        anyhow::bail!("scribe compose exited with {status}");
+    }
+
+    // Cleanup: unload VLM model from VRAM
+    if should_use_native_ollama(has_nvidia) {
+        unload_ollama_model("glm-ocr").await;
+    }
+
     Ok(())
 }
 

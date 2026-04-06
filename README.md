@@ -15,11 +15,10 @@ Installs the `hs` binary to `~/.local/bin/`. Supports macOS (Intel + Apple Silic
 ```sh
 hs config init                                    # set up config + API keys
 hs paper search "transformer attention mechanisms" # search across 6 providers
-hs paper download "neural nets" -n 25              # download PDFs
-hs scribe init                                     # set up PDF conversion server
-hs scribe convert paper.pdf -o paper.md            # convert PDF to markdown
-hs distill init                                    # set up vector search
-hs distill index                                   # index markdown into Qdrant
+hs paper download "neural nets" -n 25              # download PDFs (auto-starts scribe + distill)
+hs serve scribe                                    # run scribe service on this machine
+hs serve distill                                   # run distill service on this machine
+hs server list                                     # see all registered machines
 hs distill search "attention mechanism"            # semantic search
 hs status                                          # live pipeline dashboard
 ```
@@ -34,6 +33,8 @@ home-still is a four-phase academic research engine:
 | **Convert** | `hs scribe` | Convert PDFs to markdown using layout detection + VLM OCR | Working |
 | **Index** | `hs distill` | Chunk, embed, and index documents into Qdrant | Working |
 | **Search** | `hs distill search` | Semantic search across indexed documents | Working |
+| **Serve** | `hs serve` | Run a service on this machine (auto-init + gateway registration) | Working |
+| **Fleet** | `hs server` | Manage registered machines across the network | Working |
 | **Cloud** | `hs cloud` | Secure remote access via Cloudflare tunnel + OAuth2 | Working |
 
 ## Paper search
@@ -72,6 +73,8 @@ hs paper download --doi "10.48550/arXiv.2301.00001"
 # Higher concurrency
 hs paper download "transformers" -n 100 -c 8
 ```
+
+Downloading papers auto-triggers the full pipeline: the scribe watcher detects new PDFs and converts them to markdown, then the distill indexer picks up new markdown files and indexes them into Qdrant. No manual `hs scribe convert` or `hs distill index` step is needed when the services are running.
 
 ### Search options
 
@@ -183,6 +186,32 @@ Live TUI showing:
 - **Recent conversions** -- title, pages, duration, timestamp
 
 Refreshes every 3 seconds. Press `q` to quit.
+
+## Service Deployment (Serve)
+
+Run a service on the current machine. Each `hs serve` command initializes the service if needed, starts it, and registers it with the gateway so other machines can discover it.
+
+```sh
+hs serve scribe                   # run scribe (PDF conversion) on this machine
+hs serve distill                  # run distill (embedding + search) on this machine
+hs serve mcp                      # run MCP server on this machine
+```
+
+Services auto-initialize on first run (equivalent to `hs scribe init` / `hs distill init`), then register with the gateway for discovery by other nodes. Once registered, `hs paper download` on any machine can route conversions to this node.
+
+## Fleet Management (Server)
+
+Manage the set of machines registered across the network.
+
+```sh
+hs server list                    # show all registered machines and their services
+hs server add gpu-box:7433        # register a new machine
+hs server remove gpu-box:7433     # unregister a machine
+hs server disable gpu-box:7433    # temporarily take a machine out of rotation
+hs server enable gpu-box:7433     # bring a disabled machine back online
+```
+
+Disabled servers remain in the config but are skipped during load balancing. Use `hs server list` to see status, health, and active service counts for each machine.
 
 ## Self-Update
 
@@ -385,7 +414,7 @@ Available on all commands:
 ## Architecture
 
 ```
-crates/hs/          Unified CLI binary (paper, scribe, distill, status, upgrade, cloud, config)
+crates/hs/          Unified CLI binary (paper, scribe, distill, serve, server, status, upgrade, cloud, config)
 crates/hs-scribe/   PDF-to-markdown (ONNX layout detection + VLM OCR, client/server)
 crates/hs-distill/  Vector embedding + semantic search (ONNX embeddings, Qdrant, client/server)
 crates/hs-gateway/  Cloud access reverse proxy (OAuth2, token auth, service routing)

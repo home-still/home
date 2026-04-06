@@ -11,6 +11,8 @@ pub mod daemon;
 mod distill_cmd;
 mod scribe_cmd;
 mod scribe_pool;
+mod serve_cmd;
+mod server_cmd;
 mod status_cmd;
 mod upgrade_cmd;
 
@@ -88,6 +90,8 @@ fn main() -> ExitCode {
     let exit_code_mapper: fn(&anyhow::Error) -> ExitCode = match &cli.command {
         TopCmd::Paper { .. } => paper::exit_codes::from_error,
         TopCmd::Config { .. } => |_| ExitCode::FAILURE,
+        TopCmd::Serve { .. } => |_| ExitCode::FAILURE,
+        TopCmd::Server { .. } => |_| ExitCode::FAILURE,
         TopCmd::Scribe { .. } => |_| ExitCode::FAILURE,
         TopCmd::Distill { .. } => |_| ExitCode::FAILURE,
         TopCmd::Status => |_| ExitCode::FAILURE,
@@ -101,9 +105,17 @@ fn main() -> ExitCode {
         let work = async {
             match cli.command {
                 TopCmd::Paper { command } => {
-                    paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode).await
+                    let is_download = matches!(&command, paper::cli::PaperCmd::Download { .. });
+                    let result = paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode).await;
+                    // Auto-trigger: start scribe watcher after successful download
+                    if is_download && result.is_ok() {
+                        scribe_cmd::ensure_watcher_running(&reporter);
+                    }
+                    result
                 }
                 TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
+                TopCmd::Serve { command } => serve_cmd::dispatch(command, &reporter).await,
+                TopCmd::Server { command } => server_cmd::dispatch(command, &reporter).await,
                 TopCmd::Scribe { command } => scribe_cmd::dispatch(command, &reporter).await,
                 TopCmd::Distill { command } => {
                     distill_cmd::dispatch(command, &cli.global, &reporter).await

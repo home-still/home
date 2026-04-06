@@ -35,9 +35,17 @@ For Claude Desktop or Claude Code running on the same machine as the MCP server:
 }
 ```
 
+### `hs serve mcp` (managed)
+
+The recommended way to run the MCP server remotely. Automatically registers with the gateway, manages lifecycle (heartbeat, deregistration on shutdown):
+
+```sh
+hs serve mcp
+```
+
 ### Streamable HTTP / SSE (remote)
 
-For remote access via the cloud gateway:
+For manual remote access via the cloud gateway:
 
 ```sh
 hs-mcp --serve 127.0.0.1:7445
@@ -65,10 +73,10 @@ WantedBy=multi-user.target
 
 ## Configuration
 
-The MCP server reads the same `~/.home-still/config.yaml` as the CLI. It uses:
+The MCP server reads the same `~/.home-still/config.yaml` as the CLI. It discovers scribe and distill servers from the gateway service registry, falling back to config values when the gateway is unavailable. It uses:
 
-- `scribe.servers` — to connect to scribe backends
-- `distill.servers` — to connect to distill backends
+- `scribe.servers` — fallback scribe backends (overridden by gateway registry)
+- `distill.servers` — fallback distill backends (overridden by gateway registry)
 - `scribe.output_dir` / `scribe.watch_dir` / `scribe.catalog_dir` — for filesystem tools
 - `home.project_dir` — base directory for papers and markdown
 

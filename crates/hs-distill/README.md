@@ -109,9 +109,11 @@ distill:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `servers` | `["http://localhost:7434"]` | Distill server URL(s) |
+| `servers` | `["http://localhost:7434"]` | Distill server URL(s); overridden by gateway registry when available |
 | `markdown_dir` | `{project_dir}/markdown` | Where to find `.md` files |
 | `catalog_dir` | `{project_dir}/catalog` | Where to find catalog `.yaml` files |
+
+Server discovery uses the gateway service registry when available, falling back to the configured server list.
 
 ### 3. Index
 
@@ -121,6 +123,8 @@ hs distill index --file doc1.md doc2.md # index specific files
 ```
 
 The client reads each `.md` file locally and sends its content to the server for chunking, embedding, and storage. Files are identified by their stem name (e.g., `paper.md` becomes doc_id `paper`).
+
+Indexing can also be triggered automatically: `hs scribe watch` auto-starts the distill indexer when new conversions complete, so newly converted markdown is embedded without a separate manual step.
 
 ### 4. Search
 

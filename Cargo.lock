@@ -1663,6 +1663,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
+ "base64 0.22.1",
  "clap",
  "dirs",
  "figment",
@@ -1672,6 +1673,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
