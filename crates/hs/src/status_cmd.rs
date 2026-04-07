@@ -635,7 +635,7 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Constraint::Length(8),  // Name
             Constraint::Length(2),  // Indicator
             Constraint::Length(18), // Status + Activity
-            Constraint::Fill(1),   // URL (expands to fill)
+            Constraint::Fill(1),    // URL (expands to fill)
             Constraint::Length(14), // Detail
             Constraint::Length(16), // Version
         ],
@@ -692,7 +692,7 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
         rows,
         [
             Constraint::Length(9),  // Activity: "Download" = 8 chars
-            Constraint::Fill(1),   // Name: expands fairly
+            Constraint::Fill(1),    // Name: expands fairly
             Constraint::Length(12), // Detail: "12pg 193s", "27 chunks"
             Constraint::Length(8),  // Time: "43m ago"
         ],
