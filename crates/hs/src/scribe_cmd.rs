@@ -219,7 +219,16 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         }
         ScribeCmd::Status { status_dir } => cmd_status(status_dir, reporter).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
-        ScribeCmd::Server { action } => cmd_server(action).await,
+        ScribeCmd::Server { action } => {
+            let hint = match &action {
+                ServerAction::Start => "hs serve scribe start",
+                ServerAction::Stop => "hs serve scribe stop",
+                ServerAction::List => "hs serve scribe",
+                ServerAction::Ping { .. } => "hs serve scribe",
+            };
+            eprintln!("warning: `hs scribe server` is deprecated, use `{hint}` instead");
+            cmd_server(action).await
+        }
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
     }
 }
@@ -1302,7 +1311,7 @@ async fn cmd_init_inner(force: bool, check: bool, prereqs_only: bool) -> Result<
 
 // ── Server ──────────────────────────────────────────────────────
 
-async fn cmd_server(action: ServerAction) -> Result<()> {
+pub async fn cmd_server(action: ServerAction) -> Result<()> {
     let compose_path = hidden_dir().join("docker-compose.yml");
     if !compose_path.exists() {
         anyhow::bail!("No compose config found. Run `hs scribe init` first.");

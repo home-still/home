@@ -16,6 +16,8 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 pub enum ServeCmd {
     /// Run a scribe server (auto-init, foreground, registers with gateway)
     Scribe {
+        /// Action: start (background), stop, or omit for foreground
+        action: Option<ServeAction>,
         /// Port to listen on
         #[arg(long, default_value_t = DEFAULT_SCRIBE_PORT)]
         port: u16,
@@ -28,6 +30,8 @@ pub enum ServeCmd {
     },
     /// Run a distill server (auto-init, foreground, registers with gateway)
     Distill {
+        /// Action: start (background), stop, or omit for foreground
+        action: Option<ServeAction>,
         /// Port to listen on
         #[arg(long, default_value_t = DEFAULT_DISTILL_PORT)]
         port: u16,
@@ -52,8 +56,17 @@ pub enum ServeCmd {
     },
 }
 
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum ServeAction {
+    /// Start services in the background
+    Start,
+    /// Stop running services
+    Stop,
+}
+
 pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
     match cmd {
+        // -- install / uninstall --
         ServeCmd::Scribe {
             install: true,
             port,
@@ -78,6 +91,26 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
         ServeCmd::Mcp {
             uninstall: true, ..
         } => uninstall_service("mcp", reporter).await,
+
+        // -- start / stop (background) --
+        ServeCmd::Scribe {
+            action: Some(ServeAction::Start),
+            ..
+        } => crate::scribe_cmd::cmd_server(crate::scribe_cmd::ServerAction::Start).await,
+        ServeCmd::Scribe {
+            action: Some(ServeAction::Stop),
+            ..
+        } => crate::scribe_cmd::cmd_server(crate::scribe_cmd::ServerAction::Stop).await,
+        ServeCmd::Distill {
+            action: Some(ServeAction::Start),
+            ..
+        } => crate::distill_cmd::cmd_server_start(reporter).await,
+        ServeCmd::Distill {
+            action: Some(ServeAction::Stop),
+            ..
+        } => crate::distill_cmd::cmd_server_stop(reporter).await,
+
+        // -- foreground (default, no action) --
         ServeCmd::Scribe { port, .. } => {
             check_system_service_conflict("scribe")?;
             serve_scribe(port, reporter).await

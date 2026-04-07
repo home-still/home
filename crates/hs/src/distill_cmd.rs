@@ -132,7 +132,15 @@ pub async fn dispatch(
 ) -> Result<()> {
     match cmd {
         DistillCmd::Init { force } => cmd_init(force, reporter).await,
-        DistillCmd::Server { action } => cmd_server(action, reporter).await,
+        DistillCmd::Server { action } => {
+            let hint = match &action {
+                DistillServerAction::Start => "hs serve distill start",
+                DistillServerAction::Stop => "hs serve distill stop",
+                DistillServerAction::Ping { .. } => "hs serve distill",
+            };
+            eprintln!("warning: `hs distill server` is deprecated, use `{hint}` instead");
+            cmd_server(action, reporter).await
+        }
         DistillCmd::Index {
             force,
             file,
@@ -248,7 +256,7 @@ async fn cmd_server(action: DistillServerAction, reporter: &Arc<dyn Reporter>) -
     }
 }
 
-async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
+pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let config = DistillServerConfig::load().unwrap_or_default();
     let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
 
@@ -373,7 +381,7 @@ async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_server_stop(reporter: &Arc<dyn Reporter>) -> Result<()> {
+pub async fn cmd_server_stop(reporter: &Arc<dyn Reporter>) -> Result<()> {
     // 1. Stop native distill server
     let pid_path = distill_pid_path();
     if let Some(pid) = crate::daemon::read_pid(&pid_path) {
