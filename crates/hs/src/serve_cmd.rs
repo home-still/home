@@ -362,57 +362,60 @@ WantedBy=multi-user.target
 }
 
 async fn uninstall_service(service_type: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        let service_name = format!("hs-serve-{service_type}");
-        let unit_path = format!("/etc/systemd/system/{service_name}.service");
-
-        reporter.status("Stop", &service_name);
-        let _ = tokio::process::Command::new("sudo")
-            .args(["systemctl", "stop", &service_name])
-            .status()
-            .await;
-        let _ = tokio::process::Command::new("sudo")
-            .args(["systemctl", "disable", &service_name])
-            .status()
-            .await;
-        let _ = tokio::process::Command::new("sudo")
-            .args(["rm", "-f", &unit_path])
-            .status()
-            .await;
-        let _ = tokio::process::Command::new("sudo")
-            .args(["systemctl", "daemon-reload"])
-            .status()
-            .await;
-
-        reporter.finish(&format!("Removed {service_name}"));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let label = format!("com.home-still.{service_type}");
-        let plist_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join("Library/LaunchAgents")
-            .join(format!("{label}.plist"));
-
-        reporter.status("Unload", &label);
-        let _ = tokio::process::Command::new("launchctl")
-            .args(["unload", &plist_path.to_string_lossy()])
-            .status()
-            .await;
-        let _ = std::fs::remove_file(&plist_path);
-
-        reporter.finish(&format!("Removed {label}"));
-    }
-
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (service_type, reporter);
         anyhow::bail!("--uninstall is only supported on Linux and macOS");
     }
 
-    Ok(())
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        #[cfg(target_os = "linux")]
+        {
+            let service_name = format!("hs-serve-{service_type}");
+            let unit_path = format!("/etc/systemd/system/{service_name}.service");
+
+            reporter.status("Stop", &service_name);
+            let _ = tokio::process::Command::new("sudo")
+                .args(["systemctl", "stop", &service_name])
+                .status()
+                .await;
+            let _ = tokio::process::Command::new("sudo")
+                .args(["systemctl", "disable", &service_name])
+                .status()
+                .await;
+            let _ = tokio::process::Command::new("sudo")
+                .args(["rm", "-f", &unit_path])
+                .status()
+                .await;
+            let _ = tokio::process::Command::new("sudo")
+                .args(["systemctl", "daemon-reload"])
+                .status()
+                .await;
+
+            reporter.finish(&format!("Removed {service_name}"));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let label = format!("com.home-still.{service_type}");
+            let plist_path = dirs::home_dir()
+                .unwrap_or_default()
+                .join("Library/LaunchAgents")
+                .join(format!("{label}.plist"));
+
+            reporter.status("Unload", &label);
+            let _ = tokio::process::Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .status()
+                .await;
+            let _ = std::fs::remove_file(&plist_path);
+
+            reporter.finish(&format!("Removed {label}"));
+        }
+
+        Ok(())
+    }
 }
 
 /// Check if a system service is already running for this service type.
