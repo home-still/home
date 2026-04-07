@@ -53,18 +53,16 @@ pub async fn dispatch(cmd: McpCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
 // ── Config paths ───────────────────────────────────────────────
 
 fn claude_desktop_config_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-
     #[cfg(target_os = "macos")]
     {
-        let path = home.join("Library/Application Support/Claude/claude_desktop_config.json");
-        Some(path)
+        let home = dirs::home_dir()?;
+        Some(home.join("Library/Application Support/Claude/claude_desktop_config.json"))
     }
 
     #[cfg(target_os = "linux")]
     {
-        let path = home.join(".config/Claude/claude_desktop_config.json");
-        Some(path)
+        let home = dirs::home_dir()?;
+        Some(home.join(".config/Claude/claude_desktop_config.json"))
     }
 
     #[cfg(target_os = "windows")]
