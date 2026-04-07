@@ -111,7 +111,11 @@ pub async fn run(
     // Phase 4: update Docker services
     upgrade_docker_services(reporter).await?;
 
-    // Phase 5: health check
+    // Phase 5: restart all running services so they pick up the new binaries
+    reporter.status("Restart", "restarting running services...");
+    crate::restart_cmd::run(reporter).await?;
+
+    // Phase 6: health check
     post_upgrade_health_check(reporter).await;
 
     reporter.finish(&format!(

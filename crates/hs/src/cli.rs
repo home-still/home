@@ -40,6 +40,8 @@ pub enum TopCmd {
     },
     /// Live dashboard — pipeline health, services, recent activity
     Status,
+    /// Restart all running services (system services, daemons, containers)
+    Restart,
     /// Check for updates and upgrade hs + managed services
     Upgrade {
         /// Only check if an update is available; do not install
