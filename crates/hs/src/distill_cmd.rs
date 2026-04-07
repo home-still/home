@@ -846,6 +846,7 @@ async fn cmd_index_daemon(
 
     // Determine files
     let config = DistillClientConfig::load().unwrap_or_default();
+    let catalog_dir = config.catalog_dir.clone();
     let markdown_dir = config.markdown_dir;
 
     let paths: Vec<PathBuf> = if let Some(files) = files {
@@ -900,6 +901,13 @@ async fn cmd_index_daemon(
             Ok(result) => {
                 status.total_chunks += result.chunks_indexed;
                 status.indexed += 1;
+                hs_common::catalog::update_embedding_catalog(
+                    &catalog_dir,
+                    stem,
+                    &servers[0],
+                    result.chunks_indexed,
+                    &result.embedding_device,
+                );
             }
             Err(e) => {
                 status.failed += 1;

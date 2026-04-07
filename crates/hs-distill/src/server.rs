@@ -40,11 +40,19 @@ pub fn app(state: Arc<DistillServerState>) -> Router {
 }
 
 async fn handle_health(State(state): State<Arc<DistillServerState>>) -> impl IntoResponse {
+    let qdrant_version = state
+        .qdrant
+        .health_check()
+        .await
+        .map(|r| r.version)
+        .unwrap_or_default();
+
     Json(HealthResponse {
         status: "ok".into(),
         compute_device: state.embedder.device().to_string(),
         collection: state.config.collection_name.clone(),
         version: env!("HS_VERSION").to_string(),
+        qdrant_version,
     })
 }
 

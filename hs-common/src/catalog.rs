@@ -38,6 +38,10 @@ pub struct CatalogEntry {
     // Conversion metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversion: Option<ConversionMeta>,
+
+    // Embedding metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<EmbeddingMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +52,14 @@ pub struct ConversionMeta {
     pub converted_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<PageOffset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingMeta {
+    pub server: String,
+    pub chunks_indexed: u32,
+    pub compute_device: String,
+    pub embedded_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +128,27 @@ pub fn update_conversion_catalog(
         total_pages,
         converted_at: chrono::Utc::now().to_rfc3339(),
         pages,
+    });
+
+    write_catalog_entry(catalog_dir, stem, &entry);
+}
+
+/// Update only the embedding section of an existing catalog entry.
+/// If no entry exists, creates a minimal one with just embedding metadata.
+pub fn update_embedding_catalog(
+    catalog_dir: &Path,
+    stem: &str,
+    server: &str,
+    chunks_indexed: u32,
+    compute_device: &str,
+) {
+    let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
+
+    entry.embedding = Some(EmbeddingMeta {
+        server: server.to_string(),
+        chunks_indexed,
+        compute_device: compute_device.to_string(),
+        embedded_at: chrono::Utc::now().to_rfc3339(),
     });
 
     write_catalog_entry(catalog_dir, stem, &entry);

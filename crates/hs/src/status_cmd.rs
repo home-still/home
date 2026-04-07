@@ -27,6 +27,7 @@ struct DashboardData {
     distill_servers: Vec<ServiceStatus>,
     qdrant_healthy: bool,
     qdrant_url: String,
+    qdrant_version: String,
 
     watcher: WatcherInfo,
 
@@ -50,8 +51,9 @@ enum WatcherInfo {
 struct ServiceStatus {
     url: String,
     healthy: bool,
-    detail: String,  // e.g. "(Cpu)" or model info
-    version: String, // server version from /health
+    detail: String,   // e.g. "(Cpu)" or compute device
+    activity: String, // e.g. "idle", "3 converting", "1 embedding"
+    version: String,  // server version from /health
 }
 
 struct HistoryEvent {
@@ -144,7 +146,7 @@ async fn collect_data() -> DashboardData {
 
         if let Some(data) = readiness {
             let in_flight = data["in_flight_conversions"].as_u64().unwrap_or(0);
-            let detail = if in_flight > 0 {
+            let activity = if in_flight > 0 {
                 format!("{in_flight} converting")
             } else {
                 "idle".to_string()
@@ -152,7 +154,8 @@ async fn collect_data() -> DashboardData {
             scribe_servers.push(ServiceStatus {
                 url: url.clone(),
                 healthy: true,
-                detail,
+                detail: String::new(),
+                activity,
                 version: health_version,
             });
         } else {
@@ -160,6 +163,7 @@ async fn collect_data() -> DashboardData {
                 url: url.clone(),
                 healthy: false,
                 detail: String::new(),
+                activity: String::new(),
                 version: String::new(),
             });
         }
@@ -171,6 +175,7 @@ async fn collect_data() -> DashboardData {
     let mut embedded_chunks = 0u64;
     let mut qdrant_healthy = false;
     let mut qdrant_url = String::new();
+    let mut qdrant_version = String::new();
 
     for url in &distill_urls {
         let client = if hs_common::auth::client::is_cloud_url(url) {
@@ -189,7 +194,20 @@ async fn collect_data() -> DashboardData {
             .as_ref()
             .map(|h| h.version.clone())
             .unwrap_or_default();
+        if qdrant_version.is_empty() {
+            qdrant_version = health
+                .as_ref()
+                .map(|h| h.qdrant_version.clone())
+                .unwrap_or_default();
+        }
         let healthy = health.is_some();
+
+        // Fetch readiness for in-flight embedding count
+        let activity = match client.readiness().await {
+            Ok(r) if r.in_flight > 0 => format!("{} embedding", r.in_flight),
+            Ok(_) => "idle".into(),
+            Err(_) => String::new(),
+        };
 
         // Always try to get status (for embedded counts) even if health is slow
         if let Ok(s) = client.status().await {
@@ -204,6 +222,7 @@ async fn collect_data() -> DashboardData {
                 url: url.clone(),
                 healthy: true,
                 detail: format!("({})", s.compute_device),
+                activity,
                 version: health_version,
             });
         } else if healthy {
@@ -211,6 +230,7 @@ async fn collect_data() -> DashboardData {
                 url: url.clone(),
                 healthy: true,
                 detail: String::new(),
+                activity,
                 version: health_version,
             });
         } else {
@@ -218,6 +238,7 @@ async fn collect_data() -> DashboardData {
                 url: url.clone(),
                 healthy: false,
                 detail: String::new(),
+                activity: String::new(),
                 version: String::new(),
             });
         }
@@ -242,6 +263,7 @@ async fn collect_data() -> DashboardData {
         distill_servers,
         qdrant_healthy,
         qdrant_url,
+        qdrant_version,
         watcher,
         history,
     }
@@ -337,6 +359,18 @@ fn load_history(catalog_dir: &Path, limit: usize) -> Vec<HistoryEvent> {
                     activity: "Convert",
                     name: short_name.clone(),
                     detail: format!("{}pg {:.0}s", conv.total_pages, conv.duration_secs),
+                    when: Some(dt.with_timezone(&chrono::Utc)),
+                });
+            }
+        }
+
+        // Embedding event
+        if let Some(ref emb) = entry.embedding {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&emb.embedded_at) {
+                events.push(HistoryEvent {
+                    activity: "Embed",
+                    name: short_name.clone(),
+                    detail: format!("{} chunks", emb.chunks_indexed),
                     when: Some(dt.with_timezone(&chrono::Utc)),
                 });
             }
@@ -538,36 +572,35 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let mut rows = Vec::new();
 
     for svc in &data.scribe_servers {
-        let (indicator, style) = if svc.healthy {
+        let (indicator, ind_style) = if svc.healthy {
             ("●", Style::default().fg(Color::Green))
         } else {
             ("○", Style::default().fg(Color::Red))
         };
+        let status_text = format_status_activity(svc.healthy, "running", &svc.activity);
         rows.push(Row::new(vec![
-            Cell::from("Scribe".to_string()),
-            Cell::from(indicator).style(style),
-            Cell::from(if svc.healthy { "running" } else { "stopped" }.to_string()),
+            Cell::from("Scribe"),
+            Cell::from(indicator).style(ind_style),
+            Cell::from(status_text),
             Cell::from(svc.url.clone()),
+            Cell::from(svc.detail.clone()).style(Style::default().fg(Color::DarkGray)),
             Cell::from(svc.version.clone()).style(Style::default().fg(Color::DarkGray)),
         ]));
     }
 
     for svc in &data.distill_servers {
-        let (indicator, style) = if svc.healthy {
+        let (indicator, ind_style) = if svc.healthy {
             ("●", Style::default().fg(Color::Green))
         } else {
             ("○", Style::default().fg(Color::Red))
         };
-        let detail = if svc.detail.is_empty() {
-            svc.url.clone()
-        } else {
-            format!("{} {}", svc.url, svc.detail)
-        };
+        let status_text = format_status_activity(svc.healthy, "running", &svc.activity);
         rows.push(Row::new(vec![
-            Cell::from("Distill".to_string()),
-            Cell::from(indicator).style(style),
-            Cell::from(if svc.healthy { "running" } else { "stopped" }.to_string()),
-            Cell::from(detail),
+            Cell::from("Distill"),
+            Cell::from(indicator).style(ind_style),
+            Cell::from(status_text),
+            Cell::from(svc.url.clone()),
+            Cell::from(svc.detail.clone()).style(Style::default().fg(Color::DarkGray)),
             Cell::from(svc.version.clone()).style(Style::default().fg(Color::DarkGray)),
         ]));
     }
@@ -577,33 +610,48 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
     } else {
         ("○", Style::default().fg(Color::Red))
     };
+    let q_status = if data.qdrant_healthy {
+        "healthy"
+    } else {
+        "stopped"
+    };
+    // Split qdrant_url "http://…:7434 → collection" into url and detail
+    let (q_url, q_detail) = match data.qdrant_url.split_once(" → ") {
+        Some((u, c)) => (u.to_string(), format!("→ {c}")),
+        None => (data.qdrant_url.clone(), String::new()),
+    };
     rows.push(Row::new(vec![
-        Cell::from("Qdrant".to_string()),
+        Cell::from("Qdrant"),
         Cell::from(q_indicator).style(q_style),
-        Cell::from(
-            if data.qdrant_healthy {
-                "healthy"
-            } else {
-                "stopped"
-            }
-            .to_string(),
-        ),
-        Cell::from(data.qdrant_url.clone()),
-        Cell::from(""),
+        Cell::from(q_status.to_string()),
+        Cell::from(q_url),
+        Cell::from(q_detail).style(Style::default().fg(Color::DarkGray)),
+        Cell::from(data.qdrant_version.clone()).style(Style::default().fg(Color::DarkGray)),
     ]));
 
     let table = Table::new(
         rows,
         [
-            Constraint::Length(16),
-            Constraint::Length(2),
-            Constraint::Length(8),
-            Constraint::Length(30),
-            Constraint::Min(10),
+            Constraint::Length(8),  // Name
+            Constraint::Length(2),  // Indicator
+            Constraint::Length(18), // Status + Activity
+            Constraint::Fill(1),   // URL (expands to fill)
+            Constraint::Length(14), // Detail
+            Constraint::Length(16), // Version
         ],
     );
 
     frame.render_widget(table, inner);
+}
+
+fn format_status_activity(healthy: bool, running_label: &str, activity: &str) -> String {
+    if !healthy {
+        return "stopped".into();
+    }
+    match activity {
+        "" | "idle" => running_label.into(),
+        other => format!("{running_label} · {other}"),
+    }
 }
 
 fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
@@ -643,10 +691,10 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(10),
-            Constraint::Min(20),
-            Constraint::Length(14),
-            Constraint::Length(10),
+            Constraint::Length(9),  // Activity: "Download" = 8 chars
+            Constraint::Fill(1),   // Name: expands fairly
+            Constraint::Length(12), // Detail: "12pg 193s", "27 chunks"
+            Constraint::Length(8),  // Time: "43m ago"
         ],
     );
 
@@ -675,6 +723,7 @@ pub async fn run() -> Result<()> {
         distill_servers: vec![],
         qdrant_healthy: false,
         qdrant_url: String::new(),
+        qdrant_version: String::new(),
         watcher: WatcherInfo::Stopped,
         history: vec![],
     };

@@ -6,7 +6,7 @@ Academic research engine: 211M+ vector search with OpenAlex + PMC OA + Qdrant.
 
 ```bash
 cargo check                        # Check all crates
-cargo clippy                       # Fix issues
+cargo clippy --workspace --all-targets -- -D warnings # Fix issues
 cargo test                         # Run all tests
 cargo test -p paper                # Test paper crate
 cargo build --release -p paper     # Build paper CLI

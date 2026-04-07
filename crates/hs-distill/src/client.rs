@@ -60,6 +60,8 @@ pub struct HealthResponse {
     pub collection: String,
     #[serde(default)]
     pub version: String,
+    #[serde(default)]
+    pub qdrant_version: String,
 }
 
 /// Readiness response from the distill server.
