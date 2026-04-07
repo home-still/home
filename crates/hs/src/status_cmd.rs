@@ -704,6 +704,14 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
 // ── Entry point ─────────────────────────────────────────────────
 
 pub async fn run() -> Result<()> {
+    // Install panic hook that restores terminal before printing the panic
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+        original_hook(info);
+    }));
+
     // Setup terminal
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
@@ -775,7 +783,8 @@ pub async fn run() -> Result<()> {
         task.abort();
     }
 
-    // Restore terminal
+    // Restore terminal and panic hook
+    let _ = std::panic::take_hook(); // remove our custom hook
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     Ok(())
