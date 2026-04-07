@@ -492,8 +492,9 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let pdf_to_md = if data.pdf_count > 0 {
-        data.markdown_count as f64 / data.pdf_count as f64
+    let convertible = data.pdf_count.saturating_sub(data.corrupted_count);
+    let pdf_to_md = if convertible > 0 {
+        data.markdown_count as f64 / convertible as f64
     } else {
         0.0
     };
