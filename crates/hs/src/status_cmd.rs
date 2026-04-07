@@ -105,10 +105,31 @@ fn count_dir_recursive(dir: &Path, ext: &str) -> (u64, u64) {
 async fn collect_data() -> DashboardData {
     let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
     let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
-    let (pdf_count, pdf_bytes) = count_dir_recursive(&scribe_cfg.watch_dir, "pdf");
-    let (markdown_count, markdown_bytes) = count_dir(&scribe_cfg.output_dir, "md");
-    let (catalog_count, _) = count_dir(&scribe_cfg.catalog_dir, "yaml");
-    let (corrupted_count, _) = count_dir(&scribe_cfg.corrupted_dir, "pdf");
+
+    // Run filesystem operations on a blocking thread so stale NFS mounts
+    // don't block the tokio runtime and freeze the UI.
+    let cfg = scribe_cfg.clone();
+    let fs_result = tokio::task::spawn_blocking(move || {
+        let (pdf_count, pdf_bytes) = count_dir_recursive(&cfg.watch_dir, "pdf");
+        let (markdown_count, markdown_bytes) = count_dir(&cfg.output_dir, "md");
+        let (catalog_count, _) = count_dir(&cfg.catalog_dir, "yaml");
+        let (corrupted_count, _) = count_dir(&cfg.corrupted_dir, "pdf");
+        (
+            pdf_count,
+            pdf_bytes,
+            markdown_count,
+            markdown_bytes,
+            catalog_count,
+            corrupted_count,
+        )
+    });
+
+    // Wait up to 5 seconds for filesystem ops; use zeros if they stall
+    let (pdf_count, pdf_bytes, markdown_count, markdown_bytes, catalog_count, corrupted_count) =
+        match tokio::time::timeout(Duration::from_secs(5), fs_result).await {
+            Ok(Ok(counts)) => counts,
+            _ => (0, 0, 0, 0, 0, 0),
+        };
 
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
@@ -244,11 +265,17 @@ async fn collect_data() -> DashboardData {
         }
     }
 
-    // Watcher status
-    let watcher = read_watcher_status(&scribe_cfg.output_dir, &scribe_cfg.watch_dir);
-
-    // Build history from catalog entries
-    let history = load_history(&scribe_cfg.catalog_dir, 15);
+    // Watcher status + history (filesystem I/O, may stall on NFS)
+    let cfg2 = scribe_cfg.clone();
+    let fs_result2 = tokio::task::spawn_blocking(move || {
+        let watcher = read_watcher_status(&cfg2.output_dir, &cfg2.watch_dir);
+        let history = load_history(&cfg2.catalog_dir, 15);
+        (watcher, history)
+    });
+    let (watcher, history) = match tokio::time::timeout(Duration::from_secs(5), fs_result2).await {
+        Ok(Ok((w, h))) => (w, h),
+        _ => (WatcherInfo::Stopped, vec![]),
+    };
 
     DashboardData {
         pdf_count,

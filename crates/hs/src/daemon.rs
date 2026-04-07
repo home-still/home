@@ -61,10 +61,41 @@ pub fn acquire_instance_lock(watch_dir: &Path) -> Result<(), u32> {
     Ok(())
 }
 
+/// Resolve the path to the hs binary on disk.
+/// After an upgrade on Linux, `/proc/self/exe` may point to `hs (deleted)`.
+/// Falls back to searching known install locations.
+fn resolve_hs_binary() -> Result<std::path::PathBuf> {
+    let exe = std::env::current_exe().context("Cannot find current executable")?;
+    if exe.exists() {
+        return Ok(exe);
+    }
+    // Binary was replaced (e.g., after upgrade) — find it on disk
+    if let Some(home) = dirs::home_dir() {
+        let local_bin = home.join(".local/bin/hs");
+        if local_bin.exists() {
+            return Ok(local_bin);
+        }
+    }
+    // Try the parent directory of the (deleted) path
+    if let Some(dir) = exe.parent() {
+        let name = exe.file_name().and_then(|f| f.to_str()).unwrap_or("hs");
+        // Strip " (deleted)" suffix if present
+        let clean_name = name.strip_suffix(" (deleted)").unwrap_or(name);
+        let clean_path = dir.join(clean_name);
+        if clean_path.exists() {
+            return Ok(clean_path);
+        }
+    }
+    anyhow::bail!(
+        "Cannot find hs binary on disk (current_exe: {})",
+        exe.display()
+    )
+}
+
 /// Spawn the daemon as a detached child process.
 /// Re-execs the current binary with internal `--daemon-child` flag.
 pub fn spawn_daemon(dir: Option<&str>, outdir: Option<&str>, server: Option<&str>) -> Result<u32> {
-    let exe = std::env::current_exe().context("Cannot find current executable")?;
+    let exe = resolve_hs_binary()?;
 
     let mut args = vec![
         "scribe".to_string(),

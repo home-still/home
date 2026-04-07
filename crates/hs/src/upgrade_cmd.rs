@@ -113,7 +113,9 @@ pub async fn run(
 
     // Phase 5: restart all running services so they pick up the new binaries
     reporter.status("Restart", "restarting running services...");
-    crate::restart_cmd::run(reporter).await?;
+    if let Err(e) = crate::restart_cmd::run(reporter).await {
+        reporter.warn(&format!("Restart failed: {e:#}"));
+    }
 
     // Phase 6: health check
     post_upgrade_health_check(reporter).await;
