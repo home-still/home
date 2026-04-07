@@ -754,6 +754,13 @@ pub async fn run() -> Result<()> {
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    if key.code == KeyCode::Char('c')
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                    {
+                        break;
+                    }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         _ => {}
