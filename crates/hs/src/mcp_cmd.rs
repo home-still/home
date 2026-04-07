@@ -1,11 +1,14 @@
 //! `hs mcp` subcommand — install/uninstall MCP server config for Claude clients.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Subcommand, ValueEnum};
 use hs_common::reporter::Reporter;
+
+const GITHUB_API_RELEASES: &str = "https://api.github.com/repos/home-still/home/releases";
 
 #[derive(Clone, Debug, ValueEnum)]
 pub enum McpClient {
@@ -174,13 +177,13 @@ async fn cmd_install(
         reporter.status("Mode", &format!("remote ({})", url));
         build_remote_entry(&url)
     } else {
-        let mcp_bin = super::serve_cmd::find_mcp_binary().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not find hs-mcp binary.\n\
-                 Install it with: cargo build --release -p hs-mcp\n\
-                 Or: curl -fsSL https://raw.githubusercontent.com/home-still/home/main/docs/install.sh | sh"
-            )
-        })?;
+        let mcp_bin = match super::serve_cmd::find_mcp_binary() {
+            Some(p) => p,
+            None => {
+                reporter.status("hs-mcp", "not found locally, downloading from GitHub...");
+                download_mcp_binary(reporter).await?
+            }
+        };
         reporter.status("Mode", &format!("local stdio ({})", mcp_bin.display()));
         build_stdio_entry(&mcp_bin)
     };
@@ -210,6 +213,142 @@ async fn cmd_install(
 
     reporter.finish("MCP server configured. Restart Claude to pick up the changes.");
     Ok(())
+}
+
+// ── Binary download ───────────────────────────────────────────
+
+fn detect_target() -> Result<&'static str> {
+    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+    {
+        return Ok("x86_64-apple-darwin");
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        return Ok("aarch64-apple-darwin");
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    {
+        return Ok("x86_64-unknown-linux-gnu");
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        return Ok("aarch64-unknown-linux-gnu");
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    {
+        return Ok("x86_64-pc-windows-msvc");
+    }
+    #[allow(unreachable_code)]
+    Err(anyhow::anyhow!("Unsupported platform"))
+}
+
+/// Download `hs-mcp` from the same release tag as the running `hs` binary.
+async fn download_mcp_binary(reporter: &Arc<dyn Reporter>) -> Result<PathBuf> {
+    let target = detect_target()?;
+    let version = env!("HS_VERSION");
+    // Normalize version to tag format (e.g. "0.0.1-rc.173" → "v0.0.1-rc.173")
+    let tag = if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{version}")
+    };
+
+    // Fetch the release matching the current hs version
+    let http = reqwest::Client::builder()
+        .user_agent(format!("hs/{version}"))
+        .build()?;
+
+    let mut req = http.get(format!("{GITHUB_API_RELEASES}/tags/{tag}"));
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+
+    let resp = req.send().await.context("Failed to reach GitHub API")?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "Could not find release {tag} on GitHub ({}). \
+             Try: cargo build --release -p hs-mcp",
+            resp.status()
+        );
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Release {
+        assets: Vec<Asset>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Asset {
+        name: String,
+        browser_download_url: String,
+    }
+
+    let release: Release = resp.json().await.context("Invalid release JSON")?;
+    let archive_name = format!("hs-mcp-{tag}-{target}.tar.gz");
+
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == archive_name)
+        .ok_or_else(|| anyhow::anyhow!("No hs-mcp asset for {target} in release {tag}"))?;
+
+    reporter.status("Downloading", &archive_name);
+
+    let resp = reqwest::get(&asset.browser_download_url)
+        .await
+        .context("Download failed")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Download failed ({})", resp.status());
+    }
+
+    let bytes = resp.bytes().await.context("Failed to read download")?;
+
+    // Extract hs-mcp from tar.gz
+    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut archive = tar::Archive::new(decoder);
+
+    let mut binary_data: Option<Vec<u8>> = None;
+    for entry in archive.entries().context("Failed to read tar entries")? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        let file_name = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or_default();
+        if file_name == "hs-mcp" {
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data)?;
+            binary_data = Some(data);
+            break;
+        }
+    }
+
+    let binary_data = binary_data.ok_or_else(|| anyhow::anyhow!("hs-mcp not found in archive"))?;
+
+    // Install next to the running hs binary, falling back to ~/.local/bin
+    let install_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/bin"));
+
+    std::fs::create_dir_all(&install_dir)?;
+
+    let install_path = install_dir.join("hs-mcp");
+    let tmp_path = install_dir.join(".hs-mcp.install.tmp");
+
+    std::fs::write(&tmp_path, &binary_data)
+        .with_context(|| format!("Failed to write to {}", tmp_path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    std::fs::rename(&tmp_path, &install_path)
+        .with_context(|| format!("Failed to install hs-mcp to {}", install_path.display()))?;
+
+    reporter.status("Installed", &format!("hs-mcp → {}", install_path.display()));
+    Ok(install_path)
 }
 
 // ── Uninstall ──────────────────────────────────────────────────
