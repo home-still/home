@@ -114,8 +114,8 @@ fn read_config(path: &PathBuf) -> Result<serde_json::Value> {
     if path.exists() {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        let val: serde_json::Value =
-            serde_json::from_str(&text).with_context(|| format!("Invalid JSON in {}", path.display()))?;
+        let val: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("Invalid JSON in {}", path.display()))?;
         Ok(val)
     } else {
         Ok(serde_json::json!({}))
