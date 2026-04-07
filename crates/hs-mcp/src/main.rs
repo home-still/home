@@ -4,7 +4,7 @@ use clap::Parser;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_router, ServerHandler,
+    schemars, tool, tool_handler, tool_router, ServerHandler,
 };
 
 // ── Tool parameter types ─────────────��──────────────────────────
@@ -454,6 +454,7 @@ fn count_files(dir: &std::path::Path, ext: &str) -> u64 {
         .unwrap_or(0)
 }
 
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for HomeStillMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
