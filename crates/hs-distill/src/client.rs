@@ -126,6 +126,7 @@ impl DistillClient {
         let resp = self
             .http
             .get(&url)
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .context("Failed to reach distill server")?;
@@ -213,6 +214,7 @@ impl DistillClient {
                 "limit": limit,
                 "filters": filters,
             }))
+            .timeout(Duration::from_secs(30))
             .send()
             .await
             .context("Failed to send search request")?;
@@ -232,6 +234,7 @@ impl DistillClient {
         let resp = self
             .http
             .get(&url)
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .context("Failed to reach distill server")?;
@@ -244,6 +247,7 @@ impl DistillClient {
         let resp = self
             .http
             .get(&url)
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .context("Failed to reach distill server")?;

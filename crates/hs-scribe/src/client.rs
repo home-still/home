@@ -86,6 +86,7 @@ impl ScribeClient {
         let resp = self
             .http
             .get(&url)
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .context("Failed to reach server")?;
