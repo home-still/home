@@ -269,7 +269,7 @@ async fn collect_data() -> DashboardData {
     let cfg2 = scribe_cfg.clone();
     let fs_result2 = tokio::task::spawn_blocking(move || {
         let watcher = read_watcher_status(&cfg2.output_dir, &cfg2.watch_dir);
-        let history = load_history(&cfg2.catalog_dir, 15);
+        let history = load_history(&cfg2.catalog_dir, 100);
         (watcher, history)
     });
     let (watcher, history) = match tokio::time::timeout(Duration::from_secs(5), fs_result2).await {
