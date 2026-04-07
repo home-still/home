@@ -1,4 +1,4 @@
-//! `hs mcp` subcommand — install/uninstall MCP server config for Claude clients.
+//! `hs mcp` subcommand — install/uninstall MCP server config for Claude & OpenCode clients.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,9 @@ pub enum McpClient {
     Desktop,
     /// Claude Code CLI / IDE extension
     Code,
-    /// Both Desktop and Code
+    /// OpenCode terminal AI assistant
+    Opencode,
+    /// All supported clients
     All,
 }
 
@@ -84,6 +86,11 @@ fn claude_code_config_path() -> Option<PathBuf> {
     Some(home.join(".claude.json"))
 }
 
+fn opencode_config_path() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(home.join(".config/opencode/opencode.json"))
+}
+
 fn config_paths(client: &McpClient) -> Vec<(&'static str, PathBuf)> {
     let mut paths = Vec::new();
     match client {
@@ -97,12 +104,20 @@ fn config_paths(client: &McpClient) -> Vec<(&'static str, PathBuf)> {
                 paths.push(("Claude Code", p));
             }
         }
+        McpClient::Opencode => {
+            if let Some(p) = opencode_config_path() {
+                paths.push(("OpenCode", p));
+            }
+        }
         McpClient::All => {
             if let Some(p) = claude_desktop_config_path() {
                 paths.push(("Claude Desktop", p));
             }
             if let Some(p) = claude_code_config_path() {
                 paths.push(("Claude Code", p));
+            }
+            if let Some(p) = opencode_config_path() {
+                paths.push(("OpenCode", p));
             }
         }
     }
@@ -150,6 +165,27 @@ fn build_remote_entry(gateway_url: &str) -> serde_json::Value {
     })
 }
 
+fn build_opencode_stdio_entry(mcp_bin: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "type": "local",
+        "command": [mcp_bin.to_string_lossy()],
+        "enabled": true,
+    })
+}
+
+fn build_opencode_remote_entry(gateway_url: &str) -> serde_json::Value {
+    let url = format!("{}/mcp", gateway_url.trim_end_matches('/'));
+    serde_json::json!({
+        "type": "remote",
+        "url": url,
+        "enabled": true,
+    })
+}
+
+fn is_opencode(client_name: &str) -> bool {
+    client_name == "OpenCode"
+}
+
 async fn resolve_gateway_url(explicit: Option<String>) -> Result<String> {
     if let Some(url) = explicit {
         return Ok(url);
@@ -172,46 +208,79 @@ async fn cmd_install(
     gateway_url: Option<String>,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    let entry = if remote {
-        let url = resolve_gateway_url(gateway_url).await?;
-        reporter.status("Mode", &format!("remote ({})", url));
-        build_remote_entry(&url)
+    let resolved_url = if remote {
+        Some(resolve_gateway_url(gateway_url).await?)
     } else {
-        let mcp_bin = match super::serve_cmd::find_mcp_binary() {
+        None
+    };
+
+    let mcp_bin = if !remote {
+        let bin = match super::serve_cmd::find_mcp_binary() {
             Some(p) => p,
             None => {
                 reporter.status("hs-mcp", "not found locally, downloading from GitHub...");
                 download_mcp_binary(reporter).await?
             }
         };
-        reporter.status("Mode", &format!("local stdio ({})", mcp_bin.display()));
-        build_stdio_entry(&mcp_bin)
+        reporter.status("Mode", &format!("local stdio ({})", bin.display()));
+        Some(bin)
+    } else {
+        reporter.status(
+            "Mode",
+            &format!("remote ({})", resolved_url.as_deref().unwrap()),
+        );
+        None
     };
 
     let paths = config_paths(&client);
     if paths.is_empty() {
-        anyhow::bail!("No supported Claude config path found for this platform");
+        anyhow::bail!("No supported config path found for this platform");
     }
 
     for (name, path) in &paths {
         let mut config = read_config(path)?;
 
-        let servers = config
-            .as_object_mut()
-            .context("Config is not a JSON object")?
-            .entry("mcpServers")
-            .or_insert_with(|| serde_json::json!({}));
+        if is_opencode(name) {
+            let entry = if let Some(ref url) = resolved_url {
+                build_opencode_remote_entry(url)
+            } else {
+                build_opencode_stdio_entry(mcp_bin.as_deref().unwrap())
+            };
 
-        servers
-            .as_object_mut()
-            .context("mcpServers is not a JSON object")?
-            .insert("home-still".to_string(), entry.clone());
+            let servers = config
+                .as_object_mut()
+                .context("Config is not a JSON object")?
+                .entry("mcp")
+                .or_insert_with(|| serde_json::json!({}));
+
+            servers
+                .as_object_mut()
+                .context("mcp is not a JSON object")?
+                .insert("home-still".to_string(), entry);
+        } else {
+            let entry = if let Some(ref url) = resolved_url {
+                build_remote_entry(url)
+            } else {
+                build_stdio_entry(mcp_bin.as_deref().unwrap())
+            };
+
+            let servers = config
+                .as_object_mut()
+                .context("Config is not a JSON object")?
+                .entry("mcpServers")
+                .or_insert_with(|| serde_json::json!({}));
+
+            servers
+                .as_object_mut()
+                .context("mcpServers is not a JSON object")?
+                .insert("home-still".to_string(), entry);
+        }
 
         write_config(path, &config)?;
         reporter.status("Installed", &format!("{} ({})", name, path.display()));
     }
 
-    reporter.finish("MCP server configured. Restart Claude to pick up the changes.");
+    reporter.finish("MCP server configured. Restart your client to pick up the changes.");
     Ok(())
 }
 
@@ -356,7 +425,7 @@ async fn download_mcp_binary(reporter: &Arc<dyn Reporter>) -> Result<PathBuf> {
 async fn cmd_uninstall(client: McpClient, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let paths = config_paths(&client);
     if paths.is_empty() {
-        anyhow::bail!("No supported Claude config path found for this platform");
+        anyhow::bail!("No supported config path found for this platform");
     }
 
     for (name, path) in &paths {
@@ -367,9 +436,15 @@ async fn cmd_uninstall(client: McpClient, reporter: &Arc<dyn Reporter>) -> Resul
 
         let mut config = read_config(path)?;
 
+        let key = if is_opencode(name) {
+            "mcp"
+        } else {
+            "mcpServers"
+        };
+
         let removed = config
             .as_object_mut()
-            .and_then(|obj| obj.get_mut("mcpServers"))
+            .and_then(|obj| obj.get_mut(key))
             .and_then(|servers| servers.as_object_mut())
             .map(|servers| servers.remove("home-still").is_some())
             .unwrap_or(false);
