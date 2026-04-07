@@ -456,7 +456,12 @@ fn render(frame: &mut Frame, data: &DashboardData) {
     .split(frame.area());
 
     // Title
-    frame.render_widget(Line::from(" home-still ").bold().centered(), outer[0]);
+    frame.render_widget(
+        Line::from(format!(" home-still {} ", env!("HS_VERSION")))
+            .bold()
+            .centered(),
+        outer[0],
+    );
 
     // Pipeline section
     render_pipeline(frame, outer[1], data);
