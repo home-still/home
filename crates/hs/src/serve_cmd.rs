@@ -687,7 +687,7 @@ fn local_ip_hint() -> String {
     "127.0.0.1".into()
 }
 
-fn find_mcp_binary() -> Option<PathBuf> {
+pub(crate) fn find_mcp_binary() -> Option<PathBuf> {
     // Check ~/.local/bin (install script location)
     if let Some(home) = dirs::home_dir() {
         let path = home.join(".local/bin/hs-mcp");

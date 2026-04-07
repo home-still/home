@@ -69,6 +69,11 @@ pub enum TopCmd {
         #[command(subcommand)]
         command: super::cloud_cmd::CloudCmd,
     },
+    /// Install/uninstall MCP server config for Claude Desktop & Code
+    Mcp {
+        #[command(subcommand)]
+        command: super::mcp_cmd::McpCmd,
+    },
     /// View and manage configuration
     Config {
         #[command(subcommand)]

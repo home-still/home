@@ -9,6 +9,7 @@ mod cli;
 mod cloud_cmd;
 pub mod daemon;
 mod distill_cmd;
+mod mcp_cmd;
 mod scribe_cmd;
 mod scribe_pool;
 mod serve_cmd;
@@ -97,6 +98,7 @@ fn main() -> ExitCode {
         TopCmd::Status => |_| ExitCode::FAILURE,
         TopCmd::Upgrade { .. } => |_| ExitCode::FAILURE,
         TopCmd::Cloud { .. } => |_| ExitCode::FAILURE,
+        TopCmd::Mcp { .. } => |_| ExitCode::FAILURE,
     };
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio  runtime");
@@ -124,6 +126,7 @@ fn main() -> ExitCode {
                 }
                 TopCmd::Status => status_cmd::run().await,
                 TopCmd::Cloud { command } => cloud_cmd::dispatch(command, &reporter).await,
+                TopCmd::Mcp { command } => mcp_cmd::dispatch(command, &reporter).await,
                 TopCmd::Upgrade { check, force, pre } => {
                     upgrade_cmd::run(check, force, pre, &cli.global, &reporter).await
                 }
