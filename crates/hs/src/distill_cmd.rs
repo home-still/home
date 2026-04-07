@@ -761,9 +761,9 @@ async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let mut last_indexed = 0usize;
 
     loop {
-        // Check for q/Esc
+        // Poll for keypress with short timeout (stays responsive)
         if raw_enabled {
-            while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+            if crossterm::event::poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
                 if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
                     if key.kind == crossterm::event::KeyEventKind::Press
                         && matches!(
@@ -777,18 +777,21 @@ async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
                     }
                 }
             }
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
         // Read status
         if let Some(status) = read_index_status() {
-            // Print new entries since last check
             if status.indexed > last_indexed {
                 let _ = crossterm::terminal::disable_raw_mode();
                 eprintln!(
                     "  [{}/{}] {} — {} chunks total",
                     status.indexed, status.total_files, status.current_file, status.total_chunks
                 );
-                let _ = crossterm::terminal::enable_raw_mode();
+                if raw_enabled {
+                    let _ = crossterm::terminal::enable_raw_mode();
+                }
                 last_indexed = status.indexed;
             } else if status.gpu_yield {
                 let _ = crossterm::terminal::disable_raw_mode();
@@ -796,7 +799,9 @@ async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
                     "\r  [{}/{}] yielding to scribe...   ",
                     status.indexed, status.total_files
                 );
-                let _ = crossterm::terminal::enable_raw_mode();
+                if raw_enabled {
+                    let _ = crossterm::terminal::enable_raw_mode();
+                }
             }
 
             if status.done {
@@ -805,21 +810,17 @@ async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
                     "Indexed {}/{} files, {} chunks ({} failed)",
                     status.indexed, status.total_files, status.total_chunks, status.failed
                 ));
-                // Clean up
                 let _ = std::fs::remove_file(index_status_path());
                 crate::daemon::remove_pid_file(&index_pid_path());
                 return Ok(());
             }
 
-            // Check if daemon died
             if !crate::daemon::is_process_alive(status.pid) {
                 let _ = crossterm::terminal::disable_raw_mode();
                 reporter.error("Index daemon exited unexpectedly. Check logs.");
                 return Ok(());
             }
         }
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 

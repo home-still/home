@@ -419,78 +419,73 @@ async fn cmd_watch_attach(
     // Enable raw mode for keypress detection
     let raw_enabled = crossterm::terminal::enable_raw_mode().is_ok();
 
-    let result = async {
-        loop {
-            // Poll for keypress (non-blocking)
-            if raw_enabled {
-                while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
-                    if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
-                        use crossterm::event::KeyCode;
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                // Disable raw mode before printing
-                                let _ = crossterm::terminal::disable_raw_mode();
-                                reporter.status(
-                                    "Watch",
-                                    &format!(
-                                        "detached. Daemon running in background (PID {daemon_pid})"
-                                    ),
-                                );
-                                // Return without re-enabling; cleanup below is a no-op
-                                return Ok(());
-                            }
-                            KeyCode::Char('c')
-                                if key
-                                    .modifiers
-                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                            {
-                                let _ = crossterm::terminal::disable_raw_mode();
-                                reporter.status("Watch", "stopping daemon...");
-                                let _ = crate::daemon::stop_daemon(&watch_dir);
-                                reporter.status("Watch", "daemon stopped");
-                                return Ok(());
-                            }
-                            _ => {}
+    let result = loop {
+        // Poll for keypress with short timeout (stays responsive)
+        if raw_enabled {
+            if crossterm::event::poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
+                if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
+                    if key.kind != crossterm::event::KeyEventKind::Press {
+                        continue;
+                    }
+                    use crossterm::event::KeyCode;
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            let _ = crossterm::terminal::disable_raw_mode();
+                            reporter.status(
+                                "Watch",
+                                &format!(
+                                    "detached. Daemon running in background (PID {daemon_pid})"
+                                ),
+                            );
+                            break Ok(());
                         }
+                        KeyCode::Char('c')
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            let _ = crossterm::terminal::disable_raw_mode();
+                            reporter.status("Watch", "stopping daemon...");
+                            let _ = crate::daemon::stop_daemon(&watch_dir);
+                            reporter.status("Watch", "daemon stopped");
+                            break Ok(());
+                        }
+                        _ => {}
                     }
                 }
             }
+        } else {
+            // No raw mode — just sleep
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
 
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Check if daemon is still alive
+        if !crate::daemon::is_process_alive(daemon_pid) {
+            reporter.status("Watch", "daemon exited");
+            break Ok(());
+        }
 
-            // Check if daemon is still alive
-            if !crate::daemon::is_process_alive(daemon_pid) {
-                reporter.status("Watch", "daemon exited");
-                break;
-            }
-
-            // Read and display status — only show updates from our daemon
-            if let Ok(contents) = std::fs::read_to_string(&status_path) {
-                if let Ok(status) = serde_json::from_str::<serde_json::Value>(&contents) {
-                    let file_pid = status["pid"].as_u64().unwrap_or(0) as u32;
-                    if file_pid == daemon_pid {
-                        let p = status["processing"].as_u64().unwrap_or(0);
-                        let q = status["queued"].as_u64().unwrap_or(0);
-                        let c = status["completed"].as_u64().unwrap_or(0);
-                        let f = status["failed"].as_u64().unwrap_or(0);
-                        if raw_enabled {
-                            let _ = crossterm::terminal::disable_raw_mode();
-                        }
-                        reporter.status(
-                            "Watch",
-                            &format!("{p} processing, {q} queued, {c} completed, {f} failed"),
-                        );
-                        if raw_enabled {
-                            let _ = crossterm::terminal::enable_raw_mode();
-                        }
+        // Read and display status — only show updates from our daemon
+        if let Ok(contents) = std::fs::read_to_string(&status_path) {
+            if let Ok(status) = serde_json::from_str::<serde_json::Value>(&contents) {
+                let file_pid = status["pid"].as_u64().unwrap_or(0) as u32;
+                if file_pid == daemon_pid {
+                    let p = status["processing"].as_u64().unwrap_or(0);
+                    let q = status["queued"].as_u64().unwrap_or(0);
+                    let c = status["completed"].as_u64().unwrap_or(0);
+                    let f = status["failed"].as_u64().unwrap_or(0);
+                    let _ = crossterm::terminal::disable_raw_mode();
+                    reporter.status(
+                        "Watch",
+                        &format!("{p} processing, {q} queued, {c} completed, {f} failed"),
+                    );
+                    if raw_enabled {
+                        let _ = crossterm::terminal::enable_raw_mode();
                     }
                 }
             }
         }
-
-        Ok(())
-    }
-    .await;
+    };
 
     // Always restore terminal mode
     if raw_enabled {
