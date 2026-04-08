@@ -10,11 +10,6 @@ pub enum DistillCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Manage the distill server (Qdrant + native binary)
-    Server {
-        #[command(subcommand)]
-        action: DistillServerAction,
-    },
     /// Index markdown files into Qdrant via distill server
     Index {
         /// Re-index all documents (ignore cache)
@@ -66,15 +61,3 @@ pub enum DistillCmd {
     },
 }
 
-#[derive(Subcommand, Debug)]
-pub enum DistillServerAction {
-    /// Start Qdrant container and distill server
-    Start,
-    /// Stop Qdrant container and distill server
-    Stop,
-    /// Health-check the distill server
-    Ping {
-        /// Server URL (default: localhost:7434)
-        url: Option<String>,
-    },
-}

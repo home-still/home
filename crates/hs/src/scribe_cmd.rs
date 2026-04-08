@@ -146,11 +146,6 @@ pub enum ScribeCmd {
         #[arg(long = "dir")]
         status_dir: Option<PathBuf>,
     },
-    /// Manage the scribe server (Docker services)
-    Server {
-        #[command(subcommand)]
-        action: ServerAction,
-    },
     /// Backfill catalog entries for markdown files that were converted before the catalog feature
     CatalogBackfill,
 }
@@ -163,19 +158,11 @@ pub enum WatchAction {
     Stop,
 }
 
-#[derive(Subcommand, Debug)]
+/// Internal actions for scribe server management.
+/// Use `hs serve scribe start/stop` from the CLI.
 pub enum ServerAction {
-    /// Show running services and health status
-    List,
-    /// Start Docker services
     Start,
-    /// Stop Docker services
     Stop,
-    /// Health-check one or all servers
-    Ping {
-        /// Server URL (default: localhost:7433)
-        url: Option<String>,
-    },
 }
 
 pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -219,16 +206,6 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         }
         ScribeCmd::Status { status_dir } => cmd_status(status_dir, reporter).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
-        ScribeCmd::Server { action } => {
-            let hint = match &action {
-                ServerAction::Start => "hs serve scribe start",
-                ServerAction::Stop => "hs serve scribe stop",
-                ServerAction::List => "hs serve scribe",
-                ServerAction::Ping { .. } => "hs serve scribe",
-            };
-            eprintln!("warning: `hs scribe server` is deprecated, use `{hint}` instead");
-            cmd_server(action).await
-        }
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
     }
 }
@@ -1558,17 +1535,6 @@ pub async fn cmd_server(action: ServerAction) -> Result<()> {
     let cf = compose_path.to_str().unwrap_or_default();
 
     match action {
-        ServerAction::List => {
-            let _ = compose.run(&["-f", cf, "ps"]).await?;
-            eprintln!();
-            match health_check(DEFAULT_SERVER).await {
-                Ok(h) => eprintln!(
-                    "Health: OK (layout={}, tables={})",
-                    h.layout_model, h.table_model
-                ),
-                Err(_) => eprintln!("Health: NOT REACHABLE"),
-            }
-        }
         ServerAction::Start => {
             let has_nvidia = check_command("nvidia-smi", &[]).await;
             if should_use_native_ollama(has_nvidia) && !check_ollama_running().await {
@@ -1598,16 +1564,6 @@ pub async fn cmd_server(action: ServerAction) -> Result<()> {
                 unload_ollama_model("glm-ocr").await;
             }
             eprintln!("Stopped.");
-        }
-        ServerAction::Ping { url } => {
-            let target = url.as_deref().unwrap_or(DEFAULT_SERVER);
-            match health_check(target).await {
-                Ok(h) => eprintln!(
-                    "{}: OK (layout={}, tables={})",
-                    target, h.layout_model, h.table_model
-                ),
-                Err(e) => eprintln!("{}: FAILED ({})", target, e),
-            }
         }
     }
     Ok(())

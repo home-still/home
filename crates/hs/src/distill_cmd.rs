@@ -6,7 +6,7 @@ use hs_common::auth::client::is_cloud_url;
 use hs_common::compose::{check_command, wait_for_url, ComposeCmd};
 use hs_common::global_args::{GlobalArgs, OutputFormat};
 use hs_common::reporter::Reporter;
-use hs_distill::cli::{DistillCmd, DistillServerAction};
+use hs_distill::cli::DistillCmd;
 use hs_distill::client::DistillClient;
 use hs_distill::config::{DistillClientConfig, DistillServerConfig};
 
@@ -132,15 +132,6 @@ pub async fn dispatch(
 ) -> Result<()> {
     match cmd {
         DistillCmd::Init { force } => cmd_init(force, reporter).await,
-        DistillCmd::Server { action } => {
-            let hint = match &action {
-                DistillServerAction::Start => "hs serve distill start",
-                DistillServerAction::Stop => "hs serve distill stop",
-                DistillServerAction::Ping { .. } => "hs serve distill",
-            };
-            eprintln!("warning: `hs distill server` is deprecated, use `{hint}` instead");
-            cmd_server(action, reporter).await
-        }
         DistillCmd::Index {
             force,
             file,
@@ -239,22 +230,6 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
 }
 
 // ── Server ──────────────────────────────────────────────────────
-
-async fn cmd_server(action: DistillServerAction, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    match action {
-        DistillServerAction::Start => cmd_server_start(reporter).await,
-        DistillServerAction::Stop => cmd_server_stop(reporter).await,
-        DistillServerAction::Ping { url } => {
-            let target = url.as_deref().unwrap_or(DEFAULT_SERVER);
-            let client = DistillClient::new(target);
-            match client.health().await {
-                Ok(h) => reporter.status("OK", &format!("{target} ({})", h.compute_device)),
-                Err(e) => reporter.error(&format!("{target}: {e}")),
-            }
-            Ok(())
-        }
-    }
-}
 
 pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let config = DistillServerConfig::load().unwrap_or_default();
