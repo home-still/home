@@ -535,7 +535,7 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
 /// Used by the pipeline auto-trigger: scribe watch → distill index.
 /// Skips if distill server is not reachable (avoids spawning a daemon that
 /// will immediately fail its health check).
-pub fn ensure_index_running() -> bool {
+pub async fn ensure_index_running() -> bool {
     let pid_path = index_pid_path();
     if let Some(pid) = crate::daemon::read_pid(&pid_path) {
         if crate::daemon::is_process_alive(pid) {
@@ -550,14 +550,15 @@ pub fn ensure_index_running() -> bool {
         return false;
     }
 
-    // Quick check: is the distill server PID alive? (doesn't guarantee health,
-    // but avoids spawning a daemon when the server clearly isn't running)
-    let server_pid_path = distill_pid_path();
-    let server_running = crate::daemon::read_pid(&server_pid_path)
-        .map(crate::daemon::is_process_alive)
-        .unwrap_or(false);
-    if !server_running {
-        tracing::debug!("Skipping auto-index: distill server not running");
+    // Quick check: is the distill server reachable? Uses HTTP health check
+    // so it works for both local and remote servers (e.g. big_mac → big).
+    let server_url = DistillClientConfig::load()
+        .ok()
+        .and_then(|cfg| cfg.servers.into_iter().next())
+        .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+    let client = DistillClient::new(&server_url);
+    if client.health().await.is_err() {
+        tracing::debug!("Skipping auto-index: distill server not reachable at {server_url}");
         return false;
     }
 

@@ -859,7 +859,7 @@ async fn cmd_watch(
     }
 
     // Auto-trigger: ensure distill index daemon is running
-    if crate::distill_cmd::ensure_index_running() {
+    if crate::distill_cmd::ensure_index_running().await {
         reporter.status("Pipeline", "distill indexer running");
     }
 

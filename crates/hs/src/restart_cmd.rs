@@ -26,7 +26,7 @@ pub async fn run(reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     // 3. Distill index daemon
-    if restart_index_daemon(reporter)? {
+    if restart_index_daemon(reporter).await? {
         restarted += 1;
     }
 
@@ -132,7 +132,7 @@ fn restart_scribe_watcher(reporter: &Arc<dyn Reporter>) -> Result<bool> {
 
 // ── Distill index daemon ───────────────────────────────────────
 
-fn restart_index_daemon(reporter: &Arc<dyn Reporter>) -> Result<bool> {
+async fn restart_index_daemon(reporter: &Arc<dyn Reporter>) -> Result<bool> {
     let pid_path = dirs::home_dir()
         .unwrap_or_default()
         .join(hs_common::HIDDEN_DIR)
@@ -165,7 +165,7 @@ fn restart_index_daemon(reporter: &Arc<dyn Reporter>) -> Result<bool> {
             crate::daemon::remove_pid_file(&pid_path);
 
             // Re-spawn
-            crate::distill_cmd::ensure_index_running();
+            crate::distill_cmd::ensure_index_running().await;
             reporter.status("OK", "distill indexer restarted");
             Ok(true)
         }
