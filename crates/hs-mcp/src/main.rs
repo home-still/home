@@ -86,6 +86,12 @@ struct DistillExistsParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PaperDownloadParams {
+    #[schemars(description = "DOI of the paper to download")]
+    doi: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ScribeConvertParams {
     #[schemars(
         description = "Paper stem name (filename without extension) of a PDF in the papers directory"
@@ -238,6 +244,106 @@ impl HomeStillMcp {
             Ok(None) => Err(format!("No paper found for DOI: {}", p.doi)),
             Err(e) => Err(format!("Lookup failed: {e}")),
         }
+    }
+
+    #[tool(
+        description = "Download a paper PDF by DOI into the papers directory. Tries arXiv, Unpaywall, and provider resolvers. Creates a catalog entry with metadata. Returns JSON with file path, size, and sha256.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn paper_download(
+        &self,
+        Parameters(p): Parameters<PaperDownloadParams>,
+    ) -> Result<String, String> {
+        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
+
+        // Build downloader with minimal config (no resolvers — DOI path uses arXiv + Unpaywall)
+        let downloader = paper::providers::downloader::PaperDownloader::new(
+            self.papers_dir.clone(),
+            &config.download,
+            Vec::new(),
+        )
+        .map_err(|e| format!("Downloader init failed: {e}"))?;
+
+        // Download by DOI
+        use paper::ports::download_service::DownloadService;
+        let result = downloader
+            .download_by_doi(&p.doi)
+            .await
+            .map_err(|e| format!("Download failed: {e}"))?;
+
+        if result.skipped {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "doi": p.doi,
+                "skipped": true,
+                "path": result.file_path.display().to_string(),
+                "message": "File already exists",
+            }))
+            .unwrap_or_default());
+        }
+
+        // Look up paper metadata to populate catalog entry
+        let provider_arg = paper::cli::ProviderArg::All;
+        let paper_meta =
+            if let Ok(provider) = paper::commands::paper::make_provider(&provider_arg, &config) {
+                provider.get_by_doi(&p.doi).await.ok().flatten()
+            } else {
+                None
+            };
+
+        // Write catalog entry
+        let stem = result
+            .file_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let entry = hs_common::catalog::CatalogEntry {
+            title: paper_meta.as_ref().map(|p| p.title.clone()),
+            authors: paper_meta
+                .as_ref()
+                .map(|p| {
+                    p.authors
+                        .iter()
+                        .map(|a| hs_common::catalog::AuthorEntry {
+                            name: a.name.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            doi: Some(p.doi.clone()),
+            publication_date: paper_meta
+                .as_ref()
+                .and_then(|p| p.publication_date.map(|d| d.to_string())),
+            abstract_text: paper_meta.as_ref().and_then(|p| p.abstract_text.clone()),
+            cited_by_count: paper_meta.as_ref().and_then(|p| p.cited_by_count),
+            source: paper_meta.as_ref().map(|p| p.source.clone()),
+            download_urls: paper_meta
+                .as_ref()
+                .map(|p| p.download_urls.clone())
+                .unwrap_or_default(),
+            pdf_path: Some(result.file_path.display().to_string()),
+            markdown_path: None,
+            downloaded_at: Some(chrono::Utc::now().to_rfc3339()),
+            file_size_bytes: Some(result.size_bytes),
+            sha256: Some(result.sha256.clone()),
+            conversion: None,
+            embedding: None,
+        };
+        hs_common::catalog::write_catalog_entry(&self.catalog_dir, &stem, &entry);
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "doi": p.doi,
+            "path": result.file_path.display().to_string(),
+            "size_bytes": result.size_bytes,
+            "sha256": result.sha256,
+        }))
+        .unwrap_or_default())
     }
 
     // ── Catalog Tools ──────────────────────────────────────────
