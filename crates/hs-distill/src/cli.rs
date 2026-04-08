@@ -60,4 +60,3 @@ pub enum DistillCmd {
         server: Option<String>,
     },
 }
-

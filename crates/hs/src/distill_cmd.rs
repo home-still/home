@@ -345,7 +345,10 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     // when launched from systemd (CWD = /). Use a stable absolute path.
     let fastembed_cache = std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| {
         // Check next to the binary first (where old versions cached the model)
-        let beside_binary = binary.parent().unwrap_or(binary.as_ref()).join(".fastembed_cache");
+        let beside_binary = binary
+            .parent()
+            .unwrap_or(binary.as_ref())
+            .join(".fastembed_cache");
         if beside_binary.exists() {
             return beside_binary.to_string_lossy().to_string();
         }
@@ -521,7 +524,10 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         .unwrap_or_else(|_| "/usr/lib/libonnxruntime.so".to_string());
 
     let fastembed_cache = std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| {
-        let beside_binary = binary.parent().unwrap_or(binary.as_ref()).join(".fastembed_cache");
+        let beside_binary = binary
+            .parent()
+            .unwrap_or(binary.as_ref())
+            .join(".fastembed_cache");
         if beside_binary.exists() {
             return beside_binary.to_string_lossy().to_string();
         }
