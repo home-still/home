@@ -2,9 +2,19 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router, ServerHandler,
+    handler::server::{
+        router::{prompt::PromptRouter, tool::ToolRouter},
+        wrapper::Parameters,
+    },
+    model::{
+        ErrorData, GetPromptRequestParams, GetPromptResult, ListPromptsResult,
+        ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, PromptMessage,
+        PromptMessageRole, RawResource, RawResourceTemplate, ReadResourceRequestParams,
+        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+    },
+    prompt, prompt_handler, prompt_router, schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
 
 // ── Tool parameter types ────────────────────────────────────────
@@ -102,6 +112,7 @@ struct HomeStillMcp {
     scribe_servers: Vec<String>,
     distill_servers: Vec<String>,
     tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
 }
 
 impl HomeStillMcp {
@@ -128,6 +139,7 @@ impl HomeStillMcp {
             scribe_servers,
             distill_servers,
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
         }
     }
 
@@ -627,20 +639,285 @@ fn count_files(dir: &std::path::Path, ext: &str) -> u64 {
         .unwrap_or(0)
 }
 
+// ── Prompt parameter types ───────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ResearchPromptParams {
+    #[schemars(description = "Research topic to investigate")]
+    topic: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SummarizePromptParams {
+    #[schemars(description = "Paper stem name to summarize")]
+    stem: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ComparePromptParams {
+    #[schemars(description = "First paper stem name")]
+    stem_a: String,
+    #[schemars(description = "Second paper stem name")]
+    stem_b: String,
+}
+
+#[prompt_router]
+impl HomeStillMcp {
+    #[prompt(description = "Research a topic: search papers, read documents, synthesize findings")]
+    fn research_paper(
+        &self,
+        Parameters(p): Parameters<ResearchPromptParams>,
+    ) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Research the topic: \"{}\"\n\n\
+                 Use the home-still tools in this order:\n\
+                 1. paper_search to find relevant papers\n\
+                 2. catalog_read to check which papers are in our collection\n\
+                 3. markdown_read to read the full text of converted papers\n\
+                 4. distill_search for semantic search across the indexed corpus\n\
+                 5. Synthesize the findings into a comprehensive summary with citations",
+                p.topic
+            ),
+        )]
+    }
+
+    #[prompt(description = "Summarize a specific document from the collection")]
+    fn summarize_document(
+        &self,
+        Parameters(p): Parameters<SummarizePromptParams>,
+    ) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Read and summarize the paper with stem \"{}\".\n\n\
+                 1. Use catalog_read to get the metadata\n\
+                 2. Use markdown_read to get the full text\n\
+                 3. Provide a structured summary: objective, methods, key findings, limitations, and relevance",
+                p.stem
+            ),
+        )]
+    }
+
+    #[prompt(description = "Compare two papers from the collection")]
+    fn compare_papers(&self, Parameters(p): Parameters<ComparePromptParams>) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Compare these two papers:\n\
+                 - Paper A: \"{}\"\n\
+                 - Paper B: \"{}\"\n\n\
+                 1. Use catalog_read for metadata on both\n\
+                 2. Use markdown_read for full text of both\n\
+                 3. Compare: research questions, methodology, findings, and conclusions\n\
+                 4. Note agreements, contradictions, and complementary insights",
+                p.stem_a, p.stem_b
+            ),
+        )]
+    }
+}
+
+// ── ServerHandler ───────────────────────────────────────────────
+
 #[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for HomeStillMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
+        )
+        .with_instructions(
             "home-still: Academic research pipeline server.\n\n\
              Workflows:\n\
-             1. DISCOVER: paper_search → paper_get → paper_download\n\
+             1. DISCOVER: paper_search → paper_get\n\
              2. CONVERT: scribe_convert (PDF stem → markdown)\n\
-             3. READ: catalog_read, markdown_read\n\
+             3. READ: catalog_read, markdown_read, or use resources (catalog:///{stem}, markdown:///{stem})\n\
              4. INDEX: distill_index (markdown → vector DB)\n\
              5. SEARCH: distill_search (semantic search)\n\
              6. MONITOR: system_status, scribe_health, distill_status\n\n\
+             Prompts: research_paper, summarize_document, compare_papers\n\
              Start with system_status to verify pipeline health.",
         )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        use rmcp::model::AnnotateAble;
+
+        let mut resources = Vec::new();
+
+        // Catalog entries
+        if let Ok(dir) = std::fs::read_dir(&self.catalog_dir) {
+            for entry in dir.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "yaml") {
+                    if let Some(stem) = path.file_stem() {
+                        let stem = stem.to_string_lossy();
+                        let cat = hs_common::catalog::read_catalog_entry(&self.catalog_dir, &stem);
+                        let title = cat
+                            .as_ref()
+                            .and_then(|c| c.title.clone())
+                            .unwrap_or_else(|| stem.to_string());
+                        resources.push(
+                            RawResource {
+                                uri: format!("catalog:///{stem}"),
+                                name: title,
+                                title: None,
+                                description: Some("Catalog entry with paper metadata".into()),
+                                mime_type: Some("application/yaml".into()),
+                                size: None,
+                                icons: None,
+                                meta: None,
+                            }
+                            .no_annotation(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Markdown documents
+        if let Ok(dir) = std::fs::read_dir(&self.markdown_dir) {
+            for entry in dir.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "md") {
+                    if let Some(stem) = path.file_stem() {
+                        let stem = stem.to_string_lossy();
+                        let size = std::fs::metadata(&path).map(|m| m.len() as u32).ok();
+                        resources.push(
+                            RawResource {
+                                uri: format!("markdown:///{stem}"),
+                                name: stem.to_string(),
+                                title: None,
+                                description: Some("Converted markdown document".into()),
+                                mime_type: Some("text/markdown".into()),
+                                size,
+                                icons: None,
+                                meta: None,
+                            }
+                            .no_annotation(),
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        use rmcp::model::AnnotateAble;
+
+        Ok(ListResourceTemplatesResult::with_all_items(vec![
+            RawResourceTemplate {
+                uri_template: "catalog:///{stem}".into(),
+                name: "Catalog Entry".into(),
+                title: None,
+                description: Some(
+                    "Paper catalog entry with metadata, conversion info, and page offsets".into(),
+                ),
+                mime_type: Some("application/yaml".into()),
+                icons: None,
+            }
+            .no_annotation(),
+            RawResourceTemplate {
+                uri_template: "markdown:///{stem}".into(),
+                name: "Markdown Document".into(),
+                title: None,
+                description: Some("Full converted markdown of an academic paper".into()),
+                mime_type: Some("text/markdown".into()),
+                icons: None,
+            }
+            .no_annotation(),
+            RawResourceTemplate {
+                uri_template: "markdown:///{stem}/page/{page}".into(),
+                name: "Markdown Page".into(),
+                title: None,
+                description: Some(
+                    "Single page from a converted markdown document (1-based)".into(),
+                ),
+                mime_type: Some("text/markdown".into()),
+                icons: None,
+            }
+            .no_annotation(),
+        ]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        let uri = &request.uri;
+
+        if let Some(stem) = uri.strip_prefix("catalog:///") {
+            // Catalog resource
+            let entry = hs_common::catalog::read_catalog_entry(&self.catalog_dir, stem)
+                .ok_or_else(|| ErrorData::resource_not_found("catalog entry not found", None))?;
+            let yaml = serde_json::to_string_pretty(&entry)
+                .map_err(|e| ErrorData::internal_error(format!("serialize error: {e}"), None))?;
+            Ok(ReadResourceResult::new(vec![
+                ResourceContents::TextResourceContents {
+                    uri: uri.clone(),
+                    mime_type: Some("application/yaml".into()),
+                    text: yaml,
+                    meta: None,
+                },
+            ]))
+        } else if let Some(rest) = uri.strip_prefix("markdown:///") {
+            // Markdown resource — check for page number
+            let (stem, page) = if let Some((s, p)) = rest.rsplit_once("/page/") {
+                let page: usize = p.parse().map_err(|_| {
+                    ErrorData::invalid_params(format!("invalid page number: {p}"), None)
+                })?;
+                (s, Some(page))
+            } else {
+                (rest, None)
+            };
+
+            let path = self.markdown_dir.join(format!("{stem}.md"));
+            let content = std::fs::read_to_string(&path)
+                .map_err(|_| ErrorData::resource_not_found("markdown not found", None))?;
+
+            let text = if let Some(page) = page {
+                let pages: Vec<&str> = content.split("\n\n---\n\n").collect();
+                if page == 0 || page > pages.len() {
+                    return Err(ErrorData::invalid_params(
+                        format!("page {page} not found, document has {} pages", pages.len()),
+                        None,
+                    ));
+                }
+                pages[page - 1].to_string()
+            } else {
+                content
+            };
+
+            Ok(ReadResourceResult::new(vec![
+                ResourceContents::TextResourceContents {
+                    uri: uri.clone(),
+                    mime_type: Some("text/markdown".into()),
+                    text,
+                    meta: None,
+                },
+            ]))
+        } else {
+            Err(ErrorData::resource_not_found(
+                "unknown resource URI scheme",
+                None,
+            ))
+        }
     }
 }
 
