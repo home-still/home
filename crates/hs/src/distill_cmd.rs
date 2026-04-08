@@ -406,6 +406,12 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
         ))?;
 
     reporter.status("Distill", &format!("OK (PID {pid})"));
+
+    // Auto-start index daemon to process any pending documents
+    if ensure_index_running().await {
+        reporter.status("Pipeline", "index daemon started");
+    }
+
     reporter.finish(&format!(
         "Listening on {distill_url}\nLogs: {}",
         log_path.display()
@@ -554,6 +560,26 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         "Distill",
         &format!("running on port {port} (Ctrl+C to stop)"),
     );
+
+    // Auto-start index daemon once the server is healthy
+    let index_port = port;
+    tokio::spawn(async move {
+        let check_url = format!("http://localhost:{index_port}/health");
+        // Wait for the server to become healthy (up to 5 minutes for model load)
+        for _ in 0..300 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if reqwest::get(&check_url)
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                if ensure_index_running().await {
+                    tracing::info!("Auto-started index daemon after distill server ready");
+                }
+                return;
+            }
+        }
+    });
 
     // Run in foreground — inherit stdout/stderr, block until exit
     let status = tokio::process::Command::new(&binary)
