@@ -535,6 +535,13 @@ fn validate_pdf_bytes(bytes: &[u8]) -> bool {
     bytes.len() >= 100 && bytes.starts_with(b"%PDF")
 }
 
+/// Check if bytes look like HTML content (for .pdf files that are actually HTML).
+fn looks_like_html(bytes: &[u8]) -> bool {
+    let prefix = &bytes[..bytes.len().min(512)];
+    let lower = String::from_utf8_lossy(prefix).to_lowercase();
+    lower.contains("<!doctype html") || lower.contains("<html") || lower.contains("<head")
+}
+
 /// Move a corrupt/invalid file to the corrupted directory.
 fn quarantine_file(path: &std::path::Path, corrupted_dir: &std::path::Path) {
     let _ = std::fs::create_dir_all(corrupted_dir);
@@ -1060,6 +1067,17 @@ async fn convert_and_save_pool(
     };
 
     if !validate_pdf_bytes(&pdf_bytes) {
+        // Check if it's actually an HTML paper saved with .pdf extension
+        if looks_like_html(&pdf_bytes) {
+            let html_path = pdf_path.with_extension("html");
+            if std::fs::rename(pdf_path, &html_path).is_ok() {
+                reporter.warn(&format!(
+                    "{stem}: HTML in .pdf → renamed to .html (will convert on next scan)"
+                ));
+                stats.queued.fetch_sub(1, Relaxed);
+                return;
+            }
+        }
         reporter.warn(&format!("{stem}: invalid PDF → quarantined"));
         quarantine_file(pdf_path, corrupted_dir);
         stats.queued.fetch_sub(1, Relaxed);
