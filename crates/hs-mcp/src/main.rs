@@ -860,15 +860,16 @@ impl ServerHandler for HomeStillMcp {
         )
         .with_instructions(
             "home-still: Academic research pipeline server.\n\n\
-             Workflows:\n\
-             1. DISCOVER: paper_search → paper_get\n\
-             2. CONVERT: scribe_convert (PDF stem → markdown)\n\
-             3. READ: catalog_read, markdown_read, or use resources (catalog:///{stem}, markdown:///{stem})\n\
-             4. INDEX: distill_index (markdown → vector DB)\n\
-             5. SEARCH: distill_search (semantic search)\n\
-             6. MONITOR: system_status, scribe_health, distill_status\n\n\
-             Prompts: research_paper, summarize_document, compare_papers\n\
-             Start with system_status to verify pipeline health.",
+             Full pipeline workflow:\n\
+             1. DISCOVER: paper_search (by query) or paper_get (by DOI) — metadata lookup\n\
+             2. DOWNLOAD: paper_download (by DOI) — downloads the actual PDF/HTML into the papers directory. This is REQUIRED before conversion.\n\
+             3. CONVERT: scribe_convert (PDF/HTML stem → markdown)\n\
+             4. READ: catalog_read, markdown_read, or use resources (catalog:///{stem}, markdown:///{stem})\n\
+             5. INDEX: distill_index (markdown → vector DB)\n\
+             6. SEARCH: distill_search (semantic search across all indexed papers)\n\
+             7. MONITOR: system_status, scribe_health, distill_status\n\n\
+             To add a new paper to the pipeline: paper_search → paper_download → scribe_convert → distill_index\n\n\
+             Prompts: research_paper, summarize_document, compare_papers",
         )
     }
 
