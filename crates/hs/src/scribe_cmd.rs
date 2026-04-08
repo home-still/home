@@ -504,9 +504,10 @@ async fn cmd_watch_attach(
     result
 }
 
-/// Check if a path is a valid PDF to process (not a macOS resource fork, not a temp file).
-fn is_processable_pdf(path: &std::path::Path) -> bool {
-    if path.extension() != Some(std::ffi::OsStr::new("pdf")) {
+/// Check if a path is a document to process (PDF or HTML, not a macOS resource fork or temp file).
+fn is_processable_document(path: &std::path::Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext != "pdf" && ext != "html" && ext != "htm" {
         return false;
     }
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -541,6 +542,205 @@ fn quarantine_file(path: &std::path::Path, corrupted_dir: &std::path::Path) {
     if let Err(e) = std::fs::rename(path, &dest) {
         eprintln!("warning: Failed to quarantine {}: {e}", path.display());
     }
+}
+
+/// Convert an HTML academic paper to markdown.
+/// Extracts the article body from PMC/PubMed-style HTML, preserving structure.
+fn convert_html_to_markdown(html: &str) -> String {
+    use scraper::{Html, Selector};
+
+    let doc = Html::parse_document(html);
+
+    // Try progressively broader selectors for the article content
+    let body_selectors = ["article", "main", "#article-body", ".article-body", "body"];
+    let mut root_html = None;
+    for sel_str in &body_selectors {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            if let Some(el) = doc.select(&sel).next() {
+                root_html = Some(el);
+                break;
+            }
+        }
+    }
+
+    let root = match root_html {
+        Some(el) => el,
+        None => return doc.root_element().text().collect::<Vec<_>>().join(" "),
+    };
+
+    // Walk the DOM and produce markdown
+    let mut md = String::new();
+    walk_html_node(&root, &mut md);
+
+    // Clean up excessive blank lines
+    let mut cleaned = String::new();
+    let mut blank_count = 0u32;
+    for line in md.lines() {
+        if line.trim().is_empty() {
+            blank_count += 1;
+            if blank_count <= 2 {
+                cleaned.push('\n');
+            }
+        } else {
+            blank_count = 0;
+            cleaned.push_str(line);
+            cleaned.push('\n');
+        }
+    }
+    cleaned.trim().to_string()
+}
+
+fn walk_html_node(element: &scraper::ElementRef, md: &mut String) {
+    use scraper::Node;
+
+    for child in element.children() {
+        match child.value() {
+            Node::Text(text) => {
+                let t = text.trim();
+                if !t.is_empty() {
+                    md.push_str(t);
+                }
+            }
+            Node::Element(el) => {
+                let tag = el.name();
+                if let Some(child_ref) = scraper::ElementRef::wrap(child) {
+                    match tag {
+                        "h1" => {
+                            md.push_str("\n\n# ");
+                            walk_html_node(&child_ref, md);
+                            md.push_str("\n\n");
+                        }
+                        "h2" => {
+                            md.push_str("\n\n## ");
+                            walk_html_node(&child_ref, md);
+                            md.push_str("\n\n");
+                        }
+                        "h3" => {
+                            md.push_str("\n\n### ");
+                            walk_html_node(&child_ref, md);
+                            md.push_str("\n\n");
+                        }
+                        "h4" | "h5" | "h6" => {
+                            md.push_str("\n\n#### ");
+                            walk_html_node(&child_ref, md);
+                            md.push_str("\n\n");
+                        }
+                        "p" | "div" => {
+                            md.push_str("\n\n");
+                            walk_html_node(&child_ref, md);
+                            md.push_str("\n\n");
+                        }
+                        "strong" | "b" => {
+                            md.push_str("**");
+                            walk_html_node(&child_ref, md);
+                            md.push_str("**");
+                        }
+                        "em" | "i" => {
+                            md.push('_');
+                            walk_html_node(&child_ref, md);
+                            md.push('_');
+                        }
+                        "ul" | "ol" => {
+                            md.push('\n');
+                            walk_html_node(&child_ref, md);
+                            md.push('\n');
+                        }
+                        "li" => {
+                            md.push_str("\n- ");
+                            walk_html_node(&child_ref, md);
+                        }
+                        "br" => md.push('\n'),
+                        "a" => {
+                            walk_html_node(&child_ref, md);
+                        }
+                        "sup" => {
+                            md.push_str("<sup>");
+                            walk_html_node(&child_ref, md);
+                            md.push_str("</sup>");
+                        }
+                        "sub" => {
+                            md.push_str("<sub>");
+                            walk_html_node(&child_ref, md);
+                            md.push_str("</sub>");
+                        }
+                        "table" | "thead" | "tbody" | "tr" | "td" | "th" => {
+                            // Pass through table HTML as-is (markdown tables are limited)
+                            walk_html_node(&child_ref, md);
+                            if tag == "tr" {
+                                md.push('\n');
+                            } else if tag == "td" || tag == "th" {
+                                md.push_str(" | ");
+                            }
+                        }
+                        // Skip script, style, nav, footer, header (non-content)
+                        "script" | "style" | "nav" | "footer" | "header" | "aside" | "noscript"
+                        | "link" | "meta" => {}
+                        // Everything else: recurse
+                        _ => walk_html_node(&child_ref, md),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Convert an HTML paper and save the result, updating catalog.
+/// No server needed — runs locally.
+async fn convert_html_and_save(
+    html_path: &std::path::Path,
+    output_dir: &std::path::Path,
+    catalog_dir: &std::path::Path,
+    reporter: &Arc<dyn Reporter>,
+    stats: &WatchStats,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let start = std::time::Instant::now();
+    let stem = html_path.file_stem().unwrap_or_default().to_string_lossy();
+    let output_path = output_dir.join(format!("{stem}.md"));
+
+    stats.queued.fetch_sub(1, Relaxed);
+    stats.processing.fetch_add(1, Relaxed);
+
+    let html = match std::fs::read_to_string(html_path) {
+        Ok(h) => h,
+        Err(e) => {
+            reporter.warn(&format!("{stem}: Cannot read HTML: {e}"));
+            stats.processing.fetch_sub(1, Relaxed);
+            stats.failed.fetch_add(1, Relaxed);
+            return;
+        }
+    };
+
+    let md = convert_html_to_markdown(&html);
+    if md.trim().is_empty() {
+        reporter.warn(&format!("{stem}: HTML conversion produced empty output"));
+        stats.processing.fetch_sub(1, Relaxed);
+        stats.failed.fetch_add(1, Relaxed);
+        return;
+    }
+
+    stats.processing.fetch_sub(1, Relaxed);
+
+    if let Err(e) = atomic_write(&output_path, md.as_bytes()) {
+        reporter.warn(&format!("{stem}: Write failed: {e}"));
+        stats.failed.fetch_add(1, Relaxed);
+        return;
+    }
+
+    stats.completed.fetch_add(1, Relaxed);
+
+    let page_offsets = crate::catalog::compute_page_offsets(&md);
+    crate::catalog::update_conversion_catalog(
+        catalog_dir,
+        &stem,
+        "local-html",
+        start.elapsed().as_secs(),
+        1, // HTML papers are single-page
+        page_offsets,
+        &format!("markdown/{stem}.md"),
+    );
 }
 
 /// Atomic file write: write to temp file in same directory, then rename.
@@ -683,7 +883,7 @@ async fn cmd_watch(
     if let Ok(entries) = std::fs::read_dir(&watch_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !is_processable_pdf(&path) {
+            if !is_processable_document(&path) {
                 continue;
             }
             let stem = path.file_stem().unwrap_or_default();
@@ -702,6 +902,7 @@ async fn cmd_watch(
             stats
                 .queued
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let is_html = path.extension().is_some_and(|e| e == "html" || e == "htm");
             let pool = Arc::clone(&pool);
             let output_dir = output_dir.clone();
             let corrupted_dir = corrupted_dir.clone();
@@ -710,17 +911,22 @@ async fn cmd_watch(
             let stats = Arc::clone(&stats);
             let sem = Arc::clone(&spawn_sem);
             tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await;
-                convert_and_save_pool(
-                    &pool,
-                    &path,
-                    &output_dir,
-                    &corrupted_dir,
-                    &catalog_dir,
-                    &reporter,
-                    &stats,
-                )
-                .await;
+                if is_html {
+                    convert_html_and_save(&path, &output_dir, &catalog_dir, &reporter, &stats)
+                        .await;
+                } else {
+                    let _permit = sem.acquire_owned().await;
+                    convert_and_save_pool(
+                        &pool,
+                        &path,
+                        &output_dir,
+                        &corrupted_dir,
+                        &catalog_dir,
+                        &reporter,
+                        &stats,
+                    )
+                    .await;
+                }
             });
         }
     }
@@ -745,7 +951,7 @@ async fn cmd_watch(
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(event)) => {
                 for path in &event.paths {
-                    if !is_processable_pdf(path) {
+                    if !is_processable_document(path) {
                         continue;
                     }
                     let stem = path.file_stem().unwrap_or_default();
@@ -764,6 +970,7 @@ async fn cmd_watch(
                     stats
                         .queued
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let is_html = path.extension().is_some_and(|e| e == "html" || e == "htm");
                     let pool = Arc::clone(&pool);
                     let path = path.clone();
                     let output_dir = output_dir.clone();
@@ -773,17 +980,28 @@ async fn cmd_watch(
                     let stats = Arc::clone(&stats);
                     let sem = Arc::clone(&spawn_sem);
                     tokio::spawn(async move {
-                        let _permit = sem.acquire_owned().await;
-                        convert_and_save_pool(
-                            &pool,
-                            &path,
-                            &output_dir,
-                            &corrupted_dir,
-                            &catalog_dir,
-                            &reporter,
-                            &stats,
-                        )
-                        .await;
+                        if is_html {
+                            convert_html_and_save(
+                                &path,
+                                &output_dir,
+                                &catalog_dir,
+                                &reporter,
+                                &stats,
+                            )
+                            .await;
+                        } else {
+                            let _permit = sem.acquire_owned().await;
+                            convert_and_save_pool(
+                                &pool,
+                                &path,
+                                &output_dir,
+                                &corrupted_dir,
+                                &catalog_dir,
+                                &reporter,
+                                &stats,
+                            )
+                            .await;
+                        }
                     });
                 }
             }

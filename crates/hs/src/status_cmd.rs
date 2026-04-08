@@ -120,12 +120,15 @@ async fn collect_data() -> DashboardData {
     let cfg = scribe_cfg.clone();
     let fs_result = tokio::task::spawn_blocking(move || {
         let (pdf_count, pdf_bytes) = count_dir_recursive(&cfg.watch_dir, "pdf");
+        let (html_count, html_bytes) = count_dir_recursive(&cfg.watch_dir, "html");
+        let doc_count = pdf_count + html_count;
+        let doc_bytes = pdf_bytes + html_bytes;
         let (markdown_count, markdown_bytes) = count_dir(&cfg.output_dir, "md");
         let (catalog_count, _) = count_dir(&cfg.catalog_dir, "yaml");
         let (corrupted_count, _) = count_dir(&cfg.corrupted_dir, "pdf");
         (
-            pdf_count,
-            pdf_bytes,
+            doc_count,
+            doc_bytes,
             markdown_count,
             markdown_bytes,
             catalog_count,
@@ -515,7 +518,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
 
     let rows = vec![
         Row::new(vec![
-            Cell::from("PDFs"),
+            Cell::from("Documents"),
             Cell::from(format!("{:>6}", data.pdf_count)),
             Cell::from(format!("{:>8}", fmt_bytes(data.pdf_bytes))),
             Cell::from(""),
