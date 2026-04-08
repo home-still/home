@@ -65,13 +65,20 @@ struct HistoryEvent {
 
 // ── Data collection ─────────────────────────────────────────────
 
+/// Check if a filename is a macOS resource fork (starts with "._")
+fn is_macos_resource_fork(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(|name| name.starts_with("._"))
+}
+
 fn count_dir(dir: &Path, ext: &str) -> (u64, u64) {
     let mut count = 0u64;
     let mut bytes = 0u64;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == ext) {
+            if path.extension().is_some_and(|e| e == ext) && !is_macos_resource_fork(&path) {
                 count += 1;
                 bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
             }
@@ -91,7 +98,9 @@ fn count_dir_recursive(dir: &Path, ext: &str) -> (u64, u64) {
                 let path = entry.path();
                 if path.is_dir() {
                     walk(&path, ext, count, bytes);
-                } else if path.extension().is_some_and(|e| e == ext) {
+                } else if path.extension().is_some_and(|e| e == ext)
+                    && !is_macos_resource_fork(&path)
+                {
                     *count += 1;
                     *bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
                 }
@@ -547,15 +556,24 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                 completed,
                 failed,
             } => {
+                let (status_label, status_color) = if *processing > 0 || *queued > 0 {
+                    ("working", Color::Green)
+                } else if *completed > 0 && *failed == 0 {
+                    ("complete", Color::Green)
+                } else if *completed > 0 || *failed > 0 {
+                    ("idle", Color::Green)
+                } else {
+                    ("idle", Color::DarkGray)
+                };
                 let detail = if *processing > 0 || *queued > 0 {
                     format!("{processing} active, {queued} queued")
                 } else {
                     format!("{completed} done, {failed} failed")
                 };
                 Row::new(vec![
-                    Cell::from("Watcher").style(Style::default().fg(Color::Green)),
-                    Cell::from("●".to_string()).style(Style::default().fg(Color::Green)),
-                    Cell::from(if *processing > 0 { "working" } else { "idle" }),
+                    Cell::from("Watcher").style(Style::default().fg(status_color)),
+                    Cell::from("●".to_string()).style(Style::default().fg(status_color)),
+                    Cell::from(status_label),
                     Cell::from(detail),
                 ])
             }
