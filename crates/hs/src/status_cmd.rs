@@ -14,8 +14,8 @@ use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
 // ── Data model ──────────────────────────────────────────────────
 
 struct DashboardData {
-    pdf_count: u64,
-    pdf_bytes: u64,
+    doc_count: u64,
+    doc_bytes: u64,
     markdown_count: u64,
     markdown_bytes: u64,
     catalog_count: u64,
@@ -121,11 +121,14 @@ async fn collect_data() -> DashboardData {
     let fs_result = tokio::task::spawn_blocking(move || {
         let (pdf_count, pdf_bytes) = count_dir_recursive(&cfg.watch_dir, "pdf");
         let (html_count, html_bytes) = count_dir_recursive(&cfg.watch_dir, "html");
-        let doc_count = pdf_count + html_count;
-        let doc_bytes = pdf_bytes + html_bytes;
+        let (htm_count, htm_bytes) = count_dir_recursive(&cfg.watch_dir, "htm");
+        let doc_count = pdf_count + html_count + htm_count;
+        let doc_bytes = pdf_bytes + html_bytes + htm_bytes;
         let (markdown_count, markdown_bytes) = count_dir(&cfg.output_dir, "md");
         let (catalog_count, _) = count_dir(&cfg.catalog_dir, "yaml");
-        let (corrupted_count, _) = count_dir(&cfg.corrupted_dir, "pdf");
+        let (corrupted_pdf, _) = count_dir(&cfg.corrupted_dir, "pdf");
+        let (corrupted_html, _) = count_dir(&cfg.corrupted_dir, "html");
+        let corrupted_count = corrupted_pdf + corrupted_html;
         (
             doc_count,
             doc_bytes,
@@ -137,7 +140,7 @@ async fn collect_data() -> DashboardData {
     });
 
     // Wait up to 5 seconds for filesystem ops; use zeros if they stall
-    let (pdf_count, pdf_bytes, markdown_count, markdown_bytes, catalog_count, corrupted_count) =
+    let (doc_count, doc_bytes, markdown_count, markdown_bytes, catalog_count, corrupted_count) =
         match tokio::time::timeout(Duration::from_secs(5), fs_result).await {
             Ok(Ok(counts)) => counts,
             _ => (0, 0, 0, 0, 0, 0),
@@ -290,8 +293,8 @@ async fn collect_data() -> DashboardData {
     };
 
     DashboardData {
-        pdf_count,
-        pdf_bytes,
+        doc_count,
+        doc_bytes,
         markdown_count,
         markdown_bytes,
         catalog_count,
@@ -504,14 +507,14 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let convertible = data.pdf_count.saturating_sub(data.corrupted_count);
+    let convertible = data.doc_count.saturating_sub(data.corrupted_count);
     let pdf_to_md = if convertible > 0 {
-        data.markdown_count as f64 / convertible as f64
+        (data.markdown_count as f64 / convertible as f64).min(1.0)
     } else {
         0.0
     };
     let md_to_embed = if data.markdown_count > 0 {
-        data.embedded_docs as f64 / data.markdown_count as f64
+        (data.embedded_docs as f64 / data.markdown_count as f64).min(1.0)
     } else {
         0.0
     };
@@ -519,8 +522,8 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let rows = vec![
         Row::new(vec![
             Cell::from("Documents"),
-            Cell::from(format!("{:>6}", data.pdf_count)),
-            Cell::from(format!("{:>8}", fmt_bytes(data.pdf_bytes))),
+            Cell::from(format!("{:>6}", data.doc_count)),
+            Cell::from(format!("{:>8}", fmt_bytes(data.doc_bytes))),
             Cell::from(""),
         ]),
         Row::new(vec![
@@ -773,8 +776,8 @@ pub async fn run() -> Result<()> {
 
     let mut last_collect = Instant::now() - Duration::from_secs(10); // force immediate collect
     let mut data = DashboardData {
-        pdf_count: 0,
-        pdf_bytes: 0,
+        doc_count: 0,
+        doc_bytes: 0,
         markdown_count: 0,
         markdown_bytes: 0,
         catalog_count: 0,

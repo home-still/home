@@ -261,11 +261,32 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
 
-        // Build downloader with minimal config (no resolvers — DOI path uses arXiv + Unpaywall)
+        // Build provider resolvers for PDF URL resolution (Semantic Scholar, Europe PMC, CORE)
+        let mut resolvers: Vec<Box<dyn paper::ports::provider::PaperProvider>> = Vec::new();
+        if let Ok(s2) =
+            paper::providers::semantic_scholar::SemanticScholarProvider::new(
+                &config.providers.semantic_scholar,
+            )
+        {
+            resolvers.push(Box::new(s2));
+        }
+        if let Ok(epmc) =
+            paper::providers::europe_pmc::EuropePmcProvider::new(&config.providers.europe_pmc)
+        {
+            resolvers.push(Box::new(epmc));
+        }
+        if config.providers.core.api_key.is_some() {
+            if let Ok(core) =
+                paper::providers::core::CoreProvider::new(&config.providers.core)
+            {
+                resolvers.push(Box::new(core));
+            }
+        }
+
         let downloader = paper::providers::downloader::PaperDownloader::new(
             self.papers_dir.clone(),
             &config.download,
-            Vec::new(),
+            resolvers,
         )
         .map_err(|e| format!("Downloader init failed: {e}"))?;
 
