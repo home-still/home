@@ -285,12 +285,28 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
         reporter.status("Qdrant", &format!("reachable at {qdrant_rest}"));
     }
 
-    // 2. Start native distill server
+    // 2. Stop any existing distill server (e.g. orphaned from a previous run)
     let pid_path = distill_pid_path();
     if let Some(pid) = crate::daemon::read_pid(&pid_path) {
         if crate::daemon::is_process_alive(pid) {
-            reporter.status("Distill", &format!("already running (PID {pid})"));
-            return Ok(());
+            reporter.status("Distill", &format!("stopping old process (PID {pid})"));
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            for _ in 0..50 {
+                if !crate::daemon::is_process_alive(pid) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            #[cfg(unix)]
+            if crate::daemon::is_process_alive(pid) {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+            crate::daemon::remove_pid_file(&pid_path);
         }
     }
 
@@ -350,9 +366,25 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let ort_dylib = std::env::var("ORT_DYLIB_PATH")
         .unwrap_or_else(|_| "/usr/lib/libonnxruntime.so".to_string());
 
+    // fastembed defaults cache_dir to CWD/.fastembed_cache, which breaks
+    // when launched from systemd (CWD = /). Use a stable absolute path.
+    let fastembed_cache = std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| {
+        // Check next to the binary first (where old versions cached the model)
+        let beside_binary = binary.parent().unwrap_or(binary.as_ref()).join(".fastembed_cache");
+        if beside_binary.exists() {
+            return beside_binary.to_string_lossy().to_string();
+        }
+        // Otherwise use ~/.home-still/fastembed_cache
+        hidden_dir()
+            .join("fastembed_cache")
+            .to_string_lossy()
+            .to_string()
+    });
+
     let child = std::process::Command::new(&binary)
         .env("LD_LIBRARY_PATH", &ld_path)
         .env("ORT_DYLIB_PATH", &ort_dylib)
+        .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
         .stdout(log_file)
         .stderr(log_err)
         .stdin(std::process::Stdio::null())
@@ -507,6 +539,17 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
     let ort_dylib = std::env::var("ORT_DYLIB_PATH")
         .unwrap_or_else(|_| "/usr/lib/libonnxruntime.so".to_string());
 
+    let fastembed_cache = std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| {
+        let beside_binary = binary.parent().unwrap_or(binary.as_ref()).join(".fastembed_cache");
+        if beside_binary.exists() {
+            return beside_binary.to_string_lossy().to_string();
+        }
+        hidden_dir()
+            .join("fastembed_cache")
+            .to_string_lossy()
+            .to_string()
+    });
+
     reporter.status(
         "Distill",
         &format!("running on port {port} (Ctrl+C to stop)"),
@@ -516,6 +559,7 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
     let status = tokio::process::Command::new(&binary)
         .env("LD_LIBRARY_PATH", &ld_path)
         .env("ORT_DYLIB_PATH", &ort_dylib)
+        .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
         .env("HS_DISTILL_PORT", port.to_string())
         .kill_on_drop(true)
         .status()
