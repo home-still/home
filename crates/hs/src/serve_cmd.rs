@@ -457,17 +457,20 @@ fn check_system_service_conflict(service_type: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let service_name = format!("hs-serve-{service_type}");
-        if let Ok(output) = std::process::Command::new("systemctl")
-            .args(["is-active", &service_name])
-            .output()
-        {
-            let status = String::from_utf8_lossy(&output.stdout);
-            if status.trim() == "active" {
-                anyhow::bail!(
-                    "{service_name} is already running via systemd.\n\
-                     Stop it first:  sudo systemctl stop {service_name}\n\
-                     Or uninstall:   hs serve {service_type} --uninstall"
-                );
+        // If we ARE the systemd service (INVOCATION_ID is set), don't block ourselves.
+        if std::env::var("INVOCATION_ID").is_err() {
+            if let Ok(output) = std::process::Command::new("systemctl")
+                .args(["is-active", &service_name])
+                .output()
+            {
+                let status = String::from_utf8_lossy(&output.stdout);
+                if status.trim() == "active" {
+                    anyhow::bail!(
+                        "{service_name} is already running via systemd.\n\
+                         Stop it first:  sudo systemctl stop {service_name}\n\
+                         Or uninstall:   hs serve {service_type} --uninstall"
+                    );
+                }
             }
         }
     }
@@ -480,9 +483,21 @@ fn check_system_service_conflict(service_type: &str) -> Result<()> {
             .output()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.contains(&label) {
+            // launchctl list format: "PID\tStatus\tLabel"
+            // If PID is "-", the service is registered but not running.
+            // If PID matches our own, we ARE the launchd child — don't block ourselves.
+            let my_pid = std::process::id().to_string();
+            for line in stdout.lines() {
+                if !line.contains(&label) {
+                    continue;
+                }
+                let pid_field = line.split('\t').next().unwrap_or("-");
+                if pid_field == "-" || pid_field == my_pid {
+                    // Not running, or we are the service — no conflict
+                    continue;
+                }
                 anyhow::bail!(
-                    "{label} is already running via launchd.\n\
+                    "{label} is already running via launchd (PID {pid_field}).\n\
                      Stop it first:  launchctl unload ~/Library/LaunchAgents/{label}.plist\n\
                      Or uninstall:   hs serve {service_type} --uninstall"
                 );
