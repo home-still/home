@@ -7,7 +7,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
 
-// ── Tool parameter types ─────────────��──────────────────────────
+// ── Tool parameter types ────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PaperSearchParams {
@@ -21,6 +21,12 @@ struct PaperSearchParams {
     search_type: Option<String>,
     #[schemars(description = "Date filter, e.g. '>=2023' or '2020-2024'")]
     date: Option<String>,
+    #[schemars(description = "Result offset for pagination (default 0)")]
+    offset: Option<usize>,
+    #[schemars(
+        description = "Provider: all, arxiv, openalex, semantic_scholar, europmc, crossref, core (default: all)"
+    )]
+    provider: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -33,6 +39,14 @@ struct PaperGetParams {
 struct CatalogReadParams {
     #[schemars(description = "Paper stem name (filename without extension)")]
     stem: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ListParams {
+    #[schemars(description = "Maximum items to return (default: all)")]
+    limit: Option<usize>,
+    #[schemars(description = "Number of items to skip (default: 0)")]
+    offset: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -63,11 +77,21 @@ struct DistillExistsParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ScribeConvertParams {
-    #[schemars(description = "Absolute path to the PDF file to convert")]
-    pdf_path: String,
+    #[schemars(
+        description = "Paper stem name (filename without extension) of a PDF in the papers directory"
+    )]
+    stem: String,
 }
 
-// ── MCP Server ────────────────────���─────────────────────────────
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DistillIndexParams {
+    #[schemars(
+        description = "Paper stem name (filename without extension) of a markdown document to index"
+    )]
+    stem: String,
+}
+
+// ── MCP Server ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -125,19 +149,32 @@ impl HomeStillMcp {
     // ── Paper Tools ────────────────────────────────────────────
 
     #[tool(
-        description = "Search academic papers across 6 providers (arXiv, OpenAlex, Semantic Scholar, Europe PMC, CrossRef, CORE). Returns JSON array of papers with title, authors, abstract, DOI, citations."
+        description = "Search academic papers across 6 providers (arXiv, OpenAlex, Semantic Scholar, Europe PMC, CrossRef, CORE). Returns JSON array of papers with title, authors, abstract, DOI, citations.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
-    async fn paper_search(&self, Parameters(p): Parameters<PaperSearchParams>) -> String {
-        let config = match paper::config::Config::load() {
-            Ok(c) => c,
-            Err(e) => return format!("Config error: {e}"),
+    async fn paper_search(
+        &self,
+        Parameters(p): Parameters<PaperSearchParams>,
+    ) -> Result<String, String> {
+        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
+
+        let provider_arg = match p.provider.as_deref() {
+            Some("arxiv") => paper::cli::ProviderArg::Arxiv,
+            Some("openalex") => paper::cli::ProviderArg::OpenAlex,
+            Some("semantic_scholar") => paper::cli::ProviderArg::SemanticScholar,
+            Some("europmc") => paper::cli::ProviderArg::EuropePmc,
+            Some("crossref") => paper::cli::ProviderArg::CrossRef,
+            Some("core") => paper::cli::ProviderArg::Core,
+            _ => paper::cli::ProviderArg::All,
         };
 
-        let provider_arg = paper::cli::ProviderArg::All;
-        let provider = match paper::commands::paper::make_provider(&provider_arg, &config) {
-            Ok(p) => p,
-            Err(e) => return format!("Provider error: {e}"),
-        };
+        let provider = paper::commands::paper::make_provider(&provider_arg, &config)
+            .map_err(|e| format!("Provider error: {e}"))?;
 
         let search_type = match p.search_type.as_deref() {
             Some("title") => paper::models::SearchType::Title,
@@ -156,44 +193,53 @@ impl HomeStillMcp {
             query: p.query,
             search_type,
             max_results: p.max_results.unwrap_or(10) as usize,
-            offset: 0,
+            offset: p.offset.unwrap_or(0),
             date_filter,
             sort_by: paper::models::SortBy::Relevance,
             min_citations: None,
         };
 
         match provider.search_by_query(&query).await {
-            Ok(result) => serde_json::to_string_pretty(&result.papers).unwrap_or_default(),
-            Err(e) => format!("Search failed: {e}"),
+            Ok(result) => Ok(serde_json::to_string_pretty(&result.papers).unwrap_or_default()),
+            Err(e) => Err(format!("Search failed: {e}")),
         }
     }
 
-    #[tool(description = "Look up a single paper by DOI. Returns JSON with full metadata.")]
-    async fn paper_get(&self, Parameters(p): Parameters<PaperGetParams>) -> String {
-        let config = match paper::config::Config::load() {
-            Ok(c) => c,
-            Err(e) => return format!("Config error: {e}"),
-        };
+    #[tool(
+        description = "Look up a single paper by DOI. Returns JSON with full metadata.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn paper_get(&self, Parameters(p): Parameters<PaperGetParams>) -> Result<String, String> {
+        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
 
         let provider_arg = paper::cli::ProviderArg::All;
-        let provider = match paper::commands::paper::make_provider(&provider_arg, &config) {
-            Ok(p) => p,
-            Err(e) => return format!("Provider error: {e}"),
-        };
+        let provider = paper::commands::paper::make_provider(&provider_arg, &config)
+            .map_err(|e| format!("Provider error: {e}"))?;
 
         match provider.get_by_doi(&p.doi).await {
-            Ok(Some(paper)) => serde_json::to_string_pretty(&paper).unwrap_or_default(),
-            Ok(None) => format!("No paper found for DOI: {}", p.doi),
-            Err(e) => format!("Lookup failed: {e}"),
+            Ok(Some(paper)) => Ok(serde_json::to_string_pretty(&paper).unwrap_or_default()),
+            Ok(None) => Err(format!("No paper found for DOI: {}", p.doi)),
+            Err(e) => Err(format!("Lookup failed: {e}")),
         }
     }
 
     // ── Catalog Tools ──────────────────────────────────────────
 
     #[tool(
-        description = "List all papers in the catalog with titles and conversion status. Returns JSON array."
+        description = "List all papers in the catalog with titles and conversion status. Returns JSON array. Supports pagination via limit/offset.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
-    fn catalog_list(&self) -> String {
+    fn catalog_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
         let mut entries = Vec::new();
         if let Ok(dir) = std::fs::read_dir(&self.catalog_dir) {
             for entry in dir.flatten() {
@@ -222,23 +268,45 @@ impl HomeStillMcp {
                 .unwrap_or("")
                 .cmp(b["stem"].as_str().unwrap_or(""))
         });
-        serde_json::to_string_pretty(&entries).unwrap_or_default()
+
+        let offset = p.offset.unwrap_or(0);
+        if let Some(limit) = p.limit {
+            entries = entries.into_iter().skip(offset).take(limit).collect();
+        } else if offset > 0 {
+            entries = entries.into_iter().skip(offset).collect();
+        }
+
+        Ok(serde_json::to_string_pretty(&entries).unwrap_or_default())
     }
 
     #[tool(
-        description = "Read full catalog entry for a paper. Returns JSON with metadata, conversion info, page offsets, download URLs."
+        description = "Read full catalog entry for a paper. Returns JSON with metadata, conversion info, page offsets, download URLs.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
-    fn catalog_read(&self, Parameters(p): Parameters<CatalogReadParams>) -> String {
+    fn catalog_read(&self, Parameters(p): Parameters<CatalogReadParams>) -> Result<String, String> {
         match hs_common::catalog::read_catalog_entry(&self.catalog_dir, &p.stem) {
-            Some(entry) => serde_json::to_string_pretty(&entry).unwrap_or_default(),
-            None => format!("No catalog entry found for '{}'", p.stem),
+            Some(entry) => Ok(serde_json::to_string_pretty(&entry).unwrap_or_default()),
+            None => Err(format!("No catalog entry found for '{}'", p.stem)),
         }
     }
 
     // ── Markdown Tools ─────────────────────────────────────────
 
-    #[tool(description = "List all converted markdown documents with file sizes and page counts.")]
-    fn markdown_list(&self) -> String {
+    #[tool(
+        description = "List all converted markdown documents with file sizes and page counts. Supports pagination via limit/offset.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn markdown_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
         let mut entries = Vec::new();
         if let Ok(dir) = std::fs::read_dir(&self.markdown_dir) {
             for entry in dir.flatten() {
@@ -264,89 +332,122 @@ impl HomeStillMcp {
                 .unwrap_or("")
                 .cmp(b["stem"].as_str().unwrap_or(""))
         });
-        serde_json::to_string_pretty(&entries).unwrap_or_default()
+
+        let offset = p.offset.unwrap_or(0);
+        if let Some(limit) = p.limit {
+            entries = entries.into_iter().skip(offset).take(limit).collect();
+        } else if offset > 0 {
+            entries = entries.into_iter().skip(offset).collect();
+        }
+
+        Ok(serde_json::to_string_pretty(&entries).unwrap_or_default())
     }
 
     #[tool(
-        description = "Read a converted markdown document. Optionally specify a page number (1-based) to read just one page."
+        description = "Read a converted markdown document. Optionally specify a page number (1-based) to read just one page.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
-    fn markdown_read(&self, Parameters(p): Parameters<MarkdownReadParams>) -> String {
+    fn markdown_read(
+        &self,
+        Parameters(p): Parameters<MarkdownReadParams>,
+    ) -> Result<String, String> {
         let path = self.markdown_dir.join(format!("{}.md", p.stem));
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 if let Some(page) = p.page {
                     let pages: Vec<&str> = content.split("\n\n---\n\n").collect();
                     if page == 0 || page > pages.len() {
-                        format!(
+                        Err(format!(
                             "Page {} not found. Document has {} pages.",
                             page,
                             pages.len()
-                        )
+                        ))
                     } else {
-                        pages[page - 1].to_string()
+                        Ok(pages[page - 1].to_string())
                     }
                 } else {
-                    content
+                    Ok(content)
                 }
             }
-            Err(_) => format!(
+            Err(_) => Err(format!(
                 "Markdown not found for '{}'. Check if it has been converted.",
                 p.stem
-            ),
+            )),
         }
     }
 
-    // ── Scribe Tools ───────────────────��───────────────────────
+    // ── Scribe Tools ───────────────────────────────────────────
 
     #[tool(
-        description = "Check scribe server health: model status, version, in-flight conversions, available VLM slots."
+        description = "Check scribe server health: model status, version, in-flight conversions, available VLM slots.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn scribe_health(&self) -> String {
-        let client = match self.scribe_client() {
-            Some(c) => c,
-            None => return "No scribe server configured".into(),
-        };
+    async fn scribe_health(&self) -> Result<String, String> {
+        let client = self.scribe_client().ok_or("No scribe server configured")?;
 
         let health = client.health().await.ok();
         let readiness = client.readiness().await.ok();
 
-        serde_json::to_string_pretty(&serde_json::json!({
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
             "health": health,
             "readiness": readiness,
         }))
-        .unwrap_or_default()
+        .unwrap_or_default())
     }
 
     #[tool(
-        description = "Convert a PDF to markdown using the scribe server. Returns the converted markdown text."
+        description = "Convert a PDF from the papers directory to markdown using the scribe server. Takes a stem name (filename without extension). Returns the converted markdown text.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn scribe_convert(&self, Parameters(p): Parameters<ScribeConvertParams>) -> String {
-        let client = match self.scribe_client() {
-            Some(c) => c,
-            None => return "No scribe server configured".into(),
-        };
+    async fn scribe_convert(
+        &self,
+        Parameters(p): Parameters<ScribeConvertParams>,
+    ) -> Result<String, String> {
+        let client = self.scribe_client().ok_or("No scribe server configured")?;
 
-        let pdf_bytes = match std::fs::read(&p.pdf_path) {
-            Ok(b) => b,
-            Err(e) => return format!("Cannot read PDF: {e}"),
-        };
+        let pdf_path = self.papers_dir.join(format!("{}.pdf", p.stem));
+        let pdf_bytes =
+            std::fs::read(&pdf_path).map_err(|e| format!("Cannot read PDF '{}': {e}", p.stem))?;
 
-        match client.convert(pdf_bytes).await {
-            Ok(md) => md,
-            Err(e) => format!("Conversion failed: {e}"),
-        }
+        client
+            .convert(pdf_bytes)
+            .await
+            .map_err(|e| format!("Conversion failed: {e}"))
     }
 
-    // ── Distill Tools ─────────────��────────────────────────────
+    // ── Distill Tools ──────────────────────────────────────────
 
     #[tool(
-        description = "Semantic search across indexed academic documents. Returns ranked results with text snippets, metadata, and relevance scores."
+        description = "Semantic search across indexed academic documents. Returns ranked results with text snippets, metadata, and relevance scores.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn distill_search(&self, Parameters(p): Parameters<DistillSearchParams>) -> String {
-        let client = match self.distill_client() {
-            Some(c) => c,
-            None => return "No distill server configured".into(),
-        };
+    async fn distill_search(
+        &self,
+        Parameters(p): Parameters<DistillSearchParams>,
+    ) -> Result<String, String> {
+        let client = self
+            .distill_client()
+            .ok_or("No distill server configured")?;
 
         let filters = hs_distill::client::SearchFilters {
             year: p.year,
@@ -357,53 +458,125 @@ impl HomeStillMcp {
             .search(&p.query, p.limit.unwrap_or(10), filters)
             .await
         {
-            Ok(hits) => serde_json::to_string_pretty(&hits).unwrap_or_default(),
-            Err(e) => format!("Search failed: {e}"),
+            Ok(hits) => Ok(serde_json::to_string_pretty(&hits).unwrap_or_default()),
+            Err(e) => Err(format!("Search failed: {e}")),
         }
     }
 
     #[tool(
-        description = "Get distill system status: Qdrant collection info, document/chunk counts, compute device, server version."
+        description = "Get distill system status: Qdrant collection info, document/chunk counts, compute device, server version.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn distill_status(&self) -> String {
-        let client = match self.distill_client() {
-            Some(c) => c,
-            None => return "No distill server configured".into(),
-        };
+    async fn distill_status(&self) -> Result<String, String> {
+        let client = self
+            .distill_client()
+            .ok_or("No distill server configured")?;
 
         let health = client.health().await.ok();
         let status = client.status().await.ok();
 
-        serde_json::to_string_pretty(&serde_json::json!({
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
             "health": health,
             "status": status,
         }))
-        .unwrap_or_default()
+        .unwrap_or_default())
     }
 
-    #[tool(description = "Check if a specific document has been indexed in the vector database.")]
-    async fn distill_exists(&self, Parameters(p): Parameters<DistillExistsParams>) -> String {
-        let client = match self.distill_client() {
-            Some(c) => c,
-            None => return "No distill server configured".into(),
-        };
+    #[tool(
+        description = "Check if a specific document has been indexed in the vector database.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn distill_exists(
+        &self,
+        Parameters(p): Parameters<DistillExistsParams>,
+    ) -> Result<String, String> {
+        let client = self
+            .distill_client()
+            .ok_or("No distill server configured")?;
 
         match client.doc_exists(&p.doc_id).await {
-            Ok(exists) => serde_json::to_string_pretty(&serde_json::json!({
+            Ok(exists) => Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "doc_id": p.doc_id,
                 "indexed": exists,
             }))
-            .unwrap_or_default(),
-            Err(e) => format!("Check failed: {e}"),
+            .unwrap_or_default()),
+            Err(e) => Err(format!("Check failed: {e}")),
         }
     }
 
-    // ── System Tools ──────────────��────────────────────────────
+    #[tool(
+        description = "Index a converted markdown document into the vector database for semantic search. Takes a stem name.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn distill_index(
+        &self,
+        Parameters(p): Parameters<DistillIndexParams>,
+    ) -> Result<String, String> {
+        let client = self
+            .distill_client()
+            .ok_or("No distill server configured")?;
+
+        let md_path = self.markdown_dir.join(format!("{}.md", p.stem));
+        let path_str = md_path.to_string_lossy().to_string();
+
+        if !md_path.exists() {
+            return Err(format!(
+                "Markdown not found for '{}'. Convert the PDF first.",
+                p.stem
+            ));
+        }
+
+        match client.index_file(&path_str).await {
+            Ok(result) => {
+                // Write embedding metadata to catalog
+                hs_common::catalog::update_embedding_catalog(
+                    &self.catalog_dir,
+                    &p.stem,
+                    self.distill_servers
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                    result.chunks_indexed,
+                    &result.embedding_device,
+                );
+                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "stem": p.stem,
+                    "chunks_indexed": result.chunks_indexed,
+                    "embedding_device": result.embedding_device,
+                }))
+                .unwrap_or_default())
+            }
+            Err(e) => Err(format!("Indexing failed: {e}")),
+        }
+    }
+
+    // ── System Tools ───────────────────────────────────────────
 
     #[tool(
-        description = "Full pipeline status: PDF count, markdown count, catalog count, embedded document count, server health for all services."
+        description = "Full pipeline status: PDF count, markdown count, catalog count, embedded document count, server health for all services.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn system_status(&self) -> String {
+    async fn system_status(&self) -> Result<String, String> {
         let pdf_count = count_files(&self.papers_dir, "pdf");
         let md_count = count_files(&self.markdown_dir, "md");
         let catalog_count = count_files(&self.catalog_dir, "yaml");
@@ -426,7 +599,7 @@ impl HomeStillMcp {
             None
         };
 
-        serde_json::to_string_pretty(&serde_json::json!({
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
             "pipeline": {
                 "pdfs": pdf_count,
                 "markdown": md_count,
@@ -439,7 +612,7 @@ impl HomeStillMcp {
                 "distill": distill_health,
             },
         }))
-        .unwrap_or_default()
+        .unwrap_or_default())
     }
 }
 
@@ -458,14 +631,20 @@ fn count_files(dir: &std::path::Path, ext: &str) -> u64 {
 impl ServerHandler for HomeStillMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "home-still: Full academic research pipeline. Search papers across 6 providers, \
-             read catalog metadata, retrieve converted markdown, perform semantic search \
-             across indexed documents, and monitor pipeline health.",
+            "home-still: Academic research pipeline server.\n\n\
+             Workflows:\n\
+             1. DISCOVER: paper_search → paper_get → paper_download\n\
+             2. CONVERT: scribe_convert (PDF stem → markdown)\n\
+             3. READ: catalog_read, markdown_read\n\
+             4. INDEX: distill_index (markdown → vector DB)\n\
+             5. SEARCH: distill_search (semantic search)\n\
+             6. MONITOR: system_status, scribe_health, distill_status\n\n\
+             Start with system_status to verify pipeline health.",
         )
     }
 }
 
-// ── Entrypoint ────────────────���─────────────────────────────────
+// ── Entrypoint ──────────────────────────────────────────────────
 
 /// hs-mcp — MCP server for the home-still research pipeline
 #[derive(Parser)]
