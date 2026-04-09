@@ -42,8 +42,10 @@ enum WatcherInfo {
         completed: u64,
         failed: u64,
     },
-    /// Status file exists but PID is dead — watcher finished or crashed
-    Finished { completed: u64, failed: u64 },
+    /// PID is dead, exited cleanly (no failures)
+    Finished { completed: u64 },
+    /// PID is dead but had failures — needs attention
+    Failed { completed: u64, failed: u64 },
     /// No status file, no PID file — watcher never started
     Stopped,
 }
@@ -329,8 +331,10 @@ fn read_watcher_status(output_dir: &Path, watch_dir: &Path) -> WatcherInfo {
                     completed,
                     failed,
                 };
+            } else if failed > 0 {
+                return WatcherInfo::Failed { completed, failed };
             } else {
-                return WatcherInfo::Finished { completed, failed };
+                return WatcherInfo::Finished { completed };
             }
         }
     }
@@ -583,12 +587,16 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                     Cell::from(detail),
                 ])
             }
-            WatcherInfo::Finished {
-                completed, failed, ..
-            } => Row::new(vec![
-                Cell::from("Watcher").style(Style::default().fg(Color::Yellow)),
-                Cell::from("○".to_string()).style(Style::default().fg(Color::Yellow)),
+            WatcherInfo::Finished { completed } => Row::new(vec![
+                Cell::from("Watcher").style(Style::default().fg(Color::Green)),
+                Cell::from("○".to_string()).style(Style::default().fg(Color::Green)),
                 Cell::from("done"),
+                Cell::from(format!("{completed} done")),
+            ]),
+            WatcherInfo::Failed { completed, failed } => Row::new(vec![
+                Cell::from("Watcher").style(Style::default().fg(Color::Red)),
+                Cell::from("○".to_string()).style(Style::default().fg(Color::Red)),
+                Cell::from("failed"),
                 Cell::from(format!("{completed} done, {failed} failed")),
             ]),
             WatcherInfo::Stopped => Row::new(vec![

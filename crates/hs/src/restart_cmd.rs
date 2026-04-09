@@ -126,7 +126,17 @@ fn restart_scribe_watcher(reporter: &Arc<dyn Reporter>) -> Result<bool> {
             reporter.status("OK", "scribe watcher restarted");
             Ok(true)
         }
-        _ => Ok(false),
+        _ => {
+            // Watcher is dead — start it if there's a watch directory configured
+            if watch_dir.exists() {
+                reporter.status("Start", "scribe watcher (was stopped)");
+                crate::daemon::spawn_daemon(None, None, None)?;
+                reporter.status("OK", "scribe watcher started");
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
     }
 }
 
