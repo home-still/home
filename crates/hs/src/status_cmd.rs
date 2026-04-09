@@ -604,9 +604,9 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
         rows,
         [
             Constraint::Length(16), // Label
-            Constraint::Fill(1),   // Count
-            Constraint::Fill(1),   // Size
-            Constraint::Fill(1),   // Progress
+            Constraint::Fill(1),    // Count
+            Constraint::Fill(1),    // Size
+            Constraint::Fill(1),    // Progress
         ],
     )
     .header(
@@ -748,10 +748,10 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(9),  // Activity
-            Constraint::Fill(4),    // Name — gets 4/5 of remaining
-            Constraint::Fill(1),    // Detail — gets 1/5 of remaining
-            Constraint::Length(9),  // Time
+            Constraint::Length(9), // Activity
+            Constraint::Fill(4),   // Name — gets 4/5 of remaining
+            Constraint::Fill(1),   // Detail — gets 1/5 of remaining
+            Constraint::Length(9), // Time
         ],
     );
 
