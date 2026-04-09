@@ -612,9 +612,9 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
         rows,
         [
             Constraint::Length(16), // Label
-            Constraint::Fill(1),    // Count
-            Constraint::Fill(1),    // Size
-            Constraint::Fill(1),    // Progress
+            Constraint::Length(8),  // Count
+            Constraint::Length(14), // Size
+            Constraint::Min(8),     // Progress
         ],
     )
     .header(
