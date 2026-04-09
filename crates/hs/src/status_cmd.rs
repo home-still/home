@@ -379,7 +379,7 @@ fn load_history(catalog_dir: &Path, limit: usize) -> Vec<HistoryEvent> {
 
     for (stem, entry) in &catalog_entries {
         let name = entry.title.as_deref().unwrap_or(stem);
-        let short_name: String = name.chars().take(40).collect();
+        let short_name: String = name.to_string();
 
         // Download event
         if let Some(ref dl_at) = entry.downloaded_at {
@@ -603,10 +603,10 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(16),
-            Constraint::Length(8),
-            Constraint::Length(14),
-            Constraint::Min(8),
+            Constraint::Length(16), // Label
+            Constraint::Fill(1),   // Count
+            Constraint::Fill(1),   // Size
+            Constraint::Fill(1),   // Progress
         ],
     )
     .header(
@@ -692,8 +692,8 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Constraint::Length(8),  // Name
             Constraint::Length(2),  // Indicator
             Constraint::Length(18), // Status + Activity
-            Constraint::Fill(1),    // URL (expands to fill)
-            Constraint::Length(14), // Detail
+            Constraint::Fill(3),    // URL — gets 3/5 of remaining
+            Constraint::Fill(2),    // Detail — gets 2/5 of remaining
             Constraint::Length(16), // Version
         ],
     );
@@ -748,10 +748,10 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(9),  // Activity: "Download" = 8 chars
-            Constraint::Fill(1),    // Name: expands fairly
-            Constraint::Length(12), // Detail: "12pg 193s", "27 chunks"
-            Constraint::Length(8),  // Time: "43m ago"
+            Constraint::Length(9),  // Activity
+            Constraint::Fill(4),    // Name — gets 4/5 of remaining
+            Constraint::Fill(1),    // Detail — gets 1/5 of remaining
+            Constraint::Length(9),  // Time
         ],
     );
 
