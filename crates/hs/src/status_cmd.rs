@@ -146,9 +146,10 @@ async fn collect_data() -> DashboardData {
         )
     });
 
-    // Wait up to 5 seconds for filesystem ops; use zeros if they stall
+    // Wait up to 10 seconds for filesystem ops; NFS v3 mounts with small
+    // block sizes can take longer when scanning thousands of files.
     let (doc_count, doc_bytes, markdown_count, markdown_bytes, catalog_count, corrupted_count, fs_stalled) =
-        match tokio::time::timeout(Duration::from_secs(5), fs_result).await {
+        match tokio::time::timeout(Duration::from_secs(10), fs_result).await {
             Ok(Ok(counts)) => (counts.0, counts.1, counts.2, counts.3, counts.4, counts.5, false),
             _ => (0, 0, 0, 0, 0, 0, true),
         };
@@ -294,7 +295,7 @@ async fn collect_data() -> DashboardData {
         let history = load_history(&cfg2.catalog_dir, 100);
         (watcher, history)
     });
-    let (watcher, history, fs_stalled2) = match tokio::time::timeout(Duration::from_secs(5), fs_result2).await {
+    let (watcher, history, fs_stalled2) = match tokio::time::timeout(Duration::from_secs(10), fs_result2).await {
         Ok(Ok((w, h))) => (w, h, false),
         _ => (WatcherInfo::Stopped, vec![], true),
     };
@@ -511,8 +512,16 @@ fn render(frame: &mut Frame, data: &DashboardData) {
 }
 
 fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
+    let title = if data.fs_stalled {
+        Line::from(vec![
+            " Pipeline ".into(),
+            "· NFS stall ".fg(Color::Red),
+        ])
+    } else {
+        Line::from(" Pipeline ")
+    };
     let block = Block::new()
-        .title(" Pipeline ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .padding(Padding::horizontal(1));
@@ -521,14 +530,6 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
 
     if data.loading {
         frame.render_widget(Line::from("  Loading...").dim(), inner);
-        return;
-    }
-    if data.fs_stalled {
-        frame.render_widget(
-            Line::from("  Storage unreachable (NFS timeout)")
-                .style(Style::default().fg(Color::Red)),
-            inner,
-        );
         return;
     }
 
@@ -746,8 +747,16 @@ fn format_status_activity(healthy: bool, running_label: &str, activity: &str) ->
 }
 
 fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
+    let title = if data.fs_stalled {
+        Line::from(vec![
+            " History ".into(),
+            "· NFS stall ".fg(Color::Red),
+        ])
+    } else {
+        Line::from(" History ")
+    };
     let block = Block::new()
-        .title(" History ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .padding(Padding::horizontal(1));
@@ -756,14 +765,6 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
 
     if data.loading {
         frame.render_widget(Line::from("  Loading...").dim(), inner);
-        return;
-    }
-    if data.fs_stalled && data.history.is_empty() {
-        frame.render_widget(
-            Line::from("  Storage unreachable (NFS timeout)")
-                .style(Style::default().fg(Color::Red)),
-            inner,
-        );
         return;
     }
     if data.history.is_empty() {
@@ -855,7 +856,20 @@ pub async fn run() -> Result<()> {
             if task.is_finished() {
                 if let Some(task) = collect_task.take() {
                     if let Ok(new_data) = task.await {
-                        data = new_data;
+                        if new_data.fs_stalled && !data.loading {
+                            // NFS stalled — keep previous filesystem data, update only
+                            // network-sourced fields so the UI stays useful.
+                            data.scribe_servers = new_data.scribe_servers;
+                            data.distill_servers = new_data.distill_servers;
+                            data.qdrant_healthy = new_data.qdrant_healthy;
+                            data.qdrant_url = new_data.qdrant_url;
+                            data.qdrant_version = new_data.qdrant_version;
+                            data.embedded_docs = new_data.embedded_docs;
+                            data.embedded_chunks = new_data.embedded_chunks;
+                            data.fs_stalled = true;
+                        } else {
+                            data = new_data;
+                        }
                     }
                 }
             }
