@@ -164,6 +164,12 @@ pub async fn run_download(
             resolvers.push(Box::new(core));
         }
     }
+    if let Ok(oa) = OpenAlexProvider::new(&config.providers.openalex) {
+        resolvers.push(Box::new(oa));
+    }
+    if let Ok(cr) = CrossRefProvider::new(&config.providers.crossref) {
+        resolvers.push(Box::new(cr));
+    }
 
     let downloader =
         PaperDownloader::new(config.download_path.clone(), &config.download, resolvers)

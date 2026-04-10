@@ -30,6 +30,16 @@ struct UnpaywallLocation {
     license: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct PmcIdConverterResponse {
+    records: Vec<PmcIdRecord>,
+}
+
+#[derive(Deserialize)]
+struct PmcIdRecord {
+    pmcid: Option<String>,
+}
+
 pub struct PaperDownloader {
     client: Client,
     download_path: PathBuf,
@@ -134,6 +144,44 @@ impl PaperDownloader {
         None
     }
 
+    async fn resolve_pmc_direct(&self, doi: &str) -> Option<String> {
+        let email = self
+            .unpaywall_email
+            .as_deref()
+            .unwrap_or("home-still-user@example.com");
+        let url = format!(
+            "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={}&format=json&tool=home-still&email={}",
+            doi, email
+        );
+        tracing::debug!(doi, "PMC ID Converter lookup");
+
+        let response = match self.client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(doi, error = %e, "PMC ID Converter request failed");
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(doi, status = %response.status(), "PMC ID Converter returned error");
+            return None;
+        }
+
+        let data: PmcIdConverterResponse = match response.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(doi, error = %e, "PMC ID Converter parse failed");
+                return None;
+            }
+        };
+
+        let pmcid = data.records.into_iter().find_map(|r| r.pmcid)?;
+        let pdf_url = format!("https://pmc.ncbi.nlm.nih.gov/articles/{}/pdf/", pmcid);
+        tracing::debug!(doi, pmcid = %pmcid, url = %pdf_url, "PMC direct PDF");
+        Some(pdf_url)
+    }
+
     async fn resolve_via_providers(&self, doi: &str) -> Option<String> {
         for resolver in &self.resolvers {
             if let Ok(Some(paper)) = resolver.get_by_doi(doi).await {
@@ -159,6 +207,15 @@ impl DownloadService for PaperDownloader {
             }
         }
 
+        // 1b. MDPI fast path — all MDPI journals are open access
+        if doi.starts_with("10.3390/") {
+            let url = format!("https://www.mdpi.com/{}/pdf", doi);
+            tracing::debug!(doi, url = %url, "MDPI direct PDF");
+            if let Ok(result) = self.download_by_url(&url, &filename, None).await {
+                return Ok(result);
+            }
+        }
+
         // 2. Unpaywall lookup
         if let Some(pdf_url) = self.resolve_unpaywall(doi).await {
             if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
@@ -166,7 +223,14 @@ impl DownloadService for PaperDownloader {
             }
         }
 
-        // 3. Provider-based resolution (Semantic Scholar, Europe PMC, CORE, etc.)
+        // 2b. PMC direct PDF (DOI → PMCID via NCBI ID Converter → PDF URL)
+        if let Some(pdf_url) = self.resolve_pmc_direct(doi).await {
+            if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
+                return Ok(result);
+            }
+        }
+
+        // 3. Provider-based resolution (Semantic Scholar, Europe PMC, CORE, OpenAlex, CrossRef)
         if let Some(pdf_url) = self.resolve_via_providers(doi).await {
             if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
                 return Ok(result);
