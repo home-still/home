@@ -816,6 +816,21 @@ pub async fn run() -> Result<()> {
         original_hook(info);
     }));
 
+    // Install SIGINT handler that restores the terminal even when NFS hangs.
+    // Raw mode swallows Ctrl+C so crossterm can read it as a key event, but
+    // when the NFS mount is stuck the event loop may never reach the key check.
+    #[cfg(unix)]
+    {
+        let mut sigint =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        tokio::spawn(async move {
+            sigint.recv().await;
+            let _ = disable_raw_mode();
+            let _ = io::stdout().execute(LeaveAlternateScreen);
+            std::process::exit(130); // 128 + SIGINT(2)
+        });
+    }
+
     // Setup terminal
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
