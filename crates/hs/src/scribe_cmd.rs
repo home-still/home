@@ -519,6 +519,11 @@ fn looks_like_html(bytes: &[u8]) -> bool {
     lower.contains("<!doctype html") || lower.contains("<html") || lower.contains("<head")
 }
 
+/// Detect stub PDFs: 1-page results with minimal content (landing pages, paywalls).
+fn is_stub_pdf(total_pages: u64, markdown: &str) -> bool {
+    total_pages <= 1 && markdown.chars().filter(|c| !c.is_whitespace()).count() < 500
+}
+
 /// Move a corrupt/invalid file to the corrupted directory.
 fn quarantine_file(path: &std::path::Path, corrupted_dir: &std::path::Path) {
     let _ = std::fs::create_dir_all(corrupted_dir);
@@ -1156,6 +1161,18 @@ async fn convert_and_save_pool(
                 // Write catalog entry with conversion metadata
                 let page_offsets = crate::catalog::compute_page_offsets(&md);
                 let total_pages = total_pages_counter.load(std::sync::atomic::Ordering::Relaxed);
+
+                // Quarantine stub PDFs (landing pages, paywalls)
+                if is_stub_pdf(total_pages, &md) {
+                    reporter
+                        .warn(&format!("{stem}: stub PDF (1pg, minimal content) → quarantined"));
+                    let _ = std::fs::remove_file(&output_path);
+                    quarantine_file(pdf_path, corrupted_dir);
+                    stats.completed.fetch_sub(1, Relaxed);
+                    stats.failed.fetch_add(1, Relaxed);
+                    return;
+                }
+
                 crate::catalog::update_conversion_catalog(
                     catalog_dir,
                     &stem,
@@ -1606,6 +1623,10 @@ pub fn ensure_watcher_running(reporter: &Arc<dyn Reporter>) {
 /// Idempotent prereq check: ensures container runtime, models, and compose
 /// config exist. Does NOT start services — `start_server_foreground` handles that.
 pub async fn ensure_init(force: bool) -> Result<()> {
+    let cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+    if !cfg.local_server {
+        return Ok(());
+    }
     cmd_init_inner(force, false, true).await
 }
 

@@ -129,6 +129,15 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
 // ── Scribe ─────────────────────────────────────────────────────
 
 async fn serve_scribe(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+    if !cfg.local_server {
+        anyhow::bail!(
+            "local_server is disabled in scribe config. \
+             This machine is configured as a client-only node.\n\
+             Set scribe.local_server: true in ~/.home-still/config.yaml to enable."
+        );
+    }
+
     reporter.status("Serve", &format!("scribe on port {port}"));
 
     // Auto-init (idempotent — skips already-present steps)
@@ -266,7 +275,7 @@ WorkingDirectory={home}
 Environment=HS_ADVERTISE_IP={ip}
 Environment=FASTEMBED_CACHE_PATH={cache}
 ExecStart={hs_path} serve {service_type} --port {port}
-Restart=on-failure
+Restart=always
 RestartSec=10
 
 [Install]

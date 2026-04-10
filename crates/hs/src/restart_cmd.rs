@@ -192,10 +192,13 @@ async fn restart_compose_services(reporter: &Arc<dyn Reporter>) -> Result<u32> {
         .unwrap_or_default()
         .join(hs_common::HIDDEN_DIR);
 
-    let compose_files: Vec<(&str, std::path::PathBuf)> = vec![
-        ("scribe", hidden.join("docker-compose.yml")),
-        ("distill", hidden.join("docker-compose-distill.yml")),
-    ];
+    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+
+    let mut compose_files: Vec<(&str, std::path::PathBuf)> = Vec::new();
+    if scribe_cfg.local_server {
+        compose_files.push(("scribe", hidden.join("docker-compose.yml")));
+    }
+    compose_files.push(("distill", hidden.join("docker-compose-distill.yml")));
 
     let active: Vec<_> = compose_files
         .into_iter()

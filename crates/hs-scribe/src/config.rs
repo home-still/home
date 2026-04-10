@@ -142,6 +142,10 @@ pub struct ScribeConfig {
     pub corrupted_dir: PathBuf,
     pub catalog_dir: PathBuf,
     pub servers: Vec<String>,
+    /// When false, skip local scribe server init/start (client-only mode).
+    /// Machines that only run the watcher and forward to remote scribe servers
+    /// should set this to false.
+    pub local_server: bool,
 }
 
 impl Default for ScribeConfig {
@@ -152,6 +156,7 @@ impl Default for ScribeConfig {
             corrupted_dir: resolve_project_dir().join("corrupted"),
             catalog_dir: resolve_project_dir().join("catalog"),
             servers: vec!["http://localhost:7433".into()],
+            local_server: true,
         }
     }
 }
@@ -170,6 +175,7 @@ impl ScribeConfig {
                 "corrupted_dir": ScribeConfig::default().corrupted_dir,
                 "catalog_dir": ScribeConfig::default().catalog_dir,
                 "servers": ScribeConfig::default().servers,
+                "local_server": true,
             }
         });
         let result = Figment::from(Serialized::defaults(defaults))

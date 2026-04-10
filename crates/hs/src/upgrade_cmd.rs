@@ -369,10 +369,11 @@ fn hidden_dir() -> PathBuf {
 }
 
 async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
     let scribe_compose = hidden_dir().join("docker-compose.yml");
     let distill_compose = hidden_dir().join("docker-compose-distill.yml");
 
-    let has_scribe = scribe_compose.exists();
+    let has_scribe = scribe_cfg.local_server && scribe_compose.exists();
     let has_distill = distill_compose.exists();
 
     if !has_scribe && !has_distill {
@@ -432,8 +433,9 @@ async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) {
     // Give containers a moment to start
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
+    let scribe_cfg2 = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
     let scribe_compose = hidden_dir().join("docker-compose.yml");
-    if scribe_compose.exists() {
+    if scribe_cfg2.local_server && scribe_compose.exists() {
         match http.get("http://localhost:7433/health").send().await {
             Ok(resp) if resp.status().is_success() => {
                 reporter.status("Health", "scribe: OK");
