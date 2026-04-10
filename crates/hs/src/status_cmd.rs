@@ -32,6 +32,11 @@ struct DashboardData {
     watcher: WatcherInfo,
 
     history: Vec<HistoryEvent>,
+
+    /// True before the first data collection completes.
+    loading: bool,
+    /// True when filesystem I/O (NFS) timed out during collection.
+    fs_stalled: bool,
 }
 
 enum WatcherInfo {
@@ -142,10 +147,10 @@ async fn collect_data() -> DashboardData {
     });
 
     // Wait up to 5 seconds for filesystem ops; use zeros if they stall
-    let (doc_count, doc_bytes, markdown_count, markdown_bytes, catalog_count, corrupted_count) =
+    let (doc_count, doc_bytes, markdown_count, markdown_bytes, catalog_count, corrupted_count, fs_stalled) =
         match tokio::time::timeout(Duration::from_secs(5), fs_result).await {
-            Ok(Ok(counts)) => counts,
-            _ => (0, 0, 0, 0, 0, 0),
+            Ok(Ok(counts)) => (counts.0, counts.1, counts.2, counts.3, counts.4, counts.5, false),
+            _ => (0, 0, 0, 0, 0, 0, true),
         };
 
     let http = reqwest::Client::builder()
@@ -289,10 +294,11 @@ async fn collect_data() -> DashboardData {
         let history = load_history(&cfg2.catalog_dir, 100);
         (watcher, history)
     });
-    let (watcher, history) = match tokio::time::timeout(Duration::from_secs(5), fs_result2).await {
-        Ok(Ok((w, h))) => (w, h),
-        _ => (WatcherInfo::Stopped, vec![]),
+    let (watcher, history, fs_stalled2) = match tokio::time::timeout(Duration::from_secs(5), fs_result2).await {
+        Ok(Ok((w, h))) => (w, h, false),
+        _ => (WatcherInfo::Stopped, vec![], true),
     };
+    let fs_stalled = fs_stalled || fs_stalled2;
 
     DashboardData {
         doc_count,
@@ -310,6 +316,8 @@ async fn collect_data() -> DashboardData {
         qdrant_version,
         watcher,
         history,
+        loading: false,
+        fs_stalled,
     }
 }
 
@@ -511,6 +519,19 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if data.loading {
+        frame.render_widget(Line::from("  Loading...").dim(), inner);
+        return;
+    }
+    if data.fs_stalled {
+        frame.render_widget(
+            Line::from("  Storage unreachable (NFS timeout)")
+                .style(Style::default().fg(Color::Red)),
+            inner,
+        );
+        return;
+    }
+
     let convertible = data.doc_count.saturating_sub(data.corrupted_count);
     let pdf_to_md = if convertible > 0 {
         (data.markdown_count as f64 / convertible as f64).min(1.0)
@@ -634,6 +655,11 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if data.loading {
+        frame.render_widget(Line::from("  Loading...").dim(), inner);
+        return;
+    }
+
     let mut rows = Vec::new();
 
     for svc in &data.scribe_servers {
@@ -728,6 +754,18 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if data.loading {
+        frame.render_widget(Line::from("  Loading...").dim(), inner);
+        return;
+    }
+    if data.fs_stalled && data.history.is_empty() {
+        frame.render_widget(
+            Line::from("  Storage unreachable (NFS timeout)")
+                .style(Style::default().fg(Color::Red)),
+            inner,
+        );
+        return;
+    }
     if data.history.is_empty() {
         frame.render_widget(Line::from("  No activity yet").dim(), inner);
         return;
@@ -799,6 +837,8 @@ pub async fn run() -> Result<()> {
         qdrant_version: String::new(),
         watcher: WatcherInfo::Stopped,
         history: vec![],
+        loading: true,
+        fs_stalled: false,
     };
 
     let mut collect_task: Option<tokio::task::JoinHandle<DashboardData>> = None;
