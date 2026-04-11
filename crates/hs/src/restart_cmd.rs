@@ -218,8 +218,24 @@ async fn restart_compose_services(reporter: &Arc<dyn Reporter>) -> Result<u32> {
     for (name, path) in &active {
         let cf = path.to_string_lossy().to_string();
         reporter.status("Restart", &format!("{name} containers"));
-        let _ = compose.run(&["-f", &cf, "restart"]).await;
-        reporter.status("OK", &format!("{name} containers restarted"));
+        let output = compose.run_capture(&["-f", &cf, "restart"]).await;
+        match output {
+            Ok(o) if o.status.success() => {
+                reporter.status("OK", &format!("{name} containers restarted"));
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let errors = hs_common::compose::filter_compose_stderr(&stderr);
+                if errors.is_empty() {
+                    reporter.status("OK", &format!("{name} containers restarted"));
+                } else {
+                    reporter.warn(&format!("{name}: {}", errors.join("; ")));
+                }
+            }
+            Err(e) => {
+                reporter.warn(&format!("{name}: {e}"));
+            }
+        }
         count += 1;
     }
 

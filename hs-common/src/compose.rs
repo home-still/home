@@ -91,6 +91,32 @@ impl ComposeCmd {
     }
 }
 
+/// Filter compose stderr, returning only actionable error lines.
+/// Strips podman banners, self-resolving pod conflicts, Docker socket warnings,
+/// and other noise that isn't useful to the user.
+pub fn filter_compose_stderr(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| {
+            let l = line.trim();
+            !l.is_empty()
+                && !l.contains("Emulate Docker CLI using podman")
+                && !l.contains("nodocker to quiet msg")
+                && !l.contains("Executing external compose provider")
+                && !l.contains("podman-compose(1)")
+                && !l.contains("cannot remove container")
+                && !l.contains("container state improper")
+                && !l.contains("has associated containers")
+                && !l.contains("Use -f to forcibly")
+                && !l.contains("no container with name or ID")
+                && !l.contains("no container with ID or name")
+                && !l.contains("Cannot connect to the Docker daemon")
+                && !l.contains("Is the docker daemon running")
+                && !l.starts_with("WARN[")
+        })
+        .collect()
+}
+
 /// Check if a command exists and runs successfully.
 pub async fn check_command(cmd: &str, args: &[&str]) -> bool {
     tokio::process::Command::new(cmd)

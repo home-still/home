@@ -210,7 +210,7 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
         // Step 3: Start Qdrant
         reporter.status("Step 3/3", "Starting Qdrant");
         let cf = compose_path.to_string_lossy().to_string();
-        compose.run(&["-f", &cf, "up", "-d"]).await?;
+        compose.run_capture(&["-f", &cf, "up", "-d"]).await?;
         wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
         reporter.status("Qdrant", "OK");
     }
@@ -242,7 +242,7 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
             .await
             .ok_or_else(|| anyhow::anyhow!("No container runtime found. Run: hs distill init"))?;
         let cf = compose_path.to_string_lossy().to_string();
-        compose.run(&["-f", &cf, "up", "-d"]).await?;
+        compose.run_capture(&["-f", &cf, "up", "-d"]).await?;
         wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
         reporter.status("Qdrant", "OK");
     } else {
@@ -435,7 +435,7 @@ pub async fn cmd_server_stop(reporter: &Arc<dyn Reporter>) -> Result<()> {
     if compose_path.exists() {
         if let Some(compose) = ComposeCmd::detect().await {
             let cf = compose_path.to_string_lossy().to_string();
-            compose.run(&["-f", &cf, "down"]).await?;
+            compose.run_capture(&["-f", &cf, "down"]).await?;
             reporter.status("Qdrant", "stopped");
         }
     }
@@ -464,7 +464,7 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
             .await
             .ok_or_else(|| anyhow::anyhow!("No container runtime found. Run: hs distill init"))?;
         let cf = compose_path.to_string_lossy().to_string();
-        compose.run(&["-f", &cf, "up", "-d"]).await?;
+        compose.run_capture(&["-f", &cf, "up", "-d"]).await?;
         hs_common::compose::wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
         reporter.status("Qdrant", "OK");
     } else {
@@ -674,7 +674,7 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
     if compose_path.exists() {
         if let Some(compose) = ComposeCmd::detect().await {
             let cf = compose_path.to_string_lossy().to_string();
-            let _ = compose.run(&["-f", &cf, "ps"]).await;
+            let _ = compose.run_capture(&["-f", &cf, "ps"]).await;
         }
     }
 

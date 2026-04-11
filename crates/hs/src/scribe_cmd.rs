@@ -1591,13 +1591,13 @@ pub async fn cmd_server(action: ServerAction) -> Result<()> {
                     wait_for_ollama_native(30).await?;
                 }
             }
-            compose.run(&["-f", cf, "up", "-d"]).await?;
+            compose.run_capture(&["-f", cf, "up", "-d"]).await?;
             eprintln!("Waiting for services...");
             wait_for_health(DEFAULT_SERVER, 300).await?;
             eprintln!("Ready.");
         }
         ServerAction::Stop => {
-            compose.run(&["-f", cf, "down"]).await?;
+            compose.run_capture(&["-f", cf, "down"]).await?;
             let has_nvidia = check_command("nvidia-smi", &[]).await;
             if should_use_native_ollama(has_nvidia) {
                 eprintln!("Unloading model from VRAM...");

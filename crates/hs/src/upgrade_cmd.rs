@@ -401,20 +401,35 @@ async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
     for (cf, name) in &compose_files {
         let cf_str = cf.to_str().unwrap_or_default();
         reporter.status("Pulling", &format!("new images for {name}..."));
-        let pull = compose.run(&["-f", cf_str, "pull"]).await?;
-        if !pull.success() {
-            reporter.warn(&format!("Failed to pull images for {name}"));
+        let pull = compose.run_capture(&["-f", cf_str, "pull"]).await?;
+        if !pull.status.success() {
+            let stderr = String::from_utf8_lossy(&pull.stderr);
+            let errors = hs_common::compose::filter_compose_stderr(&stderr);
+            if !errors.is_empty() {
+                reporter.warn(&format!(
+                    "Failed to pull images for {name}: {}",
+                    errors.join("; ")
+                ));
+            } else {
+                reporter.warn(&format!("Failed to pull images for {name}"));
+            }
             continue;
         }
 
         reporter.status("Stopping", &format!("{name} containers..."));
         // down first to avoid podman pod conflicts on recreate
-        let _ = compose.run(&["-f", cf_str, "down"]).await;
+        let _ = compose.run_capture(&["-f", cf_str, "down"]).await;
 
         reporter.status("Starting", &format!("{name} containers..."));
-        let up = compose.run(&["-f", cf_str, "up", "-d"]).await?;
-        if !up.success() {
-            reporter.warn(&format!("Failed to restart {name} containers"));
+        let up = compose.run_capture(&["-f", cf_str, "up", "-d"]).await?;
+        if !up.status.success() {
+            let stderr = String::from_utf8_lossy(&up.stderr);
+            let errors = hs_common::compose::filter_compose_stderr(&stderr);
+            if !errors.is_empty() {
+                reporter.warn(&format!("Failed to restart {name}: {}", errors.join("; ")));
+            } else {
+                reporter.warn(&format!("Failed to restart {name} containers"));
+            }
         }
     }
 
