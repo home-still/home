@@ -31,52 +31,60 @@ pub trait Embedder: Send + Sync {
 }
 
 /// Detect available compute device at startup.
+/// Checks that nvidia-smi succeeds AND reports at least one GPU.
 pub fn detect_device() -> ComputeDevice {
-    // Check for NVIDIA GPU via nvidia-smi
-    if std::process::Command::new("nvidia-smi")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        return ComputeDevice::Cuda;
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok();
+
+    match output {
+        Some(o) if o.status.success() => {
+            let gpu_name = String::from_utf8_lossy(&o.stdout);
+            let gpu_name = gpu_name.trim();
+            if gpu_name.is_empty() {
+                tracing::warn!("nvidia-smi succeeded but reported no GPUs");
+                ComputeDevice::Cpu
+            } else {
+                tracing::info!("Detected GPU: {gpu_name}");
+                ComputeDevice::Cuda
+            }
+        }
+        _ => {
+            tracing::info!("No NVIDIA GPU detected (nvidia-smi not found or failed)");
+            ComputeDevice::Cpu
+        }
     }
-    ComputeDevice::Cpu
 }
 
-/// Wraps a primary (GPU) and fallback (CPU) embedder.
-/// On batch failure from primary, retries on fallback.
+/// Wraps the selected embedder (GPU or CPU). No silent fallback —
+/// if the configured device doesn't work, startup fails.
 pub struct FallbackEmbedder {
     primary: Box<dyn Embedder>,
-    fallback: Option<Box<dyn Embedder>>,
-    consecutive_failures: std::sync::atomic::AtomicU32,
 }
 
 impl FallbackEmbedder {
-    pub fn new(primary: Box<dyn Embedder>, fallback: Option<Box<dyn Embedder>>) -> Self {
-        Self {
-            primary,
-            fallback,
-            consecutive_failures: std::sync::atomic::AtomicU32::new(0),
-        }
+    pub fn new(primary: Box<dyn Embedder>, _fallback: Option<Box<dyn Embedder>>) -> Self {
+        Self { primary }
     }
 
     /// Build the right embedder configuration based on detected device.
-    /// If GPU is detected, builds GPU primary with CPU fallback.
+    /// If GPU is detected, CUDA must actually work — no silent CPU fallback.
     pub fn build(config: &crate::config::EmbeddingConfig) -> Result<Self, DistillError> {
         let device = detect_device();
         tracing::info!("Detected compute device: {}", device);
 
         match device {
             ComputeDevice::Cuda => {
+                // OnnxEmbedder::new will verify CUDA actually works (probe embedding).
+                // If CUDA fails, it returns an error — no silent fallback.
                 let primary = onnx::OnnxEmbedder::new(config, ComputeDevice::Cuda)?;
-                let fallback = onnx::OnnxEmbedder::new(config, ComputeDevice::Cpu)?;
-                tracing::info!("GPU embedder with CPU fallback");
-                Ok(Self::new(Box::new(primary), Some(Box::new(fallback))))
+                tracing::info!("GPU embedder initialized (no CPU fallback)");
+                Ok(Self::new(Box::new(primary), None))
             }
             ComputeDevice::Cpu => {
                 let primary = onnx::OnnxEmbedder::new(config, ComputeDevice::Cpu)?;
+                tracing::info!("CPU embedder initialized");
                 Ok(Self::new(Box::new(primary), None))
             }
         }
@@ -86,30 +94,7 @@ impl FallbackEmbedder {
 #[async_trait]
 impl Embedder for FallbackEmbedder {
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<EmbeddingOutput>, DistillError> {
-        match self.primary.embed_batch(texts).await {
-            Ok(result) => {
-                self.consecutive_failures
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-                Ok(result)
-            }
-            Err(e) => {
-                let failures = self
-                    .consecutive_failures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
-
-                if let Some(fallback) = &self.fallback {
-                    tracing::warn!(
-                        error = %e,
-                        failures = failures,
-                        "Primary embedder failed, falling back to CPU"
-                    );
-                    fallback.embed_batch(texts).await
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        self.primary.embed_batch(texts).await
     }
 
     fn dimension(&self) -> usize {

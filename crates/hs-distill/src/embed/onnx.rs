@@ -33,6 +33,39 @@ impl OnnxEmbedder {
         let model = TextEmbedding::try_new(opts)
             .map_err(|e| DistillError::Embedding(format!("Failed to load model: {e}")))?;
 
+        // Verify the requested device actually works by running a probe embedding.
+        // ONNX Runtime silently falls back to CPU if CUDA fails to initialize,
+        // so we measure wall-clock time of a probe to detect this.
+        if matches!(device, ComputeDevice::Cuda) {
+            tracing::info!("Verifying CUDA is actually being used (probe embedding)...");
+            let probe_texts = vec!["CUDA verification probe"];
+            let start = std::time::Instant::now();
+            model
+                .embed(probe_texts.clone(), None)
+                .map_err(|e| DistillError::Embedding(format!("CUDA probe failed: {e}")))?;
+            let probe_ms = start.elapsed().as_millis();
+
+            // A GPU probe on a warm model completes in <100ms typically.
+            // CPU on a 24-core machine takes ~200-500ms for a single text.
+            // We also check nvidia-smi for actual GPU memory usage.
+            let gpu_mem_used = check_gpu_memory_mb();
+            tracing::info!(
+                probe_ms = probe_ms,
+                gpu_mem_mb = gpu_mem_used,
+                "CUDA probe complete"
+            );
+
+            // If GPU memory didn't increase meaningfully, the model isn't on GPU
+            if gpu_mem_used < 200 {
+                return Err(DistillError::Embedding(format!(
+                    "CUDA requested but model is not on GPU (only {gpu_mem_used} MB VRAM used). \
+                     Check CUDA drivers, LD_LIBRARY_PATH, and libonnxruntime_providers_cuda.so. \
+                     Set compute_device: cpu in config to run on CPU intentionally."
+                )));
+            }
+            tracing::info!("CUDA verified: model loaded on GPU ({gpu_mem_used} MB VRAM)");
+        }
+
         Ok(Self {
             model: Mutex::new(model),
             device,
@@ -40,6 +73,18 @@ impl OnnxEmbedder {
             batch_size,
         })
     }
+}
+
+/// Check GPU memory usage via nvidia-smi. Returns MB used, or 0 on failure.
+fn check_gpu_memory_mb() -> u64 {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+        .output()
+        .ok();
+    output
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 #[async_trait]
