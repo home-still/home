@@ -30,7 +30,7 @@ impl OnnxEmbedder {
             opts = opts.with_execution_providers(vec![CUDAExecutionProvider::default().build()]);
         }
 
-        let model = TextEmbedding::try_new(opts)
+        let mut model = TextEmbedding::try_new(opts)
             .map_err(|e| DistillError::Embedding(format!("Failed to load model: {e}")))?;
 
         // Verify the requested device actually works by running a probe embedding.
