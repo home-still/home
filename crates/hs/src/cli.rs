@@ -81,6 +81,17 @@ pub enum TopCmd {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Run data migrations
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MigrateAction {
+    /// Move flat files into 2-char prefix subdirectories (papers/, markdown/, catalog/)
+    Sharding,
 }
 
 #[derive(Subcommand, Debug)]

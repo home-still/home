@@ -912,15 +912,7 @@ async fn cmd_index_daemon(
     let paths: Vec<PathBuf> = if let Some(files) = files {
         files
     } else {
-        std::fs::read_dir(&markdown_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
-                    .collect()
-            })
-            .unwrap_or_default()
+        hs_common::collect_files_recursive(&markdown_dir, "md")
     };
 
     let mut status = IndexStatus {

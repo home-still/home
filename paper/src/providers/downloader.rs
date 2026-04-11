@@ -255,11 +255,14 @@ impl DownloadService for PaperDownloader {
         filename: &str,
         on_progress: Option<&(dyn Fn(u64, Option<u64>) + Send + Sync)>,
     ) -> Result<DownloadResult, PaperError> {
-        // Ensure download directory exists
-        tokio::fs::create_dir_all(&self.download_path).await?;
-
-        let file_path = self.download_path.join(filename);
-        let tmp_path = self.download_path.join(format!("{filename}.tmp"));
+        // Derive stem from filename for sharded directory layout
+        let stem = filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(filename);
+        let ext = filename.rsplit_once('.').map(|(_, e)| e).unwrap_or("pdf");
+        let file_path = hs_common::sharded_path(&self.download_path, stem, ext);
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let tmp_path = file_path.with_extension(format!("{ext}.tmp"));
 
         // Skip if already downloaded (final file exists)
         if file_path.exists() {
@@ -317,8 +320,10 @@ impl DownloadService for PaperDownloader {
                 )));
             }
             // Looks like a real HTML paper — save as .html
-            let html_filename = filename.replace(".pdf", ".html");
-            let html_path = self.download_path.join(&html_filename);
+            let html_path = hs_common::sharded_path(&self.download_path, stem, "html");
+            if let Some(parent) = html_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
             tokio::fs::rename(&tmp_path, &html_path).await?;
             return Ok(DownloadResult {
                 file_path: html_path,

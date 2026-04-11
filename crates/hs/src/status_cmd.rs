@@ -14,12 +14,11 @@ use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
 // ── Data model ──────────────────────────────────────────────────
 
 struct DashboardData {
-    doc_count: u64,
-    doc_bytes: u64,
-    markdown_count: u64,
-    markdown_bytes: u64,
-    catalog_count: u64,
-    corrupted_count: u64,
+    /// None = still scanning, Some(count, bytes) = done.
+    doc_counts: Option<(u64, u64)>,
+    markdown_counts: Option<(u64, u64)>,
+    catalog_count: Option<u64>,
+    corrupted_count: Option<u64>,
     embedded_docs: u64,
     embedded_chunks: u64,
 
@@ -35,8 +34,10 @@ struct DashboardData {
 
     /// True before the first data collection completes.
     loading: bool,
-    /// True when filesystem I/O (NFS) timed out during collection.
-    fs_stalled: bool,
+    /// Per-directory NFS stall flags.
+    fs_stalled_docs: bool,
+    fs_stalled_markdown: bool,
+    fs_stalled_catalog: bool,
 }
 
 enum WatcherInfo {
@@ -79,21 +80,6 @@ fn is_macos_resource_fork(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with("._"))
 }
 
-fn count_dir(dir: &Path, ext: &str) -> (u64, u64) {
-    let mut count = 0u64;
-    let mut bytes = 0u64;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == ext) && !is_macos_resource_fork(&path) {
-                count += 1;
-                bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
-            }
-        }
-    }
-    (count, bytes)
-}
-
 /// Recursive version of count_dir — walks subdirectories.
 /// Used for watch_dir since scribe processes PDFs recursively.
 fn count_dir_recursive(dir: &Path, ext: &str) -> (u64, u64) {
@@ -122,37 +108,53 @@ async fn collect_data() -> DashboardData {
     let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
     let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
 
-    // Run filesystem operations on a blocking thread so stale NFS mounts
-    // don't block the tokio runtime and freeze the UI.
-    let cfg = scribe_cfg.clone();
-    let fs_result = tokio::task::spawn_blocking(move || {
-        let (pdf_count, pdf_bytes) = count_dir_recursive(&cfg.watch_dir, "pdf");
-        let (html_count, html_bytes) = count_dir_recursive(&cfg.watch_dir, "html");
-        let (htm_count, htm_bytes) = count_dir_recursive(&cfg.watch_dir, "htm");
-        let doc_count = pdf_count + html_count + htm_count;
-        let doc_bytes = pdf_bytes + html_bytes + htm_bytes;
-        let (markdown_count, markdown_bytes) = count_dir(&cfg.output_dir, "md");
-        let (catalog_count, _) = count_dir(&cfg.catalog_dir, "yaml");
-        let (corrupted_pdf, _) = count_dir(&cfg.corrupted_dir, "pdf");
-        let (corrupted_html, _) = count_dir(&cfg.corrupted_dir, "html");
-        let corrupted_count = corrupted_pdf + corrupted_html;
-        (
-            doc_count,
-            doc_bytes,
-            markdown_count,
-            markdown_bytes,
-            catalog_count,
-            corrupted_count,
-        )
+    // Run filesystem operations as independent per-directory tasks so the
+    // dashboard can show partial results as each directory finishes scanning.
+    let cfg_docs = scribe_cfg.clone();
+    let docs_task = tokio::task::spawn_blocking(move || {
+        let (pdf_count, pdf_bytes) = count_dir_recursive(&cfg_docs.watch_dir, "pdf");
+        let (html_count, html_bytes) = count_dir_recursive(&cfg_docs.watch_dir, "html");
+        let (htm_count, htm_bytes) = count_dir_recursive(&cfg_docs.watch_dir, "htm");
+        (pdf_count + html_count + htm_count, pdf_bytes + html_bytes + htm_bytes)
     });
 
-    // Wait up to 10 seconds for filesystem ops; NFS v3 mounts with small
-    // block sizes can take longer when scanning thousands of files.
-    let (doc_count, doc_bytes, markdown_count, markdown_bytes, catalog_count, corrupted_count, fs_stalled) =
-        match tokio::time::timeout(Duration::from_secs(10), fs_result).await {
-            Ok(Ok(counts)) => (counts.0, counts.1, counts.2, counts.3, counts.4, counts.5, false),
-            _ => (0, 0, 0, 0, 0, 0, true),
-        };
+    let cfg_md = scribe_cfg.clone();
+    let markdown_task = tokio::task::spawn_blocking(move || {
+        count_dir_recursive(&cfg_md.output_dir, "md")
+    });
+
+    let cfg_cat = scribe_cfg.clone();
+    let catalog_task = tokio::task::spawn_blocking(move || {
+        let (count, _) = count_dir_recursive(&cfg_cat.catalog_dir, "yaml");
+        count
+    });
+
+    let cfg_cor = scribe_cfg.clone();
+    let corrupted_task = tokio::task::spawn_blocking(move || {
+        let (pdf, _) = count_dir_recursive(&cfg_cor.corrupted_dir, "pdf");
+        let (html, _) = count_dir_recursive(&cfg_cor.corrupted_dir, "html");
+        pdf + html
+    });
+
+    // Wait up to 10s per directory independently — if one stalls, others still show.
+    let timeout = Duration::from_secs(10);
+
+    let (doc_counts, fs_stalled_docs) = match tokio::time::timeout(timeout, docs_task).await {
+        Ok(Ok(counts)) => (Some(counts), false),
+        _ => (None, true),
+    };
+    let (markdown_counts, fs_stalled_markdown) = match tokio::time::timeout(timeout, markdown_task).await {
+        Ok(Ok(counts)) => (Some(counts), false),
+        _ => (None, true),
+    };
+    let (catalog_count, fs_stalled_catalog) = match tokio::time::timeout(timeout, catalog_task).await {
+        Ok(Ok(count)) => (Some(count), false),
+        _ => (None, true),
+    };
+    let corrupted_count = match tokio::time::timeout(timeout, corrupted_task).await {
+        Ok(Ok(count)) => Some(count),
+        _ => None,
+    };
 
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
@@ -295,17 +297,14 @@ async fn collect_data() -> DashboardData {
         let history = load_history(&cfg2.catalog_dir, 100);
         (watcher, history)
     });
-    let (watcher, history, fs_stalled2) = match tokio::time::timeout(Duration::from_secs(10), fs_result2).await {
-        Ok(Ok((w, h))) => (w, h, false),
-        _ => (WatcherInfo::Stopped, vec![], true),
+    let (watcher, history) = match tokio::time::timeout(Duration::from_secs(10), fs_result2).await {
+        Ok(Ok((w, h))) => (w, h),
+        _ => (WatcherInfo::Stopped, vec![]),
     };
-    let fs_stalled = fs_stalled || fs_stalled2;
 
     DashboardData {
-        doc_count,
-        doc_bytes,
-        markdown_count,
-        markdown_bytes,
+        doc_counts,
+        markdown_counts,
         catalog_count,
         corrupted_count,
         embedded_docs,
@@ -318,7 +317,9 @@ async fn collect_data() -> DashboardData {
         watcher,
         history,
         loading: false,
-        fs_stalled,
+        fs_stalled_docs,
+        fs_stalled_markdown,
+        fs_stalled_catalog,
     }
 }
 
@@ -512,7 +513,8 @@ fn render(frame: &mut Frame, data: &DashboardData) {
 }
 
 fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
-    let title = if data.fs_stalled {
+    let any_stall = data.fs_stalled_docs || data.fs_stalled_markdown || data.fs_stalled_catalog;
+    let title = if any_stall {
         Line::from(vec![
             " Pipeline ".into(),
             "· NFS stall ".fg(Color::Red),
@@ -533,34 +535,49 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
         return;
     }
 
-    let convertible = data.doc_count.saturating_sub(data.corrupted_count);
+    let doc_count = data.doc_counts.map(|(c, _)| c).unwrap_or(0);
+    let doc_bytes = data.doc_counts.map(|(_, b)| b).unwrap_or(0);
+    let markdown_count = data.markdown_counts.map(|(c, _)| c).unwrap_or(0);
+    let markdown_bytes = data.markdown_counts.map(|(_, b)| b).unwrap_or(0);
+    let catalog_count = data.catalog_count.unwrap_or(0);
+    let corrupted_count = data.corrupted_count.unwrap_or(0);
+
+    let convertible = doc_count.saturating_sub(corrupted_count);
     let pdf_to_md = if convertible > 0 {
-        (data.markdown_count as f64 / convertible as f64).min(1.0)
+        (markdown_count as f64 / convertible as f64).min(1.0)
     } else {
         0.0
     };
-    let md_to_embed = if data.markdown_count > 0 {
-        (data.embedded_docs as f64 / data.markdown_count as f64).min(1.0)
+    let md_to_embed = if markdown_count > 0 {
+        (data.embedded_docs as f64 / markdown_count as f64).min(1.0)
     } else {
         0.0
     };
 
+    // Helper: show "Scanning..." when None, count when Some, "NFS stall" suffix when stalled
+    let scanning = "  ...".to_string();
+    let stall_style = Style::default().fg(Color::Yellow);
+
+    let doc_label = if data.fs_stalled_docs { "Documents (stall)" } else { "Documents" };
+    let md_label = if data.fs_stalled_markdown { "Markdown (stall)" } else { "Markdown" };
+    let cat_label = if data.fs_stalled_catalog { "Cataloged (stall)" } else { "Cataloged" };
+
     let rows = vec![
         Row::new(vec![
-            Cell::from("Documents"),
-            Cell::from(format!("{:>6}", data.doc_count)),
-            Cell::from(format!("{:>8}", fmt_bytes(data.doc_bytes))),
+            Cell::from(doc_label).style(if data.fs_stalled_docs { stall_style } else { Style::default() }),
+            Cell::from(if data.doc_counts.is_some() { format!("{:>6}", doc_count) } else { scanning.clone() }),
+            Cell::from(if data.doc_counts.is_some() { format!("{:>8}", fmt_bytes(doc_bytes)) } else { String::new() }),
             Cell::from(""),
         ]),
         Row::new(vec![
-            Cell::from("Markdown"),
-            Cell::from(format!("{:>6}", data.markdown_count)),
-            Cell::from(format!("{:>8}", fmt_bytes(data.markdown_bytes))),
-            Cell::from(format!("{:>5.1}%", pdf_to_md * 100.0)),
+            Cell::from(md_label).style(if data.fs_stalled_markdown { stall_style } else { Style::default() }),
+            Cell::from(if data.markdown_counts.is_some() { format!("{:>6}", markdown_count) } else { scanning.clone() }),
+            Cell::from(if data.markdown_counts.is_some() { format!("{:>8}", fmt_bytes(markdown_bytes)) } else { String::new() }),
+            Cell::from(if data.markdown_counts.is_some() { format!("{:>5.1}%", pdf_to_md * 100.0) } else { String::new() }),
         ]),
         Row::new(vec![
-            Cell::from("Cataloged"),
-            Cell::from(format!("{:>6}", data.catalog_count)),
+            Cell::from(cat_label).style(if data.fs_stalled_catalog { stall_style } else { Style::default() }),
+            Cell::from(if data.catalog_count.is_some() { format!("{:>6}", catalog_count) } else { scanning.clone() }),
             Cell::from(""),
             Cell::from(""),
         ]),
@@ -576,7 +593,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
         ]),
         Row::new(vec![
             Cell::from("Corrupted PDFs").style(Style::default().fg(Color::Red)),
-            Cell::from(format!("{:>6}", data.corrupted_count))
+            Cell::from(if data.corrupted_count.is_some() { format!("{:>6}", corrupted_count) } else { scanning.clone() })
                 .style(Style::default().fg(Color::Red)),
             Cell::from(""),
             Cell::from(""),
@@ -747,7 +764,8 @@ fn format_status_activity(healthy: bool, running_label: &str, activity: &str) ->
 }
 
 fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
-    let title = if data.fs_stalled {
+    let any_stall = data.fs_stalled_docs || data.fs_stalled_markdown || data.fs_stalled_catalog;
+    let title = if any_stall {
         Line::from(vec![
             " History ".into(),
             "· NFS stall ".fg(Color::Red),
@@ -838,12 +856,10 @@ pub async fn run() -> Result<()> {
 
     let mut last_collect = Instant::now() - Duration::from_secs(10); // force immediate collect
     let mut data = DashboardData {
-        doc_count: 0,
-        doc_bytes: 0,
-        markdown_count: 0,
-        markdown_bytes: 0,
-        catalog_count: 0,
-        corrupted_count: 0,
+        doc_counts: None,
+        markdown_counts: None,
+        catalog_count: None,
+        corrupted_count: None,
         embedded_docs: 0,
         embedded_chunks: 0,
         scribe_servers: vec![],
@@ -854,7 +870,9 @@ pub async fn run() -> Result<()> {
         watcher: WatcherInfo::Stopped,
         history: vec![],
         loading: true,
-        fs_stalled: false,
+        fs_stalled_docs: false,
+        fs_stalled_markdown: false,
+        fs_stalled_catalog: false,
     };
 
     let mut collect_task: Option<tokio::task::JoinHandle<DashboardData>> = None;
@@ -871,20 +889,26 @@ pub async fn run() -> Result<()> {
             if task.is_finished() {
                 if let Some(task) = collect_task.take() {
                     if let Ok(new_data) = task.await {
-                        if new_data.fs_stalled && !data.loading {
-                            // NFS stalled — keep previous filesystem data, update only
-                            // network-sourced fields so the UI stays useful.
-                            data.scribe_servers = new_data.scribe_servers;
-                            data.distill_servers = new_data.distill_servers;
-                            data.qdrant_healthy = new_data.qdrant_healthy;
-                            data.qdrant_url = new_data.qdrant_url;
-                            data.qdrant_version = new_data.qdrant_version;
-                            data.embedded_docs = new_data.embedded_docs;
-                            data.embedded_chunks = new_data.embedded_chunks;
-                            data.fs_stalled = true;
-                        } else {
-                            data = new_data;
-                        }
+                        // For each directory: if the new scan succeeded, use it;
+                        // if it stalled and we have previous data, keep the old value.
+                        data.doc_counts = new_data.doc_counts.or(data.doc_counts);
+                        data.markdown_counts = new_data.markdown_counts.or(data.markdown_counts);
+                        data.catalog_count = new_data.catalog_count.or(data.catalog_count);
+                        data.corrupted_count = new_data.corrupted_count.or(data.corrupted_count);
+                        data.fs_stalled_docs = new_data.fs_stalled_docs;
+                        data.fs_stalled_markdown = new_data.fs_stalled_markdown;
+                        data.fs_stalled_catalog = new_data.fs_stalled_catalog;
+                        // Always update network-sourced fields
+                        data.scribe_servers = new_data.scribe_servers;
+                        data.distill_servers = new_data.distill_servers;
+                        data.qdrant_healthy = new_data.qdrant_healthy;
+                        data.qdrant_url = new_data.qdrant_url;
+                        data.qdrant_version = new_data.qdrant_version;
+                        data.embedded_docs = new_data.embedded_docs;
+                        data.embedded_chunks = new_data.embedded_chunks;
+                        data.watcher = new_data.watcher;
+                        data.history = new_data.history;
+                        data.loading = false;
                     }
                 }
             }

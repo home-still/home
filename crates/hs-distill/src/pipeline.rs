@@ -48,8 +48,10 @@ pub async fn index_document(
     }
 
     // Read catalog entry if available
+    // With sharded layout: markdown/XX/stem.md → markdown/XX/ → markdown/ → project_root/
     let catalog_dir = markdown_path
         .parent()
+        .and_then(|p| p.parent())
         .and_then(|p| p.parent())
         .map(|p| p.join("catalog"))
         .unwrap_or_default();

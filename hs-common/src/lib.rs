@@ -49,6 +49,34 @@ pub fn resolve_project_dir() -> std::path::PathBuf {
     home.join(PROJECT_DIR_DEFAULT)
 }
 
+/// Build a sharded path: `dir/{prefix}/{stem}.{ext}` where prefix is the
+/// first 2 characters of the stem.  This keeps any single directory from
+/// growing beyond a few hundred entries, which fixes macOS Finder NFS
+/// browsing and improves readdir performance in general.
+pub fn sharded_path(dir: &std::path::Path, stem: &str, ext: &str) -> std::path::PathBuf {
+    let prefix = &stem[..stem.len().min(2)];
+    dir.join(prefix).join(format!("{stem}.{ext}"))
+}
+
+/// Recursively collect all files with a given extension under `dir`.
+pub fn collect_files_recursive(dir: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
+    let mut result = Vec::new();
+    fn walk(dir: &std::path::Path, ext: &str, result: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, ext, result);
+                } else if path.extension().is_some_and(|e| e == ext) {
+                    result.push(path);
+                }
+            }
+        }
+    }
+    walk(dir, ext, &mut result);
+    result
+}
+
 /// Resolve the log directory from config (home.log_dir) or default {project_dir}/logs.
 pub fn resolve_log_dir() -> std::path::PathBuf {
     let home = dirs::home_dir().unwrap_or_default();

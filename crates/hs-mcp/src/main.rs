@@ -447,22 +447,17 @@ impl HomeStillMcp {
     )]
     fn markdown_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
         let mut entries = Vec::new();
-        if let Ok(dir) = std::fs::read_dir(&self.markdown_dir) {
-            for entry in dir.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "md") {
-                    if let Some(stem) = path.file_stem() {
-                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        let pages = std::fs::read_to_string(&path)
-                            .map(|c| c.matches("\n\n---\n\n").count() + 1)
-                            .unwrap_or(0);
-                        entries.push(serde_json::json!({
-                            "stem": stem.to_string_lossy(),
-                            "size_bytes": size,
-                            "pages": pages,
-                        }));
-                    }
-                }
+        for path in hs_common::collect_files_recursive(&self.markdown_dir, "md") {
+            if let Some(stem) = path.file_stem() {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let pages = std::fs::read_to_string(&path)
+                    .map(|c| c.matches("\n\n---\n\n").count() + 1)
+                    .unwrap_or(0);
+                entries.push(serde_json::json!({
+                    "stem": stem.to_string_lossy(),
+                    "size_bytes": size,
+                    "pages": pages,
+                }));
             }
         }
         entries.sort_by(|a, b| {
@@ -495,7 +490,7 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<MarkdownReadParams>,
     ) -> Result<String, String> {
-        let path = self.markdown_dir.join(format!("{}.md", p.stem));
+        let path = hs_common::sharded_path(&self.markdown_dir, &p.stem, "md");
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 if let Some(page) = p.page {
@@ -670,7 +665,7 @@ impl HomeStillMcp {
             .distill_client()
             .ok_or("No distill server configured")?;
 
-        let md_path = self.markdown_dir.join(format!("{}.md", p.stem));
+        let md_path = hs_common::sharded_path(&self.markdown_dir, &p.stem, "md");
         let path_str = md_path.to_string_lossy().to_string();
 
         if !md_path.exists() {
@@ -913,28 +908,23 @@ impl ServerHandler for HomeStillMcp {
         }
 
         // Markdown documents
-        if let Ok(dir) = std::fs::read_dir(&self.markdown_dir) {
-            for entry in dir.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "md") {
-                    if let Some(stem) = path.file_stem() {
-                        let stem = stem.to_string_lossy();
-                        let size = std::fs::metadata(&path).map(|m| m.len() as u32).ok();
-                        resources.push(
-                            RawResource {
-                                uri: format!("markdown:///{stem}"),
-                                name: stem.to_string(),
-                                title: None,
-                                description: Some("Converted markdown document".into()),
-                                mime_type: Some("text/markdown".into()),
-                                size,
-                                icons: None,
-                                meta: None,
-                            }
-                            .no_annotation(),
-                        );
+        for path in hs_common::collect_files_recursive(&self.markdown_dir, "md") {
+            if let Some(stem) = path.file_stem() {
+                let stem = stem.to_string_lossy();
+                let size = std::fs::metadata(&path).map(|m| m.len() as u32).ok();
+                resources.push(
+                    RawResource {
+                        uri: format!("markdown:///{stem}"),
+                        name: stem.to_string(),
+                        title: None,
+                        description: Some("Converted markdown document".into()),
+                        mime_type: Some("text/markdown".into()),
+                        size,
+                        icons: None,
+                        meta: None,
                     }
-                }
+                    .no_annotation(),
+                );
             }
         }
 
@@ -1015,7 +1005,7 @@ impl ServerHandler for HomeStillMcp {
                 (rest, None)
             };
 
-            let path = self.markdown_dir.join(format!("{stem}.md"));
+            let path = hs_common::sharded_path(&self.markdown_dir, stem, "md");
             let content = std::fs::read_to_string(&path)
                 .map_err(|_| ErrorData::resource_not_found("markdown not found", None))?;
 

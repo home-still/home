@@ -293,8 +293,11 @@ async fn cmd_convert(
                 None
             } else {
                 let stem = input.file_stem()?;
-                std::fs::create_dir_all(dir).ok()?;
-                Some(dir.join(format!("{}.md", stem.to_string_lossy())))
+                let path = hs_common::sharded_path(dir, &stem.to_string_lossy(), "md");
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).ok()?;
+                }
+                Some(path)
             }
         })
     });
@@ -687,7 +690,10 @@ async fn convert_html_and_save(
 
     let start = std::time::Instant::now();
     let stem = html_path.file_stem().unwrap_or_default().to_string_lossy();
-    let output_path = output_dir.join(format!("{stem}.md"));
+    let output_path = hs_common::sharded_path(output_dir, &stem, "md");
+    if let Some(parent) = output_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
 
     stats.queued.fetch_sub(1, Relaxed);
     stats.processing.fetch_add(1, Relaxed);
@@ -728,7 +734,7 @@ async fn convert_html_and_save(
         start.elapsed().as_secs(),
         1, // HTML papers are single-page
         page_offsets,
-        &format!("markdown/{stem}.md"),
+        &format!("markdown/{}/{stem}.md", &stem[..stem.len().min(2)]),
     );
 }
 
@@ -869,14 +875,19 @@ async fn cmd_watch(
     });
 
     // Initial scan: queue existing PDFs that don't have up-to-date markdown
-    if let Ok(entries) = std::fs::read_dir(&watch_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
+    {
+        let all_docs = {
+            let mut docs = hs_common::collect_files_recursive(&watch_dir, "pdf");
+            docs.extend(hs_common::collect_files_recursive(&watch_dir, "html"));
+            docs.extend(hs_common::collect_files_recursive(&watch_dir, "htm"));
+            docs
+        };
+        for path in all_docs {
             if !is_processable_document(&path) {
                 continue;
             }
             let stem = path.file_stem().unwrap_or_default();
-            let md_path = output_dir.join(format!("{}.md", stem.to_string_lossy()));
+            let md_path = hs_common::sharded_path(&output_dir, &stem.to_string_lossy(), "md");
             if md_path.exists() {
                 let _ = std::fs::File::open(&path);
                 let _ = std::fs::File::open(&md_path);
@@ -944,7 +955,7 @@ async fn cmd_watch(
                         continue;
                     }
                     let stem = path.file_stem().unwrap_or_default();
-                    let md_path = output_dir.join(format!("{}.md", stem.to_string_lossy()));
+                    let md_path = hs_common::sharded_path(&output_dir, &stem.to_string_lossy(), "md");
                     if md_path.exists() {
                         let _ = std::fs::File::open(path);
                         let _ = std::fs::File::open(&md_path);
@@ -1035,7 +1046,10 @@ async fn convert_and_save_pool(
 
     let start_time = std::time::Instant::now();
     let stem = pdf_path.file_stem().unwrap_or_default().to_string_lossy();
-    let output_path = output_dir.join(format!("{stem}.md"));
+    let output_path = hs_common::sharded_path(output_dir, &stem, "md");
+    if let Some(parent) = output_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
 
     // Read and validate while still in "queued" state (no progress bar yet)
     let pdf_bytes = match std::fs::read(pdf_path) {
@@ -1180,7 +1194,7 @@ async fn convert_and_save_pool(
                     start_time.elapsed().as_secs(),
                     total_pages,
                     page_offsets,
-                    &format!("markdown/{stem}.md"),
+                    &format!("markdown/{}/{stem}.md", &stem[..stem.len().min(2)]),
                 );
             }
         }

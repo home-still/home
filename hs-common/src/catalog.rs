@@ -93,17 +93,18 @@ pub fn compute_page_offsets(markdown: &str) -> Vec<PageOffset> {
 
 /// Read an existing catalog entry, or return None if it doesn't exist.
 pub fn read_catalog_entry(catalog_dir: &Path, stem: &str) -> Option<CatalogEntry> {
-    let path = catalog_dir.join(format!("{stem}.yaml"));
+    let path = crate::sharded_path(catalog_dir, stem, "yaml");
     let contents = std::fs::read_to_string(&path).ok()?;
     serde_yaml_ng::from_str(&contents).ok()
 }
 
 /// Write a catalog entry to disk (atomic write).
 pub fn write_catalog_entry(catalog_dir: &Path, stem: &str, entry: &CatalogEntry) {
-    let _ = std::fs::create_dir_all(catalog_dir);
-    let path = catalog_dir.join(format!("{stem}.yaml"));
+    let path = crate::sharded_path(catalog_dir, stem, "yaml");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if let Ok(yaml) = serde_yaml_ng::to_string(entry) {
-        // Use atomic write if tempfile is available
         let _ = std::fs::write(&path, yaml);
     }
 }
