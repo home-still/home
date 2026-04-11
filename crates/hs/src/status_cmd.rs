@@ -29,6 +29,7 @@ struct DashboardData {
     qdrant_version: String,
 
     watcher: WatcherInfo,
+    indexer: IndexerInfo,
 
     history: Vec<HistoryEvent>,
 
@@ -53,6 +54,22 @@ enum WatcherInfo {
     /// PID is dead but had failures — needs attention
     Failed { completed: u64, failed: u64 },
     /// No status file, no PID file — watcher never started
+    Stopped,
+}
+
+enum IndexerInfo {
+    /// Indexer daemon is actively running
+    Running {
+        indexed: u64,
+        total: u64,
+        failed: u64,
+        chunks: u64,
+        current_file: String,
+        gpu_yield: bool,
+    },
+    /// Indexer finished all files
+    Finished { indexed: u64, chunks: u64 },
+    /// Not running
     Stopped,
 }
 
@@ -307,6 +324,9 @@ async fn collect_data() -> DashboardData {
         _ => (WatcherInfo::Stopped, vec![]),
     };
 
+    // Distill index daemon status (local JSON file, fast read)
+    let indexer = read_indexer_status();
+
     DashboardData {
         doc_counts,
         markdown_counts,
@@ -320,6 +340,7 @@ async fn collect_data() -> DashboardData {
         qdrant_url,
         qdrant_version,
         watcher,
+        indexer,
         history,
         loading: false,
         fs_stalled_docs,
@@ -368,6 +389,40 @@ fn read_watcher_status(output_dir: &Path, watch_dir: &Path) -> WatcherInfo {
     }
 
     WatcherInfo::Stopped
+}
+
+fn read_indexer_status() -> IndexerInfo {
+    let status = match crate::distill_cmd::read_index_status() {
+        Some(s) => s,
+        None => return IndexerInfo::Stopped,
+    };
+
+    // Check if PID is alive
+    if status.pid > 0 && !crate::daemon::is_process_alive(status.pid) {
+        if status.done {
+            return IndexerInfo::Finished {
+                indexed: status.indexed as u64,
+                chunks: status.total_chunks as u64,
+            };
+        }
+        return IndexerInfo::Stopped;
+    }
+
+    if status.done {
+        return IndexerInfo::Finished {
+            indexed: status.indexed as u64,
+            chunks: status.total_chunks as u64,
+        };
+    }
+
+    IndexerInfo::Running {
+        indexed: status.indexed as u64,
+        total: status.total_files as u64,
+        failed: status.failed as u64,
+        chunks: status.total_chunks as u64,
+        current_file: status.current_file,
+        gpu_yield: status.gpu_yield,
+    }
 }
 
 fn load_history(catalog_dir: &Path, limit: usize) -> Vec<HistoryEvent> {
@@ -699,6 +754,60 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                 Cell::from(""),
             ]),
         },
+        match &data.indexer {
+            IndexerInfo::Running {
+                indexed,
+                total,
+                failed,
+                chunks,
+                current_file,
+                gpu_yield,
+            } => {
+                let (label, color) = if *gpu_yield {
+                    ("yielding", Color::Yellow)
+                } else {
+                    ("indexing", Color::Green)
+                };
+                let pct = if *total > 0 {
+                    (*indexed as f64 / *total as f64 * 100.0) as u64
+                } else {
+                    0
+                };
+                let file_short = if current_file.len() > 30 {
+                    format!("{}...", &current_file[..27])
+                } else {
+                    current_file.clone()
+                };
+                let detail = if *gpu_yield {
+                    format!("{indexed}/{total} ({pct}%) · GPU yield")
+                } else {
+                    let fail_str = if *failed > 0 {
+                        format!(" · {failed} failed")
+                    } else {
+                        String::new()
+                    };
+                    format!("{indexed}/{total} ({pct}%) · {chunks} chunks{fail_str} · {file_short}")
+                };
+                Row::new(vec![
+                    Cell::from("Indexer").style(Style::default().fg(color)),
+                    Cell::from("●".to_string()).style(Style::default().fg(color)),
+                    Cell::from(label),
+                    Cell::from(detail),
+                ])
+            }
+            IndexerInfo::Finished { indexed, chunks } => Row::new(vec![
+                Cell::from("Indexer").style(Style::default().fg(Color::Green)),
+                Cell::from("●".to_string()).style(Style::default().fg(Color::Green)),
+                Cell::from("done"),
+                Cell::from(format!("{indexed} indexed · {chunks} chunks")),
+            ]),
+            IndexerInfo::Stopped => Row::new(vec![
+                Cell::from("Indexer").style(Style::default().fg(Color::DarkGray)),
+                Cell::from("○".to_string()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from("stopped"),
+                Cell::from(""),
+            ]),
+        },
     ];
 
     let table = Table::new(
@@ -922,6 +1031,7 @@ pub async fn run() -> Result<()> {
         qdrant_url: String::new(),
         qdrant_version: String::new(),
         watcher: WatcherInfo::Stopped,
+        indexer: IndexerInfo::Stopped,
         history: vec![],
         loading: true,
         fs_stalled_docs: false,
@@ -961,6 +1071,7 @@ pub async fn run() -> Result<()> {
                         data.embedded_docs = new_data.embedded_docs;
                         data.embedded_chunks = new_data.embedded_chunks;
                         data.watcher = new_data.watcher;
+                        data.indexer = new_data.indexer;
                         data.history = new_data.history;
                         data.loading = false;
                     }

@@ -689,23 +689,23 @@ fn index_pid_path() -> PathBuf {
     hidden_dir().join("distill-index.pid")
 }
 
-fn index_status_path() -> PathBuf {
+pub fn index_status_path() -> PathBuf {
     hidden_dir().join(INDEX_STATUS_FILE)
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
-struct IndexStatus {
-    pid: u32,
-    total_files: usize,
-    indexed: usize,
-    failed: usize,
-    gpu_yield: bool,
-    total_chunks: u32,
-    current_file: String,
-    done: bool,
+pub struct IndexStatus {
+    pub pid: u32,
+    pub total_files: usize,
+    pub indexed: usize,
+    pub failed: usize,
+    pub gpu_yield: bool,
+    pub total_chunks: u32,
+    pub current_file: String,
+    pub done: bool,
 }
 
-fn read_index_status() -> Option<IndexStatus> {
+pub fn read_index_status() -> Option<IndexStatus> {
     let contents = std::fs::read_to_string(index_status_path()).ok()?;
     serde_json::from_str(&contents).ok()
 }
