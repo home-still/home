@@ -138,8 +138,9 @@ async fn collect_data() -> DashboardData {
         pdf + html
     });
 
-    // Wait up to 10s per directory independently — if one stalls, others still show.
-    let timeout = Duration::from_secs(10);
+    // Sharded layout means recursive walks across ~150 subdirs; macOS NFS v3
+    // with 32KB blocks needs more time than a flat directory scan.
+    let timeout = Duration::from_secs(20);
 
     let (doc_counts, fs_stalled_docs) = match tokio::time::timeout(timeout, docs_task).await {
         Ok(Ok(counts)) => (Some(counts), false),
@@ -301,7 +302,7 @@ async fn collect_data() -> DashboardData {
         let history = load_history(&cfg2.catalog_dir, 100);
         (watcher, history)
     });
-    let (watcher, history) = match tokio::time::timeout(Duration::from_secs(10), fs_result2).await {
+    let (watcher, history) = match tokio::time::timeout(Duration::from_secs(20), fs_result2).await {
         Ok(Ok((w, h))) => (w, h),
         _ => (WatcherInfo::Stopped, vec![]),
     };

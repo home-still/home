@@ -359,7 +359,6 @@ fn looks_like_html(header: &[u8]) -> bool {
 
 fn is_paywall_html(content: &str) -> bool {
     let lower = content.to_lowercase();
-    let len = content.len();
 
     // Paywall indicators
     let has_login = lower.contains("sign in")
@@ -370,12 +369,12 @@ fn is_paywall_html(content: &str) -> bool {
         || lower.contains("purchase this article")
         || lower.contains("institutional access");
 
-    // Paper indicators
+    // Paper indicators — meaningful article structure
     let has_article =
         lower.contains("<article") || (lower.contains("abstract") && lower.contains("references"));
 
     // Short pages with login prompts are almost certainly paywalls
-    if has_login && len < 100_000 {
+    if has_login && content.len() < 100_000 {
         return true;
     }
 
@@ -384,5 +383,46 @@ fn is_paywall_html(content: &str) -> bool {
         return true;
     }
 
+    // Strip HTML tags and measure actual visible text
+    let text_only = strip_html_tags(&lower);
+    let text_len = text_only.trim().len();
+
+    // Very short pages without article structure are junk (landing pages, error pages)
+    if text_len < 500 && !has_article {
+        return true;
+    }
+
+    // Journal metadata pages (impact factor, citescore) with no paper body
+    let is_journal_meta = lower.contains("impact factor")
+        || lower.contains("citescore")
+        || lower.contains("aims and scope");
+    if is_journal_meta && !has_article {
+        return true;
+    }
+
+    // Institutional/repository landing pages with navigation but no paper
+    let is_landing = lower.contains("clinical trials")
+        || lower.contains("browse collections")
+        || lower.contains("search results")
+        || lower.contains("cookie policy");
+    if is_landing && !has_article {
+        return true;
+    }
+
     false
+}
+
+/// Strip HTML tags to get visible text content.
+fn strip_html_tags(html: &str) -> String {
+    let mut result = String::with_capacity(html.len() / 2);
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => result.push(ch),
+            _ => {}
+        }
+    }
+    result
 }
