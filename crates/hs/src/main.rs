@@ -136,9 +136,7 @@ fn main() -> ExitCode {
                     upgrade_cmd::run(check, force, pre, &cli.global, &reporter).await
                 }
                 TopCmd::Migrate { command } => match command {
-                    cli::MigrateAction::Sharding => {
-                        migrate_cmd::run_sharding(&reporter).await
-                    }
+                    cli::MigrateAction::Sharding => migrate_cmd::run_sharding(&reporter).await,
                 },
             }
         };

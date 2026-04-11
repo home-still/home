@@ -955,7 +955,8 @@ async fn cmd_watch(
                         continue;
                     }
                     let stem = path.file_stem().unwrap_or_default();
-                    let md_path = hs_common::sharded_path(&output_dir, &stem.to_string_lossy(), "md");
+                    let md_path =
+                        hs_common::sharded_path(&output_dir, &stem.to_string_lossy(), "md");
                     if md_path.exists() {
                         let _ = std::fs::File::open(path);
                         let _ = std::fs::File::open(&md_path);
@@ -1178,8 +1179,9 @@ async fn convert_and_save_pool(
 
                 // Quarantine stub PDFs (landing pages, paywalls)
                 if is_stub_pdf(total_pages, &md) {
-                    reporter
-                        .warn(&format!("{stem}: stub PDF (1pg, minimal content) → quarantined"));
+                    reporter.warn(&format!(
+                        "{stem}: stub PDF (1pg, minimal content) → quarantined"
+                    ));
                     let _ = std::fs::remove_file(&output_path);
                     quarantine_file(pdf_path, corrupted_dir);
                     stats.completed.fetch_sub(1, Relaxed);

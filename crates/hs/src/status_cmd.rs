@@ -115,13 +115,15 @@ async fn collect_data() -> DashboardData {
         let (pdf_count, pdf_bytes) = count_dir_recursive(&cfg_docs.watch_dir, "pdf");
         let (html_count, html_bytes) = count_dir_recursive(&cfg_docs.watch_dir, "html");
         let (htm_count, htm_bytes) = count_dir_recursive(&cfg_docs.watch_dir, "htm");
-        (pdf_count + html_count + htm_count, pdf_bytes + html_bytes + htm_bytes)
+        (
+            pdf_count + html_count + htm_count,
+            pdf_bytes + html_bytes + htm_bytes,
+        )
     });
 
     let cfg_md = scribe_cfg.clone();
-    let markdown_task = tokio::task::spawn_blocking(move || {
-        count_dir_recursive(&cfg_md.output_dir, "md")
-    });
+    let markdown_task =
+        tokio::task::spawn_blocking(move || count_dir_recursive(&cfg_md.output_dir, "md"));
 
     let cfg_cat = scribe_cfg.clone();
     let catalog_task = tokio::task::spawn_blocking(move || {
@@ -143,14 +145,16 @@ async fn collect_data() -> DashboardData {
         Ok(Ok(counts)) => (Some(counts), false),
         _ => (None, true),
     };
-    let (markdown_counts, fs_stalled_markdown) = match tokio::time::timeout(timeout, markdown_task).await {
-        Ok(Ok(counts)) => (Some(counts), false),
-        _ => (None, true),
-    };
-    let (catalog_count, fs_stalled_catalog) = match tokio::time::timeout(timeout, catalog_task).await {
-        Ok(Ok(count)) => (Some(count), false),
-        _ => (None, true),
-    };
+    let (markdown_counts, fs_stalled_markdown) =
+        match tokio::time::timeout(timeout, markdown_task).await {
+            Ok(Ok(counts)) => (Some(counts), false),
+            _ => (None, true),
+        };
+    let (catalog_count, fs_stalled_catalog) =
+        match tokio::time::timeout(timeout, catalog_task).await {
+            Ok(Ok(count)) => (Some(count), false),
+            _ => (None, true),
+        };
     let corrupted_count = match tokio::time::timeout(timeout, corrupted_task).await {
         Ok(Ok(count)) => Some(count),
         _ => None,
@@ -515,10 +519,7 @@ fn render(frame: &mut Frame, data: &DashboardData) {
 fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let any_stall = data.fs_stalled_docs || data.fs_stalled_markdown || data.fs_stalled_catalog;
     let title = if any_stall {
-        Line::from(vec![
-            " Pipeline ".into(),
-            "· NFS stall ".fg(Color::Red),
-        ])
+        Line::from(vec![" Pipeline ".into(), "· NFS stall ".fg(Color::Red)])
     } else {
         Line::from(" Pipeline ")
     };
@@ -558,26 +559,74 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let scanning = "  ...".to_string();
     let stall_style = Style::default().fg(Color::Yellow);
 
-    let doc_label = if data.fs_stalled_docs { "Documents (stall)" } else { "Documents" };
-    let md_label = if data.fs_stalled_markdown { "Markdown (stall)" } else { "Markdown" };
-    let cat_label = if data.fs_stalled_catalog { "Cataloged (stall)" } else { "Cataloged" };
+    let doc_label = if data.fs_stalled_docs {
+        "Documents (stall)"
+    } else {
+        "Documents"
+    };
+    let md_label = if data.fs_stalled_markdown {
+        "Markdown (stall)"
+    } else {
+        "Markdown"
+    };
+    let cat_label = if data.fs_stalled_catalog {
+        "Cataloged (stall)"
+    } else {
+        "Cataloged"
+    };
 
     let rows = vec![
         Row::new(vec![
-            Cell::from(doc_label).style(if data.fs_stalled_docs { stall_style } else { Style::default() }),
-            Cell::from(if data.doc_counts.is_some() { format!("{:>6}", doc_count) } else { scanning.clone() }),
-            Cell::from(if data.doc_counts.is_some() { format!("{:>8}", fmt_bytes(doc_bytes)) } else { String::new() }),
+            Cell::from(doc_label).style(if data.fs_stalled_docs {
+                stall_style
+            } else {
+                Style::default()
+            }),
+            Cell::from(if data.doc_counts.is_some() {
+                format!("{:>6}", doc_count)
+            } else {
+                scanning.clone()
+            }),
+            Cell::from(if data.doc_counts.is_some() {
+                format!("{:>8}", fmt_bytes(doc_bytes))
+            } else {
+                String::new()
+            }),
             Cell::from(""),
         ]),
         Row::new(vec![
-            Cell::from(md_label).style(if data.fs_stalled_markdown { stall_style } else { Style::default() }),
-            Cell::from(if data.markdown_counts.is_some() { format!("{:>6}", markdown_count) } else { scanning.clone() }),
-            Cell::from(if data.markdown_counts.is_some() { format!("{:>8}", fmt_bytes(markdown_bytes)) } else { String::new() }),
-            Cell::from(if data.markdown_counts.is_some() { format!("{:>5.1}%", pdf_to_md * 100.0) } else { String::new() }),
+            Cell::from(md_label).style(if data.fs_stalled_markdown {
+                stall_style
+            } else {
+                Style::default()
+            }),
+            Cell::from(if data.markdown_counts.is_some() {
+                format!("{:>6}", markdown_count)
+            } else {
+                scanning.clone()
+            }),
+            Cell::from(if data.markdown_counts.is_some() {
+                format!("{:>8}", fmt_bytes(markdown_bytes))
+            } else {
+                String::new()
+            }),
+            Cell::from(if data.markdown_counts.is_some() {
+                format!("{:>5.1}%", pdf_to_md * 100.0)
+            } else {
+                String::new()
+            }),
         ]),
         Row::new(vec![
-            Cell::from(cat_label).style(if data.fs_stalled_catalog { stall_style } else { Style::default() }),
-            Cell::from(if data.catalog_count.is_some() { format!("{:>6}", catalog_count) } else { scanning.clone() }),
+            Cell::from(cat_label).style(if data.fs_stalled_catalog {
+                stall_style
+            } else {
+                Style::default()
+            }),
+            Cell::from(if data.catalog_count.is_some() {
+                format!("{:>6}", catalog_count)
+            } else {
+                scanning.clone()
+            }),
             Cell::from(""),
             Cell::from(""),
         ]),
@@ -593,8 +642,12 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
         ]),
         Row::new(vec![
             Cell::from("Corrupted PDFs").style(Style::default().fg(Color::Red)),
-            Cell::from(if data.corrupted_count.is_some() { format!("{:>6}", corrupted_count) } else { scanning.clone() })
-                .style(Style::default().fg(Color::Red)),
+            Cell::from(if data.corrupted_count.is_some() {
+                format!("{:>6}", corrupted_count)
+            } else {
+                scanning.clone()
+            })
+            .style(Style::default().fg(Color::Red)),
             Cell::from(""),
             Cell::from(""),
         ]),
@@ -766,10 +819,7 @@ fn format_status_activity(healthy: bool, running_label: &str, activity: &str) ->
 fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let any_stall = data.fs_stalled_docs || data.fs_stalled_markdown || data.fs_stalled_catalog;
     let title = if any_stall {
-        Line::from(vec![
-            " History ".into(),
-            "· NFS stall ".fg(Color::Red),
-        ])
+        Line::from(vec![" History ".into(), "· NFS stall ".fg(Color::Red)])
     } else {
         Line::from(" History ")
     };
@@ -846,7 +896,10 @@ pub async fn run() -> Result<()> {
             let _ = io::stdout().execute(LeaveAlternateScreen);
             std::process::exit(130);
         }
-        libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        );
     }
 
     // Setup terminal

@@ -256,7 +256,10 @@ impl DownloadService for PaperDownloader {
         on_progress: Option<&(dyn Fn(u64, Option<u64>) + Send + Sync)>,
     ) -> Result<DownloadResult, PaperError> {
         // Derive stem from filename for sharded directory layout
-        let stem = filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(filename);
+        let stem = filename
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or(filename);
         let ext = filename.rsplit_once('.').map(|(_, e)| e).unwrap_or("pdf");
         let file_path = hs_common::sharded_path(&self.download_path, stem, ext);
         if let Some(parent) = file_path.parent() {
