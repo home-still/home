@@ -110,10 +110,7 @@ mod tests {
     #[test]
     fn low_diversity_rejected() {
         // "J J J J J J ..." — very low vocabulary
-        let text = std::iter::repeat("J")
-            .take(100)
-            .collect::<Vec<_>>()
-            .join(" ");
+        let text = std::iter::repeat_n("J", 100).collect::<Vec<_>>().join(" ");
         assert!(is_low_quality(&text));
     }
 
