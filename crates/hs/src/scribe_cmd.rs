@@ -841,6 +841,10 @@ async fn cmd_watch(
         .unwrap_or_else(|| watch_dir.join("markdown"));
     std::fs::create_dir_all(&output_dir)?;
 
+    // Create a drop folder for manually downloaded papers
+    let manual_dir = watch_dir.join("manually_downloaded");
+    std::fs::create_dir_all(&manual_dir)?;
+
     // Health check
     for s in &servers {
         reporter.status("Server", s);

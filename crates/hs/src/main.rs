@@ -204,6 +204,12 @@ async fn handle_config(
             std::fs::write(&config_path, generate_config(&email, &core_key))?;
             reporter.status("Created", &format!("{}", config_path.display()));
 
+            // Create project directory structure
+            let project = hs_common::resolve_project_dir();
+            let _ = std::fs::create_dir_all(project.join("papers").join("manually_downloaded"));
+            let _ = std::fs::create_dir_all(project.join("markdown"));
+            let _ = std::fs::create_dir_all(project.join("catalog"));
+
             Ok(())
         }
 
