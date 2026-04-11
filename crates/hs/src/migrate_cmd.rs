@@ -27,12 +27,18 @@ pub async fn run_sharding(reporter: &Arc<dyn Reporter>) -> Result<()> {
         }
 
         let mut moved = 0u64;
+        let mut skipped = 0u64;
         let entries: Vec<_> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
                 let path = e.path();
-                // Only migrate files directly in the root (not already in shard subdirs)
+                let name = path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or_default();
+                // Skip directories, macOS resource forks (._*), and non-matching extensions
                 !path.is_dir()
+                    && !name.starts_with("._")
                     && path
                         .extension()
                         .and_then(|ext| ext.to_str())
@@ -60,18 +66,35 @@ pub async fn run_sharding(reporter: &Arc<dyn Reporter>) -> Result<()> {
                 .unwrap_or_default();
 
             if stem.len() < 2 {
-                continue; // skip unusually short filenames
+                skipped += 1;
+                continue;
             }
 
             let target = hs_common::sharded_path(dir, stem, ext);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::rename(&path, &target)?;
-            moved += 1;
+            match std::fs::rename(&path, &target) {
+                Ok(()) => moved += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // File vanished between scan and rename (NFS race)
+                    skipped += 1;
+                }
+                Err(e) => {
+                    reporter.warn(&format!("{name}: failed to move {}: {e}", path.display()));
+                    skipped += 1;
+                }
+            }
         }
 
-        reporter.status("OK", &format!("{name}: migrated {moved} files"));
+        if skipped > 0 {
+            reporter.status(
+                "OK",
+                &format!("{name}: migrated {moved}, skipped {skipped}"),
+            );
+        } else {
+            reporter.status("OK", &format!("{name}: migrated {moved} files"));
+        }
         total_moved += moved;
     }
 
