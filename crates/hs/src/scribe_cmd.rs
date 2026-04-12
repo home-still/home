@@ -494,7 +494,7 @@ async fn cmd_watch_attach(
 /// Check if a path is a document to process (PDF or HTML, not a macOS resource fork or temp file).
 fn is_processable_document(path: &std::path::Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if ext != "pdf" && ext != "html" && ext != "htm" {
+    if ext != "pdf" && ext != "html" && ext != "htm" && ext != "epub" {
         return false;
     }
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -540,6 +540,41 @@ fn quarantine_file(path: &std::path::Path, corrupted_dir: &std::path::Path) {
     let dest = corrupted_dir.join(path.file_name().unwrap_or_default());
     if let Err(e) = std::fs::rename(path, &dest) {
         eprintln!("warning: Failed to quarantine {}: {e}", path.display());
+    }
+}
+
+/// Read an EPUB as concatenated spine-ordered HTML.
+/// EPUB is a zip of XHTML chapters; we walk the spine (reading order) and
+/// combine the chapter bodies so the existing HTML→markdown path can handle it.
+fn epub_to_html(epub_path: &std::path::Path) -> std::io::Result<String> {
+    use epub::doc::EpubDoc;
+    let mut doc =
+        EpubDoc::new(epub_path).map_err(|e| std::io::Error::other(format!("invalid EPUB: {e}")))?;
+
+    let mut combined = String::from("<html><body>");
+    loop {
+        if let Some(content) = doc.get_current_str() {
+            combined.push_str(&content.0);
+        }
+        if !doc.go_next() {
+            break;
+        }
+    }
+    combined.push_str("</body></html>");
+    Ok(combined)
+}
+
+/// Read a file as HTML, transparently handling `.epub` by unpacking its spine.
+fn read_as_html(path: &std::path::Path) -> std::io::Result<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "epub" {
+        epub_to_html(path)
+    } else {
+        std::fs::read_to_string(path)
     }
 }
 
@@ -705,10 +740,10 @@ async fn convert_html_and_save(
     stats.queued.fetch_sub(1, Relaxed);
     stats.processing.fetch_add(1, Relaxed);
 
-    let html = match std::fs::read_to_string(html_path) {
+    let html = match read_as_html(html_path) {
         Ok(h) => h,
         Err(e) => {
-            reporter.warn(&format!("{stem}: Cannot read HTML: {e}"));
+            reporter.warn(&format!("{stem}: Cannot read input: {e}"));
             stats.processing.fetch_sub(1, Relaxed);
             stats.failed.fetch_add(1, Relaxed);
             return;
@@ -891,6 +926,7 @@ async fn cmd_watch(
             let mut docs = hs_common::collect_files_recursive(&watch_dir, "pdf");
             docs.extend(hs_common::collect_files_recursive(&watch_dir, "html"));
             docs.extend(hs_common::collect_files_recursive(&watch_dir, "htm"));
+            docs.extend(hs_common::collect_files_recursive(&watch_dir, "epub"));
             docs
         };
         for path in all_docs {
@@ -913,7 +949,9 @@ async fn cmd_watch(
             stats
                 .queued
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let is_html = path.extension().is_some_and(|e| e == "html" || e == "htm");
+            let is_html = path
+                .extension()
+                .is_some_and(|e| e == "html" || e == "htm" || e == "epub");
             let pool = Arc::clone(&pool);
             let output_dir = output_dir.clone();
             let corrupted_dir = corrupted_dir.clone();
@@ -982,7 +1020,9 @@ async fn cmd_watch(
                     stats
                         .queued
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let is_html = path.extension().is_some_and(|e| e == "html" || e == "htm");
+                    let is_html = path
+                        .extension()
+                        .is_some_and(|e| e == "html" || e == "htm" || e == "epub");
                     let pool = Arc::clone(&pool);
                     let path = path.clone();
                     let output_dir = output_dir.clone();
