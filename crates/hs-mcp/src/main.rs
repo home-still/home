@@ -279,8 +279,16 @@ impl HomeStillMcp {
             }
         }
 
-        let downloader = paper::providers::downloader::PaperDownloader::new(
-            self.papers_dir.clone(),
+        let storage = config
+            .build_storage()
+            .map_err(|e| format!("Storage init failed: {e}"))?;
+        let events = config
+            .build_event_bus()
+            .await
+            .map_err(|e| format!("Event bus init failed: {e}"))?;
+        let downloader = paper::providers::downloader::PaperDownloader::with_event_bus(
+            storage,
+            events,
             &config.download,
             resolvers,
         )

@@ -15,7 +15,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
-hs-common = { workspace = true, features = ["cli"] }
+hs-common = { workspace = true, features = ["cli", "storage-s3", "events-nats"] }
 owo-colors = { workspace = true }
 serde_yaml_ng = { workspace = true }
 figment = { workspace = true }

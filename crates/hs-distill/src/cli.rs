@@ -59,4 +59,12 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Subscribe to `scribe.completed` on the configured event bus and index
+    /// each markdown object via the distill server. Event-driven replacement
+    /// for the directory-walk indexer.
+    WatchEvents {
+        /// Override server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
 }

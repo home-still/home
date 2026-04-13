@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use hs_common::service::protocol::{ReadinessInfo, ServiceClient};
+use hs_common::storage::Storage;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -151,11 +152,18 @@ impl DistillClient {
     pub async fn index_file(&self, markdown_path: &str) -> Result<IndexResult> {
         let content = std::fs::read_to_string(markdown_path)
             .context(format!("Failed to read {markdown_path}"))?;
+        self.index_content(markdown_path, &content).await
+    }
+
+    /// Index markdown already held in memory. `path_hint` is used server-side for
+    /// logging and catalog lookup (derive the doc stem) but the server never
+    /// reads it from disk.
+    pub async fn index_content(&self, path_hint: &str, content: &str) -> Result<IndexResult> {
         let url = format!("{}/distill", self.server_url);
         let resp = self
             .http
             .post(&url)
-            .json(&serde_json::json!({ "path": markdown_path, "content": content }))
+            .json(&serde_json::json!({ "path": path_hint, "content": content }))
             .send()
             .await
             .context("Failed to send index request")?;
@@ -167,6 +175,21 @@ impl DistillClient {
         }
 
         resp.json().await.context("Invalid index response")
+    }
+
+    /// Index a markdown object pulled from a `Storage` backend (local or S3).
+    pub async fn index_from_storage(
+        &self,
+        storage: &dyn Storage,
+        key: &str,
+    ) -> Result<IndexResult> {
+        let bytes = storage
+            .get(key)
+            .await
+            .with_context(|| format!("Failed to read {key} from storage"))?;
+        let content = String::from_utf8(bytes)
+            .with_context(|| format!("Markdown at {key} is not valid UTF-8"))?;
+        self.index_content(key, &content).await
     }
 
     /// Index a markdown file with streaming progress via NDJSON.

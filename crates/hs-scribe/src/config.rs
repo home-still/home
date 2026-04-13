@@ -2,8 +2,11 @@ use figment::{
     providers::{Env, Format, Serialized, Yaml},
     Figment,
 };
+use hs_common::event_bus::{EventBus, EventBusConfig};
+use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Resolve project_dir from ~/.home-still/config.yaml or default to ~/home-still.
 fn resolve_project_dir() -> PathBuf {
@@ -146,6 +149,12 @@ pub struct ScribeConfig {
     /// Machines that only run the watcher and forward to remote scribe servers
     /// should set this to false.
     pub local_server: bool,
+    /// Storage backend (loaded from top-level `storage:` section, not `scribe.storage`).
+    #[serde(skip)]
+    pub storage: StorageConfig,
+    /// Event bus (loaded from top-level `events:` section).
+    #[serde(skip)]
+    pub events: EventBusConfig,
 }
 
 impl Default for ScribeConfig {
@@ -157,6 +166,8 @@ impl Default for ScribeConfig {
             catalog_dir: resolve_project_dir().join("catalog"),
             servers: vec!["http://localhost:7433".into()],
             local_server: true,
+            storage: StorageConfig::default(),
+            events: EventBusConfig::default(),
         }
     }
 }
@@ -178,15 +189,38 @@ impl ScribeConfig {
                 "local_server": true,
             }
         });
-        let result = Figment::from(Serialized::defaults(defaults))
-            .merge(Yaml::file(config_path))
-            .merge(Env::prefixed("HS_SCRIBE_"))
-            .focus("scribe")
-            .extract::<ScribeConfig>();
+        let figment = Figment::from(Serialized::defaults(defaults))
+            .merge(Yaml::file(&config_path))
+            .merge(Env::prefixed("HS_SCRIBE_"));
 
-        match result {
-            Ok(cfg) => Ok(cfg),
-            Err(_) => Ok(ScribeConfig::default()),
-        }
+        let storage = figment
+            .clone()
+            .focus("storage")
+            .extract::<StorageConfig>()
+            .unwrap_or_default();
+
+        let events = figment
+            .clone()
+            .focus("events")
+            .extract::<EventBusConfig>()
+            .unwrap_or_default();
+
+        let mut cfg = figment
+            .focus("scribe")
+            .extract::<ScribeConfig>()
+            .unwrap_or_default();
+        cfg.storage = storage;
+        cfg.events = events;
+        Ok(cfg)
+    }
+
+    /// Build the configured storage backend.
+    pub fn build_storage(&self) -> anyhow::Result<Arc<dyn Storage>> {
+        self.storage.build()
+    }
+
+    /// Build the configured event bus.
+    pub async fn build_event_bus(&self) -> anyhow::Result<Arc<dyn EventBus>> {
+        self.events.build().await
     }
 }

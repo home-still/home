@@ -153,7 +153,40 @@ pub async fn dispatch(
             server,
         } => cmd_search(&query, limit, year, topic, server.as_deref(), global).await,
         DistillCmd::Status { server } => cmd_status(server.as_deref(), reporter).await,
+        DistillCmd::WatchEvents { server } => cmd_watch_events(server, reporter).await,
     }
+}
+
+async fn cmd_watch_events(
+    server_override: Option<String>,
+    _reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    use hs_distill::client::DistillClient;
+    use hs_distill::config::DistillClientConfig;
+    use hs_distill::event_watch::{index_and_publish, run_subscriber};
+
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage()?;
+    let bus = cfg.build_event_bus().await?;
+
+    let server_url = server_override
+        .or_else(|| cfg.servers.first().cloned())
+        .unwrap_or_else(|| "http://localhost:7434".into());
+    let distill = Arc::new(DistillClient::new(&server_url));
+
+    tracing::info!(%server_url, "starting distill event-bus watcher");
+
+    let storage_for_handler = storage.clone();
+    let bus_for_handler = bus.clone();
+    run_subscriber(bus.clone(), storage.clone(), move |event| {
+        let storage = storage_for_handler.clone();
+        let bus = bus_for_handler.clone();
+        let distill = distill.clone();
+        async move {
+            index_and_publish(storage.as_ref(), distill.as_ref(), bus.as_ref(), &event).await
+        }
+    })
+    .await
 }
 
 // ── Init ────────────────────────────────────────────────────────

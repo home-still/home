@@ -171,8 +171,15 @@ pub async fn run_download(
         resolvers.push(Box::new(cr));
     }
 
+    let storage = config
+        .build_storage()
+        .context("Failed to build storage backend")?;
+    let events = config
+        .build_event_bus()
+        .await
+        .context("Failed to build event bus")?;
     let downloader =
-        PaperDownloader::new(config.download_path.clone(), &config.download, resolvers)
+        PaperDownloader::with_event_bus(storage, events, &config.download, resolvers)
             .context("Failed to create downloader")?;
     let downloader: Arc<dyn crate::ports::download_service::DownloadService> = Arc::new(downloader);
 

@@ -43,6 +43,34 @@ auth = [
     "dep:reqwest",
     "dep:tokio",
 ]
+storage = [
+    "dep:anyhow",
+    "dep:async-trait",
+    "dep:tokio",
+    "dep:serde",
+    "dep:serde_yaml_ng",
+    "tokio/fs",
+]
+storage-s3 = [
+    "storage",
+    "dep:object_store",
+    "dep:bytes",
+    "dep:futures",
+    "dep:url",
+]
+events = [
+    "dep:anyhow",
+    "dep:async-trait",
+    "dep:tokio",
+    "dep:futures",
+    "dep:serde",
+    "dep:serde_json",
+]
+events-nats = [
+    "events",
+    "dep:async-nats",
+    "dep:bytes",
+]
 
 [dependencies]
 indicatif = { version = "0.18", optional = true }
@@ -74,3 +102,15 @@ hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 rand = { version = "0.9", optional = true }
+
+# storage-s3 feature deps
+object_store = { version = "0.13", features = ["aws"], optional = true }
+bytes = { version = "1", optional = true }
+url = { version = "2", optional = true }
+
+# events feature deps
+async-nats = { version = "0.47", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

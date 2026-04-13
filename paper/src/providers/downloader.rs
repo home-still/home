@@ -1,11 +1,13 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use hs_common::event_bus::{EventBus, NoOpBus};
+use hs_common::storage::Storage;
 use reqwest::{header, Client};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 use crate::config::DownloadConfig;
 use crate::error::PaperError;
@@ -42,14 +44,24 @@ struct PmcIdRecord {
 
 pub struct PaperDownloader {
     client: Client,
-    download_path: PathBuf,
+    storage: Arc<dyn Storage>,
+    events: Arc<dyn EventBus>,
     unpaywall_email: Option<String>,
     resolvers: Vec<Box<dyn PaperProvider>>,
 }
 
 impl PaperDownloader {
     pub fn new(
-        download_path: PathBuf,
+        storage: Arc<dyn Storage>,
+        config: &DownloadConfig,
+        resolvers: Vec<Box<dyn PaperProvider>>,
+    ) -> Result<Self, PaperError> {
+        Self::with_event_bus(storage, Arc::new(NoOpBus), config, resolvers)
+    }
+
+    pub fn with_event_bus(
+        storage: Arc<dyn Storage>,
+        events: Arc<dyn EventBus>,
         config: &DownloadConfig,
         resolvers: Vec<Box<dyn PaperProvider>>,
     ) -> Result<Self, PaperError> {
@@ -77,7 +89,8 @@ impl PaperDownloader {
 
         Ok(Self {
             client,
-            download_path,
+            storage,
+            events,
             unpaywall_email: config.unpaywall_email.clone(),
             resolvers,
         })
@@ -261,89 +274,94 @@ impl DownloadService for PaperDownloader {
             .map(|(s, _)| s)
             .unwrap_or(filename);
         let ext = filename.rsplit_once('.').map(|(_, e)| e).unwrap_or("pdf");
-        let file_path = hs_common::sharded_path(&self.download_path, stem, ext);
-        if let Some(parent) = file_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let tmp_path = file_path.with_extension(format!("{ext}.tmp"));
+        let key = hs_common::sharded_key(stem, ext);
 
-        // Skip if already downloaded (final file exists)
-        if file_path.exists() {
-            let metadata = tokio::fs::metadata(&file_path).await?;
+        // Skip if already downloaded
+        if let Some(meta) = self
+            .storage
+            .head(&key)
+            .await
+            .map_err(|e| PaperError::Io(std::io::Error::other(e.to_string())))?
+        {
             return Ok(DownloadResult {
-                file_path,
+                file_path: PathBuf::from(&key),
                 doi: None,
                 sha256: String::new(),
-                size_bytes: metadata.len(),
+                size_bytes: meta.size,
                 skipped: true,
             });
         }
 
-        // Stream to temp file, then atomic rename
+        // Stream into memory, hashing as we go. S3 PUT is atomic; the local
+        // backend writes through a parent-mkdir + fs::write.
         let response = self.client.get(url).send().await?.error_for_status()?;
-
         let content_length = response.content_length();
-
         let mut stream = response.bytes_stream();
-        let mut file = tokio::fs::File::create(&tmp_path).await?;
+        let mut buf: Vec<u8> = match content_length {
+            Some(n) => Vec::with_capacity(n as usize),
+            None => Vec::new(),
+        };
         let mut hasher = Sha256::new();
-        let mut size_bytes: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk?;
             hasher.update(&bytes);
-            size_bytes += bytes.len() as u64;
-            file.write_all(&bytes).await?;
-
+            buf.extend_from_slice(&bytes);
             if let Some(cb) = &on_progress {
-                cb(size_bytes, content_length);
+                cb(buf.len() as u64, content_length);
             }
         }
 
-        file.flush().await?;
-        drop(file); // close before rename
+        let size_bytes = buf.len() as u64;
+        let sha256 = format!("{:x}", hasher.finalize());
 
-        // Validate downloaded content before committing
-        let header = tokio::fs::read(&tmp_path)
-            .await
-            .map(|b| b[..b.len().min(4096)].to_vec())
-            .unwrap_or_default();
-
-        if header.starts_with(b"%PDF") {
-            // Valid PDF — rename to final path
-            tokio::fs::rename(&tmp_path, &file_path).await?;
-        } else if looks_like_html(&header) {
-            // HTML content — classify as paper or paywall
-            let raw = tokio::fs::read(&tmp_path).await.unwrap_or_default();
-            let content = String::from_utf8_lossy(&raw).to_string();
+        // Validate and decide final key
+        let head = &buf[..buf.len().min(4096)];
+        let (final_key, final_bytes) = if head.starts_with(b"%PDF") {
+            (key, buf)
+        } else if looks_like_html(head) {
+            let content = String::from_utf8_lossy(&buf).to_string();
             if is_paywall_html(&content) {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(PaperError::NotFound(format!(
                     "Server returned a paywall/login page instead of PDF for {url}"
                 )));
             }
-            // Looks like a real HTML paper — save as .html
-            let html_path = hs_common::sharded_path(&self.download_path, stem, "html");
-            if let Some(parent) = html_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            tokio::fs::rename(&tmp_path, &html_path).await?;
-            return Ok(DownloadResult {
-                file_path: html_path,
-                doi: None,
-                sha256: format!("{:x}", hasher.finalize()),
-                size_bytes,
-                skipped: false,
-            });
+            (hs_common::sharded_key(stem, "html"), buf)
         } else {
             // Unknown format — keep it as-is (might be a valid binary format)
-            tokio::fs::rename(&tmp_path, &file_path).await?;
+            (key, buf)
+        };
+
+        self.storage
+            .put(&final_key, final_bytes)
+            .await
+            .map_err(|e| PaperError::Io(std::io::Error::other(e.to_string())))?;
+
+        // Announce the new artifact so scribe (or any other subscriber) can
+        // pick it up. On NoOpBus this is a cheap no-op; with NATS it reaches
+        // every subscriber on `papers.ingested`.
+        let payload = serde_json::json!({
+            "key": final_key,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+            "source": "paper-download",
+        });
+        if let Err(e) = self
+            .events
+            .publish(
+                "papers.ingested",
+                serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
+            )
+            .await
+        {
+            // Publish failure shouldn't fail the download — the file is
+            // safely in storage. Log and move on; a reconcile pass can
+            // backfill missed events later.
+            tracing::warn!(key = %final_key, error = %e, "event publish failed");
         }
 
-        let sha256 = format!("{:x}", hasher.finalize());
-
         Ok(DownloadResult {
-            file_path,
+            file_path: PathBuf::from(&final_key),
             doi: None,
             sha256,
             size_bytes,

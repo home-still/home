@@ -154,3 +154,131 @@ pub fn update_embedding_catalog(
 
     write_catalog_entry(catalog_dir, stem, &entry);
 }
+
+// ── Storage-backed variants ─────────────────────────────────────────────
+//
+// These mirror the path-based helpers above but read and write via the
+// `Storage` trait, so callers can point at either a local filesystem or an
+// S3/MinIO bucket with the same code. `prefix` is the sub-path inside the
+// storage backend where catalog YAMLs live (e.g. "catalog" for a local
+// backend rooted at the project dir, or "" for a dedicated `catalog` bucket).
+
+#[cfg(feature = "storage")]
+fn catalog_key(prefix: &str, stem: &str) -> String {
+    let key = crate::sharded_key(stem, "yaml");
+    if prefix.is_empty() {
+        key
+    } else {
+        format!("{}/{}", prefix.trim_end_matches('/'), key)
+    }
+}
+
+#[cfg(feature = "storage")]
+pub async fn read_catalog_entry_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    stem: &str,
+) -> Option<CatalogEntry> {
+    let key = catalog_key(prefix, stem);
+    let bytes = storage.get(&key).await.ok()?;
+    serde_yaml_ng::from_slice(&bytes).ok()
+}
+
+#[cfg(feature = "storage")]
+pub async fn write_catalog_entry_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    stem: &str,
+    entry: &CatalogEntry,
+) -> anyhow::Result<()> {
+    let key = catalog_key(prefix, stem);
+    let yaml = serde_yaml_ng::to_string(entry)?;
+    storage.put(&key, yaml.into_bytes()).await
+}
+
+#[cfg(feature = "storage")]
+#[allow(clippy::too_many_arguments)]
+pub async fn update_conversion_catalog_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    stem: &str,
+    server: &str,
+    duration_secs: u64,
+    total_pages: u64,
+    pages: Vec<PageOffset>,
+    markdown_path: &str,
+) -> anyhow::Result<()> {
+    let mut entry = read_catalog_entry_via(storage, prefix, stem)
+        .await
+        .unwrap_or_default();
+
+    entry.markdown_path = Some(markdown_path.to_string());
+    entry.conversion = Some(ConversionMeta {
+        server: server.to_string(),
+        duration_secs,
+        total_pages,
+        converted_at: chrono::Utc::now().to_rfc3339(),
+        pages,
+    });
+
+    write_catalog_entry_via(storage, prefix, stem, &entry).await
+}
+
+#[cfg(feature = "storage")]
+pub async fn update_embedding_catalog_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    stem: &str,
+    server: &str,
+    chunks_indexed: u32,
+    compute_device: &str,
+) -> anyhow::Result<()> {
+    let mut entry = read_catalog_entry_via(storage, prefix, stem)
+        .await
+        .unwrap_or_default();
+
+    entry.embedding = Some(EmbeddingMeta {
+        server: server.to_string(),
+        chunks_indexed,
+        compute_device: compute_device.to_string(),
+        embedded_at: chrono::Utc::now().to_rfc3339(),
+    });
+
+    write_catalog_entry_via(storage, prefix, stem, &entry).await
+}
+
+#[cfg(all(test, feature = "storage"))]
+mod storage_tests {
+    use super::*;
+    use crate::storage::LocalFsStorage;
+
+    #[tokio::test]
+    async fn roundtrip_via_local_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            title: Some("Example".into()),
+            sha256: Some("deadbeef".into()),
+            ..Default::default()
+        };
+
+        write_catalog_entry_via(&storage, "catalog", "ab123", &entry)
+            .await
+            .unwrap();
+
+        let got = read_catalog_entry_via(&storage, "catalog", "ab123")
+            .await
+            .unwrap();
+        assert_eq!(got.title.as_deref(), Some("Example"));
+        assert_eq!(got.sha256.as_deref(), Some("deadbeef"));
+
+        // Empty prefix should also work (bucket-root layout)
+        write_catalog_entry_via(&storage, "", "ab123", &entry)
+            .await
+            .unwrap();
+        assert!(read_catalog_entry_via(&storage, "", "ab123")
+            .await
+            .is_some());
+    }
+}

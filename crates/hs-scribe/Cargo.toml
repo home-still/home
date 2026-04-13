@@ -39,8 +39,9 @@ tokio = { workspace = true }
 reqwest = { workspace = true, features = ["multipart", "stream"] }
 figment = { workspace = true }
 dirs = "6"
-hs-common = { workspace = true, features = ["service"] }
+hs-common = { workspace = true, features = ["service", "storage-s3", "events-nats"] }
 async-trait = "0.1"
+futures-util = "0.3"
 
 # Server Only
 axum = { version = "0.8", optional = true, features = ["multipart"] }
@@ -66,3 +67,6 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 name = "hs-scribe-server"
 path = "src/server_main.rs"
 required-features = ["server"]
+
+[dev-dependencies]
+tempfile = "3"

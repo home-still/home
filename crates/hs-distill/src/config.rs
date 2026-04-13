@@ -1,9 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use figment::{
     providers::{Env, Format, Serialized, Yaml},
     Figment,
 };
+use hs_common::event_bus::{EventBus, EventBusConfig};
+use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
 
 // ── Server Config ──────────────────────────────────────────────
@@ -85,6 +88,10 @@ pub struct DistillClientConfig {
     pub servers: Vec<String>,
     pub markdown_dir: PathBuf,
     pub catalog_dir: PathBuf,
+    #[serde(skip)]
+    pub storage: StorageConfig,
+    #[serde(skip)]
+    pub events: EventBusConfig,
 }
 
 impl Default for DistillClientConfig {
@@ -94,6 +101,8 @@ impl Default for DistillClientConfig {
             servers: vec!["http://localhost:7434".into()],
             markdown_dir: project.join("markdown"),
             catalog_dir: project.join("catalog"),
+            storage: StorageConfig::default(),
+            events: EventBusConfig::default(),
         }
     }
 }
@@ -103,11 +112,38 @@ impl DistillClientConfig {
         let home = dirs::home_dir().unwrap_or_default();
         let config_path = home.join(hs_common::CONFIG_REL_PATH);
 
-        Figment::from(Serialized::defaults(Self::default()))
+        let figment = Figment::from(Serialized::defaults(Self::default()))
             .merge(Yaml::file(&config_path).nested())
-            .merge(Env::prefixed("HS_DISTILL_"))
+            .merge(Env::prefixed("HS_DISTILL_"));
+
+        let storage = figment
+            .clone()
+            .select("storage")
+            .extract::<StorageConfig>()
+            .unwrap_or_default();
+
+        let events = figment
+            .clone()
+            .select("events")
+            .extract::<EventBusConfig>()
+            .unwrap_or_default();
+
+        let mut cfg: DistillClientConfig = figment
             .select("distill")
             .extract()
-            .map_err(Box::new)
+            .map_err(Box::new)?;
+        cfg.storage = storage;
+        cfg.events = events;
+        Ok(cfg)
+    }
+
+    /// Build the configured storage backend.
+    pub fn build_storage(&self) -> anyhow::Result<Arc<dyn Storage>> {
+        self.storage.build()
+    }
+
+    /// Build the configured event bus.
+    pub async fn build_event_bus(&self) -> anyhow::Result<Arc<dyn EventBus>> {
+        self.events.build().await
     }
 }

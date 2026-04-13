@@ -58,6 +58,13 @@ pub fn sharded_path(dir: &std::path::Path, stem: &str, ext: &str) -> std::path::
     dir.join(prefix).join(format!("{stem}.{ext}"))
 }
 
+/// Build a sharded storage key: `{prefix}/{stem}.{ext}` — the Storage-trait
+/// equivalent of `sharded_path` (no root prefix; keys are root-relative).
+pub fn sharded_key(stem: &str, ext: &str) -> String {
+    let prefix = &stem[..stem.len().min(2)];
+    format!("{prefix}/{stem}.{ext}")
+}
+
 /// Recursively collect all files with a given extension under `dir`.
 pub fn collect_files_recursive(dir: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
     let mut result = Vec::new();
@@ -121,6 +128,12 @@ pub mod service;
 
 #[cfg(feature = "catalog")]
 pub mod catalog;
+
+#[cfg(feature = "storage")]
+pub mod storage;
+
+#[cfg(feature = "events")]
+pub mod event_bus;
 
 #[cfg(feature = "compose")]
 pub mod compose;

@@ -146,6 +146,14 @@ pub enum ScribeCmd {
         #[arg(long = "dir")]
         status_dir: Option<PathBuf>,
     },
+    /// Subscribe to `papers.ingested` on the configured event bus, convert
+    /// each PDF via the scribe server, and upload the markdown back to
+    /// storage. Event-driven replacement for the filesystem watcher.
+    WatchEvents {
+        /// Server URL override
+        #[arg(long)]
+        server: Option<String>,
+    },
     /// Backfill catalog entries for markdown files that were converted before the catalog feature
     CatalogBackfill,
     /// Remove junk HTML papers (paywall pages, landing pages) from the collection
@@ -212,9 +220,43 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         }
         ScribeCmd::Status { status_dir } => cmd_status(status_dir, reporter).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
+        ScribeCmd::WatchEvents { server } => cmd_watch_events(server, reporter).await,
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
         ScribeCmd::CleanJunk { dry_run } => cmd_clean_junk(dry_run, reporter).await,
     }
+}
+
+async fn cmd_watch_events(
+    server_override: Option<String>,
+    _reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    use hs_scribe::client::ScribeClient;
+    use hs_scribe::config::ScribeConfig;
+    use hs_scribe::event_watch::{convert_and_upload, run_subscriber};
+
+    let cfg = ScribeConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage()?;
+    let bus = cfg.build_event_bus().await?;
+
+    let server_url = server_override
+        .or_else(|| cfg.servers.first().cloned())
+        .unwrap_or_else(|| "http://localhost:7433".into());
+    let scribe = Arc::new(ScribeClient::new(&server_url));
+
+    tracing::info!(%server_url, "starting event-bus watcher");
+
+    let storage_for_handler = storage.clone();
+    let bus_for_handler = bus.clone();
+    run_subscriber(bus.clone(), storage.clone(), move |event| {
+        let storage = storage_for_handler.clone();
+        let bus = bus_for_handler.clone();
+        let scribe = scribe.clone();
+        async move {
+            convert_and_upload(storage.as_ref(), scribe.as_ref(), bus.as_ref(), &event).await?;
+            Ok(())
+        }
+    })
+    .await
 }
 
 // ── Convert ─────────────────────────────────────────────────────

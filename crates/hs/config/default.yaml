@@ -49,6 +49,32 @@ paper:
     retry_min_backoff_ms: 100
     retry_max_backoff_secs: 30
 
+# --- Storage backend (papers, markdown, catalog) -----------------------
+# Default is the local filesystem rooted at {home.project_dir}.
+# To move everything to MinIO/S3, set backend: s3 and fill in the `s3:` block.
+# Secrets support ${ENV_VAR} expansion at load time.
+storage:
+  backend: local          # local | s3
+  local:
+    root: ~/home-still
+  # s3:
+  #   endpoint: http://three:9000
+  #   bucket: papers
+  #   region: us-east-1
+  #   access_key: hs-admin
+  #   secret_key: ${HS_S3_SECRET_KEY}
+  #   allow_http: true
+
+# --- Event bus (cross-node notifications) ------------------------------
+# `noop` drops publishes and never yields events — the default, which keeps
+# the legacy filesystem-watcher flow untouched.
+# `nats` connects to a NATS server; pairs with `hs scribe watch-events` and
+# `hs distill watch-events` to run the event-driven pipeline.
+events:
+  backend: noop           # noop | nats
+  # nats:
+  #   url: nats://three:4222
+
 # --- Scribe PDF conversion ---
 scribe:
   # Output directory for converted markdown (default: ~/home-still/markdown)
