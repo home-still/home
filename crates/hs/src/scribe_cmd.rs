@@ -2025,14 +2025,7 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let catalog_dir = &scribe_cfg.catalog_dir;
     let papers_dir = &scribe_cfg.watch_dir;
 
-    let entries = std::fs::read_dir(markdown_dir)
-        .map(|e| {
-            e.filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let entries = hs_common::collect_files_recursive(markdown_dir, "md");
 
     let mut created = 0u32;
     let mut skipped = 0u32;

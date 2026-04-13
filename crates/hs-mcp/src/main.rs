@@ -384,25 +384,20 @@ impl HomeStillMcp {
     )]
     fn catalog_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
         let mut entries = Vec::new();
-        if let Ok(dir) = std::fs::read_dir(&self.catalog_dir) {
-            for entry in dir.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "yaml") {
-                    if let Some(stem) = path.file_stem() {
-                        let stem = stem.to_string_lossy().to_string();
-                        let cat = hs_common::catalog::read_catalog_entry(&self.catalog_dir, &stem);
-                        let title = cat
-                            .as_ref()
-                            .and_then(|c| c.title.clone())
-                            .unwrap_or_default();
-                        let converted = cat.as_ref().and_then(|c| c.conversion.as_ref()).is_some();
-                        entries.push(serde_json::json!({
-                            "stem": stem,
-                            "title": title,
-                            "converted": converted,
-                        }));
-                    }
-                }
+        for path in hs_common::collect_files_recursive(&self.catalog_dir, "yaml") {
+            if let Some(stem) = path.file_stem() {
+                let stem = stem.to_string_lossy().to_string();
+                let cat = hs_common::catalog::read_catalog_entry(&self.catalog_dir, &stem);
+                let title = cat
+                    .as_ref()
+                    .and_then(|c| c.title.clone())
+                    .unwrap_or_default();
+                let converted = cat.as_ref().and_then(|c| c.conversion.as_ref()).is_some();
+                entries.push(serde_json::json!({
+                    "stem": stem,
+                    "title": title,
+                    "converted": converted,
+                }));
             }
         }
         entries.sort_by(|a, b| {
@@ -450,32 +445,31 @@ impl HomeStillMcp {
         )
     )]
     fn markdown_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
-        let mut entries = Vec::new();
-        for path in hs_common::collect_files_recursive(&self.markdown_dir, "md") {
-            if let Some(stem) = path.file_stem() {
-                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                let pages = std::fs::read_to_string(&path)
-                    .map(|c| c.matches("\n\n---\n\n").count() + 1)
-                    .unwrap_or(0);
-                entries.push(serde_json::json!({
-                    "stem": stem.to_string_lossy(),
-                    "size_bytes": size,
-                    "pages": pages,
-                }));
-            }
-        }
-        entries.sort_by(|a, b| {
-            a["stem"]
-                .as_str()
-                .unwrap_or("")
-                .cmp(b["stem"].as_str().unwrap_or(""))
-        });
+        let mut paths = hs_common::collect_files_recursive(&self.markdown_dir, "md");
+        paths.sort_by(|a, b| a.file_stem().cmp(&b.file_stem()));
 
         let offset = p.offset.unwrap_or(0);
-        if let Some(limit) = p.limit {
-            entries = entries.into_iter().skip(offset).take(limit).collect();
-        } else if offset > 0 {
-            entries = entries.into_iter().skip(offset).collect();
+        let slice: Vec<_> = match p.limit {
+            Some(limit) => paths.into_iter().skip(offset).take(limit).collect(),
+            None => paths.into_iter().skip(offset).collect(),
+        };
+
+        let mut entries = Vec::with_capacity(slice.len());
+        for path in slice {
+            let Some(stem_os) = path.file_stem() else {
+                continue;
+            };
+            let stem = stem_os.to_string_lossy();
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let pages = hs_common::catalog::read_catalog_entry(&self.catalog_dir, &stem)
+                .and_then(|c| c.conversion)
+                .map(|cv| cv.total_pages)
+                .unwrap_or(0);
+            entries.push(serde_json::json!({
+                "stem": stem,
+                "size_bytes": size,
+                "pages": pages,
+            }));
         }
 
         Ok(serde_json::to_string_pretty(&entries).unwrap_or_default())
@@ -755,14 +749,7 @@ impl HomeStillMcp {
 }
 
 fn count_files(dir: &std::path::Path, ext: &str) -> u64 {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == ext))
-                .count() as u64
-        })
-        .unwrap_or(0)
+    hs_common::collect_files_recursive(dir, ext).len() as u64
 }
 
 // ── Prompt parameter types ───────────────────────────────────────
@@ -882,32 +869,27 @@ impl ServerHandler for HomeStillMcp {
         let mut resources = Vec::new();
 
         // Catalog entries
-        if let Ok(dir) = std::fs::read_dir(&self.catalog_dir) {
-            for entry in dir.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "yaml") {
-                    if let Some(stem) = path.file_stem() {
-                        let stem = stem.to_string_lossy();
-                        let cat = hs_common::catalog::read_catalog_entry(&self.catalog_dir, &stem);
-                        let title = cat
-                            .as_ref()
-                            .and_then(|c| c.title.clone())
-                            .unwrap_or_else(|| stem.to_string());
-                        resources.push(
-                            RawResource {
-                                uri: format!("catalog:///{stem}"),
-                                name: title,
-                                title: None,
-                                description: Some("Catalog entry with paper metadata".into()),
-                                mime_type: Some("application/yaml".into()),
-                                size: None,
-                                icons: None,
-                                meta: None,
-                            }
-                            .no_annotation(),
-                        );
+        for path in hs_common::collect_files_recursive(&self.catalog_dir, "yaml") {
+            if let Some(stem) = path.file_stem() {
+                let stem = stem.to_string_lossy();
+                let cat = hs_common::catalog::read_catalog_entry(&self.catalog_dir, &stem);
+                let title = cat
+                    .as_ref()
+                    .and_then(|c| c.title.clone())
+                    .unwrap_or_else(|| stem.to_string());
+                resources.push(
+                    RawResource {
+                        uri: format!("catalog:///{stem}"),
+                        name: title,
+                        title: None,
+                        description: Some("Catalog entry with paper metadata".into()),
+                        mime_type: Some("application/yaml".into()),
+                        size: None,
+                        icons: None,
+                        meta: None,
                     }
-                }
+                    .no_annotation(),
+                );
             }
         }
 
