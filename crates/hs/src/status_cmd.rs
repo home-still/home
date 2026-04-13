@@ -352,6 +352,19 @@ async fn collect_data() -> DashboardData {
 fn read_watcher_status(output_dir: &Path, watch_dir: &Path) -> WatcherInfo {
     let status_path = output_dir.join(".scribe-watch-status.json");
 
+    // The watcher writes its status file every ~2s while running. A recent
+    // mtime is a cross-host liveness signal — PID checks only work when the
+    // dashboard and watcher run on the same machine.
+    let status_is_fresh = std::fs::metadata(&status_path)
+        .and_then(|m| m.modified())
+        .map(|t| {
+            std::time::SystemTime::now()
+                .duration_since(t)
+                .map(|d| d.as_secs() < 30)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+
     if let Ok(contents) = std::fs::read_to_string(&status_path) {
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&contents) {
             let pid = data["pid"].as_u64().unwrap_or(0) as u32;
@@ -360,7 +373,9 @@ fn read_watcher_status(output_dir: &Path, watch_dir: &Path) -> WatcherInfo {
             let completed = data["completed"].as_u64().unwrap_or(0);
             let failed = data["failed"].as_u64().unwrap_or(0);
 
-            if pid > 0 && crate::daemon::is_process_alive(pid) {
+            // Alive if the status file was touched recently OR the pid is local and alive
+            let is_alive = status_is_fresh || (pid > 0 && crate::daemon::is_process_alive(pid));
+            if is_alive {
                 return WatcherInfo::Running {
                     processing,
                     queued,
@@ -375,7 +390,7 @@ fn read_watcher_status(output_dir: &Path, watch_dir: &Path) -> WatcherInfo {
         }
     }
 
-    // No status file — check PID file
+    // No status file — check PID file (local-only fallback)
     let pid_path = crate::daemon::pid_file_path(watch_dir);
     if let Some(pid) = crate::daemon::read_pid(&pid_path) {
         if crate::daemon::is_process_alive(pid) {
@@ -397,8 +412,23 @@ fn read_indexer_status() -> IndexerInfo {
         None => return IndexerInfo::Stopped,
     };
 
-    // Check if PID is alive
-    if status.pid > 0 && !crate::daemon::is_process_alive(status.pid) {
+    // Cross-host liveness: trust the status file's mtime over local PID check.
+    // The indexer updates the status file frequently while running.
+    let status_path = crate::distill_cmd::index_status_path();
+    let status_is_fresh = std::fs::metadata(&status_path)
+        .and_then(|m| m.modified())
+        .map(|t| {
+            std::time::SystemTime::now()
+                .duration_since(t)
+                .map(|d| d.as_secs() < 30)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+
+    let is_alive =
+        status_is_fresh || (status.pid > 0 && crate::daemon::is_process_alive(status.pid));
+
+    if !is_alive {
         if status.done {
             return IndexerInfo::Finished {
                 indexed: status.indexed as u64,
@@ -428,21 +458,17 @@ fn read_indexer_status() -> IndexerInfo {
 fn load_history(catalog_dir: &Path, limit: usize) -> Vec<HistoryEvent> {
     let mut events = Vec::new();
 
-    let catalog_entries: Vec<_> = std::fs::read_dir(catalog_dir)
+    // Catalog is sharded under catalog/XX/stem.yaml — walk recursively.
+    let mut catalog_paths = hs_common::collect_files_recursive(catalog_dir, "yaml");
+    catalog_paths.extend(hs_common::collect_files_recursive(catalog_dir, "yml"));
+
+    let catalog_entries: Vec<_> = catalog_paths
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "yaml" || ext == "yml")
-        })
-        .filter_map(|e| {
-            let contents = std::fs::read_to_string(e.path()).ok()?;
+        .filter_map(|path| {
+            let contents = std::fs::read_to_string(&path).ok()?;
             let entry: hs_common::catalog::CatalogEntry =
                 serde_yaml_ng::from_str(&contents).ok()?;
-            let stem = e
-                .path()
+            let stem = path
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
