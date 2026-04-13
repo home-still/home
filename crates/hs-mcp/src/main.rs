@@ -152,6 +152,9 @@ impl HomeStillMcp {
                 hs_common::resolve_project_dir(),
             )),
         };
+        if let Err(e) = storage.ensure_ready().await {
+            tracing::warn!("storage ensure_ready failed: {e:#}");
+        }
 
         // Discover servers from gateway registry, falling back to config
         let scribe_servers = hs_common::service::registry::discover_or_fallback(
@@ -422,10 +425,7 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    async fn catalog_list(
-        &self,
-        Parameters(p): Parameters<ListParams>,
-    ) -> Result<String, String> {
+    async fn catalog_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
         let mut triples =
             hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
                 .await
@@ -491,10 +491,7 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    async fn markdown_list(
-        &self,
-        Parameters(p): Parameters<ListParams>,
-    ) -> Result<String, String> {
+    async fn markdown_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
         let mut metas =
             hs_common::markdown::list_markdown_meta_via(&*self.storage, &self.markdown_prefix)
                 .await
@@ -541,12 +538,8 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<MarkdownReadParams>,
     ) -> Result<String, String> {
-        match hs_common::markdown::read_markdown_via(
-            &*self.storage,
-            &self.markdown_prefix,
-            &p.stem,
-        )
-        .await
+        match hs_common::markdown::read_markdown_via(&*self.storage, &self.markdown_prefix, &p.stem)
+            .await
         {
             Some(content) => {
                 if let Some(page) = p.page {
@@ -947,11 +940,8 @@ impl ServerHandler for HomeStillMcp {
         let mut resources = Vec::new();
 
         // Catalog entries via Storage
-        if let Ok(triples) = hs_common::catalog::list_catalog_entries_via(
-            &*self.storage,
-            &self.catalog_prefix,
-        )
-        .await
+        if let Ok(triples) =
+            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix).await
         {
             for (stem, _meta, cat) in triples {
                 let title = cat.title.unwrap_or_else(|| stem.clone());
@@ -972,11 +962,8 @@ impl ServerHandler for HomeStillMcp {
         }
 
         // Markdown documents via Storage
-        if let Ok(metas) = hs_common::markdown::list_markdown_meta_via(
-            &*self.storage,
-            &self.markdown_prefix,
-        )
-        .await
+        if let Ok(metas) =
+            hs_common::markdown::list_markdown_meta_via(&*self.storage, &self.markdown_prefix).await
         {
             for (stem, obj) in metas {
                 resources.push(
@@ -1077,13 +1064,10 @@ impl ServerHandler for HomeStillMcp {
                 (rest, None)
             };
 
-            let content = hs_common::markdown::read_markdown_via(
-                &*self.storage,
-                &self.markdown_prefix,
-                stem,
-            )
-            .await
-            .ok_or_else(|| ErrorData::resource_not_found("markdown not found", None))?;
+            let content =
+                hs_common::markdown::read_markdown_via(&*self.storage, &self.markdown_prefix, stem)
+                    .await
+                    .ok_or_else(|| ErrorData::resource_not_found("markdown not found", None))?;
 
             let text = if let Some(page) = page {
                 let pages: Vec<&str> = content.split("\n\n---\n\n").collect();
@@ -1195,7 +1179,7 @@ async fn install_logging(is_sse: bool) -> Option<hs_common::logging::LoggingHand
         }
     };
     if let Some(storage_cfg) = primary_storage {
-        if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket) {
+        if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket).await {
             let _ = handle.spawn_shipper(storage);
         }
     }

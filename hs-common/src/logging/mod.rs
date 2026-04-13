@@ -182,21 +182,23 @@ pub async fn init_with_shipper(
 /// S3 reuses endpoint/credentials but swaps the bucket to `logs_bucket`.
 /// Local writes to `{log_dir}/archive/` so log files don't land inside the
 /// user's project directory.
-pub fn build_logs_storage(
+pub async fn build_logs_storage(
     primary: &StorageConfig,
     logs_bucket: &str,
 ) -> anyhow::Result<Arc<dyn Storage>> {
-    match primary.backend {
+    let storage: Arc<dyn Storage> = match primary.backend {
         Backend::Local => {
             let archive_root = crate::resolve_log_dir().join("archive");
-            Ok(Arc::new(LocalFsStorage::new(archive_root)))
+            Arc::new(LocalFsStorage::new(archive_root))
         }
         Backend::S3 => {
             let mut cfg = primary.clone();
             cfg.s3.bucket = logs_bucket.to_string();
-            cfg.build()
+            cfg.build()?
         }
-    }
+    };
+    storage.ensure_ready().await?;
+    Ok(storage)
 }
 
 /// Read the `storage:` and `logs:` sections from `~/.home-still/config.yaml`.

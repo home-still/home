@@ -1,13 +1,21 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
+use hmac::{Hmac, Mac};
 use object_store::{aws::AmazonS3Builder, ObjectStore, ObjectStoreExt, PutPayload};
+use sha2::{Digest, Sha256};
 
 use super::{ObjectMeta, Storage};
+
+type HmacSha256 = Hmac<Sha256>;
 
 pub struct S3Storage {
     inner: Box<dyn ObjectStore>,
     bucket: String,
+    endpoint: String,
+    access_key: String,
+    secret_key: String,
+    region: String,
 }
 
 #[derive(Debug, Clone)]
@@ -34,12 +42,121 @@ impl S3Storage {
         Ok(Self {
             inner: Box::new(store),
             bucket: cfg.bucket,
+            endpoint: cfg.endpoint,
+            access_key: cfg.access_key,
+            secret_key: cfg.secret_key,
+            region: cfg.region,
         })
     }
 
     pub fn bucket(&self) -> &str {
         &self.bucket
     }
+
+    /// HEAD the bucket; if 404, PUT it. Idempotent.
+    /// Uses path-style sigv4 — works for MinIO and S3.
+    pub async fn ensure_bucket(&self) -> anyhow::Result<()> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        let url = format!("{}/{}/", self.endpoint.trim_end_matches('/'), self.bucket);
+
+        // HEAD first — avoids re-creating on every startup.
+        let head = self.signed_request(&client, "HEAD", &url).send().await?;
+        if head.status().is_success() {
+            return Ok(());
+        }
+        if head.status().as_u16() != 404 && head.status().as_u16() != 403 {
+            // 403 can mean "exists but permission" OR "missing bucket (minio quirk)".
+            // We fall through to PUT; if it truly exists, the PUT returns 409/200.
+            let status = head.status();
+            let body = head.text().await.unwrap_or_default();
+            anyhow::bail!("HEAD bucket {} failed: {status} {body}", self.bucket);
+        }
+
+        let put = self.signed_request(&client, "PUT", &url).send().await?;
+        let status = put.status();
+        if status.is_success() {
+            tracing::info!(bucket = %self.bucket, "created S3 bucket");
+            return Ok(());
+        }
+        let body = put.text().await.unwrap_or_default();
+        // BucketAlreadyOwnedByYou / BucketAlreadyExists — fine.
+        if body.contains("BucketAlreadyOwnedByYou") || body.contains("BucketAlreadyExists") {
+            return Ok(());
+        }
+        anyhow::bail!("create bucket {} failed: {status} {body}", self.bucket);
+    }
+
+    fn signed_request(
+        &self,
+        client: &reqwest::Client,
+        method: &str,
+        url: &str,
+    ) -> reqwest::RequestBuilder {
+        let now = chrono::Utc::now();
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let date_stamp = now.format("%Y%m%d").to_string();
+        let empty_sha = hex_lower(&Sha256::digest(b""));
+
+        let parsed = url::Url::parse(url).expect("valid url");
+        let host = match parsed.port() {
+            Some(p) => format!("{}:{}", parsed.host_str().unwrap_or(""), p),
+            None => parsed.host_str().unwrap_or("").to_string(),
+        };
+        let canonical_uri = parsed.path().to_string();
+
+        let canonical_headers =
+            format!("host:{host}\nx-amz-content-sha256:{empty_sha}\nx-amz-date:{amz_date}\n");
+        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let canonical_request = format!(
+            "{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{empty_sha}"
+        );
+
+        let credential_scope = format!("{date_stamp}/{}/s3/aws4_request", self.region);
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+            hex_lower(&Sha256::digest(canonical_request.as_bytes()))
+        );
+
+        let k_date = hmac_sha256(
+            format!("AWS4{}", self.secret_key).as_bytes(),
+            date_stamp.as_bytes(),
+        );
+        let k_region = hmac_sha256(&k_date, self.region.as_bytes());
+        let k_service = hmac_sha256(&k_region, b"s3");
+        let k_signing = hmac_sha256(&k_service, b"aws4_request");
+        let signature = hex_lower(&hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            self.access_key
+        );
+
+        let req_method = reqwest::Method::from_bytes(method.as_bytes()).expect("valid method");
+        client
+            .request(req_method, url)
+            .header("host", host)
+            .header("x-amz-content-sha256", empty_sha)
+            .header("x-amz-date", amz_date)
+            .header("authorization", authorization)
+    }
+}
+
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
+    mac.update(msg);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn path(key: &str) -> object_store::path::Path {
@@ -99,6 +216,10 @@ impl Storage for S3Storage {
             Err(e) => Err(e.into()),
         }
     }
+
+    async fn ensure_ready(&self) -> anyhow::Result<()> {
+        self.ensure_bucket().await
+    }
 }
 
 #[cfg(test)]
@@ -137,5 +258,23 @@ mod tests {
         assert!(list.iter().any(|m| m.key == key));
         s.delete(key).await.unwrap();
         assert!(!s.exists(key).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn ensure_bucket_creates_fresh_and_is_idempotent() {
+        let Some(mut cfg) = minio_config() else {
+            eprintln!("skipping: set HS_S3_ENDPOINT/ACCESS_KEY/SECRET_KEY to run");
+            return;
+        };
+        let unique = format!("hs-test-ensure-{}", chrono::Utc::now().timestamp_millis());
+        cfg.bucket = unique.clone();
+        let s = S3Storage::new(cfg).unwrap();
+        s.ensure_bucket().await.expect("create fresh bucket");
+        // Idempotent: second call must not fail.
+        s.ensure_bucket().await.expect("second call noop");
+        // Verify writes work against the new bucket.
+        s.put("probe.txt", b"ok".to_vec()).await.unwrap();
+        assert_eq!(s.get("probe.txt").await.unwrap(), b"ok");
+        s.delete("probe.txt").await.ok();
     }
 }

@@ -81,7 +81,7 @@ async fn install_logging() -> Option<hs_common::logging::LoggingHandle> {
         }
     };
     if let Some(storage_cfg) = primary_storage {
-        if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket) {
+        if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket).await {
             let _ = handle.spawn_shipper(storage);
         }
     }

@@ -32,7 +32,8 @@ fn init_logging(
     cli: &Cli,
 ) -> (
     hs_common::logging::LoggingHandle,
-    Option<std::sync::Arc<dyn hs_common::storage::Storage>>,
+    Option<hs_common::storage::StorageConfig>,
+    String,
 ) {
     use hs_common::logging::{self, LoggingConfig, StderrOutput};
 
@@ -56,17 +57,13 @@ fn init_logging(
 
     let handle = logging::init(cfg).expect("install logging subscriber");
 
-    let logs_storage = primary_storage
-        .as_ref()
-        .and_then(|s| logging::build_logs_storage(s, &logs_yaml.bucket).ok());
-
-    (handle, logs_storage)
+    (handle, primary_storage, logs_yaml.bucket)
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let (logging_handle, logs_storage) = init_logging(&cli);
+    let (logging_handle, primary_storage_cfg, logs_bucket) = init_logging(&cli);
 
     let mode = mode::detect(cli.global.color_str(), cli.global.is_json());
 
@@ -112,8 +109,12 @@ fn main() -> ExitCode {
     let result = rt.block_on(async move {
         let reporter = reporter_for_closure;
         let mut logging_handle = logging_handle;
-        if let Some(storage) = logs_storage {
-            let _ = logging_handle.spawn_shipper(storage);
+        if let Some(primary_cfg) = primary_storage_cfg {
+            if let Ok(storage) =
+                hs_common::logging::build_logs_storage(&primary_cfg, &logs_bucket).await
+            {
+                let _ = logging_handle.spawn_shipper(storage);
+            }
         }
 
         let work = async {

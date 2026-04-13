@@ -30,6 +30,13 @@ pub trait Storage: Send + Sync {
     async fn exists(&self, key: &str) -> anyhow::Result<bool> {
         Ok(self.head(key).await?.is_some())
     }
+
+    /// Provision any container the backend needs before writes succeed
+    /// (e.g. an S3 bucket). Default is a noop — only S3 overrides.
+    /// Idempotent; callers can call on every startup.
+    async fn ensure_ready(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct LocalFsStorage {

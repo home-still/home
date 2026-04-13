@@ -57,6 +57,10 @@ storage-s3 = [
     "dep:bytes",
     "dep:futures",
     "dep:url",
+    "dep:reqwest",
+    "dep:hmac",
+    "dep:sha2",
+    "dep:chrono",
 ]
 events = [
     "dep:anyhow",
