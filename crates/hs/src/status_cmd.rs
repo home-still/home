@@ -121,7 +121,53 @@ fn count_dir_recursive(dir: &Path, ext: &str) -> (u64, u64) {
     (count, bytes)
 }
 
+/// Detect a client-role node from `~/.home-still/config.yaml`.
+///
+/// Reads the file line-by-line (no heavy YAML parser dependency, matches the
+/// style of `hs_common::resolve_project_dir`). A node opts into remote MCP
+/// dispatch by setting:
+///
+///     cloud:
+///       role: client
+fn is_cloud_client_role() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(home.join(hs_common::CONFIG_REL_PATH)) else {
+        return false;
+    };
+    let mut in_cloud = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        // Top-level key flips section tracking.
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            in_cloud = trimmed.starts_with("cloud:");
+            continue;
+        }
+        if in_cloud {
+            if let Some(val) = trimmed.strip_prefix("role:") {
+                let val = val.trim().trim_matches('"').trim_matches('\'');
+                return val == "client";
+            }
+        }
+    }
+    false
+}
+
 async fn collect_data() -> DashboardData {
+    // Client-role nodes have no usable local {project_dir} and rely on the
+    // gateway for authoritative data. Dispatch to MCP before doing any
+    // filesystem work; fall through to the local path on any error so a
+    // misconfigured client still shows *something*.
+    if is_cloud_client_role() {
+        if let Ok(remote) = collect_data_via_mcp().await {
+            return remote;
+        }
+    }
+
     let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
     let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
 
@@ -347,6 +393,132 @@ async fn collect_data() -> DashboardData {
         fs_stalled_markdown,
         fs_stalled_catalog,
     }
+}
+
+/// Populate the dashboard from the cloud gateway's MCP `system_status` tool.
+///
+/// Used on client-role nodes where no local `project_dir` is mounted. The
+/// returned data intentionally leaves byte counts at 0 (system_status only
+/// reports object counts, not sizes) and skips local-only panes (watcher,
+/// indexer, corrupted, history) — those reflect worker-node operational state
+/// and have no meaning on a read-only client.
+async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
+    use serde_json::Value;
+
+    let client = crate::mcp_client::McpClient::from_default_creds().await?;
+    let status = client
+        .call_tool("system_status", Value::Object(Default::default()))
+        .await?;
+
+    let pipeline = status
+        .get("pipeline")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
+    let services = status
+        .get("services")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
+
+    let pdf_count = pipeline
+        .get("pdfs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let md_count = pipeline
+        .get("markdown")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let catalog_count = pipeline
+        .get("catalog_entries")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let embedded_docs = pipeline
+        .get("embedded_documents")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let embedded_chunks = pipeline
+        .get("embedded_chunks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let scribe_health = services.get("scribe").cloned().unwrap_or(Value::Null);
+    let distill_health = services.get("distill").cloned().unwrap_or(Value::Null);
+
+    let mut scribe_servers = Vec::new();
+    if !scribe_health.is_null() {
+        let version = scribe_health
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        scribe_servers.push(ServiceStatus {
+            url: "gateway".into(),
+            healthy: true,
+            detail: String::new(),
+            activity: "idle".into(),
+            version,
+        });
+    }
+
+    let mut distill_servers = Vec::new();
+    let mut qdrant_healthy = false;
+    let mut qdrant_url = String::new();
+    let mut qdrant_version = String::new();
+    if !distill_health.is_null() {
+        let compute = distill_health
+            .get("compute_device")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let version = distill_health
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let collection = distill_health
+            .get("collection")
+            .and_then(|v| v.as_str())
+            .unwrap_or("academic_papers")
+            .to_string();
+        qdrant_version = distill_health
+            .get("qdrant_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        qdrant_healthy = true;
+        qdrant_url = format!("gateway → {collection}");
+        distill_servers.push(ServiceStatus {
+            url: "gateway".into(),
+            healthy: true,
+            detail: if compute.is_empty() {
+                String::new()
+            } else {
+                format!("({compute})")
+            },
+            activity: "idle".into(),
+            version,
+        });
+    }
+
+    Ok(DashboardData {
+        doc_counts: Some((pdf_count, 0)),
+        markdown_counts: Some((md_count, 0)),
+        catalog_count: Some(catalog_count),
+        corrupted_count: None,
+        embedded_docs,
+        embedded_chunks,
+        scribe_servers,
+        distill_servers,
+        qdrant_healthy,
+        qdrant_url,
+        qdrant_version,
+        watcher: WatcherInfo::Stopped,
+        indexer: IndexerInfo::Stopped,
+        history: vec![],
+        loading: false,
+        fs_stalled_docs: false,
+        fs_stalled_markdown: false,
+        fs_stalled_catalog: false,
+    })
 }
 
 fn read_watcher_status(output_dir: &Path, watch_dir: &Path) -> WatcherInfo {
