@@ -39,7 +39,7 @@ tokio = { workspace = true }
 reqwest = { workspace = true, features = ["multipart", "stream"] }
 figment = { workspace = true }
 dirs = "6"
-hs-common = { workspace = true, features = ["service", "storage-s3", "events-nats"] }
+hs-common = { workspace = true, features = ["service", "storage-s3", "events-nats", "logging"] }
 async-trait = "0.1"
 futures-util = "0.3"
 

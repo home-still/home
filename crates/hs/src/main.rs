@@ -27,45 +27,45 @@ use hs_common::tty_reporter::TtyReporter;
 
 const DEFAULT_CONFIG: &str = include_str!("../config/default.yaml");
 
-fn init_logging(verbose: bool, quiet: bool) {
-    use tracing_subscriber::{
-        fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+fn init_logging(
+    cli: &Cli,
+) -> (
+    hs_common::logging::LoggingHandle,
+    Option<std::sync::Arc<dyn hs_common::storage::Storage>>,
+) {
+    use hs_common::logging::{self, LoggingConfig, StderrOutput};
+
+    let service = match &cli.command {
+        TopCmd::Scribe {
+            command: scribe_cmd::ScribeCmd::WatchEvents { .. },
+        } => "hs-scribe-watch",
+        TopCmd::Distill {
+            command: hs_distill::cli::DistillCmd::WatchEvents { .. },
+        } => "hs-distill-watch",
+        _ => "hs",
     };
 
-    let log_dir = hs_common::resolve_log_dir();
-    let _ = std::fs::create_dir_all(&log_dir);
+    let (primary_storage, logs_yaml) = logging::load_config_sections();
 
-    // Stderr layer: human-readable, respects --verbose/--quiet
-    let stderr_filter = if quiet {
-        "error"
-    } else if verbose {
-        "debug"
-    } else {
-        "warn"
-    };
-    let stderr_layer = fmt::layer()
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .with_filter(EnvFilter::new(stderr_filter));
+    let mut cfg = LoggingConfig::for_service(service).with_stderr(StderrOutput::VerboseQuiet {
+        verbose: cli.global.verbose,
+        quiet: cli.global.quiet,
+    });
+    logs_yaml.apply_to(&mut cfg);
 
-    // File layer: always INFO+, appended to hs.log
-    let file_appender = tracing_appender::rolling::never(&log_dir, "hs.log");
-    let file_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let file_layer = fmt::layer()
-        .with_ansi(false)
-        .with_writer(file_appender)
-        .with_filter(file_filter);
+    let handle = logging::init(cfg).expect("install logging subscriber");
 
-    tracing_subscriber::registry()
-        .with(stderr_layer)
-        .with(file_layer)
-        .init();
+    let logs_storage = primary_storage
+        .as_ref()
+        .and_then(|s| logging::build_logs_storage(s, &logs_yaml.bucket).ok());
+
+    (handle, logs_storage)
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    init_logging(cli.global.verbose, cli.global.quiet);
+    let (logging_handle, logs_storage) = init_logging(&cli);
 
     let mode = mode::detect(cli.global.color_str(), cli.global.is_json());
 
@@ -107,7 +107,14 @@ fn main() -> ExitCode {
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio  runtime");
 
-    let result = rt.block_on(async {
+    let reporter_for_closure = reporter.clone();
+    let result = rt.block_on(async move {
+        let reporter = reporter_for_closure;
+        let mut logging_handle = logging_handle;
+        if let Some(storage) = logs_storage {
+            let _ = logging_handle.spawn_shipper(storage);
+        }
+
         let work = async {
             match cli.command {
                 TopCmd::Paper { command } => {
@@ -141,7 +148,7 @@ fn main() -> ExitCode {
             }
         };
 
-        tokio::select! {
+        let work_result = tokio::select! {
             result = work => result,
             _ = tokio::signal::ctrl_c() => {
                 // Restore terminal in case raw mode was enabled (e.g. watch attach)
@@ -149,7 +156,10 @@ fn main() -> ExitCode {
                 reporter.finish("");
                 Err(anyhow::anyhow!("interrupted"))
             }
-        }
+        };
+
+        let _ = logging_handle.shutdown().await;
+        work_result
     });
 
     match result {

@@ -18,7 +18,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let logging_handle = install_logging().await;
     let args = Args::parse();
 
     let config = DistillServerConfig::load().unwrap_or_else(|e| {
@@ -58,7 +58,32 @@ async fn main() -> Result<()> {
     tracing::info!("Listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, server::app(state)).await?;
+    let result = axum::serve(listener, server::app(state)).await;
 
+    if let Some(h) = logging_handle {
+        let _ = h.shutdown().await;
+    }
+    result?;
     Ok(())
+}
+
+async fn install_logging() -> Option<hs_common::logging::LoggingHandle> {
+    use hs_common::logging::{self, LoggingConfig, StderrOutput};
+    let (primary_storage, logs_yaml) = logging::load_config_sections();
+    let mut cfg = LoggingConfig::for_service("hs-distill-server")
+        .with_stderr(StderrOutput::EnvFilter("info".into()));
+    logs_yaml.apply_to(&mut cfg);
+    let mut handle = match logging::init(cfg) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("hs-distill-server: logging init failed: {e:#}");
+            return None;
+        }
+    };
+    if let Some(storage_cfg) = primary_storage {
+        if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket) {
+            let _ = handle.spawn_shipper(storage);
+        }
+    }
+    Some(handle)
 }

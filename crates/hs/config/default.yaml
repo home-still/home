@@ -75,6 +75,17 @@ events:
   # nats:
   #   url: nats://three:4222
 
+# --- Centralized logging (ship JSONL to object storage) --------------
+# Every binary spools log records locally and uploads closed files to a
+# dedicated `logs` bucket on the same storage backend.  When
+# `storage.backend=local`, files go to `{home.log_dir}/archive/` instead.
+# Keys:  <service>/<host>/<YYYY>/<MM>/<DD>/<unix-ms>-<uuid>.jsonl
+logs:
+  bucket: logs            # S3 bucket name (ignored when storage.backend=local)
+  # rotate_max_bytes: 4194304       # force a rotation when the current file hits this size
+  # rotate_interval_secs: 60        # ...or this age, whichever first
+  # ship_interval_secs: 30          # how often the shipper PUTs closed files
+
 # --- Scribe PDF conversion ---
 scribe:
   # Output directory for converted markdown (default: ~/home-still/markdown)

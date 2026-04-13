@@ -37,7 +37,7 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 figment = { workspace = true }
-hs-common = { workspace = true, features = ["service", "catalog", "storage-s3", "events-nats"] }
+hs-common = { workspace = true, features = ["service", "catalog", "storage-s3", "events-nats", "logging"] }
 async-trait = { workspace = true }
 futures-util = "0.3"
 chrono = { workspace = true }

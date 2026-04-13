@@ -27,7 +27,7 @@ regex = "1"
 axum = { version = "0.8", features = ["multipart"] }
 qdrant-client = { version = "1", features = ["serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-uuid = { version = "1", features = ["v5"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 fastembed = "5"
 chrono = { version = "0.4", features = ["serde"] }
 

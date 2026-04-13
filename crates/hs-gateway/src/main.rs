@@ -5,7 +5,6 @@ use std::sync::Arc;
 use axum::routing::{any, get, post};
 use axum::Router;
 use clap::Parser;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod config;
 mod enrollment;
@@ -32,10 +31,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(fmt::layer().with_target(false))
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
+    let logging_handle = install_logging().await;
 
     let args = Args::parse();
     let config = GatewayConfig::load()?;
@@ -103,10 +99,14 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("Gateway listening on {listen}");
 
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
 
+    if let Some(h) = logging_handle {
+        let _ = h.shutdown().await;
+    }
+    result?;
     Ok(())
 }
 
@@ -119,4 +119,25 @@ async fn shutdown_signal() {
         .await
         .expect("Failed to install CTRL+C handler");
     tracing::info!("Shutting down gateway");
+}
+
+async fn install_logging() -> Option<hs_common::logging::LoggingHandle> {
+    use hs_common::logging::{self, LoggingConfig, StderrOutput};
+    let (primary_storage, logs_yaml) = logging::load_config_sections();
+    let mut cfg = LoggingConfig::for_service("hs-gateway")
+        .with_stderr(StderrOutput::EnvFilter("info".into()));
+    logs_yaml.apply_to(&mut cfg);
+    let mut handle = match logging::init(cfg) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("hs-gateway: logging init failed: {e:#}");
+            return None;
+        }
+    };
+    if let Some(storage_cfg) = primary_storage {
+        if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket) {
+            let _ = handle.spawn_shipper(storage);
+        }
+    }
+    Some(handle)
 }

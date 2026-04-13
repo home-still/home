@@ -1058,18 +1058,15 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // In stdio mode, stdout is the MCP protocol — never write human-readable
+    // lines to stderr either, so logs are spool-only and ship to the logs
+    // bucket like every other service.
+    let logging_handle = install_logging(args.serve.is_some()).await;
+
     let server = HomeStillMcp::new().await;
 
-    if let Some(addr) = args.serve {
-        // SSE mode: Streamable HTTP transport
-        tracing_subscriber::fmt()
-            .with_target(false)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .init();
-
+    let result: anyhow::Result<()> = if let Some(addr) = args.serve {
         tracing::info!("Starting MCP SSE server on {addr}");
 
         use rmcp::transport::streamable_http_server::{
@@ -1091,12 +1088,44 @@ async fn main() -> anyhow::Result<()> {
                 tokio::signal::ctrl_c().await.ok();
             })
             .await?;
+        Ok(())
     } else {
         // stdio mode: standard MCP transport
         let transport = rmcp::transport::io::stdio();
         let ct = rmcp::service::serve_server(server, transport).await?;
         let _ = ct.waiting().await;
-    }
+        Ok(())
+    };
 
-    Ok(())
+    if let Some(h) = logging_handle {
+        let _ = h.shutdown().await;
+    }
+    result
+}
+
+async fn install_logging(is_sse: bool) -> Option<hs_common::logging::LoggingHandle> {
+    use hs_common::logging::{self, LoggingConfig, StderrOutput};
+    let (primary_storage, logs_yaml) = logging::load_config_sections();
+    let (service, stderr) = if is_sse {
+        ("hs-mcp-sse", StderrOutput::EnvFilter("info".into()))
+    } else {
+        ("hs-mcp-stdio", StderrOutput::Disabled)
+    };
+    let mut cfg = LoggingConfig::for_service(service).with_stderr(stderr);
+    logs_yaml.apply_to(&mut cfg);
+    let mut handle = match logging::init(cfg) {
+        Ok(h) => h,
+        Err(e) => {
+            if is_sse {
+                eprintln!("hs-mcp: logging init failed: {e:#}");
+            }
+            return None;
+        }
+    };
+    if let Some(storage_cfg) = primary_storage {
+        if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket) {
+            let _ = handle.spawn_shipper(storage);
+        }
+    }
+    Some(handle)
 }

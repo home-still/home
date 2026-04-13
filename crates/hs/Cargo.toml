@@ -13,7 +13,7 @@ hs-distill = { path = "../hs-distill", features = ["client"] }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-hs-common = { workspace = true, features = ["cli", "service", "catalog", "compose", "auth"] }
+hs-common = { workspace = true, features = ["cli", "service", "catalog", "compose", "auth", "storage", "storage-s3", "logging"] }
 owo-colors = { workspace = true }
 paper = { path = "../../paper" }
 dirs = { workspace = true }
@@ -28,8 +28,6 @@ tempfile = "3"
 ctrlc = "3"
 libc = "0.2"
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-tracing-appender = "0.2"
 chrono = "0.4"
 crossterm = "0.28"
 ratatui = "0.29"

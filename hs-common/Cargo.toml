@@ -71,6 +71,23 @@ events-nats = [
     "dep:async-nats",
     "dep:bytes",
 ]
+logging = [
+    "storage",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:tracing-appender",
+    "dep:gethostname",
+    "dep:uuid",
+    "dep:chrono",
+    "dep:serde_json",
+    "dep:anyhow",
+    "dep:tokio",
+    "tokio/sync",
+    "tokio/time",
+    "tokio/fs",
+    "tokio/rt",
+    "tokio/macros",
+]
 
 [dependencies]
 indicatif = { version = "0.18", optional = true }
@@ -111,6 +128,13 @@ url = { version = "2", optional = true }
 # events feature deps
 async-nats = { version = "0.47", optional = true }
 
+# logging feature deps
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+tracing-appender = { version = "0.2", optional = true }
+gethostname = { version = "1", optional = true }
+uuid = { workspace = true, optional = true }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+tracing = "0.1"

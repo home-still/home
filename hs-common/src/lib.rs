@@ -135,6 +135,9 @@ pub mod storage;
 #[cfg(feature = "events")]
 pub mod event_bus;
 
+#[cfg(feature = "logging")]
+pub mod logging;
+
 #[cfg(feature = "compose")]
 pub mod compose;
 
