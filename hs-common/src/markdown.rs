@@ -55,11 +55,7 @@ pub async fn list_markdown_meta_via(
 /// doesn't exist. Reads the full document — callers that only need a
 /// specific page range should still do that locally after the fetch (same
 /// behavior as the filesystem variant in the MCP handler).
-pub async fn read_markdown_via(
-    storage: &dyn Storage,
-    prefix: &str,
-    stem: &str,
-) -> Option<String> {
+pub async fn read_markdown_via(storage: &dyn Storage, prefix: &str, stem: &str) -> Option<String> {
     let key = markdown_key(prefix, stem);
     let bytes = storage.get(&key).await.ok()?;
     String::from_utf8(bytes).ok()

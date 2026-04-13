@@ -419,10 +419,7 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
 
-    let pdf_count = pipeline
-        .get("pdfs")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let pdf_count = pipeline.get("pdfs").and_then(|v| v.as_u64()).unwrap_or(0);
     let md_count = pipeline
         .get("markdown")
         .and_then(|v| v.as_u64())

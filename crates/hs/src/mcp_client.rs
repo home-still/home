@@ -130,10 +130,7 @@ fn parse_mcp_result_text(body: &str) -> Option<Value> {
             continue;
         };
         // Error payload (isError:true) is still surfaced as content — caller can decide.
-        let Some(text) = v
-            .pointer("/result/content/0/text")
-            .and_then(|t| t.as_str())
-        else {
+        let Some(text) = v.pointer("/result/content/0/text").and_then(|t| t.as_str()) else {
             continue;
         };
         return Some(
