@@ -2099,8 +2099,14 @@ async fn cmd_clean_junk(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<(
             Err(_) => continue, // markdown missing, skip
         };
 
-        // If the entire content fails the quality check, it's junk
-        let is_junk = hs_distill::quality::is_low_quality(markdown.trim());
+        // If the entire content fails the quality check, it's junk.
+        // Also catch known loading stubs (PMC "Preparing to download" etc.)
+        // that aren't short enough to trip the quality filter's 50-char floor.
+        let lower = markdown.to_lowercase();
+        let is_junk = hs_distill::quality::is_low_quality(markdown.trim())
+            || lower.contains("preparing to download")
+            || lower.contains("please wait while the document loads")
+            || (lower.contains("hhs vulnerability disclosure") && markdown.len() < 2000);
 
         if !is_junk {
             kept_count += 1;

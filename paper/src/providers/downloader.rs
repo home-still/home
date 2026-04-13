@@ -392,6 +392,14 @@ fn is_paywall_html(content: &str) -> bool {
         return true;
     }
 
+    // Loading / interstitial pages (PMC download stub, etc.)
+    if lower.contains("preparing to download")
+        || lower.contains("hhs vulnerability disclosure")
+        || lower.contains("please wait while the document loads")
+    {
+        return true;
+    }
+
     // Journal metadata pages (impact factor, citescore) with no paper body
     let is_journal_meta = lower.contains("impact factor")
         || lower.contains("citescore")
