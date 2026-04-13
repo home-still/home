@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
+use hs_common::storage::Storage;
 use rmcp::{
     handler::server::{
         router::{prompt::PromptRouter, tool::ToolRouter},
@@ -109,12 +110,20 @@ struct DistillIndexParams {
 
 // ── MCP Server ──────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(dead_code)]
 struct HomeStillMcp {
-    catalog_dir: PathBuf,
-    markdown_dir: PathBuf,
-    papers_dir: PathBuf,
+    // Primary read-path handle: Storage trait (local fs or S3/MinIO).
+    storage: Arc<dyn Storage>,
+    catalog_prefix: String,
+    markdown_prefix: String,
+    papers_prefix: String,
+    // Legacy filesystem paths used only by mutation handlers that bridge to
+    // external server binaries expecting local paths (scribe_convert,
+    // distill_index). Derived from `home.project_dir` in config.
+    legacy_papers_dir: std::path::PathBuf,
+    legacy_markdown_dir: std::path::PathBuf,
+    legacy_catalog_dir: std::path::PathBuf,
     scribe_servers: Vec<String>,
     distill_servers: Vec<String>,
     tool_router: ToolRouter<Self>,
@@ -123,8 +132,26 @@ struct HomeStillMcp {
 
 impl HomeStillMcp {
     async fn new() -> Self {
-        let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
         let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
+        let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+
+        // Storage backend: honor the `storage:` section in ~/.home-still/config.yaml
+        // (`backend: local` or `backend: s3`). If no storage section is present,
+        // fall back to LocalFsStorage rooted at the configured project_dir — that
+        // matches the legacy behavior of reading {project_dir}/{catalog,markdown,papers}.
+        let storage: Arc<dyn Storage> = match hs_common::logging::load_config_sections().0 {
+            Some(cfg) => cfg.build().unwrap_or_else(|e| {
+                tracing::warn!(
+                    "storage config invalid ({e}); falling back to LocalFsStorage at project_dir"
+                );
+                Arc::new(hs_common::storage::LocalFsStorage::new(
+                    hs_common::resolve_project_dir(),
+                ))
+            }),
+            None => Arc::new(hs_common::storage::LocalFsStorage::new(
+                hs_common::resolve_project_dir(),
+            )),
+        };
 
         // Discover servers from gateway registry, falling back to config
         let scribe_servers = hs_common::service::registry::discover_or_fallback(
@@ -139,9 +166,13 @@ impl HomeStillMcp {
         .await;
 
         Self {
-            catalog_dir: scribe_cfg.catalog_dir.clone(),
-            markdown_dir: scribe_cfg.output_dir.clone(),
-            papers_dir: scribe_cfg.watch_dir.clone(),
+            storage,
+            catalog_prefix: "catalog".to_string(),
+            markdown_prefix: "markdown".to_string(),
+            papers_prefix: "papers".to_string(),
+            legacy_papers_dir: scribe_cfg.watch_dir.clone(),
+            legacy_markdown_dir: scribe_cfg.output_dir.clone(),
+            legacy_catalog_dir: scribe_cfg.catalog_dir.clone(),
             scribe_servers,
             distill_servers,
             tool_router: Self::tool_router(),
@@ -360,7 +391,16 @@ impl HomeStillMcp {
             conversion: None,
             embedding: None,
         };
-        hs_common::catalog::write_catalog_entry(&self.catalog_dir, &stem, &entry);
+        if let Err(e) = hs_common::catalog::write_catalog_entry_via(
+            &*self.storage,
+            &self.catalog_prefix,
+            &stem,
+            &entry,
+        )
+        .await
+        {
+            tracing::warn!("catalog write failed for {stem}: {e}");
+        }
 
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "doi": p.doi,
@@ -382,37 +422,35 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    fn catalog_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
-        let mut entries = Vec::new();
-        for path in hs_common::collect_files_recursive(&self.catalog_dir, "yaml") {
-            if let Some(stem) = path.file_stem() {
-                let stem = stem.to_string_lossy().to_string();
-                let cat = hs_common::catalog::read_catalog_entry(&self.catalog_dir, &stem);
-                let title = cat
-                    .as_ref()
-                    .and_then(|c| c.title.clone())
-                    .unwrap_or_default();
-                let converted = cat.as_ref().and_then(|c| c.conversion.as_ref()).is_some();
-                entries.push(serde_json::json!({
+    async fn catalog_list(
+        &self,
+        Parameters(p): Parameters<ListParams>,
+    ) -> Result<String, String> {
+        let mut triples =
+            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
+                .await
+                .map_err(|e| format!("catalog list failed: {e}"))?;
+        // Stable ordering by stem for deterministic pagination.
+        triples.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let offset = p.offset.unwrap_or(0);
+        let slice: Vec<_> = match p.limit {
+            Some(limit) => triples.into_iter().skip(offset).take(limit).collect(),
+            None => triples.into_iter().skip(offset).collect(),
+        };
+
+        let entries: Vec<_> = slice
+            .into_iter()
+            .map(|(stem, _meta, cat)| {
+                let title = cat.title.unwrap_or_default();
+                let converted = cat.conversion.is_some();
+                serde_json::json!({
                     "stem": stem,
                     "title": title,
                     "converted": converted,
-                }));
-            }
-        }
-        entries.sort_by(|a, b| {
-            a["stem"]
-                .as_str()
-                .unwrap_or("")
-                .cmp(b["stem"].as_str().unwrap_or(""))
-        });
-
-        let offset = p.offset.unwrap_or(0);
-        if let Some(limit) = p.limit {
-            entries = entries.into_iter().skip(offset).take(limit).collect();
-        } else if offset > 0 {
-            entries = entries.into_iter().skip(offset).collect();
-        }
+                })
+            })
+            .collect();
 
         Ok(serde_json::to_string_pretty(&entries).unwrap_or_default())
     }
@@ -426,8 +464,17 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    fn catalog_read(&self, Parameters(p): Parameters<CatalogReadParams>) -> Result<String, String> {
-        match hs_common::catalog::read_catalog_entry(&self.catalog_dir, &p.stem) {
+    async fn catalog_read(
+        &self,
+        Parameters(p): Parameters<CatalogReadParams>,
+    ) -> Result<String, String> {
+        match hs_common::catalog::read_catalog_entry_via(
+            &*self.storage,
+            &self.catalog_prefix,
+            &p.stem,
+        )
+        .await
+        {
             Some(entry) => Ok(serde_json::to_string_pretty(&entry).unwrap_or_default()),
             None => Err(format!("No catalog entry found for '{}'", p.stem)),
         }
@@ -444,30 +491,36 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    fn markdown_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
-        let mut paths = hs_common::collect_files_recursive(&self.markdown_dir, "md");
-        paths.sort_by(|a, b| a.file_stem().cmp(&b.file_stem()));
+    async fn markdown_list(
+        &self,
+        Parameters(p): Parameters<ListParams>,
+    ) -> Result<String, String> {
+        let mut metas =
+            hs_common::markdown::list_markdown_meta_via(&*self.storage, &self.markdown_prefix)
+                .await
+                .map_err(|e| format!("markdown list failed: {e}"))?;
+        metas.sort_by(|a, b| a.0.cmp(&b.0));
 
         let offset = p.offset.unwrap_or(0);
         let slice: Vec<_> = match p.limit {
-            Some(limit) => paths.into_iter().skip(offset).take(limit).collect(),
-            None => paths.into_iter().skip(offset).collect(),
+            Some(limit) => metas.into_iter().skip(offset).take(limit).collect(),
+            None => metas.into_iter().skip(offset).collect(),
         };
 
         let mut entries = Vec::with_capacity(slice.len());
-        for path in slice {
-            let Some(stem_os) = path.file_stem() else {
-                continue;
-            };
-            let stem = stem_os.to_string_lossy();
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            let pages = hs_common::catalog::read_catalog_entry(&self.catalog_dir, &stem)
-                .and_then(|c| c.conversion)
-                .map(|cv| cv.total_pages)
-                .unwrap_or(0);
+        for (stem, obj) in slice {
+            let pages = hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &stem,
+            )
+            .await
+            .and_then(|c| c.conversion)
+            .map(|cv| cv.total_pages)
+            .unwrap_or(0);
             entries.push(serde_json::json!({
                 "stem": stem,
-                "size_bytes": size,
+                "size_bytes": obj.size,
                 "pages": pages,
             }));
         }
@@ -484,13 +537,18 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    fn markdown_read(
+    async fn markdown_read(
         &self,
         Parameters(p): Parameters<MarkdownReadParams>,
     ) -> Result<String, String> {
-        let path = hs_common::sharded_path(&self.markdown_dir, &p.stem, "md");
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
+        match hs_common::markdown::read_markdown_via(
+            &*self.storage,
+            &self.markdown_prefix,
+            &p.stem,
+        )
+        .await
+        {
+            Some(content) => {
                 if let Some(page) = p.page {
                     let pages: Vec<&str> = content.split("\n\n---\n\n").collect();
                     if page == 0 || page > pages.len() {
@@ -506,7 +564,7 @@ impl HomeStillMcp {
                     Ok(content)
                 }
             }
-            Err(_) => Err(format!(
+            None => Err(format!(
                 "Markdown not found for '{}'. Check if it has been converted.",
                 p.stem
             )),
@@ -552,7 +610,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self.scribe_client().ok_or("No scribe server configured")?;
 
-        let pdf_path = self.papers_dir.join(format!("{}.pdf", p.stem));
+        let pdf_path = self.legacy_papers_dir.join(format!("{}.pdf", p.stem));
         let pdf_bytes =
             std::fs::read(&pdf_path).map_err(|e| format!("Cannot read PDF '{}': {e}", p.stem))?;
 
@@ -663,7 +721,7 @@ impl HomeStillMcp {
             .distill_client()
             .ok_or("No distill server configured")?;
 
-        let md_path = hs_common::sharded_path(&self.markdown_dir, &p.stem, "md");
+        let md_path = hs_common::sharded_path(&self.legacy_markdown_dir, &p.stem, "md");
         let path_str = md_path.to_string_lossy().to_string();
 
         if !md_path.exists() {
@@ -675,9 +733,10 @@ impl HomeStillMcp {
 
         match client.index_file(&path_str).await {
             Ok(result) => {
-                // Write embedding metadata to catalog
-                hs_common::catalog::update_embedding_catalog(
-                    &self.catalog_dir,
+                // Write embedding metadata to catalog via Storage.
+                if let Err(e) = hs_common::catalog::update_embedding_catalog_via(
+                    &*self.storage,
+                    &self.catalog_prefix,
                     &p.stem,
                     self.distill_servers
                         .first()
@@ -685,7 +744,11 @@ impl HomeStillMcp {
                         .unwrap_or(""),
                     result.chunks_indexed,
                     &result.embedding_device,
-                );
+                )
+                .await
+                {
+                    tracing::warn!("embedding catalog update failed for {}: {e}", p.stem);
+                }
                 Ok(serde_json::to_string_pretty(&serde_json::json!({
                     "stem": p.stem,
                     "chunks_indexed": result.chunks_indexed,
@@ -709,9 +772,9 @@ impl HomeStillMcp {
         )
     )]
     async fn system_status(&self) -> Result<String, String> {
-        let pdf_count = count_files(&self.papers_dir, "pdf");
-        let md_count = count_files(&self.markdown_dir, "md");
-        let catalog_count = count_files(&self.catalog_dir, "yaml");
+        let pdf_count = count_ext_via(&*self.storage, &self.papers_prefix, "pdf").await;
+        let md_count = count_ext_via(&*self.storage, &self.markdown_prefix, "md").await;
+        let catalog_count = count_ext_via(&*self.storage, &self.catalog_prefix, "yaml").await;
 
         let scribe_health = if let Some(c) = self.scribe_client() {
             c.health().await.ok()
@@ -748,8 +811,23 @@ impl HomeStillMcp {
     }
 }
 
-fn count_files(dir: &std::path::Path, ext: &str) -> u64 {
-    hs_common::collect_files_recursive(dir, ext).len() as u64
+/// Count keys under `prefix` in the Storage backend whose filename ends with
+/// `.<ext>`. Returns 0 on any backend error so `system_status` stays non-fatal.
+async fn count_ext_via(storage: &dyn Storage, prefix: &str, ext: &str) -> u64 {
+    let suffix = format!(".{ext}");
+    match storage.list(prefix).await {
+        Ok(objs) => objs
+            .iter()
+            .filter(|o| {
+                o.key.ends_with(&suffix)
+                    && o.key
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| !name.starts_with("._"))
+            })
+            .count() as u64,
+        Err(_) => 0,
+    }
 }
 
 // ── Prompt parameter types ───────────────────────────────────────
@@ -868,15 +946,15 @@ impl ServerHandler for HomeStillMcp {
 
         let mut resources = Vec::new();
 
-        // Catalog entries
-        for path in hs_common::collect_files_recursive(&self.catalog_dir, "yaml") {
-            if let Some(stem) = path.file_stem() {
-                let stem = stem.to_string_lossy();
-                let cat = hs_common::catalog::read_catalog_entry(&self.catalog_dir, &stem);
-                let title = cat
-                    .as_ref()
-                    .and_then(|c| c.title.clone())
-                    .unwrap_or_else(|| stem.to_string());
+        // Catalog entries via Storage
+        if let Ok(triples) = hs_common::catalog::list_catalog_entries_via(
+            &*self.storage,
+            &self.catalog_prefix,
+        )
+        .await
+        {
+            for (stem, _meta, cat) in triples {
+                let title = cat.title.unwrap_or_else(|| stem.clone());
                 resources.push(
                     RawResource {
                         uri: format!("catalog:///{stem}"),
@@ -893,19 +971,22 @@ impl ServerHandler for HomeStillMcp {
             }
         }
 
-        // Markdown documents
-        for path in hs_common::collect_files_recursive(&self.markdown_dir, "md") {
-            if let Some(stem) = path.file_stem() {
-                let stem = stem.to_string_lossy();
-                let size = std::fs::metadata(&path).map(|m| m.len() as u32).ok();
+        // Markdown documents via Storage
+        if let Ok(metas) = hs_common::markdown::list_markdown_meta_via(
+            &*self.storage,
+            &self.markdown_prefix,
+        )
+        .await
+        {
+            for (stem, obj) in metas {
                 resources.push(
                     RawResource {
                         uri: format!("markdown:///{stem}"),
-                        name: stem.to_string(),
+                        name: stem.clone(),
                         title: None,
                         description: Some("Converted markdown document".into()),
                         mime_type: Some("text/markdown".into()),
-                        size,
+                        size: Some(obj.size as u32),
                         icons: None,
                         meta: None,
                     }
@@ -967,9 +1048,14 @@ impl ServerHandler for HomeStillMcp {
         let uri = &request.uri;
 
         if let Some(stem) = uri.strip_prefix("catalog:///") {
-            // Catalog resource
-            let entry = hs_common::catalog::read_catalog_entry(&self.catalog_dir, stem)
-                .ok_or_else(|| ErrorData::resource_not_found("catalog entry not found", None))?;
+            // Catalog resource via Storage
+            let entry = hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                stem,
+            )
+            .await
+            .ok_or_else(|| ErrorData::resource_not_found("catalog entry not found", None))?;
             let yaml = serde_json::to_string_pretty(&entry)
                 .map_err(|e| ErrorData::internal_error(format!("serialize error: {e}"), None))?;
             Ok(ReadResourceResult::new(vec![
@@ -991,9 +1077,13 @@ impl ServerHandler for HomeStillMcp {
                 (rest, None)
             };
 
-            let path = hs_common::sharded_path(&self.markdown_dir, stem, "md");
-            let content = std::fs::read_to_string(&path)
-                .map_err(|_| ErrorData::resource_not_found("markdown not found", None))?;
+            let content = hs_common::markdown::read_markdown_via(
+                &*self.storage,
+                &self.markdown_prefix,
+                stem,
+            )
+            .await
+            .ok_or_else(|| ErrorData::resource_not_found("markdown not found", None))?;
 
             let text = if let Some(page) = page {
                 let pages: Vec<&str> = content.split("\n\n---\n\n").collect();

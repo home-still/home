@@ -196,6 +196,67 @@ pub async fn write_catalog_entry_via(
     storage.put(&key, yaml.into_bytes()).await
 }
 
+/// List the stems of every catalog entry under `prefix`.
+///
+/// Walks `Storage::list(prefix)`, keeps keys ending in `.yaml`, strips the
+/// sharded `XX/` directory, and returns the stem (filename without extension).
+/// Works identically for `LocalFsStorage` (recursive fs walk) and `S3Storage`.
+#[cfg(feature = "storage")]
+pub async fn list_catalog_stems_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+) -> anyhow::Result<Vec<String>> {
+    let objects = storage.list(prefix).await?;
+    let mut stems = Vec::with_capacity(objects.len());
+    for obj in objects {
+        // Only yaml files are catalog entries.
+        if !obj.key.ends_with(".yaml") {
+            continue;
+        }
+        // Skip macOS AppleDouble metadata files just in case.
+        let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
+        if filename.starts_with("._") {
+            continue;
+        }
+        let stem = filename.trim_end_matches(".yaml").to_string();
+        stems.push(stem);
+    }
+    Ok(stems)
+}
+
+/// List every catalog entry under `prefix`, deserialized.
+///
+/// Returns `(stem, ObjectMeta, CatalogEntry)` tuples so callers can preserve
+/// filesystem mtime ordering (for history panes) without a second roundtrip.
+/// Entries that fail to deserialize are silently skipped — matches the
+/// lenient behavior of the pre-migration filesystem walk.
+#[cfg(feature = "storage")]
+pub async fn list_catalog_entries_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+) -> anyhow::Result<Vec<(String, crate::storage::ObjectMeta, CatalogEntry)>> {
+    let objects = storage.list(prefix).await?;
+    let mut out = Vec::with_capacity(objects.len());
+    for obj in objects {
+        if !obj.key.ends_with(".yaml") {
+            continue;
+        }
+        let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
+        if filename.starts_with("._") {
+            continue;
+        }
+        let stem = filename.trim_end_matches(".yaml").to_string();
+        let Ok(bytes) = storage.get(&obj.key).await else {
+            continue;
+        };
+        let Ok(entry) = serde_yaml_ng::from_slice::<CatalogEntry>(&bytes) else {
+            continue;
+        };
+        out.push((stem, obj, entry));
+    }
+    Ok(out)
+}
+
 #[cfg(feature = "storage")]
 #[allow(clippy::too_many_arguments)]
 pub async fn update_conversion_catalog_via(

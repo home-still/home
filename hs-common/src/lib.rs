@@ -132,6 +132,9 @@ pub mod catalog;
 #[cfg(feature = "storage")]
 pub mod storage;
 
+#[cfg(feature = "storage")]
+pub mod markdown;
+
 #[cfg(feature = "events")]
 pub mod event_bus;
 
