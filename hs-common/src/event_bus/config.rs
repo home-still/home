@@ -50,9 +50,7 @@ impl EventBusConfig {
                 }
                 #[cfg(not(feature = "events-nats"))]
                 {
-                    anyhow::bail!(
-                        "events.backend=nats requires the `events-nats` cargo feature"
-                    );
+                    anyhow::bail!("events.backend=nats requires the `events-nats` cargo feature");
                 }
             }
         }

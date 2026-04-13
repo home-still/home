@@ -178,9 +178,8 @@ pub async fn run_download(
         .build_event_bus()
         .await
         .context("Failed to build event bus")?;
-    let downloader =
-        PaperDownloader::with_event_bus(storage, events, &config.download, resolvers)
-            .context("Failed to create downloader")?;
+    let downloader = PaperDownloader::with_event_bus(storage, events, &config.download, resolvers)
+        .context("Failed to create downloader")?;
     let downloader: Arc<dyn crate::ports::download_service::DownloadService> = Arc::new(downloader);
 
     if let Some(doi_str) = doi {

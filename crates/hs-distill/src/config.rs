@@ -128,10 +128,7 @@ impl DistillClientConfig {
             .extract::<EventBusConfig>()
             .unwrap_or_default();
 
-        let mut cfg: DistillClientConfig = figment
-            .select("distill")
-            .extract()
-            .map_err(Box::new)?;
+        let mut cfg: DistillClientConfig = figment.select("distill").extract().map_err(Box::new)?;
         cfg.storage = storage;
         cfg.events = events;
         Ok(cfg)

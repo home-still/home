@@ -97,8 +97,7 @@ mod tests {
         use hs_common::event_bus::nats::{NatsBus, NatsConfig};
         use hs_common::storage::LocalFsStorage;
 
-        let bus: Arc<dyn EventBus> =
-            Arc::new(NatsBus::connect(NatsConfig { url }).await.unwrap());
+        let bus: Arc<dyn EventBus> = Arc::new(NatsBus::connect(NatsConfig { url }).await.unwrap());
         let tmp = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(tmp.path()));
 
