@@ -778,6 +778,61 @@ async fn convert_html_and_save(
         page_offsets,
         &format!("markdown/{}/{stem}.md", &stem[..stem.len().min(2)]),
     );
+
+    // After successful conversion, move source out of manually_downloaded/ (if applicable)
+    relocate_from_manual_dir(html_path);
+}
+
+/// If `source_path` sits in a `manually_downloaded/` folder, move it into the
+/// proper sharded layout (e.g. `papers/10/stem.pdf`). Source files that are
+/// already in the sharded layout are left alone.
+///
+/// Files that fail to convert stay in `manually_downloaded/` so users can see
+/// what hasn't been processed yet.
+fn relocate_from_manual_dir(source_path: &std::path::Path) {
+    // Only relocate if the parent directory is "manually_downloaded"
+    let is_manual = source_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some("manually_downloaded");
+    if !is_manual {
+        return;
+    }
+
+    // Papers root is the grandparent (papers/manually_downloaded/file.pdf)
+    let papers_root = match source_path.parent().and_then(|p| p.parent()) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let stem = match source_path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return,
+    };
+    let ext = match source_path.extension().and_then(|e| e.to_str()) {
+        Some(e) => e,
+        None => return,
+    };
+
+    let target = hs_common::sharded_path(papers_root, stem, ext);
+    if let Some(parent) = target.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!("Failed to create shard dir {}: {e}", parent.display());
+            return;
+        }
+    }
+    // Don't overwrite if target already exists (original is still the canonical copy)
+    if target.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::rename(source_path, &target) {
+        tracing::warn!(
+            "Failed to move {} → {}: {e}",
+            source_path.display(),
+            target.display()
+        );
+    }
 }
 
 /// Atomic file write: write to temp file in same directory, then rename.
@@ -1249,6 +1304,9 @@ async fn convert_and_save_pool(
                     page_offsets,
                     &format!("markdown/{}/{stem}.md", &stem[..stem.len().min(2)]),
                 );
+
+                // After successful conversion, move source out of manually_downloaded/
+                relocate_from_manual_dir(pdf_path);
             }
         }
         Err(e) => {
