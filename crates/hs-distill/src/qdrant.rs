@@ -1,8 +1,7 @@
 use qdrant_client::qdrant::{
-    points_selector::PointsSelectorOneOf, Condition, CountPointsBuilder, CreateCollectionBuilder,
-    CreateFieldIndexCollectionBuilder, DeletePointsBuilder, Distance, FacetCountsBuilder,
-    FieldType, Filter, HnswConfigDiffBuilder, PointStruct, PointsSelector, QueryPointsBuilder,
-    SearchParamsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+    Condition, CountPointsBuilder, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
+    DeletePointsBuilder, Distance, FacetCountsBuilder, FieldType, Filter, HnswConfigDiffBuilder,
+    PointStruct, QueryPointsBuilder, SearchParamsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use uuid::Uuid;
@@ -292,11 +291,8 @@ pub async fn delete_by_doc_id(
         return Ok(0);
     }
     let filter = Filter::must([Condition::matches("doc_id", doc_id.to_string())]);
-    let selector = PointsSelector {
-        points_selector_one_of: Some(PointsSelectorOneOf::Filter(filter)),
-    };
     client
-        .delete_points(DeletePointsBuilder::new(collection_name).points(selector))
+        .delete_points(DeletePointsBuilder::new(collection_name).points(filter))
         .await
         .map_err(|e| DistillError::Qdrant(format!("Failed to delete points: {e}")))?;
     Ok(count)
@@ -316,19 +312,17 @@ pub async fn list_doc_ids(
         )
         .await
         .map_err(|e| DistillError::Qdrant(format!("Failed to list doc_ids: {e}")))?;
+    use qdrant_client::qdrant::facet_value::Variant;
     Ok(response
         .hits
         .into_iter()
-        .filter_map(|h| h.value.and_then(|v| v.variant.and_then(variant_to_string)))
+        .filter_map(|h| {
+            h.value.and_then(|v| match v.variant? {
+                Variant::StringValue(s) => Some(s),
+                _ => None,
+            })
+        })
         .collect())
-}
-
-fn variant_to_string(v: qdrant_client::qdrant::value::Variant) -> Option<String> {
-    use qdrant_client::qdrant::value::Variant;
-    match v {
-        Variant::StringValue(s) => Some(s),
-        _ => None,
-    }
 }
 
 /// Count distinct documents in a collection via facet on doc_id.
