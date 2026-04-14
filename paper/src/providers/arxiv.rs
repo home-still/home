@@ -197,9 +197,28 @@ impl PaperProvider for ArxivProvider {
     async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
         let url = self.build_search_url(query)?;
 
-        let response = self.client.get(&url).send().await?;
+        let mut response = self.client.get(&url).send().await?;
 
-        if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        // arXiv throttles aggressively; one bounded retry on 429/503 usually clears it.
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(2)
+                .min(5);
+            tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+            response = self.client.get(&url).send().await?;
+        }
+
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ) {
             return Err(PaperError::RateLimited {
                 provider: String::from("arxiv"),
                 retry_after: None,

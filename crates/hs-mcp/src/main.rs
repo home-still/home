@@ -76,8 +76,6 @@ struct DistillSearchParams {
     limit: Option<u64>,
     #[schemars(description = "Year filter, e.g. '>2020', '2023', '>=2021'")]
     year: Option<String>,
-    #[schemars(description = "Topic filter keyword")]
-    topic: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -713,7 +711,7 @@ impl HomeStillMcp {
 
         let filters = hs_distill::client::SearchFilters {
             year: p.year,
-            topic: p.topic,
+            topic: None,
         };
 
         match client
