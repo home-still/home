@@ -1,3 +1,5 @@
+#![cfg(feature = "server")]
+
 use hs_scribe::config::AppConfig;
 use hs_scribe::pipeline::processor::Processor;
 

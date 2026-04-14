@@ -28,29 +28,18 @@ pub fn extract_rule_based(
         meta.pdf_path = cat.pdf_path.clone();
     }
 
-    // Regex fill-in from markdown text
-    let first_lines: String = markdown.lines().take(50).collect::<Vec<_>>().join("\n");
-
-    // DOI
-    if meta.doi.is_none() {
-        if let Some(doi) = extract_doi(markdown) {
-            meta.doi = Some(doi);
-        }
-    }
-
-    // Year
+    // Year may be filled from the document if catalog missing it.
+    // DOI is NEVER regex-extracted: the first DOI-shaped string in a paper is
+    // almost always a reference citation, not the paper's own DOI, which
+    // produced mislabeled chunks in rc.<=230.
     if meta.publication_date.is_none() {
+        let first_lines: String = markdown.lines().take(50).collect::<Vec<_>>().join("\n");
         if let Some(year) = extract_year(&first_lines) {
             meta.publication_date = Some(year);
         }
     }
 
     meta
-}
-
-fn extract_doi(text: &str) -> Option<String> {
-    let re = Regex::new(r"10\.\d{4,}/[^\s,\]>)]+").ok()?;
-    re.find(text).map(|m| m.as_str().to_string())
 }
 
 fn extract_year(text: &str) -> Option<String> {
@@ -133,13 +122,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_doi_from_text() {
-        let text = "See https://doi.org/10.1234/abcd.5678 for details.";
-        let doi = extract_doi(text);
-        assert_eq!(doi, Some("10.1234/abcd.5678".to_string()));
-    }
-
-    #[test]
     fn extract_year_from_text() {
         let text = "Published in 2023 by the authors.";
         let year = extract_year(text);
@@ -147,8 +129,10 @@ mod tests {
     }
 
     #[test]
-    fn no_doi_returns_none() {
-        let text = "No DOI here.";
-        assert_eq!(extract_doi(text), None);
+    fn doi_comes_only_from_catalog_not_body_text() {
+        // Body text mentions another paper's DOI in a citation — must be ignored.
+        let markdown = "... see 10.1002/aur.2049 for background ...";
+        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        assert_eq!(meta.doi, None);
     }
 }
