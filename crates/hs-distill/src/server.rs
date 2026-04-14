@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -36,6 +36,7 @@ pub fn app(state: Arc<DistillServerState>) -> Router {
         .route("/readiness", get(handle_readiness))
         .route("/status", get(handle_status))
         .route("/exists/{doc_id}", get(handle_exists))
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
 

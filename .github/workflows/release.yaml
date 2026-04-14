@@ -85,7 +85,7 @@ jobs:
         run: >
           cargo build --release
           --target ${{ matrix.target }}
-          -p hs-distill --features server --bin hs-distill-server
+          -p hs-distill --features cuda --bin hs-distill-server
 
       - name: Build gateway (zigbuild)
         if: matrix.use_zigbuild

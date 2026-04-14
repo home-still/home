@@ -1198,9 +1198,15 @@ async fn main() -> anyhow::Result<()> {
             session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
         };
 
+        // Default rmcp session config times out idle sessions; the Mac dashboard
+        // holds an SSE connection open between `hs status` refreshes, so we
+        // disable the idle timeout.
+        let mut session_manager = LocalSessionManager::default();
+        session_manager.session_config.keep_alive = None;
+
         let service = StreamableHttpService::new(
             move || Ok(server.clone()),
-            std::sync::Arc::new(LocalSessionManager::default()),
+            std::sync::Arc::new(session_manager),
             StreamableHttpServerConfig::default(),
         );
 
