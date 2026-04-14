@@ -414,12 +414,11 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
         .get("pipeline")
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
-    let services = status
-        .get("services")
-        .cloned()
-        .unwrap_or(Value::Object(Default::default()));
 
-    let pdf_count = pipeline.get("pdfs").and_then(|v| v.as_u64()).unwrap_or(0);
+    let pdf_count = pipeline
+        .get("documents")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let md_count = pipeline
         .get("markdown")
         .and_then(|v| v.as_u64())
@@ -437,64 +436,24 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    let scribe_health = services.get("scribe").cloned().unwrap_or(Value::Null);
-    let distill_health = services.get("distill").cloned().unwrap_or(Value::Null);
+    let scribe_servers = instances_to_rows(status.get("scribe_instances"));
+    let distill_servers = instances_to_rows(status.get("distill_instances"));
 
-    let mut scribe_servers = Vec::new();
-    if !scribe_health.is_null() {
-        let version = scribe_health
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        scribe_servers.push(ServiceStatus {
-            url: "gateway".into(),
-            healthy: true,
-            detail: String::new(),
-            activity: "idle".into(),
-            version,
-        });
-    }
-
-    let mut distill_servers = Vec::new();
-    let mut qdrant_healthy = false;
-    let mut qdrant_url = String::new();
-    let mut qdrant_version = String::new();
-    if !distill_health.is_null() {
-        let compute = distill_health
-            .get("compute_device")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let version = distill_health
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let collection = distill_health
+    let qdrant = status.get("qdrant").cloned().unwrap_or(Value::Null);
+    let (qdrant_healthy, qdrant_url) = if qdrant.is_null() {
+        (false, String::new())
+    } else {
+        let collection = qdrant
             .get("collection")
             .and_then(|v| v.as_str())
-            .unwrap_or("academic_papers")
-            .to_string();
-        qdrant_version = distill_health
-            .get("qdrant_version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        qdrant_healthy = true;
-        qdrant_url = format!("gateway → {collection}");
-        distill_servers.push(ServiceStatus {
-            url: "gateway".into(),
-            healthy: true,
-            detail: if compute.is_empty() {
-                String::new()
-            } else {
-                format!("({compute})")
-            },
-            activity: "idle".into(),
-            version,
-        });
-    }
+            .unwrap_or("academic_papers");
+        (true, format!("gateway → {collection}"))
+    };
+    let qdrant_version = distill_servers
+        .iter()
+        .find(|s| s.healthy)
+        .map(|s| s.version.clone())
+        .unwrap_or_default();
 
     let history = match client
         .call_tool("catalog_recent", serde_json::json!({"limit": 100}))
@@ -570,6 +529,68 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
         fs_stalled_markdown: false,
         fs_stalled_catalog: false,
     })
+}
+
+fn instances_to_rows(value: Option<&serde_json::Value>) -> Vec<ServiceStatus> {
+    let Some(arr) = value.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|inst| {
+            let url = inst
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let healthy = inst
+                .get("healthy")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let enabled = inst
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let device = inst
+                .get("device_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let metadata = inst.get("metadata");
+            let version = metadata
+                .and_then(|m| m.get("version"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let compute = metadata
+                .and_then(|m| m.get("compute_device"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mut detail = String::new();
+            if !device.is_empty() {
+                detail.push_str(&device);
+            }
+            if !compute.is_empty() {
+                if !detail.is_empty() {
+                    detail.push(' ');
+                }
+                detail.push_str(&format!("({compute})"));
+            }
+            let activity = if !enabled {
+                "disabled".into()
+            } else if healthy {
+                "idle".into()
+            } else {
+                "unhealthy".into()
+            };
+            ServiceStatus {
+                url,
+                healthy,
+                detail,
+                activity,
+                version,
+            }
+        })
+        .collect()
 }
 
 fn read_watcher_status(output_dir: &Path, watch_dir: &Path) -> WatcherInfo {

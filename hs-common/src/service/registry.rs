@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::client::AuthenticatedClient;
 
@@ -14,20 +14,27 @@ struct ServicesResponse {
     services: Vec<ServiceInfo>,
 }
 
-#[derive(Deserialize)]
-struct ServiceInfo {
-    service_type: String,
-    url: String,
-    enabled: bool,
-    healthy: bool,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ServiceInfo {
+    pub service_type: String,
+    pub url: String,
+    #[serde(default)]
+    pub device_name: String,
+    pub enabled: bool,
+    pub healthy: bool,
+    #[serde(default)]
+    pub metadata: ServiceMetadata,
 }
 
-/// Query the gateway registry for healthy, enabled servers of a given type.
-/// Returns a list of server URLs, or an error if the gateway is unreachable.
-pub async fn discover_servers(
-    auth: &AuthenticatedClient,
-    service_type: &str,
-) -> anyhow::Result<Vec<String>> {
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ServiceMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute_device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+async fn fetch_all(auth: &AuthenticatedClient) -> anyhow::Result<Vec<ServiceInfo>> {
     let token = auth.get_access_token().await?;
     let gateway_url = auth.gateway_url();
 
@@ -45,15 +52,41 @@ pub async fn discover_servers(
         .error_for_status()?
         .json()
         .await?;
+    Ok(resp.services)
+}
 
-    let urls: Vec<String> = resp
-        .services
+/// Query the gateway registry for healthy, enabled servers of a given type.
+/// Returns a list of server URLs, or an error if the gateway is unreachable.
+pub async fn discover_servers(
+    auth: &AuthenticatedClient,
+    service_type: &str,
+) -> anyhow::Result<Vec<String>> {
+    let urls = fetch_all(auth)
+        .await?
         .into_iter()
         .filter(|s| s.service_type == service_type && s.enabled && s.healthy)
         .map(|s| s.url)
         .collect();
-
     Ok(urls)
+}
+
+/// Query the gateway registry for every registered instance of a service type
+/// (regardless of health/enabled). Callers render this as the Services panel
+/// and can show unhealthy or disabled rows distinctly.
+pub async fn discover_instances(service_type: &str) -> Vec<ServiceInfo> {
+    let Ok(auth) = AuthenticatedClient::from_default_path() else {
+        return Vec::new();
+    };
+    let result = tokio::time::timeout(DISCOVERY_TIMEOUT, fetch_all(&auth))
+        .await
+        .unwrap_or(Err(anyhow::anyhow!("timeout")));
+    match result {
+        Ok(all) => all
+            .into_iter()
+            .filter(|s| s.service_type == service_type)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Try to discover servers from the gateway registry, falling back to the given defaults.

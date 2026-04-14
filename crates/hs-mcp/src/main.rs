@@ -501,13 +501,18 @@ impl HomeStillMcp {
                 }));
             }
             if let Some(ref emb) = entry.embedding {
-                events.push(serde_json::json!({
-                    "activity": "Embed",
-                    "stem": stem,
-                    "name": name,
-                    "chunks": emb.chunks_indexed,
-                    "at": emb.embedded_at,
-                }));
+                // Skip zero-chunk "embeddings" — they were stamped by an older
+                // pipeline when nothing actually made it into Qdrant, and only
+                // pollute the history pane.
+                if emb.chunks_indexed > 0 {
+                    events.push(serde_json::json!({
+                        "activity": "Embed",
+                        "stem": stem,
+                        "name": name,
+                        "chunks": emb.chunks_indexed,
+                        "at": emb.embedded_at,
+                    }));
+                }
             }
         }
 
@@ -833,20 +838,10 @@ impl HomeStillMcp {
     )]
     async fn system_status(&self) -> Result<String, String> {
         let pdf_count = count_ext_via(&*self.storage, &self.papers_prefix, "pdf").await;
+        let html_count = count_ext_via(&*self.storage, &self.papers_prefix, "html").await;
+        let doc_count = pdf_count + html_count;
         let md_count = count_ext_via(&*self.storage, &self.markdown_prefix, "md").await;
         let catalog_count = count_ext_via(&*self.storage, &self.catalog_prefix, "yaml").await;
-
-        let scribe_health = if let Some(c) = self.scribe_client() {
-            c.health().await.ok()
-        } else {
-            None
-        };
-
-        let distill_health = if let Some(c) = self.distill_client() {
-            c.health().await.ok()
-        } else {
-            None
-        };
 
         let distill_stats = if let Some(c) = self.distill_client() {
             c.status().await.ok()
@@ -854,18 +849,25 @@ impl HomeStillMcp {
             None
         };
 
+        let scribe_instances = hs_common::service::registry::discover_instances("scribe").await;
+        let distill_instances = hs_common::service::registry::discover_instances("distill").await;
+
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "pipeline": {
+                "documents": doc_count,
                 "pdfs": pdf_count,
+                "html_fallbacks": html_count,
                 "markdown": md_count,
                 "catalog_entries": catalog_count,
                 "embedded_documents": distill_stats.as_ref().map(|s| s.documents_count),
                 "embedded_chunks": distill_stats.as_ref().map(|s| s.points_count),
             },
-            "services": {
-                "scribe": scribe_health,
-                "distill": distill_health,
-            },
+            "scribe_instances": scribe_instances,
+            "distill_instances": distill_instances,
+            "qdrant": distill_stats.as_ref().map(|s| serde_json::json!({
+                "collection": s.collection,
+                "compute_device": s.compute_device,
+            })),
         }))
         .unwrap_or_default())
     }

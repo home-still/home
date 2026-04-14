@@ -136,6 +136,8 @@ pub fn update_conversion_catalog(
 
 /// Update only the embedding section of an existing catalog entry.
 /// If no entry exists, creates a minimal one with just embedding metadata.
+/// Returns early when `chunks_indexed == 0` so nothing gets stamped unless
+/// Qdrant actually received points.
 pub fn update_embedding_catalog(
     catalog_dir: &Path,
     stem: &str,
@@ -143,6 +145,9 @@ pub fn update_embedding_catalog(
     chunks_indexed: u32,
     compute_device: &str,
 ) {
+    if chunks_indexed == 0 {
+        return;
+    }
     let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
 
     entry.embedding = Some(EmbeddingMeta {
@@ -294,6 +299,9 @@ pub async fn update_embedding_catalog_via(
     chunks_indexed: u32,
     compute_device: &str,
 ) -> anyhow::Result<()> {
+    if chunks_indexed == 0 {
+        return Ok(());
+    }
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
         .await
         .unwrap_or_default();
