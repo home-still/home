@@ -29,5 +29,5 @@ VOLUME ["/models"]
 ENV HS_SCRIBE_LAYOUT_MODEL_PATH=/models/pp-doclayoutv3.onnx
 ENV HS_SCRIBE_TABLE_MODEL_PATH=/models/slanet-plus.onnx
 
-EXPOSE 7432
-CMD ["hs-scribe-server", "--host", "0.0.0.0", "--port", "7432"]
+EXPOSE 7433
+CMD ["hs-scribe-server", "--host", "0.0.0.0", "--port", "7433"]

@@ -1,5 +1,7 @@
 pub mod client;
 pub mod config;
+pub mod event_watch;
+pub mod postprocess;
 
 // Client-side modules (always available)
 pub mod cli;

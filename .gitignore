@@ -38,3 +38,4 @@ output_*/
 *.log
 slop.zip
 run.sh
+.fastembed_cache/

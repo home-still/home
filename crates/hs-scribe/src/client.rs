@@ -1,4 +1,8 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use hs_common::service::protocol::{ReadinessInfo, ServiceClient};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -22,11 +26,30 @@ pub struct ProgressEvent {
     pub message: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
     pub layout_model: bool,
     pub table_model: bool,
+    #[serde(default)]
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadinessResponse {
+    pub ready: bool,
+    pub vlm_slots_total: usize,
+    pub vlm_slots_available: usize,
+    pub in_flight_conversions: usize,
+}
+
+impl ReadinessInfo for ReadinessResponse {
+    fn is_ready(&self) -> bool {
+        self.ready
+    }
+    fn available_slots(&self) -> usize {
+        self.vlm_slots_available
+    }
 }
 
 pub struct ScribeClient {
@@ -36,10 +59,26 @@ pub struct ScribeClient {
 
 impl ScribeClient {
     pub fn new(server_url: &str) -> Self {
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            http: Client::new(),
+            http,
             server_url: server_url.trim_end_matches('/').to_string(),
         }
+    }
+
+    /// Create a client with a pre-configured reqwest Client (e.g., with auth headers).
+    pub fn new_with_client(server_url: &str, http: Client) -> Self {
+        Self {
+            http,
+            server_url: server_url.trim_end_matches('/').to_string(),
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        &self.server_url
     }
 
     pub async fn health(&self) -> Result<HealthResponse> {
@@ -47,12 +86,54 @@ impl ScribeClient {
         let resp = self
             .http
             .get(&url)
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .context("Failed to reach server")?;
         resp.json().await.context("Invalid health response")
     }
 
+    pub async fn readiness(&self) -> Result<ReadinessResponse> {
+        let url = format!("{}/readiness", self.server_url);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .context("Failed to reach server")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            // Old server without /readiness — treat as always ready
+            return Ok(ReadinessResponse {
+                ready: true,
+                vlm_slots_total: 0,
+                vlm_slots_available: 1,
+                in_flight_conversions: 0,
+            });
+        }
+        resp.json().await.context("Invalid readiness response")
+    }
+}
+
+#[async_trait]
+impl ServiceClient for ScribeClient {
+    type Health = HealthResponse;
+    type Readiness = ReadinessResponse;
+
+    fn url(&self) -> &str {
+        &self.server_url
+    }
+
+    async fn health(&self) -> Result<Self::Health> {
+        ScribeClient::health(self).await
+    }
+
+    async fn readiness(&self) -> Result<Self::Readiness> {
+        ScribeClient::readiness(self).await
+    }
+}
+
+impl ScribeClient {
     pub async fn convert(&self, pdf_bytes: Vec<u8>) -> Result<String> {
         let url = format!("{}/scribe", self.server_url);
         let part = reqwest::multipart::Part::bytes(pdf_bytes).file_name("input.pdf");
@@ -97,6 +178,12 @@ impl ScribeClient {
 
         // Server doesn't support streaming — fall back to plain endpoint
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            on_progress(ProgressEvent {
+                stage: "info".into(),
+                page: 0,
+                total_pages: 0,
+                message: "server does not support progress (update server image)".into(),
+            });
             return self.convert(pdf_bytes).await;
         }
 

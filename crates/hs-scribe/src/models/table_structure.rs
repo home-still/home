@@ -185,7 +185,7 @@ impl TableStructureRecognizer {
 
             let token = CHAR_DICT[char_idx];
 
-            if TD_TOKENS.iter().any(|td| *td == token) {
+            if TD_TOKENS.contains(&token) {
                 let bbox_offset = t * 8;
                 if bbox_offset + 7 < bbox_data.len() {
                     let raw_bbox = &bbox_data[bbox_offset..bbox_offset + 8];

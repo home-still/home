@@ -31,6 +31,8 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             archive: tar.gz
+            build_scribe: true
+            build_distill: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             archive: tar.gz
@@ -41,7 +43,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -57,19 +59,61 @@ jobs:
       - name: Add target
         run: rustup target add ${{ matrix.target }}
 
-      - name: Build (zigbuild)
+      - name: Build CLI (zigbuild)
         if: matrix.use_zigbuild
         run: >
           cargo zigbuild --release
           --target ${{ matrix.target }}.2.28
           -p ${{ env.CRATE }}
 
-      - name: Build (natives)
+      - name: Build CLI (native)
         if: ${{ !matrix.use_zigbuild }}
         run: >
           cargo build --release
           --target ${{ matrix.target }}
           -p ${{ env.CRATE }}
+
+      - name: Build scribe server (native)
+        if: matrix.build_scribe
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          -p hs-scribe --features server --bin hs-scribe-server
+
+      - name: Build distill server (native)
+        if: matrix.build_distill
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          -p hs-distill --features cuda --bin hs-distill-server
+
+      - name: Build gateway (zigbuild)
+        if: matrix.use_zigbuild
+        run: >
+          cargo zigbuild --release
+          --target ${{ matrix.target }}.2.28
+          -p hs-gateway
+
+      - name: Build gateway (native)
+        if: ${{ !matrix.use_zigbuild }}
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          -p hs-gateway
+
+      - name: Build MCP server (zigbuild)
+        if: matrix.use_zigbuild
+        run: >
+          cargo zigbuild --release
+          --target ${{ matrix.target }}.2.28
+          -p hs-mcp
+
+      - name: Build MCP server (native)
+        if: ${{ !matrix.use_zigbuild }}
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          -p hs-mcp
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
@@ -99,7 +143,71 @@ jobs:
           path: |
             ${{ env.ASSET }}
             ${{ env.ASSET }}.sha256
-            
+
+      - name: Upload scribe server binary
+        if: matrix.build_scribe
+        uses: actions/upload-artifact@v4
+        with:
+          name: scribe-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/hs-scribe-server
+
+      - name: Package distill server
+        if: matrix.build_distill
+        shell: bash
+        run: |
+          DISTILL_ASSET="hs-distill-server-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$DISTILL_ASSET" \
+            -C "target/${{ matrix.target }}/release" "hs-distill-server"
+          shasum -a 256 "$DISTILL_ASSET" > "$DISTILL_ASSET.sha256"
+          echo "DISTILL_ASSET=$DISTILL_ASSET" >> $GITHUB_ENV
+
+      - name: Upload distill server
+        if: matrix.build_distill
+        uses: actions/upload-artifact@v4
+        with:
+          name: distill-${{ matrix.target }}
+          path: |
+            ${{ env.DISTILL_ASSET }}
+            ${{ env.DISTILL_ASSET }}.sha256
+
+      - name: Package gateway
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          GW_ASSET="hs-gateway-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$GW_ASSET" \
+            -C "target/${{ matrix.target }}/release" "hs-gateway"
+          shasum -a 256 "$GW_ASSET" > "$GW_ASSET.sha256"
+          echo "GW_ASSET=$GW_ASSET" >> $GITHUB_ENV
+
+      - name: Upload gateway
+        if: matrix.archive == 'tar.gz'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-${{ matrix.target }}
+          path: |
+            ${{ env.GW_ASSET }}
+            ${{ env.GW_ASSET }}.sha256
+
+      - name: Package MCP server
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          MCP_ASSET="hs-mcp-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$MCP_ASSET" \
+            -C "target/${{ matrix.target }}/release" "hs-mcp"
+          shasum -a 256 "$MCP_ASSET" > "$MCP_ASSET.sha256"
+          echo "MCP_ASSET=$MCP_ASSET" >> $GITHUB_ENV
+
+      - name: Upload MCP server
+        if: matrix.archive == 'tar.gz'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-${{ matrix.target }}
+          path: |
+            ${{ env.MCP_ASSET }}
+            ${{ env.MCP_ASSET }}.sha256
+
   release:
     name: Publish Github Release
     needs: build
@@ -121,31 +229,70 @@ jobs:
           draft: false
           fail_on_unmatched_files: true
 
-  docker:
-    name: Publish Docker Image
+  docker-amd64:
+    name: Docker (amd64)
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/setup-qemu-action@v3
-
       - uses: docker/setup-buildx-action@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: scribe-x86_64-unknown-linux-gnu
+          path: docker-context/amd64/
+      - run: chmod +x docker-context/amd64/hs-scribe-server
+      - uses: docker/build-push-action@v5
+        with:
+          context: docker-context
+          file: crates/hs-scribe/docker/Dockerfile.prebuilt
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-amd64
+          cache-from: type=gha,scope=docker-amd64
+          cache-to: type=gha,mode=max,scope=docker-amd64
 
+  docker-arm64:
+    name: Docker (arm64)
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v5
         with:
           context: .
           file: crates/hs-scribe/docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/arm64
           push: true
-          tags: |
-            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}
-            ghcr.io/home-still/hs-scribe-server:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-arm64
+          cache-from: type=gha,scope=docker-arm64
+          cache-to: type=gha,mode=max,scope=docker-arm64
+
+  docker-manifest:
+    name: Docker Manifest
+    needs: [docker-amd64, docker-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Create multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }} \
+            -t ghcr.io/home-still/hs-scribe-server:latest \
+            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-amd64 \
+            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-arm64

@@ -4,9 +4,12 @@ use figment::{
     providers::{Env, Format, Yaml},
     Figment,
 };
-use hs_style::CONFIG_REL_PATH;
+use hs_common::event_bus::{EventBus, EventBusConfig};
+use hs_common::storage::{Storage, StorageConfig};
+use hs_common::CONFIG_REL_PATH;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Main application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,20 +29,29 @@ pub struct Config {
 
     /// Download config
     pub download: DownloadConfig,
+
+    /// Storage backend (local filesystem or S3/MinIO).
+    /// Loaded from the top-level `storage:` section of the config file.
+    #[serde(skip)]
+    pub storage: StorageConfig,
+
+    /// Event bus (noop or NATS). Loaded from top-level `events:` section.
+    #[serde(skip)]
+    pub events: EventBusConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             resilience: ResilienceConfig::default(),
-            download_path: dirs::home_dir()
-                .map(|h| h.join("Downloads/home-still/papers"))
-                .unwrap_or_else(|| PathBuf::from("./downloads")),
+            download_path: hs_common::resolve_project_dir().join("papers"),
             cache_path: dirs::home_dir()
-                .map(|h| h.join(".home-still/paper/cache"))
+                .map(|h| h.join(hs_common::HIDDEN_DIR).join("cache"))
                 .unwrap_or_else(|| PathBuf::from("./cache")),
             providers: ProvidersConfig::default(),
             download: DownloadConfig::default(),
+            storage: StorageConfig::default(),
+            events: EventBusConfig::default(),
         }
     }
 }
@@ -66,17 +78,38 @@ impl Config {
 
         figment = figment.merge(Env::prefixed("HOME_STILL_").split("_"));
 
-        let mut config: Config = figment.focus("paper").extract().context(format!(
+        let mut config: Config = figment.clone().focus("paper").extract().context(format!(
             "Failed to parse config ({}).  Run: hs config init",
             Config::config_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| CONFIG_REL_PATH.into())
         ))?;
 
+        config.storage = figment
+            .clone()
+            .focus("storage")
+            .extract::<StorageConfig>()
+            .unwrap_or_default();
+
+        config.events = figment
+            .focus("events")
+            .extract::<EventBusConfig>()
+            .unwrap_or_default();
+
         config.download_path = expand_tilde(&config.download_path);
         config.cache_path = expand_tilde(&config.cache_path);
 
         Ok(config)
+    }
+
+    /// Build the configured storage backend.
+    pub fn build_storage(&self) -> anyhow::Result<Arc<dyn Storage>> {
+        self.storage.build()
+    }
+
+    /// Build the configured event bus.
+    pub async fn build_event_bus(&self) -> anyhow::Result<Arc<dyn EventBus>> {
+        self.events.build().await
     }
 }
 
@@ -228,11 +261,11 @@ impl Default for DownloadConfig {
     }
 }
 
-fn expand_tilde(path: &PathBuf) -> PathBuf {
+fn expand_tilde(path: &std::path::Path) -> PathBuf {
     if let Ok(stripped) = path.strip_prefix("~") {
         if let Some(home) = dirs::home_dir() {
             return home.join(stripped);
         }
     }
-    path.clone()
+    path.to_path_buf()
 }

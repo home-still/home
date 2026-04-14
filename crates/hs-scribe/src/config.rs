@@ -2,8 +2,41 @@ use figment::{
     providers::{Env, Format, Serialized, Yaml},
     Figment,
 };
+use hs_common::event_bus::{EventBus, EventBusConfig};
+use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Resolve project_dir from ~/.home-still/config.yaml or default to ~/home-still.
+fn resolve_project_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    let config_path = home.join(".home-still/config.yaml");
+    if let Ok(contents) = std::fs::read_to_string(&config_path) {
+        let mut in_home = false;
+        for line in contents.lines() {
+            let t = line.trim();
+            if t.starts_with('#') || t.is_empty() {
+                continue;
+            }
+            if !line.starts_with(' ') && !line.starts_with('\t') {
+                in_home = t.starts_with("home:");
+            }
+            if in_home {
+                if let Some(val) = t.strip_prefix("project_dir:") {
+                    let val = val.trim().trim_matches('"').trim_matches('\'');
+                    if !val.is_empty() {
+                        if let Some(rest) = val.strip_prefix("~/") {
+                            return home.join(rest);
+                        }
+                        return PathBuf::from(val);
+                    }
+                }
+            }
+        }
+    }
+    home.join("home-still")
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum BackendChoice {
@@ -76,8 +109,8 @@ impl AppConfig {
     }
 
     /// Resolve a model filename to an absolute path.
-    /// If already absolute and exists, use as-is.                          
-    /// Otherwise look in `~/.local/share/home-still/models/`.              
+    /// If already absolute and exists, use as-is.
+    /// Otherwise look in `~/.home-still/models/`.
     pub fn resolve_model_path(name: &str) -> PathBuf {
         let p = PathBuf::from(name);
         if p.is_absolute() && p.exists() {
@@ -86,11 +119,11 @@ impl AppConfig {
         if p.exists() {
             return p;
         }
-        let data_dir = dirs::data_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"))
-            .join("home-still")
+        let models_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".home-still")
             .join("models");
-        data_dir.join(name)
+        models_dir.join(name)
     }
 
     pub fn resolved_layout_model_path(&self) -> PathBuf {
@@ -99,5 +132,95 @@ impl AppConfig {
 
     pub fn resolved_table_model_path(&self) -> PathBuf {
         Self::resolve_model_path(&self.table_model_path)
+    }
+}
+
+/// Client-side scribe configuration (server list, directories).
+/// Loaded from ~/.home-still/config.yaml under the "scribe" section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScribeConfig {
+    pub output_dir: PathBuf,
+    pub watch_dir: PathBuf,
+    pub corrupted_dir: PathBuf,
+    pub catalog_dir: PathBuf,
+    pub servers: Vec<String>,
+    /// When false, skip local scribe server init/start (client-only mode).
+    /// Machines that only run the watcher and forward to remote scribe servers
+    /// should set this to false.
+    pub local_server: bool,
+    /// Storage backend (loaded from top-level `storage:` section, not `scribe.storage`).
+    #[serde(skip)]
+    pub storage: StorageConfig,
+    /// Event bus (loaded from top-level `events:` section).
+    #[serde(skip)]
+    pub events: EventBusConfig,
+}
+
+impl Default for ScribeConfig {
+    fn default() -> Self {
+        Self {
+            output_dir: resolve_project_dir().join("markdown"),
+            watch_dir: resolve_project_dir().join("papers"),
+            corrupted_dir: resolve_project_dir().join("corrupted"),
+            catalog_dir: resolve_project_dir().join("catalog"),
+            servers: vec!["http://localhost:7433".into()],
+            local_server: true,
+            storage: StorageConfig::default(),
+            events: EventBusConfig::default(),
+        }
+    }
+}
+
+impl ScribeConfig {
+    pub fn load() -> Result<Self, Box<figment::Error>> {
+        let config_path = dirs::home_dir()
+            .map(|d| d.join(".home-still").join("config.yaml"))
+            .unwrap_or_default();
+
+        // Nest defaults under "scribe" key so they merge correctly with YAML
+        let defaults = serde_json::json!({
+            "scribe": {
+                "output_dir": ScribeConfig::default().output_dir,
+                "watch_dir": ScribeConfig::default().watch_dir,
+                "corrupted_dir": ScribeConfig::default().corrupted_dir,
+                "catalog_dir": ScribeConfig::default().catalog_dir,
+                "servers": ScribeConfig::default().servers,
+                "local_server": true,
+            }
+        });
+        let figment = Figment::from(Serialized::defaults(defaults))
+            .merge(Yaml::file(&config_path))
+            .merge(Env::prefixed("HS_SCRIBE_"));
+
+        let storage = figment
+            .clone()
+            .focus("storage")
+            .extract::<StorageConfig>()
+            .unwrap_or_default();
+
+        let events = figment
+            .clone()
+            .focus("events")
+            .extract::<EventBusConfig>()
+            .unwrap_or_default();
+
+        let mut cfg = figment
+            .focus("scribe")
+            .extract::<ScribeConfig>()
+            .unwrap_or_default();
+        cfg.storage = storage;
+        cfg.events = events;
+        Ok(cfg)
+    }
+
+    /// Build the configured storage backend.
+    pub fn build_storage(&self) -> anyhow::Result<Arc<dyn Storage>> {
+        self.storage.build()
+    }
+
+    /// Build the configured event bus.
+    pub async fn build_event_bus(&self) -> anyhow::Result<Arc<dyn EventBus>> {
+        self.events.build().await
     }
 }

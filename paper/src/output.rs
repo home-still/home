@@ -2,7 +2,7 @@ use crate::models::{Paper, SearchResult};
 use anyhow::Result;
 use serde::Serialize;
 
-use hs_style::styles::Styles;
+use hs_common::styles::Styles;
 use owo_colors::OwoColorize;
 
 /// Print any Serialize value as JSON to stdout.

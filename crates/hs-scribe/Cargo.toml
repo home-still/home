@@ -23,6 +23,7 @@ server = [
     "dep:tracing-subscriber",
     "dep:tokio-stream",
 ]
+openssl-vendored = ["dep:openssl"]
 cuda = ["server", "ort/cuda"]
 eval = ["server", "dep:edit-distance"]
 
@@ -38,6 +39,9 @@ tokio = { workspace = true }
 reqwest = { workspace = true, features = ["multipart", "stream"] }
 figment = { workspace = true }
 dirs = "6"
+hs-common = { workspace = true, features = ["service", "storage-s3", "events-nats", "logging"] }
+async-trait = "0.1"
+futures-util = "0.3"
 
 # Server Only
 axum = { version = "0.8", optional = true, features = ["multipart"] }
@@ -47,7 +51,7 @@ tracing-subscriber = { version = "0.3", features = [
 ], optional = true }
 pdfium-render = { version = "0.8.35", optional = true }
 image = { version = "0.25", optional = true }
-ort = { version = "=2.0.0-rc.12", features = ["ndarray"], optional = true }
+ort = { version = "=2.0.0-rc.11", features = ["ndarray"], optional = true }
 ndarray = { version = "0.17", optional = true }
 ollama-rs = { version = "0.3", features = ["stream"], optional = true }
 base64 = { version = "0.22", optional = true }
@@ -57,8 +61,12 @@ notify-debouncer-full = { version = "0.4", optional = true }
 ctrlc = { version = "3", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 edit-distance = { version = "2.1", optional = true }
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [[bin]]
 name = "hs-scribe-server"
 path = "src/server_main.rs"
 required-features = ["server"]
+
+[dev-dependencies]
+tempfile = "3"

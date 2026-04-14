@@ -1,0 +1,19 @@
+pub mod chunker;
+pub mod cli;
+pub mod client;
+pub mod config;
+pub mod error;
+pub mod event_watch;
+pub mod quality;
+pub mod types;
+
+#[cfg(feature = "server")]
+pub mod embed;
+#[cfg(feature = "server")]
+pub mod metadata;
+#[cfg(feature = "server")]
+pub mod pipeline;
+#[cfg(feature = "server")]
+pub mod qdrant;
+#[cfg(feature = "server")]
+pub mod server;

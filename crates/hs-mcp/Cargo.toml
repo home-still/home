@@ -1,0 +1,27 @@
+[package]
+name = "hs-mcp"
+version = "0.0.1"
+edition = "2021"
+
+[[bin]]
+name = "hs-mcp"
+path = "src/main.rs"
+
+[dependencies]
+hs-common = { workspace = true, features = ["cli", "service", "catalog", "auth", "storage-s3", "logging"] }
+hs-scribe = { path = "../hs-scribe", features = ["client"] }
+hs-distill = { path = "../hs-distill", features = ["client"] }
+paper = { path = "../../paper" }
+rmcp = { version = "1.3", features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = "0.4"
+clap = { workspace = true }
+tracing = { workspace = true }
