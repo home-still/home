@@ -1,7 +1,8 @@
 use qdrant_client::qdrant::{
-    Condition, CountPointsBuilder, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
-    Distance, FacetCountsBuilder, FieldType, Filter, HnswConfigDiffBuilder, PointStruct,
-    QueryPointsBuilder, SearchParamsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+    points_selector::PointsSelectorOneOf, Condition, CountPointsBuilder, CreateCollectionBuilder,
+    CreateFieldIndexCollectionBuilder, DeletePointsBuilder, Distance, FacetCountsBuilder,
+    FieldType, Filter, HnswConfigDiffBuilder, PointStruct, PointsSelector, QueryPointsBuilder,
+    SearchParamsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use uuid::Uuid;
@@ -276,6 +277,58 @@ pub async fn doc_exists(
 
     let count = response.result.map(|r| r.count).unwrap_or(0);
     Ok((count > 0, count))
+}
+
+/// Delete every point whose `doc_id` payload matches. Returns the count of
+/// points that existed before deletion (best-effort — Qdrant's delete response
+/// doesn't surface a deleted-count).
+pub async fn delete_by_doc_id(
+    client: &Qdrant,
+    collection_name: &str,
+    doc_id: &str,
+) -> Result<u64, DistillError> {
+    let (_, count) = doc_exists(client, collection_name, doc_id).await?;
+    if count == 0 {
+        return Ok(0);
+    }
+    let filter = Filter::must([Condition::matches("doc_id", doc_id.to_string())]);
+    let selector = PointsSelector {
+        points_selector_one_of: Some(PointsSelectorOneOf::Filter(filter)),
+    };
+    client
+        .delete_points(DeletePointsBuilder::new(collection_name).points(selector))
+        .await
+        .map_err(|e| DistillError::Qdrant(format!("Failed to delete points: {e}")))?;
+    Ok(count)
+}
+
+/// List every distinct `doc_id` present in the collection (via facet).
+pub async fn list_doc_ids(
+    client: &Qdrant,
+    collection_name: &str,
+    limit: u64,
+) -> Result<Vec<String>, DistillError> {
+    let response = client
+        .facet(
+            FacetCountsBuilder::new(collection_name, "doc_id")
+                .limit(limit)
+                .exact(true),
+        )
+        .await
+        .map_err(|e| DistillError::Qdrant(format!("Failed to list doc_ids: {e}")))?;
+    Ok(response
+        .hits
+        .into_iter()
+        .filter_map(|h| h.value.and_then(|v| v.variant.and_then(variant_to_string)))
+        .collect())
+}
+
+fn variant_to_string(v: qdrant_client::qdrant::value::Variant) -> Option<String> {
+    use qdrant_client::qdrant::value::Variant;
+    match v {
+        Variant::StringValue(s) => Some(s),
+        _ => None,
+    }
 }
 
 /// Count distinct documents in a collection via facet on doc_id.

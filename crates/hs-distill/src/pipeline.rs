@@ -13,9 +13,14 @@ use crate::types::EmbeddedChunk;
 
 /// Index a single markdown document: chunk -> metadata -> embed -> upsert.
 /// If `content` is provided, uses it directly instead of reading from disk.
+/// If `catalog_override` is provided, uses it directly and skips the
+/// filesystem-based catalog lookup — the canonical way for clients that
+/// already have the catalog entry (e.g. hs-mcp) to pass it in rather than
+/// relying on the distill server's local filesystem layout.
 pub async fn index_document(
     markdown_path: &Path,
     content: Option<&str>,
+    catalog_override: Option<hs_common::catalog::CatalogEntry>,
     config: &DistillServerConfig,
     embedder: &dyn Embedder,
     qdrant_client: &qdrant_client::Qdrant,
@@ -47,16 +52,24 @@ pub async fn index_document(
         return Ok(0);
     }
 
-    // Read catalog entry if available
+    // Prefer a caller-supplied catalog entry (e.g. hs-mcp loads it via
+    // Storage and passes it through the HTTP request). Fall back to the
+    // filesystem walk only when no override was provided — that path is
+    // still used by the CLI batch flow where markdown and catalog live
+    // as sibling directories.
     // With sharded layout: markdown/XX/stem.md → markdown/XX/ → markdown/ → project_root/
-    let catalog_dir = markdown_path
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .map(|p| p.join("catalog"))
-        .unwrap_or_default();
-
-    let catalog_entry = read_catalog_entry(&catalog_dir, stem);
+    let catalog_entry = match catalog_override {
+        Some(cat) => Some(cat),
+        None => {
+            let catalog_dir = markdown_path
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
+                .map(|p| p.join("catalog"))
+                .unwrap_or_default();
+            read_catalog_entry(&catalog_dir, stem)
+        }
+    };
     let page_offsets: Vec<PageOffset> = catalog_entry
         .as_ref()
         .and_then(|c| c.conversion.as_ref())
@@ -73,16 +86,8 @@ pub async fn index_document(
     });
 
     let mut meta = extract_rule_based(&markdown, stem, &markdown_path_str, catalog_entry.as_ref());
-
-    // Fallback: infer pdf_path from sibling papers/ directory
-    if meta.pdf_path.is_none() {
-        if let Some(parent) = markdown_path.parent().and_then(|p| p.parent()) {
-            let pdf_candidate = parent.join("papers").join(format!("{stem}.pdf"));
-            if pdf_candidate.exists() {
-                meta.pdf_path = Some(pdf_candidate.to_string_lossy().to_string());
-            }
-        }
-    }
+    // pdf_path is always populated as a sharded storage key by
+    // `extract_rule_based`; no host-filesystem fallback.
 
     // Optional LLM metadata extraction
     if config.llm_metadata {

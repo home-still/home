@@ -25,8 +25,15 @@ pub fn extract_rule_based(
         meta.abstract_text = cat.abstract_text.clone();
         meta.cited_by_count = cat.cited_by_count;
         meta.source = cat.source.clone();
-        meta.pdf_path = cat.pdf_path.clone();
     }
+
+    // Always derive pdf_path from the sharded storage key rather than the
+    // catalog's `pdf_path` field — that field is a host-local filesystem
+    // path (e.g. `/Users/.../papers/10/DOI.pdf`) written by whichever
+    // machine ran the downloader, and leaking it through search results
+    // exposes the downloader's home directory. The storage key is the
+    // canonical location and is identical across hosts.
+    meta.pdf_path = Some(format!("papers/{}", hs_common::sharded_key(stem, "pdf")));
 
     // Year may be filled from the document if catalog missing it.
     // DOI is NEVER regex-extracted: the first DOI-shaped string in a paper is

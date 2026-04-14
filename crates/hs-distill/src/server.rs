@@ -36,6 +36,8 @@ pub fn app(state: Arc<DistillServerState>) -> Router {
         .route("/readiness", get(handle_readiness))
         .route("/status", get(handle_status))
         .route("/exists/{doc_id}", get(handle_exists))
+        .route("/doc/{doc_id}", axum::routing::delete(handle_delete_doc))
+        .route("/docs", get(handle_list_docs))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
@@ -84,6 +86,36 @@ async fn handle_status(State(state): State<Arc<DistillServerState>>) -> impl Int
     }
 }
 
+async fn handle_delete_doc(
+    State(state): State<Arc<DistillServerState>>,
+    axum::extract::Path(doc_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match crate::qdrant::delete_by_doc_id(&state.qdrant, &state.config.collection_name, &doc_id)
+        .await
+    {
+        Ok(deleted) => {
+            Json(serde_json::json!({"doc_id": doc_id, "deleted": deleted})).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+async fn handle_list_docs(
+    State(state): State<Arc<DistillServerState>>,
+    axum::extract::Query(q): axum::extract::Query<ListDocsQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(100_000);
+    match crate::qdrant::list_doc_ids(&state.qdrant, &state.config.collection_name, limit).await {
+        Ok(ids) => Json(serde_json::json!({"doc_ids": ids})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ListDocsQuery {
+    limit: Option<u64>,
+}
+
 async fn handle_exists(
     State(state): State<Arc<DistillServerState>>,
     axum::extract::Path(doc_id): axum::extract::Path<String>,
@@ -102,6 +134,10 @@ struct IndexRequest {
     path: String,
     /// If provided, use this content instead of reading from disk
     content: Option<String>,
+    /// Optional catalog entry — when callers have already loaded it via
+    /// Storage, pass it in so the server doesn't need its own filesystem
+    /// copy of the catalog.
+    catalog: Option<hs_common::catalog::CatalogEntry>,
 }
 
 async fn handle_distill(
@@ -114,6 +150,7 @@ async fn handle_distill(
     match crate::pipeline::index_document(
         path,
         req.content.as_deref(),
+        req.catalog.clone(),
         &state.config,
         state.embedder.as_ref(),
         &state.qdrant,
@@ -147,6 +184,7 @@ async fn handle_distill_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
     let path = req.path.clone();
     let content = req.content.clone();
+    let catalog = req.catalog.clone();
 
     tokio::spawn(async move {
         let _guard = guard;
@@ -163,6 +201,7 @@ async fn handle_distill_stream(
         match crate::pipeline::index_document(
             doc_path,
             content.as_deref(),
+            catalog,
             &state.config,
             state.embedder.as_ref(),
             &state.qdrant,

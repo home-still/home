@@ -156,18 +156,29 @@ impl DistillClient {
     pub async fn index_file(&self, markdown_path: &str) -> Result<IndexResult> {
         let content = std::fs::read_to_string(markdown_path)
             .context(format!("Failed to read {markdown_path}"))?;
-        self.index_content(markdown_path, &content).await
+        self.index_content(markdown_path, &content, None).await
     }
 
     /// Index markdown already held in memory. `path_hint` is used server-side for
     /// logging and catalog lookup (derive the doc stem) but the server never
-    /// reads it from disk.
-    pub async fn index_content(&self, path_hint: &str, content: &str) -> Result<IndexResult> {
+    /// reads it from disk. Pass `catalog` when the caller already has the
+    /// catalog entry so metadata ends up on the Qdrant payload even when the
+    /// server has no local catalog directory.
+    pub async fn index_content(
+        &self,
+        path_hint: &str,
+        content: &str,
+        catalog: Option<&hs_common::catalog::CatalogEntry>,
+    ) -> Result<IndexResult> {
         let url = format!("{}/distill", self.server_url);
+        let mut body = serde_json::json!({ "path": path_hint, "content": content });
+        if let Some(cat) = catalog {
+            body["catalog"] = serde_json::to_value(cat).unwrap_or(serde_json::Value::Null);
+        }
         let resp = self
             .http
             .post(&url)
-            .json(&serde_json::json!({ "path": path_hint, "content": content }))
+            .json(&body)
             .send()
             .await
             .context("Failed to send index request")?;
@@ -187,13 +198,26 @@ impl DistillClient {
         storage: &dyn Storage,
         key: &str,
     ) -> Result<IndexResult> {
+        self.index_from_storage_with_catalog(storage, key, None)
+            .await
+    }
+
+    /// Same as `index_from_storage` but forwards a catalog entry loaded by
+    /// the caller (so the server's metadata extraction doesn't have to walk
+    /// the filesystem).
+    pub async fn index_from_storage_with_catalog(
+        &self,
+        storage: &dyn Storage,
+        key: &str,
+        catalog: Option<&hs_common::catalog::CatalogEntry>,
+    ) -> Result<IndexResult> {
         let bytes = storage
             .get(key)
             .await
             .with_context(|| format!("Failed to read {key} from storage"))?;
         let content = String::from_utf8(bytes)
             .with_context(|| format!("Markdown at {key} is not valid UTF-8"))?;
-        self.index_content(key, &content).await
+        self.index_content(key, &content, catalog).await
     }
 
     /// Index a markdown file with streaming progress via NDJSON.
@@ -282,6 +306,48 @@ impl DistillClient {
             .context("Failed to reach distill server")?;
         let data: serde_json::Value = resp.json().await.context("Invalid exists response")?;
         Ok(data["exists"].as_bool().unwrap_or(false))
+    }
+
+    /// Delete every point whose `doc_id` matches. Returns the number of
+    /// points that were deleted.
+    pub async fn delete_doc(&self, doc_id: &str) -> Result<u64> {
+        let url = format!("{}/doc/{}", self.server_url, doc_id);
+        let resp = self
+            .http
+            .delete(&url)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .context("Failed to reach distill server")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Server error {status}: {body}");
+        }
+        let data: serde_json::Value = resp.json().await.context("Invalid delete response")?;
+        Ok(data["deleted"].as_u64().unwrap_or(0))
+    }
+
+    /// List every distinct `doc_id` present in the collection.
+    pub async fn list_docs(&self, limit: u64) -> Result<Vec<String>> {
+        let url = format!("{}/docs?limit={}", self.server_url, limit);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .context("Failed to reach distill server")?;
+        let data: serde_json::Value = resp.json().await.context("Invalid list_docs response")?;
+        let ids = data["doc_ids"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ids)
     }
 }
 

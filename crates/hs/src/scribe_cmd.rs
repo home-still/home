@@ -571,11 +571,6 @@ fn looks_like_html(bytes: &[u8]) -> bool {
     lower.contains("<!doctype html") || lower.contains("<html") || lower.contains("<head")
 }
 
-/// Detect stub PDFs: 1-page results with minimal content (landing pages, paywalls).
-fn is_stub_pdf(total_pages: u64, markdown: &str) -> bool {
-    total_pages <= 1 && markdown.chars().filter(|c| !c.is_whitespace()).count() < 500
-}
-
 /// Move a corrupt/invalid file to the corrupted directory.
 fn quarantine_file(path: &std::path::Path, corrupted_dir: &std::path::Path) {
     let _ = std::fs::create_dir_all(corrupted_dir);
@@ -1326,7 +1321,7 @@ async fn convert_and_save_pool(
                 let total_pages = total_pages_counter.load(std::sync::atomic::Ordering::Relaxed);
 
                 // Quarantine stub PDFs (landing pages, paywalls)
-                if is_stub_pdf(total_pages, &md) {
+                if hs_scribe::postprocess::is_stub_pdf(total_pages, &md) {
                     reporter.warn(&format!(
                         "{stem}: stub PDF (1pg, minimal content) → quarantined"
                     ));

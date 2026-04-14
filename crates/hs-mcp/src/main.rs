@@ -106,6 +106,26 @@ struct DistillIndexParams {
     stem: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DistillPurgeParams {
+    #[schemars(description = "doc_id whose chunks should be deleted from Qdrant")]
+    doc_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DistillReconcileParams {
+    #[schemars(description = "If true, report orphans without deleting. Default: true.")]
+    #[serde(default = "default_true")]
+    dry_run: bool,
+    #[schemars(description = "Maximum number of doc_ids to scan. Default: 100000.")]
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 // ── MCP Server ──────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -659,7 +679,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Convert a PDF from the papers directory to markdown using the scribe server. Takes a stem name (filename without extension). Returns the converted markdown text.",
+        description = "Convert a PDF from the papers directory to markdown using the scribe server. Takes a stem name (filename without extension). Writes markdown to storage, updates the catalog conversion block, and returns a summary. Use `markdown_read` to fetch content.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -672,21 +692,81 @@ impl HomeStillMcp {
         Parameters(p): Parameters<ScribeConvertParams>,
     ) -> Result<String, String> {
         let client = self.scribe_client().ok_or("No scribe server configured")?;
+        let server_url = self
+            .scribe_servers
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("");
 
         // PDFs live flat in the papers bucket under the sharded key (e.g.
         // `10/DOI.pdf`) — same key the downloader writes (paper/src/providers/
         // downloader.rs:277, 335). No `papers/` prefix: that's the bucket name.
-        let key = hs_common::sharded_key(&p.stem, "pdf");
-        let pdf_bytes = self
-            .storage
-            .get(&key)
-            .await
-            .map_err(|e| format!("Cannot read PDF '{}' from storage ({key}): {e}", p.stem))?;
+        let pdf_key = hs_common::sharded_key(&p.stem, "pdf");
+        let pdf_bytes =
+            self.storage.get(&pdf_key).await.map_err(|e| {
+                format!("Cannot read PDF '{}' from storage ({pdf_key}): {e}", p.stem)
+            })?;
 
-        client
+        let start = std::time::Instant::now();
+        let md = client
             .convert(pdf_bytes)
             .await
-            .map_err(|e| format!("Conversion failed: {e}"))
+            .map_err(|e| format!("Conversion failed: {e}"))?;
+        let duration_secs = start.elapsed().as_secs();
+
+        let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
+        if truncations > 0 {
+            tracing::info!("{}: cleaned {} repetition site(s)", p.stem, truncations);
+        }
+
+        let page_offsets = hs_common::catalog::compute_page_offsets(&md);
+        let total_pages = page_offsets.len() as u64;
+
+        if hs_scribe::postprocess::is_stub_pdf(total_pages, &md) {
+            return Err(format!(
+                "{}: stub PDF (≤1 page, <500 non-whitespace chars) — not persisted",
+                p.stem
+            ));
+        }
+
+        let md_key = format!(
+            "{}/{}",
+            self.markdown_prefix.trim_end_matches('/'),
+            hs_common::sharded_key(&p.stem, "md")
+        );
+        let md_bytes = md.into_bytes();
+        let bytes_written = md_bytes.len();
+        self.storage
+            .put(&md_key, md_bytes)
+            .await
+            .map_err(|e| format!("Failed to write markdown to storage ({md_key}): {e}"))?;
+
+        let short_server = server_url
+            .strip_prefix("http://")
+            .or_else(|| server_url.strip_prefix("https://"))
+            .unwrap_or(server_url);
+        hs_common::catalog::update_conversion_catalog_via(
+            &*self.storage,
+            &self.catalog_prefix,
+            &p.stem,
+            short_server,
+            duration_secs,
+            total_pages,
+            page_offsets,
+            &md_key,
+        )
+        .await
+        .map_err(|e| format!("Failed to update catalog for '{}': {e}", p.stem))?;
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "stem": p.stem,
+            "markdown_key": md_key,
+            "bytes_written": bytes_written,
+            "total_pages": total_pages,
+            "duration_secs": duration_secs,
+            "server": short_server,
+        }))
+        .unwrap_or_default())
     }
 
     // ── Distill Tools ──────────────────────────────────────────
@@ -806,7 +886,20 @@ impl HomeStillMcp {
             ));
         }
 
-        match client.index_from_storage(&*self.storage, &key).await {
+        // Load the catalog entry (if any) so metadata lands on Qdrant
+        // payloads even when the distill server has no local copy of the
+        // catalog directory.
+        let catalog_entry = hs_common::catalog::read_catalog_entry_via(
+            &*self.storage,
+            &self.catalog_prefix,
+            &p.stem,
+        )
+        .await;
+
+        match client
+            .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
+            .await
+        {
             Ok(result) => {
                 // Write embedding metadata to catalog via Storage.
                 if let Err(e) = hs_common::catalog::update_embedding_catalog_via(
@@ -833,6 +926,86 @@ impl HomeStillMcp {
             }
             Err(e) => Err(format!("Indexing failed: {e}")),
         }
+    }
+
+    #[tool(
+        description = "Delete every Qdrant chunk for a given doc_id. Use to clear orphaned vectors after markdown has been removed, or to force a clean re-index.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn distill_purge(
+        &self,
+        Parameters(p): Parameters<DistillPurgeParams>,
+    ) -> Result<String, String> {
+        let client = self
+            .distill_client()
+            .ok_or("No distill server configured")?;
+        match client.delete_doc(&p.doc_id).await {
+            Ok(deleted) => Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "doc_id": p.doc_id,
+                "deleted": deleted,
+            }))
+            .unwrap_or_default()),
+            Err(e) => Err(format!("Purge failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Reconcile Qdrant against markdown storage: find doc_ids whose markdown object is missing and optionally delete them. Defaults to dry_run=true — pass dry_run=false to actually delete.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn distill_reconcile(
+        &self,
+        Parameters(p): Parameters<DistillReconcileParams>,
+    ) -> Result<String, String> {
+        let client = self
+            .distill_client()
+            .ok_or("No distill server configured")?;
+        let limit = p.limit.unwrap_or(100_000);
+        let doc_ids = client
+            .list_docs(limit)
+            .await
+            .map_err(|e| format!("list_docs failed: {e}"))?;
+
+        let mut orphans: Vec<String> = Vec::new();
+        for doc_id in &doc_ids {
+            let key = format!(
+                "{}/{}",
+                self.markdown_prefix.trim_end_matches('/'),
+                hs_common::sharded_key(doc_id, "md")
+            );
+            if !self.storage.exists(&key).await.unwrap_or(false) {
+                orphans.push(doc_id.clone());
+            }
+        }
+
+        let mut deleted_total: u64 = 0;
+        if !p.dry_run {
+            for doc_id in &orphans {
+                match client.delete_doc(doc_id).await {
+                    Ok(n) => deleted_total += n,
+                    Err(e) => tracing::warn!("purge {doc_id} failed: {e}"),
+                }
+            }
+        }
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "dry_run": p.dry_run,
+            "scanned_doc_ids": doc_ids.len(),
+            "orphan_count": orphans.len(),
+            "orphans": orphans,
+            "points_deleted": deleted_total,
+        }))
+        .unwrap_or_default())
     }
 
     // ── System Tools ───────────────────────────────────────────

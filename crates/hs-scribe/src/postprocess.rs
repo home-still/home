@@ -3,6 +3,11 @@
 //! Detects and truncates repetition loops that the VLM model produces,
 //! such as "and modeling and modeling and modeling..." or "ggggggg...".
 
+/// Detect stub PDFs: 1-page results with minimal content (landing pages, paywalls).
+pub fn is_stub_pdf(total_pages: u64, markdown: &str) -> bool {
+    total_pages <= 1 && markdown.chars().filter(|c| !c.is_whitespace()).count() < 500
+}
+
 /// Clean repetition artifacts from markdown text.
 ///
 /// Returns `(cleaned_text, truncation_count)` where `truncation_count`
