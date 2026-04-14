@@ -673,11 +673,10 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self.scribe_client().ok_or("No scribe server configured")?;
 
-        let key = format!(
-            "{}/{}",
-            self.papers_prefix,
-            hs_common::sharded_key(&p.stem, "pdf")
-        );
+        // PDFs live flat in the papers bucket under the sharded key (e.g.
+        // `10/DOI.pdf`) — same key the downloader writes (paper/src/providers/
+        // downloader.rs:277, 335). No `papers/` prefix: that's the bucket name.
+        let key = hs_common::sharded_key(&p.stem, "pdf");
         let pdf_bytes = self
             .storage
             .get(&key)
@@ -791,17 +790,23 @@ impl HomeStillMcp {
             .distill_client()
             .ok_or("No distill server configured")?;
 
-        let md_path = hs_common::sharded_path(&self.legacy_markdown_dir, &p.stem, "md");
-        let path_str = md_path.to_string_lossy().to_string();
-
-        if !md_path.exists() {
+        // Read markdown through Storage (same path markdown_read uses:
+        // `{markdown_prefix}/{sharded_key(stem, "md")}`). distill server
+        // accepts content in the request body, so we send bytes and let it
+        // embed without touching its own filesystem.
+        let key = format!(
+            "{}/{}",
+            self.markdown_prefix.trim_end_matches('/'),
+            hs_common::sharded_key(&p.stem, "md")
+        );
+        if !self.storage.exists(&key).await.unwrap_or(false) {
             return Err(format!(
-                "Markdown not found for '{}'. Convert the PDF first.",
+                "Markdown not found for '{}' at storage key '{key}'. Convert the PDF first.",
                 p.stem
             ));
         }
 
-        match client.index_file(&path_str).await {
+        match client.index_from_storage(&*self.storage, &key).await {
             Ok(result) => {
                 // Write embedding metadata to catalog via Storage.
                 if let Err(e) = hs_common::catalog::update_embedding_catalog_via(
