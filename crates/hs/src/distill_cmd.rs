@@ -154,6 +154,7 @@ pub async fn dispatch(
         } => cmd_search(&query, limit, year, topic, server.as_deref(), global).await,
         DistillCmd::Status { server } => cmd_status(server.as_deref(), reporter).await,
         DistillCmd::WatchEvents { server } => cmd_watch_events(server, reporter).await,
+        DistillCmd::Diagnose { stem, verbose } => cmd_diagnose(&stem, verbose, reporter).await,
     }
 }
 
@@ -1074,5 +1075,136 @@ async fn cmd_search(
         }
     }
 
+    Ok(())
+}
+
+// ── Diagnose ────────────────────────────────────────────────────
+
+async fn cmd_diagnose(stem: &str, verbose: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    use hs_distill::chunker::{chunk_markdown, ChunkerConfig};
+    use hs_distill::quality;
+    use hs_distill::types::DocumentMeta;
+
+    let client_cfg = DistillClientConfig::load().context("loading distill client config")?;
+    let server_cfg = DistillServerConfig::load().context("loading distill server config")?;
+    let storage = client_cfg
+        .build_storage()
+        .context("building storage backend")?;
+
+    let markdown = hs_common::markdown::read_markdown_via(&*storage, "markdown", stem)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("markdown not found for stem '{stem}'"))?;
+    let non_ws = markdown.chars().filter(|c| !c.is_whitespace()).count();
+    reporter.status(
+        "Markdown",
+        &format!("{} bytes ({} non-ws chars)", markdown.len(), non_ws),
+    );
+    if markdown.trim().is_empty() {
+        reporter.error(
+            "Markdown is empty after trim — pipeline would return Ok(0) with no catalog write.",
+        );
+        return Ok(());
+    }
+
+    let catalog_entry =
+        hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem).await;
+    let page_offsets = catalog_entry
+        .as_ref()
+        .and_then(|e| e.conversion.as_ref())
+        .map(|c| c.pages.clone())
+        .unwrap_or_default();
+    let title = catalog_entry
+        .as_ref()
+        .and_then(|e| e.title.clone())
+        .unwrap_or_else(|| stem.to_string());
+
+    let doc_meta = DocumentMeta {
+        doc_id: stem.to_string(),
+        title: Some(title),
+        markdown_path: format!("markdown/{stem}.md"),
+        ..Default::default()
+    };
+    let chunker_config = ChunkerConfig {
+        max_tokens: server_cfg.chunk_max_tokens,
+        overlap_tokens: server_cfg.chunk_overlap,
+        ..Default::default()
+    };
+    let chunks = chunk_markdown(&markdown, &doc_meta, &page_offsets, &chunker_config);
+    reporter.status(
+        "Chunked",
+        &format!("{} chunk(s) before filter", chunks.len()),
+    );
+
+    let mut accepted = 0usize;
+    let mut rejected_too_short = 0usize;
+    let mut rejected_dominant_char = 0usize;
+    let mut rejected_low_diversity = 0usize;
+    let mut rejected_dominant_ngram = 0usize;
+
+    for chunk in &chunks {
+        let reason = quality::explain(&chunk.raw_text);
+        let non_ws = chunk
+            .raw_text
+            .chars()
+            .filter(|c: &char| !c.is_whitespace())
+            .count();
+        let page = chunk
+            .page
+            .map(|p| format!("p{p}"))
+            .unwrap_or_else(|| "p?".into());
+        let header = format!(
+            "[{:02}] L{}-{} {} len={} non-ws={}",
+            chunk.chunk_index,
+            chunk.span.line_start,
+            chunk.span.line_end,
+            page,
+            chunk.raw_text.len(),
+            non_ws
+        );
+        match &reason {
+            None => {
+                accepted += 1;
+                reporter.status("Accept", &header);
+            }
+            Some(r) => {
+                match r {
+                    quality::RejectReason::TooShort { .. } => rejected_too_short += 1,
+                    quality::RejectReason::DominantChar { .. } => rejected_dominant_char += 1,
+                    quality::RejectReason::LowDiversity { .. } => rejected_low_diversity += 1,
+                    quality::RejectReason::DominantNgram { .. } => rejected_dominant_ngram += 1,
+                }
+                reporter.error(&format!("{header} — reject: {r}"));
+            }
+        }
+        let preview_source: &str = if verbose {
+            chunk.raw_text.as_str()
+        } else {
+            let end = chunk.raw_text.len().min(160);
+            let cut = chunk
+                .raw_text
+                .char_indices()
+                .take_while(|(i, _): &(usize, char)| *i < end)
+                .last()
+                .map(|(i, c): (usize, char)| i + c.len_utf8())
+                .unwrap_or(0);
+            &chunk.raw_text[..cut]
+        };
+        let oneline: String = preview_source
+            .chars()
+            .map(|c| if c == '\n' { ' ' } else { c })
+            .collect();
+        println!("    {oneline}");
+    }
+
+    reporter.status(
+        "Summary",
+        &format!(
+            "accept={accepted} reject={} (short={rejected_too_short}, dom_char={rejected_dominant_char}, low_div={rejected_low_diversity}, dom_ngram={rejected_dominant_ngram})",
+            chunks.len() - accepted,
+        ),
+    );
+    if accepted == 0 && !chunks.is_empty() {
+        reporter.error("All chunks rejected — pipeline would return Ok(0) with no catalog write.");
+    }
     Ok(())
 }

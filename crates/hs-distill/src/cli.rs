@@ -67,4 +67,14 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Explain why a stem would (or would not) produce chunks: fetch its
+    /// markdown, run the chunker + quality filter, and print per-chunk
+    /// accept/reject reasons.
+    Diagnose {
+        /// Paper stem (filename without extension)
+        stem: String,
+        /// Show the full chunk text for each chunk
+        #[arg(long)]
+        verbose: bool,
+    },
 }
