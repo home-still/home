@@ -406,116 +406,75 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
     use serde_json::Value;
 
     let client = crate::mcp_client::McpClient::from_default_creds().await?;
-    let status = client
+    let status_json = client
         .call_tool("system_status", Value::Object(Default::default()))
         .await?;
+    let snap: hs_common::status::StatusSnapshot = serde_json::from_value(status_json)?;
+    Ok(snapshot_to_dashboard(snap))
+}
 
-    let pipeline = status
-        .get("pipeline")
-        .cloned()
-        .unwrap_or(Value::Object(Default::default()));
-
-    let pdf_count = pipeline
-        .get("documents")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let md_count = pipeline
-        .get("markdown")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let catalog_count = pipeline
-        .get("catalog_entries")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let embedded_docs = pipeline
-        .get("embedded_documents")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let embedded_chunks = pipeline
-        .get("embedded_chunks")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    let scribe_servers = instances_to_rows(status.get("scribe_instances"));
-    let distill_servers = instances_to_rows(status.get("distill_instances"));
-
-    let qdrant = status.get("qdrant").cloned().unwrap_or(Value::Null);
-    let (qdrant_healthy, qdrant_url) = if qdrant.is_null() {
-        (false, String::new())
-    } else {
-        let collection = qdrant
-            .get("collection")
-            .and_then(|v| v.as_str())
-            .unwrap_or("academic_papers");
-        (true, format!("gateway → {collection}"))
-    };
-    let qdrant_version = distill_servers
+/// Map the shared StatusSnapshot into the CLI's TUI-local DashboardData.
+/// Cloud-client mode uses this as the only adapter; TUI-only state
+/// (watcher/indexer/corrupted) is left at its default.
+fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardData {
+    let scribe_servers = snap
+        .scribe_instances
         .iter()
-        .find(|s| s.healthy)
-        .map(|s| s.version.clone())
+        .map(instance_to_status)
+        .collect();
+    let distill_servers: Vec<ServiceStatus> = snap
+        .distill_instances
+        .iter()
+        .map(instance_to_status)
+        .collect();
+
+    let qdrant_healthy = snap.qdrant.is_some();
+    let qdrant_url = snap
+        .qdrant
+        .as_ref()
+        .map(|q| format!("gateway → {}", q.collection))
+        .unwrap_or_default();
+    let qdrant_version = snap
+        .qdrant
+        .as_ref()
+        .map(|q| q.qdrant_version.clone())
         .unwrap_or_default();
 
-    let history = match client
-        .call_tool("catalog_recent", serde_json::json!({"limit": 100}))
-        .await
-    {
-        Ok(Value::Array(rows)) => rows
-            .into_iter()
-            .filter_map(|row| {
-                let activity = match row.get("activity").and_then(|v| v.as_str()) {
-                    Some("Download") => "Download",
-                    Some("Convert") => "Convert",
-                    Some("Embed") => "Embed",
-                    _ => return None,
-                };
-                let name = row
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let when = row
-                    .get("at")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc));
-                let detail = match activity {
-                    "Download" => row
-                        .get("detail_bytes")
-                        .and_then(|v| v.as_u64())
-                        .map(fmt_bytes)
-                        .unwrap_or_default(),
-                    "Convert" => {
-                        let pages = row.get("pages").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let secs = row
-                            .get("duration_secs")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        format!("{pages}pg {secs}s")
-                    }
-                    "Embed" => {
-                        let chunks = row.get("chunks").and_then(|v| v.as_u64()).unwrap_or(0);
-                        format!("{chunks} chunks")
-                    }
-                    _ => String::new(),
-                };
-                Some(HistoryEvent {
-                    activity,
-                    name,
-                    detail,
-                    when,
-                })
+    let history = snap
+        .history
+        .into_iter()
+        .filter_map(|ev| {
+            let activity = match ev.activity.as_str() {
+                "Download" => "Download",
+                "Convert" => "Convert",
+                "Embed" => "Embed",
+                _ => return None,
+            };
+            let when = chrono::DateTime::parse_from_rfc3339(&ev.at)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc));
+            // Re-derive human detail from structured fields so the CLI can
+            // format byte counts (fmt_bytes) and rich metadata consistently.
+            let detail = match activity {
+                "Download" => ev.detail_bytes.map(fmt_bytes).unwrap_or(ev.detail),
+                _ => ev.detail,
+            };
+            Some(HistoryEvent {
+                activity,
+                name: ev.name,
+                detail,
+                when,
             })
-            .collect(),
-        _ => vec![],
-    };
+        })
+        .collect();
 
-    Ok(DashboardData {
-        doc_counts: Some((pdf_count, 0)),
-        markdown_counts: Some((md_count, 0)),
-        catalog_count: Some(catalog_count),
+    DashboardData {
+        doc_counts: Some((snap.pipeline.documents, 0)),
+        markdown_counts: Some((snap.pipeline.markdown, 0)),
+        catalog_count: Some(snap.pipeline.catalog_entries),
         corrupted_count: None,
-        embedded_docs,
-        embedded_chunks,
+        embedded_docs: snap.pipeline.embedded_documents.unwrap_or(0),
+        embedded_chunks: snap.pipeline.embedded_chunks.unwrap_or(0),
         scribe_servers,
         distill_servers,
         qdrant_healthy,
@@ -528,69 +487,22 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
         fs_stalled_docs: false,
         fs_stalled_markdown: false,
         fs_stalled_catalog: false,
-    })
+    }
 }
 
-fn instances_to_rows(value: Option<&serde_json::Value>) -> Vec<ServiceStatus> {
-    let Some(arr) = value.and_then(|v| v.as_array()) else {
-        return Vec::new();
+fn instance_to_status(inst: &hs_common::status::ServiceInstance) -> ServiceStatus {
+    let detail = if inst.compute_device.is_empty() {
+        String::new()
+    } else {
+        format!("({})", inst.compute_device)
     };
-    arr.iter()
-        .map(|inst| {
-            let url = inst
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let healthy = inst
-                .get("healthy")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let enabled = inst
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let device = inst
-                .get("device_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let metadata = inst.get("metadata");
-            let version = metadata
-                .and_then(|m| m.get("version"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let compute = metadata
-                .and_then(|m| m.get("compute_device"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let mut detail = String::new();
-            if !device.is_empty() {
-                detail.push_str(&device);
-            }
-            if !compute.is_empty() {
-                if !detail.is_empty() {
-                    detail.push(' ');
-                }
-                detail.push_str(&format!("({compute})"));
-            }
-            let activity = if !enabled {
-                "disabled".into()
-            } else if healthy {
-                "idle".into()
-            } else {
-                "unhealthy".into()
-            };
-            ServiceStatus {
-                url,
-                healthy,
-                detail,
-                activity,
-                version,
-            }
-        })
-        .collect()
+    ServiceStatus {
+        url: inst.url.clone(),
+        healthy: inst.healthy,
+        detail,
+        activity: inst.activity.clone(),
+        version: inst.version.clone(),
+    }
 }
 
 fn read_watcher_status(output_dir: &Path, watch_dir: &Path) -> WatcherInfo {

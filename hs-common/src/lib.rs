@@ -130,6 +130,8 @@ pub mod service;
 #[cfg(feature = "catalog")]
 pub mod catalog;
 
+pub mod status;
+
 #[cfg(feature = "storage")]
 pub mod storage;
 

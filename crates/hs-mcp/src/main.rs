@@ -842,59 +842,169 @@ impl HomeStillMcp {
         )
     )]
     async fn system_status(&self) -> Result<String, String> {
-        let pdf_count = count_ext_via(&*self.storage, &self.papers_prefix, "pdf").await;
-        let html_count = count_ext_via(&*self.storage, &self.papers_prefix, "html").await;
-        let doc_count = pdf_count + html_count;
-        let md_count = count_ext_via(&*self.storage, &self.markdown_prefix, "md").await;
-        let catalog_count = count_ext_via(&*self.storage, &self.catalog_prefix, "yaml").await;
-
-        let distill_stats = if let Some(c) = self.distill_client() {
-            c.status().await.ok()
-        } else {
-            None
-        };
-
-        let scribe_instances = self.scribe_servers.clone();
-        let distill_instances = self.distill_servers.clone();
-
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "pipeline": {
-                "documents": doc_count,
-                "pdfs": pdf_count,
-                "html_fallbacks": html_count,
-                "markdown": md_count,
-                "catalog_entries": catalog_count,
-                "embedded_documents": distill_stats.as_ref().map(|s| s.documents_count),
-                "embedded_chunks": distill_stats.as_ref().map(|s| s.points_count),
-            },
-            "scribe_instances": scribe_instances,
-            "distill_instances": distill_instances,
-            "qdrant": distill_stats.as_ref().map(|s| serde_json::json!({
-                "collection": s.collection,
-                "compute_device": s.compute_device,
-                "embed_model": s.embed_model,
-            })),
-        }))
-        .unwrap_or_default())
+        let snap = self.build_status_snapshot(20).await;
+        Ok(serde_json::to_string_pretty(&snap).unwrap_or_default())
     }
 }
 
-/// Count keys under `prefix` in the Storage backend whose filename ends with
-/// `.<ext>`. Returns 0 on any backend error so `system_status` stays non-fatal.
-async fn count_ext_via(storage: &dyn Storage, prefix: &str, ext: &str) -> u64 {
-    let suffix = format!(".{ext}");
-    match storage.list(prefix).await {
-        Ok(objs) => objs
-            .iter()
-            .filter(|o| {
-                o.key.ends_with(&suffix)
-                    && o.key
-                        .rsplit('/')
-                        .next()
-                        .is_some_and(|name| !name.starts_with("._"))
-            })
-            .count() as u64,
-        Err(_) => 0,
+impl HomeStillMcp {
+    /// Build the unified StatusSnapshot used by both `system_status` (MCP) and
+    /// `hs status` (CLI cloud-client mode). Truth source for pipeline state.
+    pub(crate) async fn build_status_snapshot(
+        &self,
+        history_limit: usize,
+    ) -> hs_common::status::StatusSnapshot {
+        use hs_common::status::{
+            build_history, collect_pipeline_counts, QdrantInfo, ServiceInstance, StatusSnapshot,
+        };
+
+        // Per-distill health fanout (also yields embedded doc/chunk counts).
+        let mut distill_instances: Vec<ServiceInstance> = Vec::new();
+        let mut embedded_documents: Option<u64> = None;
+        let mut embedded_chunks: Option<u64> = None;
+        let mut qdrant: Option<QdrantInfo> = None;
+        for url in &self.distill_servers {
+            let client = hs_distill::client::DistillClient::new(url);
+            let health = client.health().await.ok();
+            let readiness = client.readiness().await.ok();
+            let status = client.status().await.ok();
+
+            let healthy = health.is_some();
+            let version = health
+                .as_ref()
+                .map(|h| h.version.clone())
+                .unwrap_or_default();
+            let compute_device = status
+                .as_ref()
+                .map(|s| s.compute_device.clone())
+                .or_else(|| health.as_ref().map(|h| h.compute_device.clone()))
+                .unwrap_or_default();
+            let embed_model = status
+                .as_ref()
+                .map(|s| s.embed_model.clone())
+                .or_else(|| health.as_ref().map(|h| h.embed_model.clone()))
+                .unwrap_or_default();
+            let collection = status
+                .as_ref()
+                .map(|s| s.collection.clone())
+                .or_else(|| health.as_ref().map(|h| h.collection.clone()))
+                .unwrap_or_default();
+            let in_flight = readiness.as_ref().map(|r| r.in_flight as u64).unwrap_or(0);
+            let activity = if !healthy {
+                "unhealthy".to_string()
+            } else if in_flight > 0 {
+                format!("{in_flight} embedding")
+            } else {
+                "idle".to_string()
+            };
+
+            if let Some(s) = status.as_ref() {
+                if embedded_documents.is_none() {
+                    embedded_documents = Some(s.documents_count);
+                    embedded_chunks = Some(s.points_count);
+                }
+            }
+            if qdrant.is_none() && !collection.is_empty() {
+                qdrant = Some(QdrantInfo {
+                    collection: collection.clone(),
+                    compute_device: compute_device.clone(),
+                    embed_model: embed_model.clone(),
+                    qdrant_version: health
+                        .as_ref()
+                        .map(|h| h.qdrant_version.clone())
+                        .unwrap_or_default(),
+                });
+            }
+
+            distill_instances.push(ServiceInstance {
+                url: url.clone(),
+                healthy,
+                version,
+                compute_device,
+                embed_model,
+                collection,
+                activity,
+                in_flight,
+                slots_total: None,
+                slots_available: None,
+            });
+        }
+
+        // Per-scribe health fanout.
+        let mut scribe_instances: Vec<ServiceInstance> = Vec::new();
+        for url in &self.scribe_servers {
+            let client = hs_scribe::client::ScribeClient::new(url);
+            let health = client.health().await.ok();
+            let readiness = client.readiness().await.ok();
+
+            let healthy = health.is_some();
+            let version = health
+                .as_ref()
+                .map(|h| h.version.clone())
+                .unwrap_or_default();
+            let (in_flight, slots_total, slots_available) = match readiness.as_ref() {
+                Some(r) => (
+                    r.in_flight_conversions as u64,
+                    Some(r.vlm_slots_total as u64),
+                    Some(r.vlm_slots_available as u64),
+                ),
+                None => (0, None, None),
+            };
+            let activity = if !healthy {
+                "unhealthy".to_string()
+            } else if in_flight > 0 {
+                format!("{in_flight} converting")
+            } else {
+                "idle".to_string()
+            };
+
+            scribe_instances.push(ServiceInstance {
+                url: url.clone(),
+                healthy,
+                version,
+                compute_device: String::new(),
+                embed_model: String::new(),
+                collection: String::new(),
+                activity,
+                in_flight,
+                slots_total,
+                slots_available,
+            });
+        }
+
+        let pipeline = collect_pipeline_counts(
+            &*self.storage,
+            &self.papers_prefix,
+            &self.markdown_prefix,
+            &self.catalog_prefix,
+            embedded_documents,
+            embedded_chunks,
+        )
+        .await;
+
+        // History from the catalog (same source as `catalog_recent`).
+        let history = match hs_common::catalog::list_catalog_entries_via(
+            &*self.storage,
+            &self.catalog_prefix,
+        )
+        .await
+        {
+            Ok(triples) => {
+                let pairs: Vec<(String, hs_common::catalog::CatalogEntry)> =
+                    triples.into_iter().map(|(s, _m, e)| (s, e)).collect();
+                build_history(&pairs, history_limit)
+            }
+            Err(_) => Vec::new(),
+        };
+
+        StatusSnapshot {
+            pipeline,
+            scribe_instances,
+            distill_instances,
+            qdrant,
+            history,
+            generated_at: Some(chrono::Utc::now().to_rfc3339()),
+        }
     }
 }
 
