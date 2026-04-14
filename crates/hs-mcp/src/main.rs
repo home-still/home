@@ -456,6 +456,73 @@ impl HomeStillMcp {
     }
 
     #[tool(
+        description = "Most recent catalog activity across all papers (download/convert/embed events). One row per event, sorted newest first. Used by the status dashboard's History pane.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn catalog_recent(
+        &self,
+        Parameters(p): Parameters<ListParams>,
+    ) -> Result<String, String> {
+        let triples =
+            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
+                .await
+                .map_err(|e| format!("catalog list failed: {e}"))?;
+
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        for (stem, _meta, entry) in triples {
+            let name = entry.title.clone().unwrap_or_else(|| stem.clone());
+            if let Some(ref dl_at) = entry.downloaded_at {
+                let size = entry
+                    .file_size_bytes
+                    .map(|b| b.to_string())
+                    .unwrap_or_default();
+                events.push(serde_json::json!({
+                    "activity": "Download",
+                    "stem": stem,
+                    "name": name,
+                    "detail_bytes": entry.file_size_bytes,
+                    "detail": size,
+                    "at": dl_at,
+                }));
+            }
+            if let Some(ref conv) = entry.conversion {
+                events.push(serde_json::json!({
+                    "activity": "Convert",
+                    "stem": stem,
+                    "name": name,
+                    "pages": conv.total_pages,
+                    "duration_secs": conv.duration_secs,
+                    "at": conv.converted_at,
+                }));
+            }
+            if let Some(ref emb) = entry.embedding {
+                events.push(serde_json::json!({
+                    "activity": "Embed",
+                    "stem": stem,
+                    "name": name,
+                    "chunks": emb.chunks_indexed,
+                    "at": emb.embedded_at,
+                }));
+            }
+        }
+
+        events.sort_by(|a, b| {
+            let a_at = a.get("at").and_then(|v| v.as_str()).unwrap_or("");
+            let b_at = b.get("at").and_then(|v| v.as_str()).unwrap_or("");
+            b_at.cmp(a_at)
+        });
+        let limit = p.limit.unwrap_or(30);
+        events.truncate(limit);
+
+        Ok(serde_json::to_string_pretty(&events).unwrap_or_default())
+    }
+
+    #[tool(
         description = "Read full catalog entry for a paper. Returns JSON with metadata, conversion info, page offsets, download URLs.",
         annotations(
             read_only_hint = true,

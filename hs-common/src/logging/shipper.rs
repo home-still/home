@@ -51,6 +51,7 @@ pub(crate) async fn ship_once(
     for path in files {
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 tracing::warn!(error = %e, path = %path.display(), "log-shipper: read failed");
                 continue;
@@ -72,12 +73,14 @@ pub(crate) async fn ship_once(
         match storage.put(&key, bytes).await {
             Ok(()) => {
                 if delete_on_success {
-                    if let Err(e) = tokio::fs::remove_file(&path).await {
-                        tracing::warn!(
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => tracing::warn!(
                             error = %e,
                             path = %path.display(),
                             "log-shipper: delete spool file failed",
-                        );
+                        ),
                     }
                 }
             }

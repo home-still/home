@@ -263,6 +263,13 @@ async fn install_service(
                 .unwrap_or(home_dir.as_path())
                 .join(".fastembed_cache");
 
+            let secrets_path = home_dir.join(".home-still").join("secrets.env");
+            let env_file_line = if secrets_path.exists() {
+                format!("EnvironmentFile=-{}\n", secrets_path.display())
+            } else {
+                String::new()
+            };
+
             let unit = format!(
                 r#"[Unit]
 Description=Home-Still {service_type} server
@@ -272,7 +279,7 @@ After=network.target
 Type=simple
 User={user}
 WorkingDirectory={home}
-Environment=HS_ADVERTISE_IP={ip}
+{env_file_line}Environment=HS_ADVERTISE_IP={ip}
 Environment=FASTEMBED_CACHE_PATH={cache}
 ExecStart={hs_path} serve {service_type} --port {port}
 Restart=always
@@ -329,12 +336,29 @@ WantedBy=multi-user.target
         #[cfg(target_os = "macos")]
         {
             let label = format!("com.home-still.{service_type}");
-            let plist_dir = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
-                .join("Library/LaunchAgents");
+            let home_dir =
+                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+            let plist_dir = home_dir.join("Library/LaunchAgents");
             let plist_path = plist_dir.join(format!("{label}.plist"));
 
             std::fs::create_dir_all(&plist_dir)?;
+
+            let mut secret_entries = String::new();
+            let secrets_path = home_dir.join(".home-still").join("secrets.env");
+            if let Ok(contents) = std::fs::read_to_string(&secrets_path) {
+                for line in contents.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((k, v)) = line.split_once('=') {
+                        let v = v.trim_matches('"').trim_matches('\'');
+                        secret_entries.push_str(&format!(
+                            "        <key>{k}</key>\n        <string>{v}</string>\n"
+                        ));
+                    }
+                }
+            }
 
             let plist = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -357,7 +381,7 @@ WantedBy=multi-user.target
         <string>{ip}</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    </dict>
+{secret_entries}    </dict>
     <key>KeepAlive</key>
     <true/>
     <key>RunAtLoad</key>

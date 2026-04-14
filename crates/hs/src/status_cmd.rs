@@ -496,6 +496,60 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
         });
     }
 
+    let history = match client
+        .call_tool("catalog_recent", serde_json::json!({"limit": 100}))
+        .await
+    {
+        Ok(Value::Array(rows)) => rows
+            .into_iter()
+            .filter_map(|row| {
+                let activity = match row.get("activity").and_then(|v| v.as_str()) {
+                    Some("Download") => "Download",
+                    Some("Convert") => "Convert",
+                    Some("Embed") => "Embed",
+                    _ => return None,
+                };
+                let name = row
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let when = row
+                    .get("at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                let detail = match activity {
+                    "Download" => row
+                        .get("detail_bytes")
+                        .and_then(|v| v.as_u64())
+                        .map(fmt_bytes)
+                        .unwrap_or_default(),
+                    "Convert" => {
+                        let pages = row.get("pages").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let secs = row
+                            .get("duration_secs")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        format!("{pages}pg {secs}s")
+                    }
+                    "Embed" => {
+                        let chunks = row.get("chunks").and_then(|v| v.as_u64()).unwrap_or(0);
+                        format!("{chunks} chunks")
+                    }
+                    _ => String::new(),
+                };
+                Some(HistoryEvent {
+                    activity,
+                    name,
+                    detail,
+                    when,
+                })
+            })
+            .collect(),
+        _ => vec![],
+    };
+
     Ok(DashboardData {
         doc_counts: Some((pdf_count, 0)),
         markdown_counts: Some((md_count, 0)),
@@ -510,7 +564,7 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
         qdrant_version,
         watcher: WatcherInfo::Stopped,
         indexer: IndexerInfo::Stopped,
-        history: vec![],
+        history,
         loading: false,
         fs_stalled_docs: false,
         fs_stalled_markdown: false,

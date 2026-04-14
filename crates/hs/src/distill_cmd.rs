@@ -370,10 +370,6 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
         }
     }
 
-    // For ort load-dynamic: tell it where to find libonnxruntime.so
-    let ort_dylib = std::env::var("ORT_DYLIB_PATH")
-        .unwrap_or_else(|_| "/usr/lib/libonnxruntime.so".to_string());
-
     // fastembed defaults cache_dir to CWD/.fastembed_cache, which breaks
     // when launched from systemd (CWD = /). Use a stable absolute path.
     let fastembed_cache = std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| {
@@ -394,7 +390,6 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
 
     let child = std::process::Command::new(&binary)
         .env("LD_LIBRARY_PATH", &ld_path)
-        .env("ORT_DYLIB_PATH", &ort_dylib)
         .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
         .stdout(log_file)
         .stderr(log_err)
@@ -553,9 +548,6 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         }
     }
 
-    let ort_dylib = std::env::var("ORT_DYLIB_PATH")
-        .unwrap_or_else(|_| "/usr/lib/libonnxruntime.so".to_string());
-
     let fastembed_cache = std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| {
         let beside_binary = binary
             .parent()
@@ -598,7 +590,6 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
     // Run in foreground — inherit stdout/stderr, block until exit
     let status = tokio::process::Command::new(&binary)
         .env("LD_LIBRARY_PATH", &ld_path)
-        .env("ORT_DYLIB_PATH", &ort_dylib)
         .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
         .env("HS_DISTILL_PORT", port.to_string())
         .kill_on_drop(true)

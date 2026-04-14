@@ -212,9 +212,27 @@ async fn handle_config(
                 .with_prompt("CORE API key (https://core.ac.uk, Enter to skip)")
                 .allow_empty(true)
                 .interact()?;
+            let s3_secret: String = Input::new()
+                .with_prompt("S3 secret key for object storage (Enter to skip; required for MinIO/S3 backend)")
+                .allow_empty(true)
+                .interact()?;
 
             std::fs::write(&config_path, generate_config(&email, &core_key))?;
             reporter.status("Created", &format!("{}", config_path.display()));
+
+            if !s3_secret.is_empty() {
+                let secrets_path = parent.join("secrets.env");
+                std::fs::write(&secrets_path, format!("HS_S3_SECRET_KEY={}\n", s3_secret))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &secrets_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+                reporter.status("Created", &format!("{}", secrets_path.display()));
+            }
 
             // Create project directory structure
             let project = hs_common::resolve_project_dir();
