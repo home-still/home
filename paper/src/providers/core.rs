@@ -19,7 +19,7 @@ struct CoreResponse {
 
 #[derive(Debug, Deserialize)]
 struct CoreWork {
-    id: Option<String>,
+    id: Option<i64>,
     title: Option<String>,
     authors: Option<Vec<CoreAuthor>>,
     #[serde(rename = "abstract")]
@@ -79,7 +79,7 @@ impl CoreProvider {
         }
 
         Paper {
-            id: work.id.unwrap_or_default(),
+            id: work.id.map(|n| n.to_string()).unwrap_or_default(),
             title: work.title.unwrap_or_default(),
             authors,
             abstract_text: work.abstract_text,

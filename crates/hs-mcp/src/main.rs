@@ -675,12 +675,16 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self.scribe_client().ok_or("No scribe server configured")?;
 
-        // Prefer sharded layout (rc.228+); fall back to flat for pre-sharding papers.
-        let sharded = hs_common::sharded_path(&self.legacy_papers_dir, &p.stem, "pdf");
-        let flat = self.legacy_papers_dir.join(format!("{}.pdf", p.stem));
-        let pdf_path = if sharded.exists() { sharded } else { flat };
-        let pdf_bytes =
-            std::fs::read(&pdf_path).map_err(|e| format!("Cannot read PDF '{}': {e}", p.stem))?;
+        let key = format!(
+            "{}/{}",
+            self.papers_prefix,
+            hs_common::sharded_key(&p.stem, "pdf")
+        );
+        let pdf_bytes = self
+            .storage
+            .get(&key)
+            .await
+            .map_err(|e| format!("Cannot read PDF '{}' from storage ({key}): {e}", p.stem))?;
 
         client
             .convert(pdf_bytes)
