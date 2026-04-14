@@ -18,6 +18,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = hs_common::secrets::load_default_secrets();
     let logging_handle = install_logging().await;
     let args = Args::parse();
 

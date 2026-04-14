@@ -152,9 +152,31 @@ fn write_config(path: &PathBuf, value: &serde_json::Value) -> Result<()> {
 // ── Install ────────────────────────────────────────────────────
 
 fn build_stdio_entry(mcp_bin: &Path) -> serde_json::Value {
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "command": mcp_bin.to_string_lossy(),
-    })
+    });
+    if let Some(env) = secrets_as_json() {
+        entry["env"] = env;
+    }
+    entry
+}
+
+/// Load `~/.home-still/secrets.env` and return its KEY=VALUE pairs as a JSON
+/// object suitable for dropping into a Claude Desktop / opencode MCP entry's
+/// `env` field. Returns `None` if the file is absent or empty.
+fn secrets_as_json() -> Option<serde_json::Value> {
+    let path = hs_common::secrets::default_path()?;
+    let entries = hs_common::secrets::parse_secrets_from_path(&path)
+        .ok()
+        .flatten()?;
+    if entries.is_empty() {
+        return None;
+    }
+    let map: serde_json::Map<String, serde_json::Value> = entries
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .collect();
+    Some(serde_json::Value::Object(map))
 }
 
 fn build_remote_entry(gateway_url: &str) -> serde_json::Value {
@@ -166,11 +188,15 @@ fn build_remote_entry(gateway_url: &str) -> serde_json::Value {
 }
 
 fn build_opencode_stdio_entry(mcp_bin: &Path) -> serde_json::Value {
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "type": "local",
         "command": [mcp_bin.to_string_lossy()],
         "enabled": true,
-    })
+    });
+    if let Some(env) = secrets_as_json() {
+        entry["environment"] = env;
+    }
+    entry
 }
 
 fn build_opencode_remote_entry(gateway_url: &str) -> serde_json::Value {

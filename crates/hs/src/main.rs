@@ -61,6 +61,7 @@ fn init_logging(
 }
 
 fn main() -> ExitCode {
+    let _ = hs_common::secrets::load_default_secrets();
     let cli = Cli::parse();
 
     let (logging_handle, primary_storage_cfg, logs_bucket) = init_logging(&cli);

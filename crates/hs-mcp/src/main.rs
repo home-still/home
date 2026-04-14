@@ -1182,6 +1182,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = hs_common::secrets::load_default_secrets();
     let args = Args::parse();
 
     // In stdio mode, stdout is the MCP protocol — never write human-readable
