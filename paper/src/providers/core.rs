@@ -8,7 +8,7 @@ use crate::config::CoreConfig;
 use crate::error::PaperError;
 use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType, SortBy};
 use crate::ports::provider::PaperProvider;
-use crate::providers::response::check_response;
+use crate::providers::response::{check_response, parse_json_or_log};
 
 #[derive(Debug, Deserialize)]
 struct CoreResponse {
@@ -173,10 +173,7 @@ impl PaperProvider for CoreProvider {
         }
         check_response(&response, "core")?;
 
-        let body: CoreResponse = response
-            .json()
-            .await
-            .map_err(|e| PaperError::ParseError(format!("Failed to parse CORE response: {}", e)))?;
+        let body: CoreResponse = parse_json_or_log(response, "core").await?;
 
         let papers: Vec<Paper> = body
             .results
@@ -220,10 +217,7 @@ impl PaperProvider for CoreProvider {
         }
         check_response(&response, "core")?;
 
-        let body: CoreResponse = response
-            .json()
-            .await
-            .map_err(|e| PaperError::ParseError(format!("Failed to parse CORE response: {}", e)))?;
+        let body: CoreResponse = parse_json_or_log(response, "core").await?;
 
         Ok(body
             .results

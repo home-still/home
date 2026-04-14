@@ -63,6 +63,8 @@ pub struct HealthResponse {
     pub version: String,
     #[serde(default)]
     pub qdrant_version: String,
+    #[serde(default)]
+    pub embed_model: String,
 }
 
 /// Readiness response from the distill server.
@@ -93,6 +95,8 @@ pub struct StatusResponse {
     #[serde(default)]
     pub documents_count: u64,
     pub compute_device: String,
+    #[serde(default)]
+    pub embed_model: String,
 }
 
 pub type DistillStreamLine = hs_common::service::protocol::StreamLine<DistillProgress, IndexResult>;

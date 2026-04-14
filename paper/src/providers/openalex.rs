@@ -283,9 +283,8 @@ impl PaperProvider for OpenAlexProvider {
 
         check_response(&response, "openalex")?;
 
-        let body: OpenAlexResponse = response.json().await.map_err(|e| {
-            PaperError::ParseError(format!("Failed to parse OpenAlex response: {}", e))
-        })?;
+        let body: OpenAlexResponse =
+            crate::providers::response::parse_json_or_log(response, "openalex").await?;
 
         let papers: Vec<Paper> = body
             .results

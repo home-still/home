@@ -54,6 +54,7 @@ async fn handle_health(State(state): State<Arc<DistillServerState>>) -> impl Int
         collection: state.config.collection_name.clone(),
         version: env!("HS_VERSION").to_string(),
         qdrant_version,
+        embed_model: state.config.embedding.model.clone(),
     })
 }
 
@@ -76,6 +77,7 @@ async fn handle_status(State(state): State<Arc<DistillServerState>>) -> impl Int
             points_count,
             documents_count: docs.unwrap_or(0),
             compute_device: state.embedder.device().to_string(),
+            embed_model: state.config.embedding.model.clone(),
         })
         .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),

@@ -852,8 +852,8 @@ impl HomeStillMcp {
             None
         };
 
-        let scribe_instances = hs_common::service::registry::discover_instances("scribe").await;
-        let distill_instances = hs_common::service::registry::discover_instances("distill").await;
+        let scribe_instances = self.scribe_servers.clone();
+        let distill_instances = self.distill_servers.clone();
 
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "pipeline": {
@@ -870,6 +870,7 @@ impl HomeStillMcp {
             "qdrant": distill_stats.as_ref().map(|s| serde_json::json!({
                 "collection": s.collection,
                 "compute_device": s.compute_device,
+                "embed_model": s.embed_model,
             })),
         }))
         .unwrap_or_default())
