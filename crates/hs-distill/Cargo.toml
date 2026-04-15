@@ -1,0 +1,60 @@
+[package]
+name = "hs-distill"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["client"]
+client = []
+server = [
+    "dep:axum",
+    "dep:fastembed",
+    "dep:ort",
+    "dep:qdrant-client",
+    "dep:ollama-rs",
+    "dep:regex",
+    "dep:xxhash-rust",
+    "dep:uuid",
+    "dep:tokio-stream",
+    "dep:tempfile",
+    "dep:tracing-subscriber",
+]
+cuda = ["server", "ort/cuda"]
+
+[[bin]]
+name = "hs-distill-server"
+path = "src/server_main.rs"
+required-features = ["server"]
+
+[dependencies]
+# Always (client + server)
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+figment = { workspace = true }
+hs-common = { workspace = true, features = ["service", "catalog", "storage-s3", "events-nats", "logging"] }
+async-trait = { workspace = true }
+futures-util = "0.3"
+chrono = { workspace = true }
+dirs = "6"
+
+# Server only
+axum = { workspace = true, optional = true }
+fastembed = { workspace = true, optional = true }
+ort = { version = "=2.0.0-rc.11", optional = true }
+qdrant-client = { workspace = true, optional = true }
+ollama-rs = { version = "0.3", features = ["stream"], optional = true }
+regex = { workspace = true, optional = true }
+xxhash-rust = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+tokio-stream = { version = "0.1", optional = true }
+tempfile = { version = "3", optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,144 @@
+#![allow(dead_code)] // Gateway is WIP — unused code is for upcoming features
+
+use std::sync::Arc;
+
+use axum::routing::{any, get, post};
+use axum::Router;
+use clap::Parser;
+
+mod config;
+mod enrollment;
+mod oauth;
+mod proxy;
+pub mod registry;
+mod state;
+
+use config::GatewayConfig;
+use state::GatewayState;
+
+/// hs-gateway — authenticated reverse proxy for home-still cloud access
+#[derive(Parser)]
+#[command(name = "hs-gateway", version = env!("HS_VERSION"))]
+struct Args {
+    /// Override listen address (default: from config or 127.0.0.1:7440)
+    #[arg(long)]
+    listen: Option<String>,
+
+    /// Override gateway URL (for enrollment responses)
+    #[arg(long)]
+    gateway_url: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let _ = hs_common::secrets::load_default_secrets();
+    let logging_handle = install_logging().await;
+
+    let args = Args::parse();
+    let config = GatewayConfig::load()?;
+    let secret = config.load_or_create_secret()?;
+
+    let listen = args.listen.unwrap_or_else(|| config.listen.clone());
+    let gateway_url = args
+        .gateway_url
+        .unwrap_or_else(|| format!("http://{listen}"));
+
+    tracing::info!("Starting gateway on {listen}");
+    tracing::info!("Routes: {:?}", config.routes.keys().collect::<Vec<_>>());
+
+    let state = Arc::new(GatewayState {
+        config,
+        secret,
+        http: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()?,
+        enrollments: enrollment::new_enrollment_store(),
+        gateway_url,
+        cf_access_client_id: None,     // TODO: load from config
+        cf_access_client_secret: None, // TODO: load from config
+        auth_codes: oauth::new_auth_code_store(),
+        oauth_clients: oauth::new_client_store(),
+        registry: registry::ServiceRegistry::new(),
+    });
+
+    let app = Router::new()
+        // OAuth 2.1 discovery endpoints
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth::handle_protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth::handle_auth_server_metadata),
+        )
+        // OAuth 2.1 authorization + token + registration
+        .route(
+            "/authorize",
+            get(oauth::handle_authorize_get).post(oauth::handle_authorize_post),
+        )
+        .route("/token", post(oauth::handle_token))
+        .route("/register", post(oauth::handle_register))
+        // Unauthenticated endpoints
+        .route("/health", get(handle_health))
+        .route("/cloud/enroll", post(enrollment::handle_enroll))
+        .route("/cloud/refresh", post(enrollment::handle_refresh))
+        // Admin: register enrollment codes (only accessible from localhost)
+        .route("/cloud/admin/invite", post(enrollment::handle_admin_invite))
+        // Service registry
+        .route("/registry/register", post(registry::handle_register))
+        .route(
+            "/registry/deregister",
+            axum::routing::delete(registry::handle_deregister),
+        )
+        .route("/registry/heartbeat", post(registry::handle_heartbeat))
+        .route("/registry/services", get(registry::handle_services))
+        .route("/registry/set-enabled", post(registry::handle_set_enabled))
+        // Authenticated proxy — catch all remaining paths
+        .fallback(any(proxy::proxy_handler))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    tracing::info!("Gateway listening on {listen}");
+
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+
+    if let Some(h) = logging_handle {
+        let _ = h.shutdown().await;
+    }
+    result?;
+    Ok(())
+}
+
+async fn handle_health() -> &'static str {
+    "ok"
+}
+
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to install CTRL+C handler");
+    tracing::info!("Shutting down gateway");
+}
+
+async fn install_logging() -> Option<hs_common::logging::LoggingHandle> {
+    use hs_common::logging::{self, LoggingConfig, StderrOutput};
+    let (primary_storage, logs_yaml) = logging::load_config_sections();
+    let mut cfg = LoggingConfig::for_service("hs-gateway")
+        .with_stderr(StderrOutput::EnvFilter("info".into()));
+    logs_yaml.apply_to(&mut cfg);
+    let mut handle = match logging::init(cfg) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("hs-gateway: logging init failed: {e:#}");
+            return None;
+        }
+    };
+    if let Some(storage_cfg) = primary_storage {
+        if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket).await {
+            let _ = handle.spawn_shipper(storage);
+        }
+    }
+    Some(handle)
+}

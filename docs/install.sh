@@ -4,6 +4,15 @@ set -eu
 REPO="home-still/home"
 TOOL="hs"
 INSTALL_DIR="${HOME}/.local/bin"
+PRE=false
+
+# Parse flags
+for arg in "$@"; do
+    case "$arg" in
+        --pre) PRE=true ;;
+        *)     echo "Usage: install.sh [--pre]"; exit 1 ;;
+    esac
+done
 
 # Detect platform
 OS="$(uname -s)"
@@ -23,8 +32,13 @@ esac
 
 TARGET="${arch}-${os}"
 
-# Get latest version from GitHub API
-VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)"
+# Get version from GitHub API (--pre includes release candidates)
+if [ "$PRE" = true ]; then
+    # Fetch all recent tags, extract versions, sort by semver, pick highest
+    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=10" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -1)"
+else
+    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
+fi
 
 if [ -z "${VERSION}" ]; then
     echo "Failed to fetch latest version"
@@ -42,6 +56,17 @@ curl -fsSL "${URL}" | tar -xz -C "${INSTALL_DIR}"
 chmod +x "${INSTALL_DIR}/${TOOL}"
 
 echo "Installed ${TOOL} to ${INSTALL_DIR}/${TOOL}"
+
+# Install companion binaries if available for this platform
+for COMPANION in hs-distill-server hs-gateway hs-mcp; do
+    COMP_ARCHIVE="${COMPANION}-${VERSION}-${TARGET}.tar.gz"
+    COMP_URL="https://github.com/${REPO}/releases/download/${VERSION}/${COMP_ARCHIVE}"
+    if curl -fsSL -o /dev/null --head "${COMP_URL}" 2>/dev/null; then
+        curl -fsSL "${COMP_URL}" | tar -xz -C "${INSTALL_DIR}"
+        chmod +x "${INSTALL_DIR}/${COMPANION}"
+        echo "Installed ${COMPANION} to ${INSTALL_DIR}/${COMPANION}"
+    fi
+done
 
 # Check if INSTALL_DIR is in PATH
 case ":${PATH}:" in

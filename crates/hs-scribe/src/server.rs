@@ -9,12 +9,15 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 
 pub struct ServerState {
     pub processor: Processor,
     pub config: AppConfig,
+    pub vlm_sem: Arc<tokio::sync::Semaphore>,
+    pub in_flight: Arc<AtomicUsize>,
 }
 
 pub fn app(state: Arc<ServerState>) -> Router {
@@ -22,6 +25,7 @@ pub fn app(state: Arc<ServerState>) -> Router {
         .route("/scribe", post(handle_scribe))
         .route("/scribe/stream", post(handle_scribe_stream))
         .route("/health", get(handle_health))
+        .route("/readiness", get(handle_readiness))
         .route("/info", get(handle_info))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256MB
         .with_state(state)
@@ -30,7 +34,20 @@ pub fn app(state: Arc<ServerState>) -> Router {
 async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok", "layout_model": state.processor.has_layout_detector(),
-        "table_model": state.processor.has_table_recognizer()
+        "table_model": state.processor.has_table_recognizer(),
+        "version": env!("HS_VERSION"),
+    }))
+}
+
+async fn handle_readiness(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    let total = state.config.vlm_concurrency;
+    let available = state.vlm_sem.available_permits();
+    let in_flight = state.in_flight.load(Ordering::Relaxed);
+    axum::Json(serde_json::json!({
+        "ready": available > 0,
+        "vlm_slots_total": total,
+        "vlm_slots_available": available,
+        "in_flight_conversions": in_flight,
     }))
 }
 
@@ -60,6 +77,7 @@ async fn extract_pdf(mut multipart: Multipart) -> Result<Vec<u8>, Response> {
 }
 
 /// Write PDF bytes to a temp file and return the handle (keeps file alive).
+#[allow(clippy::result_large_err)]
 fn write_tmp_pdf(pdf_bytes: &[u8]) -> Result<tempfile::NamedTempFile, Response> {
     let tmp = tempfile::NamedTempFile::new()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response())?;
@@ -68,7 +86,11 @@ fn write_tmp_pdf(pdf_bytes: &[u8]) -> Result<tempfile::NamedTempFile, Response> 
     Ok(tmp)
 }
 
+use hs_common::service::inflight::InFlightGuard;
+
 async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipart) -> Response {
+    let _guard = InFlightGuard::new(&state.in_flight);
+
     let pdf_bytes = match extract_pdf(multipart).await {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -80,10 +102,15 @@ async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipa
     };
 
     let path = tmp.path().to_str().unwrap_or_default();
-    match state.processor.process_pdf(path).await {
+    match state
+        .processor
+        .process_pdf_with_shared_sem(path, Arc::clone(&state.vlm_sem))
+        .await
+    {
         Ok(md) => (StatusCode::OK, md).into_response(),
         Err(e) => {
             tracing::error!("Processing failed: {e:#}");
+            tracing::debug!("Full error chain: {e:?}");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
         }
     }
@@ -103,23 +130,27 @@ async fn handle_scribe_stream(
         Err(resp) => return resp,
     };
 
+    let in_flight_guard = InFlightGuard::new(&state.in_flight);
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
     let path = tmp.path().to_string_lossy().to_string();
+    let vlm_sem = Arc::clone(&state.vlm_sem);
 
     tokio::spawn(async move {
         let _tmp = tmp; // keep temp file alive for the duration of processing
+        let _guard = in_flight_guard;
 
         let tx_progress = tx.clone();
         let on_progress = move |event: crate::client::ProgressEvent| {
             let line = StreamLine::Progress(event);
             if let Ok(json) = serde_json::to_string(&line) {
-                let _ = tx_progress.blocking_send(Ok(format!("{json}\n")));
+                let _ = tx_progress.try_send(Ok(format!("{json}\n")));
             }
         };
 
         match state
             .processor
-            .process_pdf_with_progress(&path, on_progress)
+            .process_pdf_with_progress_and_sem(&path, on_progress, vlm_sem)
             .await
         {
             Ok(md) => {
@@ -130,6 +161,7 @@ async fn handle_scribe_stream(
             }
             Err(e) => {
                 tracing::error!("Processing failed: {e:#}");
+                tracing::debug!("Full error chain: {e:?}");
                 let line = StreamLine::Error(format!("{e:#}"));
                 if let Ok(json) = serde_json::to_string(&line) {
                     let _ = tx.send(Ok(format!("{json}\n"))).await;

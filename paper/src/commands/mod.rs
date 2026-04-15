@@ -4,10 +4,10 @@ pub mod paper;
 use std::sync::Arc;
 
 use anyhow::Result;
-use hs_style::global_args::GlobalArgs;
-use hs_style::mode::OutputMode;
-use hs_style::reporter::Reporter;
-use hs_style::styles::Styles;
+use hs_common::global_args::GlobalArgs;
+use hs_common::mode::OutputMode;
+use hs_common::reporter::Reporter;
+use hs_common::styles::Styles;
 
 use crate::cli::PaperCmd;
 

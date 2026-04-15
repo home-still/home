@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "hs-style", "paper"]
+members = ["crates/*", "hs-common", "paper"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -15,13 +15,21 @@ serde_json = "1"
 dirs = "6"
 anyhow = "1"
 thiserror = "2"
-hs-style = { path = "hs-style" }
+hs-common = { path = "hs-common" }
 owo-colors = { version = "4.3", features = ["supports-colors"] }
 serde_yaml_ng = "0.10"
 figment = { version = "0.10", features = ["yaml", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dialoguer = "0.11"
+async-trait = "0.1"
+regex = "1"
+axum = { version = "0.8", features = ["multipart"] }
+qdrant-client = { version = "1", features = ["serde"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+uuid = { version = "1", features = ["v4", "v5"] }
+fastembed = "5"
+chrono = { version = "0.4", features = ["serde"] }
 
 [profile.release]
 opt-level = 3

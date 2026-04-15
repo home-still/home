@@ -50,6 +50,7 @@ struct EpmcFullTextUrlList {
 struct EpmcFullTextUrl {
     #[serde(rename = "documentStyle")]
     document_style: Option<String>,
+    #[allow(dead_code)]
     availability: Option<String>,
     url: String,
 }

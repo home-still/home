@@ -29,12 +29,10 @@ pub fn relevance_score(query: &str, paper: &Paper) -> f64 {
         } else {
             0.0
         }
+    } else if title_lower.contains(&query_lower) {
+        1.0
     } else {
-        if title_lower.contains(&query_lower) {
-            1.0
-        } else {
-            0.0
-        }
+        0.0
     };
 
     // 3. Title match density (20%): query terms / total title words

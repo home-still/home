@@ -1,6 +1,6 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
-use hs_style::global_args::GlobalArgs;
+use hs_common::global_args::GlobalArgs;
 
 use crate::cli::ConfigAction;
 use crate::output;

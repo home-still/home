@@ -26,11 +26,11 @@ jobs:
       
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo fmt -p hs -p paper -p hs-style -p hs-scribe --check      
-      - run: cargo clippy --workspace --all-targets -- -D warnings          
-        if: matrix.os == 'ubuntu-latest'                                    
-      - run: cargo clippy --workspace --exclude hs-scribe --all-targets -- -D warnings                                                                 
-        if: matrix.os != 'ubuntu-latest'                        
+      - run: cargo fmt -p hs -p paper -p hs-common -p hs-scribe -p hs-distill --check      
+      - run: cargo clippy --workspace --exclude hs-scribe --all-targets -- -D warnings
+      - run: cargo clippy -p hs-scribe -- -D warnings
+      - run: cargo clippy -p hs-scribe --features server --all-targets -- -D warnings
+        if: matrix.os == 'ubuntu-latest'
       - run: cargo test --workspace --exclude hs-scribe                     
       - run: cargo test -p hs-scribe --features server          
         if: matrix.os == 'ubuntu-latest'                                    

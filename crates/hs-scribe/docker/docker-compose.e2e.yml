@@ -18,7 +18,7 @@ services:
     image: ${SCRIBE_IMAGE:-ghcr.io/home-still/hs-scribe-server}:${SCRIBE_TAG:-latest}
     container_name: scribe-e2e
     ports:
-      - "7432:7432"
+      - "7433:7433"
     volumes:
       - ${MODELS_DIR:-/tmp/models}:/models:ro
     environment:

@@ -9,14 +9,30 @@ path = "src/main.rs"
 
 [dependencies]
 hs-scribe = { path = "../hs-scribe", features = ["client"] }
+hs-distill = { path = "../hs-distill", features = ["client"] }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-hs-style = { workspace = true, features = ["cli"] }
+hs-common = { workspace = true, features = ["cli", "service", "catalog", "compose", "auth", "storage", "storage-s3", "logging"] }
 owo-colors = { workspace = true }
 paper = { path = "../../paper" }
 dirs = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 dialoguer = { workspace = true }
 reqwest = { workspace = true }
+notify = "8"
+futures = "0.3"
+tempfile = "3"
+ctrlc = "3"
+libc = "0.2"
+tracing = { workspace = true }
+chrono = "0.4"
+crossterm = "0.28"
+ratatui = "0.29"
+semver = "1"
+flate2 = "1"
+tar = "0.4"
+scraper = "0.22"
+epub = "2"

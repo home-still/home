@@ -1,14 +1,13 @@
 use anyhow::{Context, Result};
-use hs_style::reporter::Reporter;
-use hs_style::styles::Styles;
+use hs_common::reporter::Reporter;
+use hs_common::styles::Styles;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::models::SearchQuery;
-use crate::models::SortBy;
+use crate::models::{Paper, SearchQuery, SearchResult, SortBy};
 use crate::ports::provider::PaperProvider;
 use crate::providers::arxiv::ArxivProvider;
 use crate::providers::core::CoreProvider;
@@ -26,7 +25,7 @@ use crate::services::search::AggregateProvider;
 use crate::cli::SortByArg;
 use crate::cli::{ProviderArg, SearchTypeArg};
 use crate::output;
-use hs_style::global_args::GlobalArgs;
+use hs_common::global_args::GlobalArgs;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_search(
@@ -42,13 +41,13 @@ pub async fn run_search(
     global: &GlobalArgs,
     reporter: &Arc<dyn Reporter>,
     styles: &Styles,
-    mode: &hs_style::mode::OutputMode,
+    mode: &hs_common::mode::OutputMode,
 ) -> Result<()> {
     let config = Config::load().context("Failed to load config")?;
     let provider = make_provider(&provider, &config)?;
 
     let stage = reporter.begin_stage("Searching", None);
-    stage.set_message(&format!("{} for:{}", provider.name(), query));
+    stage.set_message(&format!("{} for '{}'", provider.name(), query));
     let date_filter = parse_date_arg(date)?;
 
     if looks_like_doi(&query) {
@@ -87,7 +86,7 @@ pub async fn run_search(
 
     if global.is_json() {
         output::print_json(&result)?;
-    } else if matches!(mode, hs_style::mode::OutputMode::Pipe) {
+    } else if matches!(mode, hs_common::mode::OutputMode::Pipe) {
         output::print_search_result_pipe(&result);
     } else {
         output::print_search_result(
@@ -165,10 +164,22 @@ pub async fn run_download(
             resolvers.push(Box::new(core));
         }
     }
+    if let Ok(oa) = OpenAlexProvider::new(&config.providers.openalex) {
+        resolvers.push(Box::new(oa));
+    }
+    if let Ok(cr) = CrossRefProvider::new(&config.providers.crossref) {
+        resolvers.push(Box::new(cr));
+    }
 
-    let downloader =
-        PaperDownloader::new(config.download_path.clone(), &config.download, resolvers)
-            .context("Failed to create downloader")?;
+    let storage = config
+        .build_storage()
+        .context("Failed to build storage backend")?;
+    let events = config
+        .build_event_bus()
+        .await
+        .context("Failed to build event bus")?;
+    let downloader = PaperDownloader::with_event_bus(storage, events, &config.download, resolvers)
+        .context("Failed to create downloader")?;
     let downloader: Arc<dyn crate::ports::download_service::DownloadService> = Arc::new(downloader);
 
     if let Some(doi_str) = doi {
@@ -191,17 +202,33 @@ pub async fn run_download(
             ));
         }
     } else if let Some(query_str) = query {
-        let provider_impl = make_provider(&provider, &config)?;
+        // For aggregate search, show a counted progress bar; for single provider, a spinner
+        let search_total = if matches!(provider, ProviderArg::All) {
+            Some(6u64)
+        } else {
+            None
+        };
+        let search_stage: Arc<Box<dyn hs_common::reporter::StageHandle>> =
+            Arc::new(reporter.begin_counted_stage("Searching", search_total));
+        search_stage.set_message(&format!("for '{}'", query_str));
 
-        let search_stage = reporter.begin_stage("Searching", None);
-        search_stage.set_message(&format!("{} for {}", provider_impl.name(), query_str));
+        let search_stage_cb = Arc::clone(&search_stage);
+        let on_provider_done = Arc::new(move |name: &str| {
+            search_stage_cb.set_message(&format!("{} done", name));
+            search_stage_cb.inc(1);
+        });
+
+        let provider_impl =
+            make_provider_with_search_progress(&provider, &config, on_provider_done)?;
 
         let date_filter = parse_date_arg(date)?;
 
+        // Over-request by 50% to compensate for papers without download URLs
+        let fetch_count = (max_results as usize).saturating_mul(3) / 2;
         let search_query = SearchQuery {
             query: query_str,
             search_type: search_type.into(),
-            max_results: max_results as usize,
+            max_results: fetch_count,
             offset: 0,
             date_filter,
             sort_by: SortBy::default(),
@@ -215,8 +242,8 @@ pub async fn run_download(
 
         search_stage.finish_and_clear();
 
-        let paper_count = search_result.papers.len();
-        if paper_count == 0 {
+        let total_found = search_result.papers.len();
+        if total_found == 0 {
             reporter.warn("No papers found.");
             if !matches!(provider, ProviderArg::All) {
                 reporter.warn("Try --provider all to search all sources.");
@@ -224,18 +251,62 @@ pub async fn run_download(
             return Ok(());
         }
 
-        reporter.status(
-            "Found",
-            &format!(
-                "{} papers, downloading (concurrency={})...",
-                paper_count, concurrency
-            ),
-        );
+        // Filter out papers with no download path (no URLs and no DOI),
+        // then cap to the requested max_results
+        let downloadable: Vec<Paper> = search_result
+            .papers
+            .into_iter()
+            .filter(|p| !p.download_urls.is_empty() || p.doi.is_some())
+            .take(max_results as usize)
+            .collect();
 
-        let bars: Arc<Mutex<HashMap<usize, Box<dyn hs_style::reporter::StageHandle>>>> =
+        let skipped_count = total_found - downloadable.len();
+        if downloadable.is_empty() {
+            reporter.warn(&format!(
+                "Found {} papers but none have download URLs or DOIs.",
+                total_found
+            ));
+            return Ok(());
+        }
+
+        if skipped_count > 0 {
+            reporter.status(
+                "Found",
+                &format!(
+                    "{} downloadable papers ({} without URLs skipped), downloading (concurrency={})...",
+                    downloadable.len(), skipped_count, concurrency
+                ),
+            );
+        } else {
+            reporter.status(
+                "Found",
+                &format!(
+                    "{} papers, downloading (concurrency={})...",
+                    downloadable.len(),
+                    concurrency
+                ),
+            );
+        }
+
+        // Replace search_result.papers with filtered list
+        let search_result = SearchResult {
+            papers: downloadable,
+            total_results: search_result.total_results,
+            next_offset: search_result.next_offset,
+            provider: search_result.provider,
+        };
+
+        // Overall progress counter (ephemeral — cleared when done)
+        let total_papers = search_result.papers.len();
+        let overall: Arc<Box<dyn hs_common::reporter::StageHandle>> =
+            Arc::new(reporter.begin_counted_stage("Downloading", Some(total_papers as u64)));
+
+        // Per-download progress bars (ephemeral — cleared on completion)
+        let bars: Arc<Mutex<HashMap<usize, Box<dyn hs_common::reporter::StageHandle>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let bars_ref = Arc::clone(&bars);
         let reporter_ref = Arc::clone(reporter);
+        let overall_ref = Arc::clone(&overall);
 
         let progress: Option<OnProgress> =
             Some(Arc::new(move |event: DownloadEvent| match event {
@@ -260,58 +331,53 @@ pub async fn run_download(
                         }
                     }
                 }
-                DownloadEvent::Completed {
-                    index, size_bytes, ..
-                } => {
+                DownloadEvent::Completed { index, .. } => {
                     if let Ok(mut bars) = bars_ref.lock() {
                         if let Some(bar) = bars.remove(&index) {
-                            bar.finish_with_message(&format_bytes(size_bytes));
+                            bar.finish_and_clear();
                         }
                     }
+                    overall_ref.inc(1);
                 }
-                DownloadEvent::Failed { index, error, .. } => {
+                DownloadEvent::Failed { index, .. } => {
                     if let Ok(mut bars) = bars_ref.lock() {
                         if let Some(bar) = bars.remove(&index) {
-                            if error.starts_with("Not found:") {
-                                bar.finish_and_clear();
-                            } else {
-                                let max_err = hs_style::tty_reporter::bar_prefix_width();
-                                let short = if error.len() > max_err {
-                                    format!("{}...", &error[..max_err - 3])
-                                } else {
-                                    error.clone()
-                                };
-                                bar.finish_failed(&short);
-                            }
+                            bar.finish_and_clear();
                         }
                     }
+                    overall_ref.inc(1);
                 }
-                DownloadEvent::Skipped {
-                    index, size_bytes, ..
-                } => {
+                DownloadEvent::Skipped { index, .. } => {
                     if let Ok(mut bars) = bars_ref.lock() {
                         if let Some(bar) = bars.remove(&index) {
-                            bar.finish_skipped(&format!(
-                                "Already Downloaded ({})",
-                                format_bytes(size_bytes)
-                            ));
+                            bar.finish_and_clear();
                         }
                     }
+                    overall_ref.inc(1);
                 }
             }));
 
         let batch_result =
             download_batch(downloader, search_result.papers, concurrency, progress).await;
 
+        overall.finish_and_clear();
+
         if global.is_json() {
             output::print_json(&batch_result)?;
         } else {
+            let total_bytes: u64 = batch_result
+                .succeeded
+                .iter()
+                .chain(batch_result.skipped.iter())
+                .map(|r| r.size_bytes)
+                .sum();
             reporter.finish(&format!(
-                "\nCompleted: {}/{} downloaded, {} already exist, {} unavailable",
+                "\n{}/{} downloaded, {} already exist, {} unavailable ({})",
                 batch_result.succeeded.len(),
                 batch_result.total_requested,
                 batch_result.skipped.len(),
                 batch_result.failed.len(),
+                format_bytes(total_bytes),
             ));
         }
 
@@ -344,7 +410,23 @@ fn make_resilient<P: PaperProvider + 'static>(
     ))
 }
 
-fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn PaperProvider>> {
+pub fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn PaperProvider>> {
+    make_provider_inner(provider, config, None)
+}
+
+fn make_provider_with_search_progress(
+    provider: &ProviderArg,
+    config: &Config,
+    on_done: crate::services::search::OnProviderDone,
+) -> Result<Box<dyn PaperProvider>> {
+    make_provider_inner(provider, config, Some(on_done))
+}
+
+fn make_provider_inner(
+    provider: &ProviderArg,
+    config: &Config,
+    on_done: Option<crate::services::search::OnProviderDone>,
+) -> Result<Box<dyn PaperProvider>> {
     let r = &config.resilience;
     let p = &config.providers;
 
@@ -419,6 +501,11 @@ fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn Pape
                 ],
                 timeout,
             );
+            let aggregate = if let Some(cb) = on_done {
+                aggregate.on_provider_done(cb)
+            } else {
+                aggregate
+            };
             Ok(Box::new(aggregate))
         }
     }
@@ -438,7 +525,7 @@ async fn lookup_and_display(
     query: &str,
     label: &str,
     provider: &dyn PaperProvider,
-    stage: Box<dyn hs_style::reporter::StageHandle>,
+    stage: Box<dyn hs_common::reporter::StageHandle>,
     global: &GlobalArgs,
     reporter: &Arc<dyn Reporter>,
     styles: &Styles,

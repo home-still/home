@@ -228,9 +228,8 @@ impl PaperProvider for CrossRefProvider {
 
         check_response(&response, "crossref")?;
 
-        let body: CrSearchResponse = response.json().await.map_err(|e| {
-            PaperError::ParseError(format!("Failed to parse CrossRef response: {}", e))
-        })?;
+        let body: CrSearchResponse =
+            crate::providers::response::parse_json_or_log(response, "crossref").await?;
 
         let papers: Vec<Paper> = body
             .message

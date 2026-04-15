@@ -1,4 +1,4 @@
-## Home-Still CLI Standard
+IS## Home-Still CLI Standard
 
 ### Tools in scope
 `paper-fetch`, `xycut-plus-plus`, `home-still` (embedding search), and the pipeline binaries (`hs-embed`, `hs-index`, `hs-gateway`, `hs-pdf-extract`).

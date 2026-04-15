@@ -8,7 +8,7 @@ use crate::config::CoreConfig;
 use crate::error::PaperError;
 use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType, SortBy};
 use crate::ports::provider::PaperProvider;
-use crate::providers::response::check_response;
+use crate::providers::response::{check_response, parse_json_or_log};
 
 #[derive(Debug, Deserialize)]
 struct CoreResponse {
@@ -19,7 +19,7 @@ struct CoreResponse {
 
 #[derive(Debug, Deserialize)]
 struct CoreWork {
-    id: Option<String>,
+    id: Option<i64>,
     title: Option<String>,
     authors: Option<Vec<CoreAuthor>>,
     #[serde(rename = "abstract")]
@@ -79,7 +79,7 @@ impl CoreProvider {
         }
 
         Paper {
-            id: work.id.unwrap_or_default(),
+            id: work.id.map(|n| n.to_string()).unwrap_or_default(),
             title: work.title.unwrap_or_default(),
             authors,
             abstract_text: work.abstract_text,
@@ -173,10 +173,7 @@ impl PaperProvider for CoreProvider {
         }
         check_response(&response, "core")?;
 
-        let body: CoreResponse = response
-            .json()
-            .await
-            .map_err(|e| PaperError::ParseError(format!("Failed to parse CORE response: {}", e)))?;
+        let body: CoreResponse = parse_json_or_log(response, "core").await?;
 
         let papers: Vec<Paper> = body
             .results
@@ -220,10 +217,7 @@ impl PaperProvider for CoreProvider {
         }
         check_response(&response, "core")?;
 
-        let body: CoreResponse = response
-            .json()
-            .await
-            .map_err(|e| PaperError::ParseError(format!("Failed to parse CORE response: {}", e)))?;
+        let body: CoreResponse = parse_json_or_log(response, "core").await?;
 
         Ok(body
             .results

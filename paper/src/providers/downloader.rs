@@ -1,11 +1,13 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use hs_common::event_bus::{EventBus, NoOpBus};
+use hs_common::storage::Storage;
 use reqwest::{header, Client};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 use crate::config::DownloadConfig;
 use crate::error::PaperError;
@@ -14,27 +16,52 @@ use crate::ports::download_service::DownloadService;
 use crate::ports::provider::PaperProvider;
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct UnpaywallResponse {
     is_oa: bool,
     best_oa_location: Option<UnpaywallLocation>,
+    oa_locations: Option<Vec<UnpaywallLocation>>,
 }
 
 #[derive(Deserialize)]
 struct UnpaywallLocation {
     url_for_pdf: Option<String>,
+    url_for_landing_page: Option<String>,
+    #[allow(dead_code)]
+    version: Option<String>,
+    #[allow(dead_code)]
+    license: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PmcIdConverterResponse {
+    records: Vec<PmcIdRecord>,
+}
+
+#[derive(Deserialize)]
+struct PmcIdRecord {
+    pmcid: Option<String>,
 }
 
 pub struct PaperDownloader {
     client: Client,
-    download_path: PathBuf,
+    storage: Arc<dyn Storage>,
+    events: Arc<dyn EventBus>,
     unpaywall_email: Option<String>,
     resolvers: Vec<Box<dyn PaperProvider>>,
 }
 
 impl PaperDownloader {
     pub fn new(
-        download_path: PathBuf,
+        storage: Arc<dyn Storage>,
+        config: &DownloadConfig,
+        resolvers: Vec<Box<dyn PaperProvider>>,
+    ) -> Result<Self, PaperError> {
+        Self::with_event_bus(storage, Arc::new(NoOpBus), config, resolvers)
+    }
+
+    pub fn with_event_bus(
+        storage: Arc<dyn Storage>,
+        events: Arc<dyn EventBus>,
         config: &DownloadConfig,
         resolvers: Vec<Box<dyn PaperProvider>>,
     ) -> Result<Self, PaperError> {
@@ -62,7 +89,8 @@ impl PaperDownloader {
 
         Ok(Self {
             client,
-            download_path,
+            storage,
+            events,
             unpaywall_email: config.unpaywall_email.clone(),
             resolvers,
         })
@@ -71,9 +99,100 @@ impl PaperDownloader {
     async fn resolve_unpaywall(&self, doi: &str) -> Option<String> {
         let email = self.unpaywall_email.as_ref()?;
         let url = format!("https://api.unpaywall.org/v2/{}?email={}", doi, email);
-        let response = self.client.get(&url).send().await.ok()?;
-        let data: UnpaywallResponse = response.json().await.ok()?;
-        data.best_oa_location?.url_for_pdf
+        tracing::debug!(doi, "Unpaywall lookup");
+
+        let response = match self.client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(doi, error = %e, "Unpaywall request failed");
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(doi, status = %response.status(), "Unpaywall returned error");
+            return None;
+        }
+
+        let data: UnpaywallResponse = match response.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(doi, error = %e, "Unpaywall response parse failed");
+                return None;
+            }
+        };
+
+        if !data.is_oa {
+            tracing::debug!(doi, "Unpaywall: not open access");
+            return None;
+        }
+
+        // 1. Best OA location PDF
+        if let Some(ref loc) = data.best_oa_location {
+            if let Some(ref pdf_url) = loc.url_for_pdf {
+                tracing::debug!(doi, url = %pdf_url, "Unpaywall: best OA PDF");
+                return Some(pdf_url.clone());
+            }
+        }
+
+        // 2. Try all OA locations
+        if let Some(locations) = &data.oa_locations {
+            for loc in locations {
+                if let Some(ref pdf_url) = loc.url_for_pdf {
+                    tracing::debug!(doi, url = %pdf_url, version = ?loc.version, "Unpaywall: alternate OA PDF");
+                    return Some(pdf_url.clone());
+                }
+            }
+        }
+
+        // 3. Landing page fallback (best location only)
+        if let Some(ref loc) = data.best_oa_location {
+            if let Some(ref landing) = loc.url_for_landing_page {
+                tracing::debug!(doi, url = %landing, "Unpaywall: landing page fallback");
+                return Some(landing.clone());
+            }
+        }
+
+        tracing::debug!(doi, "Unpaywall: OA but no usable URL found");
+        None
+    }
+
+    async fn resolve_pmc_direct(&self, doi: &str) -> Option<String> {
+        let email = self
+            .unpaywall_email
+            .as_deref()
+            .unwrap_or("home-still-user@example.com");
+        let url = format!(
+            "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={}&format=json&tool=home-still&email={}",
+            doi, email
+        );
+        tracing::debug!(doi, "PMC ID Converter lookup");
+
+        let response = match self.client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(doi, error = %e, "PMC ID Converter request failed");
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(doi, status = %response.status(), "PMC ID Converter returned error");
+            return None;
+        }
+
+        let data: PmcIdConverterResponse = match response.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(doi, error = %e, "PMC ID Converter parse failed");
+                return None;
+            }
+        };
+
+        let pmcid = data.records.into_iter().find_map(|r| r.pmcid)?;
+        let pdf_url = format!("https://pmc.ncbi.nlm.nih.gov/articles/{}/pdf/", pmcid);
+        tracing::debug!(doi, pmcid = %pmcid, url = %pdf_url, "PMC direct PDF");
+        Some(pdf_url)
     }
 
     async fn resolve_via_providers(&self, doi: &str) -> Option<String> {
@@ -101,6 +220,15 @@ impl DownloadService for PaperDownloader {
             }
         }
 
+        // 1b. MDPI fast path — all MDPI journals are open access
+        if doi.starts_with("10.3390/") {
+            let url = format!("https://www.mdpi.com/{}/pdf", doi);
+            tracing::debug!(doi, url = %url, "MDPI direct PDF");
+            if let Ok(result) = self.download_by_url(&url, &filename, None).await {
+                return Ok(result);
+            }
+        }
+
         // 2. Unpaywall lookup
         if let Some(pdf_url) = self.resolve_unpaywall(doi).await {
             if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
@@ -108,7 +236,14 @@ impl DownloadService for PaperDownloader {
             }
         }
 
-        // 3. Provider-based resolution (Semantic Scholar, Europe PMC, CORE, etc.)
+        // 2b. PMC direct PDF (DOI → PMCID via NCBI ID Converter → PDF URL)
+        if let Some(pdf_url) = self.resolve_pmc_direct(doi).await {
+            if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
+                return Ok(result);
+            }
+        }
+
+        // 3. Provider-based resolution (Semantic Scholar, Europe PMC, CORE, OpenAlex, CrossRef)
         if let Some(pdf_url) = self.resolve_via_providers(doi).await {
             if let Ok(result) = self.download_by_url(&pdf_url, &filename, None).await {
                 return Ok(result);
@@ -133,55 +268,187 @@ impl DownloadService for PaperDownloader {
         filename: &str,
         on_progress: Option<&(dyn Fn(u64, Option<u64>) + Send + Sync)>,
     ) -> Result<DownloadResult, PaperError> {
-        // Ensure download directory exists
-        tokio::fs::create_dir_all(&self.download_path).await?;
-
-        let file_path = self.download_path.join(filename);
+        // Derive stem from filename for sharded directory layout
+        let stem = filename
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or(filename);
+        let ext = filename.rsplit_once('.').map(|(_, e)| e).unwrap_or("pdf");
+        let key = hs_common::sharded_key(stem, ext);
 
         // Skip if already downloaded
-        if file_path.exists() {
-            let metadata = tokio::fs::metadata(&file_path).await?;
+        if let Some(meta) = self
+            .storage
+            .head(&key)
+            .await
+            .map_err(|e| PaperError::Io(std::io::Error::other(e.to_string())))?
+        {
             return Ok(DownloadResult {
-                file_path,
+                file_path: PathBuf::from(&key),
                 doi: None,
                 sha256: String::new(),
-                size_bytes: metadata.len(),
+                size_bytes: meta.size,
                 skipped: true,
             });
         }
 
-        // Stream the response
+        // Stream into memory, hashing as we go. S3 PUT is atomic; the local
+        // backend writes through a parent-mkdir + fs::write.
         let response = self.client.get(url).send().await?.error_for_status()?;
-
         let content_length = response.content_length();
-
         let mut stream = response.bytes_stream();
-        let mut file = tokio::fs::File::create(&file_path).await?;
+        let mut buf: Vec<u8> = match content_length {
+            Some(n) => Vec::with_capacity(n as usize),
+            None => Vec::new(),
+        };
         let mut hasher = Sha256::new();
-        let mut size_bytes: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk?;
             hasher.update(&bytes);
-            size_bytes += bytes.len() as u64;
-            file.write_all(&bytes).await?;
-
-            // Report byte level progress
+            buf.extend_from_slice(&bytes);
             if let Some(cb) = &on_progress {
-                cb(size_bytes, content_length);
+                cb(buf.len() as u64, content_length);
             }
         }
 
-        file.flush().await?;
-
+        let size_bytes = buf.len() as u64;
         let sha256 = format!("{:x}", hasher.finalize());
 
+        // Validate and decide final key
+        let head = &buf[..buf.len().min(4096)];
+        let (final_key, final_bytes) = if head.starts_with(b"%PDF") {
+            (key, buf)
+        } else if looks_like_html(head) {
+            let content = String::from_utf8_lossy(&buf).to_string();
+            if is_paywall_html(&content) {
+                return Err(PaperError::NotFound(format!(
+                    "Server returned a paywall/login page instead of PDF for {url}"
+                )));
+            }
+            (hs_common::sharded_key(stem, "html"), buf)
+        } else {
+            // Unknown format — keep it as-is (might be a valid binary format)
+            (key, buf)
+        };
+
+        self.storage
+            .put(&final_key, final_bytes)
+            .await
+            .map_err(|e| PaperError::Io(std::io::Error::other(e.to_string())))?;
+
+        // Announce the new artifact so scribe (or any other subscriber) can
+        // pick it up. On NoOpBus this is a cheap no-op; with NATS it reaches
+        // every subscriber on `papers.ingested`.
+        let payload = serde_json::json!({
+            "key": final_key,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+            "source": "paper-download",
+        });
+        if let Err(e) = self
+            .events
+            .publish(
+                "papers.ingested",
+                serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
+            )
+            .await
+        {
+            // Publish failure shouldn't fail the download — the file is
+            // safely in storage. Log and move on; a reconcile pass can
+            // backfill missed events later.
+            tracing::warn!(key = %final_key, error = %e, "event publish failed");
+        }
+
         Ok(DownloadResult {
-            file_path,
+            file_path: PathBuf::from(&final_key),
             doi: None,
             sha256,
             size_bytes,
             skipped: false,
         })
     }
+}
+
+fn looks_like_html(header: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(&header[..header.len().min(512)]).to_lowercase();
+    s.contains("<!doctype html") || s.contains("<html") || s.contains("<head")
+}
+
+fn is_paywall_html(content: &str) -> bool {
+    let lower = content.to_lowercase();
+
+    // Paywall indicators
+    let has_login = lower.contains("sign in")
+        || lower.contains("log in")
+        || lower.contains("access denied")
+        || lower.contains("403 forbidden")
+        || lower.contains("subscription required")
+        || lower.contains("purchase this article")
+        || lower.contains("institutional access");
+
+    // Paper indicators — meaningful article structure
+    let has_article =
+        lower.contains("<article") || (lower.contains("abstract") && lower.contains("references"));
+
+    // Short pages with login prompts are almost certainly paywalls
+    if has_login && content.len() < 100_000 {
+        return true;
+    }
+
+    // If it has login indicators but no article structure, it's a paywall
+    if has_login && !has_article {
+        return true;
+    }
+
+    // Strip HTML tags and measure actual visible text
+    let text_only = strip_html_tags(&lower);
+    let text_len = text_only.trim().len();
+
+    // Very short pages without article structure are junk (landing pages, error pages)
+    if text_len < 500 && !has_article {
+        return true;
+    }
+
+    // Loading / interstitial pages (PMC download stub, etc.)
+    if lower.contains("preparing to download")
+        || lower.contains("hhs vulnerability disclosure")
+        || lower.contains("please wait while the document loads")
+    {
+        return true;
+    }
+
+    // Journal metadata pages (impact factor, citescore) with no paper body
+    let is_journal_meta = lower.contains("impact factor")
+        || lower.contains("citescore")
+        || lower.contains("aims and scope");
+    if is_journal_meta && !has_article {
+        return true;
+    }
+
+    // Institutional/repository landing pages with navigation but no paper
+    let is_landing = lower.contains("clinical trials")
+        || lower.contains("browse collections")
+        || lower.contains("search results")
+        || lower.contains("cookie policy");
+    if is_landing && !has_article {
+        return true;
+    }
+
+    false
+}
+
+/// Strip HTML tags to get visible text content.
+fn strip_html_tags(html: &str) -> String {
+    let mut result = String::with_capacity(html.len() / 2);
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => result.push(ch),
+            _ => {}
+        }
+    }
+    result
 }

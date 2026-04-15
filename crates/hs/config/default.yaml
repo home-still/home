@@ -1,16 +1,22 @@
 # home-still configuration
+#
+# Two directories:
+#   ~/.home-still/     — config, cache, models (hidden, always local)
+#   ~/home-still/      — papers, markdown (visible, your research project)
 
 # --- General settings ---
 home:
-  # log_level: info
+  # Project directory — your research data (papers, markdown)
+  # May point to an NFS mount or symlink
+  # project_dir: ~/home-still
+  # log_dir: ~/home-still/logs  # default: {project_dir}/logs
 
 # --- Paper search & download ---
 paper:
-  # Where downloaded PDFs are saved
-  download_path: ~/Downloads/home-still/papers
-
-  # Metadata and search result cache
-  cache_path: ~/.home-still/paper/cache
+  # Where downloaded PDFs are saved (default: ~/home-still/papers)
+  # download_path: ~/home-still/papers
+  # Drop manually downloaded papers here for automatic processing:
+  #   ~/home-still/papers/manually_downloaded/
 
   # Search providers
   providers:
@@ -42,3 +48,52 @@ paper:
     retry_max_attempts: 5
     retry_min_backoff_ms: 100
     retry_max_backoff_secs: 30
+
+# --- Storage backend (papers, markdown, catalog) -----------------------
+# Default is the local filesystem rooted at {home.project_dir}.
+# To move everything to MinIO/S3, set backend: s3 and fill in the `s3:` block.
+# Secrets support ${ENV_VAR} expansion at load time.
+storage:
+  backend: local          # local | s3
+  local:
+    root: ~/home-still
+  # s3:
+  #   endpoint: http://three:9000
+  #   bucket: papers
+  #   region: us-east-1
+  #   access_key: hs-admin
+  #   secret_key: ${HS_S3_SECRET_KEY}
+  #   allow_http: true
+
+# --- Event bus (cross-node notifications) ------------------------------
+# `noop` drops publishes and never yields events — the default, which keeps
+# the legacy filesystem-watcher flow untouched.
+# `nats` connects to a NATS server; pairs with `hs scribe watch-events` and
+# `hs distill watch-events` to run the event-driven pipeline.
+events:
+  backend: noop           # noop | nats
+  # nats:
+  #   url: nats://three:4222
+
+# --- Centralized logging (ship JSONL to object storage) --------------
+# Every binary spools log records locally and uploads closed files to a
+# dedicated `logs` bucket on the same storage backend.  When
+# `storage.backend=local`, files go to `{home.log_dir}/archive/` instead.
+# Keys:  <service>/<host>/<YYYY>/<MM>/<DD>/<unix-ms>-<uuid>.jsonl
+logs:
+  bucket: logs            # S3 bucket name (ignored when storage.backend=local)
+  # rotate_max_bytes: 4194304       # force a rotation when the current file hits this size
+  # rotate_interval_secs: 60        # ...or this age, whichever first
+  # ship_interval_secs: 30          # how often the shipper PUTs closed files
+
+# --- Scribe PDF conversion ---
+scribe:
+  # Output directory for converted markdown (default: ~/home-still/markdown)
+  # output_dir: ~/home-still/markdown
+
+  # Directory to watch for new PDFs (default: ~/home-still/papers)
+  # watch_dir: ~/home-still/papers
+
+  # Scribe servers (PDFs are load-balanced across all servers)
+  servers:
+    - http://localhost:7433

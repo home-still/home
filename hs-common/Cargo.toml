@@ -1,0 +1,144 @@
+[package]
+name = "hs-common"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+cli = [
+    "dep:indicatif",
+    "dep:owo-colors",
+    "dep:supports-color",
+    "dep:clap",
+    "dep:terminal_size",
+    "dep:unicode-width",
+]
+service = [
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:async-trait",
+    "dep:anyhow",
+    "dep:futures",
+    "dep:tracing",
+]
+catalog = [
+    "dep:serde",
+    "dep:serde_yaml_ng",
+    "dep:chrono",
+]
+compose = [
+    "dep:tokio",
+    "dep:anyhow",
+    "dep:reqwest",
+]
+auth = [
+    "dep:hmac",
+    "dep:sha2",
+    "dep:base64",
+    "dep:rand",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:anyhow",
+    "dep:reqwest",
+    "dep:tokio",
+]
+storage = [
+    "dep:anyhow",
+    "dep:async-trait",
+    "dep:tokio",
+    "dep:serde",
+    "dep:serde_yaml_ng",
+    "tokio/fs",
+]
+storage-s3 = [
+    "storage",
+    "dep:object_store",
+    "dep:bytes",
+    "dep:futures",
+    "dep:url",
+    "dep:reqwest",
+    "dep:hmac",
+    "dep:sha2",
+    "dep:chrono",
+]
+events = [
+    "dep:anyhow",
+    "dep:async-trait",
+    "dep:tokio",
+    "dep:futures",
+    "dep:serde",
+    "dep:serde_json",
+]
+events-nats = [
+    "events",
+    "dep:async-nats",
+    "dep:bytes",
+]
+logging = [
+    "storage",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:tracing-appender",
+    "dep:gethostname",
+    "dep:uuid",
+    "dep:chrono",
+    "dep:serde_json",
+    "dep:anyhow",
+    "dep:tokio",
+    "tokio/sync",
+    "tokio/time",
+    "tokio/fs",
+    "tokio/rt",
+    "tokio/macros",
+]
+
+[dependencies]
+indicatif = { version = "0.18", optional = true }
+owo-colors = { version = "4.3", optional = true }
+supports-color = { version = "3", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+terminal_size = { version = "0.4", optional = true }
+unicode-width = { version = "0.2", optional = true }
+dirs = "6"
+
+# service feature deps
+reqwest = { version = "0.12", features = ["json"], default-features = false, optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+async-trait = { version = "0.1", optional = true }
+anyhow = { version = "1", optional = true }
+futures = { version = "0.3", optional = true }
+tracing = { version = "0.1", optional = true }
+
+# compose feature deps
+tokio = { workspace = true, optional = true }
+
+# catalog feature deps
+serde_yaml_ng = { version = "0.10", optional = true }
+chrono = { version = "0.4", optional = true }
+
+# auth feature deps
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+rand = { version = "0.9", optional = true }
+
+# storage-s3 feature deps
+object_store = { version = "0.13", features = ["aws"], optional = true }
+bytes = { version = "1", optional = true }
+url = { version = "2", optional = true }
+
+# events feature deps
+async-nats = { version = "0.47", optional = true }
+
+# logging feature deps
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+tracing-appender = { version = "0.2", optional = true }
+gethostname = { version = "1", optional = true }
+uuid = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
+tracing = "0.1"
