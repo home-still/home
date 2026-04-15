@@ -58,6 +58,10 @@ struct ListParams {
     limit: Option<usize>,
     #[schemars(description = "Number of items to skip (default: 0)")]
     offset: Option<usize>,
+    #[schemars(
+        description = "catalog_list only: filter by embedded-in-Qdrant state. true=only embedded, false=only not-yet-embedded, omit=all."
+    )]
+    embedded: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -435,7 +439,7 @@ impl HomeStillMcp {
     // ── Catalog Tools ──────────────────────────────────────────
 
     #[tool(
-        description = "List all papers in the catalog with titles and conversion status. Returns JSON array. Supports pagination via limit/offset.",
+        description = "List all papers in the catalog with titles, conversion status, and embedded-in-Qdrant status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -451,6 +455,16 @@ impl HomeStillMcp {
         // Stable ordering by stem for deterministic pagination.
         triples.sort_by(|a, b| a.0.cmp(&b.0));
 
+        // Apply embedded filter before pagination so counts make sense. An entry
+        // only counts as "embedded" if Qdrant actually got chunks — mirrors the
+        // chunks_indexed > 0 predicate used by catalog_recent.
+        if let Some(want) = p.embedded {
+            triples.retain(|(_, _, cat)| {
+                let is_embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
+                is_embedded == want
+            });
+        }
+
         let offset = p.offset.unwrap_or(0);
         let slice: Vec<_> = match p.limit {
             Some(limit) => triples.into_iter().skip(offset).take(limit).collect(),
@@ -462,10 +476,12 @@ impl HomeStillMcp {
             .map(|(stem, _meta, cat)| {
                 let title = cat.title.unwrap_or_default();
                 let converted = cat.conversion.is_some();
+                let embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
                 serde_json::json!({
                     "stem": stem,
                     "title": title,
                     "converted": converted,
+                    "embedded": embedded,
                 })
             })
             .collect();

@@ -33,6 +33,12 @@ pub struct HealthResponse {
     pub table_model: bool,
     #[serde(default)]
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_utilization_pct: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_used_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
