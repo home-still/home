@@ -760,8 +760,9 @@ fn walk_html_node(element: &scraper::ElementRef, md: &mut String) {
 /// No server needed — runs locally.
 async fn convert_html_and_save(
     html_path: &std::path::Path,
-    output_dir: &std::path::Path,
-    catalog_dir: &std::path::Path,
+    storage: &dyn hs_common::storage::Storage,
+    markdown_prefix: &str,
+    catalog_prefix: &str,
     reporter: &Arc<dyn Reporter>,
     stats: &WatchStats,
 ) {
@@ -769,10 +770,11 @@ async fn convert_html_and_save(
 
     let start = std::time::Instant::now();
     let stem = html_path.file_stem().unwrap_or_default().to_string_lossy();
-    let output_path = hs_common::sharded_path(output_dir, &stem, "md");
-    if let Some(parent) = output_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let md_key = format!(
+        "{}/{}",
+        markdown_prefix.trim_end_matches('/'),
+        hs_common::sharded_key(&stem, "md")
+    );
 
     stats.queued.fetch_sub(1, Relaxed);
     stats.processing.fetch_add(1, Relaxed);
@@ -797,8 +799,9 @@ async fn convert_html_and_save(
 
     stats.processing.fetch_sub(1, Relaxed);
 
-    if let Err(e) = atomic_write(&output_path, md.as_bytes()) {
-        reporter.warn(&format!("{stem}: Write failed: {e}"));
+    let md_bytes = md.clone().into_bytes();
+    if let Err(e) = storage.put(&md_key, md_bytes).await {
+        reporter.warn(&format!("{stem}: Write failed ({md_key}): {e}"));
         stats.failed.fetch_add(1, Relaxed);
         return;
     }
@@ -806,15 +809,20 @@ async fn convert_html_and_save(
     stats.completed.fetch_add(1, Relaxed);
 
     let page_offsets = crate::catalog::compute_page_offsets(&md);
-    crate::catalog::update_conversion_catalog(
-        catalog_dir,
+    if let Err(e) = hs_common::catalog::update_conversion_catalog_via(
+        storage,
+        catalog_prefix,
         &stem,
         "local-html",
         start.elapsed().as_secs(),
         1, // HTML papers are single-page
         page_offsets,
-        &format!("markdown/{}/{stem}.md", &stem[..stem.len().min(2)]),
-    );
+        &md_key,
+    )
+    .await
+    {
+        reporter.warn(&format!("{stem}: catalog update failed: {e}"));
+    }
 
     // After successful conversion, move source out of manually_downloaded/ (if applicable)
     relocate_from_manual_dir(html_path);
@@ -943,7 +951,11 @@ async fn cmd_watch(
     let servers = resolve_servers(server.as_deref()).await;
     let scribe_cfg = ScribeConfig::load().unwrap_or_default();
     let corrupted_dir = scribe_cfg.corrupted_dir.clone();
-    let catalog_dir = scribe_cfg.catalog_dir.clone();
+    let storage = scribe_cfg.build_storage()?;
+    // Matches the prefixes MCP and distill expect — see hs-mcp/src/main.rs and
+    // distill_cmd.rs' read_catalog_entry_via(storage, "catalog", …).
+    let markdown_prefix: Arc<str> = Arc::from("markdown");
+    let catalog_prefix: Arc<str> = Arc::from("catalog");
 
     // Resolve dirs: CLI flag > config > defaults
     let watch_dir = dir
@@ -1012,7 +1024,8 @@ async fn cmd_watch(
         shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
-    // Initial scan: queue existing PDFs that don't have up-to-date markdown
+    // Initial scan: queue existing PDFs whose markdown isn't already in storage.
+    // The existence check moved into each spawned task since storage.exists is async.
     {
         let all_docs = {
             let mut docs = hs_common::collect_files_recursive(&watch_dir, "pdf");
@@ -1025,44 +1038,49 @@ async fn cmd_watch(
             if !is_processable_document(&path) {
                 continue;
             }
-            let stem = path.file_stem().unwrap_or_default();
-            let md_path = hs_common::sharded_path(&output_dir, &stem.to_string_lossy(), "md");
-            if md_path.exists() {
-                let _ = std::fs::File::open(&path);
-                let _ = std::fs::File::open(&md_path);
-                let pdf_mod = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                let md_mod = std::fs::metadata(&md_path).and_then(|m| m.modified()).ok();
-                if let (Some(p), Some(m)) = (pdf_mod, md_mod) {
-                    if m >= p {
-                        continue;
-                    }
-                }
-            }
-            stats
-                .queued
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let is_html = path
                 .extension()
                 .is_some_and(|e| e == "html" || e == "htm" || e == "epub");
             let pool = Arc::clone(&pool);
-            let output_dir = output_dir.clone();
             let corrupted_dir = corrupted_dir.clone();
-            let catalog_dir = catalog_dir.clone();
+            let storage = storage.clone();
+            let markdown_prefix = markdown_prefix.clone();
+            let catalog_prefix = catalog_prefix.clone();
             let reporter = Arc::clone(reporter);
             let stats = Arc::clone(&stats);
             let sem = Arc::clone(&spawn_sem);
             tokio::spawn(async move {
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                let md_key = format!(
+                    "{}/{}",
+                    markdown_prefix.trim_end_matches('/'),
+                    hs_common::sharded_key(&stem, "md")
+                );
+                if storage.exists(&md_key).await.unwrap_or(false) {
+                    return;
+                }
+                stats
+                    .queued
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if is_html {
-                    convert_html_and_save(&path, &output_dir, &catalog_dir, &reporter, &stats)
-                        .await;
+                    convert_html_and_save(
+                        &path,
+                        &*storage,
+                        &markdown_prefix,
+                        &catalog_prefix,
+                        &reporter,
+                        &stats,
+                    )
+                    .await;
                 } else {
                     let _permit = sem.acquire_owned().await;
                     convert_and_save_pool(
                         &pool,
                         &path,
-                        &output_dir,
                         &corrupted_dir,
-                        &catalog_dir,
+                        &*storage,
+                        &markdown_prefix,
+                        &catalog_prefix,
                         &reporter,
                         &stats,
                     )
@@ -1095,40 +1113,37 @@ async fn cmd_watch(
                     if !is_processable_document(path) {
                         continue;
                     }
-                    let stem = path.file_stem().unwrap_or_default();
-                    let md_path =
-                        hs_common::sharded_path(&output_dir, &stem.to_string_lossy(), "md");
-                    if md_path.exists() {
-                        let _ = std::fs::File::open(path);
-                        let _ = std::fs::File::open(&md_path);
-                        let pdf_mod = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-                        let md_mod = std::fs::metadata(&md_path).and_then(|m| m.modified()).ok();
-                        if let (Some(p), Some(m)) = (pdf_mod, md_mod) {
-                            if m >= p {
-                                continue;
-                            }
-                        }
-                    }
-                    stats
-                        .queued
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let is_html = path
                         .extension()
                         .is_some_and(|e| e == "html" || e == "htm" || e == "epub");
                     let pool = Arc::clone(&pool);
                     let path = path.clone();
-                    let output_dir = output_dir.clone();
                     let corrupted_dir = corrupted_dir.clone();
-                    let catalog_dir = catalog_dir.clone();
+                    let storage = storage.clone();
+                    let markdown_prefix = markdown_prefix.clone();
+                    let catalog_prefix = catalog_prefix.clone();
                     let reporter = Arc::clone(reporter);
                     let stats = Arc::clone(&stats);
                     let sem = Arc::clone(&spawn_sem);
                     tokio::spawn(async move {
+                        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                        let md_key = format!(
+                            "{}/{}",
+                            markdown_prefix.trim_end_matches('/'),
+                            hs_common::sharded_key(&stem, "md")
+                        );
+                        if storage.exists(&md_key).await.unwrap_or(false) {
+                            return;
+                        }
+                        stats
+                            .queued
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if is_html {
                             convert_html_and_save(
                                 &path,
-                                &output_dir,
-                                &catalog_dir,
+                                &*storage,
+                                &markdown_prefix,
+                                &catalog_prefix,
                                 &reporter,
                                 &stats,
                             )
@@ -1138,9 +1153,10 @@ async fn cmd_watch(
                             convert_and_save_pool(
                                 &pool,
                                 &path,
-                                &output_dir,
                                 &corrupted_dir,
-                                &catalog_dir,
+                                &*storage,
+                                &markdown_prefix,
+                                &catalog_prefix,
                                 &reporter,
                                 &stats,
                             )
@@ -1177,12 +1193,14 @@ async fn cmd_watch(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn convert_and_save_pool(
     pool: &ScribePool,
     pdf_path: &std::path::Path,
-    output_dir: &std::path::Path,
     corrupted_dir: &std::path::Path,
-    catalog_dir: &std::path::Path,
+    storage: &dyn hs_common::storage::Storage,
+    markdown_prefix: &str,
+    catalog_prefix: &str,
     reporter: &Arc<dyn Reporter>,
     stats: &WatchStats,
 ) {
@@ -1190,10 +1208,11 @@ async fn convert_and_save_pool(
 
     let start_time = std::time::Instant::now();
     let stem = pdf_path.file_stem().unwrap_or_default().to_string_lossy();
-    let output_path = hs_common::sharded_path(output_dir, &stem, "md");
-    if let Some(parent) = output_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let md_key = format!(
+        "{}/{}",
+        markdown_prefix.trim_end_matches('/'),
+        hs_common::sharded_key(&stem, "md")
+    );
 
     // Read and validate while still in "queued" state (no progress bar yet)
     let pdf_bytes = match std::fs::read(pdf_path) {
@@ -1279,20 +1298,19 @@ async fn convert_and_save_pool(
         .await;
 
     stats.processing.fetch_sub(1, Relaxed);
-    let stage_guard = stage.lock().unwrap();
+    // Take the stage handle out of the shared Mutex so we can .await freely —
+    // MutexGuard isn't Send and holding it across an await breaks tokio::spawn.
+    let stage_handle = stage.lock().unwrap().take();
     match result {
         Ok((server_url, md)) => {
             let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
             if truncations > 0 {
-                tracing::info!(
-                    "{}: cleaned {} repetition site(s)",
-                    output_path.display(),
-                    truncations
-                );
+                tracing::info!("{md_key}: cleaned {truncations} repetition site(s)");
             }
-            if let Err(e) = atomic_write(&output_path, md.as_bytes()) {
-                if let Some(ref s) = *stage_guard {
-                    s.finish_failed(&format!("Write failed: {e}"));
+            let md_bytes = md.clone().into_bytes();
+            if let Err(e) = storage.put(&md_key, md_bytes).await {
+                if let Some(ref s) = stage_handle {
+                    s.finish_failed(&format!("Write failed ({md_key}): {e}"));
                 }
                 stats.failed.fetch_add(1, Relaxed);
             } else {
@@ -1300,7 +1318,7 @@ async fn convert_and_save_pool(
                     .strip_prefix("http://")
                     .or_else(|| server_url.strip_prefix("https://"))
                     .unwrap_or(&server_url);
-                if let Some(ref s) = *stage_guard {
+                if let Some(ref s) = stage_handle {
                     let elapsed = start_time.elapsed();
                     let secs = elapsed.as_secs();
                     let duration = if secs >= 60 {
@@ -1308,10 +1326,7 @@ async fn convert_and_save_pool(
                     } else {
                         format!("{secs}s")
                     };
-                    let out_name = output_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy();
+                    let out_name = md_key.rsplit('/').next().unwrap_or(&md_key);
                     s.finish_with_message(&format!("→ {out_name} [{short_server}] ({duration})"));
                 }
                 stats.completed.fetch_add(1, Relaxed);
@@ -1325,22 +1340,27 @@ async fn convert_and_save_pool(
                     reporter.warn(&format!(
                         "{stem}: stub PDF (1pg, minimal content) → quarantined"
                     ));
-                    let _ = std::fs::remove_file(&output_path);
+                    let _ = storage.delete(&md_key).await;
                     quarantine_file(pdf_path, corrupted_dir);
                     stats.completed.fetch_sub(1, Relaxed);
                     stats.failed.fetch_add(1, Relaxed);
                     return;
                 }
 
-                crate::catalog::update_conversion_catalog(
-                    catalog_dir,
+                if let Err(e) = hs_common::catalog::update_conversion_catalog_via(
+                    storage,
+                    catalog_prefix,
                     &stem,
                     short_server,
                     start_time.elapsed().as_secs(),
                     total_pages,
                     page_offsets,
-                    &format!("markdown/{}/{stem}.md", &stem[..stem.len().min(2)]),
-                );
+                    &md_key,
+                )
+                .await
+                {
+                    reporter.warn(&format!("{stem}: catalog update failed: {e}"));
+                }
 
                 // After successful conversion, move source out of manually_downloaded/
                 relocate_from_manual_dir(pdf_path);
@@ -1350,12 +1370,12 @@ async fn convert_and_save_pool(
             let msg = format!("{e:#}");
             stats.failed.fetch_add(1, Relaxed);
             if msg.contains("FormatError") || msg.contains("PdfiumLibrary") {
-                if let Some(ref s) = *stage_guard {
+                if let Some(ref s) = stage_handle {
                     s.finish_and_clear();
                 }
                 reporter.warn(&format!("{stem}: server rejected PDF → quarantined"));
                 quarantine_file(pdf_path, corrupted_dir);
-            } else if let Some(ref s) = *stage_guard {
+            } else if let Some(ref s) = stage_handle {
                 s.finish_failed(&msg);
             }
         }
