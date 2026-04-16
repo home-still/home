@@ -649,16 +649,25 @@ async fn convert_html_and_save(
     };
 
     let md = hs_scribe::html::convert_html_to_markdown(&html);
-    if md.trim().is_empty() {
-        reporter.warn(&format!("{stem}: HTML conversion produced empty output"));
+    let page_offsets = crate::catalog::compute_page_offsets(&md);
+    let total_pages = page_offsets.len() as u64;
+
+    // Mirrors the MCP scribe_convert gate: paywall/landing HTML often produces
+    // ≤1 page of mostly-whitespace boilerplate that passes a bare `is_empty`
+    // check but is semantically empty. Stamp as failed so it doesn't keep
+    // re-entering backfill loops.
+    if hs_scribe::postprocess::is_stub_pdf(total_pages, &md) {
+        reporter.warn(&format!(
+            "{stem}: HTML conversion produced stub document (≤1 page, <500 non-whitespace chars)"
+        ));
         if let Err(e) = hs_common::catalog::update_conversion_failed_via(
             storage,
             catalog_prefix,
             &stem,
             "local-html",
             start.elapsed().as_secs_f64(),
-            0,
-            "empty_output",
+            total_pages,
+            "stub_document",
         )
         .await
         {
@@ -680,14 +689,13 @@ async fn convert_html_and_save(
 
     stats.completed.fetch_add(1, Relaxed);
 
-    let page_offsets = crate::catalog::compute_page_offsets(&md);
     if let Err(e) = hs_common::catalog::update_conversion_catalog_via(
         storage,
         catalog_prefix,
         &stem,
         "local-html",
         start.elapsed().as_secs_f64(),
-        1, // HTML papers are single-page
+        total_pages.max(1),
         page_offsets,
         &md_key,
     )

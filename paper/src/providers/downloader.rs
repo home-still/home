@@ -337,6 +337,14 @@ impl DownloadService for PaperDownloader {
             .await
             .map_err(|e| PaperError::Io(std::io::Error::other(e.to_string())))?;
 
+        // Confirm the object is queryable + correctly sized before declaring
+        // success. `put()` returning Ok is not always sufficient on
+        // S3-compatible backends (Garage etc.); without this check, a
+        // truncated or evicted object would still be stamped as
+        // `downloaded: true` in the catalog and then explode at scribe time
+        // with "No PDF or HTML found for <stem>".
+        verify_put(self.storage.head(&final_key).await, &final_key, size_bytes)?;
+
         // Announce the new artifact so scribe (or any other subscriber) can
         // pick it up. On NoOpBus this is a cheap no-op; with NATS it reaches
         // every subscriber on `papers.ingested`.
@@ -451,4 +459,67 @@ fn strip_html_tags(html: &str) -> String {
         }
     }
     result
+}
+
+/// Check that a `head()` result confirms the just-written object exists at the
+/// expected size. Pulled out so the mismatch/missing/error branches can be
+/// covered without standing up a mock HTTP server for the full download path.
+fn verify_put(
+    head_result: anyhow::Result<Option<hs_common::storage::ObjectMeta>>,
+    key: &str,
+    expected_size: u64,
+) -> Result<(), PaperError> {
+    match head_result {
+        Ok(Some(meta)) if meta.size == expected_size => Ok(()),
+        Ok(Some(meta)) => Err(PaperError::Io(std::io::Error::other(format!(
+            "post-write verify: size mismatch for {key} (wrote {expected_size}, head reports {})",
+            meta.size
+        )))),
+        Ok(None) => Err(PaperError::Io(std::io::Error::other(format!(
+            "post-write verify: {key} not found after put"
+        )))),
+        Err(e) => Err(PaperError::Io(std::io::Error::other(format!(
+            "post-write verify failed for {key}: {e}"
+        )))),
+    }
+}
+
+#[cfg(test)]
+mod verify_put_tests {
+    use super::verify_put;
+    use hs_common::storage::ObjectMeta;
+
+    fn meta(size: u64) -> ObjectMeta {
+        ObjectMeta {
+            key: "k".into(),
+            size,
+            last_modified: None,
+            etag: None,
+        }
+    }
+
+    #[test]
+    fn ok_when_head_returns_matching_size() {
+        verify_put(Ok(Some(meta(123))), "k", 123).expect("matching size should pass");
+    }
+
+    #[test]
+    fn err_on_size_mismatch() {
+        let err = verify_put(Ok(Some(meta(99))), "k", 123).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("size mismatch"), "got: {msg}");
+        assert!(msg.contains("99") && msg.contains("123"), "got: {msg}");
+    }
+
+    #[test]
+    fn err_when_head_returns_none() {
+        let err = verify_put(Ok(None), "k", 1).unwrap_err();
+        assert!(format!("{err}").contains("not found after put"));
+    }
+
+    #[test]
+    fn err_when_head_call_itself_fails() {
+        let err = verify_put(Err(anyhow::anyhow!("network")), "k", 1).unwrap_err();
+        assert!(format!("{err}").contains("verify failed"));
+    }
 }

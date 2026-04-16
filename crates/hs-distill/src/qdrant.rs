@@ -124,9 +124,7 @@ pub async fn upsert_chunks(
                 "title": meta.title,
                 "authors": meta.authors,
                 "doi": meta.doi,
-                "year": meta.publication_date.as_ref()
-                    .and_then(|d| d.get(..4))
-                    .and_then(|y| y.parse::<i64>().ok()),
+                "year": sanitize_year(meta.publication_date.as_deref()),
                 "topics": meta.topics,
                 "keywords": meta.keywords,
                 "pdf_path": meta.pdf_path,
@@ -342,9 +340,22 @@ pub async fn distinct_doc_count(
     Ok(response.hits.len() as u64)
 }
 
+/// Coerce a `publication_date` string into a sane integer year for the Qdrant
+/// payload. The first 4 chars must parse as i64 within `[1900, current_year+1]`;
+/// anything outside that band (e.g. `"2041-..."` from a citation regex hit, or
+/// a corrupt catalog row) becomes `None` so the field is null in Qdrant rather
+/// than misleadingly precise. `+1` tolerates next-year preprints.
+pub(crate) fn sanitize_year(publication_date: Option<&str>) -> Option<i64> {
+    use chrono::Datelike;
+    let year = publication_date?.get(..4)?.parse::<i64>().ok()?;
+    let now_year = chrono::Utc::now().year() as i64;
+    (1900..=now_year + 1).contains(&year).then_some(year)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
 
     #[test]
     fn deterministic_id_is_stable() {
@@ -358,5 +369,40 @@ mod tests {
         let id1 = deterministic_id("doc-123", 0);
         let id2 = deterministic_id("doc-123", 1);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn sanitize_year_keeps_plausible_publication_year() {
+        assert_eq!(sanitize_year(Some("2018-05-15")), Some(2018));
+        assert_eq!(sanitize_year(Some("1995")), Some(1995));
+    }
+
+    #[test]
+    fn sanitize_year_keeps_next_year_preprint() {
+        let next = chrono::Utc::now().year() as i64 + 1;
+        let s = format!("{next}-01-01");
+        assert_eq!(sanitize_year(Some(&s)), Some(next));
+    }
+
+    #[test]
+    fn sanitize_year_rejects_far_future_year() {
+        // The 2041 case from the self-test: regex-extracted citation year
+        // bleeding into the payload.
+        assert_eq!(sanitize_year(Some("2041-01-01")), None);
+        assert_eq!(sanitize_year(Some("9999")), None);
+    }
+
+    #[test]
+    fn sanitize_year_rejects_pre_1900() {
+        assert_eq!(sanitize_year(Some("1899-12-31")), None);
+        assert_eq!(sanitize_year(Some("0001")), None);
+    }
+
+    #[test]
+    fn sanitize_year_handles_missing_or_unparseable() {
+        assert_eq!(sanitize_year(None), None);
+        assert_eq!(sanitize_year(Some("")), None);
+        assert_eq!(sanitize_year(Some("XX")), None); // first 4 chars need to parse, "XX" is too short
+        assert_eq!(sanitize_year(Some("nope")), None);
     }
 }
