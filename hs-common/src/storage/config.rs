@@ -97,7 +97,7 @@ impl StorageConfig {
                         endpoint: self.s3.endpoint.clone(),
                         bucket: self.s3.bucket.clone(),
                         region: if self.s3.region.is_empty() {
-                            "us-east-1".into()
+                            "garage".into()
                         } else {
                             self.s3.region.clone()
                         },
@@ -138,15 +138,15 @@ local:
         let yaml = r#"
 backend: s3
 s3:
-  endpoint: http://three:9000
-  bucket: papers
+  endpoint: http://four:3900
+  bucket: home-still
   access_key: hs-admin
   secret_key: ${HS_TEST_SECRET}
   allow_http: true
 "#;
         let cfg: StorageConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.backend, Backend::S3);
-        assert_eq!(cfg.s3.bucket, "papers");
+        assert_eq!(cfg.s3.bucket, "home-still");
         assert_eq!(expand(&cfg.s3.secret_key), "shhh");
     }
 

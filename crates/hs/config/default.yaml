@@ -31,6 +31,16 @@ paper:
       timeout_secs: 30
       rate_limit_interval_ms: 100
 
+    semantic_scholar:
+      base_url: https://api.semanticscholar.org
+      # Required for production use. Anonymous tier rate-limits at ~1 req/s
+      # globally and returns 429 with no Retry-After header. The provider
+      # retries once on transient 429s, but a key is the real fix.
+      # Get one: https://www.semanticscholar.org/product/api
+      # api_key: your-key-here
+      timeout_secs: 30
+      rate_limit_interval_ms: 1100
+
   # Download settings
   download:
     # Email for Unpaywall API
@@ -51,17 +61,17 @@ paper:
 
 # --- Storage backend (papers, markdown, catalog) -----------------------
 # Default is the local filesystem rooted at {home.project_dir}.
-# To move everything to MinIO/S3, set backend: s3 and fill in the `s3:` block.
+# To move everything to Garage (S3-compatible), set backend: s3 and fill in the `s3:` block.
 # Secrets support ${ENV_VAR} expansion at load time.
 storage:
   backend: local          # local | s3
   local:
     root: ~/home-still
   # s3:
-  #   endpoint: http://three:9000
-  #   bucket: papers
-  #   region: us-east-1
-  #   access_key: hs-admin
+  #   endpoint: http://four:3900
+  #   bucket: home-still
+  #   region: garage
+  #   access_key: ${HS_S3_ACCESS_KEY}
   #   secret_key: ${HS_S3_SECRET_KEY}
   #   allow_http: true
 

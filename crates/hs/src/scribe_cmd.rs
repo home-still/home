@@ -615,147 +615,6 @@ fn read_as_html(path: &std::path::Path) -> std::io::Result<String> {
     }
 }
 
-/// Convert an HTML academic paper to markdown.
-/// Extracts the article body from PMC/PubMed-style HTML, preserving structure.
-fn convert_html_to_markdown(html: &str) -> String {
-    use scraper::{Html, Selector};
-
-    let doc = Html::parse_document(html);
-
-    // Try progressively broader selectors for the article content
-    let body_selectors = ["article", "main", "#article-body", ".article-body", "body"];
-    let mut root_html = None;
-    for sel_str in &body_selectors {
-        if let Ok(sel) = Selector::parse(sel_str) {
-            if let Some(el) = doc.select(&sel).next() {
-                root_html = Some(el);
-                break;
-            }
-        }
-    }
-
-    let root = match root_html {
-        Some(el) => el,
-        None => return doc.root_element().text().collect::<Vec<_>>().join(" "),
-    };
-
-    // Walk the DOM and produce markdown
-    let mut md = String::new();
-    walk_html_node(&root, &mut md);
-
-    // Clean up excessive blank lines
-    let mut cleaned = String::new();
-    let mut blank_count = 0u32;
-    for line in md.lines() {
-        if line.trim().is_empty() {
-            blank_count += 1;
-            if blank_count <= 2 {
-                cleaned.push('\n');
-            }
-        } else {
-            blank_count = 0;
-            cleaned.push_str(line);
-            cleaned.push('\n');
-        }
-    }
-    cleaned.trim().to_string()
-}
-
-fn walk_html_node(element: &scraper::ElementRef, md: &mut String) {
-    use scraper::Node;
-
-    for child in element.children() {
-        match child.value() {
-            Node::Text(text) => {
-                let t = text.trim();
-                if !t.is_empty() {
-                    md.push_str(t);
-                }
-            }
-            Node::Element(el) => {
-                let tag = el.name();
-                if let Some(child_ref) = scraper::ElementRef::wrap(child) {
-                    match tag {
-                        "h1" => {
-                            md.push_str("\n\n# ");
-                            walk_html_node(&child_ref, md);
-                            md.push_str("\n\n");
-                        }
-                        "h2" => {
-                            md.push_str("\n\n## ");
-                            walk_html_node(&child_ref, md);
-                            md.push_str("\n\n");
-                        }
-                        "h3" => {
-                            md.push_str("\n\n### ");
-                            walk_html_node(&child_ref, md);
-                            md.push_str("\n\n");
-                        }
-                        "h4" | "h5" | "h6" => {
-                            md.push_str("\n\n#### ");
-                            walk_html_node(&child_ref, md);
-                            md.push_str("\n\n");
-                        }
-                        "p" | "div" => {
-                            md.push_str("\n\n");
-                            walk_html_node(&child_ref, md);
-                            md.push_str("\n\n");
-                        }
-                        "strong" | "b" => {
-                            md.push_str("**");
-                            walk_html_node(&child_ref, md);
-                            md.push_str("**");
-                        }
-                        "em" | "i" => {
-                            md.push('_');
-                            walk_html_node(&child_ref, md);
-                            md.push('_');
-                        }
-                        "ul" | "ol" => {
-                            md.push('\n');
-                            walk_html_node(&child_ref, md);
-                            md.push('\n');
-                        }
-                        "li" => {
-                            md.push_str("\n- ");
-                            walk_html_node(&child_ref, md);
-                        }
-                        "br" => md.push('\n'),
-                        "a" => {
-                            walk_html_node(&child_ref, md);
-                        }
-                        "sup" => {
-                            md.push_str("<sup>");
-                            walk_html_node(&child_ref, md);
-                            md.push_str("</sup>");
-                        }
-                        "sub" => {
-                            md.push_str("<sub>");
-                            walk_html_node(&child_ref, md);
-                            md.push_str("</sub>");
-                        }
-                        "table" | "thead" | "tbody" | "tr" | "td" | "th" => {
-                            // Pass through table HTML as-is (markdown tables are limited)
-                            walk_html_node(&child_ref, md);
-                            if tag == "tr" {
-                                md.push('\n');
-                            } else if tag == "td" || tag == "th" {
-                                md.push_str(" | ");
-                            }
-                        }
-                        // Skip script, style, nav, footer, header (non-content)
-                        "script" | "style" | "nav" | "footer" | "header" | "aside" | "noscript"
-                        | "link" | "meta" => {}
-                        // Everything else: recurse
-                        _ => walk_html_node(&child_ref, md),
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Convert an HTML paper and save the result, updating catalog.
 /// No server needed — runs locally.
 async fn convert_html_and_save(
@@ -789,9 +648,22 @@ async fn convert_html_and_save(
         }
     };
 
-    let md = convert_html_to_markdown(&html);
+    let md = hs_scribe::html::convert_html_to_markdown(&html);
     if md.trim().is_empty() {
         reporter.warn(&format!("{stem}: HTML conversion produced empty output"));
+        if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+            storage,
+            catalog_prefix,
+            &stem,
+            "local-html",
+            start.elapsed().as_secs(),
+            0,
+            "empty_output",
+        )
+        .await
+        {
+            reporter.warn(&format!("{stem}: failed-conversion catalog stamp: {e}"));
+        }
         stats.processing.fetch_sub(1, Relaxed);
         stats.failed.fetch_add(1, Relaxed);
         return;
@@ -2091,6 +1963,8 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
                 total_pages,
                 converted_at: chrono::Utc::now().to_rfc3339(),
                 pages: hs_common::catalog::compute_page_offsets(&content),
+                failed: false,
+                reason: None,
             }),
             ..Default::default()
         };

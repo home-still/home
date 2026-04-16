@@ -1,12 +1,15 @@
 pub mod client;
 pub mod config;
 pub mod event_watch;
+pub mod html;
 pub mod postprocess;
 
 // Client-side modules (always available)
 pub mod cli;
 
 // Server-side modules (heavy deps: ONNX, pdfium, image, etc.)
+#[cfg(feature = "server")]
+pub mod gpu;
 #[cfg(feature = "server")]
 pub mod models;
 #[cfg(feature = "server")]

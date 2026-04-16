@@ -60,7 +60,9 @@ enum PreparedPage {
 pub struct Processor {
     ocr: Arc<OcrEngine>,
     layout_detector: Option<Arc<std::sync::Mutex<LayoutDetector>>>,
+    layout_model_reason: Option<String>,
     table_recognizer: Option<Arc<std::sync::Mutex<TableStructureRecognizer>>>,
+    table_model_reason: Option<String>,
     config: AppConfig,
 }
 
@@ -68,6 +70,7 @@ impl Processor {
     pub fn new(config: AppConfig) -> Result<Self> {
         let ocr = Arc::new(OcrEngine::from_config(&config));
 
+        let mut layout_model_reason: Option<String> = None;
         let layout_detector = if config.pipeline_mode == PipelineMode::PerRegion {
             let layout_path = config.resolved_layout_model_path();
             if layout_path.exists() {
@@ -78,23 +81,26 @@ impl Processor {
                         Some(Arc::new(std::sync::Mutex::new(det)))
                     }
                     Err(e) => {
+                        let reason = format!("load failed: {e}");
                         tracing::warn!(
                             "Failed to load layout detector: {e}. Falling back to FullPage mode."
                         );
+                        layout_model_reason = Some(reason);
                         None
                     }
                 }
             } else {
-                tracing::warn!(
-                    "Layout model not found at {}. Falling back to FullPage mode.",
-                    layout_path.display()
-                );
+                let reason = format!("model file not found at {}", layout_path.display());
+                tracing::warn!("{reason}. Falling back to FullPage mode.");
+                layout_model_reason = Some(reason);
                 None
             }
         } else {
+            layout_model_reason = Some("disabled (pipeline_mode != per_region)".into());
             None
         };
 
+        let mut table_model_reason: Option<String> = None;
         let table_recognizer = if config.pipeline_mode == PipelineMode::PerRegion {
             let slanet_path = config.resolved_table_model_path();
             if slanet_path.exists() {
@@ -107,27 +113,39 @@ impl Processor {
                         Some(Arc::new(std::sync::Mutex::new(r)))
                     }
                     Err(e) => {
+                        let reason = format!("load failed: {e}");
                         tracing::warn!("Table structure recognizer not available: {e}");
+                        table_model_reason = Some(reason);
                         None
                     }
                 }
             } else {
-                tracing::info!(
-                    "SLANet-Plus model not found at {}, tables go to VLM",
-                    slanet_path.display()
-                );
+                let reason = format!("model file not found at {}", slanet_path.display());
+                tracing::info!("{reason}, tables go to VLM");
+                table_model_reason = Some(reason);
                 None
             }
         } else {
+            table_model_reason = Some("disabled (pipeline_mode != per_region)".into());
             None
         };
 
         Ok(Self {
             ocr,
             layout_detector,
+            layout_model_reason,
             table_recognizer,
+            table_model_reason,
             config,
         })
+    }
+
+    pub fn layout_model_reason(&self) -> Option<&str> {
+        self.layout_model_reason.as_deref()
+    }
+
+    pub fn table_model_reason(&self) -> Option<&str> {
+        self.table_model_reason.as_deref()
     }
 
     pub fn ocr(&self) -> Arc<OcrEngine> {

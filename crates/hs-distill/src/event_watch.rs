@@ -18,17 +18,43 @@ pub struct CompletedEvent {
 }
 
 /// Pull the markdown at `event.key` from `storage` and ask the distill
-/// server to index it. Publishes `distill.completed` on success.
+/// server to index it. Loads the catalog entry for the stem so metadata
+/// (title, authors, DOI, year) lands on Qdrant payloads. Publishes
+/// `distill.completed` on success.
 pub async fn index_and_publish(
     storage: &dyn Storage,
     distill: &DistillClient,
     bus: &dyn EventBus,
     event: &CompletedEvent,
 ) -> Result<()> {
+    let stem = event
+        .key
+        .rsplit('/')
+        .next()
+        .unwrap_or(&event.key)
+        .trim_end_matches(".md");
+    let catalog = hs_common::catalog::read_catalog_entry_via(storage, "catalog", stem).await;
+
     let result = distill
-        .index_from_storage(storage, &event.key)
+        .index_from_storage_with_catalog(storage, &event.key, catalog.as_ref())
         .await
         .with_context(|| format!("distill index failed for {}", event.key))?;
+
+    // Stamp the catalog so a 0-chunk skip is visible (and the backfill tool
+    // can decide whether to retry). Best-effort — failure to write the
+    // catalog must not abort the event-bus loop.
+    if let Err(e) = hs_common::catalog::record_embedding_outcome_via(
+        storage,
+        "catalog",
+        stem,
+        "event-watch",
+        result.chunks_indexed,
+        &result.embedding_device,
+    )
+    .await
+    {
+        tracing::warn!(stem = %stem, error = %e, "embedding catalog update failed");
+    }
 
     let payload = serde_json::json!({
         "key": event.key,
@@ -82,10 +108,21 @@ mod tests {
 
     #[test]
     fn parses_payload() {
-        let payload = br#"{"key":"ab/cdef.md","source_key":"ab/cdef.pdf"}"#;
+        let payload = br#"{"key":"markdown/ab/cdef.md","source_key":"ab/cdef.pdf"}"#;
         let e: CompletedEvent = serde_json::from_slice(payload).unwrap();
-        assert_eq!(e.key, "ab/cdef.md");
+        assert_eq!(e.key, "markdown/ab/cdef.md");
         assert_eq!(e.source_key.as_deref(), Some("ab/cdef.pdf"));
+    }
+
+    #[test]
+    fn stem_from_markdown_key() {
+        let key = "markdown/10/10.1609_aaai.v38i16.29728.md";
+        let stem = key
+            .rsplit('/')
+            .next()
+            .unwrap_or(key)
+            .trim_end_matches(".md");
+        assert_eq!(stem, "10.1609_aaai.v38i16.29728");
     }
 
     #[tokio::test]

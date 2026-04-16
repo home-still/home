@@ -42,6 +42,19 @@ pub struct CatalogEntry {
     // Embedding metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<EmbeddingMeta>,
+
+    /// Recorded when the distill indexer chose to skip this document
+    /// (empty markdown, zero chunks after quality filtering, etc). Lets
+    /// `catalog_list` surface "stuck" documents and lets backfill avoid
+    /// retrying known dead-ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_skip: Option<EmbeddingSkip>,
+
+    /// Recorded when `catalog_repair` synthesized a row for an orphan file
+    /// (PDF/HTML on disk with no prior catalog entry). Distinguishes
+    /// repaired rows from rows produced by the normal download path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<RepairMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +65,31 @@ pub struct ConversionMeta {
     pub converted_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<PageOffset>,
+    /// Set when the conversion path detected a degenerate result (e.g.
+    /// empty output) and chose to record the failure rather than emit a
+    /// silent success row.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub failed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingSkip {
+    /// Short machine-readable token, e.g. "empty_markdown",
+    /// "zero_chunks_after_quality_filter".
+    pub reason: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairMeta {
+    pub repaired_at: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +167,8 @@ pub fn update_conversion_catalog(
         total_pages,
         converted_at: chrono::Utc::now().to_rfc3339(),
         pages,
+        failed: false,
+        reason: None,
     });
 
     write_catalog_entry(catalog_dir, stem, &entry);
@@ -164,7 +204,7 @@ pub fn update_embedding_catalog(
 //
 // These mirror the path-based helpers above but read and write via the
 // `Storage` trait, so callers can point at either a local filesystem or an
-// S3/MinIO bucket with the same code. `prefix` is the sub-path inside the
+// Garage/S3 bucket with the same code. `prefix` is the sub-path inside the
 // storage backend where catalog YAMLs live (e.g. "catalog" for a local
 // backend rooted at the project dir, or "" for a dedicated `catalog` bucket).
 
@@ -285,9 +325,102 @@ pub async fn update_conversion_catalog_via(
         total_pages,
         converted_at: chrono::Utc::now().to_rfc3339(),
         pages,
+        failed: false,
+        reason: None,
     });
 
     write_catalog_entry_via(storage, prefix, stem, &entry).await
+}
+
+/// Stamp a failed conversion (e.g. empty-output guard tripped) instead of
+/// emitting a silent success row. Pairs with `update_conversion_catalog_via`
+/// so callers can branch on a content-quality check before recording the
+/// outcome.
+#[cfg(feature = "storage")]
+pub async fn update_conversion_failed_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    stem: &str,
+    server: &str,
+    duration_secs: u64,
+    total_pages: u64,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let mut entry = read_catalog_entry_via(storage, prefix, stem)
+        .await
+        .unwrap_or_default();
+    entry.conversion = Some(ConversionMeta {
+        server: server.to_string(),
+        duration_secs,
+        total_pages,
+        converted_at: chrono::Utc::now().to_rfc3339(),
+        pages: Vec::new(),
+        failed: true,
+        reason: Some(reason.to_string()),
+    });
+    write_catalog_entry_via(storage, prefix, stem, &entry).await
+}
+
+/// Record the outcome of an indexing attempt: stamp `embedding` when
+/// Qdrant got points, otherwise stamp `embedding_skip`. Use this at the
+/// integration seam (MCP, event_watch) so a 0-chunks return value is
+/// always visible in the catalog rather than indistinguishable from
+/// "never tried."
+#[cfg(feature = "storage")]
+pub async fn record_embedding_outcome_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    stem: &str,
+    server: &str,
+    chunks_indexed: u32,
+    compute_device: &str,
+) -> anyhow::Result<()> {
+    if chunks_indexed > 0 {
+        update_embedding_catalog_via(
+            storage,
+            prefix,
+            stem,
+            server,
+            chunks_indexed,
+            compute_device,
+        )
+        .await
+    } else {
+        update_embedding_skip_via(storage, prefix, stem, "zero_chunks_or_empty").await
+    }
+}
+
+/// Stamp a skip on the embedding stage. Used by the distill pipeline when
+/// it intentionally chooses not to index a document (empty markdown, zero
+/// chunks after quality filtering). Without this, the absence of an
+/// `embedding` block is indistinguishable from "never tried" and the doc
+/// would be retried forever.
+#[cfg(feature = "storage")]
+pub async fn update_embedding_skip_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    stem: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let mut entry = read_catalog_entry_via(storage, prefix, stem)
+        .await
+        .unwrap_or_default();
+    entry.embedding_skip = Some(EmbeddingSkip {
+        reason: reason.to_string(),
+        at: chrono::Utc::now().to_rfc3339(),
+    });
+    write_catalog_entry_via(storage, prefix, stem, &entry).await
+}
+
+/// Path-variant of `update_embedding_skip_via` for the local-CLI flows that
+/// still walk the filesystem directly.
+pub fn update_embedding_skip(catalog_dir: &Path, stem: &str, reason: &str) {
+    let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
+    entry.embedding_skip = Some(EmbeddingSkip {
+        reason: reason.to_string(),
+        at: chrono::Utc::now().to_rfc3339(),
+    });
+    write_catalog_entry(catalog_dir, stem, &entry);
 }
 
 #[cfg(feature = "storage")]

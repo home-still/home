@@ -42,6 +42,7 @@ dirs = "6"
 hs-common = { workspace = true, features = ["service", "storage-s3", "events-nats", "logging"] }
 async-trait = "0.1"
 futures-util = "0.3"
+scraper = "0.22"
 
 # Server Only
 axum = { version = "0.8", optional = true, features = ["multipart"] }

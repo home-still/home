@@ -7,6 +7,17 @@
 
 use crate::storage::{ObjectMeta, Storage};
 
+/// Default storage prefix for markdown objects. Every writer and reader
+/// should agree on this so `markdown/{shard}/{stem}.md` is the one true
+/// convention across MCP tools, event-bus daemons, and direct Storage calls.
+pub const MARKDOWN_PREFIX: &str = "markdown";
+
+/// Fully-qualified storage key for a markdown document under the default
+/// `markdown/` prefix. Shape: `markdown/{shard}/{stem}.md`.
+pub fn markdown_storage_key(stem: &str) -> String {
+    markdown_key(MARKDOWN_PREFIX, stem)
+}
+
 fn markdown_key(prefix: &str, stem: &str) -> String {
     let key = crate::sharded_key(stem, "md");
     if prefix.is_empty() {

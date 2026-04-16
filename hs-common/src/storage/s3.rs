@@ -54,7 +54,7 @@ impl S3Storage {
     }
 
     /// HEAD the bucket; if 404, PUT it. Idempotent.
-    /// Uses path-style sigv4 — works for MinIO and S3.
+    /// Uses path-style sigv4 — works for Garage and S3-compatible stores.
     pub async fn ensure_bucket(&self) -> anyhow::Result<()> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
@@ -67,7 +67,7 @@ impl S3Storage {
             return Ok(());
         }
         if head.status().as_u16() != 404 && head.status().as_u16() != 403 {
-            // 403 can mean "exists but permission" OR "missing bucket (minio quirk)".
+            // 403 can mean "exists but permission" OR "missing bucket (S3-compatible quirk)".
             // We fall through to PUT; if it truly exists, the PUT returns 409/200.
             let status = head.status();
             let body = head.text().await.unwrap_or_default();
@@ -226,24 +226,24 @@ impl Storage for S3Storage {
 mod tests {
     use super::*;
 
-    fn minio_config() -> Option<S3Config> {
+    fn garage_config() -> Option<S3Config> {
         let endpoint = std::env::var("HS_S3_ENDPOINT").ok()?;
         let access = std::env::var("HS_S3_ACCESS_KEY").ok()?;
         let secret = std::env::var("HS_S3_SECRET_KEY").ok()?;
-        let bucket = std::env::var("HS_S3_BUCKET").unwrap_or_else(|_| "papers".into());
+        let bucket = std::env::var("HS_S3_BUCKET").unwrap_or_else(|_| "home-still".into());
         Some(S3Config {
             endpoint,
             bucket,
             access_key: access,
             secret_key: secret,
-            region: "us-east-1".into(),
+            region: "garage".into(),
             allow_http: true,
         })
     }
 
     #[tokio::test]
     async fn s3_roundtrip() {
-        let Some(cfg) = minio_config() else {
+        let Some(cfg) = garage_config() else {
             eprintln!("skipping: set HS_S3_ENDPOINT/ACCESS_KEY/SECRET_KEY to run");
             return;
         };
@@ -262,7 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_bucket_creates_fresh_and_is_idempotent() {
-        let Some(mut cfg) = minio_config() else {
+        let Some(mut cfg) = garage_config() else {
             eprintln!("skipping: set HS_S3_ENDPOINT/ACCESS_KEY/SECRET_KEY to run");
             return;
         };

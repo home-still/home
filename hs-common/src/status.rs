@@ -183,6 +183,59 @@ pub async fn count_ext_via(storage: &dyn Storage, prefix: &str, ext: &str) -> u6
     }
 }
 
+/// Find document files (PDFs and HTML fallbacks) under `papers_prefix`
+/// that have no matching catalog YAML under `catalog_prefix`. Returns
+/// `(stem, ext)` pairs sorted by stem so output is deterministic.
+///
+/// This is the primary diagnostic for the documents → catalog gap that
+/// the self-test surfaces. The repair tool consumes this list to
+/// synthesize minimal catalog rows for orphan files, restoring source-
+/// of-truth alignment without re-downloading.
+#[cfg(feature = "storage")]
+pub async fn list_orphan_document_stems(
+    storage: &dyn Storage,
+    papers_prefix: &str,
+    catalog_prefix: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let papers = storage.list(papers_prefix).await?;
+    let catalog = storage.list(catalog_prefix).await?;
+
+    use std::collections::HashSet;
+    let known: HashSet<String> = catalog
+        .iter()
+        .filter_map(|o| {
+            if !o.key.ends_with(".yaml") {
+                return None;
+            }
+            let filename = o.key.rsplit('/').next()?;
+            if filename.starts_with("._") {
+                return None;
+            }
+            Some(filename.trim_end_matches(".yaml").to_string())
+        })
+        .collect();
+
+    let mut orphans: Vec<(String, String)> = Vec::new();
+    for obj in papers {
+        let filename = match obj.key.rsplit('/').next() {
+            Some(f) => f,
+            None => continue,
+        };
+        if filename.starts_with("._") {
+            continue;
+        }
+        let (stem, ext) = match filename.rsplit_once('.') {
+            Some((s, e)) if e == "pdf" || e == "html" => (s.to_string(), e.to_string()),
+            _ => continue,
+        };
+        if !known.contains(&stem) {
+            orphans.push((stem, ext));
+        }
+    }
+    orphans.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(orphans)
+}
+
 /// Pipeline counts via Storage. Same source of truth as MCP today.
 #[cfg(feature = "storage")]
 pub async fn collect_pipeline_counts(

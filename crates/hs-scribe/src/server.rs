@@ -1,5 +1,6 @@
-use crate::client::StreamLine;
+use crate::client::{HealthResponse, StreamLine};
 use crate::config::AppConfig;
+use crate::gpu;
 use crate::pipeline::processor::Processor;
 use axum::{
     body::Body,
@@ -32,11 +33,18 @@ pub fn app(state: Arc<ServerState>) -> Router {
 }
 
 async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    axum::Json(serde_json::json!({
-        "status": "ok", "layout_model": state.processor.has_layout_detector(),
-        "table_model": state.processor.has_table_recognizer(),
-        "version": env!("HS_VERSION"),
-    }))
+    let (gpu_name, gpu_utilization_pct, gpu_memory_used_mb) = gpu::query_gpu_info();
+    axum::Json(HealthResponse {
+        status: "ok".into(),
+        layout_model: state.processor.has_layout_detector(),
+        table_model: state.processor.has_table_recognizer(),
+        layout_model_reason: state.processor.layout_model_reason().map(str::to_string),
+        table_model_reason: state.processor.table_model_reason().map(str::to_string),
+        version: env!("HS_VERSION").into(),
+        gpu_name,
+        gpu_utilization_pct,
+        gpu_memory_used_mb,
+    })
 }
 
 async fn handle_readiness(State(state): State<Arc<ServerState>>) -> impl IntoResponse {

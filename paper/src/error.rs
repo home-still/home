@@ -11,7 +11,7 @@ pub enum PaperError {
     #[error("Provider unavailable: {0}. Try a different provider with --provider")]
     ProviderUnavailable(String),
 
-    #[error("Rate limited by {provider}. Retry after {retry_after:?}. Consider --concurrency 1")]
+    #[error("Rate limited by {provider}. Retry after {retry_after:?}. Set api_key under paper.providers.{provider} in ~/.home-still/config.yaml for higher quota.")]
     RateLimited {
         provider: String,
         retry_after: Option<std::time::Duration>,
@@ -97,12 +97,14 @@ mod tests {
     }
 
     #[test]
-    fn rate_limited_suggests_concurrency() {
+    fn rate_limited_suggests_api_key() {
         let err = PaperError::RateLimited {
-            provider: "arxiv".into(),
+            provider: "semantic_scholar".into(),
             retry_after: Some(std::time::Duration::from_secs(5)),
         };
-        assert!(err.to_string().contains("--concurrency"));
+        let s = err.to_string();
+        assert!(s.contains("api_key"));
+        assert!(s.contains("paper.providers.semantic_scholar"));
     }
 
     #[test]

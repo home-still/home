@@ -8,7 +8,7 @@ use crate::config::SemanticScholarConfig;
 use crate::error::PaperError;
 use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType, SortBy};
 use crate::ports::provider::PaperProvider;
-use crate::providers::response::check_response;
+use crate::providers::response::{check_response, send_with_429_retry};
 
 #[derive(Debug, Deserialize)]
 struct S2SearchResponse {
@@ -177,7 +177,7 @@ impl PaperProvider for SemanticScholarProvider {
             request = request.header("x-api-key", key);
         }
 
-        let response = request.send().await?;
+        let response = send_with_429_retry(request, "semantic_scholar").await?;
 
         check_response(&response, "semantic_scholar")?;
 
@@ -218,7 +218,7 @@ impl PaperProvider for SemanticScholarProvider {
             request = request.header("x-api-key", key);
         }
 
-        let response = request.send().await?;
+        let response = send_with_429_retry(request, "semantic_scholar").await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);

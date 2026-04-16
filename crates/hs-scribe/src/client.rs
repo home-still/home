@@ -31,6 +31,13 @@ pub struct HealthResponse {
     pub status: String,
     pub layout_model: bool,
     pub table_model: bool,
+    /// Why `layout_model` is false (file path missing, load error, mode
+    /// disabled). `None` when the model loaded successfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_model_reason: Option<String>,
+    /// Why `table_model` is false. Same semantics as `layout_model_reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_model_reason: Option<String>,
     #[serde(default)]
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

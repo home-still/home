@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
+use hs_common::event_bus::{EventBus, NoOpBus};
 use hs_common::storage::Storage;
 use rmcp::{
     handler::server::{
@@ -126,6 +127,41 @@ struct DistillReconcileParams {
     limit: Option<u64>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DistillReindexParams {
+    #[schemars(description = "Paper stem name (filename without extension) to purge and re-index")]
+    stem: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CatalogRepairParams {
+    #[schemars(
+        description = "If true, report what would be repaired without writing. Default: true."
+    )]
+    #[serde(default = "default_true")]
+    dry_run: bool,
+    #[schemars(description = "Maximum number of orphans to repair in this call.")]
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DistillBackfillParams {
+    #[schemars(
+        description = "If true, report what would be re-indexed without writing. Default: true."
+    )]
+    #[serde(default = "default_true")]
+    dry_run: bool,
+    #[schemars(description = "Maximum number of documents to attempt this call.")]
+    #[serde(default)]
+    limit: Option<usize>,
+    #[schemars(
+        description = "If true, also retry documents previously stamped with an embedding_skip reason. Default: false."
+    )]
+    #[serde(default)]
+    retry_skipped: bool,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -135,8 +171,12 @@ fn default_true() -> bool {
 #[derive(Clone)]
 #[allow(dead_code)]
 struct HomeStillMcp {
-    // Primary read-path handle: Storage trait (local fs or S3/MinIO).
+    // Primary read-path handle: Storage trait (local fs or Garage/S3).
     storage: Arc<dyn Storage>,
+    // Event bus for cross-service notifications (scribe.completed, …). Falls
+    // back to NoOpBus if the NATS config is absent or the broker is down at
+    // init; publishes become silent no-ops in that case.
+    events: Arc<dyn EventBus>,
     catalog_prefix: String,
     markdown_prefix: String,
     papers_prefix: String,
@@ -178,6 +218,17 @@ impl HomeStillMcp {
             tracing::warn!("storage ensure_ready failed: {e:#}");
         }
 
+        // Event bus: reuse the events section already parsed into ScribeConfig.
+        // Any failure (missing config, broker down, feature not compiled)
+        // degrades to NoOpBus so the MCP server still starts.
+        let events: Arc<dyn EventBus> = match scribe_cfg.build_event_bus().await {
+            Ok(bus) => bus,
+            Err(e) => {
+                tracing::warn!("event bus init failed ({e:#}); using NoOpBus");
+                Arc::new(NoOpBus)
+            }
+        };
+
         // Discover servers from gateway registry, falling back to config
         let scribe_servers = hs_common::service::registry::discover_or_fallback(
             "scribe",
@@ -192,8 +243,9 @@ impl HomeStillMcp {
 
         Self {
             storage,
+            events,
             catalog_prefix: "catalog".to_string(),
-            markdown_prefix: "markdown".to_string(),
+            markdown_prefix: hs_common::markdown::MARKDOWN_PREFIX.to_string(),
             papers_prefix: "papers".to_string(),
             legacy_papers_dir: scribe_cfg.watch_dir.clone(),
             legacy_markdown_dir: scribe_cfg.output_dir.clone(),
@@ -415,6 +467,8 @@ impl HomeStillMcp {
             sha256: Some(result.sha256.clone()),
             conversion: None,
             embedding: None,
+            embedding_skip: None,
+            repair: None,
         };
         if let Err(e) = hs_common::catalog::write_catalog_entry_via(
             &*self.storage,
@@ -475,13 +529,21 @@ impl HomeStillMcp {
             .into_iter()
             .map(|(stem, _meta, cat)| {
                 let title = cat.title.unwrap_or_default();
+                let downloaded = cat.downloaded_at.is_some();
                 let converted = cat.conversion.is_some();
+                let conversion_failed = cat.conversion.as_ref().is_some_and(|c| c.failed);
                 let embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
+                let embedding_skipped = cat.embedding_skip.is_some();
+                let repaired = cat.repair.is_some();
                 serde_json::json!({
                     "stem": stem,
                     "title": title,
+                    "downloaded": downloaded,
                     "converted": converted,
+                    "conversion_failed": conversion_failed,
                     "embedded": embedded,
+                    "embedding_skipped": embedding_skipped,
+                    "repaired": repaired,
                 })
             })
             .collect();
@@ -584,6 +646,88 @@ impl HomeStillMcp {
             Some(entry) => Ok(serde_json::to_string_pretty(&entry).unwrap_or_default()),
             None => Err(format!("No catalog entry found for '{}'", p.stem)),
         }
+    }
+
+    #[tool(
+        description = "Find document files (PDFs and HTML fallbacks) on disk that have no catalog row, and optionally synthesize minimal catalog entries for them. Use `dry_run=true` first to preview the count and a sample of stems. Repaired rows carry a `repair` block so they're distinguishable from rows produced by `paper_download`.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn catalog_repair(
+        &self,
+        Parameters(p): Parameters<CatalogRepairParams>,
+    ) -> Result<String, String> {
+        let orphans = hs_common::status::list_orphan_document_stems(
+            &*self.storage,
+            &self.papers_prefix,
+            &self.catalog_prefix,
+        )
+        .await
+        .map_err(|e| format!("orphan scan failed: {e}"))?;
+
+        let total = orphans.len();
+        let limit = p.limit.unwrap_or(usize::MAX);
+        let take = orphans.iter().take(limit);
+        let sample: Vec<String> = take.clone().take(10).map(|(s, _)| s.clone()).collect();
+
+        if p.dry_run {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "orphans_found": total,
+                "would_repair": take.count(),
+                "samples": sample,
+                "dry_run": true,
+            }))
+            .unwrap_or_default());
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut repaired = 0u64;
+        let mut errors: Vec<String> = Vec::new();
+        for (stem, ext) in orphans.iter().take(limit) {
+            // Reuse any prior partial entry (rare, but harmless).
+            let mut entry = hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                stem,
+            )
+            .await
+            .unwrap_or_default();
+            if entry.pdf_path.is_none() {
+                entry.pdf_path = Some(format!(
+                    "{}/{}",
+                    self.papers_prefix,
+                    hs_common::sharded_key(stem, ext)
+                ));
+            }
+            entry.repair = Some(hs_common::catalog::RepairMeta {
+                repaired_at: now.clone(),
+                reason: format!("orphan {ext} on disk with no catalog row"),
+            });
+            match hs_common::catalog::write_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                stem,
+                &entry,
+            )
+            .await
+            {
+                Ok(()) => repaired += 1,
+                Err(e) => errors.push(format!("{stem}: {e}")),
+            }
+        }
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "orphans_found": total,
+            "repaired": repaired,
+            "errors": errors,
+            "samples": sample,
+            "dry_run": false,
+        }))
+        .unwrap_or_default())
     }
 
     // ── Markdown Tools ─────────────────────────────────────────
@@ -695,7 +839,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Convert a PDF from the papers directory to markdown using the scribe server. Takes a stem name (filename without extension). Writes markdown to storage, updates the catalog conversion block, and returns a summary. Use `markdown_read` to fetch content.",
+        description = "Convert a paper to markdown. For PDFs, uses the scribe VLM server. For HTML papers (PMC/PubMed fallbacks), converts locally. Takes a stem name (filename without extension). Writes markdown to storage, updates the catalog, and returns a summary. Use `markdown_read` to fetch content.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -707,27 +851,38 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<ScribeConvertParams>,
     ) -> Result<String, String> {
-        let client = self.scribe_client().ok_or("No scribe server configured")?;
-        let server_url = self
-            .scribe_servers
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        // PDFs live flat in the papers bucket under the sharded key (e.g.
-        // `10/DOI.pdf`) — same key the downloader writes (paper/src/providers/
-        // downloader.rs:277, 335). No `papers/` prefix: that's the bucket name.
         let pdf_key = hs_common::sharded_key(&p.stem, "pdf");
-        let pdf_bytes =
-            self.storage.get(&pdf_key).await.map_err(|e| {
-                format!("Cannot read PDF '{}' from storage ({pdf_key}): {e}", p.stem)
-            })?;
+        let html_key = hs_common::sharded_key(&p.stem, "html");
 
         let start = std::time::Instant::now();
-        let md = client
-            .convert(pdf_bytes)
-            .await
-            .map_err(|e| format!("Conversion failed: {e}"))?;
+        let (md, source_key, server_label) = if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await
+        {
+            let client = self.scribe_client().ok_or("No scribe server configured")?;
+            let md = client
+                .convert(pdf_bytes)
+                .await
+                .map_err(|e| format!("Conversion failed: {e}"))?;
+            let server_url = self
+                .scribe_servers
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let short = server_url
+                .strip_prefix("http://")
+                .or_else(|| server_url.strip_prefix("https://"))
+                .unwrap_or(server_url);
+            (md, pdf_key, short.to_string())
+        } else if let Ok(html_bytes) = self.storage.get(&html_key).await {
+            let html = String::from_utf8(html_bytes)
+                .map_err(|e| format!("HTML at {html_key} is not valid UTF-8: {e}"))?;
+            let md = hs_scribe::html::convert_html_to_markdown(&html);
+            (md, html_key, "local-html".to_string())
+        } else {
+            return Err(format!(
+                "No PDF or HTML found for '{}' (tried {pdf_key} and {html_key})",
+                p.stem
+            ));
+        };
         let duration_secs = start.elapsed().as_secs();
 
         let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
@@ -739,8 +894,24 @@ impl HomeStillMcp {
         let total_pages = page_offsets.len() as u64;
 
         if hs_scribe::postprocess::is_stub_pdf(total_pages, &md) {
+            // Record the failure on the catalog so the doc isn't silently
+            // retried by every backfill pass, and so it's visible in
+            // `catalog_list` via the `conversion_failed` flag.
+            if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &p.stem,
+                &server_label,
+                duration_secs,
+                total_pages,
+                "stub_document",
+            )
+            .await
+            {
+                tracing::warn!("failed-conversion catalog stamp failed for {}: {e}", p.stem);
+            }
             return Err(format!(
-                "{}: stub PDF (≤1 page, <500 non-whitespace chars) — not persisted",
+                "{}: stub document (≤1 page, <500 non-whitespace chars) — not persisted",
                 p.stem
             ));
         }
@@ -757,15 +928,11 @@ impl HomeStillMcp {
             .await
             .map_err(|e| format!("Failed to write markdown to storage ({md_key}): {e}"))?;
 
-        let short_server = server_url
-            .strip_prefix("http://")
-            .or_else(|| server_url.strip_prefix("https://"))
-            .unwrap_or(server_url);
         hs_common::catalog::update_conversion_catalog_via(
             &*self.storage,
             &self.catalog_prefix,
             &p.stem,
-            short_server,
+            &server_label,
             duration_secs,
             total_pages,
             page_offsets,
@@ -774,13 +941,34 @@ impl HomeStillMcp {
         .await
         .map_err(|e| format!("Failed to update catalog for '{}': {e}", p.stem))?;
 
+        let event_payload = serde_json::json!({
+            "key": md_key,
+            "source_key": source_key,
+        });
+        if let Err(e) = self
+            .events
+            .publish(
+                "scribe.completed",
+                serde_json::to_vec(&event_payload)
+                    .unwrap_or_default()
+                    .as_slice(),
+            )
+            .await
+        {
+            tracing::warn!(
+                stem = %p.stem,
+                error = %e,
+                "scribe.completed publish failed",
+            );
+        }
+
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "stem": p.stem,
             "markdown_key": md_key,
             "bytes_written": bytes_written,
             "total_pages": total_pages,
             "duration_secs": duration_secs,
-            "server": short_server,
+            "server": server_label,
         }))
         .unwrap_or_default())
     }
@@ -917,8 +1105,10 @@ impl HomeStillMcp {
             .await
         {
             Ok(result) => {
-                // Write embedding metadata to catalog via Storage.
-                if let Err(e) = hs_common::catalog::update_embedding_catalog_via(
+                // Stamp embedding on success or embedding_skip on a 0-chunk return,
+                // so the catalog distinguishes "indexed" from "tried-and-skipped"
+                // from "never tried."
+                if let Err(e) = hs_common::catalog::record_embedding_outcome_via(
                     &*self.storage,
                     &self.catalog_prefix,
                     &p.stem,
@@ -1020,6 +1210,191 @@ impl HomeStillMcp {
             "orphan_count": orphans.len(),
             "orphans": orphans,
             "points_deleted": deleted_total,
+        }))
+        .unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Purge all vectors for a document and re-index it from storage with fresh catalog metadata. Use to fix documents with null/wrong metadata or stale embeddings.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn distill_reindex(
+        &self,
+        Parameters(p): Parameters<DistillReindexParams>,
+    ) -> Result<String, String> {
+        let client = self
+            .distill_client()
+            .ok_or("No distill server configured")?;
+
+        let deleted = client
+            .delete_doc(&p.stem)
+            .await
+            .map_err(|e| format!("Purge failed for '{}': {e}", p.stem))?;
+
+        let key = format!(
+            "{}/{}",
+            self.markdown_prefix.trim_end_matches('/'),
+            hs_common::sharded_key(&p.stem, "md")
+        );
+        if !self.storage.exists(&key).await.unwrap_or(false) {
+            return Err(format!(
+                "Purged {deleted} old vectors but markdown not found at '{key}'. Convert the paper first.",
+            ));
+        }
+
+        let catalog_entry = hs_common::catalog::read_catalog_entry_via(
+            &*self.storage,
+            &self.catalog_prefix,
+            &p.stem,
+        )
+        .await;
+
+        let result = client
+            .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
+            .await
+            .map_err(|e| format!("Re-index failed for '{}': {e}", p.stem))?;
+
+        if let Err(e) = hs_common::catalog::record_embedding_outcome_via(
+            &*self.storage,
+            &self.catalog_prefix,
+            &p.stem,
+            self.distill_servers
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or(""),
+            result.chunks_indexed,
+            &result.embedding_device,
+        )
+        .await
+        {
+            tracing::warn!("embedding catalog update failed for {}: {e}", p.stem);
+        }
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "stem": p.stem,
+            "old_vectors_purged": deleted,
+            "chunks_indexed": result.chunks_indexed,
+            "embedding_device": result.embedding_device,
+            "has_catalog": catalog_entry.is_some(),
+        }))
+        .unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Find catalog entries that are converted but not embedded and re-attempt indexing for each. Use `dry_run=true` to preview the candidate count. By default, documents previously stamped with an embedding_skip reason are excluded; pass `retry_skipped=true` to retry those too. Pairs with the per-document `distill_reindex` tool for batch recovery.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn distill_backfill(
+        &self,
+        Parameters(p): Parameters<DistillBackfillParams>,
+    ) -> Result<String, String> {
+        let triples =
+            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
+                .await
+                .map_err(|e| format!("catalog list failed: {e}"))?;
+
+        let candidates: Vec<String> = triples
+            .into_iter()
+            .filter_map(|(stem, _meta, cat)| {
+                let converted = cat.conversion.as_ref().is_some_and(|c| !c.failed);
+                let already_embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
+                let was_skipped = cat.embedding_skip.is_some();
+                if !converted || already_embedded {
+                    return None;
+                }
+                if was_skipped && !p.retry_skipped {
+                    return None;
+                }
+                Some(stem)
+            })
+            .collect();
+
+        let total = candidates.len();
+        let limit = p.limit.unwrap_or(usize::MAX);
+        let take: Vec<&String> = candidates.iter().take(limit).collect();
+        let sample: Vec<String> = take.iter().take(10).map(|s| (*s).clone()).collect();
+
+        if p.dry_run {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "candidates": total,
+                "would_index": take.len(),
+                "samples": sample,
+                "dry_run": true,
+            }))
+            .unwrap_or_default());
+        }
+
+        let client = self
+            .distill_client()
+            .ok_or("No distill server configured")?;
+
+        let mut indexed = 0u64;
+        let mut still_skipped = 0u64;
+        let mut errors: Vec<String> = Vec::new();
+
+        for stem in take {
+            let key = format!(
+                "{}/{}",
+                self.markdown_prefix.trim_end_matches('/'),
+                hs_common::sharded_key(stem, "md")
+            );
+            if !self.storage.exists(&key).await.unwrap_or(false) {
+                errors.push(format!("{stem}: markdown missing at {key}"));
+                continue;
+            }
+            let catalog_entry = hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                stem,
+            )
+            .await;
+            match client
+                .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
+                .await
+            {
+                Ok(result) => {
+                    if let Err(e) = hs_common::catalog::record_embedding_outcome_via(
+                        &*self.storage,
+                        &self.catalog_prefix,
+                        stem,
+                        self.distill_servers
+                            .first()
+                            .map(|s| s.as_str())
+                            .unwrap_or(""),
+                        result.chunks_indexed,
+                        &result.embedding_device,
+                    )
+                    .await
+                    {
+                        errors.push(format!("{stem}: catalog stamp failed: {e}"));
+                    }
+                    if result.chunks_indexed > 0 {
+                        indexed += 1;
+                    } else {
+                        still_skipped += 1;
+                    }
+                }
+                Err(e) => errors.push(format!("{stem}: {e}")),
+            }
+        }
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "candidates": total,
+            "indexed": indexed,
+            "still_skipped": still_skipped,
+            "errors": errors,
+            "samples": sample,
+            "dry_run": false,
         }))
         .unwrap_or_default())
     }

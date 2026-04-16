@@ -30,7 +30,7 @@ pub struct Config {
     /// Download config
     pub download: DownloadConfig,
 
-    /// Storage backend (local filesystem or S3/MinIO).
+    /// Storage backend (local filesystem or Garage/S3).
     /// Loaded from the top-level `storage:` section of the config file.
     #[serde(skip)]
     pub storage: StorageConfig,

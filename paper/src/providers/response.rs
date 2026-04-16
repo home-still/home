@@ -1,6 +1,49 @@
 use crate::error::PaperError;
 use serde::de::DeserializeOwned;
 
+/// Send a request, and on a 429 with no `Retry-After` header retry exactly
+/// once after a short jittered sleep. Returns the final response (which may
+/// itself be a 429 — `check_response` then maps it to `RateLimited` as today).
+///
+/// Anonymous-tier providers (notably Semantic Scholar) return 429s on the
+/// very first call when the shared bucket is exhausted, with no retry-after
+/// header. A single bounded retry turns most of those into success without
+/// pretending we have a real rate-limit budget.
+pub async fn send_with_429_retry(
+    builder: reqwest::RequestBuilder,
+    provider: &str,
+) -> Result<reqwest::Response, PaperError> {
+    let cloned = builder.try_clone();
+    let response = builder.send().await?;
+    if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Ok(response);
+    }
+    let header_retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs);
+    let Some(retry_builder) = cloned else {
+        return Ok(response);
+    };
+    let sleep = header_retry_after.unwrap_or_else(|| {
+        let jitter_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.subsec_millis() as u64) % 1500)
+            .unwrap_or(0);
+        std::time::Duration::from_millis(1500 + jitter_ms)
+    });
+    tracing::info!(
+        provider = provider,
+        sleep_ms = sleep.as_millis() as u64,
+        "429 received, retrying once"
+    );
+    drop(response);
+    tokio::time::sleep(sleep).await;
+    Ok(retry_builder.send().await?)
+}
+
 pub fn check_response(response: &reqwest::Response, provider: &str) -> Result<(), PaperError> {
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         let retry_after = response

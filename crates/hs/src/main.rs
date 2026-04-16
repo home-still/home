@@ -214,7 +214,7 @@ async fn handle_config(
                 .allow_empty(true)
                 .interact()?;
             let s3_secret: String = Input::new()
-                .with_prompt("S3 secret key for object storage (Enter to skip; required for MinIO/S3 backend)")
+                .with_prompt("S3 secret key for object storage (Enter to skip; required for Garage/S3 backend)")
                 .allow_empty(true)
                 .interact()?;
 

@@ -22,18 +22,18 @@ pub struct IngestedEvent {
     pub source: Option<String>,
 }
 
-/// Given an ingested PDF key, fetch bytes from `storage`, convert via
-/// `scribe`, and put the markdown back to `storage` under the same sharded
-/// stem but with a `.md` extension. Publishes `scribe.completed` with the
-/// markdown key on success. Skips (returns Ok) if the markdown already
-/// exists — idempotent on retry.
+/// Given an ingested paper key (PDF or HTML), fetch bytes from `storage`,
+/// convert to markdown, and put the result back under the shared
+/// `markdown/{shard}/{stem}.md` convention. PDFs go through the scribe VLM
+/// server; HTML papers are converted locally. Publishes `scribe.completed`
+/// with the markdown key on success. Skips (returns Ok) if the markdown
+/// already exists — idempotent on retry.
 pub async fn convert_and_upload(
     storage: &dyn Storage,
     scribe: &ScribeClient,
     bus: &dyn EventBus,
     event: &IngestedEvent,
 ) -> Result<String> {
-    // Derive stem + markdown key. Key is already sharded (e.g. "ab/cdef.pdf").
     let filename = event
         .key
         .rsplit_once('/')
@@ -43,7 +43,7 @@ pub async fn convert_and_upload(
         .rsplit_once('.')
         .map(|(s, _)| s)
         .unwrap_or(filename);
-    let md_key = hs_common::sharded_key(stem, "md");
+    let md_key = hs_common::markdown::markdown_storage_key(stem);
 
     if storage
         .exists(&md_key)
@@ -54,15 +54,49 @@ pub async fn convert_and_upload(
         return Ok(md_key);
     }
 
-    let pdf_bytes = storage
+    let raw_bytes = storage
         .get(&event.key)
         .await
         .with_context(|| format!("get({}) failed", event.key))?;
 
-    let markdown = scribe
-        .convert(pdf_bytes)
+    let is_html = event.key.ends_with(".html") || event.key.ends_with(".htm");
+    let markdown = if is_html {
+        let html = String::from_utf8(raw_bytes)
+            .with_context(|| format!("HTML at {} is not valid UTF-8", event.key))?;
+        crate::html::convert_html_to_markdown(&html)
+    } else {
+        scribe
+            .convert(raw_bytes)
+            .await
+            .with_context(|| format!("scribe convert failed for {}", event.key))?
+    };
+
+    // Empty/garbage output — record the failure on the catalog so the
+    // backfill tool can see it, and skip both the storage write and the
+    // `scribe.completed` publish (a downstream indexer would just skip it
+    // again, leaving an unembedded markdown forever).
+    if markdown.trim().is_empty() {
+        let stem_only = stem.to_string();
+        if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+            storage,
+            "catalog",
+            &stem_only,
+            "event-watch",
+            0,
+            0,
+            "empty_output",
+        )
         .await
-        .with_context(|| format!("scribe convert failed for {}", event.key))?;
+        {
+            tracing::warn!(stem = %stem_only, error = %e, "failed-conversion catalog stamp failed");
+        }
+        tracing::warn!(
+            stem = %stem_only,
+            source_key = %event.key,
+            "scribe convert produced empty markdown; not publishing scribe.completed",
+        );
+        return Ok(md_key);
+    }
 
     storage
         .put(&md_key, markdown.into_bytes())
