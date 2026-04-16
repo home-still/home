@@ -60,7 +60,10 @@ pub struct CatalogEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversionMeta {
     pub server: String,
-    pub duration_secs: u64,
+    /// Wall-clock convert time. Stored as `f64` so sub-second conversions
+    /// (e.g. stub PDFs that fail in 200 ms) don't read as zero. YAML 1.2
+    /// scalar conversion lets older integer-valued rows continue to parse.
+    pub duration_secs: f64,
     pub total_pages: u64,
     pub converted_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -153,7 +156,7 @@ pub fn update_conversion_catalog(
     catalog_dir: &Path,
     stem: &str,
     server: &str,
-    duration_secs: u64,
+    duration_secs: f64,
     total_pages: u64,
     pages: Vec<PageOffset>,
     markdown_path: &str,
@@ -309,7 +312,7 @@ pub async fn update_conversion_catalog_via(
     prefix: &str,
     stem: &str,
     server: &str,
-    duration_secs: u64,
+    duration_secs: f64,
     total_pages: u64,
     pages: Vec<PageOffset>,
     markdown_path: &str,
@@ -342,7 +345,7 @@ pub async fn update_conversion_failed_via(
     prefix: &str,
     stem: &str,
     server: &str,
-    duration_secs: u64,
+    duration_secs: f64,
     total_pages: u64,
     reason: &str,
 ) -> anyhow::Result<()> {
@@ -482,5 +485,54 @@ mod storage_tests {
         assert!(read_catalog_entry_via(&storage, "", "ab123")
             .await
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn duration_secs_subsecond_roundtrip() {
+        // A stub PDF that fails in 420 ms must round-trip through YAML as
+        // exact f64, not truncate to 0.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            conversion: Some(ConversionMeta {
+                server: "scribe".into(),
+                duration_secs: 0.42,
+                total_pages: 1,
+                converted_at: "2026-04-15T19:50:02Z".into(),
+                pages: vec![],
+                failed: true,
+                reason: Some("stub_document".into()),
+            }),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "stub", &entry)
+            .await
+            .unwrap();
+
+        let got = read_catalog_entry_via(&storage, "catalog", "stub")
+            .await
+            .unwrap();
+        let conv = got.conversion.unwrap();
+        assert_eq!(conv.duration_secs, 0.42);
+    }
+
+    #[test]
+    fn duration_secs_back_compat_integer_yaml() {
+        // Pre-rc.246 catalog rows wrote duration_secs as an integer. YAML 1.2
+        // scalar conversion should let those rows continue to deserialize into
+        // the new f64 field — verify so the migration doesn't strand history.
+        let yaml = r#"
+conversion:
+  server: scribe
+  duration_secs: 5
+  total_pages: 12
+  converted_at: "2025-01-01T00:00:00Z"
+"#;
+        let entry: CatalogEntry =
+            serde_yaml_ng::from_str(yaml).expect("integer duration_secs must still parse");
+        let conv = entry.conversion.expect("conversion present");
+        assert_eq!(conv.duration_secs, 5.0);
+        assert_eq!(conv.total_pages, 12);
     }
 }

@@ -656,7 +656,7 @@ async fn convert_html_and_save(
             catalog_prefix,
             &stem,
             "local-html",
-            start.elapsed().as_secs(),
+            start.elapsed().as_secs_f64(),
             0,
             "empty_output",
         )
@@ -686,7 +686,7 @@ async fn convert_html_and_save(
         catalog_prefix,
         &stem,
         "local-html",
-        start.elapsed().as_secs(),
+        start.elapsed().as_secs_f64(),
         1, // HTML papers are single-page
         page_offsets,
         &md_key,
@@ -1224,7 +1224,7 @@ async fn convert_and_save_pool(
                     catalog_prefix,
                     &stem,
                     short_server,
-                    start_time.elapsed().as_secs(),
+                    start_time.elapsed().as_secs_f64(),
                     total_pages,
                     page_offsets,
                     &md_key,
@@ -1959,7 +1959,7 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
             markdown_path: Some(md_path.to_string_lossy().to_string()),
             conversion: Some(hs_common::catalog::ConversionMeta {
                 server: "backfill".to_string(),
-                duration_secs: 0,
+                duration_secs: 0.0,
                 total_pages,
                 converted_at: chrono::Utc::now().to_rfc3339(),
                 pages: hs_common::catalog::compute_page_offsets(&content),

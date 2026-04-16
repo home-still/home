@@ -83,11 +83,11 @@ pub struct QdrantInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEvent {
-    /// "Download" | "Convert" | "Embed"
+    /// "Download" | "Convert" | "Embed" | "EmbedSkip"
     pub activity: String,
     pub stem: String,
     pub name: String,
-    /// Human detail: byte size, "12pg 45s", "27 chunks".
+    /// Human detail: byte size, "12pg 45.2s", "27 chunks", skip reason.
     pub detail: String,
     /// RFC3339 timestamp.
     pub at: String,
@@ -99,10 +99,17 @@ pub struct HistoryEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pages: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_secs: Option<u64>,
+    pub duration_secs: Option<f64>,
     /// Embed metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunks: Option<u32>,
+    /// Convert / EmbedSkip outcome flags. Surfacing these prevents stub-PDF
+    /// failures and zero-chunk skips from being indistinguishable from clean
+    /// successes in the history pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Build the history event list from catalog entries, newest first.
@@ -126,19 +133,32 @@ pub fn build_history(entries: &[(String, CatalogEntry)], limit: usize) -> Vec<Hi
                 pages: None,
                 duration_secs: None,
                 chunks: None,
+                failed: None,
+                reason: None,
             });
         }
         if let Some(ref conv) = entry.conversion {
+            let detail = if conv.failed {
+                let reason = conv.reason.as_deref().unwrap_or("unknown");
+                format!(
+                    "FAILED: {reason} ({}pg {:.1}s)",
+                    conv.total_pages, conv.duration_secs
+                )
+            } else {
+                format!("{}pg {:.1}s", conv.total_pages, conv.duration_secs)
+            };
             events.push(HistoryEvent {
                 activity: "Convert".into(),
                 stem: stem.clone(),
                 name: name.clone(),
-                detail: format!("{}pg {}s", conv.total_pages, conv.duration_secs),
+                detail,
                 at: conv.converted_at.clone(),
                 detail_bytes: None,
                 pages: Some(conv.total_pages),
                 duration_secs: Some(conv.duration_secs),
                 chunks: None,
+                failed: if conv.failed { Some(true) } else { None },
+                reason: conv.reason.clone(),
             });
         }
         if let Some(ref emb) = entry.embedding {
@@ -155,8 +175,28 @@ pub fn build_history(entries: &[(String, CatalogEntry)], limit: usize) -> Vec<Hi
                     pages: None,
                     duration_secs: None,
                     chunks: Some(emb.chunks_indexed),
+                    failed: None,
+                    reason: None,
                 });
             }
+        }
+        if let Some(ref skip) = entry.embedding_skip {
+            // Surfaces "converted but not embedded" decisions (empty markdown,
+            // zero chunks after quality filter) so they're visible in the
+            // history pane instead of being silently absent.
+            events.push(HistoryEvent {
+                activity: "EmbedSkip".into(),
+                stem: stem.clone(),
+                name: name.clone(),
+                detail: skip.reason.clone(),
+                at: skip.at.clone(),
+                detail_bytes: None,
+                pages: None,
+                duration_secs: None,
+                chunks: None,
+                failed: None,
+                reason: Some(skip.reason.clone()),
+            });
         }
     }
     events.sort_by(|a, b| b.at.cmp(&a.at));
@@ -259,5 +299,109 @@ pub async fn collect_pipeline_counts(
         catalog_entries,
         embedded_documents,
         embedded_chunks,
+    }
+}
+
+#[cfg(all(test, feature = "catalog"))]
+mod history_tests {
+    use super::*;
+    use crate::catalog::{CatalogEntry, ConversionMeta, EmbeddingMeta, EmbeddingSkip};
+
+    #[test]
+    fn surfaces_failed_convert_and_embed_skip() {
+        // One entry has a failed (stub PDF) conversion and a downstream skip
+        // stamp; the other is a clean download + convert + embed. The history
+        // should expose both failure and skip distinctly, not silently drop them.
+        let stub = CatalogEntry {
+            title: Some("Stub".into()),
+            downloaded_at: Some("2026-04-15T19:50:01Z".into()),
+            conversion: Some(ConversionMeta {
+                server: "scribe-1".into(),
+                duration_secs: 0.42,
+                total_pages: 1,
+                converted_at: "2026-04-15T19:50:02Z".into(),
+                pages: vec![],
+                failed: true,
+                reason: Some("stub_document".into()),
+            }),
+            embedding_skip: Some(EmbeddingSkip {
+                reason: "zero_chunks_or_empty".into(),
+                at: "2026-04-15T19:50:03Z".into(),
+            }),
+            ..Default::default()
+        };
+        let good = CatalogEntry {
+            title: Some("Real".into()),
+            downloaded_at: Some("2026-04-15T18:00:00Z".into()),
+            conversion: Some(ConversionMeta {
+                server: "scribe-1".into(),
+                duration_secs: 12.5,
+                total_pages: 33,
+                converted_at: "2026-04-15T18:01:00Z".into(),
+                pages: vec![],
+                failed: false,
+                reason: None,
+            }),
+            embedding: Some(EmbeddingMeta {
+                server: "distill-1".into(),
+                chunks_indexed: 33,
+                compute_device: "Cuda".into(),
+                embedded_at: "2026-04-15T18:02:00Z".into(),
+            }),
+            ..Default::default()
+        };
+
+        let entries = vec![("stub".to_string(), stub), ("real".to_string(), good)];
+        let events = build_history(&entries, 100);
+
+        // Expect 6 events: 2 downloads + 2 converts + 1 embed + 1 embed_skip.
+        assert_eq!(events.len(), 6, "events: {events:#?}");
+
+        // Sorted newest-first by timestamp.
+        let activities: Vec<&str> = events.iter().map(|e| e.activity.as_str()).collect();
+        assert_eq!(
+            activities,
+            vec![
+                "EmbedSkip",
+                "Convert",
+                "Download",
+                "Embed",
+                "Convert",
+                "Download"
+            ]
+        );
+
+        // The failed convert must carry both the flag and a FAILED-prefixed detail.
+        let stub_convert = events
+            .iter()
+            .find(|e| e.activity == "Convert" && e.stem == "stub")
+            .expect("stub convert event present");
+        assert_eq!(stub_convert.failed, Some(true));
+        assert_eq!(stub_convert.reason.as_deref(), Some("stub_document"));
+        assert!(
+            stub_convert.detail.starts_with("FAILED:"),
+            "detail: {}",
+            stub_convert.detail
+        );
+
+        // Sub-second conversion duration must round-trip through f64 with .1 precision.
+        assert!(
+            stub_convert.detail.contains("0.4s"),
+            "expected sub-second formatting in: {}",
+            stub_convert.detail
+        );
+
+        // Clean convert has no failed flag (skip_serializing_if drops it from JSON).
+        let real_convert = events
+            .iter()
+            .find(|e| e.activity == "Convert" && e.stem == "real")
+            .unwrap();
+        assert_eq!(real_convert.failed, None);
+        assert!(real_convert.detail.contains("12.5s"));
+
+        // EmbedSkip carries the reason as both `reason` and `detail`.
+        let skip = events.iter().find(|e| e.activity == "EmbedSkip").unwrap();
+        assert_eq!(skip.reason.as_deref(), Some("zero_chunks_or_empty"));
+        assert_eq!(skip.detail, "zero_chunks_or_empty");
     }
 }

@@ -37,7 +37,7 @@ struct PaperSearchParams {
     #[schemars(description = "Result offset for pagination (default 0)")]
     offset: Option<usize>,
     #[schemars(
-        description = "Provider: all, arxiv, openalex, semantic_scholar, europmc, crossref, core (default: all)"
+        description = "Provider: all, arxiv, openalex, semantic_scholar (s2), europmc (pmc), crossref, core (default: all). Unknown values return an error."
     )]
     provider: Option<String>,
 }
@@ -290,15 +290,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
 
-        let provider_arg = match p.provider.as_deref() {
-            Some("arxiv") => paper::cli::ProviderArg::Arxiv,
-            Some("openalex") => paper::cli::ProviderArg::OpenAlex,
-            Some("semantic_scholar") => paper::cli::ProviderArg::SemanticScholar,
-            Some("europmc") => paper::cli::ProviderArg::EuropePmc,
-            Some("crossref") => paper::cli::ProviderArg::CrossRef,
-            Some("core") => paper::cli::ProviderArg::Core,
-            _ => paper::cli::ProviderArg::All,
-        };
+        let provider_arg = resolve_provider_arg(p.provider.as_deref())?;
 
         let provider = paper::commands::paper::make_provider(&provider_arg, &config)
             .map_err(|e| format!("Provider error: {e}"))?;
@@ -594,6 +586,8 @@ impl HomeStillMcp {
                     "name": name,
                     "pages": conv.total_pages,
                     "duration_secs": conv.duration_secs,
+                    "failed": conv.failed,
+                    "reason": conv.reason,
                     "at": conv.converted_at,
                 }));
             }
@@ -610,6 +604,15 @@ impl HomeStillMcp {
                         "at": emb.embedded_at,
                     }));
                 }
+            }
+            if let Some(ref skip) = entry.embedding_skip {
+                events.push(serde_json::json!({
+                    "activity": "EmbedSkip",
+                    "stem": stem,
+                    "name": name,
+                    "reason": skip.reason,
+                    "at": skip.at,
+                }));
             }
         }
 
@@ -912,7 +915,7 @@ impl HomeStillMcp {
                 p.stem
             ));
         };
-        let duration_secs = start.elapsed().as_secs();
+        let duration_secs = start.elapsed().as_secs_f64();
 
         let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
         if truncations > 0 {
@@ -1949,6 +1952,25 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
+fn resolve_provider_arg(s: Option<&str>) -> Result<paper::cli::ProviderArg, String> {
+    use paper::cli::ProviderArg;
+    let Some(name) = s else {
+        return Ok(ProviderArg::All);
+    };
+    match name {
+        "all" => Ok(ProviderArg::All),
+        "arxiv" => Ok(ProviderArg::Arxiv),
+        "openalex" => Ok(ProviderArg::OpenAlex),
+        "semantic_scholar" | "s2" => Ok(ProviderArg::SemanticScholar),
+        "europmc" | "pmc" => Ok(ProviderArg::EuropePmc),
+        "crossref" => Ok(ProviderArg::CrossRef),
+        "core" => Ok(ProviderArg::Core),
+        other => Err(format!(
+            "Unknown provider {other:?}. Accepted: all, arxiv, openalex, semantic_scholar (s2), europmc (pmc), crossref, core."
+        )),
+    }
+}
+
 async fn install_logging(is_sse: bool) -> Option<hs_common::logging::LoggingHandle> {
     use hs_common::logging::{self, LoggingConfig, StderrOutput};
     let (primary_storage, logs_yaml) = logging::load_config_sections();
@@ -1974,4 +1996,57 @@ async fn install_logging(is_sse: bool) -> Option<hs_common::logging::LoggingHand
         }
     }
     Some(handle)
+}
+
+#[cfg(test)]
+mod provider_arg_tests {
+    use super::resolve_provider_arg;
+    use paper::cli::ProviderArg;
+
+    #[test]
+    fn none_routes_to_all() {
+        assert!(matches!(resolve_provider_arg(None), Ok(ProviderArg::All)));
+    }
+
+    #[test]
+    fn pmc_aliases_to_europe_pmc() {
+        assert!(matches!(
+            resolve_provider_arg(Some("pmc")),
+            Ok(ProviderArg::EuropePmc)
+        ));
+    }
+
+    #[test]
+    fn s2_aliases_to_semantic_scholar() {
+        assert!(matches!(
+            resolve_provider_arg(Some("s2")),
+            Ok(ProviderArg::SemanticScholar)
+        ));
+    }
+
+    #[test]
+    fn canonical_names_resolve() {
+        assert!(matches!(
+            resolve_provider_arg(Some("crossref")),
+            Ok(ProviderArg::CrossRef)
+        ));
+        assert!(matches!(
+            resolve_provider_arg(Some("europmc")),
+            Ok(ProviderArg::EuropePmc)
+        ));
+        assert!(matches!(
+            resolve_provider_arg(Some("semantic_scholar")),
+            Ok(ProviderArg::SemanticScholar)
+        ));
+    }
+
+    #[test]
+    fn unknown_returns_error_naming_value_and_aliases() {
+        let err = resolve_provider_arg(Some("bogus")).unwrap_err();
+        assert!(
+            err.contains("bogus"),
+            "error should name the bad value: {err}"
+        );
+        assert!(err.contains("pmc"), "error should hint at pmc alias: {err}");
+    }
 }

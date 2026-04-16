@@ -232,3 +232,68 @@ impl PaperProvider for SemanticScholarProvider {
         Ok(Some(self.s2_paper_to_paper(paper)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider() -> SemanticScholarProvider {
+        SemanticScholarProvider::new(&SemanticScholarConfig::default())
+            .expect("default config should build a provider")
+    }
+
+    #[test]
+    fn search_response_round_trip_populates_doi_and_pdf() {
+        // Captured-shape S2 bulk-search response: one paper has DOI + open-access
+        // PDF; the other has neither, mirroring the mixed reality of the corpus.
+        let body = r#"{
+            "total": 2,
+            "data": [
+                {
+                    "paperId": "abc123",
+                    "title": "Attention Is All You Need",
+                    "abstract": "We propose a new simple network architecture.",
+                    "year": 2017,
+                    "authors": [{"name": "Ashish Vaswani"}],
+                    "citationCount": 100000,
+                    "externalIds": {"DOI": "10.48550/arXiv.1706.03762"},
+                    "openAccessPdf": {"url": "https://arxiv.org/pdf/1706.03762.pdf"}
+                },
+                {
+                    "paperId": "def456",
+                    "title": "Some Closed-Access Paper",
+                    "abstract": null,
+                    "year": 2020,
+                    "authors": [],
+                    "citationCount": 5,
+                    "externalIds": {},
+                    "openAccessPdf": null
+                }
+            ]
+        }"#;
+
+        let parsed: S2SearchResponse = serde_json::from_str(body).expect("S2 fixture must parse");
+        assert_eq!(parsed.total, 2);
+        assert_eq!(parsed.data.len(), 2);
+
+        let p = provider();
+        let papers: Vec<Paper> = parsed
+            .data
+            .into_iter()
+            .map(|s| p.s2_paper_to_paper(s))
+            .collect();
+
+        // First paper: DOI + PDF must survive the round trip.
+        assert_eq!(papers[0].doi.as_deref(), Some("10.48550/arXiv.1706.03762"));
+        assert_eq!(
+            papers[0].download_urls,
+            vec![String::from("https://arxiv.org/pdf/1706.03762.pdf")]
+        );
+        assert_eq!(papers[0].cited_by_count, Some(100000));
+
+        // Second paper: empty externalIds + null openAccessPdf must yield None/empty,
+        // not an error — this is the "coverage artifact" case.
+        assert_eq!(papers[1].doi, None);
+        assert!(papers[1].download_urls.is_empty());
+    }
+}

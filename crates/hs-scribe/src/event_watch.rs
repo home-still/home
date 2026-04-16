@@ -82,7 +82,7 @@ pub async fn convert_and_upload(
             "catalog",
             &stem_only,
             "event-watch",
-            0,
+            0.0,
             0,
             "empty_output",
         )
