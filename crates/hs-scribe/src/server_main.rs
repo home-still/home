@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 
 use hs_scribe::config::AppConfig;
@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
         config,
         vlm_sem,
         in_flight: Arc::new(AtomicUsize::new(0)),
+        last_conversion_ms: Arc::new(AtomicU64::new(0)),
     });
 
     let addr = format!("{}:{}", args.host, args.port);

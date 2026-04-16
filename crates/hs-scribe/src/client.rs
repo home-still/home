@@ -46,6 +46,12 @@ pub struct HealthResponse {
     pub gpu_utilization_pct: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_memory_used_mb: Option<u64>,
+    /// RFC 3339 timestamp of the most recent successful conversion. `None`
+    /// when the server has not produced non-empty markdown since startup.
+    /// Reflects "processor returned non-empty markdown" — quality validation
+    /// (stub-PDF detection, schema checks) lives in callers, not here.
+    #[serde(default)]
+    pub last_conversion_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

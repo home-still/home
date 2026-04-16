@@ -38,10 +38,27 @@ struct S2Author {
     name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct S2ExternalIds {
     #[serde(rename = "DOI")]
     doi: Option<String>,
+    #[serde(rename = "ArXiv")]
+    arxiv: Option<String>,
+}
+
+/// Best-effort DOI for an S2 paper: publisher DOI if present, else the
+/// DataCite-registered arXiv DOI synthesized from `externalIds.ArXiv`.
+/// arXiv DOIs in the `10.48550/arXiv.{id}` form resolve via doi.org and
+/// are recognized by the downloader's arXiv fast-path.
+fn resolve_doi(ids: Option<S2ExternalIds>) -> Option<String> {
+    let ids = ids?;
+    if let Some(doi) = ids.doi.filter(|s| !s.trim().is_empty()) {
+        return Some(doi);
+    }
+    ids.arxiv
+        .map(|id| id.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|id| format!("10.48550/arXiv.{id}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,7 +87,7 @@ impl SemanticScholarProvider {
     }
 
     fn s2_paper_to_paper(&self, s2: S2Paper) -> Paper {
-        let doi = s2.external_ids.and_then(|ids| ids.doi);
+        let doi = resolve_doi(s2.external_ids);
 
         let authors = s2
             .authors
@@ -245,9 +262,9 @@ mod tests {
     #[test]
     fn search_response_round_trip_populates_doi_and_pdf() {
         // Captured-shape S2 bulk-search response: one paper has DOI + open-access
-        // PDF; the other has neither, mirroring the mixed reality of the corpus.
+        // PDF; one has neither; one is arXiv-only (synthesizes DataCite DOI).
         let body = r#"{
-            "total": 2,
+            "total": 3,
             "data": [
                 {
                     "paperId": "abc123",
@@ -268,13 +285,23 @@ mod tests {
                     "citationCount": 5,
                     "externalIds": {},
                     "openAccessPdf": null
+                },
+                {
+                    "paperId": "ghi789",
+                    "title": "ArXiv-Only Preprint",
+                    "abstract": "A paper that only exists on arXiv.",
+                    "year": 2024,
+                    "authors": [{"name": "Jane Researcher"}],
+                    "citationCount": 3,
+                    "externalIds": {"ArXiv": "2401.12345"},
+                    "openAccessPdf": {"url": "https://arxiv.org/pdf/2401.12345.pdf"}
                 }
             ]
         }"#;
 
         let parsed: S2SearchResponse = serde_json::from_str(body).expect("S2 fixture must parse");
-        assert_eq!(parsed.total, 2);
-        assert_eq!(parsed.data.len(), 2);
+        assert_eq!(parsed.total, 3);
+        assert_eq!(parsed.data.len(), 3);
 
         let p = provider();
         let papers: Vec<Paper> = parsed
@@ -295,5 +322,46 @@ mod tests {
         // not an error — this is the "coverage artifact" case.
         assert_eq!(papers[1].doi, None);
         assert!(papers[1].download_urls.is_empty());
+
+        // Third paper: only ArXiv ID — synthesized DataCite DOI must be populated
+        // so the downstream paper_download chain recognizes the 10.48550/arXiv prefix.
+        assert_eq!(papers[2].doi.as_deref(), Some("10.48550/arXiv.2401.12345"));
+    }
+
+    #[test]
+    fn resolve_doi_prefers_publisher_over_arxiv() {
+        let ids = S2ExternalIds {
+            doi: Some("10.1145/3528223.3530127".into()),
+            arxiv: Some("2204.01234".into()),
+        };
+        assert_eq!(
+            resolve_doi(Some(ids)).as_deref(),
+            Some("10.1145/3528223.3530127")
+        );
+    }
+
+    #[test]
+    fn resolve_doi_synthesizes_when_only_arxiv() {
+        let ids = S2ExternalIds {
+            doi: None,
+            arxiv: Some("hep-th/9711200".into()),
+        };
+        assert_eq!(
+            resolve_doi(Some(ids)).as_deref(),
+            Some("10.48550/arXiv.hep-th/9711200")
+        );
+    }
+
+    #[test]
+    fn resolve_doi_returns_none_when_empty() {
+        assert_eq!(resolve_doi(Some(S2ExternalIds::default())), None);
+        assert_eq!(resolve_doi(None), None);
+
+        // Whitespace-only DOI / ArXiv values are treated as absent.
+        let ids = S2ExternalIds {
+            doi: Some("   ".into()),
+            arxiv: Some("   ".into()),
+        };
+        assert_eq!(resolve_doi(Some(ids)), None);
     }
 }

@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -19,6 +19,31 @@ pub struct ServerState {
     pub config: AppConfig,
     pub vlm_sem: Arc<tokio::sync::Semaphore>,
     pub in_flight: Arc<AtomicUsize>,
+    /// Unix millis of the most recent successful conversion. `0` = never.
+    /// Lock-free reads serve `/health` probes without blocking writers.
+    pub last_conversion_ms: Arc<AtomicU64>,
+}
+
+fn record_success(slot: &AtomicU64, md: &str) {
+    if md.trim().is_empty() {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if now_ms > 0 {
+        slot.store(now_ms, Ordering::Relaxed);
+    }
+}
+
+fn format_last_conv(slot: &AtomicU64) -> Option<String> {
+    let ms = slot.load(Ordering::Relaxed);
+    if ms == 0 {
+        return None;
+    }
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
 pub fn app(state: Arc<ServerState>) -> Router {
@@ -44,6 +69,7 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoRespon
         gpu_name,
         gpu_utilization_pct,
         gpu_memory_used_mb,
+        last_conversion_at: format_last_conv(&state.last_conversion_ms),
     })
 }
 
@@ -115,7 +141,10 @@ async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipa
         .process_pdf_with_shared_sem(path, Arc::clone(&state.vlm_sem))
         .await
     {
-        Ok(md) => (StatusCode::OK, md).into_response(),
+        Ok(md) => {
+            record_success(&state.last_conversion_ms, &md);
+            (StatusCode::OK, md).into_response()
+        }
         Err(e) => {
             tracing::error!("Processing failed: {e:#}");
             tracing::debug!("Full error chain: {e:?}");
@@ -162,6 +191,7 @@ async fn handle_scribe_stream(
             .await
         {
             Ok(md) => {
+                record_success(&state.last_conversion_ms, &md);
                 let line = StreamLine::Result { markdown: md };
                 if let Ok(json) = serde_json::to_string(&line) {
                     let _ = tx.send(Ok(format!("{json}\n"))).await;
@@ -185,4 +215,46 @@ async fn handle_scribe_stream(
         .header(header::CONTENT_TYPE, "text/x-ndjson")
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_success_sets_recent_unix_millis() {
+        let slot = AtomicU64::new(0);
+        record_success(&slot, "# Some markdown\n\nbody");
+        let stored = slot.load(Ordering::Relaxed);
+        assert!(stored > 0, "timestamp should be set");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            now.saturating_sub(stored) < 5_000,
+            "stored ts {stored} should be within 5s of now {now}"
+        );
+    }
+
+    #[test]
+    fn record_success_skips_empty_markdown() {
+        let slot = AtomicU64::new(0);
+        record_success(&slot, "   \n\n   ");
+        assert_eq!(slot.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn format_last_conv_returns_none_for_unset() {
+        let slot = AtomicU64::new(0);
+        assert!(format_last_conv(&slot).is_none());
+    }
+
+    #[test]
+    fn format_last_conv_emits_rfc3339() {
+        let slot = AtomicU64::new(1_700_000_000_000); // 2023-11-14T22:13:20Z
+        let s = format_last_conv(&slot).expect("set");
+        assert!(s.starts_with("2023-11-14T"), "got: {s}");
+        assert!(s.ends_with('Z'), "got: {s}");
+    }
 }
