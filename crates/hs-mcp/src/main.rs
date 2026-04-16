@@ -10,9 +10,10 @@ use rmcp::{
     },
     model::{
         ErrorData, GetPromptRequestParams, GetPromptResult, ListPromptsResult,
-        ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, PromptMessage,
-        PromptMessageRole, RawResource, RawResourceTemplate, ReadResourceRequestParams,
-        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+        ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+        ProgressNotificationParam, PromptMessage, PromptMessageRole, RawResource,
+        RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
+        ServerCapabilities, ServerInfo,
     },
     prompt, prompt_handler, prompt_router, schemars,
     service::RequestContext,
@@ -850,6 +851,7 @@ impl HomeStillMcp {
     async fn scribe_convert(
         &self,
         Parameters(p): Parameters<ScribeConvertParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         let pdf_key = hs_common::sharded_key(&p.stem, "pdf");
         let html_key = hs_common::sharded_key(&p.stem, "html");
@@ -858,8 +860,35 @@ impl HomeStillMcp {
         let (md, source_key, server_label) = if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await
         {
             let client = self.scribe_client().ok_or("No scribe server configured")?;
+            // Stream scribe's per-page progress through the MCP peer as
+            // notifications/progress events. Each event resets Claude
+            // Desktop's 4-min tool-call timeout, so multi-page PDFs that
+            // take longer than 240s end-to-end can complete.
+            let progress_token = context.meta.get_progress_token();
+            let peer = context.peer.clone();
+            let stem_for_progress = p.stem.clone();
+            let on_progress = move |event: hs_scribe::client::ProgressEvent| {
+                let Some(token) = progress_token.clone() else {
+                    return;
+                };
+                let peer = peer.clone();
+                let stem = stem_for_progress.clone();
+                tokio::spawn(async move {
+                    let mut params = ProgressNotificationParam::new(token, event.page as f64)
+                        .with_message(format!(
+                            "{stem}: {} {}/{}",
+                            event.stage, event.page, event.total_pages
+                        ));
+                    if event.total_pages > 0 {
+                        params = params.with_total(event.total_pages as f64);
+                    }
+                    if let Err(e) = peer.notify_progress(params).await {
+                        tracing::warn!(stem = %stem, error = %e, "notify_progress failed");
+                    }
+                });
+            };
             let md = client
-                .convert(pdf_bytes)
+                .convert_with_progress(pdf_bytes, on_progress)
                 .await
                 .map_err(|e| format!("Conversion failed: {e}"))?;
             let server_url = self
