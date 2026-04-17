@@ -938,6 +938,8 @@ async fn cmd_watch(
                     hs_common::sharded_key(&stem, "md")
                 );
                 if storage.exists(&md_key).await.unwrap_or(false) {
+                    // Already converted — still relocate from manually_downloaded/ if applicable.
+                    relocate_from_manual_dir(&path);
                     return;
                 }
                 stats
@@ -1014,6 +1016,8 @@ async fn cmd_watch(
                             hs_common::sharded_key(&stem, "md")
                         );
                         if storage.exists(&md_key).await.unwrap_or(false) {
+                            // Already converted — still relocate from manually_downloaded/ if applicable.
+                            relocate_from_manual_dir(&path);
                             return;
                         }
                         stats
