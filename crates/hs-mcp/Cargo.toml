@@ -25,3 +25,4 @@ axum = { workspace = true }
 chrono = "0.4"
 clap = { workspace = true }
 tracing = { workspace = true }
+percent-encoding = "2"

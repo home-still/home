@@ -155,6 +155,15 @@ struct CatalogRepairParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DedupeUrlEncodedParams {
+    #[schemars(
+        description = "If true, report what would be deleted without writing. Default: true."
+    )]
+    #[serde(default = "default_true")]
+    dry_run: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DistillBackfillParams {
     #[schemars(
         description = "If true, report what would be re-indexed without writing. Default: true."
@@ -854,6 +863,127 @@ impl HomeStillMcp {
                 "deleted": phantom_deleted,
                 "samples": phantom_samples,
             },
+            "errors": errors,
+        }))
+        .unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Find and remove URL-encoded duplicate stems. When a PDF is ingested twice — once with the original filename containing unicode or unsafe chars, once with the URL-encoded form (e.g., `Anna%E2%80%99s Archive` + `Anna's Archive`) — both markdown objects get written and the decoded-form is usually the one that embeds. The encoded-form is a ghost: it may have a catalog row with only `embedding_skip`, a markdown in storage, and no Qdrant points. This tool finds pairs where both an encoded stem and its decoded twin exist as markdown, confirms the decoded twin is the one that was indexed, and deletes the encoded-form catalog row, markdown object, and any stray Qdrant points. Default is dry-run.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn dedupe_url_encoded(
+        &self,
+        Parameters(p): Parameters<DedupeUrlEncodedParams>,
+    ) -> Result<String, String> {
+        // Enumerate all markdown stems.
+        let markdown = self
+            .storage
+            .list(&self.markdown_prefix)
+            .await
+            .map_err(|e| format!("markdown list failed: {e}"))?;
+
+        use std::collections::HashSet;
+        let stems: HashSet<String> = markdown
+            .iter()
+            .filter_map(|o| {
+                if !o.key.ends_with(".md") {
+                    return None;
+                }
+                let filename = o.key.rsplit('/').next()?;
+                if filename.starts_with("._") {
+                    return None;
+                }
+                Some(filename.trim_end_matches(".md").to_string())
+            })
+            .collect();
+
+        // Find encoded-form stems whose decoded twin also exists.
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for s in &stems {
+            if !s.contains('%') {
+                continue;
+            }
+            let decoded = percent_encoding::percent_decode_str(s)
+                .decode_utf8_lossy()
+                .into_owned();
+            if decoded != *s && stems.contains(&decoded) {
+                pairs.push((s.clone(), decoded));
+            }
+        }
+        pairs.sort();
+
+        let total = pairs.len();
+        let samples: Vec<serde_json::Value> = pairs
+            .iter()
+            .take(10)
+            .map(|(e, d)| serde_json::json!({"encoded": e, "decoded": d}))
+            .collect();
+
+        if p.dry_run {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": true,
+                "pairs_found": total,
+                "would_delete_encoded_rows": total,
+                "samples": samples,
+            }))
+            .unwrap_or_default());
+        }
+
+        let distill = self.distill_client();
+        let mut md_deleted = 0u64;
+        let mut cat_deleted = 0u64;
+        let mut qdrant_deleted = 0u64;
+        let mut errors: Vec<String> = Vec::new();
+
+        for (encoded, _decoded) in &pairs {
+            // 1. Delete the markdown storage object.
+            let md_key = format!(
+                "{}/{}",
+                self.markdown_prefix.trim_end_matches('/'),
+                hs_common::sharded_key(encoded, "md")
+            );
+            match self.storage.delete(&md_key).await {
+                Ok(()) => md_deleted += 1,
+                Err(e) => errors.push(format!("md/{encoded}: {e}")),
+            }
+
+            // 2. Delete the catalog YAML row.
+            match hs_common::catalog::delete_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                encoded,
+            )
+            .await
+            {
+                Ok(()) => cat_deleted += 1,
+                Err(e) => errors.push(format!("cat/{encoded}: {e}")),
+            }
+
+            // 3. Delete any stray Qdrant points for the encoded doc_id.
+            if let Some(ref client) = distill {
+                match client.delete_doc(encoded).await {
+                    Ok(n) => qdrant_deleted += n,
+                    Err(e) => {
+                        // Not fatal — encoded form usually isn't indexed.
+                        tracing::debug!(%encoded, error=%e, "qdrant delete (may be absent)");
+                    }
+                }
+            }
+        }
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "dry_run": false,
+            "pairs_found": total,
+            "markdown_deleted": md_deleted,
+            "catalog_rows_deleted": cat_deleted,
+            "qdrant_points_deleted": qdrant_deleted,
+            "samples": samples,
             "errors": errors,
         }))
         .unwrap_or_default())

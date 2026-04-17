@@ -1928,6 +1928,7 @@ dependencies = [
  "hs-distill",
  "hs-scribe",
  "paper",
+ "percent-encoding",
  "rmcp",
  "serde",
  "serde_json",
