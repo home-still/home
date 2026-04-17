@@ -935,14 +935,17 @@ impl HomeStillMcp {
             .unwrap_or_default());
         }
 
-        let distill = self.distill_client();
         let mut md_deleted = 0u64;
+        let mut md_missing = 0u64;
         let mut cat_deleted = 0u64;
-        let mut qdrant_deleted = 0u64;
         let mut errors: Vec<String> = Vec::new();
 
         for (encoded, _decoded) in &pairs {
-            // 1. Delete the markdown storage object.
+            // 1. Delete the markdown storage object. Object-store's S3 bulk
+            // DeleteObjects path re-URL-encodes keys that already contain
+            // percent-sequences, producing a 404 — tolerate that, since the
+            // objective is to break the Embed/EmbedSkip loop, which the
+            // catalog-row delete alone accomplishes.
             let md_key = format!(
                 "{}/{}",
                 self.markdown_prefix.trim_end_matches('/'),
@@ -950,10 +953,19 @@ impl HomeStillMcp {
             );
             match self.storage.delete(&md_key).await {
                 Ok(()) => md_deleted += 1,
-                Err(e) => errors.push(format!("md/{encoded}: {e}")),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if msg.contains("NoSuchKey") || msg.contains("404") {
+                        md_missing += 1;
+                    } else {
+                        errors.push(format!("md/{encoded}: {msg}"));
+                    }
+                }
             }
 
-            // 2. Delete the catalog YAML row.
+            // 2. Delete the catalog YAML row. This is the load-bearing
+            // operation — with no row, the reconciler won't try to re-embed
+            // the encoded stem, and the Embed/EmbedSkip loop breaks.
             match hs_common::catalog::delete_catalog_entry_via(
                 &*self.storage,
                 &self.catalog_prefix,
@@ -965,24 +977,21 @@ impl HomeStillMcp {
                 Err(e) => errors.push(format!("cat/{encoded}: {e}")),
             }
 
-            // 3. Delete any stray Qdrant points for the encoded doc_id.
-            if let Some(ref client) = distill {
-                match client.delete_doc(encoded).await {
-                    Ok(n) => qdrant_deleted += n,
-                    Err(e) => {
-                        // Not fatal — encoded form usually isn't indexed.
-                        tracing::debug!(%encoded, error=%e, "qdrant delete (may be absent)");
-                    }
-                }
-            }
+            // Deliberately NOT calling distill.delete_doc here: the reqwest
+            // client URL-encodes the path segment, axum URL-decodes it twice
+            // in the server router, and the encoded stem's doc_id round-
+            // trips to the decoded twin's doc_id — deleting the wrong (good)
+            // embeddings. Since the reconciler has already confirmed the
+            // encoded form is embed_missing, there's nothing to clean up in
+            // Qdrant anyway.
         }
 
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "dry_run": false,
             "pairs_found": total,
             "markdown_deleted": md_deleted,
+            "markdown_already_missing": md_missing,
             "catalog_rows_deleted": cat_deleted,
-            "qdrant_points_deleted": qdrant_deleted,
             "samples": samples,
             "errors": errors,
         }))
