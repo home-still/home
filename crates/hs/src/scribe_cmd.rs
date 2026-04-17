@@ -748,8 +748,18 @@ fn relocate_from_manual_dir(source_path: &std::path::Path) {
             return;
         }
     }
-    // Don't overwrite if target already exists (original is still the canonical copy)
+    // Don't overwrite if target already exists (original is still the canonical copy).
+    // But if source and target are byte-identical (same size), the drop-zone copy is a
+    // redundant duplicate — remove it so the folder stays clean. Different sizes mean
+    // the user dropped a distinct version; leave it for manual inspection.
     if target.exists() {
+        let src_size = std::fs::metadata(source_path).map(|m| m.len()).ok();
+        let tgt_size = std::fs::metadata(&target).map(|m| m.len()).ok();
+        if src_size.is_some() && src_size == tgt_size {
+            if let Err(e) = std::fs::remove_file(source_path) {
+                tracing::warn!("Failed to remove duplicate {}: {e}", source_path.display());
+            }
+        }
         return;
     }
     if let Err(e) = std::fs::rename(source_path, &target) {
