@@ -34,6 +34,11 @@ pub struct PipelineCounts {
     pub html_fallbacks: u64,
     pub markdown: u64,
     pub catalog_entries: u64,
+    /// Catalog rows stamped `conversion.failed == true` (stub_document et al).
+    /// These have a PDF in `papers/` and a YAML in `catalog/` but no markdown —
+    /// they account for the Documents − Markdown gap in the TUI pipeline panel.
+    #[serde(default)]
+    pub conversion_failed: u64,
     #[serde(default)]
     pub embedded_documents: Option<u64>,
     #[serde(default)]
@@ -348,6 +353,9 @@ pub async fn collect_pipeline_counts(
         html_fallbacks,
         markdown,
         catalog_entries,
+        // Populated separately by the caller after it scans the catalog
+        // bodies; `collect_pipeline_counts` only does cheap metadata listings.
+        conversion_failed: 0,
         embedded_documents,
         embedded_chunks,
     }

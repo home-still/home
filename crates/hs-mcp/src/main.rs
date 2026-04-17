@@ -1660,7 +1660,24 @@ impl HomeStillMcp {
             });
         }
 
-        let pipeline = collect_pipeline_counts(
+        // Scan the catalog once; reuse for both the pipeline failed-count
+        // and the history panel so we don't pay to deserialize every YAML twice.
+        let catalog_triples =
+            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
+                .await
+                .ok();
+
+        let conversion_failed = catalog_triples
+            .as_ref()
+            .map(|triples| {
+                triples
+                    .iter()
+                    .filter(|(_, _, e)| e.conversion.as_ref().is_some_and(|c| c.failed))
+                    .count() as u64
+            })
+            .unwrap_or(0);
+
+        let mut pipeline = collect_pipeline_counts(
             &*self.storage,
             &self.papers_prefix,
             &self.markdown_prefix,
@@ -1669,20 +1686,16 @@ impl HomeStillMcp {
             embedded_chunks,
         )
         .await;
+        pipeline.conversion_failed = conversion_failed;
 
         // History from the catalog (same source as `catalog_recent`).
-        let history = match hs_common::catalog::list_catalog_entries_via(
-            &*self.storage,
-            &self.catalog_prefix,
-        )
-        .await
-        {
-            Ok(triples) => {
+        let history = match catalog_triples {
+            Some(triples) => {
                 let pairs: Vec<(String, hs_common::catalog::CatalogEntry)> =
                     triples.into_iter().map(|(s, _m, e)| (s, e)).collect();
                 build_history(&pairs, history_limit)
             }
-            Err(_) => Vec::new(),
+            None => Vec::new(),
         };
 
         StatusSnapshot {
