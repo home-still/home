@@ -155,6 +155,11 @@ pub async fn dispatch(
         DistillCmd::Status { server } => cmd_status(server.as_deref(), reporter).await,
         DistillCmd::WatchEvents { server } => cmd_watch_events(server, reporter).await,
         DistillCmd::Diagnose { stem, verbose } => cmd_diagnose(&stem, verbose, reporter).await,
+        DistillCmd::Reconcile {
+            fix_stamps,
+            reembed,
+            server,
+        } => cmd_reconcile(fix_stamps, reembed, server.as_deref(), reporter).await,
     }
 }
 
@@ -1206,5 +1211,254 @@ async fn cmd_diagnose(stem: &str, verbose: bool, reporter: &Arc<dyn Reporter>) -
     if accepted == 0 && !chunks.is_empty() {
         reporter.error("All chunks rejected — pipeline would return Ok(0) with no catalog write.");
     }
+    Ok(())
+}
+
+// ── Reconcile ───────────────────────────────────────────────────
+
+/// Walk markdown, Qdrant and catalog; heal the divergences that let
+/// phantom "unembedded" docs accumulate. See `hs_distill::reconcile` for
+/// the pure classification logic; this function is the IO driver.
+async fn cmd_reconcile(
+    fix_stamps: bool,
+    reembed: bool,
+    server_override: Option<&str>,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    use hs_distill::reconcile::{partition, CatalogState, Classification, ReconcileCounts};
+    use std::collections::{HashMap, HashSet};
+
+    let cfg = DistillClientConfig::load().context("loading distill client config")?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+
+    let server_url = server_override
+        .map(|s| s.to_string())
+        .or_else(|| cfg.servers.first().cloned())
+        .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+    let distill = make_distill_client(&server_url).await?;
+
+    reporter.status("Scan", "listing markdown stems from storage");
+    let markdown_objects = storage
+        .list("markdown")
+        .await
+        .context("listing markdown prefix")?;
+    let markdown_stems: Vec<String> = markdown_objects
+        .iter()
+        .filter_map(|o| {
+            let name = o.key.rsplit('/').next()?;
+            if name.starts_with("._") || !name.ends_with(".md") {
+                return None;
+            }
+            Some(name.trim_end_matches(".md").to_string())
+        })
+        .collect();
+    reporter.status("Markdown", &format!("{} stems", markdown_stems.len()));
+
+    reporter.status("Scan", "fetching indexed doc_ids from Qdrant");
+    // `list_docs` returns the distinct doc_id facet over the entire
+    // collection. 500k is well above our expected corpus size for years.
+    let indexed: HashSet<String> = distill
+        .list_docs(500_000)
+        .await
+        .context("listing Qdrant doc_ids")?
+        .into_iter()
+        .collect();
+    reporter.status("Qdrant", &format!("{} indexed docs", indexed.len()));
+
+    reporter.status("Scan", "reading catalog entries");
+    let catalog_triples = hs_common::catalog::list_catalog_entries_via(&*storage, "catalog")
+        .await
+        .context("listing catalog entries")?;
+    let catalog: HashMap<String, CatalogState> = catalog_triples
+        .into_iter()
+        .map(|(stem, _, entry)| {
+            (
+                stem,
+                CatalogState {
+                    has_embedding_stamp: entry.embedding.is_some(),
+                    conversion_failed: entry.conversion.as_ref().is_some_and(|c| c.failed),
+                    embedding_skip_reason: entry.embedding_skip.map(|s| s.reason),
+                },
+            )
+        })
+        .collect();
+    reporter.status("Catalog", &format!("{} entries", catalog.len()));
+
+    let parts = partition(&markdown_stems, &indexed, &catalog);
+    let counts = ReconcileCounts::from_partitions(&parts);
+    reporter.status(
+        "Partition",
+        &format!(
+            "ok={}  stamp_missing={}  embed_missing={}",
+            counts.ok, counts.stamp_missing, counts.embed_missing
+        ),
+    );
+
+    // Collect the two actionable buckets so we can drive them in order.
+    let stamp_missing: Vec<&str> = parts
+        .iter()
+        .filter_map(|(s, c)| matches!(c, Classification::StampMissing).then_some(*s))
+        .collect();
+    let embed_missing: Vec<&str> = parts
+        .iter()
+        .filter_map(|(s, c)| matches!(c, Classification::EmbedMissing).then_some(*s))
+        .collect();
+
+    if !fix_stamps && !reembed {
+        reporter.status(
+            "Dry run",
+            "no changes. Pass --fix-stamps to backfill stamps, --reembed to re-index.",
+        );
+        if !stamp_missing.is_empty() {
+            reporter.status(
+                "Sample stamp_missing",
+                &stamp_missing
+                    .iter()
+                    .take(5)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        if !embed_missing.is_empty() {
+            reporter.status(
+                "Sample embed_missing",
+                &embed_missing
+                    .iter()
+                    .take(5)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        return Ok(());
+    }
+
+    // ── Fix stamps ────────────────────────────────────────────────
+    let mut stamp_done = 0usize;
+    let mut stamp_failed = 0usize;
+    if fix_stamps && !stamp_missing.is_empty() {
+        // Pull compute_device from the distill health so the backfilled
+        // stamp reflects reality (Cpu vs Cuda) instead of a placeholder.
+        let device = distill
+            .health()
+            .await
+            .ok()
+            .map(|h| h.compute_device)
+            .unwrap_or_else(|| "unknown".to_string());
+
+        reporter.status(
+            "Fix stamps",
+            &format!("backfilling {} embedding stamps", stamp_missing.len()),
+        );
+        for (i, stem) in stamp_missing.iter().enumerate() {
+            if i.is_multiple_of(25) && i > 0 {
+                reporter.status("Progress", &format!("{i}/{} stamped", stamp_missing.len()));
+            }
+            let chunks = match distill.doc_chunks(stem).await {
+                Ok((true, n)) => n as u32,
+                Ok((false, _)) => {
+                    // Doc vanished between list_docs and doc_chunks — rare
+                    // race. Skip.
+                    stamp_failed += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(%stem, error = %e, "doc_chunks failed during reconcile");
+                    stamp_failed += 1;
+                    continue;
+                }
+            };
+            match hs_common::catalog::update_embedding_catalog_via(
+                &*storage,
+                "catalog",
+                stem,
+                "reconciler-backfill",
+                chunks,
+                &device,
+            )
+            .await
+            {
+                Ok(()) => stamp_done += 1,
+                Err(e) => {
+                    tracing::warn!(%stem, error = %e, "stamp write failed during reconcile");
+                    stamp_failed += 1;
+                }
+            }
+        }
+        reporter.status(
+            "Stamps",
+            &format!("done={stamp_done}  failed={stamp_failed}"),
+        );
+    }
+
+    // ── Re-embed ──────────────────────────────────────────────────
+    let mut embed_done = 0usize;
+    let mut embed_failed = 0usize;
+    if reembed && !embed_missing.is_empty() {
+        reporter.status(
+            "Re-embed",
+            &format!("indexing {} markdown stems", embed_missing.len()),
+        );
+        for (i, stem) in embed_missing.iter().enumerate() {
+            if i.is_multiple_of(10) && i > 0 {
+                reporter.status(
+                    "Progress",
+                    &format!("{i}/{} re-embedded", embed_missing.len()),
+                );
+            }
+            // `sharded_key` returns `{2-char-shard}/{stem}.md`; the storage
+            // backend needs the `markdown/` prefix on top. The event-driven
+            // path gets this for free from the NATS payload (`event.key`
+            // already includes the prefix); the reconciler reconstructs it.
+            let md_key = format!("markdown/{}", hs_common::sharded_key(stem, "md"));
+            let catalog_entry =
+                hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem).await;
+            match distill
+                .index_from_storage_with_catalog(&*storage, &md_key, catalog_entry.as_ref())
+                .await
+            {
+                Ok(result) => {
+                    // Also write the stamp — if we don't, the next
+                    // reconcile run will see this as StampMissing and
+                    // redo the work.
+                    if let Err(e) = hs_common::catalog::record_embedding_outcome_via(
+                        &*storage,
+                        "catalog",
+                        stem,
+                        "reconciler-reembed",
+                        result.chunks_indexed,
+                        &result.embedding_device,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%stem, error = %e, "stamp after reembed failed");
+                    }
+                    embed_done += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(%stem, error = %e, "reembed failed");
+                    // Record the failure so the next reconcile cycle
+                    // doesn't keep retrying a doc the server can't
+                    // handle.
+                    let reason = format!("embed_failed: {e}");
+                    let _ = hs_common::catalog::update_embedding_skip_via(
+                        &*storage, "catalog", stem, &reason,
+                    )
+                    .await;
+                    embed_failed += 1;
+                }
+            }
+        }
+        reporter.status(
+            "Re-embed",
+            &format!("done={embed_done}  failed={embed_failed}"),
+        );
+    }
+
+    reporter.finish(&format!(
+        "Reconcile complete: ok={} stamps_fixed={} embeds_done={} (failures: stamps={} embeds={})",
+        counts.ok, stamp_done, embed_done, stamp_failed, embed_failed
+    ));
     Ok(())
 }

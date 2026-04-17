@@ -302,6 +302,12 @@ impl DistillClient {
 
     /// Check if a document is already indexed.
     pub async fn doc_exists(&self, doc_id: &str) -> Result<bool> {
+        Ok(self.doc_chunks(doc_id).await?.0)
+    }
+
+    /// Return `(exists, chunk_count)` for a doc. Chunk count is needed by the
+    /// reconciler to backfill catalog stamps that were lost on earlier writes.
+    pub async fn doc_chunks(&self, doc_id: &str) -> Result<(bool, u64)> {
         let url = format!("{}/exists/{}", self.server_url, doc_id);
         let resp = self
             .http
@@ -311,7 +317,9 @@ impl DistillClient {
             .await
             .context("Failed to reach distill server")?;
         let data: serde_json::Value = resp.json().await.context("Invalid exists response")?;
-        Ok(data["exists"].as_bool().unwrap_or(false))
+        let exists = data["exists"].as_bool().unwrap_or(false);
+        let chunks = data["chunks"].as_u64().unwrap_or(0);
+        Ok((exists, chunks))
     }
 
     /// Delete every point whose `doc_id` matches. Returns the number of

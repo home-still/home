@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures_util::StreamExt;
 use hs_common::event_bus::EventBus;
 use hs_common::storage::Storage;
@@ -15,6 +16,42 @@ pub struct CompletedEvent {
     pub key: String,
     #[serde(default)]
     pub source_key: Option<String>,
+}
+
+/// Retry a storage write up to 3 times with exponential backoff (100ms,
+/// 300ms, 900ms). Stamp writes are the bookkeeping side of the
+/// embedding pipeline — a single S3 blip must not make the catalog and
+/// Qdrant diverge, because that divergence is the source of the phantom
+/// "unembedded" backlog the reconciler exists to clean up.
+async fn write_with_retry<F, Fut>(op_name: &str, stem: &str, mut op: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let backoffs = [
+        Duration::from_millis(100),
+        Duration::from_millis(300),
+        Duration::from_millis(900),
+    ];
+    let mut last_err: Option<anyhow::Error> = None;
+    for (attempt, wait) in std::iter::once(Duration::ZERO).chain(backoffs).enumerate() {
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        match op().await {
+            Ok(()) => {
+                if attempt > 0 {
+                    tracing::info!(stem = %stem, attempt, "{op_name} succeeded after retry");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(stem = %stem, attempt, error = %e, "{op_name} failed, will retry");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("{op_name}: retries exhausted")))
 }
 
 /// Pull the markdown at `event.key` from `storage` and ask the distill
@@ -35,25 +72,46 @@ pub async fn index_and_publish(
         .trim_end_matches(".md");
     let catalog = hs_common::catalog::read_catalog_entry_via(storage, "catalog", stem).await;
 
-    let result = distill
+    let result = match distill
         .index_from_storage_with_catalog(storage, &event.key, catalog.as_ref())
         .await
-        .with_context(|| format!("distill index failed for {}", event.key))?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Stamp the failure so it's visible to the reconciler. Without
+            // this, a dropped embed is indistinguishable from "never tried"
+            // and the document is invisible until someone runs a full
+            // markdown-vs-qdrant diff.
+            tracing::error!(stem = %stem, key = %event.key, error = %e, "distill index failed");
+            let reason = format!("embed_failed: {e}");
+            if let Err(stamp_err) = write_with_retry("embed_failed stamp", stem, || {
+                hs_common::catalog::update_embedding_skip_via(storage, "catalog", stem, &reason)
+            })
+            .await
+            {
+                tracing::error!(stem = %stem, error = %stamp_err, "failed to stamp embed_failed");
+            }
+            return Err(e.context(format!("distill index failed for {}", event.key)));
+        }
+    };
 
-    // Stamp the catalog so a 0-chunk skip is visible (and the backfill tool
-    // can decide whether to retry). Best-effort — failure to write the
-    // catalog must not abort the event-bus loop.
-    if let Err(e) = hs_common::catalog::record_embedding_outcome_via(
-        storage,
-        "catalog",
-        stem,
-        "event-watch",
-        result.chunks_indexed,
-        &result.embedding_device,
-    )
+    // Stamp the embed outcome. Retry on transient S3/storage errors —
+    // a lost stamp here is the historical root cause of phantom
+    // "unembedded" docs (doc is in Qdrant but catalog doesn't know).
+    if let Err(e) = write_with_retry("embedding stamp", stem, || {
+        hs_common::catalog::record_embedding_outcome_via(
+            storage,
+            "catalog",
+            stem,
+            "event-watch",
+            result.chunks_indexed,
+            &result.embedding_device,
+        )
+    })
     .await
     {
-        tracing::warn!(stem = %stem, error = %e, "embedding catalog update failed");
+        // Retries exhausted: the reconciler will catch this later.
+        tracing::error!(stem = %stem, error = %e, "embedding catalog stamp lost after retries");
     }
 
     let payload = serde_json::json!({

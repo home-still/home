@@ -77,4 +77,19 @@ pub enum DistillCmd {
         #[arg(long)]
         verbose: bool,
     },
+    /// Reconcile markdown ↔ Qdrant ↔ catalog. Finds docs that were
+    /// embedded but lost their catalog stamp (`--fix-stamps` backfills)
+    /// and docs whose markdown exists but never reached Qdrant
+    /// (`--reembed` re-indexes). Safe to run anytime: default is dry-run.
+    Reconcile {
+        /// Backfill missing `embedding` stamps for docs already in Qdrant
+        #[arg(long)]
+        fix_stamps: bool,
+        /// Re-index markdown that never reached Qdrant
+        #[arg(long)]
+        reembed: bool,
+        /// Override server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
 }

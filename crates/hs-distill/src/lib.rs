@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod event_watch;
 pub mod quality;
+pub mod reconcile;
 pub mod types;
 
 #[cfg(feature = "server")]
