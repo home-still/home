@@ -2,6 +2,10 @@
 
 Free and open source tools to democratize knowledge acquisition, distillation, and comprehension.
 
+> **New here?** Start with the [plain-English guide](docs/guide.md) — what home-still is, why it exists, and how to use it without prior knowledge of vector databases or MCP.
+>
+> **Setting up across multiple machines?** See the [home-cloud deployment guide](docs/deployment.md) — step-by-step recipes for tunnel host, storage server, GPU compute, DB host, and clients.
+
 ## Install
 
 ```sh
