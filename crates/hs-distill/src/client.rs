@@ -65,6 +65,12 @@ pub struct HealthResponse {
     pub qdrant_version: String,
     #[serde(default)]
     pub embed_model: String,
+    /// Qdrant endpoint this distill server is talking to, straight from the
+    /// server's config. Surfaced so the CLI / MCP snapshot can render the
+    /// real Qdrant URL in the dashboard instead of mislabeling distill's own
+    /// URL as Qdrant's.
+    #[serde(default)]
+    pub qdrant_url: String,
 }
 
 /// Readiness response from the distill server.

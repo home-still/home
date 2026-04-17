@@ -90,318 +90,68 @@ struct HistoryEvent {
 
 // ── Data collection ─────────────────────────────────────────────
 
-/// Check if a filename is a macOS resource fork (starts with "._")
-fn is_macos_resource_fork(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|f| f.to_str())
-        .is_some_and(|name| name.starts_with("._"))
-}
-
-/// Recursive version of count_dir — walks subdirectories.
-/// Used for watch_dir since scribe processes PDFs recursively.
-fn count_dir_recursive(dir: &Path, ext: &str) -> (u64, u64) {
-    let mut count = 0u64;
-    let mut bytes = 0u64;
-    fn walk(dir: &Path, ext: &str, count: &mut u64, bytes: &mut u64) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    walk(&path, ext, count, bytes);
-                } else if path.extension().is_some_and(|e| e == ext)
-                    && !is_macos_resource_fork(&path)
-                {
-                    *count += 1;
-                    *bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
-                }
-            }
-        }
-    }
-    walk(dir, ext, &mut count, &mut bytes);
-    (count, bytes)
-}
-
-/// Detect a client-role node from `~/.home-still/config.yaml`.
-///
-/// Reads the file line-by-line (no heavy YAML parser dependency, matches the
-/// style of `hs_common::resolve_project_dir`). A node opts into remote MCP
-/// dispatch by setting:
-///
-///     cloud:
-///       role: client
-fn is_cloud_client_role() -> bool {
-    let Some(home) = dirs::home_dir() else {
-        return false;
-    };
-    let Ok(contents) = std::fs::read_to_string(home.join(hs_common::CONFIG_REL_PATH)) else {
-        return false;
-    };
-    let mut in_cloud = false;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') || trimmed.is_empty() {
-            continue;
-        }
-        // Top-level key flips section tracking.
-        if !line.starts_with(' ') && !line.starts_with('\t') {
-            in_cloud = trimmed.starts_with("cloud:");
-            continue;
-        }
-        if in_cloud {
-            if let Some(val) = trimmed.strip_prefix("role:") {
-                let val = val.trim().trim_matches('"').trim_matches('\'');
-                return val == "client";
-            }
-        }
-    }
-    false
-}
-
 async fn collect_data() -> DashboardData {
-    // Client-role nodes have no usable local {project_dir} and rely on the
-    // gateway for authoritative data. Dispatch to MCP before doing any
-    // filesystem work; fall through to the local path on any error so a
-    // misconfigured client still shows *something*.
-    if is_cloud_client_role() {
-        if let Ok(remote) = collect_data_via_mcp().await {
-            return remote;
-        }
-    }
-
-    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
-    let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
-
-    // Run filesystem operations as independent per-directory tasks so the
-    // dashboard can show partial results as each directory finishes scanning.
-    let cfg_docs = scribe_cfg.clone();
-    let docs_task = tokio::task::spawn_blocking(move || {
-        let (pdf_count, pdf_bytes) = count_dir_recursive(&cfg_docs.watch_dir, "pdf");
-        let (html_count, html_bytes) = count_dir_recursive(&cfg_docs.watch_dir, "html");
-        let (htm_count, htm_bytes) = count_dir_recursive(&cfg_docs.watch_dir, "htm");
-        (
-            pdf_count + html_count + htm_count,
-            pdf_bytes + html_bytes + htm_bytes,
-        )
-    });
-
-    let cfg_md = scribe_cfg.clone();
-    let markdown_task =
-        tokio::task::spawn_blocking(move || count_dir_recursive(&cfg_md.output_dir, "md"));
-
-    let cfg_cat = scribe_cfg.clone();
-    let catalog_task = tokio::task::spawn_blocking(move || {
-        let (count, _) = count_dir_recursive(&cfg_cat.catalog_dir, "yaml");
-        count
-    });
-
-    let cfg_cor = scribe_cfg.clone();
-    let corrupted_task = tokio::task::spawn_blocking(move || {
-        let (pdf, _) = count_dir_recursive(&cfg_cor.corrupted_dir, "pdf");
-        let (html, _) = count_dir_recursive(&cfg_cor.corrupted_dir, "html");
-        pdf + html
-    });
-
-    // Sharded layout means recursive walks across ~150 subdirs; macOS NFS v3
-    // with 32KB blocks needs more time than a flat directory scan.
-    let timeout = Duration::from_secs(20);
-
-    let (doc_counts, fs_stalled_docs) = match tokio::time::timeout(timeout, docs_task).await {
-        Ok(Ok(counts)) => (Some(counts), false),
-        _ => (None, true),
-    };
-    let (markdown_counts, fs_stalled_markdown) =
-        match tokio::time::timeout(timeout, markdown_task).await {
-            Ok(Ok(counts)) => (Some(counts), false),
-            _ => (None, true),
-        };
-    let (catalog_count, fs_stalled_catalog) =
-        match tokio::time::timeout(timeout, catalog_task).await {
-            Ok(Ok(count)) => (Some(count), false),
-            _ => (None, true),
-        };
-    let corrupted_count = match tokio::time::timeout(timeout, corrupted_task).await {
-        Ok(Ok(count)) => Some(count),
-        _ => None,
-    };
-
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(3))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    // Discover servers from gateway registry, falling back to config
-    let scribe_urls =
-        hs_common::service::registry::discover_or_fallback("scribe", scribe_cfg.servers.clone())
-            .await;
-    let distill_urls =
-        hs_common::service::registry::discover_or_fallback("distill", distill_cfg.servers.clone())
-            .await;
-
-    // Scribe server health + readiness checks
-    let mut scribe_servers = Vec::new();
-    for url in &scribe_urls {
-        let health_version: String = async {
-            let resp = http.get(format!("{url}/health")).send().await.ok()?;
-            let data: serde_json::Value = resp.json().await.ok()?;
-            data["version"].as_str().map(|s| s.to_string())
-        }
-        .await
-        .unwrap_or_default();
-
-        let readiness: Option<serde_json::Value> = async {
-            let resp = http.get(format!("{url}/readiness")).send().await.ok()?;
-            if !resp.status().is_success() {
-                return None;
+    // Single source of truth: the MCP gateway's `system_status` tool, whose
+    // counts come from the Storage trait and therefore work for both LocalFs
+    // and S3/Garage backends. The previous filesystem-count path only worked
+    // on nodes where the storage backend happened to be LocalFs at the
+    // configured paths, producing bogus zeros on S3-backed deployments. On
+    // MCP failure we return a blank dashboard with watcher/indexer still
+    // read locally — zeros are accurate ("we don't know yet") rather than
+    // confidently wrong.
+    match collect_data_via_mcp().await {
+        Ok(data) => data,
+        Err(_) => {
+            let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+            let (watcher, indexer) = read_local_daemon_state(&scribe_cfg).await;
+            DashboardData {
+                doc_counts: None,
+                markdown_counts: None,
+                catalog_count: None,
+                corrupted_count: None,
+                embedded_docs: 0,
+                embedded_chunks: 0,
+                scribe_servers: Vec::new(),
+                distill_servers: Vec::new(),
+                qdrant_healthy: false,
+                qdrant_url: String::new(),
+                qdrant_version: String::new(),
+                watcher,
+                indexer,
+                history: Vec::new(),
+                loading: false,
+                fs_stalled_docs: false,
+                fs_stalled_markdown: false,
+                fs_stalled_catalog: false,
             }
-            resp.json().await.ok()
         }
-        .await;
-
-        if let Some(data) = readiness {
-            let in_flight = data["in_flight_conversions"].as_u64().unwrap_or(0);
-            let activity = if in_flight > 0 {
-                format!("{in_flight} converting")
-            } else {
-                "idle".to_string()
-            };
-            scribe_servers.push(ServiceStatus {
-                url: url.clone(),
-                healthy: true,
-                detail: String::new(),
-                activity,
-                version: health_version,
-            });
-        } else {
-            scribe_servers.push(ServiceStatus {
-                url: url.clone(),
-                healthy: false,
-                detail: String::new(),
-                activity: String::new(),
-                version: String::new(),
-            });
-        }
-    }
-
-    // Distill server health checks + embedded counts
-    let mut distill_servers = Vec::new();
-    let mut embedded_docs = 0u64;
-    let mut embedded_chunks = 0u64;
-    let mut qdrant_healthy = false;
-    let mut qdrant_url = String::new();
-    let mut qdrant_version = String::new();
-
-    for url in &distill_urls {
-        let client = if hs_common::auth::client::is_cloud_url(url) {
-            match hs_common::auth::client::AuthenticatedClient::from_default_path() {
-                Ok(auth) => match auth.build_reqwest_client().await {
-                    Ok(http) => hs_distill::client::DistillClient::new_with_client(url, http),
-                    Err(_) => hs_distill::client::DistillClient::new(url),
-                },
-                Err(_) => hs_distill::client::DistillClient::new(url),
-            }
-        } else {
-            hs_distill::client::DistillClient::new(url)
-        };
-        let health = client.health().await.ok();
-        let health_version = health
-            .as_ref()
-            .map(|h| h.version.clone())
-            .unwrap_or_default();
-        if qdrant_version.is_empty() {
-            qdrant_version = health
-                .as_ref()
-                .map(|h| h.qdrant_version.clone())
-                .unwrap_or_default();
-        }
-        let healthy = health.is_some();
-
-        // Fetch readiness for in-flight embedding count
-        let activity = match client.readiness().await {
-            Ok(r) if r.in_flight > 0 => format!("{} embedding", r.in_flight),
-            Ok(_) => "idle".into(),
-            Err(_) => String::new(),
-        };
-
-        // Always try to get status (for embedded counts) even if health is slow
-        if let Ok(s) = client.status().await {
-            if embedded_docs == 0 {
-                embedded_docs = s.documents_count;
-                embedded_chunks = s.points_count;
-            }
-            // If we got a status response, Qdrant must be healthy
-            qdrant_healthy = true;
-            qdrant_url = format!("{url} → {}", s.collection);
-            distill_servers.push(ServiceStatus {
-                url: url.clone(),
-                healthy: true,
-                detail: format!("({})", s.compute_device),
-                activity,
-                version: health_version,
-            });
-        } else if healthy {
-            distill_servers.push(ServiceStatus {
-                url: url.clone(),
-                healthy: true,
-                detail: String::new(),
-                activity,
-                version: health_version,
-            });
-        } else {
-            distill_servers.push(ServiceStatus {
-                url: url.clone(),
-                healthy: false,
-                detail: String::new(),
-                activity: String::new(),
-                version: String::new(),
-            });
-        }
-    }
-
-    // Watcher status + history (filesystem I/O, may stall on NFS)
-    let cfg2 = scribe_cfg.clone();
-    let fs_result2 = tokio::task::spawn_blocking(move || {
-        let watcher = read_watcher_status(&cfg2.output_dir, &cfg2.watch_dir);
-        let history = load_history(&cfg2.catalog_dir, 100);
-        (watcher, history)
-    });
-    let (watcher, history) = match tokio::time::timeout(Duration::from_secs(20), fs_result2).await {
-        Ok(Ok((w, h))) => (w, h),
-        _ => (WatcherInfo::Stopped, vec![]),
-    };
-
-    // Distill index daemon status (local JSON file, fast read)
-    let indexer = read_indexer_status();
-
-    DashboardData {
-        doc_counts,
-        markdown_counts,
-        catalog_count,
-        corrupted_count,
-        embedded_docs,
-        embedded_chunks,
-        scribe_servers,
-        distill_servers,
-        qdrant_healthy,
-        qdrant_url,
-        qdrant_version,
-        watcher,
-        indexer,
-        history,
-        loading: false,
-        fs_stalled_docs,
-        fs_stalled_markdown,
-        fs_stalled_catalog,
     }
 }
 
-/// Populate the dashboard from the cloud gateway's MCP `system_status` tool.
-///
-/// Used on client-role nodes where no local `project_dir` is mounted. The
-/// returned data intentionally leaves byte counts at 0 (system_status only
-/// reports object counts, not sizes) and skips local-only panes (watcher,
-/// indexer, corrupted, history) — those reflect worker-node operational state
-/// and have no meaning on a read-only client.
+/// Read the two local daemon-state signals (watcher + indexer). Both read
+/// local status files that have no relationship to the storage backend, so
+/// they remain useful even when pipeline counts come exclusively from MCP.
+/// Returns `(Stopped, Stopped)` if the configured dirs don't exist — the
+/// `read_*` helpers already handle missing files gracefully.
+async fn read_local_daemon_state(
+    scribe_cfg: &hs_scribe::config::ScribeConfig,
+) -> (WatcherInfo, IndexerInfo) {
+    let output_dir = scribe_cfg.output_dir.clone();
+    let watch_dir = scribe_cfg.watch_dir.clone();
+    let fs_task = tokio::task::spawn_blocking(move || read_watcher_status(&output_dir, &watch_dir));
+    let watcher = match tokio::time::timeout(Duration::from_secs(20), fs_task).await {
+        Ok(Ok(w)) => w,
+        _ => WatcherInfo::Stopped,
+    };
+    let indexer = read_indexer_status();
+    (watcher, indexer)
+}
+
+/// Populate the dashboard from the MCP `system_status` tool — the single
+/// source of truth for pipeline counts and service health. Byte counts stay
+/// at 0 (system_status reports object counts, not sizes). Watcher / indexer
+/// rows are filled in from local daemon status files, which reflect the host
+/// the CLI is running on, not the remote gateway.
 async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
     use serde_json::Value;
 
@@ -410,12 +160,20 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
         .call_tool("system_status", Value::Object(Default::default()))
         .await?;
     let snap: hs_common::status::StatusSnapshot = serde_json::from_value(status_json)?;
-    Ok(snapshot_to_dashboard(snap))
+
+    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+    let (watcher, indexer) = read_local_daemon_state(&scribe_cfg).await;
+
+    let mut data = snapshot_to_dashboard(snap);
+    data.watcher = watcher;
+    data.indexer = indexer;
+    Ok(data)
 }
 
 /// Map the shared StatusSnapshot into the CLI's TUI-local DashboardData.
-/// Cloud-client mode uses this as the only adapter; TUI-only state
-/// (watcher/indexer/corrupted) is left at its default.
+/// The caller is responsible for overlaying local-daemon fields
+/// (`watcher`, `indexer`) since those reflect the CLI host, not the remote
+/// gateway.
 fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardData {
     let scribe_servers = snap
         .scribe_instances
@@ -432,7 +190,17 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
     let qdrant_url = snap
         .qdrant
         .as_ref()
-        .map(|q| format!("gateway → {}", q.collection))
+        .map(|q| {
+            // Prefer the real Qdrant endpoint reported by distill's /health;
+            // fall back to "gateway" only for older distill servers that
+            // don't yet surface qdrant_url (backward-compat via serde default).
+            let url_part = if q.qdrant_url.is_empty() {
+                "gateway".to_string()
+            } else {
+                q.qdrant_url.clone()
+            };
+            format!("{url_part} → {}", q.collection)
+        })
         .unwrap_or_default();
     let qdrant_version = snap
         .qdrant
@@ -609,79 +377,6 @@ fn read_indexer_status() -> IndexerInfo {
         current_file: status.current_file,
         gpu_yield: status.gpu_yield,
     }
-}
-
-fn load_history(catalog_dir: &Path, limit: usize) -> Vec<HistoryEvent> {
-    let mut events = Vec::new();
-
-    // Catalog is sharded under catalog/XX/stem.yaml — walk recursively.
-    let mut catalog_paths = hs_common::collect_files_recursive(catalog_dir, "yaml");
-    catalog_paths.extend(hs_common::collect_files_recursive(catalog_dir, "yml"));
-
-    let catalog_entries: Vec<_> = catalog_paths
-        .into_iter()
-        .filter_map(|path| {
-            let contents = std::fs::read_to_string(&path).ok()?;
-            let entry: hs_common::catalog::CatalogEntry =
-                serde_yaml_ng::from_str(&contents).ok()?;
-            let stem = path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            Some((stem, entry))
-        })
-        .collect();
-
-    for (stem, entry) in &catalog_entries {
-        let name = entry.title.as_deref().unwrap_or(stem);
-        let short_name: String = name.to_string();
-
-        // Download event
-        if let Some(ref dl_at) = entry.downloaded_at {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(dl_at) {
-                let size = entry.file_size_bytes.map(fmt_bytes).unwrap_or_default();
-                events.push(HistoryEvent {
-                    activity: "Download",
-                    name: short_name.clone(),
-                    detail: size,
-                    when: Some(dt.with_timezone(&chrono::Utc)),
-                });
-            }
-        }
-
-        // Conversion event
-        if let Some(ref conv) = entry.conversion {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&conv.converted_at) {
-                events.push(HistoryEvent {
-                    activity: "Convert",
-                    name: short_name.clone(),
-                    detail: format!("{}pg {:.0}s", conv.total_pages, conv.duration_secs),
-                    when: Some(dt.with_timezone(&chrono::Utc)),
-                });
-            }
-        }
-
-        // Embedding event
-        if let Some(ref emb) = entry.embedding {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&emb.embedded_at) {
-                events.push(HistoryEvent {
-                    activity: "Embed",
-                    name: short_name.clone(),
-                    detail: format!("{} chunks", emb.chunks_indexed),
-                    when: Some(dt.with_timezone(&chrono::Utc)),
-                });
-            }
-        }
-    }
-
-    events.sort_by(|a, b| {
-        let a_ts = a.when.unwrap_or(chrono::DateTime::UNIX_EPOCH);
-        let b_ts = b.when.unwrap_or(chrono::DateTime::UNIX_EPOCH);
-        b_ts.cmp(&a_ts)
-    });
-    events.truncate(limit);
-    events
 }
 
 // ── Formatting helpers ──────────────────────────────────────────

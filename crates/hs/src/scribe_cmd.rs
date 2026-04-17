@@ -651,21 +651,22 @@ async fn convert_html_and_save(
     let md = hs_scribe::html::convert_html_to_markdown(&html);
     let page_offsets = crate::catalog::compute_page_offsets(&md);
     let total_pages = page_offsets.len() as u64;
+    let duration_secs = start.elapsed().as_secs_f64();
 
     // Mirrors the MCP scribe_convert gate: paywall/landing HTML often produces
     // ≤1 page of mostly-whitespace boilerplate that passes a bare `is_empty`
     // check but is semantically empty. Stamp as failed so it doesn't keep
     // re-entering backfill loops.
-    if hs_scribe::postprocess::is_stub_pdf(total_pages, &md) {
+    if hs_scribe::postprocess::is_stub_pdf(total_pages, &md, duration_secs) {
         reporter.warn(&format!(
-            "{stem}: HTML conversion produced stub document (≤1 page, <500 non-whitespace chars)"
+            "{stem}: HTML conversion produced stub document (≤1 page, <500 non-whitespace chars or sub-second convert)"
         ));
         if let Err(e) = hs_common::catalog::update_conversion_failed_via(
             storage,
             catalog_prefix,
             &stem,
             "local-html",
-            start.elapsed().as_secs_f64(),
+            duration_secs,
             total_pages,
             "stub_document",
         )
@@ -1214,11 +1215,12 @@ async fn convert_and_save_pool(
                 // Write catalog entry with conversion metadata
                 let page_offsets = crate::catalog::compute_page_offsets(&md);
                 let total_pages = total_pages_counter.load(std::sync::atomic::Ordering::Relaxed);
+                let duration_secs = start_time.elapsed().as_secs_f64();
 
-                // Quarantine stub PDFs (landing pages, paywalls)
-                if hs_scribe::postprocess::is_stub_pdf(total_pages, &md) {
+                // Quarantine stub PDFs (landing pages, paywalls, sub-second returns)
+                if hs_scribe::postprocess::is_stub_pdf(total_pages, &md, duration_secs) {
                     reporter.warn(&format!(
-                        "{stem}: stub PDF (1pg, minimal content) → quarantined"
+                        "{stem}: stub PDF (1pg, minimal content or sub-second convert) → quarantined"
                     ));
                     let _ = storage.delete(&md_key).await;
                     quarantine_file(pdf_path, corrupted_dir);
@@ -1232,7 +1234,7 @@ async fn convert_and_save_pool(
                     catalog_prefix,
                     &stem,
                     short_server,
-                    start_time.elapsed().as_secs_f64(),
+                    duration_secs,
                     total_pages,
                     page_offsets,
                     &md_key,

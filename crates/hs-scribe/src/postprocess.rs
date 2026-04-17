@@ -3,9 +3,16 @@
 //! Detects and truncates repetition loops that the VLM model produces,
 //! such as "and modeling and modeling and modeling..." or "ggggggg...".
 
-/// Detect stub PDFs: 1-page results with minimal content (landing pages, paywalls).
-pub fn is_stub_pdf(total_pages: u64, markdown: &str) -> bool {
-    total_pages <= 1 && markdown.chars().filter(|c| !c.is_whitespace()).count() < 500
+/// Detect stub PDFs: 1-page results that are either short on content (landing
+/// pages, paywalls) OR returned suspiciously fast (under a second — a real
+/// VLM pass cannot complete in that time; the "content" is almost certainly a
+/// cached or malformed response).
+pub fn is_stub_pdf(total_pages: u64, markdown: &str, duration_secs: f64) -> bool {
+    if total_pages > 1 {
+        return false;
+    }
+    let non_ws = markdown.chars().filter(|c| !c.is_whitespace()).count();
+    non_ws < 500 || duration_secs < 1.0
 }
 
 /// Clean repetition artifacts from markdown text.
@@ -178,5 +185,36 @@ mod tests {
         assert!(count >= 1); // "the model" bigram repetition is caught
         assert!(output.contains("end"));
         assert!(!output.contains("the model the model the model the model the model"));
+    }
+
+    #[test]
+    fn stub_short_content() {
+        // 1 page, few chars, plausible duration → stub
+        let md = "# Title\n\nnot much here";
+        assert!(is_stub_pdf(1, md, 2.5));
+    }
+
+    #[test]
+    fn stub_sub_second() {
+        // 1 page, plenty of chars, but impossibly fast → stub.
+        // A real VLM pass cannot complete a page in under 1s; this
+        // case catches cached/empty scribe responses that slipped
+        // the char-count gate.
+        let md = "x".repeat(2000);
+        assert!(is_stub_pdf(1, &md, 0.0));
+    }
+
+    #[test]
+    fn real_short_paper_not_stub() {
+        // Multi-page, even with brief content → not a stub.
+        let md = "# Short paper\n\nabstract body.";
+        assert!(!is_stub_pdf(2, md, 0.5));
+    }
+
+    #[test]
+    fn real_long_paper_not_stub() {
+        // 1 page with enough real content and plausible duration.
+        let md = "a".repeat(2000);
+        assert!(!is_stub_pdf(1, &md, 3.0));
     }
 }

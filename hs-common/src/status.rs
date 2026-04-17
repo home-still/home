@@ -79,6 +79,10 @@ pub struct QdrantInfo {
     pub embed_model: String,
     #[serde(default)]
     pub qdrant_version: String,
+    /// Qdrant endpoint URL reported by distill, e.g. `http://host:6334`.
+    /// Empty when an older distill server doesn't yet expose it.
+    #[serde(default)]
+    pub qdrant_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +277,53 @@ pub async fn list_orphan_document_stems(
         }
     }
     orphans.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(orphans)
+}
+
+/// List stems of catalog rows that claim a successful conversion but whose
+/// markdown object is missing from storage. These are the textbook F5-class
+/// orphans: the row says "I was converted" but the payload isn't where the
+/// pipeline wrote it.
+///
+/// Rows with `conversion.failed == true` are skipped — those are intentional
+/// stub/failure stamps, not orphans. Rows with no `conversion` at all are
+/// also skipped (they never claimed to have markdown in the first place).
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub async fn list_catalog_rows_without_markdown(
+    storage: &dyn Storage,
+    catalog_prefix: &str,
+    markdown_prefix: &str,
+) -> anyhow::Result<Vec<String>> {
+    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
+
+    let markdown_objects = storage.list(markdown_prefix).await?;
+    use std::collections::HashSet;
+    let markdown_stems: HashSet<String> = markdown_objects
+        .iter()
+        .filter_map(|o| {
+            if !o.key.ends_with(".md") {
+                return None;
+            }
+            let filename = o.key.rsplit('/').next()?;
+            if filename.starts_with("._") {
+                return None;
+            }
+            Some(filename.trim_end_matches(".md").to_string())
+        })
+        .collect();
+
+    let mut orphans: Vec<String> = triples
+        .into_iter()
+        .filter_map(|(stem, _meta, entry)| {
+            let claims_converted = entry.conversion.as_ref().is_some_and(|c| !c.failed);
+            if claims_converted && !markdown_stems.contains(&stem) {
+                Some(stem)
+            } else {
+                None
+            }
+        })
+        .collect();
+    orphans.sort();
     Ok(orphans)
 }
 

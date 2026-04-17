@@ -40,6 +40,14 @@ struct PaperSearchParams {
         description = "Provider: all, arxiv, openalex, semantic_scholar (s2), europmc (pmc), crossref, core (default: all). Unknown values return an error."
     )]
     provider: Option<String>,
+    #[schemars(
+        description = "Minimum citation count filter. Papers with fewer citations are excluded. Provider support varies (OpenAlex, Semantic Scholar, CORE honor this; arXiv does not)."
+    )]
+    min_citations: Option<u32>,
+    #[schemars(
+        description = "Sort order: relevance, citations, date (default: relevance). Unknown values fall back to relevance."
+    )]
+    sort: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -181,6 +189,7 @@ struct HomeStillMcp {
     catalog_prefix: String,
     markdown_prefix: String,
     papers_prefix: String,
+    // TODO: We should remove legacy code, this is a grienfield project.
     // Legacy filesystem paths used only by mutation handlers that bridge to
     // external server binaries expecting local paths (scribe_convert,
     // distill_index). Derived from `home.project_dir` in config.
@@ -198,6 +207,7 @@ impl HomeStillMcp {
         let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
         let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
 
+        // TODO: We don't want fallbacks, this leads to magical behavior.
         // Storage backend: honor the `storage:` section in ~/.home-still/config.yaml
         // (`backend: local` or `backend: s3`). If no storage section is present,
         // fall back to LocalFsStorage rooted at the configured project_dir — that
@@ -308,14 +318,20 @@ impl HomeStillMcp {
             .as_deref()
             .and_then(|d| paper::models::DateFilter::parse(d).ok());
 
+        let sort_by = match p.sort.as_deref() {
+            Some("citations") => paper::models::SortBy::Citations,
+            Some("date") => paper::models::SortBy::Date,
+            _ => paper::models::SortBy::Relevance,
+        };
+
         let query = paper::models::SearchQuery {
             query: p.query,
             search_type,
             max_results: p.max_results.unwrap_or(10) as usize,
             offset: p.offset.unwrap_or(0),
             date_filter,
-            sort_by: paper::models::SortBy::Relevance,
-            min_citations: None,
+            sort_by,
+            min_citations: p.min_citations.map(u64::from),
         };
 
         match provider.search_by_query(&query).await {
@@ -592,6 +608,7 @@ impl HomeStillMcp {
                 }));
             }
             if let Some(ref emb) = entry.embedding {
+                // TODO: Legacy, deal with it.
                 // Skip zero-chunk "embeddings" — they were stamped by an older
                 // pipeline when nothing actually made it into Qdrant, and only
                 // pollute the history pane.
@@ -653,7 +670,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Find document files (PDFs and HTML fallbacks) on disk that have no catalog row, and optionally synthesize minimal catalog entries for them. Use `dry_run=true` first to preview the count and a sample of stems. Repaired rows carry a `repair` block so they're distinguishable from rows produced by `paper_download`.",
+        description = "Reconcile catalog ↔ storage in both directions. Forward: document files (PDFs/HTML) on disk with no catalog row → synthesize minimal catalog entries (carry a `repair` block). Reverse: catalog rows that claim a successful conversion but whose markdown object is missing → clear the stale `conversion` / `embedding` / `embedding_skip` blocks so the row re-enters the convert queue (original `downloaded_at` / `sha256` / etc preserved). Use `dry_run=true` first to see counts for both directions. Does NOT delete catalog rows outright or touch storage objects.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -665,34 +682,58 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<CatalogRepairParams>,
     ) -> Result<String, String> {
-        let orphans = hs_common::status::list_orphan_document_stems(
+        // Forward direction: files on disk with no catalog row.
+        let disk_orphans = hs_common::status::list_orphan_document_stems(
             &*self.storage,
             &self.papers_prefix,
             &self.catalog_prefix,
         )
         .await
-        .map_err(|e| format!("orphan scan failed: {e}"))?;
+        .map_err(|e| format!("disk-orphan scan failed: {e}"))?;
 
-        let total = orphans.len();
+        // Reverse direction: catalog claims converted but markdown is gone.
+        let md_orphans = hs_common::status::list_catalog_rows_without_markdown(
+            &*self.storage,
+            &self.catalog_prefix,
+            &self.markdown_prefix,
+        )
+        .await
+        .map_err(|e| format!("markdown-orphan scan failed: {e}"))?;
+
+        let disk_total = disk_orphans.len();
+        let md_total = md_orphans.len();
         let limit = p.limit.unwrap_or(usize::MAX);
-        let take = orphans.iter().take(limit);
-        let sample: Vec<String> = take.clone().take(10).map(|(s, _)| s.clone()).collect();
+        let disk_samples: Vec<String> = disk_orphans
+            .iter()
+            .take(10)
+            .map(|(s, _)| s.clone())
+            .collect();
+        let md_samples: Vec<String> = md_orphans.iter().take(10).cloned().collect();
 
         if p.dry_run {
             return Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "orphans_found": total,
-                "would_repair": take.count(),
-                "samples": sample,
                 "dry_run": true,
+                "disk_no_catalog": {
+                    "orphans_found": disk_total,
+                    "would_repair": disk_orphans.iter().take(limit).count(),
+                    "samples": disk_samples,
+                },
+                "catalog_no_markdown": {
+                    "orphans_found": md_total,
+                    "would_clear_conversion": md_orphans.iter().take(limit).count(),
+                    "samples": md_samples,
+                },
             }))
             .unwrap_or_default());
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        let mut repaired = 0u64;
+        let mut disk_repaired = 0u64;
+        let mut md_cleared = 0u64;
         let mut errors: Vec<String> = Vec::new();
-        for (stem, ext) in orphans.iter().take(limit) {
-            // Reuse any prior partial entry (rare, but harmless).
+
+        // Forward repair: synthesize catalog rows for disk orphans.
+        for (stem, ext) in disk_orphans.iter().take(limit) {
             let mut entry = hs_common::catalog::read_catalog_entry_via(
                 &*self.storage,
                 &self.catalog_prefix,
@@ -719,17 +760,59 @@ impl HomeStillMcp {
             )
             .await
             {
-                Ok(()) => repaired += 1,
-                Err(e) => errors.push(format!("{stem}: {e}")),
+                Ok(()) => disk_repaired += 1,
+                Err(e) => errors.push(format!("disk/{stem}: {e}")),
+            }
+        }
+
+        // Reverse repair: clear stale conversion/embedding blocks. We keep
+        // downloaded_at / sha256 / file_size_bytes untouched — that data is
+        // still authoritative and lets the convert queue re-pick the row
+        // without re-downloading.
+        for stem in md_orphans.iter().take(limit) {
+            let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                stem,
+            )
+            .await
+            else {
+                errors.push(format!("md/{stem}: catalog entry vanished mid-repair"));
+                continue;
+            };
+            entry.conversion = None;
+            entry.embedding = None;
+            entry.embedding_skip = None;
+            entry.repair = Some(hs_common::catalog::RepairMeta {
+                repaired_at: now.clone(),
+                reason: "catalog claimed converted but markdown missing — cleared".into(),
+            });
+            match hs_common::catalog::write_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                stem,
+                &entry,
+            )
+            .await
+            {
+                Ok(()) => md_cleared += 1,
+                Err(e) => errors.push(format!("md/{stem}: {e}")),
             }
         }
 
         Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "orphans_found": total,
-            "repaired": repaired,
-            "errors": errors,
-            "samples": sample,
             "dry_run": false,
+            "disk_no_catalog": {
+                "orphans_found": disk_total,
+                "repaired": disk_repaired,
+                "samples": disk_samples,
+            },
+            "catalog_no_markdown": {
+                "orphans_found": md_total,
+                "cleared": md_cleared,
+                "samples": md_samples,
+            },
+            "errors": errors,
         }))
         .unwrap_or_default())
     }
@@ -925,7 +1008,7 @@ impl HomeStillMcp {
         let page_offsets = hs_common::catalog::compute_page_offsets(&md);
         let total_pages = page_offsets.len() as u64;
 
-        if hs_scribe::postprocess::is_stub_pdf(total_pages, &md) {
+        if hs_scribe::postprocess::is_stub_pdf(total_pages, &md, duration_secs) {
             // Record the failure on the catalog so the doc isn't silently
             // retried by every backfill pass, and so it's visible in
             // `catalog_list` via the `conversion_failed` flag.
@@ -943,7 +1026,7 @@ impl HomeStillMcp {
                 tracing::warn!("failed-conversion catalog stamp failed for {}: {e}", p.stem);
             }
             return Err(format!(
-                "{}: stub document (≤1 page, <500 non-whitespace chars) — not persisted",
+                "{}: stub document (≤1 page, <500 non-whitespace chars or sub-second convert) — not persisted",
                 p.stem
             ));
         }
@@ -1513,6 +1596,10 @@ impl HomeStillMcp {
                     qdrant_version: health
                         .as_ref()
                         .map(|h| h.qdrant_version.clone())
+                        .unwrap_or_default(),
+                    qdrant_url: health
+                        .as_ref()
+                        .map(|h| h.qdrant_url.clone())
                         .unwrap_or_default(),
                 });
             }

@@ -57,6 +57,7 @@ async fn handle_health(State(state): State<Arc<DistillServerState>>) -> impl Int
         version: env!("HS_VERSION").to_string(),
         qdrant_version,
         embed_model: state.config.embedding.model.clone(),
+        qdrant_url: state.config.qdrant_url.clone(),
     })
 }
 
