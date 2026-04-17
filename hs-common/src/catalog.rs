@@ -244,6 +244,16 @@ pub async fn write_catalog_entry_via(
     storage.put(&key, yaml.into_bytes()).await
 }
 
+#[cfg(feature = "storage")]
+pub async fn delete_catalog_entry_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    stem: &str,
+) -> anyhow::Result<()> {
+    let key = catalog_key(prefix, stem);
+    storage.delete(&key).await
+}
+
 /// List the stems of every catalog entry under `prefix`.
 ///
 /// Walks `Storage::list(prefix)`, keeps keys ending in `.yaml`, strips the

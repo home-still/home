@@ -670,10 +670,10 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Reconcile catalog ↔ storage in both directions. Forward: document files (PDFs/HTML) on disk with no catalog row → synthesize minimal catalog entries (carry a `repair` block). Reverse: catalog rows that claim a successful conversion but whose markdown object is missing → clear the stale `conversion` / `embedding` / `embedding_skip` blocks so the row re-enters the convert queue (original `downloaded_at` / `sha256` / etc preserved). Use `dry_run=true` first to see counts for both directions. Does NOT delete catalog rows outright or touch storage objects.",
+        description = "Reconcile catalog ↔ storage in three directions. Forward: document files (PDFs/HTML) on disk with no catalog row → synthesize minimal catalog entries (carry a `repair` block). Reverse: catalog rows that claim a successful conversion but whose markdown object is missing → clear the stale `conversion` / `embedding` / `embedding_skip` blocks so the row re-enters the convert queue (original `downloaded_at` / `sha256` / etc preserved). Phantom: catalog rows with neither a paper file nor a markdown in storage → delete the row outright (the YAML is the last trace; with no source to re-derive from, it's unreachable). Use `dry_run=true` first to see counts in all three directions.",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = true,
             open_world_hint = false
         )
@@ -700,8 +700,22 @@ impl HomeStillMcp {
         .await
         .map_err(|e| format!("markdown-orphan scan failed: {e}"))?;
 
+        // Phantom direction: catalog row with neither a paper file nor a
+        // markdown file. These inflate `catalog_entries` above `documents`
+        // in the pipeline rollup and have no reachable payload anywhere —
+        // safe to delete once confirmed via dry-run.
+        let phantom_orphans = hs_common::status::list_catalog_rows_without_source(
+            &*self.storage,
+            &self.papers_prefix,
+            &self.catalog_prefix,
+            &self.markdown_prefix,
+        )
+        .await
+        .map_err(|e| format!("phantom-orphan scan failed: {e}"))?;
+
         let disk_total = disk_orphans.len();
         let md_total = md_orphans.len();
+        let phantom_total = phantom_orphans.len();
         let limit = p.limit.unwrap_or(usize::MAX);
         let disk_samples: Vec<String> = disk_orphans
             .iter()
@@ -709,6 +723,7 @@ impl HomeStillMcp {
             .map(|(s, _)| s.clone())
             .collect();
         let md_samples: Vec<String> = md_orphans.iter().take(10).cloned().collect();
+        let phantom_samples: Vec<String> = phantom_orphans.iter().take(10).cloned().collect();
 
         if p.dry_run {
             return Ok(serde_json::to_string_pretty(&serde_json::json!({
@@ -723,6 +738,11 @@ impl HomeStillMcp {
                     "would_clear_conversion": md_orphans.iter().take(limit).count(),
                     "samples": md_samples,
                 },
+                "catalog_no_source": {
+                    "orphans_found": phantom_total,
+                    "would_delete": phantom_orphans.iter().take(limit).count(),
+                    "samples": phantom_samples,
+                },
             }))
             .unwrap_or_default());
         }
@@ -730,6 +750,7 @@ impl HomeStillMcp {
         let now = chrono::Utc::now().to_rfc3339();
         let mut disk_repaired = 0u64;
         let mut md_cleared = 0u64;
+        let mut phantom_deleted = 0u64;
         let mut errors: Vec<String> = Vec::new();
 
         // Forward repair: synthesize catalog rows for disk orphans.
@@ -800,6 +821,22 @@ impl HomeStillMcp {
             }
         }
 
+        // Phantom purge: catalog YAMLs with no backing paper file AND no
+        // markdown. These have nowhere to be reconstructed from, so the
+        // row itself is the orphan — delete it outright.
+        for stem in phantom_orphans.iter().take(limit) {
+            match hs_common::catalog::delete_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                stem,
+            )
+            .await
+            {
+                Ok(()) => phantom_deleted += 1,
+                Err(e) => errors.push(format!("phantom/{stem}: {e}")),
+            }
+        }
+
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "dry_run": false,
             "disk_no_catalog": {
@@ -811,6 +848,11 @@ impl HomeStillMcp {
                 "orphans_found": md_total,
                 "cleared": md_cleared,
                 "samples": md_samples,
+            },
+            "catalog_no_source": {
+                "orphans_found": phantom_total,
+                "deleted": phantom_deleted,
+                "samples": phantom_samples,
             },
             "errors": errors,
         }))
@@ -1189,31 +1231,34 @@ impl HomeStillMcp {
             .distill_client()
             .ok_or("No distill server configured")?;
 
-        // Read markdown through Storage (same path markdown_read uses:
-        // `{markdown_prefix}/{sharded_key(stem, "md")}`). distill server
-        // accepts content in the request body, so we send bytes and let it
-        // embed without touching its own filesystem.
-        let key = format!(
-            "{}/{}",
-            self.markdown_prefix.trim_end_matches('/'),
-            hs_common::sharded_key(&p.stem, "md")
-        );
-        if !self.storage.exists(&key).await.unwrap_or(false) {
-            return Err(format!(
-                "Markdown not found for '{}' at storage key '{key}'. Convert the PDF first.",
-                p.stem
-            ));
-        }
-
-        // Load the catalog entry (if any) so metadata lands on Qdrant
-        // payloads even when the distill server has no local copy of the
-        // catalog directory.
+        // Load the catalog entry first so we can prefer the exact key scribe
+        // wrote (`markdown_path`). Re-deriving via `sharded_key` is unsafe
+        // for stems with apostrophes or percent-encoded bytes — the derived
+        // key can silently miss the stored object. Fall back to re-derivation
+        // only for pre-rc.241 rows that predate the `markdown_path` field.
         let catalog_entry = hs_common::catalog::read_catalog_entry_via(
             &*self.storage,
             &self.catalog_prefix,
             &p.stem,
         )
         .await;
+
+        let key = catalog_entry
+            .as_ref()
+            .and_then(|e| e.markdown_path.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}/{}",
+                    self.markdown_prefix.trim_end_matches('/'),
+                    hs_common::sharded_key(&p.stem, "md")
+                )
+            });
+        if !self.storage.exists(&key).await.unwrap_or(false) {
+            return Err(format!(
+                "Markdown not found for '{}' at storage key '{key}'. Convert the PDF first.",
+                p.stem
+            ));
+        }
 
         match client
             .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())

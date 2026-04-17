@@ -1407,13 +1407,19 @@ async fn cmd_reconcile(
                     &format!("{i}/{} re-embedded", embed_missing.len()),
                 );
             }
-            // `sharded_key` returns `{2-char-shard}/{stem}.md`; the storage
-            // backend needs the `markdown/` prefix on top. The event-driven
-            // path gets this for free from the NATS payload (`event.key`
-            // already includes the prefix); the reconciler reconstructs it.
-            let md_key = format!("markdown/{}", hs_common::sharded_key(stem, "md"));
+            // Prefer the exact key scribe wrote (stored on the catalog row
+            // as `markdown_path`). Re-deriving via `sharded_key(stem, "md")`
+            // is only safe when the stem has no normalization drift relative
+            // to the original filename — stems with apostrophes or
+            // percent-encoded bytes silently orphan the markdown otherwise.
+            // Fall back to re-derivation for pre-rc.241 rows that predate
+            // the `markdown_path` field.
             let catalog_entry =
                 hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem).await;
+            let md_key = catalog_entry
+                .as_ref()
+                .and_then(|e| e.markdown_path.clone())
+                .unwrap_or_else(|| format!("markdown/{}", hs_common::sharded_key(stem, "md")));
             match distill
                 .index_from_storage_with_catalog(&*storage, &md_key, catalog_entry.as_ref())
                 .await

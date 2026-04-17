@@ -332,6 +332,67 @@ pub async fn list_catalog_rows_without_markdown(
     Ok(orphans)
 }
 
+/// List stems of catalog rows with no backing file in storage — neither a
+/// PDF/HTML under `papers_prefix` nor a markdown under `markdown_prefix`.
+/// These are phantom rows (YAML that survived a paper deletion, or a stale
+/// synthesis from a prior `catalog_repair` run on content that later
+/// vanished). They inflate `catalog_entries` above `documents` in the
+/// pipeline rollup without being reachable by any downstream stage.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub async fn list_catalog_rows_without_source(
+    storage: &dyn Storage,
+    papers_prefix: &str,
+    catalog_prefix: &str,
+    markdown_prefix: &str,
+) -> anyhow::Result<Vec<String>> {
+    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
+    let papers = storage.list(papers_prefix).await?;
+    let markdown = storage.list(markdown_prefix).await?;
+
+    use std::collections::HashSet;
+    let paper_stems: HashSet<String> = papers
+        .iter()
+        .filter_map(|o| {
+            let filename = o.key.rsplit('/').next()?;
+            if filename.starts_with("._") {
+                return None;
+            }
+            let (stem, ext) = filename.rsplit_once('.')?;
+            if ext == "pdf" || ext == "html" {
+                Some(stem.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let md_stems: HashSet<String> = markdown
+        .iter()
+        .filter_map(|o| {
+            if !o.key.ends_with(".md") {
+                return None;
+            }
+            let filename = o.key.rsplit('/').next()?;
+            if filename.starts_with("._") {
+                return None;
+            }
+            Some(filename.trim_end_matches(".md").to_string())
+        })
+        .collect();
+
+    let mut orphans: Vec<String> = triples
+        .into_iter()
+        .filter_map(|(stem, _meta, _entry)| {
+            if paper_stems.contains(&stem) || md_stems.contains(&stem) {
+                None
+            } else {
+                Some(stem)
+            }
+        })
+        .collect();
+    orphans.sort();
+    Ok(orphans)
+}
+
 /// Pipeline counts via Storage. Same source of truth as MCP today.
 #[cfg(feature = "storage")]
 pub async fn collect_pipeline_counts(

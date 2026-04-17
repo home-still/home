@@ -59,6 +59,7 @@ pub async fn convert_and_upload(
         .await
         .with_context(|| format!("get({}) failed", event.key))?;
 
+    let start = std::time::Instant::now();
     let is_html = event.key.ends_with(".html") || event.key.ends_with(".htm");
     let markdown = if is_html {
         let html = String::from_utf8(raw_bytes)
@@ -70,21 +71,32 @@ pub async fn convert_and_upload(
             .await
             .with_context(|| format!("scribe convert failed for {}", event.key))?
     };
+    let duration_secs = start.elapsed().as_secs_f64();
 
-    // Empty/garbage output — record the failure on the catalog so the
-    // backfill tool can see it, and skip both the storage write and the
-    // `scribe.completed` publish (a downstream indexer would just skip it
-    // again, leaving an unembedded markdown forever).
-    if markdown.trim().is_empty() {
+    // Apply the same stub-document gate the CLI and MCP scribe_convert paths
+    // apply (hs/src/scribe_cmd.rs, hs-mcp/src/main.rs): ≤1 page AND <500
+    // non-whitespace chars OR sub-second convert ⇒ stamp `conversion.failed`
+    // and skip the markdown write. Without this gate, HTML landing pages
+    // (OpenAlex, PMC, DOI metadata-only) become near-empty markdown that
+    // later fails distill embed with `zero_chunks_or_empty`, which the
+    // reconciler classifies as terminal — a silent dead letter.
+    let page_offsets = hs_common::catalog::compute_page_offsets(&markdown);
+    let total_pages = page_offsets.len() as u64;
+    if crate::postprocess::is_stub_pdf(total_pages, &markdown, duration_secs) {
+        let reason = if markdown.trim().is_empty() {
+            "empty_output"
+        } else {
+            "stub_document"
+        };
         let stem_only = stem.to_string();
         if let Err(e) = hs_common::catalog::update_conversion_failed_via(
             storage,
             "catalog",
             &stem_only,
             "event-watch",
-            0.0,
-            0,
-            "empty_output",
+            duration_secs,
+            total_pages,
+            reason,
         )
         .await
         {
@@ -93,7 +105,8 @@ pub async fn convert_and_upload(
         tracing::warn!(
             stem = %stem_only,
             source_key = %event.key,
-            "scribe convert produced empty markdown; not publishing scribe.completed",
+            reason = reason,
+            "scribe convert produced stub; not publishing scribe.completed",
         );
         return Ok(md_key);
     }
