@@ -622,6 +622,7 @@ async fn convert_html_and_save(
     storage: &dyn hs_common::storage::Storage,
     markdown_prefix: &str,
     catalog_prefix: &str,
+    papers_prefix: &str,
     reporter: &Arc<dyn Reporter>,
     stats: &WatchStats,
 ) {
@@ -706,16 +707,22 @@ async fn convert_html_and_save(
     }
 
     // After successful conversion, move source out of manually_downloaded/ (if applicable)
-    relocate_from_manual_dir(html_path);
+    relocate_from_manual_dir(html_path, storage, papers_prefix).await;
 }
 
-/// If `source_path` sits in a `manually_downloaded/` folder, move it into the
-/// proper sharded layout (e.g. `papers/10/stem.pdf`). Source files that are
-/// already in the sharded layout are left alone.
+/// If `source_path` sits in a `manually_downloaded/` folder, ensure the file
+/// is in S3 under `{papers_prefix}/{shard}/{stem}.{ext}` (so remote consumers
+/// like mac_air see it via rclone-NFS), then move the local copy into the
+/// sharded layout (e.g. `papers/10/stem.pdf`). Source files that are already
+/// in the sharded layout are left alone.
 ///
 /// Files that fail to convert stay in `manually_downloaded/` so users can see
 /// what hasn't been processed yet.
-fn relocate_from_manual_dir(source_path: &std::path::Path) {
+async fn relocate_from_manual_dir(
+    source_path: &std::path::Path,
+    storage: &dyn hs_common::storage::Storage,
+    papers_prefix: &str,
+) {
     // Only relocate if the parent directory is "manually_downloaded"
     let is_manual = source_path
         .parent()
@@ -740,6 +747,33 @@ fn relocate_from_manual_dir(source_path: &std::path::Path) {
         Some(e) => e,
         None => return,
     };
+
+    // Mirror to S3 so remote consumers see this file. Skip if already present.
+    let s3_key = format!(
+        "{}/{}",
+        papers_prefix.trim_end_matches('/'),
+        hs_common::sharded_key(stem, ext)
+    );
+    if !storage.exists(&s3_key).await.unwrap_or(false) {
+        match std::fs::read(source_path) {
+            Ok(bytes) => {
+                if let Err(e) = storage.put(&s3_key, bytes).await {
+                    tracing::warn!(
+                        "Failed to upload {} to {s3_key}: {e}",
+                        source_path.display()
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read {} for S3 upload: {e}",
+                    source_path.display()
+                );
+                return;
+            }
+        }
+    }
 
     let target = hs_common::sharded_path(papers_root, stem, ext);
     if let Some(parent) = target.parent() {
@@ -847,6 +881,7 @@ async fn cmd_watch(
     // distill_cmd.rs' read_catalog_entry_via(storage, "catalog", …).
     let markdown_prefix: Arc<str> = Arc::from("markdown");
     let catalog_prefix: Arc<str> = Arc::from("catalog");
+    let papers_prefix: Arc<str> = Arc::from("papers");
 
     // Resolve dirs: CLI flag > config > defaults
     let watch_dir = dir
@@ -937,6 +972,7 @@ async fn cmd_watch(
             let storage = storage.clone();
             let markdown_prefix = markdown_prefix.clone();
             let catalog_prefix = catalog_prefix.clone();
+            let papers_prefix = papers_prefix.clone();
             let reporter = Arc::clone(reporter);
             let stats = Arc::clone(&stats);
             let sem = Arc::clone(&spawn_sem);
@@ -949,7 +985,7 @@ async fn cmd_watch(
                 );
                 if storage.exists(&md_key).await.unwrap_or(false) {
                     // Already converted — still relocate from manually_downloaded/ if applicable.
-                    relocate_from_manual_dir(&path);
+                    relocate_from_manual_dir(&path, &*storage, &papers_prefix).await;
                     return;
                 }
                 stats
@@ -961,6 +997,7 @@ async fn cmd_watch(
                         &*storage,
                         &markdown_prefix,
                         &catalog_prefix,
+                        &papers_prefix,
                         &reporter,
                         &stats,
                     )
@@ -974,6 +1011,7 @@ async fn cmd_watch(
                         &*storage,
                         &markdown_prefix,
                         &catalog_prefix,
+                        &papers_prefix,
                         &reporter,
                         &stats,
                     )
@@ -1015,6 +1053,7 @@ async fn cmd_watch(
                     let storage = storage.clone();
                     let markdown_prefix = markdown_prefix.clone();
                     let catalog_prefix = catalog_prefix.clone();
+                    let papers_prefix = papers_prefix.clone();
                     let reporter = Arc::clone(reporter);
                     let stats = Arc::clone(&stats);
                     let sem = Arc::clone(&spawn_sem);
@@ -1027,7 +1066,7 @@ async fn cmd_watch(
                         );
                         if storage.exists(&md_key).await.unwrap_or(false) {
                             // Already converted — still relocate from manually_downloaded/ if applicable.
-                            relocate_from_manual_dir(&path);
+                            relocate_from_manual_dir(&path, &*storage, &papers_prefix).await;
                             return;
                         }
                         stats
@@ -1039,6 +1078,7 @@ async fn cmd_watch(
                                 &*storage,
                                 &markdown_prefix,
                                 &catalog_prefix,
+                                &papers_prefix,
                                 &reporter,
                                 &stats,
                             )
@@ -1052,6 +1092,7 @@ async fn cmd_watch(
                                 &*storage,
                                 &markdown_prefix,
                                 &catalog_prefix,
+                                &papers_prefix,
                                 &reporter,
                                 &stats,
                             )
@@ -1096,6 +1137,7 @@ async fn convert_and_save_pool(
     storage: &dyn hs_common::storage::Storage,
     markdown_prefix: &str,
     catalog_prefix: &str,
+    papers_prefix: &str,
     reporter: &Arc<dyn Reporter>,
     stats: &WatchStats,
 ) {
@@ -1259,7 +1301,7 @@ async fn convert_and_save_pool(
                 }
 
                 // After successful conversion, move source out of manually_downloaded/
-                relocate_from_manual_dir(pdf_path);
+                relocate_from_manual_dir(pdf_path, storage, papers_prefix).await;
             }
         }
         Err(e) => {
