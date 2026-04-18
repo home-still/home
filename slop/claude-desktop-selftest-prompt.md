@@ -55,11 +55,12 @@ Before any pipeline work, establish what cluster you are looking at. None of the
 9. `markdown_list` (small limit). Pick any 2 entries and `markdown_read` their first 500 chars — coherent text, not gibberish? Tables/equations preserved?
 10. `distill_reconcile` with `{ "dry_run": true }`. Lists doc_ids that exist in Qdrant but have no markdown. The reconciler now consults `catalog_entry.markdown_path` before deciding something is orphaned, so pre-rc.241 unsharded rows no longer show up as ghosts. **Expected orphan count at steady state: ≤ 5.** Anything higher is a real anomaly — feed the offending doc_ids into `distill_scan_repetitions` / `distill_purge` for triage.
 11. `distill_scan_repetitions` with `{ "dry_run": true, "limit": 1000 }`. Walks every markdown object and counts VLM repetition truncations; docs above the threshold (default 20 truncation sites) are flagged. **Expected `flagged_count == 0` at steady state.** Any hits mean the scribe-side QC gate let a loopy convert through — list the offending stems and their first offending snippet under a "Repetition poisoning" subsection of the report.
-12. `catalog_repair` with `{ "dry_run": true }`. Four directions to check:
+12. `catalog_repair` with `{ "dry_run": true }`. Five directions to check:
     - `disk_no_catalog.orphans_found` — PDFs on disk with no catalog row. Expected ≈ 0 with the inbox watcher running; non-zero means either the watcher is off or a file just landed and hasn't been swept yet.
-    - `catalog_no_markdown.orphans_found` — catalog claims converted but markdown is gone. Expected 0.
+    - `catalog_no_markdown.orphans_found` — catalog claims converted but markdown is gone. Expected 0. When non-zero, the repair now also purges stale Qdrant vectors for the doc_id — `qdrant_points_purged` in the response reports how many stale points the sweep would clear.
     - `catalog_no_source.orphans_found` — phantom catalog rows with neither paper nor markdown. Expected 0 in steady state.
     - `flag_drift.drift_found` — catalog rows whose stage flags disagree with storage (e.g. markdown exists but `conversion == None`, or PDF exists but `downloaded_at == None`). Expected 0 once a prior repair has run.
+    - `stuck_convert.stuck_found` — catalog rows with a source file on disk but no `conversion` stamp. Expected 0 in steady state. When non-zero, `catalog_repair` with `dry_run=false` purges any residual Qdrant chunks and publishes `papers.ingested` so the `hs scribe watch-events` daemon drains them asynchronously — so the count should drop after one run and a wait for the convert loop.
     Any non-zero count after a recent sweep is a real anomaly worth flagging.
 
 ## Phase 3 — Search surface (all 6 providers)

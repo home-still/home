@@ -529,6 +529,20 @@ For local rc deploys, set the version explicitly so `git describe` doesn't bake 
 GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs-distill --features server,cuda
 ```
 
+**Start the event-bus subscribers**
+
+The scribe and distill HTTP servers above handle direct MCP calls. Asynchronous ingestion (from `paper_download`, the inbox watcher, or `catalog_repair`'s `stuck_convert` direction) flows through NATS: `papers.ingested` → scribe convert → `scribe.completed` → distill index → `distill.completed`. Each hop needs a dedicated subscriber running. Both run on this host:
+
+```bash
+nohup ~/.local/bin/hs scribe watch-events \
+  > ~/.home-still/logs/scribe-watch-events.log 2>&1 & disown
+
+nohup ~/.local/bin/hs distill watch-events \
+  > ~/.home-still/logs/distill-watch-events.log 2>&1 & disown
+```
+
+Promote these to systemd user units once you're happy they stay up (model after the `home-still-scribe-inbox.service` unit that `hs scribe inbox install` creates). Without both daemons running, `paper_download`'s event publish is silently dropped and `catalog_repair stuck_convert` has no one to pick up its emissions — ingestion has to fall back to synchronous MCP calls through Claude Desktop.
+
 **Register with the gateway as a serve-mode service**
 
 ```bash
