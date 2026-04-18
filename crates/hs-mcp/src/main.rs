@@ -113,6 +113,20 @@ struct ScribeConvertParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ScribeRequeueStuckParams {
+    #[schemars(
+        description = "If true, report what would be re-queued without writing. Default: true."
+    )]
+    #[serde(default = "default_true")]
+    dry_run: bool,
+    #[schemars(
+        description = "Maximum number of stuck documents to requeue in this call. Each triggers a scribe convert (~seconds to minutes per PDF); keep this bounded."
+    )]
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DistillIndexParams {
     #[schemars(
         description = "Paper stem name (filename without extension) of a markdown document to index"
@@ -852,10 +866,16 @@ impl HomeStillMcp {
             }
         }
 
-        // Reverse repair: clear stale conversion/embedding blocks. We keep
-        // downloaded_at / sha256 / file_size_bytes untouched — that data is
-        // still authoritative and lets the convert queue re-pick the row
-        // without re-downloading.
+        // Reverse repair: clear stale conversion/embedding blocks AND purge
+        // any Qdrant vectors for the doc_id. Clearing the catalog flag
+        // without purging Qdrant is the 2026-04-18 ghost-chunk class of
+        // bug — the catalog says "not converted" while Qdrant still serves
+        // stale chunks from the deleted markdown. We keep downloaded_at /
+        // sha256 / file_size_bytes untouched — that data is still
+        // authoritative and lets the convert queue re-pick the row without
+        // re-downloading.
+        let distill_client_for_purge = self.distill_client();
+        let mut md_qdrant_purged = 0u64;
         for stem in md_orphans.iter().take(limit) {
             let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
                 &*self.storage,
@@ -872,7 +892,8 @@ impl HomeStillMcp {
             entry.embedding_skip = None;
             entry.repair = Some(hs_common::catalog::RepairMeta {
                 repaired_at: now.clone(),
-                reason: "catalog claimed converted but markdown missing — cleared".into(),
+                reason: "catalog claimed converted but markdown missing — cleared + Qdrant purged"
+                    .into(),
             });
             match hs_common::catalog::write_catalog_entry_via(
                 &*self.storage,
@@ -883,7 +904,25 @@ impl HomeStillMcp {
             .await
             {
                 Ok(()) => md_cleared += 1,
-                Err(e) => errors.push(format!("md/{stem}: {e}")),
+                Err(e) => {
+                    errors.push(format!("md/{stem}: {e}"));
+                    continue;
+                }
+            }
+            // Best-effort Qdrant purge. A failure here doesn't roll back the
+            // catalog clear — the next distill_reconcile will surface any
+            // ghost chunks that slipped through, and the catalog change is
+            // the load-bearing invariant.
+            if let Some(ref client) = distill_client_for_purge {
+                match client.delete_doc(stem).await {
+                    Ok(n) if n > 0 => {
+                        md_qdrant_purged += n;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("md-orphan qdrant purge {stem} failed: {e}");
+                    }
+                }
             }
         }
 
@@ -976,6 +1015,7 @@ impl HomeStillMcp {
             "catalog_no_markdown": {
                 "orphans_found": md_total,
                 "cleared": md_cleared,
+                "qdrant_points_purged": md_qdrant_purged,
                 "samples": md_samples,
             },
             "catalog_no_source": {
@@ -1547,6 +1587,288 @@ impl HomeStillMcp {
             "total_pages": total_pages,
             "duration_secs": duration_secs,
             "server": server_label,
+        }))
+        .unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Requeue documents whose catalog has a PDF/HTML source but no `conversion` stamp (the 2026-04-18 drift-gate failure mode: markdown was deleted, `catalog_no_markdown` cleared the catalog stage flags, and the Qdrant chunks went stale). For each stuck stem: purge any residual Qdrant vectors, run scribe conversion, stamp the catalog, then re-index. Defaults to dry-run. Each convert is expensive (~seconds to minutes per PDF); use `limit` to batch.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn scribe_requeue_stuck(
+        &self,
+        Parameters(p): Parameters<ScribeRequeueStuckParams>,
+    ) -> Result<String, String> {
+        let stuck = hs_common::status::list_catalog_stuck_convert(
+            &*self.storage,
+            &self.papers_prefix,
+            &self.catalog_prefix,
+        )
+        .await
+        .map_err(|e| format!("stuck-convert scan failed: {e}"))?;
+
+        let total = stuck.len();
+        let limit = p.limit.unwrap_or(usize::MAX);
+        let take: Vec<hs_common::status::StuckConvertRow> = stuck.into_iter().take(limit).collect();
+        let samples: Vec<serde_json::Value> = take
+            .iter()
+            .take(10)
+            .map(|r| serde_json::json!({ "stem": r.stem, "source_ext": r.source_ext }))
+            .collect();
+        let pdf_count = take.iter().filter(|r| r.source_ext == "pdf").count();
+        let html_count = take.iter().filter(|r| r.source_ext == "html").count();
+
+        if p.dry_run {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": true,
+                "stuck_found": total,
+                "would_requeue": take.len(),
+                "pdf_candidates": pdf_count,
+                "html_candidates": html_count,
+                "samples": samples,
+            }))
+            .unwrap_or_default());
+        }
+
+        let scribe_client = self.scribe_client();
+        let distill_client = self.distill_client();
+        let server_url = self
+            .scribe_servers
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let server_label = server_url
+            .strip_prefix("http://")
+            .or_else(|| server_url.strip_prefix("https://"))
+            .unwrap_or(server_url)
+            .to_string();
+
+        let mut converted_indexed = 0u64;
+        let mut converted_no_index = 0u64;
+        let mut convert_failed = 0u64;
+        let mut qdrant_points_purged: u64 = 0;
+        let mut errors: Vec<String> = Vec::new();
+
+        for row in take.iter() {
+            // Step 1: Best-effort purge of any residual Qdrant vectors for
+            // this doc_id. Idempotent; a no-op on stems that never had
+            // chunks, load-bearing on the 30 Type A docs in the 2026-04-18
+            // scan that have ghost chunks from a prior completed cycle.
+            if let Some(ref client) = distill_client {
+                match client.delete_doc(&row.stem).await {
+                    Ok(n) => qdrant_points_purged += n,
+                    Err(e) => {
+                        errors.push(format!("purge/{}: {e}", row.stem));
+                    }
+                }
+            }
+
+            // Step 2: Convert. We pick the convert path from source_ext
+            // rather than probing storage — the `list_catalog_stuck_convert`
+            // helper already verified the source exists.
+            let start = std::time::Instant::now();
+            let (md, source_key) = match row.source_ext.as_str() {
+                "pdf" => {
+                    let pdf_key = format!(
+                        "{}/{}",
+                        self.papers_prefix.trim_end_matches('/'),
+                        hs_common::sharded_key(&row.stem, "pdf")
+                    );
+                    let Ok(pdf_bytes) = self.storage.get(&pdf_key).await else {
+                        errors.push(format!("fetch/{}: could not read {pdf_key}", row.stem));
+                        continue;
+                    };
+                    let Some(ref client) = scribe_client else {
+                        errors.push(format!("{}: no scribe server configured", row.stem));
+                        continue;
+                    };
+                    match client.convert(pdf_bytes).await {
+                        Ok(md) => (md, pdf_key),
+                        Err(e) => {
+                            convert_failed += 1;
+                            errors.push(format!("convert/{}: {e}", row.stem));
+                            continue;
+                        }
+                    }
+                }
+                "html" => {
+                    let html_key = format!(
+                        "{}/{}",
+                        self.papers_prefix.trim_end_matches('/'),
+                        hs_common::sharded_key(&row.stem, "html")
+                    );
+                    let Ok(html_bytes) = self.storage.get(&html_key).await else {
+                        errors.push(format!("fetch/{}: could not read {html_key}", row.stem));
+                        continue;
+                    };
+                    let Ok(html) = String::from_utf8(html_bytes) else {
+                        errors.push(format!("{}: HTML not valid UTF-8", row.stem));
+                        continue;
+                    };
+                    let md = hs_scribe::html::convert_html_to_markdown(&html);
+                    (md, html_key)
+                }
+                other => {
+                    errors.push(format!("{}: unknown source_ext {other}", row.stem));
+                    continue;
+                }
+            };
+            let duration_secs = start.elapsed().as_secs_f64();
+
+            // Step 3: QC + stub gates, same as scribe_convert so the
+            // requeue path can't smuggle loopy or stub markdown past the
+            // checks the online path applies.
+            let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
+            let page_offsets = hs_common::catalog::compute_page_offsets(&md);
+            let total_pages = page_offsets.len() as u64;
+
+            if hs_scribe::postprocess::qc_verdict(truncations, total_pages)
+                == hs_scribe::postprocess::QcVerdict::RejectLoop
+            {
+                if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+                    &*self.storage,
+                    &self.catalog_prefix,
+                    &row.stem,
+                    &server_label,
+                    duration_secs,
+                    total_pages,
+                    "repetition_loop",
+                )
+                .await
+                {
+                    errors.push(format!("fail-stamp/{}: {e}", row.stem));
+                }
+                convert_failed += 1;
+                continue;
+            }
+
+            if hs_scribe::postprocess::is_stub_pdf(total_pages, &md, duration_secs) {
+                if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+                    &*self.storage,
+                    &self.catalog_prefix,
+                    &row.stem,
+                    &server_label,
+                    duration_secs,
+                    total_pages,
+                    "stub_document",
+                )
+                .await
+                {
+                    errors.push(format!("fail-stamp/{}: {e}", row.stem));
+                }
+                convert_failed += 1;
+                continue;
+            }
+
+            // Step 4: Persist markdown + stamp catalog.
+            let md_key = format!(
+                "{}/{}",
+                self.markdown_prefix.trim_end_matches('/'),
+                hs_common::sharded_key(&row.stem, "md")
+            );
+            let md_bytes = md.into_bytes();
+            if let Err(e) = self.storage.put(&md_key, md_bytes).await {
+                errors.push(format!("write/{}: {md_key}: {e}", row.stem));
+                continue;
+            }
+            if let Err(e) = hs_common::catalog::update_conversion_catalog_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &row.stem,
+                &server_label,
+                duration_secs,
+                total_pages,
+                page_offsets,
+                &md_key,
+            )
+            .await
+            {
+                errors.push(format!("stamp/{}: {e}", row.stem));
+                continue;
+            }
+
+            // Best-effort `scribe.completed` emit so any downstream
+            // subscribers (indexers, readers) pick it up without waiting
+            // for the next reconcile.
+            let payload = serde_json::json!({
+                "key": md_key,
+                "source_key": source_key,
+            });
+            if let Err(e) = self
+                .events
+                .publish(
+                    "scribe.completed",
+                    serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
+                )
+                .await
+            {
+                tracing::warn!(stem = %row.stem, error = %e, "scribe.completed publish failed");
+            }
+
+            // Step 5: Inline index. Re-read the catalog entry so the
+            // index carries the fresh conversion metadata we just wrote.
+            if let Some(ref client) = distill_client {
+                let catalog_entry = hs_common::catalog::read_catalog_entry_via(
+                    &*self.storage,
+                    &self.catalog_prefix,
+                    &row.stem,
+                )
+                .await;
+                let key = hs_common::markdown::resolve_markdown_key(
+                    &self.markdown_prefix,
+                    &row.stem,
+                    catalog_entry
+                        .as_ref()
+                        .and_then(|e| e.markdown_path.as_deref()),
+                );
+                match client
+                    .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
+                    .await
+                {
+                    Ok(result) => {
+                        if let Err(e) = hs_common::catalog::record_embedding_outcome_via(
+                            &*self.storage,
+                            &self.catalog_prefix,
+                            &row.stem,
+                            self.distill_servers
+                                .first()
+                                .map(|s| s.as_str())
+                                .unwrap_or(""),
+                            result.chunks_indexed,
+                            &result.embedding_device,
+                        )
+                        .await
+                        {
+                            tracing::warn!("embedding catalog update failed for {}: {e}", row.stem);
+                        }
+                        converted_indexed += 1;
+                    }
+                    Err(e) => {
+                        converted_no_index += 1;
+                        errors.push(format!("index/{}: {e}", row.stem));
+                    }
+                }
+            } else {
+                // No distill configured — convert succeeded, leave indexing
+                // for a later pass.
+                converted_no_index += 1;
+            }
+        }
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "dry_run": false,
+            "stuck_found": total,
+            "attempted": take.len(),
+            "converted_indexed": converted_indexed,
+            "converted_no_index": converted_no_index,
+            "convert_failed": convert_failed,
+            "qdrant_points_purged": qdrant_points_purged,
+            "errors": errors,
         }))
         .unwrap_or_default())
     }

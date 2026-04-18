@@ -50,6 +50,17 @@ pub struct HealthResponse {
     /// when the server has not produced non-empty markdown since startup.
     /// Reflects "processor returned non-empty markdown" — quality validation
     /// (stub-PDF detection, schema checks) lives in callers, not here.
+    ///
+    /// **In-memory only.** Held by the scribe server as an `AtomicU64`
+    /// initialized at process start; a restart resets it to `None` until
+    /// the first post-restart conversion. This is diagnostic, not
+    /// persistent. For the persistent last-activity timestamp across
+    /// restarts, read `system_status.history` — it surfaces the most
+    /// recent `Convert`/`Embed` event straight out of the catalog YAMLs.
+    ///
+    /// A `null` here paired with recent converts in `system_status.history`
+    /// is not a contradiction — it just means scribe was restarted between
+    /// the last activity and the health probe.
     #[serde(default)]
     pub last_conversion_at: Option<String>,
 }

@@ -431,6 +431,80 @@ pub async fn list_catalog_flag_drift(
     Ok(drift)
 }
 
+/// A stuck-convert row: catalog has no `conversion` stamp, but a source
+/// file (PDF or HTML) is present in storage. Surfaces the 2026-04-18
+/// drift-gate failure mode: docs that went through convert → markdown →
+/// embed, had their markdown deleted, and whose catalog flags were
+/// cleared by `catalog_no_markdown` repair without the corresponding
+/// Qdrant purge. After the rc.260 purge-also-on-clear fix the catalog
+/// is consistent, but the source remains and needs re-conversion.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+#[derive(Debug, Clone)]
+pub struct StuckConvertRow {
+    pub stem: String,
+    /// `"pdf"` or `"html"` — tells the caller which scribe path to use.
+    pub source_ext: String,
+}
+
+/// List stems whose catalog has no `conversion` block but whose source
+/// file (PDF or HTML) is in storage. Candidates for `scribe_requeue_stuck`.
+///
+/// Not to be confused with [`list_catalog_rows_without_source`] (phantoms
+/// with neither source nor markdown) or [`list_catalog_flag_drift`] (flags
+/// missing but storage evidence present for an already-completed stage).
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub async fn list_catalog_stuck_convert(
+    storage: &dyn Storage,
+    papers_prefix: &str,
+    catalog_prefix: &str,
+) -> anyhow::Result<Vec<StuckConvertRow>> {
+    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
+    let papers = storage.list(papers_prefix).await?;
+
+    use std::collections::HashMap;
+    // stem -> extension. PDF wins over HTML when both exist so we prefer
+    // the richer source; the convert path handles either.
+    let mut source_by_stem: HashMap<String, String> = HashMap::new();
+    for o in papers.iter() {
+        let Some(filename) = o.key.rsplit('/').next() else {
+            continue;
+        };
+        if filename.starts_with("._") {
+            continue;
+        }
+        let Some((stem, ext)) = filename.rsplit_once('.') else {
+            continue;
+        };
+        match ext {
+            "pdf" => {
+                source_by_stem.insert(stem.to_string(), "pdf".to_string());
+            }
+            "html" => {
+                source_by_stem
+                    .entry(stem.to_string())
+                    .or_insert_with(|| "html".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    let mut stuck: Vec<StuckConvertRow> = Vec::new();
+    for (stem, _meta, entry) in triples {
+        if entry.conversion.is_some() {
+            continue;
+        }
+        let Some(ext) = source_by_stem.get(&stem) else {
+            continue;
+        };
+        stuck.push(StuckConvertRow {
+            stem,
+            source_ext: ext.clone(),
+        });
+    }
+    stuck.sort_by(|a, b| a.stem.cmp(&b.stem));
+    Ok(stuck)
+}
+
 /// List stems of catalog rows with no backing file in storage — neither a
 /// PDF/HTML under `papers_prefix` nor a markdown under `markdown_prefix`.
 /// These are phantom rows (YAML that survived a paper deletion, or a stale
@@ -625,5 +699,108 @@ mod history_tests {
         let skip = events.iter().find(|e| e.activity == "EmbedSkip").unwrap();
         assert_eq!(skip.reason.as_deref(), Some("zero_chunks_or_empty"));
         assert_eq!(skip.detail, "zero_chunks_or_empty");
+    }
+}
+
+#[cfg(all(test, feature = "storage", feature = "catalog"))]
+mod stuck_convert_tests {
+    use super::*;
+    use crate::catalog::{write_catalog_entry_via, CatalogEntry, ConversionMeta};
+    use crate::storage::LocalFsStorage;
+
+    #[tokio::test]
+    async fn surfaces_entry_with_pdf_but_no_conversion() {
+        // Two catalog entries:
+        //  1. `stuck` — downloaded, no `conversion` block, PDF on disk.
+        //     This is the 2026-04-18 drift case the tool must surface.
+        //  2. `converted` — has a `conversion` stamp. Must NOT be listed
+        //     (a successful prior convert is not a requeue candidate).
+        // A third fixture (`dangling`) has a catalog entry but NO source
+        // on disk — that's the phantom direction's domain, not ours.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let stuck = CatalogEntry {
+            downloaded_at: Some("2026-04-15T17:27:52Z".into()),
+            pdf_path: Some("10/stuck.pdf".into()),
+            conversion: None,
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "stuck", &stuck)
+            .await
+            .unwrap();
+        storage
+            .put("papers/st/stuck.pdf", b"fake pdf".to_vec())
+            .await
+            .unwrap();
+
+        let converted = CatalogEntry {
+            downloaded_at: Some("2026-04-15T16:00:00Z".into()),
+            pdf_path: Some("10/converted.pdf".into()),
+            conversion: Some(ConversionMeta {
+                server: "scribe-1".into(),
+                duration_secs: 10.0,
+                total_pages: 5,
+                converted_at: "2026-04-15T16:01:00Z".into(),
+                pages: vec![],
+                failed: false,
+                reason: None,
+            }),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "converted", &converted)
+            .await
+            .unwrap();
+        storage
+            .put("papers/co/converted.pdf", b"fake pdf 2".to_vec())
+            .await
+            .unwrap();
+
+        let dangling = CatalogEntry {
+            downloaded_at: Some("2026-04-15T15:00:00Z".into()),
+            conversion: None,
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "dangling", &dangling)
+            .await
+            .unwrap();
+
+        let stuck_rows = list_catalog_stuck_convert(&storage, "papers", "catalog")
+            .await
+            .unwrap();
+
+        assert_eq!(stuck_rows.len(), 1, "got: {stuck_rows:?}");
+        assert_eq!(stuck_rows[0].stem, "stuck");
+        assert_eq!(stuck_rows[0].source_ext, "pdf");
+    }
+
+    #[tokio::test]
+    async fn prefers_pdf_when_both_pdf_and_html_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            downloaded_at: Some("2026-04-15T12:00:00Z".into()),
+            conversion: None,
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "both", &entry)
+            .await
+            .unwrap();
+        // Seed both — PDF should win.
+        storage
+            .put("papers/bo/both.html", b"<html/>".to_vec())
+            .await
+            .unwrap();
+        storage
+            .put("papers/bo/both.pdf", b"fake".to_vec())
+            .await
+            .unwrap();
+
+        let rows = list_catalog_stuck_convert(&storage, "papers", "catalog")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_ext, "pdf");
     }
 }
