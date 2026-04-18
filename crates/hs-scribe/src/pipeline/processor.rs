@@ -267,7 +267,7 @@ impl Processor {
         let ocr = Arc::clone(&self.ocr);
         let image_arc = Arc::new(image.clone());
 
-        let region_results: Vec<Result<(BBox, String)>> = stream::iter(other_bboxes.into_iter())
+        let region_results: Vec<Result<(BBox, String)>> = stream::iter(other_bboxes)
             .map(|bbox| {
                 let ocr = Arc::clone(&ocr);
                 let image = Arc::clone(&image_arc);
@@ -857,40 +857,38 @@ async fn execute_vlm_for_page(
             });
 
             // Process text regions with semaphore-gated concurrency
-            let region_results: Vec<Result<(BBox, String)>> =
-                stream::iter(text_regions.into_iter())
-                    .map(|r| {
-                        let ocr = Arc::clone(&ocr);
-                        let sem = Arc::clone(&sem);
-                        let on_progress = Arc::clone(&on_progress);
-                        let region_done = Arc::clone(&region_done);
-                        async move {
-                            if r.region_type == RegionType::Figure
-                                || r.region_type == RegionType::Skip
-                            {
-                                region_done.fetch_add(1, Ordering::Relaxed);
-                                return Ok((r.bbox, String::new()));
-                            }
-                            let _permit = sem
-                                .acquire()
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
-                            let text = ocr.recognize_region(&r.jpeg_bytes, r.region_type).await?;
-                            let done = region_done.fetch_add(1, Ordering::Relaxed) + 1;
-                            on_progress(ProgressEvent {
-                                stage: "vlm".into(),
-                                page: page_num,
-                                total_pages,
-                                message: format!(
-                                    "OCR region {done}/{total_regions} on page {page_num}"
-                                ),
-                            });
-                            Ok((r.bbox, text))
+            let region_results: Vec<Result<(BBox, String)>> = stream::iter(text_regions)
+                .map(|r| {
+                    let ocr = Arc::clone(&ocr);
+                    let sem = Arc::clone(&sem);
+                    let on_progress = Arc::clone(&on_progress);
+                    let region_done = Arc::clone(&region_done);
+                    async move {
+                        if r.region_type == RegionType::Figure || r.region_type == RegionType::Skip
+                        {
+                            region_done.fetch_add(1, Ordering::Relaxed);
+                            return Ok((r.bbox, String::new()));
                         }
-                    })
-                    .buffer_unordered(region_parallel)
-                    .collect()
-                    .await;
+                        let _permit = sem
+                            .acquire()
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
+                        let text = ocr.recognize_region(&r.jpeg_bytes, r.region_type).await?;
+                        let done = region_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        on_progress(ProgressEvent {
+                            stage: "vlm".into(),
+                            page: page_num,
+                            total_pages,
+                            message: format!(
+                                "OCR region {done}/{total_regions} on page {page_num}"
+                            ),
+                        });
+                        Ok((r.bbox, text))
+                    }
+                })
+                .buffer_unordered(region_parallel)
+                .collect()
+                .await;
 
             let mut regions: Vec<(BBox, String)> =
                 region_results.into_iter().collect::<Result<Vec<_>>>()?;
@@ -911,7 +909,7 @@ async fn execute_vlm_for_page(
                     ),
                 });
 
-                let cell_texts: Vec<String> = stream::iter(table.cell_jpegs.into_iter())
+                let cell_texts: Vec<String> = stream::iter(table.cell_jpegs)
                     .map(|jpeg| {
                         let ocr = Arc::clone(&ocr);
                         let sem = Arc::clone(&sem);
