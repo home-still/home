@@ -14,6 +14,18 @@ You have access to the `home-still` MCP server (tools prefixed with `paper_` / `
 
 **Run an end-to-end self-test and produce a debug report.** Capture every error verbatim and continue to the next step. Only stop early if Phase 1 reveals the cluster is fundamentally unreachable (no MCP tool returns at all). Prefer small `limit` values; we want signal, not volume.
 
+## Preflight — tool surface and schema sanity
+
+Before Phase 0. These three checks confirm the `hs-mcp` binary Claude Desktop spawned is the rc this prompt was written against — not a stale local binary from a prior rc. Clients host `hs-mcp` via stdio and cache the child process at app launch, so a cluster-side upgrade is silently useless until the client session is bounced. If any preflight check fails, stop, restart Claude Desktop (`Cmd+Q`, reopen) or reconnect the `home-still` server in the MCP panel, and re-run preflight. Don't proceed to Phase 0 until all three pass.
+
+a. **Tool surface.** Ask: *"What `home-still` MCP tools do you see? I'm specifically checking for `distill_scan_repetitions` and `catalog_repair`."* Both must be present. Absence means the spawned `hs-mcp` binary predates the current rc — the client-spawned binary isn't in sync with the cluster.
+
+b. **Schema fields.** Ask: *"Call `system_status` and show me the `pipeline` object."* Both `pipeline_drift` and `pipeline_drift_threshold` must be present. Same diagnosis as (a) if missing: stale client binary.
+
+c. **Arithmetic spot-check.** Compute `documents − markdown − conversion_failed − Σ(scribe.in_flight)` client-side and compare to the server's `pipeline_drift`. They must match. Divergence means the server-side formula has changed vs what this prompt documents — file an issue rather than debugging the cluster from a moving spec.
+
+Only after all three pass: proceed to Phase 0.
+
 ## Phase 0 — Topology snapshot (read-only)
 
 Before any pipeline work, establish what cluster you are looking at. None of these steps are pass/fail on their own — they make every later finding interpretable.
