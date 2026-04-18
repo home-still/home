@@ -181,9 +181,19 @@ fn status_macos(reporter: &Arc<dyn Reporter>) -> Result<()> {
     Ok(())
 }
 
+// Only called from macOS paths (install/uninstall/status) dispatched via
+// a runtime `OS == "macos"` match. `libc::geteuid` isn't in the Windows
+// libc, so gate the real impl to unix and leave a panicking stub for
+// Windows — unreachable at runtime, but keeps the call sites compiling.
+#[cfg(unix)]
 fn users_uid() -> u32 {
     // SAFETY: `geteuid` is a trivial read-only syscall with no out-params.
     unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn users_uid() -> u32 {
+    unreachable!("users_uid is only called from macOS dispatch paths")
 }
 
 // ── Linux: systemd --user ───────────────────────────────────────────

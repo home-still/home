@@ -750,6 +750,19 @@ hs cloud status
 
 Now `hs distill search` works locally (direct to `big:7434` on LAN) **and** remotely (through the gateway over the tunnel).
 
+**Upgrading clients on a new `rc.*` tag.** Clients that host Claude Desktop / Claude Code / any other MCP client spawn `hs-mcp` locally via stdio — they must be upgraded alongside the compute host, not after. Skipping this is the fastest way to ship a tool-surface mismatch: the compute host runs rc.NEW but Claude Desktop still spawns rc.OLD from `~/.local/bin/hs-mcp`, and the self-test's tool-surface gate fails even though the services themselves are up to date.
+
+Run on every client after `big` is upgraded:
+
+```bash
+hs upgrade                       # pulls rc-signed binaries into ~/.local/bin
+# …then bounce any Claude Desktop / Claude Code session so it re-spawns the new hs-mcp.
+# On macOS:   Cmd+Q Claude Desktop and reopen, or use the MCP panel to reconnect `home-still`.
+# On Linux:   reload the MCP server from whichever client launched it.
+```
+
+Verification: in a fresh chat, ask the client to list home-still MCP tools and confirm the latest rc's new tools (e.g. `distill_scan_repetitions` in rc.259) are present.
+
 ### 6.6 Client-side inbox watcher
 
 **Where it runs**: one client with write access to the shared storage root (typically the daily driver — `mac_air`). Do NOT run it on multiple clients against the same `papers/manually_downloaded/` prefix; duplicate fsnotify triggers and racing catalog writes will produce ghost rows.
