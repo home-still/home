@@ -30,28 +30,32 @@ Before any pipeline work, establish what cluster you are looking at. None of the
 3. **CUDA gate.** For every entry in `distill_instances`, assert `compute_device == "Cuda"`. Also call `distill_status` and confirm the same. If any instance reports `Cpu` (or empty/unknown), mark **FAIL — CUDA NON-NEGOTIABLE VIOLATED** at the very top of the final report and name the offending instance URL. Do not skip the rest of the test — keep going so the report is complete — but the overall verdict is FAIL.
 4. **Scribe gate.** `scribe_health` for each scribe instance. Server up? GPU name + utilization, queue depth, last conversion timestamp, slot availability. A scribe instance reporting CPU-only compute is also a FAIL per the same rule.
 5. **Qdrant gate.** From `distill_status`: collection exists? Vector count plausible (non-zero on a populated cluster)? Indexed vs pending. URL matches what `system_status` reported.
-6. **Pipeline math (rc.253).** Verify the gap reconciles:
-   `documents == markdown + conversion_failed + (in-flight conversions across scribe instances)`
-   Acceptance: **drift ≤ 3 is PASS** (small in-flight tolerance; the client-side inbox watcher from rc.258 moves files in seconds). **Drift > 3 is FAIL** — report the drift and which side is over-counting. The `conversion_failed` field is the rc.253 surface that closes the previous "documents > markdown for no visible reason" gap — its absence in the snapshot is itself a FAIL.
-   If there's an operator running `hs scribe inbox` on a client, note it: on a healthy cluster with an active inbox watcher, this identity balances within seconds of any drop into `papers/manually_downloaded/`.
+6. **Pipeline math.** The snapshot carries two fields that make this a single-assertion gate:
+   - `pipeline.pipeline_drift` — computed server-side as `documents − markdown − conversion_failed − (sum of scribe in_flight)`. Saturating subtraction, so never negative.
+   - `pipeline.pipeline_drift_threshold` — the threshold above which the gate fails (currently 3).
+   Acceptance: **`pipeline_drift <= pipeline_drift_threshold` is PASS.** Anything above is FAIL — report both values and which stage is likely over-counting. The absence of either field in the snapshot is itself a FAIL (the MCP server is older than this prompt expects).
+   If there's an operator running `hs scribe inbox` on a client, note it: on a healthy cluster with an active inbox watcher, the drift balances within seconds of any drop into `papers/manually_downloaded/`.
 
 ## Phase 2 — Inventory & gap detection (read-only)
 
 7. `catalog_recent` with a generous window — last 10 downloads, 10 conversions, 10 embeds. Report timestamps and call out gaps (downloaded but never converted, converted but never embedded, embedded with zero chunks).
 8. `catalog_list` (page 1, small limit). Sample the first 5: confirm each has `markdown` and `embedded` flags set consistently with what `system_status` reported in aggregate.
 9. `markdown_list` (small limit). Pick any 2 entries and `markdown_read` their first 500 chars — coherent text, not gibberish? Tables/equations preserved?
-10. `distill_reconcile` with `{ "dry_run": true }`. This is the rc.254 phantom-embed reconciler — it lists doc_ids that exist in Qdrant but have no markdown. Report `orphan_count`. A non-trivial orphan count on a healthy cluster suggests the event-watch retry path is dropping work and is worth flagging.
-11. `catalog_repair` with `{ "dry_run": true }`. Three directions to check:
+10. `distill_reconcile` with `{ "dry_run": true }`. Lists doc_ids that exist in Qdrant but have no markdown. The reconciler now consults `catalog_entry.markdown_path` before deciding something is orphaned, so pre-rc.241 unsharded rows no longer show up as ghosts. **Expected orphan count at steady state: ≤ 5.** Anything higher is a real anomaly — feed the offending doc_ids into `distill_scan_repetitions` / `distill_purge` for triage.
+11. `distill_scan_repetitions` with `{ "dry_run": true, "limit": 1000 }`. Walks every markdown object and counts VLM repetition truncations; docs above the threshold (default 20 truncation sites) are flagged. **Expected `flagged_count == 0` at steady state.** Any hits mean the scribe-side QC gate let a loopy convert through — list the offending stems and their first offending snippet under a "Repetition poisoning" subsection of the report.
+12. `catalog_repair` with `{ "dry_run": true }`. Four directions to check:
     - `disk_no_catalog.orphans_found` — PDFs on disk with no catalog row. Expected ≈ 0 with the inbox watcher running; non-zero means either the watcher is off or a file just landed and hasn't been swept yet.
     - `catalog_no_markdown.orphans_found` — catalog claims converted but markdown is gone. Expected 0.
-    - `catalog_no_source.orphans_found` (rc.255) — phantom catalog rows with neither paper nor markdown. Expected 0 in steady state.
+    - `catalog_no_source.orphans_found` — phantom catalog rows with neither paper nor markdown. Expected 0 in steady state.
+    - `flag_drift.drift_found` — catalog rows whose stage flags disagree with storage (e.g. markdown exists but `conversion == None`, or PDF exists but `downloaded_at == None`). Expected 0 once a prior repair has run.
     Any non-zero count after a recent sweep is a real anomaly worth flagging.
 
 ## Phase 3 — Search surface (all 6 providers)
 
 12. `paper_search` for `"retrieval augmented generation"` on each provider individually (`arxiv`, `openalex`, `semantic_scholar`, `pmc`, `crossref`, `core`), `limit=2`, `abstract=true`. Which providers returned results, which errored, latency per call if visible.
-13. `paper_search` with filters: `date=">=2024"`, `min_citations=10`, `sort=citations`. Confirm filters applied (look at the `year` and `citations` fields in the results).
+13. `paper_search` with filters: `date=">=2024"`, `min_citations=10`, `sort=citations`. Confirm filters applied (look at the `year` and `citations` fields in the results). With the citation-sort relevance floor in place, the top results should be genuinely about RAG — if you see off-topic high-cite papers (ferroptosis, points-of-interest) at the top, that's a regression.
 14. `paper_get` by a known-stable DOI (pick one returned above). Full metadata returned?
+15. **arXiv DOI resolution** — call both `paper_get("10.48550/arXiv.2005.11401")` and `paper_get("10.48550/arxiv.2312.10997")` (note the case difference). Both should return full metadata (Lewis et al. RAG paper + a follow-up). A `"No paper found"` error on either is a regression in the aggregate `get_by_doi` arXiv shortcut. Then `paper_download("10.48550/arxiv.2312.10997")` should write a PDF > 100 KB — the downloader's case-insensitive fast-path should engage.
 
 ## Phase 4 — Ingestion round-trips (mutating — do ONE paper per path)
 
@@ -65,6 +69,7 @@ Pick **one** distill instance and **one** scribe instance for this phase and rec
 18. `distill_index` that stem (force). Chunk count produced. **If zero chunks: this is the main thing to debug — report why** (year filter rejecting? language detection? empty markdown after extraction?).
 19. `distill_exists` with the doc_id — returns true?
 20. `distill_search` for a distinctive phrase from the markdown. Does the new doc appear in top-5? Score?
+20a. `distill_scan_repetitions` with `{ "dry_run": true, "limit": 50, "threshold": 10 }` (lower threshold than the steady-state check so even borderline loops surface). The new doc MUST NOT appear in `flagged` — a fresh convert that trips the scanner means the scribe-side QC gate regressed or the repetition_penalty is too low. Report both the scanner output and a sample of the markdown if flagged.
 
 ### 4B — Client-side inbox round-trip (rc.258)
 

@@ -10,6 +10,12 @@ const RRF_K: f64 = 60.0;
 // Log(1 + 10_000) - papers with 10k+ citations score near 1.0
 const MAX_EXPECTED_CITATIONS: f64 = 10_000.0;
 
+/// When the caller sorts by citations, papers below this content-relevance
+/// score are dropped before the final sort. Keeps high-citation off-topic
+/// papers from swamping the target paper in "sort by citations" searches.
+/// Value chosen to drop papers where only ~30% of query terms match.
+pub const CITATION_SORT_MIN_RELEVANCE: f64 = 0.3;
+
 // Per-source weights: how much we trust each provider's relevance ordering
 fn source_weight(source: &str) -> f64 {
     match source {
@@ -51,6 +57,7 @@ pub fn rank_papers(groups: &[DedupGroup], merged: Vec<Paper>, query: &str) -> Ve
             RankedPaper {
                 contributing_sources: contributing_sources(group),
                 score,
+                relevance: rel,
                 paper,
             }
         })
@@ -63,4 +70,112 @@ pub fn rank_papers(groups: &[DedupGroup], merged: Vec<Paper>, query: &str) -> Ve
     });
 
     ranked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aggregation::dedup::{DedupGroup, MatchType, SourcedPaper};
+    use crate::models::Paper;
+
+    fn make_paper(title: &str, source: &str, cites: Option<u64>) -> Paper {
+        Paper {
+            id: title.to_string(),
+            title: title.to_string(),
+            authors: Vec::new(),
+            abstract_text: None,
+            publication_date: None,
+            doi: None,
+            download_urls: Vec::new(),
+            cited_by_count: cites,
+            source: source.to_string(),
+        }
+    }
+
+    fn source_paper(title: &str, source: &str, rank: usize, cites: Option<u64>) -> SourcedPaper {
+        SourcedPaper {
+            paper: make_paper(title, source, cites),
+            rank,
+            source: source.to_string(),
+        }
+    }
+
+    fn group_of(paper: SourcedPaper) -> DedupGroup {
+        DedupGroup {
+            papers: vec![paper],
+            doi: None,
+            match_type: MatchType::Single,
+        }
+    }
+
+    #[test]
+    fn relevance_is_stamped_on_ranked_paper() {
+        // Title matches every query token → high relevance.
+        let groups = vec![group_of(source_paper(
+            "retrieval augmented generation",
+            "openalex",
+            0,
+            Some(500),
+        ))];
+        let merged: Vec<Paper> = groups.iter().map(|g| g.papers[0].paper.clone()).collect();
+        let ranked = rank_papers(&groups, merged, "retrieval augmented generation");
+        assert_eq!(ranked.len(), 1);
+        assert!(
+            ranked[0].relevance > 0.5,
+            "relevance should be high on full title match, got {}",
+            ranked[0].relevance
+        );
+    }
+
+    #[test]
+    fn off_topic_high_citation_paper_has_low_relevance() {
+        // Paper about a completely different topic but with many citations.
+        let groups = vec![group_of(source_paper(
+            "ferroptosis in cancer cells",
+            "openalex",
+            0,
+            Some(1_000),
+        ))];
+        let merged: Vec<Paper> = groups.iter().map(|g| g.papers[0].paper.clone()).collect();
+        let ranked = rank_papers(&groups, merged, "retrieval augmented generation");
+        assert_eq!(ranked.len(), 1);
+        assert!(
+            ranked[0].relevance < CITATION_SORT_MIN_RELEVANCE,
+            "off-topic paper should be below the citation-sort floor, got {}",
+            ranked[0].relevance
+        );
+    }
+
+    #[test]
+    fn target_paper_survives_citation_floor_even_with_fewer_citations() {
+        // The Gao et al. RAG survey (low-citation in this fixture) has
+        // perfect relevance; the off-topic high-cite paper does not.
+        // After applying the floor, only the target survives.
+        let groups = vec![
+            group_of(source_paper(
+                "retrieval augmented generation for large language models",
+                "openalex",
+                0,
+                Some(400),
+            )),
+            group_of(source_paper(
+                "points of interest recommendation via ranked retrieval",
+                "openalex",
+                0,
+                Some(1_200),
+            )),
+        ];
+        let merged: Vec<Paper> = groups.iter().map(|g| g.papers[0].paper.clone()).collect();
+        let ranked = rank_papers(&groups, merged, "retrieval augmented generation");
+        let survivors: Vec<&RankedPaper> = ranked
+            .iter()
+            .filter(|rp| rp.relevance >= CITATION_SORT_MIN_RELEVANCE)
+            .collect();
+        assert_eq!(survivors.len(), 1, "only the target should survive");
+        assert!(
+            survivors[0].paper.title.contains("retrieval augmented"),
+            "survivor should be the target paper, got: {:?}",
+            survivors[0].paper.title
+        );
+    }
 }

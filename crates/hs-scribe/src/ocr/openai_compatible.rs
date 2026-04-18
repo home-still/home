@@ -48,7 +48,7 @@ impl OpenAiBackend {
             ],
             "temperature": 0.0,
             "max_tokens": 8192,
-            "repetition_penalty": 1.1,
+            "repetition_penalty": 1.3,
             "top_k": 40,
             "top_p": 0.9
         });

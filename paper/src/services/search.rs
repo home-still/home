@@ -117,6 +117,18 @@ impl PaperProvider for AggregateProvider {
             ranked
         };
 
+        // When the caller sorts by citations, drop low-relevance papers so the
+        // 25% citation weight in the ranking formula doesn't amplify
+        // high-citation off-topic hits above the target paper.
+        let ranked: Vec<_> = if matches!(query.sort_by, crate::models::SortBy::Citations) {
+            ranked
+                .into_iter()
+                .filter(|rp| rp.relevance >= ranking::CITATION_SORT_MIN_RELEVANCE)
+                .collect()
+        } else {
+            ranked
+        };
+
         // Convert back to Papers, truncate to max_results
         let papers: Vec<Paper> = ranked
             .into_iter()
@@ -133,6 +145,17 @@ impl PaperProvider for AggregateProvider {
     }
 
     async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
+        // arXiv DOIs (`10.48550/arXiv.*`) are registered with DataCite, not
+        // Crossref — Crossref/OpenAlex/Semantic Scholar don't index them, so
+        // fanning out is wasted work and returns the wrong answer (empty).
+        // Short-circuit to the arXiv provider, which knows how to translate
+        // the prefix into an id_list lookup.
+        if crate::providers::downloader::strip_arxiv_doi_prefix(doi).is_some() {
+            if let Some(arxiv) = self.providers.iter().find(|p| p.name() == "arxiv") {
+                return arxiv.get_by_doi(doi).await;
+            }
+        }
+
         let futures: Vec<_> = self
             .providers
             .iter()

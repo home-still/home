@@ -143,6 +143,20 @@ struct DistillReindexParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DistillScanRepetitionsParams {
+    #[schemars(
+        description = "Maximum number of markdown objects to scan. Default: 100000 (effectively unbounded)."
+    )]
+    #[serde(default)]
+    limit: Option<u64>,
+    #[schemars(
+        description = "Flag documents whose repetition truncation count exceeds this value. Default: 20. Lower is more aggressive; tune against a hand-labeled sample."
+    )]
+    #[serde(default)]
+    threshold: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct CatalogRepairParams {
     #[schemars(
         description = "If true, report what would be repaired without writing. Default: true."
@@ -161,6 +175,20 @@ struct DedupeUrlEncodedParams {
     )]
     #[serde(default = "default_true")]
     dry_run: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CatalogBackfillTitleParams {
+    #[schemars(
+        description = "If true, report what would be backfilled without writing. Default: true."
+    )]
+    #[serde(default = "default_true")]
+    dry_run: bool,
+    #[schemars(
+        description = "Maximum number of catalog rows to process in this call. Each row triggers one provider aggregate lookup — keep this bounded."
+    )]
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -722,9 +750,30 @@ impl HomeStillMcp {
         .await
         .map_err(|e| format!("phantom-orphan scan failed: {e}"))?;
 
+        // Flag-drift direction: catalog row where a stage flag is missing but
+        // the storage evidence for that stage exists. Backfills without
+        // deleting — unlike the three directions above, which clear or synth.
+        let drift_rows = hs_common::status::list_catalog_flag_drift(
+            &*self.storage,
+            &self.papers_prefix,
+            &self.catalog_prefix,
+            &self.markdown_prefix,
+        )
+        .await
+        .map_err(|e| format!("flag-drift scan failed: {e}"))?;
+
         let disk_total = disk_orphans.len();
         let md_total = md_orphans.len();
         let phantom_total = phantom_orphans.len();
+        let drift_total = drift_rows.len();
+        let drift_conversion_total = drift_rows
+            .iter()
+            .filter(|r| r.conversion_missing_with_markdown)
+            .count();
+        let drift_download_total = drift_rows
+            .iter()
+            .filter(|r| r.download_stamp_missing_with_source)
+            .count();
         let limit = p.limit.unwrap_or(usize::MAX);
         let disk_samples: Vec<String> = disk_orphans
             .iter()
@@ -733,6 +782,8 @@ impl HomeStillMcp {
             .collect();
         let md_samples: Vec<String> = md_orphans.iter().take(10).cloned().collect();
         let phantom_samples: Vec<String> = phantom_orphans.iter().take(10).cloned().collect();
+        let drift_samples: Vec<String> =
+            drift_rows.iter().take(10).map(|r| r.stem.clone()).collect();
 
         if p.dry_run {
             return Ok(serde_json::to_string_pretty(&serde_json::json!({
@@ -751,6 +802,12 @@ impl HomeStillMcp {
                     "orphans_found": phantom_total,
                     "would_delete": phantom_orphans.iter().take(limit).count(),
                     "samples": phantom_samples,
+                },
+                "flag_drift": {
+                    "drift_found": drift_total,
+                    "would_backfill_conversion": drift_conversion_total.min(limit),
+                    "would_backfill_downloaded_at": drift_download_total.min(limit),
+                    "samples": drift_samples,
                 },
             }))
             .unwrap_or_default());
@@ -846,6 +903,69 @@ impl HomeStillMcp {
             }
         }
 
+        // Flag-drift repair: backfill the missing stage flag using the
+        // storage evidence. We can't recover the real conversion duration /
+        // page count that the original convert would have stamped — we
+        // record that the metadata came from repair so operators can tell
+        // organic stamps from repair stamps, and re-run `distill_reindex`
+        // if they need accurate page offsets.
+        let mut drift_conversion_repaired = 0u64;
+        let mut drift_download_repaired = 0u64;
+        for row in drift_rows.iter().take(limit) {
+            let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &row.stem,
+            )
+            .await
+            else {
+                errors.push(format!(
+                    "drift/{}: catalog entry vanished mid-repair",
+                    row.stem
+                ));
+                continue;
+            };
+            let mut changed = false;
+            if row.conversion_missing_with_markdown && entry.conversion.is_none() {
+                entry.conversion = Some(hs_common::catalog::ConversionMeta {
+                    server: "catalog_repair:flag_drift".to_string(),
+                    duration_secs: 0.0,
+                    total_pages: 0,
+                    converted_at: now.clone(),
+                    pages: Vec::new(),
+                    failed: false,
+                    reason: Some(
+                        "backfilled by flag_drift repair; markdown existed without conversion stamp"
+                            .to_string(),
+                    ),
+                });
+                drift_conversion_repaired += 1;
+                changed = true;
+            }
+            if row.download_stamp_missing_with_source && entry.downloaded_at.is_none() {
+                entry.downloaded_at = Some(now.clone());
+                drift_download_repaired += 1;
+                changed = true;
+            }
+            if changed {
+                entry.repair = Some(hs_common::catalog::RepairMeta {
+                    repaired_at: now.clone(),
+                    reason: "flag_drift backfill — storage had evidence the catalog flags didn't"
+                        .to_string(),
+                });
+                if let Err(e) = hs_common::catalog::write_catalog_entry_via(
+                    &*self.storage,
+                    &self.catalog_prefix,
+                    &row.stem,
+                    &entry,
+                )
+                .await
+                {
+                    errors.push(format!("drift/{}: {e}", row.stem));
+                }
+            }
+        }
+
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "dry_run": false,
             "disk_no_catalog": {
@@ -862,6 +982,12 @@ impl HomeStillMcp {
                 "orphans_found": phantom_total,
                 "deleted": phantom_deleted,
                 "samples": phantom_samples,
+            },
+            "flag_drift": {
+                "drift_found": drift_total,
+                "conversion_backfilled": drift_conversion_repaired,
+                "downloaded_at_backfilled": drift_download_repaired,
+                "samples": drift_samples,
             },
             "errors": errors,
         }))
@@ -1082,6 +1208,140 @@ impl HomeStillMcp {
         }
     }
 
+    #[tool(
+        description = "Backfill empty/missing `title` fields on catalog rows that have a DOI. Rows synthesized by `catalog_repair`'s `disk_no_catalog` direction, by the inbox watcher, or by server-event conversions have no title until a metadata fan-in happens. This tool calls the aggregate paper provider (`paper::get_by_doi`) for each eligible row and stamps `title` (plus `authors`, `publication_date`, `abstract_text`, `cited_by_count` when we're already on the wire). Defaults to dry-run.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn catalog_backfill_title(
+        &self,
+        Parameters(p): Parameters<CatalogBackfillTitleParams>,
+    ) -> Result<String, String> {
+        let triples =
+            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
+                .await
+                .map_err(|e| format!("catalog list failed: {e}"))?;
+
+        // Candidates: row has a DOI and title is missing/empty.
+        let candidates: Vec<(String, hs_common::catalog::CatalogEntry)> = triples
+            .into_iter()
+            .filter_map(|(stem, _meta, entry)| {
+                let has_doi = entry.doi.as_ref().is_some_and(|d| !d.trim().is_empty());
+                let missing_title = entry
+                    .title
+                    .as_ref()
+                    .map(|t| t.trim().is_empty())
+                    .unwrap_or(true);
+                if has_doi && missing_title {
+                    Some((stem, entry))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let total = candidates.len();
+        let limit = p.limit.unwrap_or(usize::MAX);
+        let take: Vec<(String, hs_common::catalog::CatalogEntry)> =
+            candidates.into_iter().take(limit).collect();
+        let samples: Vec<String> = take.iter().take(10).map(|(s, _)| s.clone()).collect();
+
+        if p.dry_run {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": true,
+                "candidates": total,
+                "would_backfill": take.len(),
+                "samples": samples,
+            }))
+            .unwrap_or_default());
+        }
+
+        // Provider aggregate for metadata fan-in. Same factory `paper_download`
+        // uses, so behavior is consistent.
+        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
+        let provider_arg = paper::cli::ProviderArg::All;
+        let provider = paper::commands::paper::make_provider(&provider_arg, &config)
+            .map_err(|e| format!("Provider init failed: {e}"))?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut backfilled = 0u64;
+        let mut no_metadata = 0u64;
+        let mut errors: Vec<String> = Vec::new();
+
+        for (stem, mut entry) in take {
+            let doi = match entry.doi.as_deref() {
+                Some(d) => d,
+                None => continue,
+            };
+            let meta = match provider.get_by_doi(doi).await {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    no_metadata += 1;
+                    continue;
+                }
+                Err(e) => {
+                    errors.push(format!("{stem}: provider error: {e}"));
+                    continue;
+                }
+            };
+
+            if meta.title.trim().is_empty() {
+                no_metadata += 1;
+                continue;
+            }
+
+            entry.title = Some(meta.title.clone());
+            if entry.authors.is_empty() && !meta.authors.is_empty() {
+                entry.authors = meta
+                    .authors
+                    .iter()
+                    .map(|a| hs_common::catalog::AuthorEntry {
+                        name: a.name.clone(),
+                    })
+                    .collect();
+            }
+            if entry.publication_date.is_none() {
+                entry.publication_date = meta.publication_date.map(|d| d.to_string());
+            }
+            if entry.abstract_text.is_none() {
+                entry.abstract_text = meta.abstract_text.clone();
+            }
+            if entry.cited_by_count.is_none() {
+                entry.cited_by_count = meta.cited_by_count;
+            }
+            entry.repair = Some(hs_common::catalog::RepairMeta {
+                repaired_at: now.clone(),
+                reason: "title backfilled via paper aggregate".to_string(),
+            });
+
+            match hs_common::catalog::write_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &stem,
+                &entry,
+            )
+            .await
+            {
+                Ok(()) => backfilled += 1,
+                Err(e) => errors.push(format!("{stem}: write failed: {e}")),
+            }
+        }
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "dry_run": false,
+            "candidates": total,
+            "backfilled": backfilled,
+            "no_metadata": no_metadata,
+            "samples": samples,
+            "errors": errors,
+        }))
+        .unwrap_or_default())
+    }
+
     // ── Scribe Tools ───────────────────────────────────────────
 
     #[tool(
@@ -1188,6 +1448,28 @@ impl HomeStillMcp {
 
         let page_offsets = hs_common::catalog::compute_page_offsets(&md);
         let total_pages = page_offsets.len() as u64;
+
+        if hs_scribe::postprocess::qc_verdict(truncations, total_pages)
+            == hs_scribe::postprocess::QcVerdict::RejectLoop
+        {
+            if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &p.stem,
+                &server_label,
+                duration_secs,
+                total_pages,
+                "repetition_loop",
+            )
+            .await
+            {
+                tracing::warn!("failed-conversion catalog stamp failed for {}: {e}", p.stem);
+            }
+            return Err(format!(
+                "{}: VLM repetition loop ({} truncation site(s) across {} page(s)) — not persisted",
+                p.stem, truncations, total_pages
+            ));
+        }
 
         if hs_scribe::postprocess::is_stub_pdf(total_pages, &md, duration_secs) {
             // Record the failure on the catalog so the doc isn't silently
@@ -1382,16 +1664,13 @@ impl HomeStillMcp {
         )
         .await;
 
-        let key = catalog_entry
-            .as_ref()
-            .and_then(|e| e.markdown_path.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "{}/{}",
-                    self.markdown_prefix.trim_end_matches('/'),
-                    hs_common::sharded_key(&p.stem, "md")
-                )
-            });
+        let key = hs_common::markdown::resolve_markdown_key(
+            &self.markdown_prefix,
+            &p.stem,
+            catalog_entry
+                .as_ref()
+                .and_then(|e| e.markdown_path.as_deref()),
+        );
         if !self.storage.exists(&key).await.unwrap_or(false) {
             return Err(format!(
                 "Markdown not found for '{}' at storage key '{key}'. Convert the PDF first.",
@@ -1483,10 +1762,21 @@ impl HomeStillMcp {
 
         let mut orphans: Vec<String> = Vec::new();
         for doc_id in &doc_ids {
-            let key = format!(
-                "{}/{}",
-                self.markdown_prefix.trim_end_matches('/'),
-                hs_common::sharded_key(doc_id, "md")
+            // Consult the catalog for an authoritative markdown_path first.
+            // Pre-rc.241 rows can have an unsharded path; without this lookup
+            // we'd flag them as ghost orphans even though the object exists.
+            let catalog_entry = hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                doc_id,
+            )
+            .await;
+            let key = hs_common::markdown::resolve_markdown_key(
+                &self.markdown_prefix,
+                doc_id,
+                catalog_entry
+                    .as_ref()
+                    .and_then(|e| e.markdown_path.as_deref()),
             );
             if !self.storage.exists(&key).await.unwrap_or(false) {
                 orphans.push(doc_id.clone());
@@ -1514,6 +1804,81 @@ impl HomeStillMcp {
     }
 
     #[tool(
+        description = "Scan every markdown object for VLM repetition artifacts and report doc_ids whose cleanup truncation count exceeds `threshold` (default 20). Read-only — reports only, does not purge or delete. Pair with `distill_purge` to remediate poisoned docs.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn distill_scan_repetitions(
+        &self,
+        Parameters(p): Parameters<DistillScanRepetitionsParams>,
+    ) -> Result<String, String> {
+        let limit = p.limit.unwrap_or(100_000) as usize;
+        let threshold = p.threshold.unwrap_or(20);
+
+        let objects = self
+            .storage
+            .list(&self.markdown_prefix)
+            .await
+            .map_err(|e| format!("list({}) failed: {e}", self.markdown_prefix))?;
+
+        let mut scanned: usize = 0;
+        let mut flagged: Vec<serde_json::Value> = Vec::new();
+
+        for obj in objects.iter().take(limit) {
+            if !obj.key.ends_with(".md") {
+                continue;
+            }
+            scanned += 1;
+
+            let bytes = match self.storage.get(&obj.key).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("skip {}: get failed: {e}", obj.key);
+                    continue;
+                }
+            };
+            let original = match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::warn!("skip {}: not UTF-8", obj.key);
+                    continue;
+                }
+            };
+            let (cleaned, truncations) = hs_scribe::postprocess::clean_repetitions(&original);
+            if truncations <= threshold {
+                continue;
+            }
+            let stem = obj
+                .key
+                .rsplit('/')
+                .next()
+                .and_then(|f| f.strip_suffix(".md"))
+                .unwrap_or(obj.key.as_str())
+                .to_string();
+            let snippet = hs_scribe::postprocess::divergence_snippet(&original, &cleaned, 120)
+                .unwrap_or_default();
+            flagged.push(serde_json::json!({
+                "stem": stem,
+                "key": obj.key,
+                "truncations": truncations,
+                "offending_snippet": snippet,
+            }));
+        }
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "scanned": scanned,
+            "threshold": threshold,
+            "flagged_count": flagged.len(),
+            "flagged": flagged,
+        }))
+        .unwrap_or_default())
+    }
+
+    #[tool(
         description = "Purge all vectors for a document and re-index it from storage with fresh catalog metadata. Use to fix documents with null/wrong metadata or stale embeddings.",
         annotations(
             read_only_hint = false,
@@ -1535,23 +1900,27 @@ impl HomeStillMcp {
             .await
             .map_err(|e| format!("Purge failed for '{}': {e}", p.stem))?;
 
-        let key = format!(
-            "{}/{}",
-            self.markdown_prefix.trim_end_matches('/'),
-            hs_common::sharded_key(&p.stem, "md")
-        );
-        if !self.storage.exists(&key).await.unwrap_or(false) {
-            return Err(format!(
-                "Purged {deleted} old vectors but markdown not found at '{key}'. Convert the paper first.",
-            ));
-        }
-
+        // Read the catalog BEFORE resolving the key so we pick up the
+        // canonical markdown_path for pre-rc.241 unsharded rows.
         let catalog_entry = hs_common::catalog::read_catalog_entry_via(
             &*self.storage,
             &self.catalog_prefix,
             &p.stem,
         )
         .await;
+
+        let key = hs_common::markdown::resolve_markdown_key(
+            &self.markdown_prefix,
+            &p.stem,
+            catalog_entry
+                .as_ref()
+                .and_then(|e| e.markdown_path.as_deref()),
+        );
+        if !self.storage.exists(&key).await.unwrap_or(false) {
+            return Err(format!(
+                "Purged {deleted} old vectors but markdown not found at '{key}'. Convert the paper first.",
+            ));
+        }
 
         let result = client
             .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
@@ -1642,21 +2011,23 @@ impl HomeStillMcp {
         let mut errors: Vec<String> = Vec::new();
 
         for stem in take {
-            let key = format!(
-                "{}/{}",
-                self.markdown_prefix.trim_end_matches('/'),
-                hs_common::sharded_key(stem, "md")
-            );
-            if !self.storage.exists(&key).await.unwrap_or(false) {
-                errors.push(format!("{stem}: markdown missing at {key}"));
-                continue;
-            }
             let catalog_entry = hs_common::catalog::read_catalog_entry_via(
                 &*self.storage,
                 &self.catalog_prefix,
                 stem,
             )
             .await;
+            let key = hs_common::markdown::resolve_markdown_key(
+                &self.markdown_prefix,
+                stem,
+                catalog_entry
+                    .as_ref()
+                    .and_then(|e| e.markdown_path.as_deref()),
+            );
+            if !self.storage.exists(&key).await.unwrap_or(false) {
+                errors.push(format!("{stem}: markdown missing at {key}"));
+                continue;
+            }
             match client
                 .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
                 .await
@@ -1871,6 +2242,18 @@ impl HomeStillMcp {
         )
         .await;
         pipeline.conversion_failed = conversion_failed;
+
+        // Pipeline drift: rows in `documents` that the next-stage counts don't
+        // claim. Saturating subtraction so under-counting a stage never yields
+        // a negative (i.e. drift can only be >= 0). Testers assert the value
+        // stays at or below PIPELINE_DRIFT_THRESHOLD.
+        let total_in_flight: u64 = scribe_instances.iter().map(|s| s.in_flight).sum();
+        pipeline.pipeline_drift = pipeline
+            .documents
+            .saturating_sub(pipeline.markdown)
+            .saturating_sub(pipeline.conversion_failed)
+            .saturating_sub(total_in_flight);
+        pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
 
         // History from the catalog (same source as `catalog_recent`).
         let history = match catalog_triples {

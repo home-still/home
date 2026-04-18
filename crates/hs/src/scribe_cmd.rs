@@ -369,6 +369,16 @@ async fn cmd_convert(
         tracing::info!("Cleaned {} repetition site(s)", truncations);
     }
 
+    let page_offsets = hs_common::catalog::compute_page_offsets(&md);
+    let total_pages = page_offsets.len() as u64;
+    if hs_scribe::postprocess::qc_verdict(truncations, total_pages)
+        == hs_scribe::postprocess::QcVerdict::RejectLoop
+    {
+        anyhow::bail!(
+            "VLM repetition loop: {truncations} truncation site(s) across {total_pages} page(s). Output not persisted; re-run or investigate the source PDF.",
+        );
+    }
+
     // Resolve output: CLI flag > config output_dir > stdout
     let out = out_file.or_else(|| {
         ScribeConfig::load().ok().and_then(|cfg| {
@@ -1292,6 +1302,41 @@ async fn convert_and_save_pool(
             if truncations > 0 {
                 tracing::info!("{md_key}: cleaned {truncations} repetition site(s)");
             }
+
+            let qc_page_offsets = crate::catalog::compute_page_offsets(&md);
+            let qc_total_pages = qc_page_offsets.len() as u64;
+            if hs_scribe::postprocess::qc_verdict(truncations, qc_total_pages)
+                == hs_scribe::postprocess::QcVerdict::RejectLoop
+            {
+                let duration_secs = start_time.elapsed().as_secs_f64();
+                let short_server = server_url
+                    .strip_prefix("http://")
+                    .or_else(|| server_url.strip_prefix("https://"))
+                    .unwrap_or(&server_url);
+                reporter.warn(&format!(
+                    "{stem}: VLM repetition loop ({truncations} site(s), {qc_total_pages} pg) → quarantined"
+                ));
+                if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+                    storage,
+                    catalog_prefix,
+                    &stem,
+                    short_server,
+                    duration_secs,
+                    qc_total_pages,
+                    "repetition_loop",
+                )
+                .await
+                {
+                    reporter.warn(&format!("{stem}: catalog stamp failed: {e}"));
+                }
+                quarantine_file(pdf_path, corrupted_dir);
+                stats.failed.fetch_add(1, Relaxed);
+                if let Some(ref s) = stage_handle {
+                    s.finish_failed("repetition_loop");
+                }
+                return;
+            }
+
             let md_bytes = md.clone().into_bytes();
             if let Err(e) = storage.put(&md_key, md_bytes).await {
                 if let Some(ref s) = stage_handle {

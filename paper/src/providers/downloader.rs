@@ -15,6 +15,23 @@ use crate::models::DownloadResult;
 use crate::ports::download_service::DownloadService;
 use crate::ports::provider::PaperProvider;
 
+/// If `doi` is a DataCite-registered arXiv DOI of the form
+/// `10.48550/arXiv.<id>` (any casing of `arXiv`), return the bare `<id>`.
+/// Otherwise `None`. Used by both the download fast-path and the aggregate
+/// `get_by_doi` router so an arXiv DOI always resolves to arXiv, not to the
+/// other providers (which don't index this DOI prefix).
+pub fn strip_arxiv_doi_prefix(doi: &str) -> Option<&str> {
+    const PREFIX: &str = "10.48550/arxiv.";
+    if doi.len() <= PREFIX.len() {
+        return None;
+    }
+    if doi[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        Some(&doi[PREFIX.len()..])
+    } else {
+        None
+    }
+}
+
 #[derive(Deserialize)]
 struct UnpaywallResponse {
     is_oa: bool,
@@ -212,8 +229,10 @@ impl DownloadService for PaperDownloader {
     async fn download_by_doi(&self, doi: &str) -> Result<DownloadResult, PaperError> {
         let filename = format!("{}.pdf", doi.replace('/', "_"));
 
-        // 1. arXiv fast path
-        if let Some(arxiv_id) = doi.strip_prefix("10.48550/arXiv.") {
+        // 1. arXiv fast path — match the arXiv DOI prefix case-insensitively
+        // (DataCite registration is `arXiv`, but consumers paste both
+        // `arXiv` and `arxiv`; we should resolve either).
+        if let Some(arxiv_id) = strip_arxiv_doi_prefix(doi) {
             let url = format!("https://arxiv.org/pdf/{}", arxiv_id);
             if let Ok(result) = self.download_by_url(&url, &filename, None).await {
                 return Ok(result);
@@ -521,5 +540,43 @@ mod verify_put_tests {
     fn err_when_head_call_itself_fails() {
         let err = verify_put(Err(anyhow::anyhow!("network")), "k", 1).unwrap_err();
         assert!(format!("{err}").contains("verify failed"));
+    }
+}
+
+#[cfg(test)]
+mod arxiv_doi_tests {
+    use super::strip_arxiv_doi_prefix;
+
+    #[test]
+    fn matches_mixed_case_arxiv() {
+        assert_eq!(
+            strip_arxiv_doi_prefix("10.48550/arXiv.2005.11401"),
+            Some("2005.11401")
+        );
+        assert_eq!(
+            strip_arxiv_doi_prefix("10.48550/arxiv.2312.10997"),
+            Some("2312.10997")
+        );
+        assert_eq!(
+            strip_arxiv_doi_prefix("10.48550/ARXIV.1706.03762"),
+            Some("1706.03762")
+        );
+    }
+
+    #[test]
+    fn rejects_non_arxiv_doi() {
+        assert_eq!(strip_arxiv_doi_prefix("10.1007/s11704-024-40231-1"), None);
+        assert_eq!(strip_arxiv_doi_prefix("10.3390/ijms24031234"), None);
+    }
+
+    #[test]
+    fn rejects_prefix_only() {
+        assert_eq!(strip_arxiv_doi_prefix("10.48550/arxiv."), None);
+        assert_eq!(strip_arxiv_doi_prefix("10.48550/arxiv"), None);
+    }
+
+    #[test]
+    fn rejects_nearby_prefix() {
+        assert_eq!(strip_arxiv_doi_prefix("10.48551/arxiv.1234"), None);
     }
 }

@@ -12,6 +12,11 @@ use crate::catalog::CatalogEntry;
 #[cfg(feature = "storage")]
 use crate::storage::Storage;
 
+/// Threshold for `pipeline_drift` above which the self-test fails. Small
+/// residuals (documents vs markdown+failed+in_flight) are expected during
+/// normal conversion activity; larger values indicate catalog flag drift.
+pub const PIPELINE_DRIFT_THRESHOLD: u64 = 3;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     pub pipeline: PipelineCounts,
@@ -43,6 +48,17 @@ pub struct PipelineCounts {
     pub embedded_documents: Option<u64>,
     #[serde(default)]
     pub embedded_chunks: Option<u64>,
+    /// Unaccounted rows:
+    /// `documents − markdown − conversion_failed − in_flight`.
+    /// Small residual (<=3) is expected due to stage-in-progress; larger values
+    /// indicate catalog flag drift (rc.253). Testers assert
+    /// `pipeline_drift <= pipeline_drift_threshold`.
+    #[serde(default)]
+    pub pipeline_drift: u64,
+    /// Threshold the self-test uses when asserting `pipeline_drift`.
+    /// Exposed alongside the value so the assertion is self-contained.
+    #[serde(default)]
+    pub pipeline_drift_threshold: u64,
 }
 
 /// Per-service health row. Same shape for scribe and distill; fields unused
@@ -332,6 +348,89 @@ pub async fn list_catalog_rows_without_markdown(
     Ok(orphans)
 }
 
+/// A catalog row whose stage flags contradict what's actually in storage.
+/// Discovered by `list_catalog_flag_drift`; consumed by `catalog_repair`'s
+/// `flag_drift` direction to backfill missing stamps from the storage truth.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+#[derive(Debug, Clone)]
+pub struct FlagDriftRow {
+    pub stem: String,
+    /// Row has `conversion == None` but a markdown object exists — probably
+    /// pre-dates the `conversion` block or was cleared mid-pipeline.
+    pub conversion_missing_with_markdown: bool,
+    /// Row has `downloaded_at == None` but a PDF/HTML object exists — catalog
+    /// pre-dates `downloaded_at`, or a synthetic repair row was upgraded.
+    pub download_stamp_missing_with_source: bool,
+}
+
+/// List catalog rows whose stage flags are out of sync with storage.
+///
+/// Two drift cases — see [`FlagDriftRow`]. Callers can repair either side
+/// without deleting data (unlike the phantom-purge direction). Skips rows
+/// that look like they're waiting on a downstream stage rather than
+/// genuinely drifted:
+/// - `conversion.failed == true` (intentional failure stamp, not drift).
+/// - Neither drift condition true (healthy row).
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub async fn list_catalog_flag_drift(
+    storage: &dyn Storage,
+    papers_prefix: &str,
+    catalog_prefix: &str,
+    markdown_prefix: &str,
+) -> anyhow::Result<Vec<FlagDriftRow>> {
+    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
+    let papers = storage.list(papers_prefix).await?;
+    let markdown = storage.list(markdown_prefix).await?;
+
+    use std::collections::HashSet;
+    let paper_stems: HashSet<String> = papers
+        .iter()
+        .filter_map(|o| {
+            let filename = o.key.rsplit('/').next()?;
+            if filename.starts_with("._") {
+                return None;
+            }
+            let (stem, ext) = filename.rsplit_once('.')?;
+            if ext == "pdf" || ext == "html" {
+                Some(stem.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let md_stems: HashSet<String> = markdown
+        .iter()
+        .filter_map(|o| {
+            if !o.key.ends_with(".md") {
+                return None;
+            }
+            let filename = o.key.rsplit('/').next()?;
+            if filename.starts_with("._") {
+                return None;
+            }
+            Some(filename.trim_end_matches(".md").to_string())
+        })
+        .collect();
+
+    let mut drift: Vec<FlagDriftRow> = Vec::new();
+    for (stem, _meta, entry) in triples {
+        if entry.conversion.as_ref().is_some_and(|c| c.failed) {
+            continue;
+        }
+        let conversion_missing = entry.conversion.is_none() && md_stems.contains(&stem);
+        let download_missing = entry.downloaded_at.is_none() && paper_stems.contains(&stem);
+        if conversion_missing || download_missing {
+            drift.push(FlagDriftRow {
+                stem,
+                conversion_missing_with_markdown: conversion_missing,
+                download_stamp_missing_with_source: download_missing,
+            });
+        }
+    }
+    drift.sort_by(|a, b| a.stem.cmp(&b.stem));
+    Ok(drift)
+}
+
 /// List stems of catalog rows with no backing file in storage — neither a
 /// PDF/HTML under `papers_prefix` nor a markdown under `markdown_prefix`.
 /// These are phantom rows (YAML that survived a paper deletion, or a stale
@@ -419,6 +518,9 @@ pub async fn collect_pipeline_counts(
         conversion_failed: 0,
         embedded_documents,
         embedded_chunks,
+        // Computed by caller once it knows conversion_failed + total in_flight.
+        pipeline_drift: 0,
+        pipeline_drift_threshold: PIPELINE_DRIFT_THRESHOLD,
     }
 }
 

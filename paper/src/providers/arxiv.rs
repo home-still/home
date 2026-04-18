@@ -26,6 +26,29 @@ impl ArxivProvider {
         })
     }
 
+    /// Fetch a paper by bare arXiv id (e.g. `"2005.11401"`, `"2312.10997"`).
+    /// Uses the `id_list=` form of the arXiv API, which is more reliable than
+    /// the text-search form when the id is known. Returns `Ok(None)` if no
+    /// entry matches — callers that hit this via an arXiv-prefix DOI should
+    /// treat `None` as "not found," not as an error.
+    pub async fn get_by_arxiv_id(&self, id: &str) -> Result<Option<Paper>, PaperError> {
+        // Strip any arXiv version suffix (`v1`, `v2`...) — the id_list API
+        // accepts versioned IDs but the bare form is what our callers stash
+        // in their catalogs, so normalize to that on the way back.
+        let url = url::Url::parse_with_params(&self.base_url, &[("id_list", id)])
+            .map_err(|e| PaperError::InvalidInput(e.to_string()))?;
+        let response = self.client.get(url).send().await?;
+        if !response.status().is_success() {
+            return Err(PaperError::ProviderUnavailable(format!(
+                "arXiv id_list returned {}",
+                response.status()
+            )));
+        }
+        let xml = response.text().await?;
+        let (papers, _) = self.parse_atom_feed(&xml)?;
+        Ok(papers.into_iter().next())
+    }
+
     fn build_search_url(&self, query: &SearchQuery) -> Result<String, PaperError> {
         let search_prefix = match query.search_type {
             SearchType::Keywords => "all:",
@@ -242,6 +265,13 @@ impl PaperProvider for ArxivProvider {
     }
 
     async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
+        // DataCite-registered arXiv DOIs (`10.48550/arXiv.<id>`, any casing)
+        // have a direct translation to an arXiv id. Use the id_list API
+        // rather than relevance search — it's both faster and correct.
+        if let Some(arxiv_id) = super::downloader::strip_arxiv_doi_prefix(doi) {
+            return self.get_by_arxiv_id(arxiv_id).await;
+        }
+
         let query = SearchQuery {
             query: String::from(doi),
             search_type: SearchType::DOI,

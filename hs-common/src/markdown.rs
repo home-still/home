@@ -27,6 +27,22 @@ fn markdown_key(prefix: &str, stem: &str) -> String {
     }
 }
 
+/// Resolve the storage key for a doc_id's markdown object.
+///
+/// Prefers the catalog-recorded path if present — this survives the
+/// pre-rc.241 unsharded layout where some rows have
+/// `markdown_path: "markdown/<stem>.md"` instead of the sharded form.
+/// Falls back to the sharded derivation only when the catalog has no
+/// recorded path (or no catalog entry exists at all).
+///
+/// Mirrors the logic `distill_index` uses (hs-mcp/src/main.rs) and must
+/// be called from `distill_reconcile` and `distill_reindex` for parity.
+pub fn resolve_markdown_key(prefix: &str, stem: &str, stored_path: Option<&str>) -> String {
+    stored_path
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| markdown_key(prefix, stem))
+}
+
 /// List the stems of every markdown document under `prefix`.
 pub async fn list_markdown_stems_via(
     storage: &dyn Storage,
@@ -86,6 +102,39 @@ pub async fn markdown_exists_via(
 mod tests {
     use super::*;
     use crate::storage::LocalFsStorage;
+
+    #[test]
+    fn resolve_uses_catalog_path_when_present() {
+        // Pre-rc.241 unsharded row: catalog points at `markdown/<stem>.md`,
+        // resolver MUST return that exact path — not re-derive to sharded.
+        let got = resolve_markdown_key(
+            "markdown",
+            "10.1002_aur.2162",
+            Some("markdown/10.1002_aur.2162.md"),
+        );
+        assert_eq!(got, "markdown/10.1002_aur.2162.md");
+    }
+
+    #[test]
+    fn resolve_falls_back_to_sharded_when_catalog_path_missing() {
+        let got = resolve_markdown_key("markdown", "10.1002_aur.2162", None);
+        assert_eq!(got, "markdown/10/10.1002_aur.2162.md");
+    }
+
+    #[test]
+    fn resolve_handles_empty_prefix() {
+        let got = resolve_markdown_key("", "abcdef", None);
+        assert_eq!(got, "ab/abcdef.md");
+    }
+
+    #[test]
+    fn resolve_respects_alternate_sharded_catalog_path() {
+        // A row may have its markdown under a different top-level prefix
+        // (e.g. a migration that moved objects). Resolver trusts the stored
+        // path, never second-guesses it.
+        let got = resolve_markdown_key("markdown", "ab", Some("legacy/ab.md"));
+        assert_eq!(got, "legacy/ab.md");
+    }
 
     #[tokio::test]
     async fn list_and_read_roundtrip() {

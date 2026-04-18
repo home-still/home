@@ -750,6 +750,43 @@ hs cloud status
 
 Now `hs distill search` works locally (direct to `big:7434` on LAN) **and** remotely (through the gateway over the tunnel).
 
+### 6.6 Client-side inbox watcher
+
+**Where it runs**: one client with write access to the shared storage root (typically the daily driver — `mac_air`). Do NOT run it on multiple clients against the same `papers/manually_downloaded/` prefix; duplicate fsnotify triggers and racing catalog writes will produce ghost rows.
+
+**What it does**: polls `papers/manually_downloaded/` every 30 s (configurable via `scribe.inbox_poll_interval_secs`). Any new PDF or HTML shows up as a synthesized catalog row plus a `papers.ingested` NATS event; the scribe event-watch path then picks it up and converts. This closes the Anna's Archive / manually-downloaded loop — files dropped into the shared folder ingest automatically.
+
+**Install** (cross-platform — macOS LaunchAgent or Linux systemd user unit):
+
+```bash
+hs scribe inbox install      # registers + starts the daemon
+hs scribe inbox status       # confirms the service is running
+```
+
+The install baked-in path is whatever `hs` binary ran the `install` — so upgrades via `hs upgrade` re-register the daemon against the new binary; no manual re-install needed.
+
+**Logs**:
+- macOS: `~/Library/Logs/home-still-scribe-inbox.log`
+- Linux: `journalctl --user -u home-still-scribe-inbox.service`
+
+**Verify** it's actually sweeping:
+
+```bash
+# Drop a PDF:
+cp ~/Downloads/foo.pdf <shared-root>/papers/manually_downloaded/
+
+# Within ~30s the catalog should have a row for it:
+hs catalog recent | head
+```
+
+If `catalog_repair`'s `disk_no_catalog` direction starts reporting orphans on a cluster where the watcher is supposed to be running, the daemon is either (a) not running (`hs scribe inbox status`), (b) pointed at the wrong storage root, or (c) racing with another copy on another client.
+
+**Uninstall**:
+
+```bash
+hs scribe inbox uninstall
+```
+
 ## 7. Storage backend deep-dive: NFS vs Garage S3
 
 Both work. Pick based on what you actually need.

@@ -73,6 +73,52 @@ pub async fn convert_and_upload(
     };
     let duration_secs = start.elapsed().as_secs_f64();
 
+    // Strip VLM repetition artifacts before the stub gate / storage write.
+    // The CLI and MCP scribe_convert paths both run this; the event-watch
+    // path was missing it, so server-event conversions were shipping raw
+    // VLM output and poisoning the downstream embeddings.
+    let (markdown, truncations) = crate::postprocess::clean_repetitions(&markdown);
+    if truncations > 0 {
+        tracing::info!(
+            stem = %stem,
+            truncations,
+            "cleaned repetition site(s) before stub gate",
+        );
+    }
+
+    let page_offsets = hs_common::catalog::compute_page_offsets(&markdown);
+    let total_pages = page_offsets.len() as u64;
+
+    // QC gate: runaway truncation counts mean the VLM went into a loop
+    // that clean_repetitions couldn't salvage. Stamp failed and bail
+    // before we pollute storage + Qdrant.
+    if crate::postprocess::qc_verdict(truncations, total_pages)
+        == crate::postprocess::QcVerdict::RejectLoop
+    {
+        let stem_only = stem.to_string();
+        if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+            storage,
+            "catalog",
+            &stem_only,
+            "event-watch",
+            duration_secs,
+            total_pages,
+            "repetition_loop",
+        )
+        .await
+        {
+            tracing::warn!(stem = %stem_only, error = %e, "failed-conversion catalog stamp failed");
+        }
+        tracing::warn!(
+            stem = %stem_only,
+            source_key = %event.key,
+            truncations,
+            total_pages,
+            "VLM repetition loop; not publishing scribe.completed",
+        );
+        return Ok(md_key);
+    }
+
     // Apply the same stub-document gate the CLI and MCP scribe_convert paths
     // apply (hs/src/scribe_cmd.rs, hs-mcp/src/main.rs): ≤1 page AND <500
     // non-whitespace chars OR sub-second convert ⇒ stamp `conversion.failed`
@@ -80,8 +126,6 @@ pub async fn convert_and_upload(
     // (OpenAlex, PMC, DOI metadata-only) become near-empty markdown that
     // later fails distill embed with `zero_chunks_or_empty`, which the
     // reconciler classifies as terminal — a silent dead letter.
-    let page_offsets = hs_common::catalog::compute_page_offsets(&markdown);
-    let total_pages = page_offsets.len() as u64;
     if crate::postprocess::is_stub_pdf(total_pages, &markdown, duration_secs) {
         let reason = if markdown.trim().is_empty() {
             "empty_output"
