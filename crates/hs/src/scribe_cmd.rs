@@ -154,6 +154,19 @@ pub enum ScribeCmd {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Client-side inbox watcher. Sweeps `papers/manually_downloaded/` on
+    /// the configured storage, relocates each file to `papers/<shard>/...`,
+    /// and publishes `papers.ingested` on NATS so the server-side scribe
+    /// can convert. Runs purely against the Storage trait — works on any
+    /// host with S3 creds (or a local/NFS-mounted papers/ directory).
+    ///
+    /// No local conversion. No dependency on a reachable scribe server.
+    /// Pair with `hs scribe watch-events` on the scribe host for the
+    /// full ingest pipeline.
+    Inbox {
+        #[command(subcommand)]
+        action: Option<InboxAction>,
+    },
     /// Backfill catalog entries for markdown files that were converted before the catalog feature
     CatalogBackfill,
     /// Remove junk HTML papers (paywall pages, landing pages) from the collection
@@ -170,6 +183,25 @@ pub enum WatchAction {
     Start,
     /// Stop a running watch daemon
     Stop,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InboxAction {
+    /// Run the inbox watcher in the foreground (Ctrl+C to exit).
+    /// Default when no subcommand is given.
+    Run,
+    /// Do one sweep of the inbox prefix and exit. Useful for testing.
+    Sweep,
+    /// Install a user-level daemon that runs the inbox watcher at login.
+    /// macOS: LaunchAgent plist. Linux: systemd --user unit.
+    Install,
+    /// Remove the user-level daemon.
+    Uninstall,
+    /// Report the daemon's running state.
+    Status,
+    /// Internal: daemon child process (hidden).
+    #[command(hide = true)]
+    DaemonChild,
 }
 
 /// Internal actions for scribe server management.
@@ -221,6 +253,9 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         ScribeCmd::Status { status_dir } => cmd_status(status_dir, reporter).await,
         ScribeCmd::Init { force, check } => cmd_init(force, check).await,
         ScribeCmd::WatchEvents { server } => cmd_watch_events(server, reporter).await,
+        ScribeCmd::Inbox { action } => {
+            crate::scribe_inbox::dispatch(action.unwrap_or(InboxAction::Run), reporter).await
+        }
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
         ScribeCmd::CleanJunk { dry_run } => cmd_clean_junk(dry_run, reporter).await,
     }
@@ -587,7 +622,20 @@ fn epub_to_html(epub_path: &std::path::Path) -> std::io::Result<String> {
     use epub::doc::EpubDoc;
     let mut doc =
         EpubDoc::new(epub_path).map_err(|e| std::io::Error::other(format!("invalid EPUB: {e}")))?;
+    Ok(epub_doc_to_html(&mut doc))
+}
 
+/// In-memory variant: unpack an EPUB from its raw bytes. Used by the
+/// client-side inbox watcher, which reads the source from S3 and has
+/// no path to pass. Shares the spine-walking logic with `epub_to_html`.
+pub(crate) fn epub_bytes_to_html(bytes: Vec<u8>) -> std::io::Result<String> {
+    use epub::doc::EpubDoc;
+    let mut doc = EpubDoc::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|e| std::io::Error::other(format!("invalid EPUB: {e}")))?;
+    Ok(epub_doc_to_html(&mut doc))
+}
+
+fn epub_doc_to_html<R: std::io::Read + std::io::Seek>(doc: &mut epub::doc::EpubDoc<R>) -> String {
     let mut combined = String::from("<html><body>");
     loop {
         if let Some(content) = doc.get_current_str() {
@@ -598,7 +646,7 @@ fn epub_to_html(epub_path: &std::path::Path) -> std::io::Result<String> {
         }
     }
     combined.push_str("</body></html>");
-    Ok(combined)
+    combined
 }
 
 /// Read a file as HTML, transparently handling `.epub` by unpacking its spine.

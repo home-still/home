@@ -149,12 +149,25 @@ pub struct ScribeConfig {
     /// Machines that only run the watcher and forward to remote scribe servers
     /// should set this to false.
     pub local_server: bool,
+    /// Polling interval for the client-side inbox watcher
+    /// (`hs scribe inbox run`). The inbox daemon sweeps
+    /// `papers/manually_downloaded/` on the configured Storage at this
+    /// cadence, relocates eligible files to `papers/<shard>/...`, and
+    /// publishes `papers.ingested` on NATS. Default 30 seconds; a short
+    /// value drains drops quickly, a long value is gentler on S3 list
+    /// cost. Must be ≥ 1.
+    #[serde(default = "default_inbox_poll_interval_secs")]
+    pub inbox_poll_interval_secs: u64,
     /// Storage backend (loaded from top-level `storage:` section, not `scribe.storage`).
     #[serde(skip)]
     pub storage: StorageConfig,
     /// Event bus (loaded from top-level `events:` section).
     #[serde(skip)]
     pub events: EventBusConfig,
+}
+
+fn default_inbox_poll_interval_secs() -> u64 {
+    30
 }
 
 impl Default for ScribeConfig {
@@ -166,6 +179,7 @@ impl Default for ScribeConfig {
             catalog_dir: resolve_project_dir().join("catalog"),
             servers: vec!["http://localhost:7433".into()],
             local_server: true,
+            inbox_poll_interval_secs: default_inbox_poll_interval_secs(),
             storage: StorageConfig::default(),
             events: EventBusConfig::default(),
         }
@@ -187,6 +201,7 @@ impl ScribeConfig {
                 "catalog_dir": ScribeConfig::default().catalog_dir,
                 "servers": ScribeConfig::default().servers,
                 "local_server": true,
+                "inbox_poll_interval_secs": default_inbox_poll_interval_secs(),
             }
         });
         let figment = Figment::from(Serialized::defaults(defaults))

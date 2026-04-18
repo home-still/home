@@ -141,6 +141,9 @@ pub mod markdown;
 #[cfg(feature = "events")]
 pub mod event_bus;
 
+#[cfg(all(feature = "storage", feature = "events"))]
+pub mod inbox;
+
 #[cfg(feature = "logging")]
 pub mod logging;
 

@@ -14,6 +14,8 @@ mod mcp_cmd;
 mod migrate_cmd;
 mod restart_cmd;
 mod scribe_cmd;
+mod scribe_inbox;
+mod scribe_inbox_install;
 mod scribe_pool;
 mod serve_cmd;
 mod server_cmd;

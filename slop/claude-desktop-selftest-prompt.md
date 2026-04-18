@@ -1,54 +1,115 @@
 # Claude Desktop Self-Test Prompt — home-still
 
-Quit and summarize findings at the first error encountered.
+Please stop and write your report at the first issue.  DO NOT CONTINUE TESTING.
 
-Paste this into Claude Desktop (which has the `hs-mcp` server connected). It exercises every tool and returns a debug-focused report.
+Paste the prompt below into Claude Desktop with the `hs-mcp` server connected. It exercises the MCP tool surface and emits a debug-focused report covering the topology described in `docs/deployment.md`.
+
+> **Companion check:** this prompt covers what's reachable through MCP. For LAN/host-side verification (NFS export, Garage admin port, Qdrant gRPC, NVIDIA driver, gateway systemd unit), run the shell commands in `docs/deployment.md` §9 in parallel. The two together are the full self-test.
+
+> **CUDA is non-negotiable.** Per `CLAUDE.md`: "Distill MUST run on CUDA. Do not 'fall back to CPU' for distill / embedding — not as a quick fix, not temporarily, not as a workaround." This prompt fails the whole report if any distill instance reports a non-CUDA `compute_device`.
 
 ---
 
-You have access to the `home-still` MCP server (tools prefixed with paper/catalog/markdown/scribe/distill). This is a 211M+ vector academic research pipeline: OpenAlex/arXiv/PMC → PDF download → VLM scribe (markdown) → CUDA distill (Qdrant embeddings) → semantic search.
+You have access to the `home-still` MCP server (tools prefixed with `paper_` / `catalog_` / `markdown_` / `scribe_` / `distill_` / `system_`). This is a vector-search academic research pipeline: OpenAlex / arXiv / PMC / Crossref / Semantic Scholar / CORE → PDF download → VLM scribe (markdown) → CUDA distill (Qdrant embeddings) → semantic search.
 
-**Run a full end-to-end self-test and produce a debug report.** Do not skip steps on failure — capture every error verbatim. Prefer small `limit` values; we want signal, not volume.
+**Run an end-to-end self-test and produce a debug report.** Capture every error verbatim and continue to the next step. Only stop early if Phase 1 reveals the cluster is fundamentally unreachable (no MCP tool returns at all). Prefer small `limit` values; we want signal, not volume.
 
-## Phase 1 — Health & Inventory (read-only)
+## Phase 0 — Topology snapshot (read-only)
 
-1. `distill_status` — Qdrant reachable? Collection name, vector count, indexed vs pending, device (cuda/cpu), embed model.
-2. `scribe_health` — server up? GPU name + utilization, queue depth, last conversion timestamp.
-3. `catalog_recent` with a generous window — last 10 downloads, 10 conversions, 10 embeds. Report timestamps and any gaps (e.g. downloaded but never converted, converted but never embedded).
-4. `catalog_list` (page 1, small limit) — total paper count, how many have `markdown: true`, how many `embedded: true`.
-5. `markdown_list` (small limit) — sanity check that markdown files exist matching the catalog.
+Before any pipeline work, establish what cluster you are looking at. None of these steps are pass/fail on their own — they make every later finding interpretable.
 
-## Phase 2 — Search surface (all 6 providers)
+1. `system_status` (no args). From the snapshot, record:
+   - **Storage backend** in use — infer from object key shapes returned by `markdown_list` / `catalog_list` later (S3 keys vs local POSIX paths).
+   - **Service registry**: count and per-host URL of `scribe_instances` and `distill_instances`, with each one's `healthy`, `version`, `compute_device`, `embed_model`, `collection`, `activity`, `in_flight`, `slots_available`/`slots_total`.
+   - **Qdrant rollup**: `qdrant.collection`, `qdrant.qdrant_url`, `qdrant.qdrant_version`, `qdrant.compute_device`.
+   - **Pipeline counts**: `documents`, `pdfs`, `html_fallbacks`, `markdown`, `catalog_entries`, `conversion_failed`, `embedded_documents`, `embedded_chunks`.
+2. Note whether you reached MCP **directly on-LAN** or **through the gateway** (token / origin clue from your client config). Record which path is exercising the rest of this test.
 
-6. `paper_search` for `"retrieval augmented generation"` on each provider individually (arxiv, openalex, semantic_scholar, pmc, crossref, core), `limit=2`, `abstract=true`. Which providers returned results, which errored, latency per call if visible.
-7. `paper_search` with filters: `date=">=2024"`, `min_citations=10`, `sort=citations`. Confirm filters applied.
-8. `paper_get` by a known-stable DOI (pick one returned above). Full metadata returned?
+## Phase 1 — Health gates (read-only, hard pass/fail)
 
-## Phase 3 — Ingestion round-trip (mutating — do ONE paper only)
+3. **CUDA gate.** For every entry in `distill_instances`, assert `compute_device == "Cuda"`. Also call `distill_status` and confirm the same. If any instance reports `Cpu` (or empty/unknown), mark **FAIL — CUDA NON-NEGOTIABLE VIOLATED** at the very top of the final report and name the offending instance URL. Do not skip the rest of the test — keep going so the report is complete — but the overall verdict is FAIL.
+4. **Scribe gate.** `scribe_health` for each scribe instance. Server up? GPU name + utilization, queue depth, last conversion timestamp, slot availability. A scribe instance reporting CPU-only compute is also a FAIL per the same rule.
+5. **Qdrant gate.** From `distill_status`: collection exists? Vector count plausible (non-zero on a populated cluster)? Indexed vs pending. URL matches what `system_status` reported.
+6. **Pipeline math (rc.253).** Verify the gap reconciles:
+   `documents == markdown + conversion_failed + (in-flight conversions across scribe instances)`
+   Acceptance: **drift ≤ 3 is PASS** (small in-flight tolerance; the client-side inbox watcher from rc.258 moves files in seconds). **Drift > 3 is FAIL** — report the drift and which side is over-counting. The `conversion_failed` field is the rc.253 surface that closes the previous "documents > markdown for no visible reason" gap — its absence in the snapshot is itself a FAIL.
+   If there's an operator running `hs scribe inbox` on a client, note it: on a healthy cluster with an active inbox watcher, this identity balances within seconds of any drop into `papers/manually_downloaded/`.
 
-9. `paper_download` for a small open-access PDF (PMC or arXiv DOI from step 7). Record the `stem` / `doc_id` assigned.
-10. `scribe_convert` that stem. Time to completion; page count; any OCR warnings.
-11. `markdown_read` same stem, first 500 chars — is content coherent (not gibberish)?
-12. `distill_index` that stem (force). Chunk count produced. If zero chunks: this is the main thing to debug — report why.
-13. `distill_exists` with the doc_id — returns true?
-14. `distill_search` for a distinctive phrase from the markdown. Does the new doc appear in top-5? Score?
+## Phase 2 — Inventory & gap detection (read-only)
 
-## Phase 4 — Diagnose paths
+7. `catalog_recent` with a generous window — last 10 downloads, 10 conversions, 10 embeds. Report timestamps and call out gaps (downloaded but never converted, converted but never embedded, embedded with zero chunks).
+8. `catalog_list` (page 1, small limit). Sample the first 5: confirm each has `markdown` and `embedded` flags set consistently with what `system_status` reported in aggregate.
+9. `markdown_list` (small limit). Pick any 2 entries and `markdown_read` their first 500 chars — coherent text, not gibberish? Tables/equations preserved?
+10. `distill_reconcile` with `{ "dry_run": true }`. This is the rc.254 phantom-embed reconciler — it lists doc_ids that exist in Qdrant but have no markdown. Report `orphan_count`. A non-trivial orphan count on a healthy cluster suggests the event-watch retry path is dropping work and is worth flagging.
+11. `catalog_repair` with `{ "dry_run": true }`. Three directions to check:
+    - `disk_no_catalog.orphans_found` — PDFs on disk with no catalog row. Expected ≈ 0 with the inbox watcher running; non-zero means either the watcher is off or a file just landed and hasn't been swept yet.
+    - `catalog_no_markdown.orphans_found` — catalog claims converted but markdown is gone. Expected 0.
+    - `catalog_no_source.orphans_found` (rc.255) — phantom catalog rows with neither paper nor markdown. Expected 0 in steady state.
+    Any non-zero count after a recent sweep is a real anomaly worth flagging.
 
-15. Pick one paper from `catalog_recent` where `markdown: true` but `embedded: false` (if any). Call `distill_index` on it. Capture the failure mode.
-16. Pick one paper where `downloaded: true` but `markdown: false`. Call `scribe_convert`. Capture failure mode.
-17. `distill_search` with `year` filter and `topic` filter combined. Are metadata filters respected?
+## Phase 3 — Search surface (all 6 providers)
+
+12. `paper_search` for `"retrieval augmented generation"` on each provider individually (`arxiv`, `openalex`, `semantic_scholar`, `pmc`, `crossref`, `core`), `limit=2`, `abstract=true`. Which providers returned results, which errored, latency per call if visible.
+13. `paper_search` with filters: `date=">=2024"`, `min_citations=10`, `sort=citations`. Confirm filters applied (look at the `year` and `citations` fields in the results).
+14. `paper_get` by a known-stable DOI (pick one returned above). Full metadata returned?
+
+## Phase 4 — Ingestion round-trips (mutating — do ONE paper per path)
+
+Pick **one** distill instance and **one** scribe instance for this phase and record which URLs you used.
+
+### 4A — Provider-fetch round-trip
+
+15. `paper_download` for a small open-access PDF (PMC or arXiv DOI from step 13). Record the `stem` / `doc_id` assigned.
+16. `scribe_convert` that stem. Time to completion; page count; any OCR warnings.
+17. `markdown_read` same stem, first 500 chars — coherent?
+18. `distill_index` that stem (force). Chunk count produced. **If zero chunks: this is the main thing to debug — report why** (year filter rejecting? language detection? empty markdown after extraction?).
+19. `distill_exists` with the doc_id — returns true?
+20. `distill_search` for a distinctive phrase from the markdown. Does the new doc appear in top-5? Score?
+
+### 4B — Client-side inbox round-trip (rc.258)
+
+Exercises the `hs scribe inbox` watcher. Only run this if an operator is on the LAN and can drop a file via NFS mount or `aws s3 cp`; otherwise note as not-tested.
+
+21. Drop a small fresh PDF (not already in the corpus) into `papers/manually_downloaded/selftest-<timestamp>.pdf`. Record timestamp and target key.
+22. Within 60 seconds, call `catalog_recent` and confirm a `Convert` event appears for the dropped stem. The event's `stem` should match the filename (minus extension).
+23. Call `markdown_list` — the target key `papers/se/selftest-<ts>.md` should exist.
+24. The source key `papers/manually_downloaded/selftest-<ts>.pdf` should be **gone** (watcher relocated it). If the source is still there after 60s, report as FAIL — the inbox watcher is not running on any client.
+25. Repeat the drop with the same filename — on the second drop, the watcher should log `AlreadyAtTarget` and still delete the source. `distill_search` results should not change (no duplicate chunks indexed).
+
+## Phase 5 — Diagnose paths
+
+21. Pick one paper from `catalog_recent` where `markdown: true` but `embedded: false` (if any). Call `distill_index` on it. Capture the failure mode.
+22. Pick one paper where `downloaded: true` but `markdown: false` (and `conversion_failed: false`). Call `scribe_convert`. Capture failure mode.
+23. Pick one paper where `conversion_failed: true`. Read its catalog row via `catalog_read` and report the `conversion.reason` / `conversion.error` field — that's the rc.253 explanation surface.
+24. `distill_search` with `year` filter and `topic` filter combined. Are metadata filters respected?
+
+## Phase 6 — Multi-instance consistency (skip if only 1 of each)
+
+25. If multiple `distill_instances`: call `distill_status` against each and confirm they agree on `collection`, `embed_model`, `qdrant_url`. Divergence here means clients will get inconsistent search results depending on which instance the gateway routed them to.
+26. If multiple `scribe_instances`: confirm they agree on `version` and model. A version split mid-rollout is OK (rolling upgrade in progress) — flag it but don't fail.
 
 ## Report format
 
 Produce a markdown report with these sections:
 
-- **Environment snapshot** — Qdrant vectors, device, GPU, service versions, collection name.
-- **Pipeline gap table** — counts at each stage (downloaded → converted → embedded) and deltas.
+- **Verdict** — one line: PASS / FAIL. If FAIL, include the rule(s) that fired (e.g. "CUDA non-negotiable violated on http://big:7434", "pipeline math drift of 17 documents").
+- **Topology snapshot** (Phase 0) — backend, gateway-or-direct, instance counts and URLs, Qdrant info, pipeline counts.
+- **Health gate results** (Phase 1) — pass/fail per gate with the evidence.
+- **Pipeline gap table** — counts at each stage (downloaded → converted → conversion_failed → embedded) and the deltas.
+- **Reconciler results** (Phase 2 steps 10–11) — phantom embeds and disk/catalog orphans, with sample stems if any.
 - **Per-tool results** — one row per tool call: tool, args (abbreviated), outcome (ok/err), latency, salient field or error message.
-- **Round-trip trace** — the stem from Phase 3 with timestamp at each stage.
+- **Round-trip trace** (Phase 4) — the stem with timestamp at each stage; which scribe + distill instance handled it.
 - **Failures & hypotheses** — for each error, list 2–3 competing hypotheses with the evidence that points to each. Do not propose fixes.
-- **Data quality flags** — empty chunks, low similarity on self-search, broken markdown, missing catalog fields, stamp drift.
+- **Data quality flags** — empty chunks, low similarity on self-search, broken markdown, missing catalog fields, year drift, stub PDFs.
 - **Open questions** — anything ambiguous that needs a human to clarify before debugging further.
 
-Keep the report under ~800 lines. Include exact error strings. Do not sanitize paths or stems — we need them for grep.
+Keep the report under ~800 lines. Include exact error strings. Do not sanitize paths, stems, doc_ids, or instance URLs — we need them for grep.
+
+## What this prompt does NOT cover
+
+These need shell access or off-network clients and live in `docs/deployment.md` §9:
+
+- Direct port reachability: 2049 (NFS), 3900/3903 (Garage S3 + admin), 4222 (NATS event bus), 5432 (Postgres), 6334 (Qdrant gRPC), 11434 (Ollama).
+- Cloudflare tunnel state and the OAuth enrollment / token-refresh flow (an authenticated client cannot meaningfully test its own auth path).
+- NVIDIA driver / CUDA library health beyond what the running services report (`nvidia-smi`, `ldd` of the pyke ort cache, `LD_LIBRARY_PATH`).
+- Postgres schema / connectivity — home-still does not yet consume Postgres directly per `docs/deployment.md` §6.4.
