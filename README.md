@@ -509,6 +509,14 @@ cargo check -p hs-distill --features server           # distill server
 cargo test --workspace                                # run tests
 ```
 
+## Related projects
+
+Other repos in the home-still family:
+
+- [**apple_health_source**](https://github.com/home-still/apple_health_source)
+  — sync Apple Health to your own Postgres/TimescaleDB and query it from
+  Claude Desktop via MCP. iOS app + Rust API + read-only SQL MCP server.
+
 ## License
 
 MIT
