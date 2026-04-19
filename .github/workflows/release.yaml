@@ -144,12 +144,31 @@ jobs:
             ${{ env.ASSET }}
             ${{ env.ASSET }}.sha256
 
-      - name: Upload scribe server binary
+      - name: Upload scribe server binary (raw, for Docker)
+        if: matrix.build_scribe
+        uses: actions/upload-artifact@v4
+        with:
+          name: scribe-binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/hs-scribe-server
+
+      - name: Package scribe server
+        if: matrix.build_scribe
+        shell: bash
+        run: |
+          SCRIBE_ASSET="hs-scribe-server-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$SCRIBE_ASSET" \
+            -C "target/${{ matrix.target }}/release" "hs-scribe-server"
+          shasum -a 256 "$SCRIBE_ASSET" > "$SCRIBE_ASSET.sha256"
+          echo "SCRIBE_ASSET=$SCRIBE_ASSET" >> $GITHUB_ENV
+
+      - name: Upload scribe server tarball
         if: matrix.build_scribe
         uses: actions/upload-artifact@v4
         with:
           name: scribe-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/hs-scribe-server
+          path: |
+            ${{ env.SCRIBE_ASSET }}
+            ${{ env.SCRIBE_ASSET }}.sha256
 
       - name: Package distill server
         if: matrix.build_distill
@@ -243,7 +262,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: actions/download-artifact@v4
         with:
-          name: scribe-x86_64-unknown-linux-gnu
+          name: scribe-binary-x86_64-unknown-linux-gnu
           path: docker-context/amd64/
       - run: chmod +x docker-context/amd64/hs-scribe-server
       - uses: docker/build-push-action@v5
