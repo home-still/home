@@ -159,8 +159,22 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// Construct an `object_store::path::Path` from a key string.
+///
+/// `Path::from` percent-encodes every segment, which double-encodes any `%`
+/// already present — so a key like `foo%3Cbar.md` becomes `foo%253Cbar.md`
+/// and round-trips through `list → to_string → get` land on a 404. `list`
+/// returns paths whose `to_string()` is already percent-encoded, so anything
+/// we pipe back into `get`/`head`/`delete` must be treated as pre-encoded.
+///
+/// `Path::parse` validates an already-encoded path and stores it verbatim
+/// — exactly the semantics we want for keys that came out of `list`. For
+/// raw callers (e.g. `put("catalog/ab/stem.yaml", …)`), `parse` also succeeds
+/// because ordinary ASCII path segments are valid percent-encoded input.
+/// Fall back to `Path::from` only if `parse` rejects the input (malformed
+/// percent triplets or disallowed characters in an unencoded segment).
 fn path(key: &str) -> object_store::path::Path {
-    object_store::path::Path::from(key)
+    object_store::path::Path::parse(key).unwrap_or_else(|_| object_store::path::Path::from(key))
 }
 
 #[async_trait]
@@ -276,5 +290,30 @@ mod tests {
         s.put("probe.txt", b"ok".to_vec()).await.unwrap();
         assert_eq!(s.get("probe.txt").await.unwrap(), b"ok");
         s.delete("probe.txt").await.ok();
+    }
+
+    /// Regression: `Path::from` double-encodes `%` in percent-encoded keys,
+    /// so a key round-tripping through `list → to_string → get` used to land
+    /// on a 404. `path()` now routes through `Path::parse`, which treats the
+    /// input as already-encoded.
+    #[test]
+    fn path_preserves_percent_encoded_input() {
+        // Realistic stem from the catalog: DOI with `<` / `>` escaped as
+        // `%3C` / `%3E`, parentheses and semicolons left raw.
+        let key = "markdown/10/10.1002_(sici)1099-1050(199601)5:1%3C77::aid-hec184%3E3.0.co;2-w.md";
+        let p = path(key);
+        assert_eq!(
+            p.to_string(),
+            key,
+            "path() must not double-encode already-percent-encoded input"
+        );
+    }
+
+    /// Ordinary safe ASCII keys round-trip unchanged.
+    #[test]
+    fn path_preserves_safe_ascii_keys() {
+        let key = "catalog/ab/some_stem-123.yaml";
+        let p = path(key);
+        assert_eq!(p.to_string(), key);
     }
 }
