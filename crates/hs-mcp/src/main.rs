@@ -160,6 +160,18 @@ struct DistillReindexParams {
     stem: String,
 }
 
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct PipelineRebuildParams {
+    #[schemars(
+        description = "If true (default), count what would be deleted/republished without touching anything. Set false to actually run."
+    )]
+    dry_run: Option<bool>,
+    #[schemars(
+        description = "Required when dry_run=false. Must equal the literal string `rebuild-from-papers`. Guards against a fat-fingered `{dry_run: false}` wiping derived state."
+    )]
+    confirm: Option<String>,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DistillScanRepetitionsParams {
     #[schemars(
@@ -2167,6 +2179,158 @@ impl HomeStillMcp {
             "orphan_count": orphans.len(),
             "orphans": orphans,
             "points_deleted": deleted_total,
+        }))
+        .unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Nuclear reset: delete every markdown object, every catalog YAML, drop+recreate the Qdrant collection, then republish `papers.ingested` for every PDF/HTML under `papers/` so scribe + distill rebuild the entire pipeline from source. Papers themselves are never touched. Defaults to `dry_run=true` (reports counts only). Live run requires `confirm=\"rebuild-from-papers\"`. Expect ~minutes to drain deletes and ~hours for scribe+distill to catch up on the republished queue.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn pipeline_rebuild(
+        &self,
+        Parameters(p): Parameters<PipelineRebuildParams>,
+    ) -> Result<String, String> {
+        let dry_run = p.dry_run.unwrap_or(true);
+        if !dry_run && p.confirm.as_deref() != Some("rebuild-from-papers") {
+            return Err(
+                "Live run requires `confirm=\"rebuild-from-papers\"`. Aborting with no \
+                 changes. Re-run with `{dry_run: true}` to preview what would change."
+                    .to_string(),
+            );
+        }
+
+        let client = self
+            .distill_client()
+            .ok_or("No distill server configured — cannot reset Qdrant collection")?;
+
+        // Inventory: storage listings + Qdrant counts. Used for both the dry-run
+        // report and the live run's "before" snapshot.
+        let papers = self
+            .storage
+            .list(&self.papers_prefix)
+            .await
+            .map_err(|e| format!("list papers failed: {e}"))?;
+        let paper_keys: Vec<String> = papers
+            .into_iter()
+            .filter_map(|o| {
+                let name = o.key.rsplit('/').next()?;
+                if name.starts_with("._") {
+                    return None;
+                }
+                let ext = name.rsplit_once('.').map(|(_, e)| e)?;
+                if ext == "pdf" || ext == "html" {
+                    Some(o.key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let markdown_objs = self
+            .storage
+            .list(&self.markdown_prefix)
+            .await
+            .map_err(|e| format!("list markdown failed: {e}"))?;
+        let catalog_objs = self
+            .storage
+            .list(&self.catalog_prefix)
+            .await
+            .map_err(|e| format!("list catalog failed: {e}"))?;
+        let qdrant_docs = client
+            .list_docs(u64::MAX)
+            .await
+            .map_err(|e| format!("list qdrant docs failed: {e}"))?;
+
+        if dry_run {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": true,
+                "papers_keep": paper_keys.len(),
+                "markdown_to_delete": markdown_objs.len(),
+                "catalog_to_delete": catalog_objs.len(),
+                "qdrant_docs_to_delete": qdrant_docs.len(),
+                "papers_to_republish": paper_keys.len(),
+                "preconditions": {
+                    "distill_reachable": true,
+                    "papers_prefix_read_only_by_convention": true,
+                },
+            }))
+            .unwrap_or_default());
+        }
+
+        // Live run — destructive phases are additive: errors are collected but
+        // don't abort, because papers remain intact and the next run picks up
+        // whatever the previous one missed.
+        let mut errors: Vec<String> = Vec::new();
+        let started_at = chrono::Utc::now().to_rfc3339();
+
+        let qdrant_deleted = match client.reset_collection().await {
+            Ok(n) => n,
+            Err(e) => {
+                errors.push(format!("qdrant-reset: {e}"));
+                0
+            }
+        };
+
+        let mut markdown_deleted: u64 = 0;
+        for (i, obj) in markdown_objs.iter().enumerate() {
+            match self.storage.delete(&obj.key).await {
+                Ok(()) => markdown_deleted += 1,
+                Err(e) => errors.push(format!("markdown-delete/{}: {e}", obj.key)),
+            }
+            if (i + 1) % 500 == 0 {
+                tracing::info!("pipeline_rebuild: deleted {markdown_deleted} markdown objects");
+            }
+        }
+
+        let mut catalog_deleted: u64 = 0;
+        for (i, obj) in catalog_objs.iter().enumerate() {
+            match self.storage.delete(&obj.key).await {
+                Ok(()) => catalog_deleted += 1,
+                Err(e) => errors.push(format!("catalog-delete/{}: {e}", obj.key)),
+            }
+            if (i + 1) % 500 == 0 {
+                tracing::info!("pipeline_rebuild: deleted {catalog_deleted} catalog objects");
+            }
+        }
+
+        let mut papers_republished: u64 = 0;
+        for (i, key) in paper_keys.iter().enumerate() {
+            let payload = serde_json::json!({
+                "key": key,
+                "source": "pipeline_rebuild",
+            });
+            match self
+                .events
+                .publish(
+                    "papers.ingested",
+                    serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
+                )
+                .await
+            {
+                Ok(()) => papers_republished += 1,
+                Err(e) => errors.push(format!("publish/{key}: {e}")),
+            }
+            if (i + 1) % 500 == 0 {
+                tracing::info!(
+                    "pipeline_rebuild: republished {papers_republished} papers.ingested events"
+                );
+            }
+        }
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "dry_run": false,
+            "markdown_deleted": markdown_deleted,
+            "catalog_deleted": catalog_deleted,
+            "qdrant_deleted": qdrant_deleted,
+            "papers_republished": papers_republished,
+            "errors": errors,
+            "rebuild_started_at": started_at,
         }))
         .unwrap_or_default())
     }

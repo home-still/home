@@ -38,6 +38,7 @@ pub fn app(state: Arc<DistillServerState>) -> Router {
         .route("/exists/{doc_id}", get(handle_exists))
         .route("/doc/{doc_id}", axum::routing::delete(handle_delete_doc))
         .route("/docs", get(handle_list_docs))
+        .route("/collection/reset", post(handle_reset_collection))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
@@ -108,6 +109,22 @@ async fn handle_list_docs(
     let limit = q.limit.unwrap_or(100_000);
     match crate::qdrant::list_doc_ids(&state.qdrant, &state.config.collection_name, limit).await {
         Ok(ids) => Json(serde_json::json!({"doc_ids": ids})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+async fn handle_reset_collection(
+    State(state): State<Arc<DistillServerState>>,
+) -> impl IntoResponse {
+    let dimension = state.embedder.dimension();
+    match crate::qdrant::reset_collection(&state.qdrant, &state.config.collection_name, dimension)
+        .await
+    {
+        Ok(deleted) => Json(serde_json::json!({
+            "collection": state.config.collection_name,
+            "deleted_points": deleted,
+        }))
+        .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }

@@ -342,6 +342,29 @@ impl DistillClient {
         Ok(data["deleted"].as_u64().unwrap_or(0))
     }
 
+    /// Drop + recreate the Qdrant collection, wiping every vector.
+    /// Returns the pre-drop point count for reporting.
+    pub async fn reset_collection(&self) -> Result<u64> {
+        let url = format!("{}/collection/reset", self.server_url);
+        let resp = self
+            .http
+            .post(&url)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .context("Failed to reach distill server")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Server error {status}: {body}");
+        }
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .context("Invalid reset_collection response")?;
+        Ok(data["deleted_points"].as_u64().unwrap_or(0))
+    }
+
     /// List every distinct `doc_id` present in the collection.
     pub async fn list_docs(&self, limit: u64) -> Result<Vec<String>> {
         let url = format!("{}/docs?limit={}", self.server_url, limit);
