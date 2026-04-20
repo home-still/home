@@ -87,10 +87,23 @@ pub struct ScribeClient {
     server_url: String,
 }
 
+/// Default per-request timeout for convert endpoints. Overridden via
+/// `ScribeConfig::convert_timeout_secs` / `HS_SCRIBE_CONVERT_TIMEOUT_SECS`.
+/// Caps each PDF conversion so a stuck backend can't pin the watcher.
+const DEFAULT_CONVERT_TIMEOUT_SECS: u64 = 900;
+
 impl ScribeClient {
     pub fn new(server_url: &str) -> Self {
+        Self::new_with_timeout(
+            server_url,
+            Duration::from_secs(DEFAULT_CONVERT_TIMEOUT_SECS),
+        )
+    }
+
+    pub fn new_with_timeout(server_url: &str, convert_timeout: Duration) -> Self {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            .timeout(convert_timeout)
             .build()
             .unwrap_or_else(|_| Client::new());
         Self {
@@ -100,6 +113,7 @@ impl ScribeClient {
     }
 
     /// Create a client with a pre-configured reqwest Client (e.g., with auth headers).
+    /// The caller is responsible for setting a request timeout on the provided client.
     pub fn new_with_client(server_url: &str, http: Client) -> Self {
         Self {
             http,
@@ -128,7 +142,7 @@ impl ScribeClient {
         let resp = self
             .http
             .get(&url)
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .context("Failed to reach server")?;

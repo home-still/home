@@ -17,6 +17,7 @@ permissions:
 env:
   SCRIBE_IMAGE: ghcr.io/home-still/hs-scribe-server
   LAYOUT_MODEL_URL: https://github.com/home-still/home/releases/download/v0.0.1-rc.39/pp-doclayoutv3.onnx
+  TABLE_MODEL_URL: https://github.com/home-still/home/releases/download/v0.0.1-rc.39/slanet-plus.onnx
 
 jobs:
   e2e:
@@ -34,11 +35,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download layout model
+      - name: Download models
         run: |
           mkdir -p /tmp/models
           curl -fSL -o /tmp/models/pp-doclayoutv3.onnx "$LAYOUT_MODEL_URL"
-          ls -lh /tmp/models/pp-doclayoutv3.onnx
+          curl -fSL -o /tmp/models/slanet-plus.onnx    "$TABLE_MODEL_URL"
+          ls -lh /tmp/models/
 
       - name: Create test PDF
         run: |

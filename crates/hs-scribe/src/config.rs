@@ -158,6 +158,14 @@ pub struct ScribeConfig {
     /// cost. Must be ≥ 1.
     #[serde(default = "default_inbox_poll_interval_secs")]
     pub inbox_poll_interval_secs: u64,
+    /// Request timeout (seconds) for `ScribeClient::convert` /
+    /// `convert_with_progress`. Caps a single PDF conversion so a
+    /// stuck backend (e.g. Ollama hang) can't freeze the subscriber.
+    /// Default 900s (15min) fits long multi-page VLM runs on Metal
+    /// with headroom; raise for outlier workloads via the
+    /// `HS_SCRIBE_CONVERT_TIMEOUT_SECS` env override.
+    #[serde(default = "default_convert_timeout_secs")]
+    pub convert_timeout_secs: u64,
     /// Storage backend (loaded from top-level `storage:` section, not `scribe.storage`).
     #[serde(skip)]
     pub storage: StorageConfig,
@@ -170,6 +178,10 @@ fn default_inbox_poll_interval_secs() -> u64 {
     30
 }
 
+fn default_convert_timeout_secs() -> u64 {
+    900
+}
+
 impl Default for ScribeConfig {
     fn default() -> Self {
         Self {
@@ -180,6 +192,7 @@ impl Default for ScribeConfig {
             servers: vec!["http://localhost:7433".into()],
             local_server: true,
             inbox_poll_interval_secs: default_inbox_poll_interval_secs(),
+            convert_timeout_secs: default_convert_timeout_secs(),
             storage: StorageConfig::default(),
             events: EventBusConfig::default(),
         }
@@ -202,6 +215,7 @@ impl ScribeConfig {
                 "servers": ScribeConfig::default().servers,
                 "local_server": true,
                 "inbox_poll_interval_secs": default_inbox_poll_interval_secs(),
+                "convert_timeout_secs": default_convert_timeout_secs(),
             }
         });
         let figment = Figment::from(Serialized::defaults(defaults))

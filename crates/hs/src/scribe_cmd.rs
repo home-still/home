@@ -12,14 +12,24 @@ use crate::scribe_pool::ScribePool;
 const DEFAULT_SERVER: &str = "http://localhost:7433";
 
 /// Create a ScribeClient, with auth headers if the URL is a cloud gateway.
-async fn make_scribe_client(url: &str) -> Result<hs_scribe::client::ScribeClient> {
+/// `convert_timeout` caps each PDF conversion so a stuck server can't
+/// pin the caller. Cloud path uses the auth-injected reqwest client; the
+/// caller is responsible for configuring its timeouts (see
+/// `AuthenticatedClient::build_reqwest_client`).
+async fn make_scribe_client(
+    url: &str,
+    convert_timeout: std::time::Duration,
+) -> Result<hs_scribe::client::ScribeClient> {
     if is_cloud_url(url) {
         let auth = hs_common::auth::client::AuthenticatedClient::from_default_path()
             .context("Cloud credentials not found. Run `hs cloud enroll` first.")?;
         let http = auth.build_reqwest_client().await?;
         Ok(hs_scribe::client::ScribeClient::new_with_client(url, http))
     } else {
-        Ok(hs_scribe::client::ScribeClient::new(url))
+        Ok(hs_scribe::client::ScribeClient::new_with_timeout(
+            url,
+            convert_timeout,
+        ))
     }
 }
 
@@ -36,6 +46,8 @@ async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
 }
 const LAYOUT_MODEL_URL: &str =
     "https://github.com/home-still/home/releases/download/v0.0.1-rc.39/pp-doclayoutv3.onnx";
+const TABLE_MODEL_URL: &str =
+    "https://github.com/home-still/home/releases/download/v0.0.1-rc.39/slanet-plus.onnx";
 
 fn compose_yaml(has_gpu: bool) -> String {
     let gpu_section = if has_gpu {
@@ -53,6 +65,7 @@ fn compose_yaml(has_gpu: bool) -> String {
       - ${{MODELS_DIR}}:/models:ro
     environment:
       HS_SCRIBE_LAYOUT_MODEL_PATH: /models/pp-doclayoutv3.onnx
+      HS_SCRIBE_TABLE_MODEL_PATH: /models/slanet-plus.onnx
       HS_SCRIBE_BACKEND: Ollama
       HS_SCRIBE_OLLAMA_URL: http://vlm:11434
       HS_SCRIBE_USE_CUDA: "{has_gpu}"
@@ -90,6 +103,7 @@ fn compose_yaml_native_ollama(use_cuda: bool) -> String {
       - ${{MODELS_DIR}}:/models:ro
     environment:
       HS_SCRIBE_LAYOUT_MODEL_PATH: /models/pp-doclayoutv3.onnx
+      HS_SCRIBE_TABLE_MODEL_PATH: /models/slanet-plus.onnx
       HS_SCRIBE_BACKEND: Ollama
       HS_SCRIBE_OLLAMA_URL: http://host.docker.internal:11434
       HS_SCRIBE_USE_CUDA: "{use_cuda}"
@@ -265,6 +279,7 @@ async fn cmd_watch_events(
     server_override: Option<String>,
     _reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
+    use hs_common::service::pool::ServicePool;
     use hs_scribe::client::ScribeClient;
     use hs_scribe::config::ScribeConfig;
     use hs_scribe::event_watch::{convert_and_upload, run_subscriber};
@@ -273,21 +288,38 @@ async fn cmd_watch_events(
     let storage = cfg.build_storage()?;
     let bus = cfg.build_event_bus().await?;
 
-    let server_url = server_override
-        .or_else(|| cfg.servers.first().cloned())
-        .unwrap_or_else(|| "http://localhost:7433".into());
-    let scribe = Arc::new(ScribeClient::new(&server_url));
+    let servers: Vec<String> = match server_override {
+        Some(s) => vec![s],
+        None if !cfg.servers.is_empty() => cfg.servers.clone(),
+        None => vec![DEFAULT_SERVER.to_string()],
+    };
+    let convert_timeout = std::time::Duration::from_secs(cfg.convert_timeout_secs);
+    let clients: Vec<ScribeClient> = servers
+        .iter()
+        .map(|u| ScribeClient::new_with_timeout(u, convert_timeout))
+        .collect();
+    let pool = Arc::new(ServicePool::new(clients));
 
-    tracing::info!(%server_url, "starting event-bus watcher");
+    tracing::info!(
+        servers = ?servers,
+        convert_timeout_secs = cfg.convert_timeout_secs,
+        "starting event-bus watcher with {}-server pool",
+        servers.len()
+    );
 
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
     run_subscriber(bus.clone(), storage.clone(), move |event| {
         let storage = storage_for_handler.clone();
         let bus = bus_for_handler.clone();
-        let scribe = scribe.clone();
+        let pool = pool.clone();
         async move {
-            convert_and_upload(storage.as_ref(), scribe.as_ref(), bus.as_ref(), &event).await?;
+            let client = pool
+                .pick_server()
+                .await
+                .context("no ready scribe servers")?;
+            tracing::info!(server = %client.url(), key = %event.key, "dispatching event");
+            convert_and_upload(storage.as_ref(), client, bus.as_ref(), &event).await?;
             Ok(())
         }
     })
@@ -303,13 +335,18 @@ async fn cmd_convert(
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
     let servers = resolve_servers(server.as_deref()).await;
+    let convert_timeout = std::time::Duration::from_secs(
+        ScribeConfig::load()
+            .map(|c| c.convert_timeout_secs)
+            .unwrap_or(900),
+    );
 
     // Health check
     let check_stage = reporter.begin_stage("Connecting", None);
     if servers.len() == 1 {
         let url = &servers[0];
         check_stage.set_message(&format!("server at {url}"));
-        let client = make_scribe_client(url).await?;
+        let client = make_scribe_client(url, convert_timeout).await?;
         match client.health().await {
             Ok(_) => check_stage.finish_and_clear(),
             Err(e) => {
@@ -321,7 +358,7 @@ async fn cmd_convert(
         }
     } else {
         check_stage.set_message(&format!("{} servers", servers.len()));
-        let pool = ScribePool::new(&servers);
+        let pool = ScribePool::new(&servers, convert_timeout);
         let results = pool.check_all().await;
         let reachable = results.iter().filter(|(_, ok)| *ok).count();
         if reachable == 0 {
@@ -348,13 +385,13 @@ async fn cmd_convert(
     };
 
     let result = if servers.len() == 1 {
-        let client = make_scribe_client(&servers[0]).await?;
+        let client = make_scribe_client(&servers[0], convert_timeout).await?;
         client
             .convert_with_progress(pdf_bytes, on_progress)
             .await
             .map(|md| (servers[0].clone(), md))
     } else {
-        let pool = ScribePool::new(&servers);
+        let pool = ScribePool::new(&servers, convert_timeout);
         pool.convert_one(pdf_bytes, on_progress).await
     };
 
@@ -972,7 +1009,10 @@ async fn cmd_watch(
     for s in &servers {
         reporter.status("Server", s);
     }
-    let pool = Arc::new(ScribePool::new(&servers));
+    let pool = Arc::new(ScribePool::new(
+        &servers,
+        std::time::Duration::from_secs(scribe_cfg.convert_timeout_secs),
+    ));
     let spawn_sem = Arc::new(tokio::sync::Semaphore::new(pool.concurrency()));
     let results = pool.check_all().await;
     let reachable = results.iter().filter(|(_, ok)| *ok).count();
@@ -1600,20 +1640,28 @@ async fn cmd_init_inner(force: bool, check: bool, prereqs_only: bool) -> Result<
         }
     }
 
-    // Step 3: Download layout model
+    // Step 3: Download models (layout + table structure)
     let models_dir = hidden_dir().join("models");
     let layout_path = models_dir.join("pp-doclayoutv3.onnx");
+    let table_path = models_dir.join("slanet-plus.onnx");
 
-    eprintln!("[3/5] Layout model...");
-    if layout_path.exists() && !force {
-        eprintln!("       OK (already downloaded)");
-    } else if check {
-        eprintln!("       MISSING ({})", layout_path.display());
-    } else {
+    eprintln!("[3/5] Models...");
+    if !check {
         std::fs::create_dir_all(&models_dir)?;
-        eprintln!("       Downloading (~125MB)...");
-        download_file(LAYOUT_MODEL_URL, &layout_path).await?;
-        eprintln!("       Saved to {}", layout_path.display());
+    }
+    for (label, size_hint, url, path) in [
+        ("layout", "~125MB", LAYOUT_MODEL_URL, &layout_path),
+        ("table", "~8MB", TABLE_MODEL_URL, &table_path),
+    ] {
+        if path.exists() && !force {
+            eprintln!("       {label}: OK (already downloaded)");
+        } else if check {
+            eprintln!("       {label}: MISSING ({})", path.display());
+        } else {
+            eprintln!("       {label}: downloading ({size_hint})...");
+            download_file(url, path).await?;
+            eprintln!("       {label}: saved to {}", path.display());
+        }
     }
 
     // Step 4: Write compose config

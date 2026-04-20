@@ -234,6 +234,7 @@ struct HomeStillMcp {
     legacy_markdown_dir: std::path::PathBuf,
     legacy_catalog_dir: std::path::PathBuf,
     scribe_servers: Vec<String>,
+    scribe_convert_timeout: std::time::Duration,
     distill_servers: Vec<String>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
@@ -299,6 +300,7 @@ impl HomeStillMcp {
             legacy_markdown_dir: scribe_cfg.output_dir.clone(),
             legacy_catalog_dir: scribe_cfg.catalog_dir.clone(),
             scribe_servers,
+            scribe_convert_timeout: std::time::Duration::from_secs(scribe_cfg.convert_timeout_secs),
             distill_servers,
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
@@ -306,9 +308,9 @@ impl HomeStillMcp {
     }
 
     fn scribe_client(&self) -> Option<hs_scribe::client::ScribeClient> {
-        self.scribe_servers
-            .first()
-            .map(|url| hs_scribe::client::ScribeClient::new(url))
+        self.scribe_servers.first().map(|url| {
+            hs_scribe::client::ScribeClient::new_with_timeout(url, self.scribe_convert_timeout)
+        })
     }
 
     fn distill_client(&self) -> Option<hs_distill::client::DistillClient> {

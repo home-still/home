@@ -1,14 +1,21 @@
 use anyhow::Result;
 use hs_common::service::pool::ServicePool;
 use hs_scribe::client::{ProgressEvent, ScribeClient};
+use std::time::Duration;
 
 pub struct ScribePool {
     inner: ServicePool<ScribeClient>,
 }
 
 impl ScribePool {
-    pub fn new(servers: &[String]) -> Self {
-        let clients: Vec<ScribeClient> = servers.iter().map(|url| ScribeClient::new(url)).collect();
+    /// Build a pool whose `ScribeClient`s carry the given convert-request
+    /// timeout. The timeout caps each PDF conversion so a stuck backend
+    /// (e.g. Ollama hang) can't pin dispatchers indefinitely.
+    pub fn new(servers: &[String], convert_timeout: Duration) -> Self {
+        let clients: Vec<ScribeClient> = servers
+            .iter()
+            .map(|url| ScribeClient::new_with_timeout(url, convert_timeout))
+            .collect();
         Self {
             inner: ServicePool::new(clients),
         }

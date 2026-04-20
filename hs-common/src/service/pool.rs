@@ -32,6 +32,21 @@ impl<C: ServiceClient> ServicePool<C> {
             .collect();
         let results = futures::future::join_all(futures).await;
 
+        for (c, r) in &results {
+            match r {
+                Err(e) => tracing::warn!(
+                    server = %c.url(),
+                    error = %e,
+                    "readiness probe failed; excluding from this dispatch"
+                ),
+                Ok(rr) if !rr.is_ready() => tracing::debug!(
+                    server = %c.url(),
+                    "server has no available slots; excluding from this dispatch"
+                ),
+                _ => {}
+            }
+        }
+
         let max_avail = results
             .iter()
             .filter_map(|(_, r)| r.as_ref().ok())
