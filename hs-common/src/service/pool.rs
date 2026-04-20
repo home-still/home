@@ -18,9 +18,11 @@ impl<C: ServiceClient> ServicePool<C> {
         }
     }
 
-    /// Number of concurrent operations to allow (2 per server).
+    /// Number of concurrent operations to allow (4 per server — matches
+    /// scribe's default VLM slot count, so the watcher's dispatch ceiling
+    /// equals the cluster's aggregate compute ceiling).
     pub fn concurrency(&self) -> usize {
-        (self.clients.len() * 2).max(1)
+        (self.clients.len() * 4).max(1)
     }
 
     /// Pick the least-loaded ready server with round-robin tie-breaking.
