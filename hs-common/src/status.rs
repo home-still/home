@@ -348,6 +348,106 @@ pub async fn list_catalog_rows_without_markdown(
     Ok(orphans)
 }
 
+/// A catalog row whose recorded `markdown_path` disagrees with storage —
+/// either the recorded path doesn't exist or the `markdown_path` field is
+/// absent while a matching-filename markdown object is present under the
+/// prefix at some other key.
+///
+/// Discovered by `list_catalog_rows_with_md_path_drift`; consumed by
+/// `catalog_repair`'s `md_path_drift` direction to rewrite the catalog
+/// `markdown_path` to the real location.
+///
+/// This is the rc.241 ghost-orphan regression's permanent fix: the
+/// `bc2b6fb` sharding migration moved files to `markdown/{XX}/{stem}.md`
+/// but pre-existing catalog rows still record `markdown/<stem>.md` (or
+/// nothing at all), so `resolve_markdown_key_verified` has to do an extra
+/// HEAD on every probe. Rewriting the catalog eliminates the drift at rest.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdPathDrift {
+    pub stem: String,
+    /// Whatever `catalog_entry.markdown_path` currently says (empty string
+    /// if `None`). Guaranteed ≠ `resolved_path`.
+    pub stale_path: String,
+    /// The key at which the markdown actually lives, discovered by listing
+    /// the markdown prefix and matching filename = `{stem}.md`.
+    pub resolved_path: String,
+}
+
+/// List catalog rows whose `markdown_path` field disagrees with the
+/// markdown file's actual storage location.
+///
+/// Returns every catalog row where:
+/// - A markdown object with filename `{stem}.md` exists somewhere under
+///   `markdown_prefix` (tolerant of both sharded and legacy unsharded
+///   layouts), AND
+/// - The row's `markdown_path` is either absent, or points to a different
+///   key than where the file actually lives.
+///
+/// Prefers the deepest (most path segments) discovered key as the canonical
+/// target — after `bc2b6fb` the sharded key `{prefix}/{XX}/{stem}.md` wins
+/// over a legacy unsharded `{prefix}/{stem}.md`. If multiple sharded copies
+/// somehow coexist the first-listed one is chosen; that's a separate
+/// duplication class and not this scan's concern.
+///
+/// Rows with no matching markdown anywhere under the prefix are skipped —
+/// those belong to `list_catalog_rows_without_markdown`, which the
+/// `catalog_no_markdown` direction handles by clearing the conversion
+/// stamp.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub async fn list_catalog_rows_with_md_path_drift(
+    storage: &dyn Storage,
+    catalog_prefix: &str,
+    markdown_prefix: &str,
+) -> anyhow::Result<Vec<MdPathDrift>> {
+    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
+    let markdown_objects = storage.list(markdown_prefix).await?;
+
+    use std::collections::HashMap;
+    let mut md_by_filename: HashMap<String, String> = HashMap::new();
+    for obj in &markdown_objects {
+        if !obj.key.ends_with(".md") {
+            continue;
+        }
+        let Some(filename) = obj.key.rsplit('/').next() else {
+            continue;
+        };
+        if filename.starts_with("._") {
+            continue;
+        }
+        md_by_filename
+            .entry(filename.to_string())
+            .and_modify(|existing| {
+                // Prefer the key with more path segments — sharded
+                // `{prefix}/{XX}/{stem}.md` beats unsharded
+                // `{prefix}/{stem}.md`. Same depth: keep whichever we
+                // saw first (stable order from storage.list).
+                if obj.key.matches('/').count() > existing.matches('/').count() {
+                    *existing = obj.key.clone();
+                }
+            })
+            .or_insert_with(|| obj.key.clone());
+    }
+
+    let mut drift = Vec::new();
+    for (stem, _meta, entry) in triples {
+        let filename = format!("{stem}.md");
+        let Some(resolved) = md_by_filename.get(&filename) else {
+            continue;
+        };
+        let current = entry.markdown_path.as_deref().unwrap_or("");
+        if current != resolved.as_str() {
+            drift.push(MdPathDrift {
+                stem,
+                stale_path: current.to_string(),
+                resolved_path: resolved.clone(),
+            });
+        }
+    }
+    drift.sort_by(|a, b| a.stem.cmp(&b.stem));
+    Ok(drift)
+}
+
 /// A catalog row whose stage flags contradict what's actually in storage.
 /// Discovered by `list_catalog_flag_drift`; consumed by `catalog_repair`'s
 /// `flag_drift` direction to backfill missing stamps from the storage truth.
@@ -802,5 +902,145 @@ mod stuck_convert_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source_ext, "pdf");
+    }
+}
+
+#[cfg(all(test, feature = "storage", feature = "catalog"))]
+mod md_path_drift_tests {
+    use super::*;
+    use crate::catalog::{write_catalog_entry_via, CatalogEntry};
+    use crate::storage::LocalFsStorage;
+
+    #[tokio::test]
+    async fn detects_stale_unsharded_path_with_sharded_file() {
+        // The rc.241 regression shape: catalog row records pre-bc2b6fb
+        // `markdown/<stem>.md` but the file is at sharded
+        // `markdown/{XX}/<stem>.md`. Must be reported as drift, with the
+        // sharded key as the resolved_path.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            markdown_path: Some("markdown/04947b2f.md".into()),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "04947b2f", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("markdown/04/04947b2f.md", b"sharded-real".to_vec())
+            .await
+            .unwrap();
+
+        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+            .await
+            .unwrap();
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].stem, "04947b2f");
+        assert_eq!(drift[0].stale_path, "markdown/04947b2f.md");
+        assert_eq!(drift[0].resolved_path, "markdown/04/04947b2f.md");
+    }
+
+    #[tokio::test]
+    async fn detects_missing_markdown_path_when_file_present() {
+        // Row with no markdown_path at all, but a markdown file exists
+        // under the prefix → drift. resolved_path is the physical key.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            markdown_path: None,
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "ghostpath", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("markdown/gh/ghostpath.md", b"content".to_vec())
+            .await
+            .unwrap();
+
+        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+            .await
+            .unwrap();
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].stale_path, "");
+        assert_eq!(drift[0].resolved_path, "markdown/gh/ghostpath.md");
+    }
+
+    #[tokio::test]
+    async fn healthy_row_is_not_flagged() {
+        // markdown_path matches actual storage location → no drift.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            markdown_path: Some("markdown/ab/abcdef.md".into()),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "abcdef", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("markdown/ab/abcdef.md", b"content".to_vec())
+            .await
+            .unwrap();
+
+        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+            .await
+            .unwrap();
+        assert!(drift.is_empty());
+    }
+
+    #[tokio::test]
+    async fn skips_rows_with_no_markdown_file_anywhere() {
+        // Row whose markdown is truly missing → not this scan's job. The
+        // catalog_no_markdown direction handles these by clearing the
+        // conversion stamp; flagging them here would double-repair.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            markdown_path: Some("markdown/gone.md".into()),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "gone", &entry)
+            .await
+            .unwrap();
+
+        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+            .await
+            .unwrap();
+        assert!(drift.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prefers_sharded_when_both_copies_exist() {
+        // Duplicate markdown (sharded + unsharded) — catalog should be
+        // rewritten to the sharded canonical location.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            markdown_path: Some("markdown/duped.md".into()),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "duped", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("markdown/duped.md", b"flat".to_vec())
+            .await
+            .unwrap();
+        storage
+            .put("markdown/du/duped.md", b"sharded".to_vec())
+            .await
+            .unwrap();
+
+        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+            .await
+            .unwrap();
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].resolved_path, "markdown/du/duped.md");
     }
 }

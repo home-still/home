@@ -709,7 +709,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Reconcile catalog ↔ storage in three directions. Forward: document files (PDFs/HTML) on disk with no catalog row → synthesize minimal catalog entries (carry a `repair` block). Reverse: catalog rows that claim a successful conversion but whose markdown object is missing → clear the stale `conversion` / `embedding` / `embedding_skip` blocks so the row re-enters the convert queue (original `downloaded_at` / `sha256` / etc preserved). Phantom: catalog rows with neither a paper file nor a markdown in storage → delete the row outright (the YAML is the last trace; with no source to re-derive from, it's unreachable). Use `dry_run=true` first to see counts in all three directions.",
+        description = "Reconcile catalog ↔ storage in six directions. Forward: document files (PDFs/HTML) on disk with no catalog row → synthesize minimal catalog entries (carry a `repair` block). Reverse (catalog_no_markdown): catalog rows that claim a successful conversion but whose markdown object is missing → clear the stale `conversion` / `embedding` / `embedding_skip` blocks and purge any stranded Qdrant points so the row re-enters the convert queue (original `downloaded_at` / `sha256` / etc preserved). Phantom (catalog_no_source): catalog rows with neither a paper file nor a markdown in storage → delete the row outright (the YAML is the last trace; with no source to re-derive from, it's unreachable). Flag-drift: rows whose stage flags disagree with storage evidence → backfill the missing stamp without deleting. Md-path-drift: rows whose `markdown_path` points to a stale key (pre-`bc2b6fb` unsharded layout) or is absent while the file exists under a different key → rewrite `markdown_path` to the real storage location (non-destructive). Stuck-convert: rows with a paper file but no conversion stamp → purge any ghost Qdrant points and re-publish `papers.ingested` so the event-watch daemon converts + embeds. Use `dry_run=true` first to see counts in all six directions.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -764,6 +764,21 @@ impl HomeStillMcp {
         .await
         .map_err(|e| format!("flag-drift scan failed: {e}"))?;
 
+        // Md-path-drift direction: catalog `markdown_path` disagrees with
+        // where the markdown actually lives. Post-`bc2b6fb` the physical
+        // layout moved from `markdown/<stem>.md` to `markdown/{XX}/<stem>.md`,
+        // but pre-existing catalog rows weren't rewritten — so every
+        // resolver that trusts `markdown_path` probes a stale key and
+        // reports a ghost orphan. Rewrites the catalog field to the real
+        // storage key (non-destructive; does not touch markdown or Qdrant).
+        let md_path_drift_rows = hs_common::status::list_catalog_rows_with_md_path_drift(
+            &*self.storage,
+            &self.catalog_prefix,
+            &self.markdown_prefix,
+        )
+        .await
+        .map_err(|e| format!("md-path-drift scan failed: {e}"))?;
+
         // Stuck-convert direction: catalog has a PDF/HTML source on disk but
         // no `conversion` stamp. Re-queues via the event bus rather than an
         // inline scribe call — publishes `papers.ingested`, which the
@@ -784,6 +799,7 @@ impl HomeStillMcp {
         let md_total = md_orphans.len();
         let phantom_total = phantom_orphans.len();
         let drift_total = drift_rows.len();
+        let md_path_drift_total = md_path_drift_rows.len();
         let stuck_total = stuck_rows.len();
         let stuck_pdf = stuck_rows.iter().filter(|r| r.source_ext == "pdf").count();
         let stuck_html = stuck_rows.iter().filter(|r| r.source_ext == "html").count();
@@ -805,6 +821,17 @@ impl HomeStillMcp {
         let phantom_samples: Vec<String> = phantom_orphans.iter().take(10).cloned().collect();
         let drift_samples: Vec<String> =
             drift_rows.iter().take(10).map(|r| r.stem.clone()).collect();
+        let md_path_drift_samples: Vec<serde_json::Value> = md_path_drift_rows
+            .iter()
+            .take(10)
+            .map(|r| {
+                serde_json::json!({
+                    "stem": r.stem,
+                    "stale_path": r.stale_path,
+                    "resolved_path": r.resolved_path,
+                })
+            })
+            .collect();
         let stuck_samples: Vec<serde_json::Value> = stuck_rows
             .iter()
             .take(10)
@@ -834,6 +861,11 @@ impl HomeStillMcp {
                     "would_backfill_conversion": drift_conversion_total.min(limit),
                     "would_backfill_downloaded_at": drift_download_total.min(limit),
                     "samples": drift_samples,
+                },
+                "md_path_drift": {
+                    "drift_found": md_path_drift_total,
+                    "would_rewrite": md_path_drift_rows.iter().take(limit).count(),
+                    "samples": md_path_drift_samples,
                 },
                 "stuck_convert": {
                     "stuck_found": stuck_total,
@@ -1024,6 +1056,46 @@ impl HomeStillMcp {
             }
         }
 
+        // Md-path-drift repair: rewrite `markdown_path` to the real storage
+        // key. Non-destructive — does not touch markdown objects or Qdrant.
+        // Eliminates the 2026-04 ghost-orphan class where every reconcile
+        // was re-probing a stale path and burning two HEADs per doc_id.
+        let mut md_path_drift_repaired = 0u64;
+        for d in md_path_drift_rows.iter().take(limit) {
+            let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &d.stem,
+            )
+            .await
+            else {
+                errors.push(format!(
+                    "md_path_drift/{}: catalog entry vanished mid-repair",
+                    d.stem
+                ));
+                continue;
+            };
+            entry.markdown_path = Some(d.resolved_path.clone());
+            entry.repair = Some(hs_common::catalog::RepairMeta {
+                repaired_at: now.clone(),
+                reason: format!(
+                    "md_path_drift: rewrote markdown_path '{}' → '{}'",
+                    d.stale_path, d.resolved_path
+                ),
+            });
+            match hs_common::catalog::write_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &d.stem,
+                &entry,
+            )
+            .await
+            {
+                Ok(()) => md_path_drift_repaired += 1,
+                Err(e) => errors.push(format!("md_path_drift/{}: {e}", d.stem)),
+            }
+        }
+
         // Stuck-convert repair: purge any residual Qdrant vectors for the
         // doc_id (Type A ghost chunks from a prior cycle whose markdown was
         // deleted), then publish `papers.ingested`. `hs scribe watch-events`
@@ -1087,6 +1159,11 @@ impl HomeStillMcp {
                 "conversion_backfilled": drift_conversion_repaired,
                 "downloaded_at_backfilled": drift_download_repaired,
                 "samples": drift_samples,
+            },
+            "md_path_drift": {
+                "drift_found": md_path_drift_total,
+                "rewritten": md_path_drift_repaired,
+                "samples": md_path_drift_samples,
             },
             "stuck_convert": {
                 "stuck_found": stuck_total,
@@ -1771,13 +1848,15 @@ impl HomeStillMcp {
         )
         .await;
 
-        let key = hs_common::markdown::resolve_markdown_key(
+        let key = hs_common::markdown::resolve_markdown_key_verified(
+            &*self.storage,
             &self.markdown_prefix,
             &p.stem,
             catalog_entry
                 .as_ref()
                 .and_then(|e| e.markdown_path.as_deref()),
-        );
+        )
+        .await;
         if !self.storage.exists(&key).await.unwrap_or(false) {
             return Err(format!(
                 "Markdown not found for '{}' at storage key '{key}'. Convert the PDF first.",
@@ -1878,13 +1957,15 @@ impl HomeStillMcp {
                 doc_id,
             )
             .await;
-            let key = hs_common::markdown::resolve_markdown_key(
+            let key = hs_common::markdown::resolve_markdown_key_verified(
+                &*self.storage,
                 &self.markdown_prefix,
                 doc_id,
                 catalog_entry
                     .as_ref()
                     .and_then(|e| e.markdown_path.as_deref()),
-            );
+            )
+            .await;
             if !self.storage.exists(&key).await.unwrap_or(false) {
                 orphans.push(doc_id.clone());
             }
@@ -2016,13 +2097,15 @@ impl HomeStillMcp {
         )
         .await;
 
-        let key = hs_common::markdown::resolve_markdown_key(
+        let key = hs_common::markdown::resolve_markdown_key_verified(
+            &*self.storage,
             &self.markdown_prefix,
             &p.stem,
             catalog_entry
                 .as_ref()
                 .and_then(|e| e.markdown_path.as_deref()),
-        );
+        )
+        .await;
         if !self.storage.exists(&key).await.unwrap_or(false) {
             return Err(format!(
                 "Purged {deleted} old vectors but markdown not found at '{key}'. Convert the paper first.",
@@ -2124,13 +2207,15 @@ impl HomeStillMcp {
                 stem,
             )
             .await;
-            let key = hs_common::markdown::resolve_markdown_key(
+            let key = hs_common::markdown::resolve_markdown_key_verified(
+                &*self.storage,
                 &self.markdown_prefix,
                 stem,
                 catalog_entry
                     .as_ref()
                     .and_then(|e| e.markdown_path.as_deref()),
-            );
+            )
+            .await;
             if !self.storage.exists(&key).await.unwrap_or(false) {
                 errors.push(format!("{stem}: markdown missing at {key}"));
                 continue;
