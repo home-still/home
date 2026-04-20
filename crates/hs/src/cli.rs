@@ -86,6 +86,11 @@ pub enum TopCmd {
         #[command(subcommand)]
         command: MigrateAction,
     },
+    /// Cross-service pipeline operations (rebuild from papers, etc.)
+    Pipeline {
+        #[command(subcommand)]
+        command: super::pipeline_cmd::PipelineCmd,
+    },
 }
 
 #[derive(Subcommand, Debug)]

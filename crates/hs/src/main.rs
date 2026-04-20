@@ -12,6 +12,7 @@ mod distill_cmd;
 mod mcp_client;
 mod mcp_cmd;
 mod migrate_cmd;
+mod pipeline_cmd;
 mod restart_cmd;
 mod scribe_cmd;
 mod scribe_inbox;
@@ -104,6 +105,7 @@ fn main() -> ExitCode {
         TopCmd::Cloud { .. } => |_| ExitCode::FAILURE,
         TopCmd::Mcp { .. } => |_| ExitCode::FAILURE,
         TopCmd::Migrate { .. } => |_| ExitCode::FAILURE,
+        TopCmd::Pipeline { .. } => |_| ExitCode::FAILURE,
     };
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio  runtime");
@@ -150,6 +152,7 @@ fn main() -> ExitCode {
                 TopCmd::Migrate { command } => match command {
                     cli::MigrateAction::Sharding => migrate_cmd::run_sharding(&reporter).await,
                 },
+                TopCmd::Pipeline { command } => pipeline_cmd::dispatch(command, &reporter).await,
             }
         };
 
