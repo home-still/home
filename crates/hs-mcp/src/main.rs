@@ -84,6 +84,14 @@ struct CatalogRecentParams {
     include_repaired: Option<bool>,
 }
 
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct SystemStatusParams {
+    #[schemars(
+        description = "When false (default), the `history` pane mirrors `catalog_recent` and suppresses `catalog_repair` backfill rows. Set true for forensic mode — repair rows reappear with `\"repair\": true`."
+    )]
+    include_repaired: Option<bool>,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct MarkdownReadParams {
     #[schemars(description = "Paper stem name (filename without extension)")]
@@ -559,7 +567,7 @@ impl HomeStillMcp {
     // ── Catalog Tools ──────────────────────────────────────────
 
     #[tool(
-        description = "List all papers in the catalog with titles, conversion status, and embedded-in-Qdrant status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed.",
+        description = "List all papers in the catalog with titles, conversion status, and embedded-in-Qdrant status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed. Flag semantics: `converted` is true only when a successful conversion record exists; failed conversions show as `conversion_failed=true, converted=false` (mutually exclusive). `embedded` is true only when Qdrant actually received chunks (`chunks_indexed > 0`).",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -596,7 +604,11 @@ impl HomeStillMcp {
             .map(|(stem, _meta, cat)| {
                 let title = cat.title.unwrap_or_default();
                 let downloaded = cat.downloaded_at.is_some();
-                let converted = cat.conversion.is_some();
+                // `converted` means successfully converted. A failed
+                // conversion record shows as `conversion_failed=true,
+                // converted=false` — the two flags are mutually exclusive so
+                // clients can treat `converted` as "markdown is usable."
+                let converted = cat.conversion.as_ref().is_some_and(|c| !c.failed);
                 let conversion_failed = cat.conversion.as_ref().is_some_and(|c| c.failed);
                 let embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
                 let embedding_skipped = cat.embedding_skip.is_some();
@@ -2432,7 +2444,7 @@ impl HomeStillMcp {
     // ── System Tools ───────────────────────────────────────────
 
     #[tool(
-        description = "Full pipeline status: PDF count, markdown count, catalog count, embedded document count, server health for all services.",
+        description = "Full pipeline status: PDF count, markdown count, catalog count, embedded document count, server health for all services. The `history` pane matches `catalog_recent`'s defaults — rows stamped by a `catalog_repair` backfill (`downloaded_at == repair.repaired_at`, or synthetic Convert whose `converted_at == repair.repaired_at`) are suppressed. Pass `include_repaired=true` for forensic mode; repair rows reappear annotated `\"repair\": true`.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2440,8 +2452,12 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    async fn system_status(&self) -> Result<String, String> {
-        let snap = self.build_status_snapshot(20).await;
+    async fn system_status(
+        &self,
+        Parameters(p): Parameters<SystemStatusParams>,
+    ) -> Result<String, String> {
+        let include_repaired = p.include_repaired.unwrap_or(false);
+        let snap = self.build_status_snapshot(20, include_repaired).await;
         Ok(serde_json::to_string_pretty(&snap).unwrap_or_default())
     }
 }
@@ -2452,6 +2468,7 @@ impl HomeStillMcp {
     pub(crate) async fn build_status_snapshot(
         &self,
         history_limit: usize,
+        include_repaired: bool,
     ) -> hs_common::status::StatusSnapshot {
         use hs_common::status::{
             build_history, collect_pipeline_counts, QdrantInfo, ServiceInstance, StatusSnapshot,
@@ -2608,6 +2625,20 @@ impl HomeStillMcp {
         // a negative (i.e. drift can only be >= 0). Testers assert the value
         // stays at or below PIPELINE_DRIFT_THRESHOLD.
         let total_in_flight: u64 = scribe_instances.iter().map(|s| s.in_flight).sum();
+        // Compute the signed raw drift first so the opposite direction
+        // (stages claiming more rows than `documents` holds — e.g. markdown
+        // still on disk for a row newly stamped `failed=true`) is surfaced
+        // as `flag_overlap`. The saturating gate below remains unchanged
+        // for existing alerts.
+        let raw_drift: i64 = pipeline.documents as i64
+            - pipeline.markdown as i64
+            - pipeline.conversion_failed as i64
+            - total_in_flight as i64;
+        pipeline.flag_overlap = if raw_drift < 0 {
+            raw_drift.unsigned_abs()
+        } else {
+            0
+        };
         pipeline.pipeline_drift = pipeline
             .documents
             .saturating_sub(pipeline.markdown)
@@ -2615,12 +2646,13 @@ impl HomeStillMcp {
             .saturating_sub(total_in_flight);
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
 
-        // History from the catalog (same source as `catalog_recent`).
+        // History from the catalog — same source and same default filter as
+        // `catalog_recent` so the two activity feeds can never disagree.
         let history = match catalog_triples {
             Some(triples) => {
                 let pairs: Vec<(String, hs_common::catalog::CatalogEntry)> =
                     triples.into_iter().map(|(s, _m, e)| (s, e)).collect();
-                build_history(&pairs, history_limit)
+                build_history(&pairs, history_limit, include_repaired)
             }
             None => Vec::new(),
         };

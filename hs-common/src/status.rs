@@ -59,6 +59,15 @@ pub struct PipelineCounts {
     /// Exposed alongside the value so the assertion is self-contained.
     #[serde(default)]
     pub pipeline_drift_threshold: u64,
+    /// Diagnostic for the *opposite* direction of drift. When
+    /// `markdown + conversion_failed + in_flight > documents`, the raw
+    /// subtraction goes negative and `pipeline_drift` saturates to 0,
+    /// hiding the state. `flag_overlap` is the magnitude of that overshoot
+    /// so stale-flag conditions (e.g. markdown still present for a row now
+    /// stamped `failed=true`) are visible without changing the existing
+    /// gate. `0` is clean.
+    #[serde(default)]
+    pub flag_overlap: u64,
 }
 
 /// Per-service health row. Same shape for scribe and distill; fields unused
@@ -135,34 +144,68 @@ pub struct HistoryEvent {
     pub failed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Marks events whose timestamp came from a `catalog_repair` backfill
+    /// sweep. Only emitted when `build_history` is called with
+    /// `include_repaired = true` — `catalog_recent` uses the same flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<bool>,
 }
 
 /// Build the history event list from catalog entries, newest first.
+///
+/// When `include_repaired` is `false` (the default for both `system_status`
+/// and `catalog_recent`), rows whose timestamp is a `catalog_repair`
+/// backfill fingerprint are suppressed so the feed shows organic activity.
+/// When `true`, those rows reappear annotated with `repair: true`.
 #[cfg(feature = "catalog")]
-pub fn build_history(entries: &[(String, CatalogEntry)], limit: usize) -> Vec<HistoryEvent> {
+pub fn build_history(
+    entries: &[(String, CatalogEntry)],
+    limit: usize,
+    include_repaired: bool,
+) -> Vec<HistoryEvent> {
     let mut events: Vec<HistoryEvent> = Vec::new();
     for (stem, entry) in entries {
         let name = entry.title.clone().unwrap_or_else(|| stem.clone());
+        let repair_at: Option<&str> = entry.repair.as_ref().map(|r| r.repaired_at.as_str());
         if let Some(ref dl_at) = entry.downloaded_at {
-            let detail = entry
-                .file_size_bytes
-                .map(|b| b.to_string())
-                .unwrap_or_default();
-            events.push(HistoryEvent {
-                activity: "Download".into(),
-                stem: stem.clone(),
-                name: name.clone(),
-                detail,
-                at: dl_at.clone(),
-                detail_bytes: entry.file_size_bytes,
-                pages: None,
-                duration_secs: None,
-                chunks: None,
-                failed: None,
-                reason: None,
-            });
+            // Fingerprint: `downloaded_at` stamped by a prior
+            // `catalog_repair` flag_drift pass collapses hundreds of rows
+            // onto one nanosecond. Skip by default; mirror `catalog_recent`.
+            let is_repair = repair_at == Some(dl_at.as_str());
+            if is_repair && !include_repaired {
+                // skip
+            } else {
+                let detail = entry
+                    .file_size_bytes
+                    .map(|b| b.to_string())
+                    .unwrap_or_default();
+                events.push(HistoryEvent {
+                    activity: "Download".into(),
+                    stem: stem.clone(),
+                    name: name.clone(),
+                    detail,
+                    at: dl_at.clone(),
+                    detail_bytes: entry.file_size_bytes,
+                    pages: None,
+                    duration_secs: None,
+                    chunks: None,
+                    failed: None,
+                    reason: None,
+                    repair: if is_repair { Some(true) } else { None },
+                });
+            }
         }
         if let Some(ref conv) = entry.conversion {
+            // Synthetic Convert fingerprint: flag_drift backfill stamps
+            // `server = "catalog_repair:flag_drift"` and shares the batch
+            // `now()` with `repair.repaired_at`. Matching on both guards
+            // against a real conversion finishing at the same instant as an
+            // unrelated repair on another row.
+            let is_repair = conv.server == "catalog_repair:flag_drift"
+                && repair_at == Some(conv.converted_at.as_str());
+            if is_repair && !include_repaired {
+                continue;
+            }
             let detail = if conv.failed {
                 let reason = conv.reason.as_deref().unwrap_or("unknown");
                 format!(
@@ -184,6 +227,7 @@ pub fn build_history(entries: &[(String, CatalogEntry)], limit: usize) -> Vec<Hi
                 chunks: None,
                 failed: if conv.failed { Some(true) } else { None },
                 reason: conv.reason.clone(),
+                repair: if is_repair { Some(true) } else { None },
             });
         }
         if let Some(ref emb) = entry.embedding {
@@ -202,6 +246,7 @@ pub fn build_history(entries: &[(String, CatalogEntry)], limit: usize) -> Vec<Hi
                     chunks: Some(emb.chunks_indexed),
                     failed: None,
                     reason: None,
+                    repair: None,
                 });
             }
         }
@@ -221,6 +266,7 @@ pub fn build_history(entries: &[(String, CatalogEntry)], limit: usize) -> Vec<Hi
                 chunks: None,
                 failed: None,
                 reason: Some(skip.reason.clone()),
+                repair: None,
             });
         }
     }
@@ -830,6 +876,7 @@ pub async fn collect_pipeline_counts(
         // Computed by caller once it knows conversion_failed + total in_flight.
         pipeline_drift: 0,
         pipeline_drift_threshold: PIPELINE_DRIFT_THRESHOLD,
+        flag_overlap: 0,
     }
 }
 
@@ -883,7 +930,7 @@ mod history_tests {
         };
 
         let entries = vec![("stub".to_string(), stub), ("real".to_string(), good)];
-        let events = build_history(&entries, 100);
+        let events = build_history(&entries, 100, false);
 
         // Expect 6 events: 2 downloads + 2 converts + 1 embed + 1 embed_skip.
         assert_eq!(events.len(), 6, "events: {events:#?}");
