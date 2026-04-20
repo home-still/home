@@ -309,7 +309,8 @@ pub(crate) async fn cmd_watch_events(
 
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
-    run_subscriber(bus.clone(), storage.clone(), move |event| {
+    let concurrency = pool.concurrency();
+    run_subscriber(bus.clone(), storage.clone(), concurrency, move |event| {
         let storage = storage_for_handler.clone();
         let bus = bus_for_handler.clone();
         let pool = pool.clone();

@@ -182,16 +182,24 @@ pub(crate) async fn cmd_watch_events(
 
     tracing::info!(%server_url, "starting distill event-bus watcher");
 
+    // One distill worker today; if a second is ever added, bump this to
+    // `pool.concurrency()` like scribe_cmd does.
+    let concurrency = 2;
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
-    run_subscriber(bus.clone(), storage.clone(), move |event| {
-        let storage = storage_for_handler.clone();
-        let bus = bus_for_handler.clone();
-        let distill = distill.clone();
-        async move {
-            index_and_publish(storage.as_ref(), distill.as_ref(), bus.as_ref(), &event).await
-        }
-    })
+    run_subscriber(
+        bus.clone(),
+        storage.clone(),
+        concurrency,
+        move |event| {
+            let storage = storage_for_handler.clone();
+            let bus = bus_for_handler.clone();
+            let distill = distill.clone();
+            async move {
+                index_and_publish(storage.as_ref(), distill.as_ref(), bus.as_ref(), &event).await
+            }
+        },
+    )
     .await
 }
 

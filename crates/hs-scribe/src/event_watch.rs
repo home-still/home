@@ -4,22 +4,34 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use hs_common::event_bus::EventBus;
 use hs_common::storage::Storage;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::client::ScribeClient;
+
+/// Cap on re-publishes of a single event before we give up. Plain NATS
+/// queue-subscribe is at-most-once, so the watcher has to do its own
+/// retry loop — but an unbounded loop on a genuinely bad input would
+/// wedge the queue forever. Three attempts is the standard "once plus
+/// two retries" contract.
+const MAX_RETRIES: u32 = 3;
 
 /// Payload published by `paper` and any other ingestion source on
 /// `papers.ingested`. Fields beyond `key` are optional — a minimal publisher
 /// may only know the object key.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IngestedEvent {
     pub key: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// How many times this event has been re-published after a handler
+    /// failure. `None` / `0` on the first delivery. Incremented by the
+    /// watcher on retry; events exceeding [`MAX_RETRIES`] are dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u32>,
 }
 
 /// Given an ingested paper key, fetch bytes from `storage`, dispatch to the
@@ -162,11 +174,12 @@ pub async fn convert_and_upload(
 pub async fn run_subscriber<F, Fut>(
     bus: Arc<dyn EventBus>,
     _storage: Arc<dyn Storage>,
+    concurrency: usize,
     handler: F,
 ) -> Result<()>
 where
-    F: Fn(IngestedEvent) -> Fut + Send + Sync,
-    Fut: std::future::Future<Output = Result<()>> + Send,
+    F: Fn(IngestedEvent) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
     // Queue-subscribe so multiple scribe hosts load-balance `papers.ingested`
     // instead of each converting every paper. The broker delivers each
@@ -174,7 +187,17 @@ where
     let mut stream = bus
         .queue_subscribe("papers.ingested", "scribe-workers")
         .await?;
-    tracing::info!("scribe subscribed to papers.ingested (queue: scribe-workers)");
+    let concurrency = concurrency.max(1);
+    tracing::info!(
+        concurrency,
+        "scribe subscribed to papers.ingested (queue: scribe-workers)"
+    );
+
+    // Cap in-flight dispatches so the watcher doesn't spawn thousands of
+    // tasks at once. The loop naturally blocks on `acquire_owned` when all
+    // slots are busy, which gives NATS back-pressure for free.
+    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let handler = Arc::new(handler);
 
     while let Some(event) = stream.next().await {
         let parsed: IngestedEvent = match serde_json::from_slice(&event.payload) {
@@ -184,10 +207,48 @@ where
                 continue;
             }
         };
-        tracing::info!(key = %parsed.key, "scribe received ingested event");
-        if let Err(e) = handler(parsed).await {
-            tracing::error!(error = %e, "scribe handler failed");
-        }
+
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // semaphore closed → shutting down
+        };
+        let handler = Arc::clone(&handler);
+        let bus = Arc::clone(&bus);
+        tokio::spawn(async move {
+            let _permit = permit; // drop at scope end releases the slot
+            let key = parsed.key.clone();
+            tracing::info!(key = %key, "scribe received ingested event");
+            if let Err(e) = handler(parsed.clone()).await {
+                let next = parsed.retry_count.unwrap_or(0) + 1;
+                if next <= MAX_RETRIES {
+                    tracing::warn!(
+                        key = %key,
+                        retry = next,
+                        error = %e,
+                        "scribe handler failed — republishing for retry"
+                    );
+                    let mut retry = parsed;
+                    retry.retry_count = Some(next);
+                    let payload = match serde_json::to_vec(&retry) {
+                        Ok(b) => b,
+                        Err(se) => {
+                            tracing::error!(key = %key, error = %se, "retry payload serialize failed");
+                            return;
+                        }
+                    };
+                    if let Err(pe) = bus.publish("papers.ingested", &payload).await {
+                        tracing::error!(key = %key, error = %pe, "retry republish failed");
+                    }
+                } else {
+                    tracing::error!(
+                        key = %key,
+                        attempts = next,
+                        error = %e,
+                        "scribe handler failed after max retries — giving up"
+                    );
+                }
+            }
+        });
     }
     Ok(())
 }
@@ -221,13 +282,18 @@ mod tests {
         let received = Arc::new(tokio::sync::Mutex::new(Vec::<IngestedEvent>::new()));
         let received_clone = received.clone();
 
-        let sub_task = tokio::spawn(run_subscriber(bus.clone(), storage.clone(), move |event| {
-            let received = received_clone.clone();
-            async move {
-                received.lock().await.push(event);
-                Ok(())
-            }
-        }));
+        let sub_task = tokio::spawn(run_subscriber(
+            bus.clone(),
+            storage.clone(),
+            1,
+            move |event| {
+                let received = received_clone.clone();
+                async move {
+                    received.lock().await.push(event);
+                    Ok(())
+                }
+            },
+        ));
 
         // Give the subscription a moment to register with the server.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -260,7 +326,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(tmp.path()));
 
-        let fut = run_subscriber(bus, storage, |_e| async { Ok(()) });
+        let fut = run_subscriber(bus, storage, 1, |_e| async { Ok(()) });
         let r = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
         // NoOpBus stream is pending; the timeout is expected.
         assert!(r.is_err());
