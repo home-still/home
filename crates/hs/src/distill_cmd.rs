@@ -364,15 +364,20 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
             ld_path.push_str(extra);
         }
     }
-    // Include ~/.local/lib for user-created compat symlinks
+    // Include ~/.local/lib for user-created compat symlinks and the
+    // home-still CUDA-12 runtime-compat dir (rc.267: the pyke cu12 ort
+    // bundle needs cublas/cudart/cufft .so.12/.so.11 that a CUDA-13-only
+    // host lacks; NVIDIA's runtime-only wheels drop into this dir).
     if let Some(home) = dirs::home_dir() {
-        let user_lib = home.join(".local/lib");
-        let user_lib_str = user_lib.to_string_lossy().to_string();
-        if !ld_path.contains(&user_lib_str) {
-            if !ld_path.is_empty() {
-                ld_path.push(':');
+        for rel in [".local/lib", ".home-still/cuda12-libs"] {
+            let dir = home.join(rel);
+            let s = dir.to_string_lossy().to_string();
+            if !ld_path.contains(&s) {
+                if !ld_path.is_empty() {
+                    ld_path.push(':');
+                }
+                ld_path.push_str(&s);
             }
-            ld_path.push_str(&user_lib_str);
         }
     }
 
@@ -544,13 +549,15 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         }
     }
     if let Some(home) = dirs::home_dir() {
-        let user_lib = home.join(".local/lib");
-        let user_lib_str = user_lib.to_string_lossy().to_string();
-        if !ld_path.contains(&user_lib_str) {
-            if !ld_path.is_empty() {
-                ld_path.push(':');
+        for rel in [".local/lib", ".home-still/cuda12-libs"] {
+            let dir = home.join(rel);
+            let s = dir.to_string_lossy().to_string();
+            if !ld_path.contains(&s) {
+                if !ld_path.is_empty() {
+                    ld_path.push(':');
+                }
+                ld_path.push_str(&s);
             }
-            ld_path.push_str(&user_lib_str);
         }
     }
 

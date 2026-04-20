@@ -529,6 +529,29 @@ For local rc deploys, set the version explicitly so `git describe` doesn't bake 
 GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs-distill --features server,cuda
 ```
 
+**CUDA-12 runtime-compat libs (required on CUDA-13-only hosts).** ort 2.0.0-rc.11 ships a pyke bundle compiled against CUDA 12 (`libcublas.so.12`, `libcudart.so.12`, `libcufft.so.11`). A host that only has CUDA 13 system libraries will segfault at ort init when the loader grabs Arch's `/usr/lib/libonnxruntime_providers_cuda.so` (1.24.4, ABI-mismatched with the pyke bundle). The fix is to drop the CUDA-12 runtime-only libraries into `~/.home-still/cuda12-libs/`; `hs-scribe-server` and `hs-distill-server` auto-prepend that dir plus the pyke hash dir to `LD_LIBRARY_PATH` on startup (via a re-exec bootstrap — see `hs-common/src/service/cuda_bootstrap.rs`). One-time setup:
+
+```bash
+mkdir -p ~/.home-still/cuda12-libs
+cd ~/.home-still/cuda12-libs
+python3 <<'PY'
+import urllib.request, json, os, zipfile
+for pkg in ['nvidia-cuda-runtime-cu12', 'nvidia-cublas-cu12', 'nvidia-cufft-cu12']:
+    data = json.loads(urllib.request.urlopen(f'https://pypi.org/pypi/{pkg}/json').read())
+    wheel = next(u for u in data['urls']
+                 if u['filename'].endswith('_x86_64.whl') and 'linux' in u['filename'])
+    urllib.request.urlretrieve(wheel['url'], wheel['filename'])
+    with zipfile.ZipFile(wheel['filename']) as z:
+        for n in z.namelist():
+            base = os.path.basename(n)
+            if ('.so' in n) and not base.startswith(('libnvrtc-builtins', 'libnvJitLink')):
+                open(base, 'wb').write(z.read(n))
+    os.remove(wheel['filename'])
+PY
+```
+
+Verify with `ldd ~/.cache/ort.pyke.io/dfbin/x86_64-*/<hash>/libonnxruntime_providers_cuda.so`: every `*.so.12` and `libcufft.so.11` must resolve. This directory is a deployment artifact, not a build input — keep it out of git.
+
 **Start the event-bus subscribers**
 
 The scribe and distill HTTP servers above handle direct MCP calls. Asynchronous ingestion (from `paper_download`, the inbox watcher, or `catalog_repair`'s `stuck_convert` direction) flows through NATS: `papers.ingested` → scribe convert → `scribe.completed` → distill index → `distill.completed`. Each hop needs a dedicated subscriber running. Both run on this host:
