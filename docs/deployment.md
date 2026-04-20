@@ -497,39 +497,39 @@ set -Ux HS_S3_ACCESS_KEY GK351...
 set -Ux HS_S3_SECRET_KEY 7d37...
 ```
 
-**Initialize and start scribe**
+**Install the servers and watchers as supervised services**
+
+Five supervised units run on this host. All are installed by `hs serve <name> --install`, which drops the systemd unit (Linux) or LaunchAgent (macOS), enables it, and starts it immediately.
 
 ```bash
-hs scribe init                # downloads layout model, sets up Ollama + scribe container
-hs scribe server start
-hs scribe server ping
+# System services (require sudo, run under the `ladvien` user):
+hs serve scribe --install       # hs-serve-scribe.service   (native bare binary)
+hs serve distill --install      # hs-serve-distill.service  (native bare binary, CUDA)
+hs serve mcp --install          # hs-serve-mcp.service      (optional — only if hosting MCP over HTTP)
+
+# User services (no sudo, installed under the invoking user):
+hs serve scribe-watch --install     # hs-scribe-watch-events.service  (NATS papers.ingested → scribe pool)
+hs serve distill-watch --install    # hs-distill-watch-events.service (NATS scribe.completed → distill index)
 ```
 
-> Suppress non-actionable container output on this node — Docker/podman are noisy with health-check chatter that is not actionable. Pipe through `grep -v` or run with `--quiet` where the CLI supports it.
+Only one event-watch pair runs cluster-wide — on the host that owns S3/catalog writes (this one). Secondary scribe nodes run **only** `hs serve scribe --install`; they are pure HTTP workers fed by this host's watcher through the scribe pool. See §6.7.
 
-**Initialize and start distill — with CUDA**
-
-```bash
-hs distill init               # creates the Qdrant compose file (skip if Qdrant runs on `four`)
-hs distill server start
-hs distill server ping
-```
-
-If you're building distill from source rather than using the prebuilt binary, **always pass `--features cuda`**:
+**Build from source (if not using the prebuilt binary)**
 
 ```bash
-cargo build --release -p hs-distill --features server,cuda
+# Linux GPU host: scribe + distill need the cuda feature
+GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs-scribe --features cuda
+GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs-distill --features cuda
+
+# Always build hs + hs-mcp for the CLI and MCP stdio surface
+GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs -p hs-mcp
+
+install -m755 target/release/{hs,hs-mcp,hs-scribe-server,hs-distill-server} ~/.local/bin/
 ```
 
 Without `--features cuda`, distill silently falls back to CPU, which at corpus scale degrades to unusable. Confirm CUDA is in use by inspecting the server logs for the VRAM probe — non-zero VRAM means the GPU is in play.
 
-For local rc deploys, set the version explicitly so `git describe` doesn't bake the prior tag:
-
-```bash
-GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs-distill --features server,cuda
-```
-
-**CUDA-12 runtime-compat libs (required on CUDA-13-only hosts).** ort 2.0.0-rc.11 ships a pyke bundle compiled against CUDA 12 (`libcublas.so.12`, `libcudart.so.12`, `libcufft.so.11`). A host that only has CUDA 13 system libraries will segfault at ort init when the loader grabs Arch's `/usr/lib/libonnxruntime_providers_cuda.so` (1.24.4, ABI-mismatched with the pyke bundle). The fix is to drop the CUDA-12 runtime-only libraries into `~/.home-still/cuda12-libs/`; `hs-scribe-server` and `hs-distill-server` auto-prepend that dir plus the pyke hash dir to `LD_LIBRARY_PATH` on startup (via a re-exec bootstrap — see `hs-common/src/service/cuda_bootstrap.rs`). One-time setup:
+**CUDA-12 runtime-compat libs (required on CUDA-13-only hosts).** ort 2.0.0-rc.11 ships a pyke bundle compiled against CUDA 12 (`libcublas.so.12`, `libcudart.so.12`, `libcufft.so.11`). A host that only has CUDA 13 system libraries will segfault at ort init when the loader grabs Arch's `/usr/lib/libonnxruntime_providers_cuda.so` (1.24.4, ABI-mismatched with the pyke bundle). The fix is to drop the CUDA-12 runtime-only libraries into `~/.home-still/cuda12-libs/`; `hs-scribe-server` and `hs-distill-server` auto-prepend that dir plus the pyke hash dir to `LD_LIBRARY_PATH` on startup (via a re-exec bootstrap — see `hs-common/src/service/lib_bootstrap.rs`). One-time setup:
 
 ```bash
 mkdir -p ~/.home-still/cuda12-libs
@@ -552,31 +552,35 @@ PY
 
 Verify with `ldd ~/.cache/ort.pyke.io/dfbin/x86_64-*/<hash>/libonnxruntime_providers_cuda.so`: every `*.so.12` and `libcufft.so.11` must resolve. This directory is a deployment artifact, not a build input — keep it out of git.
 
-**Start the event-bus subscribers**
+**Event-bus pipeline at a glance**
 
-The scribe and distill HTTP servers above handle direct MCP calls. Asynchronous ingestion (from `paper_download`, the inbox watcher, or `catalog_repair`'s `stuck_convert` direction) flows through NATS: `papers.ingested` → scribe convert → `scribe.completed` → distill index → `distill.completed`. Each hop needs a dedicated subscriber running. Both run on this host:
+Asynchronous ingestion (from `paper_download`, the inbox watcher, `catalog_repair stuck_convert`, or `hs pipeline rebuild`) flows through NATS queue groups:
 
-```bash
-nohup ~/.local/bin/hs scribe watch-events \
-  > ~/.home-still/logs/scribe-watch-events.log 2>&1 & disown
-
-nohup ~/.local/bin/hs distill watch-events \
-  > ~/.home-still/logs/distill-watch-events.log 2>&1 & disown
+```
+papers.ingested ─[queue: scribe-workers]─▶ hs-scribe-watch-events (this host only)
+                                              │
+                                              ├─▶ hs-serve-scribe.service (local, CUDA VLM)
+                                              └─▶ http://secondary-scribe:7433 (big_mac, §6.7)
+                                              │
+                                              ▼
+                        markdown + catalog written locally (S3 I/O stays here)
+                                              │
+scribe.completed ─[queue: distill-workers]─▶ hs-distill-watch-events (this host only)
+                                              │
+                                              ▼
+                                      hs-serve-distill.service → Qdrant
 ```
 
-Promote these to systemd user units once you're happy they stay up (model after the `home-still-scribe-inbox.service` unit that `hs scribe inbox install` creates). Without both daemons running, `paper_download`'s event publish is silently dropped and `catalog_repair stuck_convert` has no one to pick up its emissions — ingestion has to fall back to synchronous MCP calls through Claude Desktop.
+Each queue group guarantees exactly-one delivery per member, so adding a second scribe worker shares load without duplicating work.
 
-**Register with the gateway as a serve-mode service**
+**Register with the gateway**
 
 ```bash
 hs cloud enroll --gateway https://cloud.example.com
 # enter the enrollment code printed on `two` by `hs cloud invite --name big`
-
-hs serve scribe   # one terminal — auto-init, start, and register
-hs serve distill  # another terminal — same
 ```
 
-Once registered, the gateway routes `/scribe/*` and `/distill/*` to this host even when off-network clients connect through Cloudflare.
+The installed `hs-serve-*.service` units auto-register with the gateway (heartbeat loop inside `hs serve`). Once registered, the gateway routes `/scribe/*` and `/distill/*` to this host even when off-network clients connect through Cloudflare.
 
 ### 6.4 DB host (`four`)
 
@@ -688,7 +692,12 @@ distill_server:
   qdrant_url: http://four:6334
 ```
 
-### 6.5 Clients (`mac_air`, `big_mac`)
+### 6.5 Clients (`mac_air`)
+
+Client-only nodes run the `hs` CLI and spawn `hs-mcp` via stdio for Claude Desktop. No server-side services, no event watchers, no storage I/O beyond what Claude's tool calls trigger.
+
+If you want a macOS client to also host a secondary scribe worker (e.g. a MacBook Pro like `big_mac` with an M-series SoC you'd like to enlist for Ollama VLM), see §6.7.
+
 
 **Install hs**
 
@@ -836,6 +845,65 @@ If `catalog_repair`'s `disk_no_catalog` direction starts reporting orphans on a 
 ```bash
 hs scribe inbox uninstall
 ```
+
+### 6.7 Secondary scribe worker (e.g. `big_mac`)
+
+A secondary scribe host contributes **compute only**: it runs `hs-scribe-server` as a stateless HTTP worker. It does *not* run a NATS watcher, does *not* write the catalog, and does *not* touch S3. The GPU compute host's watcher (§6.3) picks up every `papers.ingested` event, dispatches bytes to both scribe-servers through the scribe pool, receives markdown back, and handles all storage + catalog writes locally.
+
+This pattern keeps big_mac a pure Ollama-VLM worker — no shared-storage auth, no race conditions on catalog writes, and it rides out a flaky wifi link because it never touches S3.
+
+**Prereqs on the secondary host**
+
+1. `rustc` + `cargo` (rustup).
+2. For macOS: `libpdfium.dylib` (pdfium-render dlopens this at runtime, and macOS has no system pdfium). Drop the bblanchon prebuilt into `~/.local/lib/` or `~/.home-still/dyld-libs/`:
+   ```bash
+   URL=$(curl -s https://api.github.com/repos/bblanchon/pdfium-binaries/releases/latest \
+          | python3 -c 'import sys,json; d=json.load(sys.stdin); \
+                        print(next(a["browser_download_url"] for a in d["assets"] \
+                        if a["name"].startswith("pdfium-mac-arm64") and a["name"].endswith(".tgz")))')
+   mkdir -p ~/.local/lib && cd /tmp
+   curl -sL -o pdfium.tgz "$URL" && tar -xzf pdfium.tgz lib/libpdfium.dylib \
+     && mv lib/libpdfium.dylib ~/.local/lib/ && rm -rf pdfium.tgz lib
+   ```
+   The scribe-server's `lib_bootstrap` trampoline auto-adds `~/.local/lib` to `DYLD_LIBRARY_PATH`, so no launchd env-var injection is needed.
+3. Ollama running locally with the VLM model pulled (`ollama pull glm-ocr:latest`).
+
+**Install the worker**
+
+```bash
+# Sync source from your build host, then native cargo build (no cuda feature on macOS):
+cd ~/home-still
+GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs-scribe --features server -p hs
+install -m755 target/release/{hs,hs-scribe-server} ~/.local/bin/
+
+# Install as LaunchAgent (or systemd if Linux):
+hs serve scribe --install
+```
+
+**Wire it into the pool**
+
+On the primary GPU host (§6.3), add the new URL to `~/.home-still/config.yaml`:
+
+```yaml
+scribe:
+  servers:
+    - http://192.168.1.110:7433   # big   (primary)
+    - http://192.168.1.111:7433   # big_mac (secondary)
+```
+
+Restart the primary's `hs-scribe-watch-events.service`:
+
+```bash
+systemctl --user restart hs-scribe-watch-events.service
+```
+
+The primary's pool will now include the new URL in its readiness probe and round-robin dispatch.
+
+**What NOT to do on a secondary host**
+
+- **Do not** run `hs serve scribe-watch --install`. Only one watcher per cluster (on the S3-primary). A second watcher would consume NATS events it can't actually fulfil (no local S3) and silently drop them.
+- **Do not** run `hs serve distill --install`. One distill host.
+- **Do not** run Docker Desktop's compose stack for `home-still-scribe` — the auto-healing container fights the supervised native binary for `:7433`. If you previously installed via compose, `docker compose -f ~/.home-still/docker-compose.yml down -v --remove-orphans` and then rename the compose file out of the way.
 
 ## 7. Storage backend deep-dive: NFS vs Garage S3
 

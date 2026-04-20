@@ -275,7 +275,7 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
     }
 }
 
-async fn cmd_watch_events(
+pub(crate) async fn cmd_watch_events(
     server_override: Option<String>,
     _reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
@@ -1834,23 +1834,51 @@ pub async fn ensure_init(force: bool) -> Result<()> {
     cmd_init_inner(force, false, true).await
 }
 
-/// Start the scribe server in the foreground (blocks until shutdown).
-/// Runs `compose up` without `-d` so the process stays attached.
-///
-/// Note: the scribe server port is determined by the Docker compose config
-/// generated during `hs scribe init`. The `port` parameter is currently used
-/// only for gateway registration (the URL advertised to the registry).
-pub async fn start_server_foreground(_port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let compose_path = hidden_dir().join("docker-compose.yml");
-    if !compose_path.exists() {
-        anyhow::bail!("No compose config found. Run `hs scribe init` or `hs serve scribe` first.");
+/// Resolve the `hs-scribe-server` binary location. Preference order: user
+/// install (`~/.local/bin`), alongside the current `hs` binary, then
+/// development-build targets. Mirrors `find_distill_binary`.
+fn find_scribe_server_binary() -> Option<PathBuf> {
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".local/bin/hs-scribe-server");
+        if path.exists() {
+            return Some(path);
+        }
     }
-    let compose = ComposeCmd::detect()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("No container runtime found"))?;
-    let cf = compose_path.to_str().unwrap_or_default();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let path = dir.join("hs-scribe-server");
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    let project = hs_common::resolve_project_dir();
+    for profile in ["release", "debug"] {
+        let path = project
+            .join("target")
+            .join(profile)
+            .join("hs-scribe-server");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
 
-    // Ensure native Ollama is running if needed
+/// Start the scribe server in the foreground (blocks until shutdown).
+/// Launches the native `hs-scribe-server` binary directly — one path, no
+/// container indirection. `lib_bootstrap` in the binary handles the
+/// platform-specific library-path setup (CUDA on Linux, pdfium on macOS).
+pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let binary = find_scribe_server_binary().ok_or_else(|| {
+        anyhow::anyhow!(
+            "hs-scribe-server binary not found. Build with:\n  \
+             cargo build --release -p hs-scribe --features server,cuda   (Linux with CUDA)\n  \
+             cargo build --release -p hs-scribe --features server         (macOS / CPU)"
+        )
+    })?;
+
+    // Ensure Ollama (the VLM backend) is running — same logic as before.
     let has_nvidia = check_command("nvidia-smi", &[]).await;
     if should_use_native_ollama(has_nvidia) && !check_ollama_running().await {
         if cfg!(target_os = "linux") {
@@ -1867,16 +1895,26 @@ pub async fn start_server_foreground(_port: u16, reporter: &Arc<dyn Reporter>) -
         }
     }
 
-    // Start compose in foreground (no -d) — blocks until Ctrl+C
-    reporter.status("Scribe", "running (Ctrl+C to stop)");
-    let status = compose
-        .run(&["-f", cf, "up", "--abort-on-container-exit"])
-        .await?;
+    reporter.status(
+        "Scribe",
+        &format!("running on port {port} (Ctrl+C to stop)"),
+    );
+
+    // Run in foreground — inherit stdout/stderr, block until exit.
+    let status = tokio::process::Command::new(&binary)
+        .arg("--host")
+        .arg("0.0.0.0")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdin(std::process::Stdio::null())
+        .status()
+        .await
+        .context("Failed to spawn hs-scribe-server")?;
+
     if !status.success() {
-        anyhow::bail!("scribe compose exited with {status}");
+        anyhow::bail!("hs-scribe-server exited with {status}");
     }
 
-    // Cleanup: unload VLM model from VRAM
     if should_use_native_ollama(has_nvidia) {
         unload_ollama_model("glm-ocr").await;
     }

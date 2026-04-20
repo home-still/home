@@ -163,7 +163,7 @@ pub async fn dispatch(
     }
 }
 
-async fn cmd_watch_events(
+pub(crate) async fn cmd_watch_events(
     server_override: Option<String>,
     _reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {

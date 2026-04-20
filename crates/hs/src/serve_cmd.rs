@@ -54,6 +54,27 @@ pub enum ServeCmd {
         #[arg(long, conflicts_with = "install")]
         uninstall: bool,
     },
+    /// NATS event-watch daemon that converts `papers.ingested` events into
+    /// markdown via the scribe pool. Runs as a user-level service.
+    ScribeWatch {
+        /// Install as a user service (systemd --user on Linux, LaunchAgent on
+        /// macOS) and start it. Runs under the current user — no sudo.
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Stop and remove the user service
+        #[arg(long, conflicts_with = "install")]
+        uninstall: bool,
+    },
+    /// NATS event-watch daemon that indexes `scribe.completed` events into
+    /// Qdrant via the distill server. Runs as a user-level service.
+    DistillWatch {
+        /// Install as a user service and start it
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Stop and remove the user service
+        #[arg(long, conflicts_with = "install")]
+        uninstall: bool,
+    },
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -91,6 +112,32 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
         ServeCmd::Mcp {
             uninstall: true, ..
         } => uninstall_service("mcp", reporter).await,
+        ServeCmd::ScribeWatch { install: true, .. } => {
+            install_user_service(
+                "scribe-watch-events",
+                &["scribe", "watch-events"],
+                "Home-Still scribe event-watch daemon (NATS papers.ingested → scribe pool)",
+                reporter,
+            )
+            .await
+        }
+        ServeCmd::DistillWatch { install: true, .. } => {
+            install_user_service(
+                "distill-watch-events",
+                &["distill", "watch-events"],
+                "Home-Still distill event-watch daemon (NATS scribe.completed → distill index)",
+                reporter,
+            )
+            .await
+        }
+        ServeCmd::ScribeWatch {
+            uninstall: true, ..
+        } => uninstall_user_service("scribe-watch-events", reporter).await,
+        ServeCmd::DistillWatch {
+            uninstall: true, ..
+        } => uninstall_user_service("distill-watch-events", reporter).await,
+        ServeCmd::ScribeWatch { .. } => serve_scribe_watch(reporter).await,
+        ServeCmd::DistillWatch { .. } => serve_distill_watch(reporter).await,
 
         // -- start / stop (background) --
         ServeCmd::Scribe {
@@ -230,6 +277,241 @@ async fn serve_mcp(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
 
     reporter.finish("mcp server stopped");
     Ok(())
+}
+
+// ── Watchers (user-level services) ──────────────────────────────
+
+async fn serve_scribe_watch(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    reporter.status("Serve", "scribe watch-events");
+    crate::scribe_cmd::cmd_watch_events(None, reporter).await
+}
+
+async fn serve_distill_watch(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    reporter.status("Serve", "distill watch-events");
+    crate::distill_cmd::cmd_watch_events(None, reporter).await
+}
+
+/// Install a user-level systemd unit (Linux) or LaunchAgent (macOS) that
+/// runs `hs <exec_args...>` under the invoking user. Used for the event-
+/// watch daemons — they need the user's NATS creds and S3 secrets, so a
+/// root-owned system unit isn't appropriate.
+async fn install_user_service(
+    service_name: &str,
+    exec_args: &[&str],
+    description: &str,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (service_name, exec_args, description, reporter);
+        anyhow::bail!("--install is only supported on Linux and macOS");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
+        let hs_path = hs_bin.display().to_string();
+        let home_dir =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+        let secrets_path = home_dir.join(".home-still").join("secrets.env");
+
+        #[cfg(target_os = "linux")]
+        {
+            let unit_dir = home_dir.join(".config/systemd/user");
+            std::fs::create_dir_all(&unit_dir)?;
+            let unit_path = unit_dir.join(format!("hs-{service_name}.service"));
+
+            let env_file_line = if secrets_path.exists() {
+                format!("EnvironmentFile=-{}\n", secrets_path.display())
+            } else {
+                String::new()
+            };
+            let exec_spaced = exec_args.join(" ");
+            let unit = format!(
+                r#"[Unit]
+Description={description}
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={home}
+{env_file_line}ExecStart={hs_path} {exec_spaced}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"#,
+                home = home_dir.display(),
+            );
+
+            reporter.status("Install", &format!("{}", unit_path.display()));
+            std::fs::write(&unit_path, &unit).context("Failed to write user unit file")?;
+
+            let status = tokio::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status()
+                .await
+                .context("systemctl --user daemon-reload failed")?;
+            if !status.success() {
+                anyhow::bail!("systemctl --user daemon-reload failed");
+            }
+            let full_name = format!("hs-{service_name}.service");
+            let status = tokio::process::Command::new("systemctl")
+                .args(["--user", "enable", "--now", &full_name])
+                .status()
+                .await?;
+            if !status.success() {
+                anyhow::bail!("systemctl --user enable --now {full_name} failed");
+            }
+
+            reporter.finish(&format!(
+                "Installed and started {full_name}\n\
+             View logs: journalctl --user -u {full_name} -f\n\
+             Stop:      systemctl --user stop {full_name}\n\
+             Disable:   systemctl --user disable {full_name}"
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = description;
+            let label = format!("com.home-still.{service_name}");
+            let plist_dir = home_dir.join("Library/LaunchAgents");
+            std::fs::create_dir_all(&plist_dir)?;
+            let plist_path = plist_dir.join(format!("{label}.plist"));
+
+            let exec_joined = exec_args
+                .iter()
+                .map(|a| format!("<string>{a}</string>"))
+                .collect::<Vec<_>>()
+                .join("\n        ");
+
+            let mut secret_entries = String::new();
+            if let Ok(contents) = std::fs::read_to_string(&secrets_path) {
+                for line in contents.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((k, v)) = line.split_once('=') {
+                        let v = v.trim_matches('"').trim_matches('\'');
+                        secret_entries.push_str(&format!(
+                            "        <key>{k}</key>\n        <string>{v}</string>\n"
+                        ));
+                    }
+                }
+            }
+
+            let plist = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://schemas.apple.com/dtds/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{hs_path}</string>
+        {exec_joined}
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+{secret_entries}    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/hs-{service_name}.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/hs-{service_name}.log</string>
+</dict>
+</plist>
+"#
+            );
+
+            reporter.status("Install", &format!("{}", plist_path.display()));
+            std::fs::write(&plist_path, &plist)?;
+
+            let _ = tokio::process::Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .status()
+                .await;
+            let status = tokio::process::Command::new("launchctl")
+                .args(["load", &plist_path.to_string_lossy()])
+                .status()
+                .await?;
+            if !status.success() {
+                anyhow::bail!("launchctl load failed");
+            }
+
+            reporter.finish(&format!(
+                "Installed and started {label}\n\
+             View logs: tail -f /tmp/hs-{service_name}.log\n\
+             Stop:      launchctl unload {}\n\
+             Remove:    rm {}",
+                plist_path.display(),
+                plist_path.display()
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+async fn uninstall_user_service(service_name: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (service_name, reporter);
+        anyhow::bail!("--uninstall is only supported on Linux and macOS");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let home_dir =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let full_name = format!("hs-{service_name}.service");
+            let unit_path = home_dir.join(".config/systemd/user").join(&full_name);
+            reporter.status("Stop", &full_name);
+            let _ = tokio::process::Command::new("systemctl")
+                .args(["--user", "stop", &full_name])
+                .status()
+                .await;
+            let _ = tokio::process::Command::new("systemctl")
+                .args(["--user", "disable", &full_name])
+                .status()
+                .await;
+            let _ = std::fs::remove_file(&unit_path);
+            let _ = tokio::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status()
+                .await;
+            reporter.finish(&format!("Removed {full_name}"));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let label = format!("com.home-still.{service_name}");
+            let plist_path = home_dir
+                .join("Library/LaunchAgents")
+                .join(format!("{label}.plist"));
+            reporter.status("Unload", &label);
+            let _ = tokio::process::Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .status()
+                .await;
+            let _ = std::fs::remove_file(&plist_path);
+            reporter.finish(&format!("Removed {label}"));
+        }
+
+        Ok(())
+    }
 }
 
 // ── Service Installation ───────────────────────────────────────

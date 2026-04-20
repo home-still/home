@@ -17,11 +17,11 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    // Must run before ANY dlopen or tokio init — re-execs self with
-    // LD_LIBRARY_PATH augmented so ort's CUDA provider loads from the
-    // pyke bundle (not Arch's ABI-mismatched /usr/lib copy) and finds
-    // its cu12 runtime deps in ~/.home-still/cuda12-libs.
-    hs_common::service::cuda_bootstrap::ensure_cuda_paths_or_reexec();
+    // Must run before ANY dlopen or tokio init — re-execs self with the
+    // platform's dynamic-lib search path augmented so ort's CUDA provider
+    // (Linux) and pdfium (macOS) load from our bundled directories
+    // instead of the system default.
+    hs_common::service::lib_bootstrap::ensure_lib_paths_or_reexec();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
