@@ -38,6 +38,15 @@ pub enum PipelineCmd {
         #[arg(long)]
         confirm: Option<String>,
     },
+    /// Republish `papers.ingested` for every paper under `papers/` that does
+    /// not yet have a matching markdown file. Use after bringing a new scribe
+    /// worker online mid-rebuild so it can pitch in on the remaining queue.
+    /// Never deletes.
+    CatchUp {
+        /// Report what would be republished without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -47,7 +56,109 @@ pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<
             yes,
             confirm,
         } => cmd_rebuild(dry_run, yes, confirm, reporter).await,
+        PipelineCmd::CatchUp { dry_run } => cmd_catch_up(dry_run, reporter).await,
     }
+}
+
+async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+
+    let papers = storage.list("papers").await.context("list papers prefix")?;
+    let markdown = storage
+        .list("markdown")
+        .await
+        .context("list markdown prefix")?;
+
+    use std::collections::HashSet;
+    let md_stems: HashSet<String> = markdown
+        .iter()
+        .filter_map(|o| {
+            let name = o.key.rsplit('/').next()?;
+            if name.starts_with("._") || !name.ends_with(".md") {
+                return None;
+            }
+            Some(name.trim_end_matches(".md").to_string())
+        })
+        .collect();
+
+    let mut to_republish: Vec<String> = Vec::new();
+    for obj in &papers {
+        let name = match obj.key.rsplit('/').next() {
+            Some(n) if !n.starts_with("._") => n,
+            _ => continue,
+        };
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((s, e)) if e == "pdf" || e == "html" => (s, e),
+            _ => continue,
+        };
+        if md_stems.contains(stem) {
+            continue;
+        }
+        let _ = ext;
+        to_republish.push(obj.key.clone());
+    }
+
+    reporter.status(
+        "Papers",
+        &format!(
+            "{} total, {} have markdown, {} pending republish",
+            papers.len(),
+            md_stems.len(),
+            to_republish.len()
+        ),
+    );
+
+    if dry_run {
+        reporter.finish("Dry-run complete — no events published.");
+        return Ok(());
+    }
+    if to_republish.is_empty() {
+        reporter.finish("Nothing to do — every paper already has markdown.");
+        return Ok(());
+    }
+
+    let bus = cfg
+        .build_event_bus()
+        .await
+        .context("building event bus for papers.ingested publish")?;
+
+    let mut published = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    for (i, key) in to_republish.iter().enumerate() {
+        let payload = serde_json::json!({
+            "key": key,
+            "source": "hs pipeline catch-up",
+        });
+        match bus
+            .publish(
+                "papers.ingested",
+                serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
+            )
+            .await
+        {
+            Ok(()) => published += 1,
+            Err(e) => errors.push(format!("publish/{key}: {e}")),
+        }
+        if (i + 1) % 500 == 0 {
+            reporter.status(
+                "Republish",
+                &format!("published {published}/{}", to_republish.len()),
+            );
+        }
+    }
+
+    reporter.finish(&format!(
+        "Catch-up queued — papers_republished={published} errors={}",
+        errors.len()
+    ));
+    for e in errors.iter().take(10) {
+        eprintln!("  error: {e}");
+    }
+    if errors.len() > 10 {
+        eprintln!("  ... and {} more", errors.len() - 10);
+    }
+    Ok(())
 }
 
 async fn cmd_rebuild(

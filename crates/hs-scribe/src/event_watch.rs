@@ -191,8 +191,13 @@ where
     F: Fn(IngestedEvent) -> Fut + Send + Sync,
     Fut: std::future::Future<Output = Result<()>> + Send,
 {
-    let mut stream = bus.subscribe("papers.ingested").await?;
-    tracing::info!("scribe subscribed to papers.ingested");
+    // Queue-subscribe so multiple scribe hosts load-balance `papers.ingested`
+    // instead of each converting every paper. The broker delivers each
+    // message to exactly one member of the `scribe-workers` group.
+    let mut stream = bus
+        .queue_subscribe("papers.ingested", "scribe-workers")
+        .await?;
+    tracing::info!("scribe subscribed to papers.ingested (queue: scribe-workers)");
 
     while let Some(event) = stream.next().await {
         let parsed: IngestedEvent = match serde_json::from_slice(&event.payload) {

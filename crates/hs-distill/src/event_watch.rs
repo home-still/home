@@ -141,8 +141,13 @@ where
     F: Fn(CompletedEvent) -> Fut + Send + Sync,
     Fut: std::future::Future<Output = Result<()>> + Send,
 {
-    let mut stream = bus.subscribe("scribe.completed").await?;
-    tracing::info!("distill subscribed to scribe.completed");
+    // Queue-subscribe so a future second distill host load-balances
+    // `scribe.completed` instead of both embedding every doc. Only one
+    // distill runs today but the queue group is cheap and future-proofs.
+    let mut stream = bus
+        .queue_subscribe("scribe.completed", "distill-workers")
+        .await?;
+    tracing::info!("distill subscribed to scribe.completed (queue: distill-workers)");
 
     while let Some(event) = stream.next().await {
         let parsed: CompletedEvent = match serde_json::from_slice(&event.payload) {

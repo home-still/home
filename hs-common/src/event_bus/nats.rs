@@ -38,6 +38,18 @@ impl EventBus for NatsBus {
         });
         Ok(Box::pin(stream))
     }
+
+    async fn queue_subscribe(&self, subject: &str, queue: &str) -> anyhow::Result<EventStream> {
+        let sub = self
+            .client
+            .queue_subscribe(subject.to_string(), queue.to_string())
+            .await?;
+        let stream = sub.map(|m| Event {
+            subject: m.subject.to_string(),
+            payload: m.payload.to_vec(),
+        });
+        Ok(Box::pin(stream))
+    }
 }
 
 #[cfg(test)]

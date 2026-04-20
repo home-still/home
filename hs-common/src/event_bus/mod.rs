@@ -24,6 +24,16 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Event> + Send>>;
 pub trait EventBus: Send + Sync {
     async fn publish(&self, subject: &str, payload: &[u8]) -> anyhow::Result<()>;
     async fn subscribe(&self, subject: &str) -> anyhow::Result<EventStream>;
+    /// Subscribe as a member of `queue` so the broker load-balances each
+    /// message to exactly one subscriber in the group. Multiple hosts
+    /// running the same worker (e.g. two scribes) should share a single
+    /// queue group so they split the corpus instead of each converting
+    /// every paper. Default impl falls back to [`subscribe`] for buses
+    /// that don't support queue groups (every subscriber sees every
+    /// message — correct but not work-sharing).
+    async fn queue_subscribe(&self, subject: &str, _queue: &str) -> anyhow::Result<EventStream> {
+        self.subscribe(subject).await
+    }
 }
 
 /// A bus that silently drops publishes and produces no events. Useful as a
