@@ -22,12 +22,15 @@ pub struct IngestedEvent {
     pub source: Option<String>,
 }
 
-/// Given an ingested paper key (PDF or HTML), fetch bytes from `storage`,
-/// convert to markdown, and put the result back under the shared
-/// `markdown/{shard}/{stem}.md` convention. PDFs go through the scribe VLM
-/// server; HTML papers are converted locally. Publishes `scribe.completed`
-/// with the markdown key on success. Skips (returns Ok) if the markdown
-/// already exists — idempotent on retry.
+/// Given an ingested paper key, fetch bytes from `storage`, dispatch to the
+/// converter for its file type (PDF → scribe VLM, HTML → parser, EPUB →
+/// parser), and put the markdown back under `markdown/{shard}/{stem}.md`.
+/// Publishes `scribe.completed` with the markdown key on success. Skips
+/// (returns Ok) if the markdown already exists — idempotent on retry.
+///
+/// Errors (unsupported type, fetch failure, converter failure, VLM
+/// repetition loop) propagate — no catalog row is written. Operators see
+/// the error in tracing logs. No fallback paths, no silent stub stamps.
 pub async fn convert_and_upload(
     storage: &dyn Storage,
     scribe: &ScribeClient,
@@ -39,10 +42,10 @@ pub async fn convert_and_upload(
         .rsplit_once('/')
         .map(|(_, f)| f)
         .unwrap_or(&event.key);
-    let stem = filename
+    let (stem, ext) = filename
         .rsplit_once('.')
-        .map(|(s, _)| s)
-        .unwrap_or(filename);
+        .map(|(s, e)| (s, e.to_ascii_lowercase()))
+        .ok_or_else(|| anyhow::anyhow!("key {} has no extension", event.key))?;
     let md_key = hs_common::markdown::markdown_storage_key(stem);
 
     if storage
@@ -60,29 +63,40 @@ pub async fn convert_and_upload(
         .with_context(|| format!("get({}) failed", event.key))?;
 
     let start = std::time::Instant::now();
-    let is_html = event.key.ends_with(".html") || event.key.ends_with(".htm");
-    let markdown = if is_html {
-        let html = String::from_utf8(raw_bytes)
-            .with_context(|| format!("HTML at {} is not valid UTF-8", event.key))?;
-        crate::html::convert_html_to_markdown(&html)
-    } else {
-        scribe
-            .convert(raw_bytes)
-            .await
-            .with_context(|| format!("scribe convert failed for {}", event.key))?
+    let (markdown, server) = match ext.as_str() {
+        "pdf" => {
+            let md = scribe
+                .convert(raw_bytes)
+                .await
+                .with_context(|| format!("scribe convert failed for {}", event.key))?;
+            (md, "scribe-vlm")
+        }
+        "html" | "htm" => {
+            let html = String::from_utf8(raw_bytes)
+                .with_context(|| format!("HTML at {} is not valid UTF-8", event.key))?;
+            (crate::html::convert_html_to_markdown(&html), "html-parser")
+        }
+        "epub" => {
+            let md = crate::epub::convert_epub_to_markdown(&raw_bytes)
+                .with_context(|| format!("EPUB parse failed for {}", event.key))?;
+            (md, "epub-parser")
+        }
+        other => {
+            anyhow::bail!(
+                "unsupported source type `.{other}` for {} — supported: .pdf, .html, .htm, .epub",
+                event.key
+            );
+        }
     };
     let duration_secs = start.elapsed().as_secs_f64();
 
-    // Strip VLM repetition artifacts before the stub gate / storage write.
-    // The CLI and MCP scribe_convert paths both run this; the event-watch
-    // path was missing it, so server-event conversions were shipping raw
-    // VLM output and poisoning the downstream embeddings.
+    // Strip VLM repetition artifacts (harmless no-op for HTML/EPUB output).
     let (markdown, truncations) = crate::postprocess::clean_repetitions(&markdown);
     if truncations > 0 {
         tracing::info!(
             stem = %stem,
             truncations,
-            "cleaned repetition site(s) before stub gate",
+            "cleaned repetition site(s)",
         );
     }
 
@@ -90,75 +104,38 @@ pub async fn convert_and_upload(
     let total_pages = page_offsets.len() as u64;
 
     // QC gate: runaway truncation counts mean the VLM went into a loop
-    // that clean_repetitions couldn't salvage. Stamp failed and bail
-    // before we pollute storage + Qdrant.
+    // that clean_repetitions couldn't salvage. Treat as a hard error —
+    // the caller logs and moves on; no catalog row is written.
     if crate::postprocess::qc_verdict(truncations, total_pages)
         == crate::postprocess::QcVerdict::RejectLoop
     {
-        let stem_only = stem.to_string();
-        if let Err(e) = hs_common::catalog::update_conversion_failed_via(
-            storage,
-            "catalog",
-            &stem_only,
-            "event-watch",
-            duration_secs,
-            total_pages,
-            "repetition_loop",
-        )
-        .await
-        {
-            tracing::warn!(stem = %stem_only, error = %e, "failed-conversion catalog stamp failed");
-        }
-        tracing::warn!(
-            stem = %stem_only,
-            source_key = %event.key,
-            truncations,
-            total_pages,
-            "VLM repetition loop; not publishing scribe.completed",
+        anyhow::bail!(
+            "VLM repetition loop for {} ({truncations} truncation sites across {total_pages} pages)",
+            event.key
         );
-        return Ok(md_key);
-    }
-
-    // Apply the same stub-document gate the CLI and MCP scribe_convert paths
-    // apply (hs/src/scribe_cmd.rs, hs-mcp/src/main.rs): ≤1 page AND <500
-    // non-whitespace chars OR sub-second convert ⇒ stamp `conversion.failed`
-    // and skip the markdown write. Without this gate, HTML landing pages
-    // (OpenAlex, PMC, DOI metadata-only) become near-empty markdown that
-    // later fails distill embed with `zero_chunks_or_empty`, which the
-    // reconciler classifies as terminal — a silent dead letter.
-    if crate::postprocess::is_stub_pdf(total_pages, &markdown, duration_secs) {
-        let reason = if markdown.trim().is_empty() {
-            "empty_output"
-        } else {
-            "stub_document"
-        };
-        let stem_only = stem.to_string();
-        if let Err(e) = hs_common::catalog::update_conversion_failed_via(
-            storage,
-            "catalog",
-            &stem_only,
-            "event-watch",
-            duration_secs,
-            total_pages,
-            reason,
-        )
-        .await
-        {
-            tracing::warn!(stem = %stem_only, error = %e, "failed-conversion catalog stamp failed");
-        }
-        tracing::warn!(
-            stem = %stem_only,
-            source_key = %event.key,
-            reason = reason,
-            "scribe convert produced stub; not publishing scribe.completed",
-        );
-        return Ok(md_key);
     }
 
     storage
         .put(&md_key, markdown.into_bytes())
         .await
         .with_context(|| format!("put({md_key}) failed"))?;
+
+    // Stamp the catalog with the converter used so downstream can tell
+    // which pipeline produced this markdown without guessing.
+    if let Err(e) = hs_common::catalog::update_conversion_catalog_via(
+        storage,
+        "catalog",
+        stem,
+        server,
+        duration_secs,
+        total_pages,
+        page_offsets,
+        &md_key,
+    )
+    .await
+    {
+        tracing::warn!(stem = %stem, error = %e, "conversion catalog stamp failed");
+    }
 
     let payload = serde_json::json!({
         "key": md_key,

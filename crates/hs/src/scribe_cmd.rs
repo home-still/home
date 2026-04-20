@@ -747,33 +747,6 @@ async fn convert_html_and_save(
     let md = hs_scribe::html::convert_html_to_markdown(&html);
     let page_offsets = crate::catalog::compute_page_offsets(&md);
     let total_pages = page_offsets.len() as u64;
-    let duration_secs = start.elapsed().as_secs_f64();
-
-    // Mirrors the MCP scribe_convert gate: paywall/landing HTML often produces
-    // ≤1 page of mostly-whitespace boilerplate that passes a bare `is_empty`
-    // check but is semantically empty. Stamp as failed so it doesn't keep
-    // re-entering backfill loops.
-    if hs_scribe::postprocess::is_stub_pdf(total_pages, &md, duration_secs) {
-        reporter.warn(&format!(
-            "{stem}: HTML conversion produced stub document (≤1 page, <500 non-whitespace chars or sub-second convert)"
-        ));
-        if let Err(e) = hs_common::catalog::update_conversion_failed_via(
-            storage,
-            catalog_prefix,
-            &stem,
-            "local-html",
-            duration_secs,
-            total_pages,
-            "stub_document",
-        )
-        .await
-        {
-            reporter.warn(&format!("{stem}: failed-conversion catalog stamp: {e}"));
-        }
-        stats.processing.fetch_sub(1, Relaxed);
-        stats.failed.fetch_add(1, Relaxed);
-        return;
-    }
 
     stats.processing.fetch_sub(1, Relaxed);
 
@@ -790,7 +763,7 @@ async fn convert_html_and_save(
         storage,
         catalog_prefix,
         &stem,
-        "local-html",
+        "html-parser",
         start.elapsed().as_secs_f64(),
         total_pages.max(1),
         page_offsets,
@@ -1348,27 +1321,9 @@ async fn convert_and_save_pool(
             if hs_scribe::postprocess::qc_verdict(truncations, qc_total_pages)
                 == hs_scribe::postprocess::QcVerdict::RejectLoop
             {
-                let duration_secs = start_time.elapsed().as_secs_f64();
-                let short_server = server_url
-                    .strip_prefix("http://")
-                    .or_else(|| server_url.strip_prefix("https://"))
-                    .unwrap_or(&server_url);
                 reporter.warn(&format!(
                     "{stem}: VLM repetition loop ({truncations} site(s), {qc_total_pages} pg) → quarantined"
                 ));
-                if let Err(e) = hs_common::catalog::update_conversion_failed_via(
-                    storage,
-                    catalog_prefix,
-                    &stem,
-                    short_server,
-                    duration_secs,
-                    qc_total_pages,
-                    "repetition_loop",
-                )
-                .await
-                {
-                    reporter.warn(&format!("{stem}: catalog stamp failed: {e}"));
-                }
                 quarantine_file(pdf_path, corrupted_dir);
                 stats.failed.fetch_add(1, Relaxed);
                 if let Some(ref s) = stage_handle {
@@ -1405,18 +1360,6 @@ async fn convert_and_save_pool(
                 let page_offsets = crate::catalog::compute_page_offsets(&md);
                 let total_pages = total_pages_counter.load(std::sync::atomic::Ordering::Relaxed);
                 let duration_secs = start_time.elapsed().as_secs_f64();
-
-                // Quarantine stub PDFs (landing pages, paywalls, sub-second returns)
-                if hs_scribe::postprocess::is_stub_pdf(total_pages, &md, duration_secs) {
-                    reporter.warn(&format!(
-                        "{stem}: stub PDF (1pg, minimal content or sub-second convert) → quarantined"
-                    ));
-                    let _ = storage.delete(&md_key).await;
-                    quarantine_file(pdf_path, corrupted_dir);
-                    stats.completed.fetch_sub(1, Relaxed);
-                    stats.failed.fetch_add(1, Relaxed);
-                    return;
-                }
 
                 if let Err(e) = hs_common::catalog::update_conversion_catalog_via(
                     storage,
@@ -2170,8 +2113,6 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
                 total_pages,
                 converted_at: chrono::Utc::now().to_rfc3339(),
                 pages: hs_common::catalog::compute_page_offsets(&content),
-                failed: false,
-                reason: None,
             }),
             ..Default::default()
         };

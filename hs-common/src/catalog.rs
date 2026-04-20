@@ -57,28 +57,23 @@ pub struct CatalogEntry {
     pub repair: Option<RepairMeta>,
 }
 
+/// A successful conversion. The presence of this struct on a catalog
+/// entry means "markdown exists and is usable" — there is no `failed`
+/// state. If a converter errors, the operator sees it in logs and no
+/// `conversion` block is written. One path per feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversionMeta {
+    /// Descriptive name of the converter that produced this markdown:
+    /// `"scribe-vlm"`, `"html-parser"`, `"epub-parser"`, or a
+    /// `"catalog_repair:<direction>"` marker for synthesized repair rows.
     pub server: String,
     /// Wall-clock convert time. Stored as `f64` so sub-second conversions
-    /// (e.g. stub PDFs that fail in 200 ms) don't read as zero. YAML 1.2
-    /// scalar conversion lets older integer-valued rows continue to parse.
+    /// (tiny EPUBs / HTMLs) don't read as zero.
     pub duration_secs: f64,
     pub total_pages: u64,
     pub converted_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<PageOffset>,
-    /// Set when the conversion path detected a degenerate result (e.g.
-    /// empty output) and chose to record the failure rather than emit a
-    /// silent success row.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub failed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,8 +165,6 @@ pub fn update_conversion_catalog(
         total_pages,
         converted_at: chrono::Utc::now().to_rfc3339(),
         pages,
-        failed: false,
-        reason: None,
     });
 
     write_catalog_entry(catalog_dir, stem, &entry);
@@ -338,39 +331,8 @@ pub async fn update_conversion_catalog_via(
         total_pages,
         converted_at: chrono::Utc::now().to_rfc3339(),
         pages,
-        failed: false,
-        reason: None,
     });
 
-    write_catalog_entry_via(storage, prefix, stem, &entry).await
-}
-
-/// Stamp a failed conversion (e.g. empty-output guard tripped) instead of
-/// emitting a silent success row. Pairs with `update_conversion_catalog_via`
-/// so callers can branch on a content-quality check before recording the
-/// outcome.
-#[cfg(feature = "storage")]
-pub async fn update_conversion_failed_via(
-    storage: &dyn crate::storage::Storage,
-    prefix: &str,
-    stem: &str,
-    server: &str,
-    duration_secs: f64,
-    total_pages: u64,
-    reason: &str,
-) -> anyhow::Result<()> {
-    let mut entry = read_catalog_entry_via(storage, prefix, stem)
-        .await
-        .unwrap_or_default();
-    entry.conversion = Some(ConversionMeta {
-        server: server.to_string(),
-        duration_secs,
-        total_pages,
-        converted_at: chrono::Utc::now().to_rfc3339(),
-        pages: Vec::new(),
-        failed: true,
-        reason: Some(reason.to_string()),
-    });
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
 
@@ -506,13 +468,11 @@ mod storage_tests {
 
         let entry = CatalogEntry {
             conversion: Some(ConversionMeta {
-                server: "scribe".into(),
+                server: "scribe-vlm".into(),
                 duration_secs: 0.42,
                 total_pages: 1,
                 converted_at: "2026-04-15T19:50:02Z".into(),
                 pages: vec![],
-                failed: true,
-                reason: Some("stub_document".into()),
             }),
             ..Default::default()
         };

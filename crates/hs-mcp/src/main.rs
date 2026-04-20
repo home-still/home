@@ -567,7 +567,7 @@ impl HomeStillMcp {
     // ── Catalog Tools ──────────────────────────────────────────
 
     #[tool(
-        description = "List all papers in the catalog with titles, conversion status, and embedded-in-Qdrant status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed. Flag semantics: `converted` is true only when a successful conversion record exists; failed conversions show as `conversion_failed=true, converted=false` (mutually exclusive). `embedded` is true only when Qdrant actually received chunks (`chunks_indexed > 0`).",
+        description = "List all papers in the catalog with titles, conversion status, and embedded-in-Qdrant status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed. Flag semantics: `converted` is true iff markdown exists (converters don't write failure rows — errors propagate and leave no catalog record). `embedded` is true only when Qdrant actually received chunks (`chunks_indexed > 0`).",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -604,12 +604,10 @@ impl HomeStillMcp {
             .map(|(stem, _meta, cat)| {
                 let title = cat.title.unwrap_or_default();
                 let downloaded = cat.downloaded_at.is_some();
-                // `converted` means successfully converted. A failed
-                // conversion record shows as `conversion_failed=true,
-                // converted=false` — the two flags are mutually exclusive so
-                // clients can treat `converted` as "markdown is usable."
-                let converted = cat.conversion.as_ref().is_some_and(|c| !c.failed);
-                let conversion_failed = cat.conversion.as_ref().is_some_and(|c| c.failed);
+                // `converted` means markdown exists. Converters don't stamp
+                // failure rows — errors propagate and no catalog record is
+                // written, so `conversion.is_some()` is always truthful.
+                let converted = cat.conversion.is_some();
                 let embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
                 let embedding_skipped = cat.embedding_skip.is_some();
                 let repaired = cat.repair.is_some();
@@ -618,7 +616,6 @@ impl HomeStillMcp {
                     "title": title,
                     "downloaded": downloaded,
                     "converted": converted,
-                    "conversion_failed": conversion_failed,
                     "embedded": embedded,
                     "embedding_skipped": embedding_skipped,
                     "repaired": repaired,
@@ -698,8 +695,7 @@ impl HomeStillMcp {
                         "name": name,
                         "pages": conv.total_pages,
                         "duration_secs": conv.duration_secs,
-                        "failed": conv.failed,
-                        "reason": conv.reason,
+                        "server": conv.server,
                         "at": conv.converted_at,
                     });
                     if is_repair {
@@ -1135,11 +1131,6 @@ impl HomeStillMcp {
                     total_pages: 0,
                     converted_at,
                     pages: Vec::new(),
-                    failed: false,
-                    reason: Some(
-                        "backfilled by flag_drift repair; markdown existed without conversion stamp"
-                            .to_string(),
-                    ),
                 });
                 drift_conversion_repaired += 1;
                 changed = true;
@@ -1746,8 +1737,12 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let pdf_key = hs_common::sharded_key(&p.stem, "pdf");
         let html_key = hs_common::sharded_key(&p.stem, "html");
+        let epub_key = hs_common::sharded_key(&p.stem, "epub");
 
         let start = std::time::Instant::now();
+        // Dispatch by source type — one path per file extension. No
+        // fallback between types; if the named source isn't present, we
+        // error loudly instead of silently converting something else.
         let (md, source_key, server_label) = if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await
         {
             let client = self.scribe_client().ok_or("No scribe server configured")?;
@@ -1782,24 +1777,19 @@ impl HomeStillMcp {
                 .convert_with_progress(pdf_bytes, on_progress)
                 .await
                 .map_err(|e| format!("Conversion failed: {e}"))?;
-            let server_url = self
-                .scribe_servers
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            let short = server_url
-                .strip_prefix("http://")
-                .or_else(|| server_url.strip_prefix("https://"))
-                .unwrap_or(server_url);
-            (md, pdf_key, short.to_string())
+            (md, pdf_key, "scribe-vlm".to_string())
         } else if let Ok(html_bytes) = self.storage.get(&html_key).await {
             let html = String::from_utf8(html_bytes)
                 .map_err(|e| format!("HTML at {html_key} is not valid UTF-8: {e}"))?;
             let md = hs_scribe::html::convert_html_to_markdown(&html);
-            (md, html_key, "local-html".to_string())
+            (md, html_key, "html-parser".to_string())
+        } else if let Ok(epub_bytes) = self.storage.get(&epub_key).await {
+            let md = hs_scribe::epub::convert_epub_to_markdown(&epub_bytes)
+                .map_err(|e| format!("EPUB parse failed for {epub_key}: {e}"))?;
+            (md, epub_key, "epub-parser".to_string())
         } else {
             return Err(format!(
-                "No PDF or HTML found for '{}' (tried {pdf_key} and {html_key})",
+                "No PDF, HTML, or EPUB found for '{}' (tried {pdf_key}, {html_key}, {epub_key})",
                 p.stem
             ));
         };
@@ -1813,48 +1803,14 @@ impl HomeStillMcp {
         let page_offsets = hs_common::catalog::compute_page_offsets(&md);
         let total_pages = page_offsets.len() as u64;
 
+        // VLM repetition-loop check: propagate as a hard error. No catalog
+        // row is written — operator sees it in MCP error response + logs.
         if hs_scribe::postprocess::qc_verdict(truncations, total_pages)
             == hs_scribe::postprocess::QcVerdict::RejectLoop
         {
-            if let Err(e) = hs_common::catalog::update_conversion_failed_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &p.stem,
-                &server_label,
-                duration_secs,
-                total_pages,
-                "repetition_loop",
-            )
-            .await
-            {
-                tracing::warn!("failed-conversion catalog stamp failed for {}: {e}", p.stem);
-            }
             return Err(format!(
                 "{}: VLM repetition loop ({} truncation site(s) across {} page(s)) — not persisted",
                 p.stem, truncations, total_pages
-            ));
-        }
-
-        if hs_scribe::postprocess::is_stub_pdf(total_pages, &md, duration_secs) {
-            // Record the failure on the catalog so the doc isn't silently
-            // retried by every backfill pass, and so it's visible in
-            // `catalog_list` via the `conversion_failed` flag.
-            if let Err(e) = hs_common::catalog::update_conversion_failed_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &p.stem,
-                &server_label,
-                duration_secs,
-                total_pages,
-                "stub_document",
-            )
-            .await
-            {
-                tracing::warn!("failed-conversion catalog stamp failed for {}: {e}", p.stem);
-            }
-            return Err(format!(
-                "{}: stub document (≤1 page, <500 non-whitespace chars or sub-second convert) — not persisted",
-                p.stem
             ));
         }
 
@@ -2344,7 +2300,7 @@ impl HomeStillMcp {
         let candidates: Vec<String> = triples
             .into_iter()
             .filter_map(|(stem, _meta, cat)| {
-                let converted = cat.conversion.as_ref().is_some_and(|c| !c.failed);
+                let converted = cat.conversion.is_some();
                 let already_embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
                 let was_skipped = cat.embedding_skip.is_some();
                 if !converted || already_embedded {
@@ -2599,16 +2555,6 @@ impl HomeStillMcp {
                 .await
                 .ok();
 
-        let conversion_failed = catalog_triples
-            .as_ref()
-            .map(|triples| {
-                triples
-                    .iter()
-                    .filter(|(_, _, e)| e.conversion.as_ref().is_some_and(|c| c.failed))
-                    .count() as u64
-            })
-            .unwrap_or(0);
-
         let mut pipeline = collect_pipeline_counts(
             &*self.storage,
             &self.papers_prefix,
@@ -2618,31 +2564,18 @@ impl HomeStillMcp {
             embedded_chunks,
         )
         .await;
-        pipeline.conversion_failed = conversion_failed;
 
-        // Pipeline drift: rows in `documents` that the next-stage counts don't
-        // claim. Saturating subtraction so under-counting a stage never yields
-        // a negative (i.e. drift can only be >= 0). Testers assert the value
-        // stays at or below PIPELINE_DRIFT_THRESHOLD.
+        // Pipeline drift: source documents that haven't produced markdown
+        // yet. Saturating subtraction so stage lag never yields a negative.
+        // With no "failed" catalog semantics, drift is simply
+        // `documents - markdown - in_flight`. Values above
+        // `pipeline_drift_threshold` indicate stems that errored during
+        // conversion (no catalog row is written on error — the operator
+        // sees the cause in scribe/event-watch logs).
         let total_in_flight: u64 = scribe_instances.iter().map(|s| s.in_flight).sum();
-        // Compute the signed raw drift first so the opposite direction
-        // (stages claiming more rows than `documents` holds — e.g. markdown
-        // still on disk for a row newly stamped `failed=true`) is surfaced
-        // as `flag_overlap`. The saturating gate below remains unchanged
-        // for existing alerts.
-        let raw_drift: i64 = pipeline.documents as i64
-            - pipeline.markdown as i64
-            - pipeline.conversion_failed as i64
-            - total_in_flight as i64;
-        pipeline.flag_overlap = if raw_drift < 0 {
-            raw_drift.unsigned_abs()
-        } else {
-            0
-        };
         pipeline.pipeline_drift = pipeline
             .documents
             .saturating_sub(pipeline.markdown)
-            .saturating_sub(pipeline.conversion_failed)
             .saturating_sub(total_in_flight);
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
 

@@ -18,9 +18,6 @@ struct DashboardData {
     doc_counts: Option<(u64, u64)>,
     markdown_counts: Option<(u64, u64)>,
     catalog_count: Option<u64>,
-    /// Catalog rows with `conversion.failed == true` — accounts for the
-    /// Documents − Markdown gap so the pipeline math reconciles on screen.
-    failed_count: Option<u64>,
     corrupted_count: Option<u64>,
     embedded_docs: u64,
     embedded_chunks: u64,
@@ -111,7 +108,6 @@ async fn collect_data() -> DashboardData {
                 doc_counts: None,
                 markdown_counts: None,
                 catalog_count: None,
-                failed_count: None,
                 corrupted_count: None,
                 embedded_docs: 0,
                 embedded_chunks: 0,
@@ -244,7 +240,6 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         doc_counts: Some((snap.pipeline.documents, 0)),
         markdown_counts: Some((snap.pipeline.markdown, 0)),
         catalog_count: Some(snap.pipeline.catalog_entries),
-        failed_count: Some(snap.pipeline.conversion_failed),
         corrupted_count: None,
         embedded_docs: snap.pipeline.embedded_documents.unwrap_or(0),
         embedded_chunks: snap.pipeline.embedded_chunks.unwrap_or(0),
@@ -479,13 +474,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let markdown_count = data.markdown_counts.map(|(c, _)| c).unwrap_or(0);
     let markdown_bytes = data.markdown_counts.map(|(_, b)| b).unwrap_or(0);
     let catalog_count = data.catalog_count.unwrap_or(0);
-    let failed_count = data.failed_count.unwrap_or(0);
     let corrupted_count = data.corrupted_count.unwrap_or(0);
-    let failed_pct = if doc_count > 0 {
-        (failed_count as f64 / doc_count as f64).min(1.0)
-    } else {
-        0.0
-    };
 
     let convertible = doc_count.saturating_sub(corrupted_count);
     let pdf_to_md = if convertible > 0 {
@@ -556,21 +545,6 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
             }),
             Cell::from(if data.markdown_counts.is_some() {
                 format!("{:>5.1}%", pdf_to_md * 100.0)
-            } else {
-                String::new()
-            }),
-        ]),
-        Row::new(vec![
-            Cell::from("Failed").style(Style::default().fg(Color::Yellow)),
-            Cell::from(if data.failed_count.is_some() {
-                format!("{:>6}", failed_count)
-            } else {
-                scanning.clone()
-            })
-            .style(Style::default().fg(Color::Yellow)),
-            Cell::from(""),
-            Cell::from(if data.failed_count.is_some() {
-                format!("{:>5.1}%", failed_pct * 100.0)
             } else {
                 String::new()
             }),
@@ -925,7 +899,6 @@ pub async fn run() -> Result<()> {
         doc_counts: None,
         markdown_counts: None,
         catalog_count: None,
-        failed_count: None,
         corrupted_count: None,
         embedded_docs: 0,
         embedded_chunks: 0,
@@ -962,7 +935,6 @@ pub async fn run() -> Result<()> {
                         data.doc_counts = new_data.doc_counts.or(data.doc_counts);
                         data.markdown_counts = new_data.markdown_counts.or(data.markdown_counts);
                         data.catalog_count = new_data.catalog_count.or(data.catalog_count);
-                        data.failed_count = new_data.failed_count.or(data.failed_count);
                         data.corrupted_count = new_data.corrupted_count.or(data.corrupted_count);
                         data.fs_stalled_docs = new_data.fs_stalled_docs;
                         data.fs_stalled_markdown = new_data.fs_stalled_markdown;

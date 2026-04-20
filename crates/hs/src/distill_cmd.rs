@@ -1283,7 +1283,6 @@ async fn cmd_reconcile(
                 stem,
                 CatalogState {
                     has_embedding_stamp: entry.embedding.is_some(),
-                    conversion_failed: entry.conversion.as_ref().is_some_and(|c| c.failed),
                     embedding_skip_reason: entry.embedding_skip.map(|s| s.reason),
                 },
             )

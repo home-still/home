@@ -70,18 +70,6 @@ pub fn qc_verdict(truncations: usize, total_pages: u64) -> QcVerdict {
     QcVerdict::Accept
 }
 
-/// Detect stub PDFs: 1-page results that are either short on content (landing
-/// pages, paywalls) OR returned suspiciously fast (under a second — a real
-/// VLM pass cannot complete in that time; the "content" is almost certainly a
-/// cached or malformed response).
-pub fn is_stub_pdf(total_pages: u64, markdown: &str, duration_secs: f64) -> bool {
-    if total_pages > 1 {
-        return false;
-    }
-    let non_ws = markdown.chars().filter(|c| !c.is_whitespace()).count();
-    non_ws < 500 || duration_secs < 1.0
-}
-
 /// Clean repetition artifacts from markdown text.
 ///
 /// Returns `(cleaned_text, truncation_count)` where `truncation_count`
@@ -356,36 +344,5 @@ mod tests {
         let (output, count) = clean_repetitions(input);
         assert_eq!(output, input);
         assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn stub_short_content() {
-        // 1 page, few chars, plausible duration → stub
-        let md = "# Title\n\nnot much here";
-        assert!(is_stub_pdf(1, md, 2.5));
-    }
-
-    #[test]
-    fn stub_sub_second() {
-        // 1 page, plenty of chars, but impossibly fast → stub.
-        // A real VLM pass cannot complete a page in under 1s; this
-        // case catches cached/empty scribe responses that slipped
-        // the char-count gate.
-        let md = "x".repeat(2000);
-        assert!(is_stub_pdf(1, &md, 0.0));
-    }
-
-    #[test]
-    fn real_short_paper_not_stub() {
-        // Multi-page, even with brief content → not a stub.
-        let md = "# Short paper\n\nabstract body.";
-        assert!(!is_stub_pdf(2, md, 0.5));
-    }
-
-    #[test]
-    fn real_long_paper_not_stub() {
-        // 1 page with enough real content and plausible duration.
-        let md = "a".repeat(2000);
-        assert!(!is_stub_pdf(1, &md, 3.0));
     }
 }
