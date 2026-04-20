@@ -461,6 +461,14 @@ pub struct FlagDriftRow {
     /// Row has `downloaded_at == None` but a PDF/HTML object exists — catalog
     /// pre-dates `downloaded_at`, or a synthetic repair row was upgraded.
     pub download_stamp_missing_with_source: bool,
+    /// `last_modified` of the source PDF/HTML object, if present. Lets the
+    /// repair write a per-object `downloaded_at` drawn from storage truth
+    /// instead of a shared batch `now()` — without this the whole repair
+    /// pass collapses into one nanosecond in the activity feed.
+    pub source_last_modified: Option<std::time::SystemTime>,
+    /// `last_modified` of the markdown object, if present. Same purpose for
+    /// the synthetic Convert stamp emitted when `conversion_missing_with_markdown`.
+    pub markdown_last_modified: Option<std::time::SystemTime>,
 }
 
 /// List catalog rows whose stage flags are out of sync with storage.
@@ -482,53 +490,180 @@ pub async fn list_catalog_flag_drift(
     let papers = storage.list(papers_prefix).await?;
     let markdown = storage.list(markdown_prefix).await?;
 
-    use std::collections::HashSet;
-    let paper_stems: HashSet<String> = papers
-        .iter()
-        .filter_map(|o| {
-            let filename = o.key.rsplit('/').next()?;
-            if filename.starts_with("._") {
-                return None;
+    use std::collections::HashMap;
+    // Keep the `last_modified` per stem so the repair can emit per-object
+    // timestamps. PDF wins over HTML when both exist, matching the preference
+    // in `list_catalog_stuck_convert`.
+    let mut paper_mtime_by_stem: HashMap<String, (String, Option<std::time::SystemTime>)> =
+        HashMap::new();
+    for o in papers.iter() {
+        let Some(filename) = o.key.rsplit('/').next() else {
+            continue;
+        };
+        if filename.starts_with("._") {
+            continue;
+        }
+        let Some((stem, ext)) = filename.rsplit_once('.') else {
+            continue;
+        };
+        match ext {
+            "pdf" => {
+                paper_mtime_by_stem.insert(stem.to_string(), (ext.to_string(), o.last_modified));
             }
-            let (stem, ext) = filename.rsplit_once('.')?;
-            if ext == "pdf" || ext == "html" {
-                Some(stem.to_string())
-            } else {
-                None
+            "html" => {
+                paper_mtime_by_stem
+                    .entry(stem.to_string())
+                    .or_insert_with(|| (ext.to_string(), o.last_modified));
             }
-        })
-        .collect();
-    let md_stems: HashSet<String> = markdown
-        .iter()
-        .filter_map(|o| {
-            if !o.key.ends_with(".md") {
-                return None;
-            }
-            let filename = o.key.rsplit('/').next()?;
-            if filename.starts_with("._") {
-                return None;
-            }
-            Some(filename.trim_end_matches(".md").to_string())
-        })
-        .collect();
+            _ => {}
+        }
+    }
+    let mut md_mtime_by_stem: HashMap<String, Option<std::time::SystemTime>> = HashMap::new();
+    for o in markdown.iter() {
+        if !o.key.ends_with(".md") {
+            continue;
+        }
+        let Some(filename) = o.key.rsplit('/').next() else {
+            continue;
+        };
+        if filename.starts_with("._") {
+            continue;
+        }
+        let stem = filename.trim_end_matches(".md").to_string();
+        md_mtime_by_stem.insert(stem, o.last_modified);
+    }
 
     let mut drift: Vec<FlagDriftRow> = Vec::new();
     for (stem, _meta, entry) in triples {
         if entry.conversion.as_ref().is_some_and(|c| c.failed) {
             continue;
         }
-        let conversion_missing = entry.conversion.is_none() && md_stems.contains(&stem);
-        let download_missing = entry.downloaded_at.is_none() && paper_stems.contains(&stem);
+        let md_hit = md_mtime_by_stem.get(&stem).copied();
+        let paper_hit = paper_mtime_by_stem.get(&stem).cloned();
+        let conversion_missing = entry.conversion.is_none() && md_hit.is_some();
+        let download_missing = entry.downloaded_at.is_none() && paper_hit.is_some();
         if conversion_missing || download_missing {
             drift.push(FlagDriftRow {
                 stem,
                 conversion_missing_with_markdown: conversion_missing,
                 download_stamp_missing_with_source: download_missing,
+                source_last_modified: paper_hit.and_then(|(_ext, mtime)| mtime),
+                markdown_last_modified: md_hit.flatten(),
             });
         }
     }
     drift.sort_by(|a, b| a.stem.cmp(&b.stem));
     Ok(drift)
+}
+
+/// A catalog row whose `downloaded_at` or synthetic-Convert `converted_at`
+/// matches its `repair.repaired_at` to the nanosecond — the fingerprint of a
+/// prior `catalog_repair` flag_drift pass that stamped every row with one
+/// batch `now()`. Rewritable to the storage object's `last_modified` so the
+/// activity feed recovers useful chronology.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+#[derive(Debug, Clone)]
+pub struct FlagDriftResyncCandidate {
+    pub stem: String,
+    /// `downloaded_at` currently equals `repair.repaired_at` and the source
+    /// object has a usable `last_modified`.
+    pub resync_download: Option<std::time::SystemTime>,
+    /// Synthetic flag_drift Convert whose `converted_at` equals
+    /// `repair.repaired_at`; replace with the markdown `last_modified`.
+    pub resync_conversion: Option<std::time::SystemTime>,
+}
+
+/// List catalog rows whose timestamps still carry a prior `catalog_repair`
+/// batch stamp (the "uniform nanosecond" pattern that poisons `catalog_recent`).
+///
+/// Fingerprint (both conditions must hold per field):
+/// - `entry.repair.is_some()` AND
+/// - For download: `entry.downloaded_at == entry.repair.repaired_at`.
+/// - For conversion: `conv.server == "catalog_repair:flag_drift"` AND
+///   `conv.converted_at == entry.repair.repaired_at`.
+///
+/// Only rows with a storage object that actually has a `last_modified` are
+/// returned — otherwise there's nothing better to rewrite to and the resync
+/// would be a no-op.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub async fn list_catalog_flag_drift_resync_candidates(
+    storage: &dyn Storage,
+    papers_prefix: &str,
+    catalog_prefix: &str,
+    markdown_prefix: &str,
+) -> anyhow::Result<Vec<FlagDriftResyncCandidate>> {
+    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
+    let papers = storage.list(papers_prefix).await?;
+    let markdown = storage.list(markdown_prefix).await?;
+
+    use std::collections::HashMap;
+    let mut paper_mtime_by_stem: HashMap<String, Option<std::time::SystemTime>> = HashMap::new();
+    for o in papers.iter() {
+        let Some(filename) = o.key.rsplit('/').next() else {
+            continue;
+        };
+        if filename.starts_with("._") {
+            continue;
+        }
+        let Some((stem, ext)) = filename.rsplit_once('.') else {
+            continue;
+        };
+        match ext {
+            "pdf" => {
+                paper_mtime_by_stem.insert(stem.to_string(), o.last_modified);
+            }
+            "html" => {
+                paper_mtime_by_stem
+                    .entry(stem.to_string())
+                    .or_insert(o.last_modified);
+            }
+            _ => {}
+        }
+    }
+    let mut md_mtime_by_stem: HashMap<String, Option<std::time::SystemTime>> = HashMap::new();
+    for o in markdown.iter() {
+        if !o.key.ends_with(".md") {
+            continue;
+        }
+        let Some(filename) = o.key.rsplit('/').next() else {
+            continue;
+        };
+        if filename.starts_with("._") {
+            continue;
+        }
+        let stem = filename.trim_end_matches(".md").to_string();
+        md_mtime_by_stem.insert(stem, o.last_modified);
+    }
+
+    let mut out: Vec<FlagDriftResyncCandidate> = Vec::new();
+    for (stem, _meta, entry) in triples {
+        let Some(ref repair) = entry.repair else {
+            continue;
+        };
+        let repair_at = repair.repaired_at.as_str();
+
+        let resync_download = match entry.downloaded_at.as_deref() {
+            Some(dl) if dl == repair_at => paper_mtime_by_stem.get(&stem).copied().flatten(),
+            _ => None,
+        };
+        let resync_conversion = match entry.conversion.as_ref() {
+            Some(conv)
+                if conv.server == "catalog_repair:flag_drift" && conv.converted_at == repair_at =>
+            {
+                md_mtime_by_stem.get(&stem).copied().flatten()
+            }
+            _ => None,
+        };
+        if resync_download.is_some() || resync_conversion.is_some() {
+            out.push(FlagDriftResyncCandidate {
+                stem,
+                resync_download,
+                resync_conversion,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.stem.cmp(&b.stem));
+    Ok(out)
 }
 
 /// A stuck-convert row: catalog has no `conversion` stamp, but a source
@@ -1042,5 +1177,155 @@ mod md_path_drift_tests {
             .unwrap();
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].resolved_path, "markdown/du/duped.md");
+    }
+}
+
+#[cfg(all(test, feature = "storage", feature = "catalog"))]
+mod flag_drift_tests {
+    use super::*;
+    use crate::catalog::{write_catalog_entry_via, CatalogEntry, ConversionMeta, RepairMeta};
+    use crate::storage::LocalFsStorage;
+
+    #[tokio::test]
+    async fn populates_source_last_modified_from_storage_mtime() {
+        // A catalog row with no `downloaded_at` but a PDF on disk → drift. The
+        // scanner must carry the PDF's `last_modified` through so the repair
+        // can stamp a per-object timestamp instead of a batch `now()`.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            downloaded_at: None,
+            conversion: None,
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "mtimed", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("papers/mt/mtimed.pdf", b"fake pdf".to_vec())
+            .await
+            .unwrap();
+
+        let drift = list_catalog_flag_drift(&storage, "papers", "catalog", "markdown")
+            .await
+            .unwrap();
+        assert_eq!(drift.len(), 1);
+        let row = &drift[0];
+        assert_eq!(row.stem, "mtimed");
+        assert!(row.download_stamp_missing_with_source);
+        assert!(
+            row.source_last_modified.is_some(),
+            "scanner must thread the source object's last_modified through"
+        );
+    }
+
+    #[tokio::test]
+    async fn resync_candidate_detects_batch_stamp_fingerprint() {
+        // Fingerprint: `downloaded_at == repair.repaired_at`. The scanner must
+        // return the stem only when the source object also has a `last_modified`
+        // worth rewriting to — otherwise the resync would be a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let batch_stamp = "2026-04-20T15:09:23.905851118+00:00";
+        let entry = CatalogEntry {
+            downloaded_at: Some(batch_stamp.into()),
+            repair: Some(RepairMeta {
+                repaired_at: batch_stamp.into(),
+                reason: "flag_drift backfill".into(),
+            }),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "resyncable", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("papers/re/resyncable.pdf", b"fake".to_vec())
+            .await
+            .unwrap();
+
+        let candidates =
+            list_catalog_flag_drift_resync_candidates(&storage, "papers", "catalog", "markdown")
+                .await
+                .unwrap();
+        assert_eq!(candidates.len(), 1);
+        let cand = &candidates[0];
+        assert_eq!(cand.stem, "resyncable");
+        assert!(cand.resync_download.is_some());
+        assert!(cand.resync_conversion.is_none());
+    }
+
+    #[tokio::test]
+    async fn resync_candidate_skips_organic_rows() {
+        // A row with `repair.is_some()` but `downloaded_at` DIFFERENT from
+        // `repair.repaired_at` is organic — someone downloaded a paper after a
+        // prior repair stamped the row. Must NOT be reported as resyncable.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            downloaded_at: Some("2026-04-19T10:00:00+00:00".into()),
+            repair: Some(RepairMeta {
+                repaired_at: "2026-04-20T15:09:23.905851118+00:00".into(),
+                reason: "flag_drift backfill".into(),
+            }),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "organic", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("papers/or/organic.pdf", b"fake".to_vec())
+            .await
+            .unwrap();
+
+        let candidates =
+            list_catalog_flag_drift_resync_candidates(&storage, "papers", "catalog", "markdown")
+                .await
+                .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resync_candidate_detects_synthetic_conversion() {
+        // Synthetic Convert fingerprint: `server == "catalog_repair:flag_drift"`
+        // AND `converted_at == repair.repaired_at`. Must be reported with
+        // `resync_conversion` populated from the markdown mtime.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let batch_stamp = "2026-04-20T15:09:23.905851118+00:00";
+        let entry = CatalogEntry {
+            conversion: Some(ConversionMeta {
+                server: "catalog_repair:flag_drift".into(),
+                duration_secs: 0.0,
+                total_pages: 0,
+                converted_at: batch_stamp.into(),
+                pages: vec![],
+                failed: false,
+                reason: Some("backfilled by flag_drift repair".into()),
+            }),
+            repair: Some(RepairMeta {
+                repaired_at: batch_stamp.into(),
+                reason: "flag_drift backfill".into(),
+            }),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "synthconv", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("markdown/sy/synthconv.md", b"md body".to_vec())
+            .await
+            .unwrap();
+
+        let candidates =
+            list_catalog_flag_drift_resync_candidates(&storage, "papers", "catalog", "markdown")
+                .await
+                .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].resync_conversion.is_some());
+        assert!(candidates[0].resync_download.is_none());
     }
 }

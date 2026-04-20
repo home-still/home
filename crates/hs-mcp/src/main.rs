@@ -75,6 +75,16 @@ struct ListParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CatalogRecentParams {
+    #[schemars(description = "Maximum items to return (default: 30)")]
+    limit: Option<usize>,
+    #[schemars(
+        description = "When false (default), suppress rows whose timestamp came from a catalog_repair backfill (`downloaded_at == repair.repaired_at`, or synthetic Convert whose `converted_at == repair.repaired_at`). Set true for forensic mode — repair rows reappear with `\"repair\": true`."
+    )]
+    include_repaired: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct MarkdownReadParams {
     #[schemars(description = "Paper stem name (filename without extension)")]
     stem: String,
@@ -210,6 +220,14 @@ struct DistillBackfillParams {
 
 fn default_true() -> bool {
     true
+}
+
+/// Format a `SystemTime` as an RFC3339 UTC string. Used by `catalog_repair`
+/// to stamp per-object timestamps drawn from storage `last_modified` instead
+/// of a shared batch `now()` — which was the root cause of the `catalog_recent`
+/// "all rows on one nanosecond" anomaly.
+fn system_time_to_rfc3339(t: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
 }
 
 // ── MCP Server ──────────────────────────────────────────────────
@@ -600,7 +618,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Most recent catalog activity across all papers (download/convert/embed events). One row per event, sorted newest first. Used by the status dashboard's History pane.",
+        description = "Most recent catalog activity (download/convert/embed/embed-skip events). One row per event, sorted newest-first by event timestamp; ties broken by stem so output is deterministic. By default excludes rows whose timestamp is a `catalog_repair` backfill stamp (fingerprint: `downloaded_at == repair.repaired_at`, or synthetic Convert whose `converted_at == repair.repaired_at`) so the feed reflects organic activity. Pass `include_repaired=true` for forensic inspection — repair rows reappear annotated `\"repair\": true`. Used by the status dashboard's History pane.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -610,41 +628,73 @@ impl HomeStillMcp {
     )]
     async fn catalog_recent(
         &self,
-        Parameters(p): Parameters<ListParams>,
+        Parameters(p): Parameters<CatalogRecentParams>,
     ) -> Result<String, String> {
         let triples =
             hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
                 .await
                 .map_err(|e| format!("catalog list failed: {e}"))?;
 
+        let include_repaired = p.include_repaired.unwrap_or(false);
+
         let mut events: Vec<serde_json::Value> = Vec::new();
         for (stem, _meta, entry) in triples {
             let name = entry.title.clone().unwrap_or_else(|| stem.clone());
+            let repair_at: Option<&str> = entry.repair.as_ref().map(|r| r.repaired_at.as_str());
+
             if let Some(ref dl_at) = entry.downloaded_at {
-                let size = entry
-                    .file_size_bytes
-                    .map(|b| b.to_string())
-                    .unwrap_or_default();
-                events.push(serde_json::json!({
-                    "activity": "Download",
-                    "stem": stem,
-                    "name": name,
-                    "detail_bytes": entry.file_size_bytes,
-                    "detail": size,
-                    "at": dl_at,
-                }));
+                // Fingerprint: this `downloaded_at` was stamped by a prior
+                // catalog_repair flag_drift pass. Skip by default so the feed
+                // shows organic activity instead of hundreds of batch-stamped
+                // rows collapsed onto one nanosecond.
+                let is_repair = repair_at == Some(dl_at.as_str());
+                if is_repair && !include_repaired {
+                    // skip
+                } else {
+                    let size = entry
+                        .file_size_bytes
+                        .map(|b| b.to_string())
+                        .unwrap_or_default();
+                    let mut row = serde_json::json!({
+                        "activity": "Download",
+                        "stem": stem,
+                        "name": name,
+                        "detail_bytes": entry.file_size_bytes,
+                        "detail": size,
+                        "at": dl_at,
+                    });
+                    if is_repair {
+                        row["repair"] = serde_json::Value::Bool(true);
+                    }
+                    events.push(row);
+                }
             }
             if let Some(ref conv) = entry.conversion {
-                events.push(serde_json::json!({
-                    "activity": "Convert",
-                    "stem": stem,
-                    "name": name,
-                    "pages": conv.total_pages,
-                    "duration_secs": conv.duration_secs,
-                    "failed": conv.failed,
-                    "reason": conv.reason,
-                    "at": conv.converted_at,
-                }));
+                // Synthetic Convert fingerprint: the flag_drift backfill
+                // stamps `server = "catalog_repair:flag_drift"` and shares the
+                // batch `now()` with `repair.repaired_at`. Matching on both
+                // guards against a real conversion that happened to finish at
+                // the same moment as an unrelated repair on another row.
+                let is_repair = conv.server == "catalog_repair:flag_drift"
+                    && repair_at == Some(conv.converted_at.as_str());
+                if is_repair && !include_repaired {
+                    // skip
+                } else {
+                    let mut row = serde_json::json!({
+                        "activity": "Convert",
+                        "stem": stem,
+                        "name": name,
+                        "pages": conv.total_pages,
+                        "duration_secs": conv.duration_secs,
+                        "failed": conv.failed,
+                        "reason": conv.reason,
+                        "at": conv.converted_at,
+                    });
+                    if is_repair {
+                        row["repair"] = serde_json::Value::Bool(true);
+                    }
+                    events.push(row);
+                }
             }
             if let Some(ref emb) = entry.embedding {
                 // TODO: Legacy, deal with it.
@@ -672,10 +722,15 @@ impl HomeStillMcp {
             }
         }
 
+        // Primary sort: RFC3339 lexicographic DESC. Secondary: stem ASC so
+        // ties (common after batch backfills) produce a stable, readable
+        // order instead of whatever the storage `list` happened to return.
         events.sort_by(|a, b| {
             let a_at = a.get("at").and_then(|v| v.as_str()).unwrap_or("");
             let b_at = b.get("at").and_then(|v| v.as_str()).unwrap_or("");
-            b_at.cmp(a_at)
+            let a_stem = a.get("stem").and_then(|v| v.as_str()).unwrap_or("");
+            let b_stem = b.get("stem").and_then(|v| v.as_str()).unwrap_or("");
+            b_at.cmp(a_at).then_with(|| a_stem.cmp(b_stem))
         });
         let limit = p.limit.unwrap_or(30);
         events.truncate(limit);
@@ -709,7 +764,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Reconcile catalog ↔ storage in six directions. Forward: document files (PDFs/HTML) on disk with no catalog row → synthesize minimal catalog entries (carry a `repair` block). Reverse (catalog_no_markdown): catalog rows that claim a successful conversion but whose markdown object is missing → clear the stale `conversion` / `embedding` / `embedding_skip` blocks and purge any stranded Qdrant points so the row re-enters the convert queue (original `downloaded_at` / `sha256` / etc preserved). Phantom (catalog_no_source): catalog rows with neither a paper file nor a markdown in storage → delete the row outright (the YAML is the last trace; with no source to re-derive from, it's unreachable). Flag-drift: rows whose stage flags disagree with storage evidence → backfill the missing stamp without deleting. Md-path-drift: rows whose `markdown_path` points to a stale key (pre-`bc2b6fb` unsharded layout) or is absent while the file exists under a different key → rewrite `markdown_path` to the real storage location (non-destructive). Stuck-convert: rows with a paper file but no conversion stamp → purge any ghost Qdrant points and re-publish `papers.ingested` so the event-watch daemon converts + embeds. Use `dry_run=true` first to see counts in all six directions.",
+        description = "Reconcile catalog ↔ storage in seven directions. Forward: document files (PDFs/HTML) on disk with no catalog row → synthesize minimal catalog entries (carry a `repair` block). Reverse (catalog_no_markdown): catalog rows that claim a successful conversion but whose markdown object is missing → clear the stale `conversion` / `embedding` / `embedding_skip` blocks and purge any stranded Qdrant points so the row re-enters the convert queue (original `downloaded_at` / `sha256` / etc preserved). Phantom (catalog_no_source): catalog rows with neither a paper file nor a markdown in storage → delete the row outright (the YAML is the last trace; with no source to re-derive from, it's unreachable). Flag-drift: rows whose stage flags disagree with storage evidence → backfill the missing stamp from the storage object's `last_modified` (fallback `now()` only when storage can't report one). Flag-drift-resync: rows still carrying a prior flag_drift batch `now()` (fingerprint: `downloaded_at == repair.repaired_at`, or synthetic Convert whose `converted_at == repair.repaired_at`) → rewrite to the storage object's `last_modified` so the activity feed regains chronology. Md-path-drift: rows whose `markdown_path` points to a stale key (pre-`bc2b6fb` unsharded layout) or is absent while the file exists under a different key → rewrite `markdown_path` to the real storage location (non-destructive). Stuck-convert: rows with a paper file but no conversion stamp → purge any ghost Qdrant points and re-publish `papers.ingested` so the event-watch daemon converts + embeds. Use `dry_run=true` first to see counts in all seven directions.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -764,6 +819,20 @@ impl HomeStillMcp {
         .await
         .map_err(|e| format!("flag-drift scan failed: {e}"))?;
 
+        // Flag-drift-resync direction: rows still wearing the fingerprint of a
+        // prior flag_drift batch stamp (`downloaded_at == repair.repaired_at` or
+        // synthetic Convert whose `converted_at == repair.repaired_at`). Rewrite
+        // to the storage object's `last_modified` so the activity feed stops
+        // showing hundreds of rows collapsed onto one nanosecond.
+        let resync_rows = hs_common::status::list_catalog_flag_drift_resync_candidates(
+            &*self.storage,
+            &self.papers_prefix,
+            &self.catalog_prefix,
+            &self.markdown_prefix,
+        )
+        .await
+        .map_err(|e| format!("flag-drift-resync scan failed: {e}"))?;
+
         // Md-path-drift direction: catalog `markdown_path` disagrees with
         // where the markdown actually lives. Post-`bc2b6fb` the physical
         // layout moved from `markdown/<stem>.md` to `markdown/{XX}/<stem>.md`,
@@ -811,6 +880,15 @@ impl HomeStillMcp {
             .iter()
             .filter(|r| r.download_stamp_missing_with_source)
             .count();
+        let resync_total = resync_rows.len();
+        let resync_download_total = resync_rows
+            .iter()
+            .filter(|r| r.resync_download.is_some())
+            .count();
+        let resync_conversion_total = resync_rows
+            .iter()
+            .filter(|r| r.resync_conversion.is_some())
+            .count();
         let limit = p.limit.unwrap_or(usize::MAX);
         let disk_samples: Vec<String> = disk_orphans
             .iter()
@@ -821,6 +899,11 @@ impl HomeStillMcp {
         let phantom_samples: Vec<String> = phantom_orphans.iter().take(10).cloned().collect();
         let drift_samples: Vec<String> =
             drift_rows.iter().take(10).map(|r| r.stem.clone()).collect();
+        let resync_samples: Vec<String> = resync_rows
+            .iter()
+            .take(10)
+            .map(|r| r.stem.clone())
+            .collect();
         let md_path_drift_samples: Vec<serde_json::Value> = md_path_drift_rows
             .iter()
             .take(10)
@@ -861,6 +944,12 @@ impl HomeStillMcp {
                     "would_backfill_conversion": drift_conversion_total.min(limit),
                     "would_backfill_downloaded_at": drift_download_total.min(limit),
                     "samples": drift_samples,
+                },
+                "flag_drift_resync": {
+                    "candidates_found": resync_total,
+                    "would_resync_downloaded_at": resync_download_total.min(limit),
+                    "would_resync_conversion": resync_conversion_total.min(limit),
+                    "samples": resync_samples,
                 },
                 "md_path_drift": {
                     "drift_found": md_path_drift_total,
@@ -999,6 +1088,13 @@ impl HomeStillMcp {
         // record that the metadata came from repair so operators can tell
         // organic stamps from repair stamps, and re-run `distill_reindex`
         // if they need accurate page offsets.
+        //
+        // Stamp values come from the source object's `last_modified` (S3
+        // LastModified / fs mtime) — NOT a shared batch `now()`. The prior
+        // behavior collapsed every repaired row onto one nanosecond, which
+        // poisoned `catalog_recent` for gap detection. `now` is used only
+        // for `RepairMeta.repaired_at`, which legitimately reflects when
+        // the repair itself ran.
         let mut drift_conversion_repaired = 0u64;
         let mut drift_download_repaired = 0u64;
         for row in drift_rows.iter().take(limit) {
@@ -1017,11 +1113,15 @@ impl HomeStillMcp {
             };
             let mut changed = false;
             if row.conversion_missing_with_markdown && entry.conversion.is_none() {
+                let converted_at = row
+                    .markdown_last_modified
+                    .map(system_time_to_rfc3339)
+                    .unwrap_or_else(|| now.clone());
                 entry.conversion = Some(hs_common::catalog::ConversionMeta {
                     server: "catalog_repair:flag_drift".to_string(),
                     duration_secs: 0.0,
                     total_pages: 0,
-                    converted_at: now.clone(),
+                    converted_at,
                     pages: Vec::new(),
                     failed: false,
                     reason: Some(
@@ -1033,7 +1133,11 @@ impl HomeStillMcp {
                 changed = true;
             }
             if row.download_stamp_missing_with_source && entry.downloaded_at.is_none() {
-                entry.downloaded_at = Some(now.clone());
+                let downloaded_at = row
+                    .source_last_modified
+                    .map(system_time_to_rfc3339)
+                    .unwrap_or_else(|| now.clone());
+                entry.downloaded_at = Some(downloaded_at);
                 drift_download_repaired += 1;
                 changed = true;
             }
@@ -1052,6 +1156,64 @@ impl HomeStillMcp {
                 .await
                 {
                     errors.push(format!("drift/{}: {e}", row.stem));
+                }
+            }
+        }
+
+        // Flag-drift-resync: for rows whose timestamps still carry a prior
+        // batch `now()` stamp, rewrite `downloaded_at` / synthetic Convert
+        // `converted_at` to the storage `last_modified`. Leaves `entry.repair`
+        // intact so the audit trail of "this came from a backfill" survives.
+        let mut resync_download_repaired = 0u64;
+        let mut resync_conversion_repaired = 0u64;
+        for row in resync_rows.iter().take(limit) {
+            let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &row.stem,
+            )
+            .await
+            else {
+                errors.push(format!(
+                    "resync/{}: catalog entry vanished mid-repair",
+                    row.stem
+                ));
+                continue;
+            };
+            // Re-verify the fingerprint on the freshly-read entry — guards
+            // against the row being rewritten by another process between scan
+            // and repair.
+            let Some(repair_at) = entry.repair.as_ref().map(|r| r.repaired_at.clone()) else {
+                continue;
+            };
+            let mut changed = false;
+            if let Some(mtime) = row.resync_download {
+                if entry.downloaded_at.as_deref() == Some(repair_at.as_str()) {
+                    entry.downloaded_at = Some(system_time_to_rfc3339(mtime));
+                    resync_download_repaired += 1;
+                    changed = true;
+                }
+            }
+            if let Some(mtime) = row.resync_conversion {
+                if let Some(conv) = entry.conversion.as_mut() {
+                    if conv.server == "catalog_repair:flag_drift" && conv.converted_at == repair_at
+                    {
+                        conv.converted_at = system_time_to_rfc3339(mtime);
+                        resync_conversion_repaired += 1;
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                if let Err(e) = hs_common::catalog::write_catalog_entry_via(
+                    &*self.storage,
+                    &self.catalog_prefix,
+                    &row.stem,
+                    &entry,
+                )
+                .await
+                {
+                    errors.push(format!("resync/{}: {e}", row.stem));
                 }
             }
         }
@@ -1159,6 +1321,12 @@ impl HomeStillMcp {
                 "conversion_backfilled": drift_conversion_repaired,
                 "downloaded_at_backfilled": drift_download_repaired,
                 "samples": drift_samples,
+            },
+            "flag_drift_resync": {
+                "candidates_found": resync_total,
+                "downloaded_at_resynced": resync_download_repaired,
+                "conversion_resynced": resync_conversion_repaired,
+                "samples": resync_samples,
             },
             "md_path_drift": {
                 "drift_found": md_path_drift_total,
