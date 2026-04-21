@@ -61,7 +61,17 @@ pub struct AppConfig {
     pub cloud_url: String,
     pub openai_url: String,
     pub backend: BackendChoice,
-    pub timeout_secs: u64,
+    /// Wall-clock deadline (seconds) for a single PDF convert on the server.
+    /// The handler wraps `process_pdf_*` in `tokio::time::timeout()` — when
+    /// this fires, the inner future chain is dropped, which cancels every
+    /// in-flight VLM request to Ollama (reqwest is cancel-safe) and releases
+    /// the VLM semaphore permit. Without this, a slow Ollama backend (e.g.
+    /// Apple Silicon on big_mac / mac_air) could leave the handler polling
+    /// forever after the client disconnected, wedging all convert slots until
+    /// the process was restarted. Matches the client-side
+    /// `ScribeConfig::convert_timeout_secs` default (900s); tune via
+    /// `HS_SCRIBE_CONVERT_DEADLINE_SECS`.
+    pub convert_deadline_secs: u64,
     pub dpi: u16,
     pub parallel: usize,
     pub pipeline_mode: PipelineMode,
@@ -81,7 +91,7 @@ impl Default for AppConfig {
             cloud_url: "https://api.z.ai/api/paas/v4/layout_parsing".into(),
             openai_url: "http://localhost:8080".into(),
             backend: BackendChoice::Ollama,
-            timeout_secs: 120,
+            convert_deadline_secs: 900,
             dpi: 200,
             parallel: 1,
             pipeline_mode: PipelineMode::PerRegion,

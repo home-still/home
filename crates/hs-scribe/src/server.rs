@@ -12,6 +12,7 @@ use axum::{
 };
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
 pub struct ServerState {
@@ -136,19 +137,36 @@ async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipa
     };
 
     let path = tmp.path().to_str().unwrap_or_default();
-    match state
+    let deadline = Duration::from_secs(state.config.convert_deadline_secs);
+    let fut = state
         .processor
-        .process_pdf_with_shared_sem(path, Arc::clone(&state.vlm_sem))
-        .await
-    {
-        Ok(md) => {
+        .process_pdf_with_shared_sem(path, Arc::clone(&state.vlm_sem));
+    match tokio::time::timeout(deadline, fut).await {
+        Ok(Ok(md)) => {
             record_success(&state.last_conversion_ms, &md);
             (StatusCode::OK, md).into_response()
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!("Processing failed: {e:#}");
             tracing::debug!("Full error chain: {e:?}");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
+        }
+        Err(_elapsed) => {
+            // tokio::time::timeout fired → inner future chain dropped → every
+            // in-flight Ollama request aborts, stage-1 spawn_blocking exits on
+            // the next send to a closed channel, VLM permit released.
+            tracing::error!(
+                deadline_secs = state.config.convert_deadline_secs,
+                "convert deadline exceeded — aborting; slot released"
+            );
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "convert deadline ({}s) exceeded",
+                    state.config.convert_deadline_secs
+                ),
+            )
+                .into_response()
         }
     }
 }
@@ -173,6 +191,7 @@ async fn handle_scribe_stream(
     let path = tmp.path().to_string_lossy().to_string();
     let vlm_sem = Arc::clone(&state.vlm_sem);
 
+    let deadline = Duration::from_secs(state.config.convert_deadline_secs);
     tokio::spawn(async move {
         let _tmp = tmp; // keep temp file alive for the duration of processing
         let _guard = in_flight_guard;
@@ -185,22 +204,34 @@ async fn handle_scribe_stream(
             }
         };
 
-        match state
+        let fut = state
             .processor
-            .process_pdf_with_progress_and_sem(&path, on_progress, vlm_sem)
-            .await
-        {
-            Ok(md) => {
+            .process_pdf_with_progress_and_sem(&path, on_progress, vlm_sem);
+        match tokio::time::timeout(deadline, fut).await {
+            Ok(Ok(md)) => {
                 record_success(&state.last_conversion_ms, &md);
                 let line = StreamLine::Result { markdown: md };
                 if let Ok(json) = serde_json::to_string(&line) {
                     let _ = tx.send(Ok(format!("{json}\n"))).await;
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::error!("Processing failed: {e:#}");
                 tracing::debug!("Full error chain: {e:?}");
                 let line = StreamLine::Error(format!("{e:#}"));
+                if let Ok(json) = serde_json::to_string(&line) {
+                    let _ = tx.send(Ok(format!("{json}\n"))).await;
+                }
+            }
+            Err(_elapsed) => {
+                tracing::error!(
+                    deadline_secs = state.config.convert_deadline_secs,
+                    "convert deadline exceeded — aborting stream; slot released"
+                );
+                let line = StreamLine::Error(format!(
+                    "convert deadline ({}s) exceeded",
+                    state.config.convert_deadline_secs
+                ));
                 if let Ok(json) = serde_json::to_string(&line) {
                     let _ = tx.send(Ok(format!("{json}\n"))).await;
                 }
