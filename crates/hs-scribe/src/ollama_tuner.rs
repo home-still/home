@@ -136,6 +136,23 @@ pub fn decide(cfg: &AutotuneConfig, state: &mut State, latest_rate: f64) -> Acti
         };
     }
 
+    // Zero-rate guard: no converts in the window means we have no
+    // signal. Previously the improvement check `0 >= 0 * 1.05` was
+    // TRUE, so a host that got zero dispatches during its window
+    // would "step up" every tick and climb to the ceiling producing
+    // nothing. Hold + warn instead. Operators can then investigate
+    // why the host is starved (pool misconfig, catch-up backlog
+    // drained, Ollama wedged after a restart, etc.).
+    if latest_rate == 0.0 {
+        tracing::warn!(
+            current_n = state.current_n,
+            best_n = state.best_n,
+            best_rate = state.best_rate,
+            "zero-rate window — holding at current N (no converts to measure)"
+        );
+        return Action::Noop;
+    }
+
     // Need at least one historical sample at current_n (the one we
     // just appended) — but on the very first tick we want to measure
     // once before making any change.
@@ -146,8 +163,9 @@ pub fn decide(cfg: &AutotuneConfig, state: &mut State, latest_rate: f64) -> Acti
         .map(|s| s.rate_per_min)
         .collect();
     if samples_at_current.len() < 2 && state.best_rate == 0.0 {
-        // Bootstrap: record the first sample as the best so we have
-        // something to compare future ticks against.
+        // Bootstrap: record the first (non-zero, per guard above)
+        // sample as the best so we have something to compare future
+        // ticks against.
         state.best_rate = latest_rate;
         state.best_n = state.current_n;
         // Step once in the default (+) direction to begin exploration.
@@ -609,6 +627,48 @@ mod tests {
             converts: 0,
             ts: "1970-01-01T00:00:00Z".into(),
         });
+    }
+
+    #[test]
+    fn zero_rate_holds_without_state_mutation() {
+        // Regression test for the rc.284 bug where 0 >= 0 * 1.05 was
+        // treated as improvement and the hill-climber marched all the
+        // way to the value-list ceiling producing no work.
+        let cfg = base_cfg();
+        let mut state = State::bootstrap(4);
+        push_sample(&mut state, 4, 0.0);
+        let before = (
+            state.current_n,
+            state.best_n,
+            state.best_rate,
+            state.stable_count,
+        );
+        let action = decide(&cfg, &mut state, 0.0);
+        let after = (
+            state.current_n,
+            state.best_n,
+            state.best_rate,
+            state.stable_count,
+        );
+        assert_eq!(action, Action::Noop);
+        assert_eq!(before, after, "zero rate must not mutate state");
+    }
+
+    #[test]
+    fn zero_rate_after_good_sample_also_holds() {
+        // Even if we already have a good best_rate, a subsequent zero
+        // window should not trigger a regression/revert — just hold.
+        let cfg = base_cfg();
+        let mut state = State::bootstrap(8);
+        state.best_n = 8;
+        state.best_rate = 3.0;
+        state.current_n = 8;
+        push_sample(&mut state, 8, 0.0);
+        let action = decide(&cfg, &mut state, 0.0);
+        assert_eq!(action, Action::Noop);
+        assert_eq!(state.current_n, 8);
+        assert_eq!(state.best_n, 8);
+        assert_eq!(state.best_rate, 3.0);
     }
 
     #[test]
