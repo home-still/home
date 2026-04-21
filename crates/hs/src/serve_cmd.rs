@@ -734,12 +734,14 @@ WantedBy=multi-user.target
 /// `systemctl restart ollama` each tick. macOS is not yet supported —
 /// the inner `apply_num_parallel` returns Err on that platform.
 async fn install_autotune_service(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        return install_autotune_service_macos(reporter).await;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = reporter;
-        anyhow::bail!(
-            "scribe-autotune is Linux-only for now (macOS apply path not yet implemented)"
-        );
+        anyhow::bail!("scribe-autotune is only supported on Linux and macOS");
     }
     #[cfg(target_os = "linux")]
     {
@@ -798,6 +800,98 @@ WantedBy=multi-user.target
         ));
         Ok(())
     }
+}
+
+/// macOS counterpart to [`install_autotune_service`]. Installs a
+/// user-level LaunchAgent — no sudo. All three macOS Ollama control
+/// variants (Homebrew, Desktop app, custom LaunchAgent) restart Ollama
+/// via `launchctl` under the invoking user's GUI domain, so the
+/// autotuner itself must also run as that user.
+#[cfg(target_os = "macos")]
+async fn install_autotune_service_macos(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
+    let hs_path = hs_bin.display().to_string();
+    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+    let label = "com.home-still.scribe-autotune";
+    let plist_dir = home_dir.join("Library/LaunchAgents");
+    std::fs::create_dir_all(&plist_dir)?;
+    let plist_path = plist_dir.join(format!("{label}.plist"));
+
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://schemas.apple.com/dtds/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{hs_path}</string>
+        <string>scribe</string>
+        <string>autotune</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/hs-scribe-autotune.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/hs-scribe-autotune.log</string>
+</dict>
+</plist>
+"#
+    );
+
+    reporter.status("Install", &format!("{}", plist_path.display()));
+    std::fs::write(&plist_path, &plist)?;
+
+    // Bootout+bootstrap: load in the GUI user domain and start.
+    // Use the target name (`gui/<uid>/<label>`) for bootout so a
+    // re-install is idempotent. Ignore bootout exit status — missing
+    // is fine on a fresh install.
+    let uid_out = tokio::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .await
+        .context("id -u")?;
+    let uid = String::from_utf8(uid_out.stdout)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| anyhow::anyhow!("could not read uid from `id -u`"))?;
+    let domain = format!("gui/{uid}");
+    let _ = tokio::process::Command::new("launchctl")
+        .args(["bootout", &format!("{domain}/{label}")])
+        .status()
+        .await;
+    let status = tokio::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, plist_path.to_string_lossy().as_ref()])
+        .status()
+        .await
+        .context("launchctl bootstrap failed")?;
+    if !status.success() {
+        anyhow::bail!(
+            "launchctl bootstrap {domain} {} failed",
+            plist_path.display()
+        );
+    }
+
+    reporter.finish(&format!(
+        "Installed and started {label}\n\
+         Logs: tail -f /tmp/hs-scribe-autotune.log\n\
+         State: ~/.home-still/autotune-state.json\n\
+         Remove: hs serve scribe-autotune --uninstall\n\n\
+         Heads up — the autotuner restarts local Ollama on each step,\n\
+         causing ~30-60s VLM outages during its 10-30 minute cycles."
+    ));
+    Ok(())
 }
 
 async fn uninstall_service(service_type: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
