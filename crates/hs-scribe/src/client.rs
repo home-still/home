@@ -111,6 +111,10 @@ impl ScribeClient {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(convert_timeout)
+            // Detect half-open TCP connections within ~30 s instead of the
+            // kernel's default ~2 h. Wi-Fi drops on a laptop scribe used to
+            // strand watcher permits for the full 900 s convert_timeout.
+            .tcp_keepalive(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| Client::new());
         Self {

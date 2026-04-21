@@ -315,13 +315,41 @@ pub(crate) async fn cmd_watch_events(
         let bus = bus_for_handler.clone();
         let pool = pool.clone();
         async move {
-            let client = pool
-                .pick_server()
-                .await
-                .context("no ready scribe servers")?;
-            tracing::info!(server = %client.url(), key = %event.key, "dispatching event");
-            convert_and_upload(storage.as_ref(), client, bus.as_ref(), &event).await?;
-            Ok(())
+            // Dispatch retry: a /convert can fail mid-stream when a scribe's
+            // link flaps (Wi-Fi jitter on big_mac). One fast retry on a
+            // different host beats the NATS republish round-trip, and
+            // convert_and_upload is idempotent via its head-check on the
+            // target markdown key. If both attempts fail, fall through to
+            // the event-bus retry (MAX_RETRIES=3).
+            let max_dispatch_attempts: u32 = 2;
+            let mut last_err: Option<anyhow::Error> = None;
+            for attempt in 1..=max_dispatch_attempts {
+                let client = pool
+                    .pick_server()
+                    .await
+                    .context("no ready scribe servers")?;
+                tracing::info!(
+                    server = %client.url(),
+                    key = %event.key,
+                    attempt,
+                    "dispatching event"
+                );
+                match convert_and_upload(storage.as_ref(), client, bus.as_ref(), &event).await {
+                    Ok(_) => return Ok(()),
+                    Err(e) if attempt < max_dispatch_attempts => {
+                        tracing::warn!(
+                            server = %client.url(),
+                            key = %event.key,
+                            attempt,
+                            error = %e,
+                            "convert failed — retrying on a different server"
+                        );
+                        last_err = Some(e);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("dispatch retries exhausted")))
         }
     })
     .await
