@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::DistillClient;
 
-/// Cap on re-publishes of a single event before we give up. See
-/// `hs-scribe/src/event_watch.rs` for the rationale.
-const MAX_RETRIES: u32 = 3;
+// Failed index attempts log the full anyhow chain and die. Core NATS
+// `scribe.completed` is at-most-once; republishing on failure was a
+// lie about durability (see `hs-scribe/src/event_watch.rs`).
+// `hs distill reconcile` is the single canonical reconciliation path.
 
 /// Payload published by scribe (or any other markdown producer) on
 /// `scribe.completed`. `key` is the storage key of the markdown object.
@@ -20,10 +21,6 @@ pub struct CompletedEvent {
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_key: Option<String>,
-    /// How many times this event has been re-published after a handler
-    /// failure. `None` / `0` on first delivery.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_count: Option<u32>,
 }
 
 /// Retry a storage write up to 3 times with exponential backoff (100ms,
@@ -142,9 +139,10 @@ pub async fn index_and_publish(
 /// Subscribe to `scribe.completed` and dispatch each event to `handler`.
 ///
 /// Dispatches run concurrently up to `concurrency` at a time (via a
-/// semaphore), and failed handler invocations are re-published with an
-/// incremented `retry_count` up to [`MAX_RETRIES`]. Beyond that the event
-/// is dropped with an ERROR log.
+/// semaphore). Failed handler invocations log the full anyhow chain at
+/// ERROR and die — no event-bus retry. Reconciliation is the explicit,
+/// operator-driven `hs distill reconcile`, which diffs markdown against
+/// Qdrant and re-indexes exactly the missing set.
 pub async fn run_subscriber<F, Fut>(
     bus: Arc<dyn EventBus>,
     _storage: Arc<dyn Storage>,
@@ -184,40 +182,16 @@ where
             Err(_) => break,
         };
         let handler = Arc::clone(&handler);
-        let bus = Arc::clone(&bus);
         tokio::spawn(async move {
             let _permit = permit;
             let key = parsed.key.clone();
             tracing::info!(key = %key, "distill received completed event");
-            if let Err(e) = handler(parsed.clone()).await {
-                let next = parsed.retry_count.unwrap_or(0) + 1;
-                if next <= MAX_RETRIES {
-                    tracing::warn!(
-                        key = %key,
-                        retry = next,
-                        error = %e,
-                        "distill handler failed — republishing for retry"
-                    );
-                    let mut retry = parsed;
-                    retry.retry_count = Some(next);
-                    let payload = match serde_json::to_vec(&retry) {
-                        Ok(b) => b,
-                        Err(se) => {
-                            tracing::error!(key = %key, error = %se, "retry payload serialize failed");
-                            return;
-                        }
-                    };
-                    if let Err(pe) = bus.publish("scribe.completed", &payload).await {
-                        tracing::error!(key = %key, error = %pe, "retry republish failed");
-                    }
-                } else {
-                    tracing::error!(
-                        key = %key,
-                        attempts = next,
-                        error = %e,
-                        "distill handler failed after max retries — giving up"
-                    );
-                }
+            if let Err(e) = handler(parsed).await {
+                tracing::error!(
+                    key = %key,
+                    error = ?e,
+                    "distill handler failed — giving up; reconcile with `hs distill reconcile`"
+                );
             }
         });
     }

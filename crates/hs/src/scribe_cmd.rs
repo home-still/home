@@ -317,10 +317,10 @@ pub(crate) async fn cmd_watch_events(
         async move {
             // Dispatch retry: a /convert can fail mid-stream when a scribe's
             // link flaps (Wi-Fi jitter on big_mac). One fast retry on a
-            // different host beats the NATS republish round-trip, and
-            // convert_and_upload is idempotent via its head-check on the
-            // target markdown key. If both attempts fail, fall through to
-            // the event-bus retry (MAX_RETRIES=3).
+            // different host is cheap, and convert_and_upload is idempotent
+            // via its head-check on the target markdown key. If both
+            // attempts fail, the subscriber logs the full error chain and
+            // gives up — operator reconciles via `hs pipeline catch-up`.
             let max_dispatch_attempts: u32 = 2;
             let mut last_err: Option<anyhow::Error> = None;
             for attempt in 1..=max_dispatch_attempts {

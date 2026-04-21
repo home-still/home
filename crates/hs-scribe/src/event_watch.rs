@@ -8,12 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::ScribeClient;
 
-/// Cap on re-publishes of a single event before we give up. Plain NATS
-/// queue-subscribe is at-most-once, so the watcher has to do its own
-/// retry loop — but an unbounded loop on a genuinely bad input would
-/// wedge the queue forever. Three attempts is the standard "once plus
-/// two retries" contract.
-const MAX_RETRIES: u32 = 3;
+// Failed conversions log the full anyhow chain and die. Core NATS
+// `papers.ingested` is at-most-once; republishing on failure was a
+// lie about durability — on watcher restart every in-flight retry
+// was dropped (rc.278 post-mortem: ~2,156 papers lost this way).
+// `hs pipeline catch-up` is the single canonical reconciliation path.
 
 /// Payload published by `paper` and any other ingestion source on
 /// `papers.ingested`. Fields beyond `key` are optional — a minimal publisher
@@ -27,11 +26,6 @@ pub struct IngestedEvent {
     pub size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// How many times this event has been re-published after a handler
-    /// failure. `None` / `0` on the first delivery. Incremented by the
-    /// watcher on retry; events exceeding [`MAX_RETRIES`] are dropped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_count: Option<u32>,
 }
 
 /// Given an ingested paper key, fetch bytes from `storage`, dispatch to the
@@ -207,40 +201,16 @@ where
             Err(_) => break, // semaphore closed → shutting down
         };
         let handler = Arc::clone(&handler);
-        let bus = Arc::clone(&bus);
         tokio::spawn(async move {
             let _permit = permit; // drop at scope end releases the slot
             let key = parsed.key.clone();
             tracing::info!(key = %key, "scribe received ingested event");
-            if let Err(e) = handler(parsed.clone()).await {
-                let next = parsed.retry_count.unwrap_or(0) + 1;
-                if next <= MAX_RETRIES {
-                    tracing::warn!(
-                        key = %key,
-                        retry = next,
-                        error = %e,
-                        "scribe handler failed — republishing for retry"
-                    );
-                    let mut retry = parsed;
-                    retry.retry_count = Some(next);
-                    let payload = match serde_json::to_vec(&retry) {
-                        Ok(b) => b,
-                        Err(se) => {
-                            tracing::error!(key = %key, error = %se, "retry payload serialize failed");
-                            return;
-                        }
-                    };
-                    if let Err(pe) = bus.publish("papers.ingested", &payload).await {
-                        tracing::error!(key = %key, error = %pe, "retry republish failed");
-                    }
-                } else {
-                    tracing::error!(
-                        key = %key,
-                        attempts = next,
-                        error = %e,
-                        "scribe handler failed after max retries — giving up"
-                    );
-                }
+            if let Err(e) = handler(parsed).await {
+                tracing::error!(
+                    key = %key,
+                    error = ?e,
+                    "scribe handler failed — giving up; reconcile with `hs pipeline catch-up`"
+                );
             }
         });
     }
