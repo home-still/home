@@ -81,6 +81,22 @@ pub async fn convert_and_upload(
                 .convert(raw_bytes)
                 .await
                 .with_context(|| format!("scribe convert failed for {}", event.key))?;
+            // VLM-only QC. HTML/EPUB parsers don't repeat tokens, and their
+            // natural structural repetition (headings, tables) trips
+            // clean_repetitions and explodes into a retry storm.
+            let (md, truncations) = crate::postprocess::clean_repetitions(&md);
+            if truncations > 0 {
+                tracing::info!(stem = %stem, truncations, "cleaned VLM repetition site(s)");
+            }
+            let pages = hs_common::catalog::compute_page_offsets(&md).len() as u64;
+            if crate::postprocess::qc_verdict(truncations, pages)
+                == crate::postprocess::QcVerdict::RejectLoop
+            {
+                anyhow::bail!(
+                    "VLM repetition loop for {} ({truncations} truncation sites across {pages} pages)",
+                    event.key
+                );
+            }
             (md, "scribe-vlm")
         }
         "html" | "htm" => {
@@ -102,30 +118,8 @@ pub async fn convert_and_upload(
     };
     let duration_secs = start.elapsed().as_secs_f64();
 
-    // Strip VLM repetition artifacts (harmless no-op for HTML/EPUB output).
-    let (markdown, truncations) = crate::postprocess::clean_repetitions(&markdown);
-    if truncations > 0 {
-        tracing::info!(
-            stem = %stem,
-            truncations,
-            "cleaned repetition site(s)",
-        );
-    }
-
     let page_offsets = hs_common::catalog::compute_page_offsets(&markdown);
     let total_pages = page_offsets.len() as u64;
-
-    // QC gate: runaway truncation counts mean the VLM went into a loop
-    // that clean_repetitions couldn't salvage. Treat as a hard error —
-    // the caller logs and moves on; no catalog row is written.
-    if crate::postprocess::qc_verdict(truncations, total_pages)
-        == crate::postprocess::QcVerdict::RejectLoop
-    {
-        anyhow::bail!(
-            "VLM repetition loop for {} ({truncations} truncation sites across {total_pages} pages)",
-            event.key
-        );
-    }
 
     storage
         .put(&md_key, markdown.into_bytes())
