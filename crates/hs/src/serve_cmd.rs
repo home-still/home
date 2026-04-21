@@ -756,6 +756,7 @@ Wants=ollama.service hs-serve-scribe.service
 [Service]
 Type=simple
 User=root
+Environment=RUST_LOG=info
 ExecStart={hs_path} scribe autotune
 Restart=always
 RestartSec=30

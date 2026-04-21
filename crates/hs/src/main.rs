@@ -40,22 +40,35 @@ fn init_logging(
 ) {
     use hs_common::logging::{self, LoggingConfig, StderrOutput};
 
-    let service = match &cli.command {
+    let (service, force_info_stderr) = match &cli.command {
         TopCmd::Scribe {
             command: scribe_cmd::ScribeCmd::WatchEvents { .. },
-        } => "hs-scribe-watch",
+        } => ("hs-scribe-watch", false),
         TopCmd::Distill {
             command: hs_distill::cli::DistillCmd::WatchEvents { .. },
-        } => "hs-distill-watch",
-        _ => "hs",
+        } => ("hs-distill-watch", false),
+        TopCmd::Scribe {
+            command: scribe_cmd::ScribeCmd::Autotune,
+        } => ("hs-scribe-autotune", true),
+        _ => ("hs", false),
     };
 
     let (primary_storage, logs_yaml) = logging::load_config_sections();
 
-    let mut cfg = LoggingConfig::for_service(service).with_stderr(StderrOutput::VerboseQuiet {
-        verbose: cli.global.verbose,
-        quiet: cli.global.quiet,
-    });
+    let stderr_output = if force_info_stderr && !cli.global.quiet {
+        // Long-running daemons whose only signal is periodic INFO logs
+        // (tick/measure/decide) need stderr at "info", regardless of
+        // whether the operator remembered the global --verbose flag.
+        // systemd-journal captures stderr on this unit, so anything
+        // dropped here is lost forever.
+        StderrOutput::EnvFilter("info".into())
+    } else {
+        StderrOutput::VerboseQuiet {
+            verbose: cli.global.verbose,
+            quiet: cli.global.quiet,
+        }
+    };
+    let mut cfg = LoggingConfig::for_service(service).with_stderr(stderr_output);
     logs_yaml.apply_to(&mut cfg);
 
     let handle = logging::init(cfg).expect("install logging subscriber");
