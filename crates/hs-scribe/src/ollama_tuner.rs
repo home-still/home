@@ -285,6 +285,36 @@ async fn apply_num_parallel(_n: u32) -> Result<()> {
     ))
 }
 
+/// Best-effort read of the current NUM_PARALLEL from the platform's
+/// live Ollama config. Lets the daemon bootstrap from whatever value
+/// is actually in effect, rather than assuming the list default. If
+/// we can't detect it, returns None and the caller falls back to
+/// `cfg.values.first()`.
+#[cfg(target_os = "linux")]
+fn detect_current_num_parallel() -> Option<u32> {
+    let drop_in = Path::new("/etc/systemd/system/ollama.service.d/num-parallel.conf");
+    let txt = std::fs::read_to_string(drop_in).ok()?;
+    parse_num_parallel_from_systemd_snippet(&txt)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_current_num_parallel() -> Option<u32> {
+    None
+}
+
+/// Parse an `Environment="OLLAMA_NUM_PARALLEL=<n>"` line out of a
+/// systemd drop-in. Tolerant of quoting + whitespace; scans every
+/// line so the directive doesn't need to be first.
+fn parse_num_parallel_from_systemd_snippet(txt: &str) -> Option<u32> {
+    txt.lines().find_map(|line| {
+        let line = line.trim();
+        let rhs = line
+            .strip_prefix("Environment=\"OLLAMA_NUM_PARALLEL=")
+            .or_else(|| line.strip_prefix("Environment=OLLAMA_NUM_PARALLEL="))?;
+        rhs.trim_end_matches('"').trim().parse::<u32>().ok()
+    })
+}
+
 /// Long-running daemon. One tick per `tick_interval_secs`: warmup,
 /// measure, decide, apply (maybe), persist state.
 pub async fn run_forever(cfg: AutotuneConfig) -> Result<()> {
@@ -297,7 +327,18 @@ pub async fn run_forever(cfg: AutotuneConfig) -> Result<()> {
         anyhow::bail!("autotune.values must be strictly increasing");
     }
 
-    let starting_n = cfg.values.first().copied().unwrap_or(2);
+    // Bootstrap priority:
+    //   1. If a persisted state file exists, use that — survives restarts.
+    //   2. Otherwise detect the live NUM_PARALLEL from the platform's
+    //      Ollama config (systemd drop-in on Linux) so the daemon's
+    //      mental model matches the hardware. Without this step a
+    //      fresh daemon on e.g. N=4 hardware would label its first
+    //      measurement "N=2" and make confused comparisons after
+    //      its first "step up".
+    //   3. Last resort: `cfg.values.first()`.
+    let detected = detect_current_num_parallel();
+    let fallback = cfg.values.first().copied().unwrap_or(2);
+    let starting_n = detected.unwrap_or(fallback);
     let mut state = State::load_or_bootstrap(&cfg.state_path, starting_n);
     let client = ScribeClient::new(&cfg.scribe_url);
 
@@ -305,6 +346,7 @@ pub async fn run_forever(cfg: AutotuneConfig) -> Result<()> {
         starting_n = state.current_n,
         best_n = state.best_n,
         history_len = state.history.len(),
+        detected_num_parallel = ?detected,
         scribe_url = %cfg.scribe_url,
         "autotune daemon starting"
     );
@@ -466,6 +508,24 @@ mod tests {
         assert_eq!(next_in_direction(&values, 4, -1), 2);
         // Off-list value snaps to nearest candidate.
         assert_eq!(next_in_direction(&values, 5, 1), 8);
+    }
+
+    #[test]
+    fn parse_num_parallel_quoted() {
+        let txt = "[Service]\nEnvironment=\"OLLAMA_NUM_PARALLEL=8\"\n";
+        assert_eq!(parse_num_parallel_from_systemd_snippet(txt), Some(8));
+    }
+
+    #[test]
+    fn parse_num_parallel_unquoted() {
+        let txt = "[Service]\nEnvironment=OLLAMA_NUM_PARALLEL=12\n";
+        assert_eq!(parse_num_parallel_from_systemd_snippet(txt), Some(12));
+    }
+
+    #[test]
+    fn parse_num_parallel_missing_returns_none() {
+        let txt = "[Service]\nEnvironment=\"OLLAMA_KEEP_ALIVE=5m\"\n";
+        assert_eq!(parse_num_parallel_from_systemd_snippet(txt), None);
     }
 
     #[test]
