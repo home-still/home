@@ -77,8 +77,15 @@ impl ReadinessInfo for ReadinessResponse {
     fn is_ready(&self) -> bool {
         self.ready
     }
+    /// Load-based pool ranking. `vlm_slots_available` is decorative in
+    /// today's server (the semaphore is re-created per request), so tying
+    /// on it collapsed the pool to pure round-robin — which starved fast
+    /// hosts because slow ones accumulated in-flight work. Approximate the
+    /// "slots free" signal from actual load: total minus in-flight,
+    /// floored at zero when oversubscribed.
     fn available_slots(&self) -> usize {
-        self.vlm_slots_available
+        self.vlm_slots_total
+            .saturating_sub(self.in_flight_conversions)
     }
 }
 
