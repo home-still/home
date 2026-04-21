@@ -176,12 +176,72 @@ pub struct ScribeConfig {
     /// `HS_SCRIBE_CONVERT_TIMEOUT_SECS` env override.
     #[serde(default = "default_convert_timeout_secs")]
     pub convert_timeout_secs: u64,
+    /// Ollama `OLLAMA_NUM_PARALLEL` auto-tuner knobs. Consumed by
+    /// `hs scribe autotune`, which hill-climbs against observed
+    /// per-host scribe throughput.
+    #[serde(default)]
+    pub autotune: AutotuneConfig,
     /// Storage backend (loaded from top-level `storage:` section, not `scribe.storage`).
     #[serde(skip)]
     pub storage: StorageConfig,
     /// Event bus (loaded from top-level `events:` section).
     #[serde(skip)]
     pub events: EventBusConfig,
+}
+
+/// Per-host knobs for `hs scribe autotune`. All fields have sane
+/// defaults; the autotuner works out of the box.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutotuneConfig {
+    /// URL of the scribe-server on the same host as Ollama.
+    pub scribe_url: String,
+    /// How long between ticks. Each tick restarts Ollama once, so this
+    /// is also the "per-host disruption budget" — default 30 min.
+    pub tick_interval_secs: u64,
+    /// Wait after each Ollama restart before starting the measurement
+    /// window. Gives the model time to warm up and in-flight converts
+    /// to drain.
+    pub warmup_secs: u64,
+    /// Measurement window: count scribe's `total_conversions` delta
+    /// across this interval. Shorter → noisier; longer → slower to
+    /// converge. Default 24 min (so warmup + measure fits in a 30 min
+    /// tick with headroom).
+    pub measure_secs: u64,
+    /// Candidate values the hill-climber walks. Must be strictly
+    /// increasing and have at least 2 entries.
+    pub values: Vec<u32>,
+    /// Ratio that counts as a real improvement, e.g. 1.05 = needs +5%.
+    pub improvement_threshold: f64,
+    /// Ratio below which we call it a regression and step back, e.g.
+    /// 0.90 = backs off at a -10% drop.
+    pub regression_threshold: f64,
+    /// Number of inconclusive ticks (rate within the two thresholds)
+    /// before the tuner marks itself converged and stops stepping.
+    pub converge_after_stable: u32,
+    /// Where the tuner persists its rolling history + current state.
+    /// Survives across restarts.
+    pub state_path: PathBuf,
+}
+
+impl Default for AutotuneConfig {
+    fn default() -> Self {
+        let state_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".home-still")
+            .join("autotune-state.json");
+        Self {
+            scribe_url: "http://127.0.0.1:7433".into(),
+            tick_interval_secs: 1800,
+            warmup_secs: 120,
+            measure_secs: 1440,
+            values: vec![2, 4, 6, 8, 12, 16, 24],
+            improvement_threshold: 1.05,
+            regression_threshold: 0.90,
+            converge_after_stable: 3,
+            state_path,
+        }
+    }
 }
 
 fn default_inbox_poll_interval_secs() -> u64 {
@@ -203,6 +263,7 @@ impl Default for ScribeConfig {
             local_server: true,
             inbox_poll_interval_secs: default_inbox_poll_interval_secs(),
             convert_timeout_secs: default_convert_timeout_secs(),
+            autotune: AutotuneConfig::default(),
             storage: StorageConfig::default(),
             events: EventBusConfig::default(),
         }

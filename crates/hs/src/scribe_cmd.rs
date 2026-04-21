@@ -189,6 +189,13 @@ pub enum ScribeCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Auto-tune `OLLAMA_NUM_PARALLEL` against the local scribe-server's
+    /// observed throughput. Long-running daemon: every tick (default 30
+    /// min) it measures per-host convert rate, decides step up / step
+    /// down / stay, and rewrites the Ollama env var accordingly.
+    /// Install as a root systemd service via
+    /// `sudo hs serve scribe-autotune --install`.
+    Autotune,
 }
 
 #[derive(Subcommand, Debug)]
@@ -272,7 +279,14 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         }
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
         ScribeCmd::CleanJunk { dry_run } => cmd_clean_junk(dry_run, reporter).await,
+        ScribeCmd::Autotune => cmd_autotune(reporter).await,
     }
+}
+
+async fn cmd_autotune(_reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let cfg = hs_scribe::config::ScribeConfig::load()
+        .map_err(|e| anyhow::anyhow!("load ScribeConfig: {e}"))?;
+    hs_scribe::ollama_tuner::run_forever(cfg.autotune).await
 }
 
 pub(crate) async fn cmd_watch_events(

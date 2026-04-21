@@ -23,9 +23,13 @@ pub struct ServerState {
     /// Unix millis of the most recent successful conversion. `0` = never.
     /// Lock-free reads serve `/health` probes without blocking writers.
     pub last_conversion_ms: Arc<AtomicU64>,
+    /// Monotonic count of successful conversions since startup. Consumers
+    /// diff this across polls for throughput measurement (see `hs scribe
+    /// autotune`). Lock-free atomic increment on success.
+    pub total_conversions: Arc<AtomicU64>,
 }
 
-fn record_success(slot: &AtomicU64, md: &str) {
+fn record_success(last_slot: &AtomicU64, total: &AtomicU64, md: &str) {
     if md.trim().is_empty() {
         return;
     }
@@ -34,8 +38,9 @@ fn record_success(slot: &AtomicU64, md: &str) {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     if now_ms > 0 {
-        slot.store(now_ms, Ordering::Relaxed);
+        last_slot.store(now_ms, Ordering::Relaxed);
     }
+    total.fetch_add(1, Ordering::Relaxed);
 }
 
 fn format_last_conv(slot: &AtomicU64) -> Option<String> {
@@ -71,6 +76,7 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoRespon
         gpu_utilization_pct,
         gpu_memory_used_mb,
         last_conversion_at: format_last_conv(&state.last_conversion_ms),
+        total_conversions: state.total_conversions.load(Ordering::Relaxed),
     })
 }
 
@@ -143,7 +149,7 @@ async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipa
         .process_pdf_with_shared_sem(path, Arc::clone(&state.vlm_sem));
     match tokio::time::timeout(deadline, fut).await {
         Ok(Ok(md)) => {
-            record_success(&state.last_conversion_ms, &md);
+            record_success(&state.last_conversion_ms, &state.total_conversions, &md);
             (StatusCode::OK, md).into_response()
         }
         Ok(Err(e)) => {
@@ -209,7 +215,7 @@ async fn handle_scribe_stream(
             .process_pdf_with_progress_and_sem(&path, on_progress, vlm_sem);
         match tokio::time::timeout(deadline, fut).await {
             Ok(Ok(md)) => {
-                record_success(&state.last_conversion_ms, &md);
+                record_success(&state.last_conversion_ms, &state.total_conversions, &md);
                 let line = StreamLine::Result { markdown: md };
                 if let Ok(json) = serde_json::to_string(&line) {
                     let _ = tx.send(Ok(format!("{json}\n"))).await;
@@ -253,11 +259,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_success_sets_recent_unix_millis() {
+    fn record_success_sets_recent_unix_millis_and_increments_total() {
         let slot = AtomicU64::new(0);
-        record_success(&slot, "# Some markdown\n\nbody");
+        let total = AtomicU64::new(0);
+        record_success(&slot, &total, "# Some markdown\n\nbody");
         let stored = slot.load(Ordering::Relaxed);
         assert!(stored > 0, "timestamp should be set");
+        assert_eq!(total.load(Ordering::Relaxed), 1, "total should increment");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -271,8 +279,14 @@ mod tests {
     #[test]
     fn record_success_skips_empty_markdown() {
         let slot = AtomicU64::new(0);
-        record_success(&slot, "   \n\n   ");
+        let total = AtomicU64::new(0);
+        record_success(&slot, &total, "   \n\n   ");
         assert_eq!(slot.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            total.load(Ordering::Relaxed),
+            0,
+            "empty md shouldn't bump total"
+        );
     }
 
     #[test]

@@ -75,6 +75,18 @@ pub enum ServeCmd {
         #[arg(long, conflicts_with = "install")]
         uninstall: bool,
     },
+    /// `OLLAMA_NUM_PARALLEL` auto-tuner daemon. Runs as a root-level
+    /// systemd unit (Linux only; macOS is a stub — see
+    /// `hs_scribe::ollama_tuner`). Needs root so it can rewrite the
+    /// `/etc/systemd/system/ollama.service.d/` drop-in.
+    ScribeAutotune {
+        /// Install as a root system service and start it (requires sudo).
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Stop and remove the system service.
+        #[arg(long, conflicts_with = "install")]
+        uninstall: bool,
+    },
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -136,8 +148,15 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
         ServeCmd::DistillWatch {
             uninstall: true, ..
         } => uninstall_user_service("distill-watch-events", reporter).await,
+        ServeCmd::ScribeAutotune { install: true, .. } => install_autotune_service(reporter).await,
+        ServeCmd::ScribeAutotune {
+            uninstall: true, ..
+        } => uninstall_service("scribe-autotune", reporter).await,
         ServeCmd::ScribeWatch { .. } => serve_scribe_watch(reporter).await,
         ServeCmd::DistillWatch { .. } => serve_distill_watch(reporter).await,
+        ServeCmd::ScribeAutotune { .. } => {
+            crate::scribe_cmd::dispatch(crate::scribe_cmd::ScribeCmd::Autotune, reporter).await
+        }
 
         // -- start / stop (background) --
         ServeCmd::Scribe {
@@ -707,6 +726,77 @@ WantedBy=multi-user.target
 
         Ok(())
     } // cfg(any(linux, macos))
+}
+
+/// Install the OLLAMA_NUM_PARALLEL auto-tuner as a root-level systemd
+/// service. Root is required because the tuner rewrites the Ollama
+/// drop-in under `/etc/systemd/system/ollama.service.d/` and calls
+/// `systemctl restart ollama` each tick. macOS is not yet supported —
+/// the inner `apply_num_parallel` returns Err on that platform.
+async fn install_autotune_service(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = reporter;
+        anyhow::bail!(
+            "scribe-autotune is Linux-only for now (macOS apply path not yet implemented)"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
+        let hs_path = hs_bin.display();
+        let service_name = "hs-serve-scribe-autotune";
+        let unit_path = format!("/etc/systemd/system/{service_name}.service");
+        let unit = format!(
+            r#"[Unit]
+Description=Home-Still OLLAMA_NUM_PARALLEL auto-tuner
+After=network.target ollama.service hs-serve-scribe.service
+Wants=ollama.service hs-serve-scribe.service
+
+[Service]
+Type=simple
+User=root
+ExecStart={hs_path} scribe autotune
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+"#
+        );
+        reporter.status("Install", &format!("writing {unit_path}"));
+        let tmp = format!("/tmp/{service_name}.service");
+        std::fs::write(&tmp, &unit).context("Failed to write temp unit file")?;
+        let status = tokio::process::Command::new("sudo")
+            .args(["cp", &tmp, &unit_path])
+            .status()
+            .await
+            .context("sudo cp failed")?;
+        if !status.success() {
+            anyhow::bail!("Failed to install systemd unit (sudo cp)");
+        }
+        let _ = std::fs::remove_file(&tmp);
+        for args in [
+            &["systemctl", "daemon-reload"][..],
+            &["systemctl", "enable", "--now", service_name][..],
+        ] {
+            let status = tokio::process::Command::new("sudo")
+                .args(args)
+                .status()
+                .await
+                .context("sudo systemctl failed")?;
+            if !status.success() {
+                anyhow::bail!("sudo {} failed", args.join(" "));
+            }
+        }
+        reporter.finish(&format!(
+            "Installed and started {service_name}\n\
+             Logs: sudo journalctl -u {service_name} -f\n\
+             State: /root/.home-still/autotune-state.json (root owns it)\n\
+             Remove: sudo hs serve scribe-autotune --uninstall"
+        ));
+        Ok(())
+    }
 }
 
 async fn uninstall_service(service_type: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
