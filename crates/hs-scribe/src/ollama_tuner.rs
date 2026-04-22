@@ -184,6 +184,17 @@ pub fn decide(cfg: &AutotuneConfig, state: &mut State, latest_rate: f64) -> Acti
         return step_to(state, next);
     }
 
+    // Decay best_rate on any non-improvement outcome (regression OR
+    // plateau). Without this, a stale historical peak permanently blocks
+    // future stepping when workload character shifts (e.g. from small
+    // papers to larger ones): every subsequent sample looks like either
+    // regression or plateau forever, because the thresholds are computed
+    // against a `best_rate` the current workload can never reach.
+    // Decay erodes the peak, eventually letting a sample clear the
+    // improvement threshold and resume exploration. Default decay=0.95
+    // per tick; see AutotuneConfig::best_rate_decay.
+    state.best_rate *= cfg.best_rate_decay;
+
     if avg_current <= state.best_rate * cfg.regression_threshold {
         // Real regression — revert to best, flip direction.
         state.direction = -state.direction;
@@ -616,6 +627,9 @@ mod tests {
             improvement_threshold: 1.05,
             regression_threshold: 0.90,
             converge_after_stable: 3,
+            // Decay disabled in most tests so pre-rc.295 invariants still hold
+            // byte-for-byte; dedicated tests below flip it on.
+            best_rate_decay: 1.0,
             state_path: PathBuf::from("/tmp/hs-autotune-test.json"),
         }
     }
@@ -769,5 +783,81 @@ mod tests {
         let loaded = State::load_or_bootstrap(tmp.path(), 2);
         assert_eq!(loaded.current_n, s.current_n);
         assert_eq!(loaded.history.len(), 1);
+    }
+
+    #[test]
+    fn best_rate_decays_on_plateau_ticks() {
+        // rc.295: on a plateau tick the best_rate should decay by the
+        // configured factor. This is the mechanism that unsticks the
+        // tuner from a stale historical peak when workload shifts.
+        let mut cfg = base_cfg();
+        cfg.best_rate_decay = 0.9;
+        let mut state = State::bootstrap(6);
+        state.best_n = 6;
+        state.best_rate = 10.0;
+        state.current_n = 6;
+        push_sample(&mut state, 6, 10.0);
+        let _ = decide(&cfg, &mut state, 10.0);
+        // 10.0 is inside [9.0, 10.5] plateau band → plateau; best_rate *= 0.9.
+        assert!(
+            (state.best_rate - 9.0).abs() < 1e-9,
+            "plateau tick should decay best_rate 10.0 * 0.9 = 9.0, got {}",
+            state.best_rate
+        );
+    }
+
+    #[test]
+    fn best_rate_decay_unsticks_stale_peak() {
+        // Simulates the production case: a historical window recorded
+        // best_rate=1.75 on small papers. Current workload tops out at
+        // 0.75 cvt/min, which fails both improvement (>=1.05*best) and
+        // regression (<=0.9*best) tests → plateau → decay. After enough
+        // decay ticks, 0.75 clears improvement against the decayed best
+        // and the tuner resumes stepping.
+        let mut cfg = base_cfg();
+        cfg.best_rate_decay = 0.9;
+        cfg.converge_after_stable = 100; // don't converge during the test
+        let mut state = State::bootstrap(6);
+        state.best_n = 6;
+        state.best_rate = 1.75;
+        state.current_n = 6;
+
+        // Feed plateau samples at rate 0.75 and count how many ticks it
+        // takes before an Apply fires (i.e. stepping resumes).
+        let mut stepped_at: Option<usize> = None;
+        for tick in 1..=30 {
+            let n = state.current_n;
+            push_sample(&mut state, n, 0.75);
+            let action = decide(&cfg, &mut state, 0.75);
+            if matches!(action, Action::Apply(_)) {
+                stepped_at = Some(tick);
+                break;
+            }
+        }
+        let stepped = stepped_at.expect("tuner must resume stepping after decay eats the peak");
+        assert!(
+            (5..=20).contains(&stepped),
+            "expected unstick within a handful of ticks (5..=20), got {stepped}"
+        );
+    }
+
+    #[test]
+    fn decay_disabled_preserves_plateau_behavior() {
+        // base_cfg uses decay=1.0; verify best_rate is invariant under
+        // plateau ticks, matching pre-rc.295 behavior. This is the
+        // compatibility fence for existing operator workflows.
+        let cfg = base_cfg();
+        assert_eq!(cfg.best_rate_decay, 1.0);
+        let mut state = State::bootstrap(6);
+        state.best_n = 6;
+        state.best_rate = 10.0;
+        state.current_n = 6;
+        push_sample(&mut state, 6, 10.0);
+        let _ = decide(&cfg, &mut state, 10.0);
+        assert!(
+            (state.best_rate - 10.0).abs() < 1e-9,
+            "decay=1.0 must leave best_rate unchanged, got {}",
+            state.best_rate
+        );
     }
 }

@@ -80,7 +80,11 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoRespon
 }
 
 async fn handle_readiness(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let total = state.config.vlm_concurrency;
+    // Report the EFFECTIVE capacity, not the configured value — rc.295
+    // clamps vlm_concurrency to live OLLAMA_NUM_PARALLEL when the config
+    // would oversubscribe Ollama. The pool load-balancer relies on this
+    // number being truthful.
+    let total = state.processor.effective_vlm_concurrency();
     let available = state.processor.vlm_sem().available_permits();
     let in_flight = state.in_flight.load(Ordering::Relaxed);
     axum::Json(serde_json::json!({

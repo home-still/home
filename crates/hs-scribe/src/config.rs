@@ -221,6 +221,14 @@ pub struct AutotuneConfig {
     /// Number of inconclusive ticks (rate within the two thresholds)
     /// before the tuner marks itself converged and stops stepping.
     pub converge_after_stable: u32,
+    /// Multiplicative decay applied to `best_rate` on every plateau tick
+    /// so a stale historical peak doesn't block future stepping when
+    /// workload character shifts (e.g. from small papers to larger ones,
+    /// or after a hardware change). Default `0.95` — half-life ≈ 14
+    /// ticks ≈ 140 min at the 10-min cadence; fast enough to unstick
+    /// within a session, slow enough to ignore sample noise. Set to
+    /// `1.0` to disable.
+    pub best_rate_decay: f64,
     /// Where the tuner persists its rolling history + current state.
     /// Survives across restarts.
     pub state_path: PathBuf,
@@ -246,6 +254,7 @@ impl Default for AutotuneConfig {
             improvement_threshold: 1.05,
             regression_threshold: 0.90,
             converge_after_stable: 5,
+            best_rate_decay: 0.95,
             state_path,
         }
     }
