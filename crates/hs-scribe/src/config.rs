@@ -235,13 +235,17 @@ impl Default for AutotuneConfig {
         let values = HardwareProfile::detect().class.autotune_values();
         Self {
             scribe_url: "http://127.0.0.1:7433".into(),
-            tick_interval_secs: 1800,
-            warmup_secs: 120,
-            measure_secs: 1440,
+            // Tick 10 min: warmup 60s + measure 480s = 9 min per tick with
+            // ~1 min idle slack. Shorter windows are noisier, so
+            // `converge_after_stable = 5` compensates. Net convergence drops
+            // from ~2 hours at the old 30-min tick to ~45 min.
+            tick_interval_secs: 600,
+            warmup_secs: 60,
+            measure_secs: 480,
             values,
             improvement_threshold: 1.05,
             regression_threshold: 0.90,
-            converge_after_stable: 3,
+            converge_after_stable: 5,
             state_path,
         }
     }
