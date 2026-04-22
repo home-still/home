@@ -6,6 +6,7 @@ use figment::{
     Figment,
 };
 use hs_common::event_bus::{EventBus, EventBusConfig};
+use hs_common::hardware_profile::HardwareProfile;
 use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +89,12 @@ pub struct DistillClientConfig {
     pub servers: Vec<String>,
     pub markdown_dir: PathBuf,
     pub catalog_dir: PathBuf,
+    /// Event-watch worker concurrency — how many markdown documents the
+    /// local `hs distill watch-events` loop will index in parallel.
+    /// `None` means "use the HardwareProfile default for this host"
+    /// (Pi=2, AppleSiliconLow=4, AppleSiliconHigh=6, Nvidia*=8, GenericCpu
+    /// scales with `cpu_count/4`). Explicit override wins.
+    pub concurrency: Option<usize>,
     #[serde(skip)]
     pub storage: StorageConfig,
     #[serde(skip)]
@@ -101,9 +108,21 @@ impl Default for DistillClientConfig {
             servers: vec!["http://localhost:7434".into()],
             markdown_dir: project.join("markdown"),
             catalog_dir: project.join("catalog"),
+            concurrency: None,
             storage: StorageConfig::default(),
             events: EventBusConfig::default(),
         }
+    }
+}
+
+impl DistillClientConfig {
+    /// Resolve the effective worker concurrency: explicit config value, or
+    /// the HardwareProfile default for this host.
+    pub fn resolved_concurrency(&self) -> usize {
+        self.concurrency.unwrap_or_else(|| {
+            let profile = HardwareProfile::detect();
+            profile.class.distill_concurrency(profile.cpu_count)
+        })
     }
 }
 

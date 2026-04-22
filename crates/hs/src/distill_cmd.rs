@@ -180,11 +180,9 @@ pub(crate) async fn cmd_watch_events(
         .unwrap_or_else(|| "http://localhost:7434".into());
     let distill = Arc::new(DistillClient::new(&server_url));
 
-    tracing::info!(%server_url, "starting distill event-bus watcher");
+    let concurrency = cfg.resolved_concurrency();
+    tracing::info!(%server_url, concurrency, "starting distill event-bus watcher");
 
-    // One distill worker today; if a second is ever added, bump this to
-    // `pool.concurrency()` like scribe_cmd does.
-    let concurrency = 2;
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
     run_subscriber(
