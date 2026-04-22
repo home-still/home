@@ -11,10 +11,11 @@ use crate::pipeline::PdfParser;
 use crate::utils::deduplication::{deduplicate_boxes, filter_contained_regions};
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
+use hs_common::hardware_profile::HardwareProfile;
 use image::DynamicImage;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A single region's OCR output with its layout classification.
 #[derive(Debug, Clone)]
@@ -57,11 +58,42 @@ enum PreparedPage {
     },
 }
 
+/// Round-robin pool of ONNX detectors. Each detector holds an `ort::Session`
+/// that serializes calls through `Session::run(&mut self)`, so a single
+/// shared detector was the dominant bottleneck in per-region mode — every
+/// concurrent page's layout detection queued on one Mutex. Sizing comes
+/// from `HardwareProfile::detector_pool_size()`.
+pub struct DetectorPool<T> {
+    slots: Vec<Mutex<T>>,
+    next: AtomicUsize,
+}
+
+impl<T> DetectorPool<T> {
+    fn new(slots: Vec<T>) -> Self {
+        assert!(!slots.is_empty(), "DetectorPool requires at least one slot");
+        Self {
+            slots: slots.into_iter().map(Mutex::new).collect(),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn acquire(&self) -> Result<MutexGuard<'_, T>> {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        self.slots[idx]
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DetectorPool lock poisoned: {e}"))
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+}
+
 pub struct Processor {
     ocr: Arc<OcrEngine>,
-    layout_detector: Option<Arc<std::sync::Mutex<LayoutDetector>>>,
+    layout_detectors: Option<Arc<DetectorPool<LayoutDetector>>>,
     layout_model_reason: Option<String>,
-    table_recognizer: Option<Arc<std::sync::Mutex<TableStructureRecognizer>>>,
+    table_recognizers: Option<Arc<DetectorPool<TableStructureRecognizer>>>,
     table_model_reason: Option<String>,
     /// Shared VLM concurrency semaphore — one per Processor, reused across
     /// every convert call. Size = `config.vlm_concurrency`. Server-side
@@ -75,73 +107,35 @@ impl Processor {
     pub fn new(config: AppConfig) -> Result<Self> {
         let ocr = Arc::new(OcrEngine::from_config(&config));
 
-        let mut layout_model_reason: Option<String> = None;
-        let layout_detector = if config.pipeline_mode == PipelineMode::PerRegion {
-            let layout_path = config.resolved_layout_model_path();
-            if layout_path.exists() {
-                match LayoutDetector::new(layout_path.to_str().unwrap_or_default(), config.use_cuda)
-                {
-                    Ok(det) => {
-                        tracing::info!("Layout detector loaded from {}", layout_path.display());
-                        Some(Arc::new(std::sync::Mutex::new(det)))
-                    }
-                    Err(e) => {
-                        let reason = format!("load failed: {e}");
-                        tracing::warn!(
-                            "Failed to load layout detector: {e}. Falling back to FullPage mode."
-                        );
-                        layout_model_reason = Some(reason);
-                        None
-                    }
-                }
-            } else {
-                let reason = format!("model file not found at {}", layout_path.display());
-                tracing::warn!("{reason}. Falling back to FullPage mode.");
-                layout_model_reason = Some(reason);
-                None
-            }
-        } else {
-            layout_model_reason = Some("disabled (pipeline_mode != per_region)".into());
-            None
-        };
+        let pool_size = HardwareProfile::detect().class.detector_pool_size();
 
-        let mut table_model_reason: Option<String> = None;
-        let table_recognizer = if config.pipeline_mode == PipelineMode::PerRegion {
-            let slanet_path = config.resolved_table_model_path();
-            if slanet_path.exists() {
-                match TableStructureRecognizer::new(
-                    slanet_path.to_str().unwrap_or_default(),
-                    config.use_cuda,
-                ) {
-                    Ok(r) => {
-                        tracing::info!("Table structure recognizer loaded (SLANet-Plus)");
-                        Some(Arc::new(std::sync::Mutex::new(r)))
-                    }
-                    Err(e) => {
-                        let reason = format!("load failed: {e}");
-                        tracing::warn!("Table structure recognizer not available: {e}");
-                        table_model_reason = Some(reason);
-                        None
-                    }
-                }
+        let (layout_detectors, layout_model_reason) =
+            if config.pipeline_mode == PipelineMode::PerRegion {
+                build_layout_pool(&config, pool_size)
             } else {
-                let reason = format!("model file not found at {}", slanet_path.display());
-                tracing::info!("{reason}, tables go to VLM");
-                table_model_reason = Some(reason);
-                None
-            }
-        } else {
-            table_model_reason = Some("disabled (pipeline_mode != per_region)".into());
-            None
-        };
+                (
+                    None,
+                    Some("disabled (pipeline_mode != per_region)".to_string()),
+                )
+            };
+
+        let (table_recognizers, table_model_reason) =
+            if config.pipeline_mode == PipelineMode::PerRegion {
+                build_table_pool(&config, pool_size)
+            } else {
+                (
+                    None,
+                    Some("disabled (pipeline_mode != per_region)".to_string()),
+                )
+            };
 
         let vlm_sem = Arc::new(tokio::sync::Semaphore::new(config.vlm_concurrency));
 
         Ok(Self {
             ocr,
-            layout_detector,
+            layout_detectors,
             layout_model_reason,
-            table_recognizer,
+            table_recognizers,
             table_model_reason,
             vlm_sem,
             config,
@@ -167,17 +161,17 @@ impl Processor {
         Arc::clone(&self.vlm_sem)
     }
 
-    /// Is this processor running in per-region mode (i.e., has a layout detector)?
+    /// Is this processor running in per-region mode (i.e., has a layout detector pool)?
     fn is_per_region(&self) -> bool {
-        self.layout_detector.is_some()
+        self.layout_detectors.is_some()
     }
 
     pub fn has_layout_detector(&self) -> bool {
-        self.layout_detector.is_some()
+        self.layout_detectors.is_some()
     }
 
     pub fn has_table_recognizer(&self) -> bool {
-        self.table_recognizer.is_some()
+        self.table_recognizers.is_some()
     }
 
     pub async fn process_image(&self, image: &DynamicImage) -> Result<String> {
@@ -203,12 +197,11 @@ impl Processor {
 
     async fn process_image_regions_full(&self, image: &DynamicImage) -> Result<ProcessedPage> {
         let bboxes = {
-            let mut det = self
-                .layout_detector
+            let pool = self
+                .layout_detectors
                 .as_ref()
-                .expect("per-region requires layout_detector")
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Layout detector lock poisoned: {e}"))?;
+                .expect("per-region requires layout_detectors");
+            let mut det = pool.acquire()?;
             det.detect(image)?
         };
 
@@ -269,7 +262,7 @@ impl Processor {
         let mut other_bboxes = Vec::new();
         for bbox in bboxes {
             if RegionType::from_class(&bbox.class_name) == RegionType::Table
-                && self.table_recognizer.is_some()
+                && self.table_recognizers.is_some()
             {
                 table_bboxes.push(bbox);
             } else {
@@ -348,12 +341,11 @@ impl Processor {
     /// Recognize table structure with SLANet-Plus, OCR each cell with VLM, return HTML.
     async fn recognize_table_html(&self, table_image: &DynamicImage) -> Result<String> {
         let structure = {
-            let mut rec = self
-                .table_recognizer
+            let pool = self
+                .table_recognizers
                 .as_ref()
-                .expect("table_recognizer required")
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Table recognizer lock poisoned: {e}"))?;
+                .expect("table_recognizers required");
+            let mut rec = pool.acquire()?;
             rec.recognize(table_image)?
         };
 
@@ -480,8 +472,8 @@ impl Processor {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<PreparedPage>(3);
         let vlm_sem = Arc::clone(&self.vlm_sem);
 
-        let layout = self.layout_detector.clone();
-        let table = self.table_recognizer.clone();
+        let layout = self.layout_detectors.clone();
+        let table = self.table_recognizers.clone();
         let config = self.config.clone();
         let on_progress_s1 = Arc::clone(&on_progress);
 
@@ -605,14 +597,14 @@ impl Processor {
         }
 
         // Per-region mode: 2-stage async pipeline
-        // Stage 1 (CPU): layout detection, cropping, JPEG encoding — sequential (ONNX mutex)
+        // Stage 1 (CPU): layout detection, cropping, JPEG encoding — pool-gated
         // Stage 2 (VLM): HTTP inference — concurrent across pages
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<PreparedPage>(3);
         let vlm_sem = Arc::clone(&self.vlm_sem);
 
-        let layout = self.layout_detector.clone();
-        let table = self.table_recognizer.clone();
+        let layout = self.layout_detectors.clone();
+        let table = self.table_recognizers.clone();
         let config = self.config.clone();
 
         let stage1 = tokio::task::spawn_blocking(move || {
@@ -660,6 +652,72 @@ impl Processor {
     }
 }
 
+fn build_layout_pool(
+    config: &AppConfig,
+    pool_size: usize,
+) -> (Option<Arc<DetectorPool<LayoutDetector>>>, Option<String>) {
+    let layout_path = config.resolved_layout_model_path();
+    if !layout_path.exists() {
+        let reason = format!("model file not found at {}", layout_path.display());
+        tracing::warn!("{reason}. Falling back to FullPage mode.");
+        return (None, Some(reason));
+    }
+
+    let path_str = layout_path.to_str().unwrap_or_default();
+    let mut slots: Vec<LayoutDetector> = Vec::with_capacity(pool_size);
+    for i in 0..pool_size {
+        match LayoutDetector::new(path_str, config.use_cuda) {
+            Ok(det) => slots.push(det),
+            Err(e) => {
+                // One path: any slot failure aborts the whole pool. No
+                // "at least one loaded" partial state to reason about.
+                let reason = format!("load failed on slot {i}/{pool_size}: {e}");
+                tracing::warn!(
+                    "Failed to load layout detector: {e}. Falling back to FullPage mode."
+                );
+                return (None, Some(reason));
+            }
+        }
+    }
+
+    tracing::info!(
+        "Layout detector pool loaded from {} (N={pool_size})",
+        layout_path.display()
+    );
+    (Some(Arc::new(DetectorPool::new(slots))), None)
+}
+
+fn build_table_pool(
+    config: &AppConfig,
+    pool_size: usize,
+) -> (
+    Option<Arc<DetectorPool<TableStructureRecognizer>>>,
+    Option<String>,
+) {
+    let slanet_path = config.resolved_table_model_path();
+    if !slanet_path.exists() {
+        let reason = format!("model file not found at {}", slanet_path.display());
+        tracing::info!("{reason}, tables go to VLM");
+        return (None, Some(reason));
+    }
+
+    let path_str = slanet_path.to_str().unwrap_or_default();
+    let mut slots: Vec<TableStructureRecognizer> = Vec::with_capacity(pool_size);
+    for i in 0..pool_size {
+        match TableStructureRecognizer::new(path_str, config.use_cuda) {
+            Ok(r) => slots.push(r),
+            Err(e) => {
+                let reason = format!("load failed on slot {i}/{pool_size}: {e}");
+                tracing::warn!("Table structure recognizer not available: {e}");
+                return (None, Some(reason));
+            }
+        }
+    }
+
+    tracing::info!("Table structure recognizer pool loaded (SLANet-Plus, N={pool_size})");
+    (Some(Arc::new(DetectorPool::new(slots))), None)
+}
+
 /// Downscale an image if its longest dimension exceeds max_dim.
 /// Region crops are already small so this is typically a no-op for them.
 fn maybe_downscale(image: &DynamicImage, max_dim: u32) -> DynamicImage {
@@ -680,16 +738,15 @@ fn maybe_downscale(image: &DynamicImage, max_dim: u32) -> DynamicImage {
 fn prepare_page(
     page_idx: usize,
     image: &DynamicImage,
-    layout: &Option<Arc<std::sync::Mutex<LayoutDetector>>>,
-    table: &Option<Arc<std::sync::Mutex<TableStructureRecognizer>>>,
+    layout: &Option<Arc<DetectorPool<LayoutDetector>>>,
+    table: &Option<Arc<DetectorPool<TableStructureRecognizer>>>,
     config: &AppConfig,
 ) -> Result<PreparedPage> {
     let bboxes = {
-        let mut det = layout
+        let pool = layout
             .as_ref()
-            .expect("per-region requires layout_detector")
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Layout detector lock poisoned: {e}"))?;
+            .expect("per-region requires layout_detectors");
+        let mut det = pool.acquire()?;
         det.detect(image)?
     };
 
@@ -769,11 +826,8 @@ fn prepare_page(
     for bbox in table_bboxes {
         let crop = crop_bbox(image, &bbox);
         let structure = {
-            let mut rec = table
-                .as_ref()
-                .expect("table_recognizer required")
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Table recognizer lock poisoned: {e}"))?;
+            let pool = table.as_ref().expect("table_recognizers required");
+            let mut rec = pool.acquire()?;
             rec.recognize(&crop)?
         };
 
