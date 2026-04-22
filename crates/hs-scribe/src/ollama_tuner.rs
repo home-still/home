@@ -127,15 +127,6 @@ pub enum Action {
 /// Pure hill-climb logic. No I/O. Takes a mutable `State` so the
 /// caller can persist the post-decision state.
 pub fn decide(cfg: &AutotuneConfig, state: &mut State, latest_rate: f64) -> Action {
-    if state.converged {
-        return if state.current_n == state.best_n {
-            Action::Noop
-        } else {
-            state.current_n = state.best_n;
-            Action::Apply(state.best_n)
-        };
-    }
-
     // Zero-rate guard: no converts in the window means we have no
     // signal. Previously the improvement check `0 >= 0 * 1.05` was
     // TRUE, so a host that got zero dispatches during its window
@@ -148,6 +139,7 @@ pub fn decide(cfg: &AutotuneConfig, state: &mut State, latest_rate: f64) -> Acti
             current_n = state.current_n,
             best_n = state.best_n,
             best_rate = state.best_rate,
+            converged = state.converged,
             "zero-rate window — holding at current N (no converts to measure)"
         );
         return Action::Noop;
@@ -175,8 +167,22 @@ pub fn decide(cfg: &AutotuneConfig, state: &mut State, latest_rate: f64) -> Acti
 
     let avg_current = average_tail(&samples_at_current, 3);
 
+    // Improvement check is evaluated BEFORE the converged short-circuit
+    // so decay (applied below on every non-improvement tick, including
+    // post-converge) eventually lets a current sample clear the
+    // threshold and un-stick a converged tuner. Without this, once
+    // `converged=true` was persisted to disk (rc.294 era), the daemon
+    // would short-circuit forever and rc.295's decay would never run.
     if avg_current >= state.best_rate * cfg.improvement_threshold {
         // Genuine improvement — record new best and keep stepping.
+        if state.converged {
+            tracing::info!(
+                new_best = avg_current,
+                old_best = state.best_rate,
+                "autotune un-converged — decayed best beaten by current sample"
+            );
+            state.converged = false;
+        }
         state.best_n = state.current_n;
         state.best_rate = avg_current;
         state.stable_count = 0;
@@ -184,16 +190,28 @@ pub fn decide(cfg: &AutotuneConfig, state: &mut State, latest_rate: f64) -> Acti
         return step_to(state, next);
     }
 
-    // Decay best_rate on any non-improvement outcome (regression OR
-    // plateau). Without this, a stale historical peak permanently blocks
-    // future stepping when workload character shifts (e.g. from small
-    // papers to larger ones): every subsequent sample looks like either
-    // regression or plateau forever, because the thresholds are computed
-    // against a `best_rate` the current workload can never reach.
-    // Decay erodes the peak, eventually letting a sample clear the
-    // improvement threshold and resume exploration. Default decay=0.95
-    // per tick; see AutotuneConfig::best_rate_decay.
+    // Decay best_rate on any non-improvement outcome (regression, plateau,
+    // OR converged-and-holding). Without this, a stale historical peak
+    // permanently blocks future stepping when workload character shifts
+    // (e.g. from small papers to larger ones): every subsequent sample
+    // looks like either regression or plateau forever, because the
+    // thresholds are computed against a `best_rate` the current workload
+    // can never reach. Decay erodes the peak; once it drops low enough,
+    // the improvement check above fires and we un-converge. Default
+    // decay=0.95 per tick; see AutotuneConfig::best_rate_decay.
     state.best_rate *= cfg.best_rate_decay;
+
+    // Converged short-circuit — comes AFTER the improvement+decay
+    // evaluation so we keep eroding `best_rate` even when frozen at
+    // best_n. That's the un-stick path for converged-on-stale-peak.
+    if state.converged {
+        return if state.current_n == state.best_n {
+            Action::Noop
+        } else {
+            state.current_n = state.best_n;
+            Action::Apply(state.best_n)
+        };
+    }
 
     if avg_current <= state.best_rate * cfg.regression_threshold {
         // Real regression — revert to best, flip direction.
@@ -589,7 +607,19 @@ pub async fn run_forever(cfg: AutotuneConfig) -> Result<()> {
             "sample recorded"
         );
 
+        let pre_best = state.best_rate;
         let action = decide(&cfg, &mut state, per_min);
+        // rc.295 diagnostic: surface post-decision best_rate so operators
+        // can see whether decay actually mutated state.
+        tracing::info!(
+            pre_best,
+            post_best = state.best_rate,
+            current_n = state.current_n,
+            best_n = state.best_n,
+            stable_count = state.stable_count,
+            converged = state.converged,
+            "post-decide state"
+        );
         match action {
             Action::Noop => {
                 tracing::info!("no change (N={})", state.current_n);
@@ -839,6 +869,67 @@ mod tests {
             (5..=20).contains(&stepped),
             "expected unstick within a handful of ticks (5..=20), got {stepped}"
         );
+    }
+
+    #[test]
+    fn converged_state_decays_and_unconverges_on_improvement() {
+        // rc.296: a converged daemon (state on disk has converged=true,
+        // typically from a pre-rc.295 plateau) must NOT short-circuit
+        // forever. Decay still erodes best_rate post-convergence; once it
+        // drops below the improvement threshold, a fresh sample resumes
+        // stepping. This is the production scenario big landed in: state
+        // file showed converged=true, best_rate=1.749, and rc.295 decay
+        // never executed because the converged check returned early.
+        let mut cfg = base_cfg();
+        cfg.best_rate_decay = 0.85; // aggressive so the test is short
+        let mut state = State::bootstrap(6);
+        state.best_n = 6;
+        state.best_rate = 1.75;
+        state.current_n = 6;
+        state.converged = true;
+
+        // Feed plateau-ish samples at 0.75. Without decay, every tick
+        // would short-circuit at converged. With decay, best_rate erodes
+        // until 0.75 ≥ best * 1.05.
+        let mut un_converged_at: Option<usize> = None;
+        for tick in 1..=30 {
+            let n = state.current_n;
+            push_sample(&mut state, n, 0.75);
+            let _ = decide(&cfg, &mut state, 0.75);
+            if !state.converged {
+                un_converged_at = Some(tick);
+                break;
+            }
+        }
+        let tick = un_converged_at.expect("decay must un-converge a stuck-converged tuner");
+        assert!(
+            (3..=15).contains(&tick),
+            "expected un-converge in 3..=15 ticks, got {tick}"
+        );
+        assert_eq!(
+            state.best_rate, 0.75,
+            "post-improvement best should be the new sample"
+        );
+    }
+
+    #[test]
+    fn converged_at_best_n_returns_noop_until_unstuck() {
+        // While converged AND current_n==best_n, with no improvement,
+        // decide() must return Noop on every tick (don't bounce N around
+        // for nothing). Decay still applies, so eventually un-stick.
+        let mut cfg = base_cfg();
+        cfg.best_rate_decay = 0.9;
+        let mut state = State::bootstrap(6);
+        state.best_n = 6;
+        state.best_rate = 10.0;
+        state.current_n = 6;
+        state.converged = true;
+        push_sample(&mut state, 6, 0.5); // way below improvement threshold
+        let action = decide(&cfg, &mut state, 0.5);
+        assert_eq!(action, Action::Noop);
+        assert!(state.converged, "single low sample should not un-converge");
+        // best_rate decayed: 10.0 * 0.9 = 9.0
+        assert!((state.best_rate - 9.0).abs() < 1e-9);
     }
 
     #[test]
