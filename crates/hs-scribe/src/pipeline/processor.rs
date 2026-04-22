@@ -83,10 +83,6 @@ impl<T> DetectorPool<T> {
             .lock()
             .map_err(|e| anyhow::anyhow!("DetectorPool lock poisoned: {e}"))
     }
-
-    pub fn len(&self) -> usize {
-        self.slots.len()
-    }
 }
 
 pub struct Processor {

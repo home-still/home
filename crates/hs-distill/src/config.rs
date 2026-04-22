@@ -72,6 +72,11 @@ pub struct EmbeddingConfig {
     /// "pick per device": CUDA=1 (single GPU context is faster than N),
     /// CPU= min(HardwareProfile::distill_concurrency, 4).
     pub pool_size: Option<usize>,
+    /// Adaptive batch-size controller. When true (default), the embedder
+    /// hill-climbs `batch_size` in-process against observed throughput
+    /// using an EWMA controller. `batch_size` becomes the starting point
+    /// rather than a fixed value. Disable to pin batch_size exactly.
+    pub adaptive_batch: bool,
     pub sparse_enabled: bool,
 }
 
@@ -82,6 +87,7 @@ impl Default for EmbeddingConfig {
             dimension: 1024,
             batch_size: None,
             pool_size: None,
+            adaptive_batch: true,
             sparse_enabled: true,
         }
     }

@@ -1,11 +1,13 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use hs_common::hardware_profile::HardwareProfile;
 
 use super::{ComputeDevice, Embedder};
+use crate::adaptive_batch::{AdaptiveBatchController, AdaptiveConfig};
 use crate::config::EmbeddingConfig;
 use crate::error::DistillError;
 use crate::types::EmbeddingOutput;
@@ -21,12 +23,12 @@ pub struct OnnxEmbedder {
     next: AtomicUsize,
     device: ComputeDevice,
     dimension: usize,
-    batch_size: usize,
+    batch_ctrl: Arc<AdaptiveBatchController>,
 }
 
 impl OnnxEmbedder {
     pub fn new(config: &EmbeddingConfig, device: ComputeDevice) -> Result<Self, DistillError> {
-        let batch_size = config.batch_size.unwrap_or(match &device {
+        let initial_batch_size = config.batch_size.unwrap_or(match &device {
             ComputeDevice::Cpu => 8,
             ComputeDevice::Cuda => 32,
         });
@@ -40,10 +42,18 @@ impl OnnxEmbedder {
         });
         let pool_size = pool_size.max(1);
 
+        let adaptive_cfg = if config.adaptive_batch {
+            AdaptiveConfig::default_for_device(&device, initial_batch_size)
+        } else {
+            AdaptiveConfig::pinned(initial_batch_size)
+        };
+
         tracing::info!(
             device = %device,
             pool_size,
-            batch_size,
+            initial_batch_size,
+            adaptive = config.adaptive_batch,
+            candidates = ?adaptive_cfg.candidates,
             "initializing bge-m3 embedder pool"
         );
 
@@ -67,7 +77,7 @@ impl OnnxEmbedder {
             next: AtomicUsize::new(0),
             device,
             dimension: config.dimension,
-            batch_size,
+            batch_ctrl: Arc::new(AdaptiveBatchController::new(adaptive_cfg)),
         })
     }
 }
@@ -130,8 +140,9 @@ impl Embedder for OnnxEmbedder {
             return Ok(Vec::new());
         }
 
+        let texts_len = texts.len();
         let texts: Vec<String> = texts.to_vec();
-        let batch_size = self.batch_size;
+        let batch_size = self.batch_ctrl.current();
 
         // Round-robin pick a model so concurrent callers land on different
         // Mutexes on CPU hosts. CUDA hosts have pool_size=1 so this just
@@ -141,6 +152,7 @@ impl Embedder for OnnxEmbedder {
 
         // fastembed's `embed` is synchronous and CPU/GPU-heavy. spawn_blocking
         // keeps it off the tokio worker threads.
+        let started = Instant::now();
         let denses = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>, DistillError> {
             let mut model = model
                 .lock()
@@ -161,6 +173,10 @@ impl Embedder for OnnxEmbedder {
         })
         .await
         .map_err(|e| DistillError::Embedding(format!("spawn_blocking join failed: {e}")))??;
+
+        // Feed the controller: texts_len processed in elapsed wall-clock.
+        self.batch_ctrl
+            .observe(texts_len, started.elapsed().as_secs_f64());
 
         Ok(denses
             .into_iter()
