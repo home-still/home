@@ -3,6 +3,7 @@ use figment::{
     Figment,
 };
 use hs_common::event_bus::{EventBus, EventBusConfig};
+use hs_common::hardware_profile::HardwareProfile;
 use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -84,6 +85,7 @@ pub struct AppConfig {
 }
 impl Default for AppConfig {
     fn default() -> Self {
+        let class = HardwareProfile::detect().class;
         Self {
             ollama_url: "http://localhost:11434".into(),
             model: "glm-ocr:latest".into(),
@@ -97,10 +99,10 @@ impl Default for AppConfig {
             pipeline_mode: PipelineMode::PerRegion,
             layout_model_path: "pp-doclayoutv3.onnx".into(),
             table_model_path: "slanet-plus.onnx".into(),
-            region_parallel: 4,
+            region_parallel: class.region_parallel(),
             use_cuda: true,
             max_image_dim: 1800,
-            vlm_concurrency: 4,
+            vlm_concurrency: class.vlm_concurrency(),
         }
     }
 }
@@ -230,12 +232,13 @@ impl Default for AutotuneConfig {
             .unwrap_or_default()
             .join(".home-still")
             .join("autotune-state.json");
+        let values = HardwareProfile::detect().class.autotune_values();
         Self {
             scribe_url: "http://127.0.0.1:7433".into(),
             tick_interval_secs: 1800,
             warmup_secs: 120,
             measure_secs: 1440,
-            values: vec![2, 4, 6, 8, 12, 16, 24],
+            values,
             improvement_threshold: 1.05,
             regression_threshold: 0.90,
             converge_after_stable: 3,
