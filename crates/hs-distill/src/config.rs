@@ -67,6 +67,11 @@ pub struct EmbeddingConfig {
     pub model: String,
     pub dimension: usize,
     pub batch_size: Option<usize>,
+    /// Model pool size. Each model is ~600 MB resident; pool lets parallel
+    /// `embed_batch` callers avoid contending on one Mutex. `None` means
+    /// "pick per device": CUDA=1 (single GPU context is faster than N),
+    /// CPU= min(HardwareProfile::distill_concurrency, 4).
+    pub pool_size: Option<usize>,
     pub sparse_enabled: bool,
 }
 
@@ -76,6 +81,7 @@ impl Default for EmbeddingConfig {
             model: "bge-m3".into(),
             dimension: 1024,
             batch_size: None,
+            pool_size: None,
             sparse_enabled: true,
         }
     }
