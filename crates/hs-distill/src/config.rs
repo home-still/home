@@ -23,6 +23,16 @@ pub struct DistillServerConfig {
     pub embedding: EmbeddingConfig,
     pub chunk_max_tokens: usize,
     pub chunk_overlap: usize,
+    /// Number of chunks per Qdrant upsert request. Each chunk carries a
+    /// 1024-dim f32 dense vector plus sparse + payload (~3–5 KB), so the
+    /// default 1000 sits well within Qdrant's 4 MB gRPC frame limit
+    /// while amortizing per-request overhead.
+    pub qdrant_upsert_batch: usize,
+    /// How many Qdrant upsert requests to fire in parallel per document.
+    /// Qdrant handles many concurrent writes to one collection cheaply,
+    /// so this keeps the upsert phase from being the slow link after a
+    /// fast embed.
+    pub qdrant_upsert_parallelism: usize,
     pub llm_metadata: bool,
     pub metadata_model: String,
     pub ollama_url: String,
@@ -40,6 +50,8 @@ impl Default for DistillServerConfig {
             embedding: EmbeddingConfig::default(),
             chunk_max_tokens: 1000,
             chunk_overlap: 100,
+            qdrant_upsert_batch: 1000,
+            qdrant_upsert_parallelism: 4,
             llm_metadata: false,
             metadata_model: "llama3.2:latest".into(),
             ollama_url: "http://localhost:11434".into(),

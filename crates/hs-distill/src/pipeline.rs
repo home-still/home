@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use hs_common::catalog::{read_catalog_entry, PageOffset};
 
 use crate::chunker::{chunk_markdown, ChunkerConfig};
@@ -170,9 +171,26 @@ pub async fn index_document(
         message: format!("Upserting {} chunks to Qdrant", total_chunks),
     });
 
-    // Upsert in batches of 500
-    for batch in embedded_chunks.chunks(500) {
-        qdrant::upsert_chunks(qdrant_client, &config.collection_name, batch).await?;
+    // Upsert in config-sized batches, several in flight at once — Qdrant
+    // handles concurrent writes to one collection cheaply, and the old
+    // sequential loop became the slow link once embed got faster.
+    let upsert_batch = config.qdrant_upsert_batch.max(1);
+    let parallelism = config.qdrant_upsert_parallelism.max(1);
+    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+    for batch in embedded_chunks.chunks(upsert_batch) {
+        in_flight.push(qdrant::upsert_chunks(
+            qdrant_client,
+            &config.collection_name,
+            batch,
+        ));
+        if in_flight.len() >= parallelism {
+            if let Some(r) = in_flight.next().await {
+                r?;
+            }
+        }
+    }
+    while let Some(r) = in_flight.next().await {
+        r?;
     }
 
     on_progress(DistillProgress {
