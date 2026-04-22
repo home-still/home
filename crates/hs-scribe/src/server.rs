@@ -18,7 +18,6 @@ use tokio_stream::wrappers::ReceiverStream;
 pub struct ServerState {
     pub processor: Processor,
     pub config: AppConfig,
-    pub vlm_sem: Arc<tokio::sync::Semaphore>,
     pub in_flight: Arc<AtomicUsize>,
     /// Unix millis of the most recent successful conversion. `0` = never.
     /// Lock-free reads serve `/health` probes without blocking writers.
@@ -82,7 +81,7 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoRespon
 
 async fn handle_readiness(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let total = state.config.vlm_concurrency;
-    let available = state.vlm_sem.available_permits();
+    let available = state.processor.vlm_sem().available_permits();
     let in_flight = state.in_flight.load(Ordering::Relaxed);
     axum::Json(serde_json::json!({
         "ready": available > 0,
@@ -144,9 +143,7 @@ async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipa
 
     let path = tmp.path().to_str().unwrap_or_default();
     let deadline = Duration::from_secs(state.config.convert_deadline_secs);
-    let fut = state
-        .processor
-        .process_pdf_with_shared_sem(path, Arc::clone(&state.vlm_sem));
+    let fut = state.processor.process_pdf(path);
     match tokio::time::timeout(deadline, fut).await {
         Ok(Ok(md)) => {
             record_success(&state.last_conversion_ms, &state.total_conversions, &md);
@@ -195,7 +192,6 @@ async fn handle_scribe_stream(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
     let path = tmp.path().to_string_lossy().to_string();
-    let vlm_sem = Arc::clone(&state.vlm_sem);
 
     let deadline = Duration::from_secs(state.config.convert_deadline_secs);
     tokio::spawn(async move {
@@ -212,7 +208,7 @@ async fn handle_scribe_stream(
 
         let fut = state
             .processor
-            .process_pdf_with_progress_and_sem(&path, on_progress, vlm_sem);
+            .process_pdf_with_progress(&path, on_progress);
         match tokio::time::timeout(deadline, fut).await {
             Ok(Ok(md)) => {
                 record_success(&state.last_conversion_ms, &state.total_conversions, &md);

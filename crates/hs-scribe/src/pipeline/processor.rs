@@ -63,6 +63,11 @@ pub struct Processor {
     layout_model_reason: Option<String>,
     table_recognizer: Option<Arc<std::sync::Mutex<TableStructureRecognizer>>>,
     table_model_reason: Option<String>,
+    /// Shared VLM concurrency semaphore — one per Processor, reused across
+    /// every convert call. Size = `config.vlm_concurrency`. Server-side
+    /// callers consume the same semaphore as watch/CLI callers; `/readiness`
+    /// reports its live permit count via `Processor::vlm_sem()`.
+    vlm_sem: Arc<tokio::sync::Semaphore>,
     config: AppConfig,
 }
 
@@ -130,12 +135,15 @@ impl Processor {
             None
         };
 
+        let vlm_sem = Arc::new(tokio::sync::Semaphore::new(config.vlm_concurrency));
+
         Ok(Self {
             ocr,
             layout_detector,
             layout_model_reason,
             table_recognizer,
             table_model_reason,
+            vlm_sem,
             config,
         })
     }
@@ -150,6 +158,13 @@ impl Processor {
 
     pub fn ocr(&self) -> Arc<OcrEngine> {
         Arc::clone(&self.ocr)
+    }
+
+    /// Shared VLM semaphore. `/readiness` reports `available_permits()` so
+    /// the pool load-balancer sees the true free-slot count, not a
+    /// request-level approximation.
+    pub fn vlm_sem(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.vlm_sem)
     }
 
     /// Is this processor running in per-region mode (i.e., has a layout detector)?
@@ -463,7 +478,7 @@ impl Processor {
 
         // Per-region mode: 2-stage async pipeline
         let (tx, mut rx) = tokio::sync::mpsc::channel::<PreparedPage>(3);
-        let vlm_sem = Arc::new(tokio::sync::Semaphore::new(self.config.vlm_concurrency));
+        let vlm_sem = Arc::clone(&self.vlm_sem);
 
         let layout = self.layout_detector.clone();
         let table = self.table_recognizer.clone();
@@ -552,29 +567,6 @@ impl Processor {
         ))
     }
 
-    /// Process PDF with progress and a shared VLM semaphore from ServerState.
-    /// TODO: Wire shared semaphore into pipeline internals for true cross-request limiting.
-    pub async fn process_pdf_with_progress_and_sem<F>(
-        &self,
-        pdf_path: &str,
-        on_progress: F,
-        _vlm_sem: Arc<tokio::sync::Semaphore>,
-    ) -> Result<String>
-    where
-        F: Fn(ProgressEvent) + Send + Sync + 'static,
-    {
-        self.process_pdf_with_progress(pdf_path, on_progress).await
-    }
-
-    /// Process PDF with a shared VLM semaphore from ServerState.
-    pub async fn process_pdf_with_shared_sem(
-        &self,
-        pdf_path: &str,
-        _vlm_sem: Arc<tokio::sync::Semaphore>,
-    ) -> Result<String> {
-        self.process_pdf(pdf_path).await
-    }
-
     pub async fn process_pdf(&self, pdf_path: &str) -> Result<String> {
         let pages = {
             let pdf_parser = PdfParser::new()?;
@@ -617,7 +609,7 @@ impl Processor {
         // Stage 2 (VLM): HTTP inference — concurrent across pages
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<PreparedPage>(3);
-        let vlm_sem = Arc::new(tokio::sync::Semaphore::new(self.config.vlm_concurrency));
+        let vlm_sem = Arc::clone(&self.vlm_sem);
 
         let layout = self.layout_detector.clone();
         let table = self.table_recognizer.clone();

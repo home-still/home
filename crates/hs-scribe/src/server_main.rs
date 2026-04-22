@@ -45,12 +45,10 @@ async fn async_main() -> Result<()> {
         config.model,
         config.vlm_concurrency
     );
-    let vlm_sem = Arc::new(tokio::sync::Semaphore::new(config.vlm_concurrency));
     let processor = Processor::new(config.clone())?;
     let state = Arc::new(ServerState {
         processor,
         config,
-        vlm_sem,
         in_flight: Arc::new(AtomicUsize::new(0)),
         last_conversion_ms: Arc::new(AtomicU64::new(0)),
         total_conversions: Arc::new(AtomicU64::new(0)),
