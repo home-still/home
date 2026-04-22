@@ -83,15 +83,13 @@ impl ReadinessInfo for ReadinessResponse {
     fn is_ready(&self) -> bool {
         self.ready
     }
-    /// Load-based pool ranking. `vlm_slots_available` is decorative in
-    /// today's server (the semaphore is re-created per request), so tying
-    /// on it collapsed the pool to pure round-robin — which starved fast
-    /// hosts because slow ones accumulated in-flight work. Approximate the
-    /// "slots free" signal from actual load: total minus in-flight,
-    /// floored at zero when oversubscribed.
+    /// Live VLM permit count from the server-side shared semaphore
+    /// (`Processor::vlm_sem().available_permits()`). Because scribe now
+    /// owns exactly one semaphore per process (see rc.286), this is the
+    /// truthful "free slot" signal the pool uses to pick the least-loaded
+    /// host.
     fn available_slots(&self) -> usize {
-        self.vlm_slots_total
-            .saturating_sub(self.in_flight_conversions)
+        self.vlm_slots_available
     }
 }
 
