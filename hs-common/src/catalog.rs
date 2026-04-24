@@ -39,6 +39,16 @@ pub struct CatalogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversion: Option<ConversionMeta>,
 
+    /// Recorded when the source bytes are not a valid PDF (or EPUB / HTML)
+    /// at all — e.g. a paywall HTML renamed `.pdf`, truncated downloads,
+    /// ransomware stubs. This is not a retry-able error: the *content* is
+    /// wrong, so no number of reconvert attempts will succeed. `catalog_
+    /// repair`'s `stuck_convert` direction skips rows with this stamp, and
+    /// the scribe watch-events daemon writes it before acking NATS so the
+    /// queue drains instead of re-processing the same dead files forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversion_failed: Option<ConversionFailure>,
+
     // Embedding metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<EmbeddingMeta>,
@@ -74,6 +84,30 @@ pub struct ConversionMeta {
     pub converted_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<PageOffset>,
+}
+
+/// Terminal convert failure — written when the source is unconvertable by
+/// content, not by transient error. Presence of this stamp means "stop
+/// trying; look at the reason and either re-download or quarantine."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversionFailure {
+    /// Short machine-readable reason. Canonical values:
+    /// `"unsupported_content_type:html"` (paywall HTML saved as .pdf),
+    /// `"unsupported_content_type:binary"` (random bytes, truncated
+    /// download, encrypted PDF, etc.), `"quarantine_scan:html"` /
+    /// `"quarantine_scan:binary"` (flagged by the offline quarantine
+    /// sweeper).
+    pub reason: String,
+    /// RFC3339 timestamp of when this failure was recorded.
+    pub at: String,
+    /// Attempt counter. Always 1 today (terminal on first detection); the
+    /// field is carried so a future retry policy has a place to increment.
+    #[serde(default = "default_attempts")]
+    pub attempts: u32,
+}
+
+fn default_attempts() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,6 +465,35 @@ pub async fn update_conversion_catalog_via(
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
 
+/// Stamp a terminal convert failure on the catalog row. Called by the
+/// scribe watch-events daemon when the `/convert` endpoint rejects the
+/// source bytes as unconvertable (e.g. HTML masquerading as PDF), and by
+/// the `hs migrate quarantine-bad-content` sweeper when it relocates a
+/// bad file. Idempotent: overwrites any prior stamp (the `attempts`
+/// counter is preserved across stamps for future retry policies).
+#[cfg(feature = "storage")]
+pub async fn update_conversion_failed_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    stem: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let mut entry = read_catalog_entry_via(storage, prefix, stem)
+        .await
+        .unwrap_or_default();
+    let attempts = entry
+        .conversion_failed
+        .as_ref()
+        .map(|f| f.attempts.saturating_add(1))
+        .unwrap_or(1);
+    entry.conversion_failed = Some(ConversionFailure {
+        reason: reason.to_string(),
+        at: chrono::Utc::now().to_rfc3339(),
+        attempts,
+    });
+    write_catalog_entry_via(storage, prefix, stem, &entry).await
+}
+
 /// Record the outcome of an indexing attempt: stamp `embedding` when
 /// Qdrant got points, otherwise stamp `embedding_skip`. Use this at the
 /// integration seam (MCP, event_watch) so a 0-chunks return value is
@@ -599,6 +662,43 @@ conversion:
         let conv = entry.conversion.expect("conversion present");
         assert_eq!(conv.duration_secs, 5.0);
         assert_eq!(conv.total_pages, 12);
+    }
+
+    #[tokio::test]
+    async fn conversion_failed_roundtrip_and_increments_attempts() {
+        // Stamp, read back, stamp again — attempts counter should
+        // increment so a future retry policy can see how many tries the
+        // file has already eaten.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        update_conversion_failed_via(
+            &storage,
+            "catalog",
+            "paywalled",
+            "unsupported_content_type:html",
+        )
+        .await
+        .unwrap();
+        let entry = read_catalog_entry_via(&storage, "catalog", "paywalled")
+            .await
+            .expect("row stamped");
+        let f1 = entry.conversion_failed.expect("field present");
+        assert_eq!(f1.reason, "unsupported_content_type:html");
+        assert_eq!(f1.attempts, 1);
+
+        update_conversion_failed_via(
+            &storage,
+            "catalog",
+            "paywalled",
+            "unsupported_content_type:html",
+        )
+        .await
+        .unwrap();
+        let entry2 = read_catalog_entry_via(&storage, "catalog", "paywalled")
+            .await
+            .unwrap();
+        assert_eq!(entry2.conversion_failed.unwrap().attempts, 2);
     }
 
     #[tokio::test]

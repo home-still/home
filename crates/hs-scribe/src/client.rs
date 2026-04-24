@@ -6,6 +6,32 @@ use hs_common::service::protocol::{ReadinessInfo, ServiceClient};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::config::TimeoutPolicy;
+
+/// HTTP header name carrying the per-request convert deadline. The
+/// server reads this and wraps `process_pdf` in
+/// `tokio::time::timeout(header_value)`, so client and server agree on
+/// how long to wait for a given PDF instead of drifting between
+/// independent config defaults.
+pub const CONVERT_DEADLINE_HEADER: &str = "X-Convert-Deadline-Secs";
+
+/// Compute the per-request convert timeout from a PDF's page count.
+///
+/// `pages = None` (parse failed, non-PDF payload) → `policy.fallback_secs`.
+/// Otherwise: `clamp(base + pages * per_page, floor, ceiling)`.
+pub fn compute_convert_timeout(pages: Option<u32>, policy: &TimeoutPolicy) -> Duration {
+    let secs = match pages {
+        None => policy.fallback_secs,
+        Some(n) => {
+            let raw = policy
+                .base_secs
+                .saturating_add(policy.per_page_secs.saturating_mul(n as u64));
+            raw.clamp(policy.floor_secs, policy.ceiling_secs)
+        }
+    };
+    Duration::from_secs(secs)
+}
+
 // ── NDJSON streaming protocol types ──────────────────────────────
 
 /// A single line in the NDJSON progress stream.
@@ -193,18 +219,23 @@ impl ServiceClient for ScribeClient {
 }
 
 impl ScribeClient {
-    pub async fn convert(&self, pdf_bytes: Vec<u8>) -> Result<String> {
+    /// Convert a PDF. When `timeout` is `Some`, applies it as the
+    /// reqwest per-request timeout and sends the same value in the
+    /// `X-Convert-Deadline-Secs` header so the server's
+    /// `tokio::time::timeout` wrapper matches. `None` uses the client's
+    /// construction-time baseline.
+    pub async fn convert(&self, pdf_bytes: Vec<u8>, timeout: Option<Duration>) -> Result<String> {
         let url = format!("{}/scribe", self.server_url);
         let part = reqwest::multipart::Part::bytes(pdf_bytes).file_name("input.pdf");
         let form = reqwest::multipart::Form::new().part("pdf", part);
 
-        let resp = self
-            .http
-            .post(&url)
-            .multipart(form)
-            .send()
-            .await
-            .context("Failed to send PDF")?;
+        let mut req = self.http.post(&url).multipart(form);
+        if let Some(d) = timeout {
+            req = req
+                .timeout(d)
+                .header(CONVERT_DEADLINE_HEADER, d.as_secs().to_string());
+        }
+        let resp = req.send().await.context("Failed to send PDF")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -217,23 +248,25 @@ impl ScribeClient {
 
     /// Convert a PDF with streaming progress updates via NDJSON.
     /// Falls back to the plain `/scribe` endpoint if the server doesn't
-    /// support streaming (404).
+    /// support streaming (404). `timeout` semantics match
+    /// [`ScribeClient::convert`].
     pub async fn convert_with_progress(
         &self,
         pdf_bytes: Vec<u8>,
+        timeout: Option<Duration>,
         on_progress: impl Fn(ProgressEvent),
     ) -> Result<String> {
         let url = format!("{}/scribe/stream", self.server_url);
         let part = reqwest::multipart::Part::bytes(pdf_bytes.clone()).file_name("input.pdf");
         let form = reqwest::multipart::Form::new().part("pdf", part);
 
-        let mut resp = self
-            .http
-            .post(&url)
-            .multipart(form)
-            .send()
-            .await
-            .context("Failed to send PDF")?;
+        let mut req = self.http.post(&url).multipart(form);
+        if let Some(d) = timeout {
+            req = req
+                .timeout(d)
+                .header(CONVERT_DEADLINE_HEADER, d.as_secs().to_string());
+        }
+        let mut resp = req.send().await.context("Failed to send PDF")?;
 
         // Server doesn't support streaming — fall back to plain endpoint
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -243,7 +276,7 @@ impl ScribeClient {
                 total_pages: 0,
                 message: "server does not support progress (update server image)".into(),
             });
-            return self.convert(pdf_bytes).await;
+            return self.convert(pdf_bytes, timeout).await;
         }
 
         if !resp.status().is_success() {
@@ -278,5 +311,54 @@ impl ScribeClient {
         }
 
         anyhow::bail!("Server closed connection without sending result")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy() -> TimeoutPolicy {
+        TimeoutPolicy::default()
+    }
+
+    #[test]
+    fn unknown_page_count_uses_fallback() {
+        let d = compute_convert_timeout(None, &policy());
+        assert_eq!(d.as_secs(), 900);
+    }
+
+    #[test]
+    fn one_page_clamps_to_floor() {
+        let d = compute_convert_timeout(Some(1), &policy());
+        assert_eq!(d.as_secs(), 300);
+    }
+
+    #[test]
+    fn midsize_scales_linearly() {
+        let d = compute_convert_timeout(Some(50), &policy());
+        // 60 + 50 * 15 = 810
+        assert_eq!(d.as_secs(), 810);
+    }
+
+    #[test]
+    fn huge_book_clamps_to_ceiling() {
+        let d = compute_convert_timeout(Some(1000), &policy());
+        assert_eq!(d.as_secs(), 3600);
+    }
+
+    #[test]
+    fn custom_policy_respected() {
+        let p = TimeoutPolicy {
+            base_secs: 10,
+            per_page_secs: 5,
+            floor_secs: 30,
+            ceiling_secs: 200,
+            fallback_secs: 60,
+        };
+        assert_eq!(compute_convert_timeout(Some(20), &p).as_secs(), 110);
+        assert_eq!(compute_convert_timeout(Some(1), &p).as_secs(), 30);
+        assert_eq!(compute_convert_timeout(Some(500), &p).as_secs(), 200);
+        assert_eq!(compute_convert_timeout(None, &p).as_secs(), 60);
     }
 }

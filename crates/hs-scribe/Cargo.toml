@@ -45,6 +45,7 @@ futures-util = "0.3"
 scraper = "0.22"
 chrono = { workspace = true }
 epub = "2"
+lopdf = { version = "0.33", default-features = false, features = ["pom_parser"] }
 
 # Server Only
 axum = { version = "0.8", optional = true, features = ["multipart"] }

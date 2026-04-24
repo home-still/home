@@ -47,6 +47,29 @@ pub enum PipelineCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Delete the JetStream PAPERS and SCRIBE streams — all queued and
+    /// in-flight events are discarded. Use when a consumer is stuck
+    /// with a stale config (e.g. wrong ack_wait) and `create_or_update`
+    /// alone can't recover it. The worker daemons recreate the streams
+    /// on their next connect using the current `NatsConfig`. Follow
+    /// with `hs pipeline catch-up` to re-queue unconverted papers.
+    EventsReset,
+    /// Delete HTML paywall / loading-stub artifacts — source `.html`,
+    /// derived `.md`, and catalog `.yaml` — for every catalog entry
+    /// stamped `embedding_skip.reason = zero_chunks_or_empty` AND
+    /// produced by the html-parser. These are known-junk ingests
+    /// (PMC "Preparing to download" interstitials etc.) that a
+    /// newly-stricter pre-conversion guard now rejects at the door;
+    /// this removes the legacy residue so `hs pipeline catch-up`
+    /// stops re-queueing them.
+    PurgeSkipped {
+        /// Report what would be deleted without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -57,7 +80,36 @@ pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<
             confirm,
         } => cmd_rebuild(dry_run, yes, confirm, reporter).await,
         PipelineCmd::CatchUp { dry_run } => cmd_catch_up(dry_run, reporter).await,
+        PipelineCmd::EventsReset => cmd_events_reset(reporter).await,
+        PipelineCmd::PurgeSkipped { dry_run, yes } => {
+            cmd_purge_skipped(dry_run, yes, reporter).await
+        }
     }
+}
+
+async fn cmd_events_reset(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let bus_cfg = cfg.events.clone();
+    if bus_cfg.backend != hs_common::event_bus::EventsBackend::Nats {
+        reporter.warn("events.backend is not `nats` — nothing to reset.");
+        return Ok(());
+    }
+    let nats =
+        hs_common::event_bus::nats::NatsBus::connect(hs_common::event_bus::nats::NatsConfig {
+            url: bus_cfg.nats.url.clone(),
+            ack_wait: std::time::Duration::from_secs(bus_cfg.nats.ack_wait_secs),
+            max_deliver: bus_cfg.nats.max_deliver,
+            max_age: std::time::Duration::from_secs(bus_cfg.nats.max_age_secs),
+            max_ack_pending: bus_cfg.nats.max_ack_pending,
+        })
+        .await
+        .context("connecting to NATS for stream reset")?;
+    nats.reset_streams()
+        .await
+        .context("reset JetStream streams")?;
+    reporter
+        .finish("Deleted JetStream streams PAPERS and SCRIBE. Next worker connect recreates them.");
+    Ok(())
 }
 
 async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -382,4 +434,130 @@ fn print_summary(inv: &Inventory, reporter: &Arc<dyn Reporter>) {
         &format!("{} points / {} docs", inv.qdrant_points, inv.qdrant_docs),
     );
     reporter.status("Papers to republish", &format!("{}", inv.paper_keys.len()));
+}
+
+async fn cmd_purge_skipped(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+
+    reporter.status("Scan", "catalog for embedding_skip stubs");
+    let triples = hs_common::catalog::list_catalog_entries_via(&*storage, "catalog")
+        .await
+        .context("list catalog entries")?;
+
+    // A "junk HTML stub" is an entry whose distill decision was
+    // `zero_chunks_or_empty` AND whose converter was `html-parser`.
+    // Restricting on both fields keeps this from ever nuking a PDF whose
+    // extraction legitimately failed — a PDF path would use `scribe-vlm`.
+    struct Victim {
+        stem: String,
+        catalog_key: String,
+    }
+    let victims: Vec<Victim> = triples
+        .into_iter()
+        .filter_map(|(stem, obj, entry)| {
+            let skip = entry.embedding_skip.as_ref()?;
+            if skip.reason != "zero_chunks_or_empty" {
+                return None;
+            }
+            let conv = entry.conversion.as_ref()?;
+            if conv.server != "html-parser" {
+                return None;
+            }
+            Some(Victim {
+                stem,
+                catalog_key: obj.key,
+            })
+        })
+        .collect();
+
+    reporter.status(
+        "Victims",
+        &format!("{} HTML stubs identified", victims.len()),
+    );
+    if victims.is_empty() {
+        reporter.finish("Nothing to purge — no HTML stubs stamped `zero_chunks_or_empty`.");
+        return Ok(());
+    }
+
+    for v in victims.iter().take(5) {
+        reporter.status("Sample", &v.stem);
+    }
+    if victims.len() > 5 {
+        reporter.status("...", &format!("+{} more", victims.len() - 5));
+    }
+
+    if dry_run {
+        reporter.finish("Dry-run complete — no state changed.");
+        return Ok(());
+    }
+
+    if !yes {
+        let accept = Confirm::new()
+            .with_prompt(format!(
+                "Delete {} HTML stubs (source .html + .md + catalog .yaml)?",
+                victims.len()
+            ))
+            .default(false)
+            .interact()?;
+        if !accept {
+            reporter.finish("Aborted — no state changed.");
+            return Ok(());
+        }
+    }
+
+    let mut md_deleted = 0u64;
+    let mut cat_deleted = 0u64;
+    let mut src_deleted = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, v) in victims.iter().enumerate() {
+        // Catalog yaml — we already have the exact key from the listing.
+        match storage.delete(&v.catalog_key).await {
+            Ok(()) => cat_deleted += 1,
+            Err(e) => errors.push(format!("catalog/{}: {e}", v.stem)),
+        }
+
+        // Markdown — always `markdown/{shard}/{stem}.md`.
+        let md_key = hs_common::markdown::markdown_storage_key(&v.stem);
+        match storage.delete(&md_key).await {
+            Ok(()) => md_deleted += 1,
+            Err(e) => errors.push(format!("markdown/{}: {e}", v.stem)),
+        }
+
+        // Source HTML — extension may be `html` or `htm`. Try both, count
+        // one success per stem. `delete` on a missing key is not an error.
+        let mut src_hit = false;
+        for ext in ["html", "htm"] {
+            let key = format!("papers/{}", hs_common::sharded_key(&v.stem, ext));
+            if storage.exists(&key).await.unwrap_or(false) {
+                match storage.delete(&key).await {
+                    Ok(()) => {
+                        src_hit = true;
+                        break;
+                    }
+                    Err(e) => errors.push(format!("papers/{}.{ext}: {e}", v.stem)),
+                }
+            }
+        }
+        if src_hit {
+            src_deleted += 1;
+        }
+
+        if (i + 1) % 50 == 0 {
+            reporter.status("Progress", &format!("purged {}/{}", i + 1, victims.len()));
+        }
+    }
+
+    reporter.finish(&format!(
+        "Purged HTML stubs — catalog={cat_deleted} markdown={md_deleted} source={src_deleted} errors={}",
+        errors.len()
+    ));
+    for e in errors.iter().take(10) {
+        eprintln!("  error: {e}");
+    }
+    if errors.len() > 10 {
+        eprintln!("  ... and {} more", errors.len() - 10);
+    }
+    Ok(())
 }

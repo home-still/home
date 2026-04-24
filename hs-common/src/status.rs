@@ -97,6 +97,13 @@ pub struct PipelineCounts {
     /// the denominator.
     #[serde(default)]
     pub embedding_skipped: Option<u64>,
+    /// Catalog entries stamped `conversion_failed` — terminal content-type
+    /// or parse failures (paywall HTML renamed .pdf, truncated downloads,
+    /// corrupt PDFs). Rendered in the "Corrupted PDFs" row and subtracted
+    /// from the convert denominator so the progress bar reflects
+    /// convertible work only.
+    #[serde(default)]
+    pub corrupted_pdfs: Option<u64>,
     /// Unaccounted rows: `documents − markdown − in_flight`. Small
     /// residual (<= threshold) is expected due to stage-in-progress;
     /// larger values indicate a conversion error the operator needs to
@@ -796,6 +803,16 @@ pub fn list_catalog_stuck_convert(
         if entry.conversion.is_some() {
             continue;
         }
+        // Rows stamped `conversion_failed` are terminal: the source is
+        // unconvertable by content (paywall HTML renamed .pdf, truncated
+        // download, corrupt PDF). Republishing them into the NATS queue
+        // would get another HTTP 415 and another stamp — infinite churn.
+        // The row isn't "stuck"; it's dead. Let `hs migrate
+        // quarantine-bad-content` relocate and `hs status` surface it
+        // via the corrupted-PDF count.
+        if entry.conversion_failed.is_some() {
+            continue;
+        }
         let Some(ext) = source_by_stem.get(stem) else {
             continue;
         };
@@ -960,6 +977,8 @@ pub async fn collect_pipeline_counts(
         embedded_documents,
         embedded_chunks,
         embedding_skipped,
+        // Computed by caller (needs the full catalog in memory).
+        corrupted_pdfs: None,
         // Computed by caller once it knows total in_flight.
         pipeline_drift: 0,
         pipeline_drift_threshold: PIPELINE_DRIFT_THRESHOLD,
@@ -1110,6 +1129,44 @@ mod stuck_convert_tests {
         assert_eq!(stuck_rows.len(), 1, "got: {stuck_rows:?}");
         assert_eq!(stuck_rows[0].stem, "stuck");
         assert_eq!(stuck_rows[0].source_ext, "pdf");
+    }
+
+    #[tokio::test]
+    async fn skips_rows_stamped_conversion_failed() {
+        // A row with a PDF on disk, no conversion, BUT stamped
+        // conversion_failed is terminal — stuck_convert must not surface
+        // it, otherwise catalog_repair re-publishes and the queue loops.
+        use crate::catalog::ConversionFailure;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let dead = CatalogEntry {
+            downloaded_at: Some("2026-04-24T10:00:00Z".into()),
+            pdf_path: Some("papers/de/dead.pdf".into()),
+            conversion: None,
+            conversion_failed: Some(ConversionFailure {
+                reason: "unsupported_content_type:html".into(),
+                at: "2026-04-24T10:01:00Z".into(),
+                attempts: 1,
+            }),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "dead", &dead)
+            .await
+            .unwrap();
+        storage
+            .put("papers/de/dead.pdf", b"<html>paywall</html>".to_vec())
+            .await
+            .unwrap();
+
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
+            .await
+            .unwrap();
+        let stuck_rows = list_catalog_stuck_convert(&snap.papers, &snap.catalog);
+        assert!(
+            stuck_rows.is_empty(),
+            "dead row should not surface as stuck: {stuck_rows:?}"
+        );
     }
 
     #[tokio::test]

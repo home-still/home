@@ -214,7 +214,7 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         doc_counts: Some((snap.pipeline.documents, 0)),
         markdown_counts: Some((snap.pipeline.markdown, 0)),
         catalog_count: Some(snap.pipeline.catalog_entries),
-        corrupted_count: None,
+        corrupted_count: snap.pipeline.corrupted_pdfs,
         embedded_docs: snap.pipeline.embedded_documents.unwrap_or(0),
         embedded_chunks: snap.pipeline.embedded_chunks.unwrap_or(0),
         embedding_skipped: snap.pipeline.embedding_skipped.unwrap_or(0),

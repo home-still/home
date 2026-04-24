@@ -171,13 +171,21 @@ pub struct ScribeConfig {
     #[serde(default = "default_inbox_poll_interval_secs")]
     pub inbox_poll_interval_secs: u64,
     /// Request timeout (seconds) for `ScribeClient::convert` /
-    /// `convert_with_progress`. Caps a single PDF conversion so a
-    /// stuck backend (e.g. Ollama hang) can't freeze the subscriber.
-    /// Default 900s (15min) fits long multi-page VLM runs on Metal
-    /// with headroom; raise for outlier workloads via the
-    /// `HS_SCRIBE_CONVERT_TIMEOUT_SECS` env override.
+    /// `convert_with_progress` when the subscriber could not determine
+    /// the PDF page count. Acts as the reqwest client's baseline
+    /// timeout; per-request overrides come from `timeout_policy`. Raise
+    /// via `HS_SCRIBE_CONVERT_TIMEOUT_SECS` for outlier workloads.
     #[serde(default = "default_convert_timeout_secs")]
     pub convert_timeout_secs: u64,
+    /// Page-count-aware timeout policy for PDF conversion. Each
+    /// dispatch reads the PDF page count (lopdf), feeds it into the
+    /// policy formula (`clamp(base + pages × per_page, floor, ceiling)`),
+    /// and sends that deadline both as reqwest's per-request timeout
+    /// and as the `X-Convert-Deadline-Secs` header. The server mirrors
+    /// the header when present so client and server agree on the
+    /// deadline and neither gives up prematurely.
+    #[serde(default)]
+    pub timeout_policy: TimeoutPolicy,
     /// Ollama `OLLAMA_NUM_PARALLEL` auto-tuner knobs. Consumed by
     /// `hs scribe autotune`, which hill-climbs against observed
     /// per-host scribe throughput.
@@ -268,6 +276,48 @@ fn default_convert_timeout_secs() -> u64 {
     900
 }
 
+/// Page-count-aware timeout formula for PDF conversion. The subscriber
+/// reads the page count from the raw PDF before dispatching and sizes
+/// the per-request deadline as
+/// `clamp(base + pages × per_page, floor, ceiling)`. When page count
+/// can't be determined (corrupt PDF, non-PDF bytes), the subscriber
+/// falls back to `fallback_secs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TimeoutPolicy {
+    /// Constant overhead per convert (model load, PDF parse on server,
+    /// network + S3 fetch). Independent of page count.
+    pub base_secs: u64,
+    /// Budget per PDF page for VLM + layout + table extraction. A
+    /// generous estimate — a slow Metal VLM takes ~10s/page at 1800px
+    /// and `per_page_secs=15` leaves headroom for queueing and retries.
+    pub per_page_secs: u64,
+    /// Minimum deadline regardless of page count. A 1-page paper
+    /// shouldn't time out at 75s when the actual convert takes 200s on
+    /// a saturated cluster.
+    pub floor_secs: u64,
+    /// Maximum deadline regardless of page count. Caps a truly huge
+    /// book so a poison input can't hold a delivery slot for hours.
+    /// JetStream `ack_wait` must be ≥ this value.
+    pub ceiling_secs: u64,
+    /// Used when `pdf_meta::count_pages` returns `None` — we don't know
+    /// how big the PDF is, so we use a reasonable default that won't
+    /// time out on typical papers.
+    pub fallback_secs: u64,
+}
+
+impl Default for TimeoutPolicy {
+    fn default() -> Self {
+        Self {
+            base_secs: 60,
+            per_page_secs: 15,
+            floor_secs: 300,
+            ceiling_secs: 3600,
+            fallback_secs: 900,
+        }
+    }
+}
+
 impl Default for ScribeConfig {
     fn default() -> Self {
         Self {
@@ -279,6 +329,7 @@ impl Default for ScribeConfig {
             local_server: true,
             inbox_poll_interval_secs: default_inbox_poll_interval_secs(),
             convert_timeout_secs: default_convert_timeout_secs(),
+            timeout_policy: TimeoutPolicy::default(),
             autotune: AutotuneConfig::default(),
             storage: StorageConfig::default(),
             events: EventBusConfig::default(),

@@ -540,6 +540,7 @@ impl HomeStillMcp {
             file_size_bytes: Some(result.size_bytes),
             sha256: Some(result.sha256.clone()),
             conversion: None,
+            conversion_failed: None,
             embedding: None,
             embedding_skip: None,
             repair: None,
@@ -2616,6 +2617,15 @@ impl HomeStillMcp {
                 .count() as u64
         });
 
+        // Same pass — catalog rows stamped `conversion_failed` surface as
+        // the Corrupted PDFs count in `hs status`.
+        let corrupted_pdfs: Option<u64> = catalog_triples.as_ref().map(|triples| {
+            triples
+                .iter()
+                .filter(|(_, _, entry)| entry.conversion_failed.is_some())
+                .count() as u64
+        });
+
         let mut pipeline = collect_pipeline_counts(
             &*self.storage,
             &self.papers_prefix,
@@ -2640,6 +2650,7 @@ impl HomeStillMcp {
             .saturating_sub(pipeline.markdown)
             .saturating_sub(total_in_flight);
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
+        pipeline.corrupted_pdfs = corrupted_pdfs;
 
         // History from the catalog — same source and same default filter as
         // `catalog_recent` so the two activity feeds can never disagree.

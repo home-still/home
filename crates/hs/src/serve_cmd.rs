@@ -206,10 +206,6 @@ async fn serve_scribe(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
 
     reporter.status("Serve", &format!("scribe on port {port}"));
 
-    // Auto-init (idempotent — skips already-present steps)
-    reporter.status("Init", "checking scribe prerequisites");
-    super::scribe_cmd::ensure_init(false).await?;
-
     // Register with gateway (best-effort); auto-deregisters on drop
     let my_url = format!("http://{}:{port}", local_ip_hint());
     let _reg = RegistryGuard::try_register("scribe", &my_url, reporter).await;

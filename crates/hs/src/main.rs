@@ -159,6 +159,9 @@ fn main() -> ExitCode {
                     cli::MigrateAction::MoveRootOrphans { dry_run, limit } => {
                         migrate_cmd::run_move_root_orphans(&reporter, dry_run, limit).await
                     }
+                    cli::MigrateAction::QuarantineBadContent { dry_run, limit } => {
+                        migrate_cmd::run_quarantine_bad_content(&reporter, dry_run, limit).await
+                    }
                 },
                 TopCmd::Pipeline { command } => pipeline_cmd::dispatch(command, &reporter).await,
             }

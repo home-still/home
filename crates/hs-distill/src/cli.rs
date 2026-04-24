@@ -24,10 +24,6 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
 
-        /// Don't yield GPU to scribe when it has work queued
-        #[arg(long)]
-        no_yield: bool,
-
         /// Internal: run as daemon child process
         #[arg(long, hide = true)]
         daemon_child: bool,

@@ -136,13 +136,12 @@ pub async fn dispatch(
             force,
             file,
             server,
-            no_yield,
             daemon_child,
         } => {
             if daemon_child {
-                cmd_index_daemon(file, server.as_deref(), no_yield, force).await
+                cmd_index_daemon(file, server.as_deref(), force).await
             } else {
-                cmd_index(file, server.as_deref(), no_yield, force, reporter).await
+                cmd_index(file, server.as_deref(), force, reporter).await
             }
         }
         DistillCmd::Search {
@@ -657,7 +656,7 @@ pub async fn ensure_index_running() -> bool {
     }
 
     // Spawn index daemon with defaults (no specific files, no force)
-    match spawn_index_daemon(&None, None, false, false) {
+    match spawn_index_daemon(&None, None, false) {
         Ok(pid) => {
             tracing::info!("Auto-started index daemon (PID {pid})");
             true
@@ -742,7 +741,6 @@ pub struct IndexStatus {
     pub total_files: usize,
     pub indexed: usize,
     pub failed: usize,
-    pub gpu_yield: bool,
     pub total_chunks: u32,
     pub current_file: String,
     pub done: bool,
@@ -763,7 +761,6 @@ fn write_index_status(status: &IndexStatus) {
 fn spawn_index_daemon(
     files: &Option<Vec<PathBuf>>,
     server: Option<&str>,
-    no_yield: bool,
     force: bool,
 ) -> Result<u32> {
     let exe = std::env::current_exe().context("Cannot find current executable")?;
@@ -773,9 +770,6 @@ fn spawn_index_daemon(
         "index".to_string(),
         "--daemon-child".to_string(),
     ];
-    if no_yield {
-        args.push("--no-yield".to_string());
-    }
     if force {
         args.push("--force".to_string());
     }
@@ -815,7 +809,6 @@ fn spawn_index_daemon(
 async fn cmd_index(
     files: Option<Vec<PathBuf>>,
     server: Option<&str>,
-    no_yield: bool,
     force: bool,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
@@ -846,7 +839,7 @@ async fn cmd_index(
     };
 
     // Spawn daemon
-    let pid = spawn_index_daemon(&files, server, no_yield, force)?;
+    let pid = spawn_index_daemon(&files, server, force)?;
     reporter.status(
         "Index",
         &format!("daemon started (PID {pid}). Press q to detach."),
@@ -896,15 +889,6 @@ async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
                     let _ = crossterm::terminal::enable_raw_mode();
                 }
                 last_indexed = status.indexed;
-            } else if status.gpu_yield {
-                let _ = crossterm::terminal::disable_raw_mode();
-                eprint!(
-                    "\r  [{}/{}] yielding to scribe...   ",
-                    status.indexed, status.total_files
-                );
-                if raw_enabled {
-                    let _ = crossterm::terminal::enable_raw_mode();
-                }
             }
 
             if status.done {
@@ -931,7 +915,6 @@ async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
 async fn cmd_index_daemon(
     files: Option<Vec<PathBuf>>,
     server: Option<&str>,
-    no_yield: bool,
     force: bool,
 ) -> Result<()> {
     // Write PID
@@ -966,16 +949,6 @@ async fn cmd_index_daemon(
     write_index_status(&status);
 
     for path in &paths {
-        // Yield GPU to scribe if it has work queued
-        if !no_yield && hs_common::gpu_priority::scribe_is_active() {
-            status.gpu_yield = true;
-            write_index_status(&status);
-            tracing::info!("Yielding to scribe (has active work)");
-            hs_common::gpu_priority::wait_for_scribe_idle().await;
-            status.gpu_yield = false;
-            tracing::info!("Scribe idle, resuming indexing");
-        }
-
         let path_str = path.to_string_lossy().to_string();
         let stem = path
             .file_stem()

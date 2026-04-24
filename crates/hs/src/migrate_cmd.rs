@@ -378,6 +378,263 @@ async fn relocate_one(
     Ok(RelocateOutcome::Moved { catalog_updated })
 }
 
+// ── quarantine-bad-content ───────────────────────────────────────────────
+
+#[derive(Debug)]
+enum QuarantineOutcome {
+    /// First 4 KB started with `%PDF` — legitimate PDF, left alone.
+    HealthyPdf,
+    /// Bytes were HTML. File renamed in place from `.pdf` to `.html`;
+    /// scribe-watch-events' html/htm branch will pick it up on republish.
+    RenamedToHtml,
+    /// Bytes were neither PDF nor HTML. File moved to
+    /// `papers/.quarantine/XX/stem.pdf` and the catalog row stamped
+    /// `conversion_failed` so nothing re-publishes it.
+    Quarantined,
+}
+
+/// Scan `papers/XX/*.pdf` for content-type mismatches and quarantine the
+/// bad files. Per-key flow:
+/// 1. List `papers/` recursively, keep `.pdf` keys (skip `._*`, skip
+///    `.quarantine/` which is our own output).
+/// 2. Bounded-concurrency (8) fetch each object's bytes, inspect the
+///    first 4 KB:
+///    - `%PDF` → `HealthyPdf`, no-op.
+///    - `looks_like_html` → `put` to `papers/XX/stem.html`, `delete`
+///      the `.pdf` key, publish `papers.ingested` so watch-events
+///      re-queues under the html/htm branch.
+///    - else → `put` to `papers/.quarantine/XX/stem.pdf`, `delete`
+///      original, `update_conversion_failed_via` with reason
+///      `quarantine_scan:binary`.
+/// 3. Fail-loud on any storage error; summary at end.
+pub async fn run_quarantine_bad_content(
+    reporter: &Arc<dyn Reporter>,
+    dry_run: bool,
+    limit: Option<usize>,
+) -> Result<()> {
+    use futures::stream::{self, StreamExt};
+    use hs_common::event_bus::EventBus;
+    use hs_common::storage::Storage;
+
+    let paper_cfg = paper::config::Config::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let scribe_cfg = hs_scribe::config::ScribeConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage: Arc<dyn Storage> = paper_cfg
+        .build_storage()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let bus: Arc<dyn EventBus> = scribe_cfg.build_event_bus().await?;
+
+    reporter.status("Scan", "listing papers/ for .pdf keys...");
+    let all = storage
+        .list("papers")
+        .await
+        .map_err(|e| anyhow::anyhow!("list papers/: {e}"))?;
+
+    let mut candidates: Vec<hs_common::storage::ObjectMeta> = all
+        .into_iter()
+        .filter(|o| {
+            if !o.key.ends_with(".pdf") {
+                return false;
+            }
+            // Skip our own quarantine output + macOS junk.
+            if o.key.contains("/.quarantine/") || o.key.contains("/._") {
+                return false;
+            }
+            true
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.key.cmp(&b.key));
+
+    let total = candidates.len();
+    if total == 0 {
+        reporter.finish("No papers/*.pdf objects to inspect");
+        return Ok(());
+    }
+    if let Some(lim) = limit {
+        candidates.truncate(lim);
+    }
+    let planned = candidates.len();
+
+    reporter.status(
+        "Plan",
+        &format!(
+            "{} PDF objects; inspecting {} this run ({})",
+            total,
+            planned,
+            if dry_run { "dry-run" } else { "live" }
+        ),
+    );
+
+    const CONCURRENCY: usize = 8;
+    let healthy = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let renamed_html = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let quarantined = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let errors: Arc<tokio::sync::Mutex<Vec<String>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    let mut stream = stream::iter(candidates.into_iter().map(|obj| {
+        let storage = Arc::clone(&storage);
+        let bus = Arc::clone(&bus);
+        let healthy = Arc::clone(&healthy);
+        let renamed_html = Arc::clone(&renamed_html);
+        let quarantined = Arc::clone(&quarantined);
+        let errors = Arc::clone(&errors);
+        async move {
+            match inspect_and_quarantine(&*storage, &*bus, &obj.key, dry_run).await {
+                Ok(QuarantineOutcome::HealthyPdf) => {
+                    healthy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(QuarantineOutcome::RenamedToHtml) => {
+                    renamed_html.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(QuarantineOutcome::Quarantined) => {
+                    quarantined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    errors.lock().await.push(format!("{}: {e}", obj.key));
+                }
+            }
+        }
+    }))
+    .buffer_unordered(CONCURRENCY);
+
+    let mut done = 0usize;
+    while stream.next().await.is_some() {
+        done += 1;
+        if done.is_multiple_of(25) || done == planned {
+            reporter.status(
+                "Scan",
+                &format!(
+                    "{done}/{planned} (healthy={}, html-rename={}, quarantined={}, errors={})",
+                    healthy.load(std::sync::atomic::Ordering::Relaxed),
+                    renamed_html.load(std::sync::atomic::Ordering::Relaxed),
+                    quarantined.load(std::sync::atomic::Ordering::Relaxed),
+                    errors.lock().await.len(),
+                ),
+            );
+        }
+    }
+
+    let h = healthy.load(std::sync::atomic::Ordering::Relaxed);
+    let r = renamed_html.load(std::sync::atomic::Ordering::Relaxed);
+    let q = quarantined.load(std::sync::atomic::Ordering::Relaxed);
+    let errs = errors.lock().await;
+    for e in errs.iter() {
+        reporter.warn(e);
+    }
+
+    let tag = if dry_run { "would" } else { "did" };
+    if errs.is_empty() {
+        reporter.finish(&format!(
+            "Inspected {planned}: {h} healthy · {tag} rename-to-html {r} · {tag} quarantine {q}"
+        ));
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "quarantine finished with {} error(s); healthy={h} html-rename={r} quarantined={q}",
+            errs.len()
+        )
+    }
+}
+
+/// Inspect one `.pdf` object, classify, and act. Guards:
+/// - `head(src)` first; skip silently if vanished (concurrent run).
+/// - HTML path publishes `papers.ingested` with the new `.html` key so
+///   `hs-scribe-watch-events` re-queues it — otherwise the renamed
+///   file would sit forever without trigger.
+/// - Quarantine path writes the catalog `conversion_failed` stamp
+///   *before* relocating, so even if we crash mid-operation the row is
+///   marked and stuck_convert won't re-emit it.
+async fn inspect_and_quarantine(
+    storage: &dyn hs_common::storage::Storage,
+    bus: &dyn hs_common::event_bus::EventBus,
+    src: &str,
+    dry_run: bool,
+) -> anyhow::Result<QuarantineOutcome> {
+    let Some(filename) = src.rsplit('/').next() else {
+        anyhow::bail!("source key has no filename: {src}");
+    };
+    let stem = filename.trim_end_matches(".pdf").to_string();
+    if stem.is_empty() {
+        anyhow::bail!("source key has no stem: {src}");
+    }
+
+    let bytes = storage
+        .get(src)
+        .await
+        .map_err(|e| anyhow::anyhow!("get({src}): {e}"))?;
+    let head = &bytes[..bytes.len().min(4096)];
+    if head.starts_with(b"%PDF") {
+        return Ok(QuarantineOutcome::HealthyPdf);
+    }
+    if hs_common::html::looks_like_html(head) {
+        // Rename papers/XX/stem.pdf -> papers/XX/stem.html.
+        let (prefix_dir, _) = src
+            .rsplit_once('/')
+            .ok_or_else(|| anyhow::anyhow!("cannot split {src}"))?;
+        let tgt = format!("{prefix_dir}/{stem}.html");
+        if dry_run {
+            return Ok(QuarantineOutcome::RenamedToHtml);
+        }
+        storage
+            .put(&tgt, bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("put({tgt}): {e}"))?;
+        storage
+            .delete(src)
+            .await
+            .map_err(|e| anyhow::anyhow!("delete({src}): {e}"))?;
+        // Re-queue the file under its actual content-type. Best-effort —
+        // if the bus publish fails the file is still in the right place
+        // and `catalog_repair`'s stuck_convert direction will re-emit it
+        // on the next run.
+        let payload = serde_json::json!({
+            "key": tgt,
+            "source": "hs migrate quarantine-bad-content:html_rename",
+        });
+        if let Err(e) = bus
+            .publish(
+                "papers.ingested",
+                serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
+            )
+            .await
+        {
+            tracing::warn!(key = %tgt, error = %e, "re-queue publish failed; file relies on catalog_repair");
+        }
+        return Ok(QuarantineOutcome::RenamedToHtml);
+    }
+    // Neither PDF nor HTML — random bytes, encrypted, truncated, etc.
+    // Move to .quarantine/ and stamp conversion_failed.
+    let (prefix_dir, _) = src
+        .rsplit_once('/')
+        .ok_or_else(|| anyhow::anyhow!("cannot split {src}"))?;
+    let shard = prefix_dir.rsplit('/').next().unwrap_or("");
+    let tgt = format!("papers/.quarantine/{shard}/{stem}.pdf");
+    if dry_run {
+        return Ok(QuarantineOutcome::Quarantined);
+    }
+    // Stamp catalog first so a mid-op crash still leaves the row dead
+    // rather than resurrectable by stuck_convert.
+    if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+        storage,
+        "catalog",
+        &stem,
+        "quarantine_scan:binary",
+    )
+    .await
+    {
+        tracing::warn!(stem, error = %e, "conversion_failed stamp failed; continuing with move");
+    }
+    storage
+        .put(&tgt, bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("put({tgt}): {e}"))?;
+    storage
+        .delete(src)
+        .await
+        .map_err(|e| anyhow::anyhow!("delete({src}): {e}"))?;
+    Ok(QuarantineOutcome::Quarantined)
+}
+
 #[cfg(test)]
 mod root_orphan_tests {
     use super::*;
@@ -521,5 +778,95 @@ mod root_orphan_tests {
         fn not(self) -> bool {
             !self
         }
+    }
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+    use hs_common::event_bus::NoOpBus;
+    use hs_common::storage::{LocalFsStorage, Storage};
+
+    #[tokio::test]
+    async fn real_pdf_left_alone_html_renamed_binary_quarantined() {
+        // Seed three files under papers/ab/: a real %PDF, an HTML
+        // masquerading as .pdf, and random binary. Run
+        // inspect_and_quarantine on each and verify the outcome + the
+        // filesystem post-state.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let bus = NoOpBus;
+
+        storage
+            .put(
+                "papers/ab/real.pdf",
+                b"%PDF-1.7\nnot actually a real pdf".to_vec(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "papers/ab/fake.pdf",
+                b"<!DOCTYPE html><html><body>paywall</body></html>".to_vec(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("papers/ab/binary.pdf", vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+            .await
+            .unwrap();
+
+        // 1. real PDF → HealthyPdf, untouched.
+        let outcome = inspect_and_quarantine(&storage, &bus, "papers/ab/real.pdf", false)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, QuarantineOutcome::HealthyPdf));
+        assert!(storage.exists("papers/ab/real.pdf").await.unwrap());
+
+        // 2. HTML-masquerading-as-PDF → rename in place.
+        let outcome = inspect_and_quarantine(&storage, &bus, "papers/ab/fake.pdf", false)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, QuarantineOutcome::RenamedToHtml));
+        assert!(!storage.exists("papers/ab/fake.pdf").await.unwrap());
+        assert!(storage.exists("papers/ab/fake.html").await.unwrap());
+
+        // 3. Random bytes → quarantine + conversion_failed stamp.
+        let outcome = inspect_and_quarantine(&storage, &bus, "papers/ab/binary.pdf", false)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, QuarantineOutcome::Quarantined));
+        assert!(!storage.exists("papers/ab/binary.pdf").await.unwrap());
+        assert!(storage
+            .exists("papers/.quarantine/ab/binary.pdf")
+            .await
+            .unwrap());
+        let entry = hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "binary")
+            .await
+            .expect("conversion_failed stamped");
+        assert_eq!(
+            entry.conversion_failed.unwrap().reason,
+            "quarantine_scan:binary"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_makes_no_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let bus = NoOpBus;
+
+        storage
+            .put("papers/ab/fake.pdf", b"<!DOCTYPE html><html/>".to_vec())
+            .await
+            .unwrap();
+
+        let outcome = inspect_and_quarantine(&storage, &bus, "papers/ab/fake.pdf", true)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, QuarantineOutcome::RenamedToHtml));
+        // Dry-run: file still where it was.
+        assert!(storage.exists("papers/ab/fake.pdf").await.unwrap());
+        assert!(!storage.exists("papers/ab/fake.html").await.unwrap());
     }
 }

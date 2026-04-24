@@ -176,9 +176,9 @@ mod tests {
             async fn publish(&self, _subject: &str, _payload: &[u8]) -> anyhow::Result<()> {
                 anyhow::bail!("bus is down")
             }
-            async fn subscribe(
+            async fn consume(
                 &self,
-                _subject: &str,
+                _spec: &crate::event_bus::ConsumerSpec,
             ) -> anyhow::Result<crate::event_bus::EventStream> {
                 Ok(Box::pin(futures::stream::pending()))
             }

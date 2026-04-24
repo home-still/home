@@ -109,6 +109,20 @@ pub enum MigrateAction {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Scan `papers/XX/*.pdf` for content-type mismatches (paywall HTML
+    /// renamed `.pdf`, truncated downloads). HTML is renamed in place to
+    /// `.html` so the existing html-parser path picks it up; other
+    /// non-PDF bytes are relocated to `papers/.quarantine/XX/` and the
+    /// catalog row stamped `conversion_failed` so scribe-watch-events
+    /// stops republishing them. Drains pre-rc.300 junk from the queue.
+    QuarantineBadContent {
+        /// Preview without moving or stamping anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Cap on files inspected this run
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

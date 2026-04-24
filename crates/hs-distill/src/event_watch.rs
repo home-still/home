@@ -3,16 +3,46 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::StreamExt;
-use hs_common::event_bus::EventBus;
+use hs_common::event_bus::{specs, EventBus};
 use hs_common::storage::Storage;
 use serde::{Deserialize, Serialize};
 
 use crate::client::DistillClient;
 
-// Failed index attempts log the full anyhow chain and die. Core NATS
-// `scribe.completed` is at-most-once; republishing on failure was a
-// lie about durability (see `hs-scribe/src/event_watch.rs`).
-// `hs distill reconcile` is the single canonical reconciliation path.
+/// Handler outcome for the distill consumer. Same Permanent/Transient
+/// split as scribe — see `crates/hs-scribe/src/event_watch.rs` for the
+/// rationale.
+pub enum HandlerError {
+    Permanent(anyhow::Error),
+    Transient(anyhow::Error),
+}
+
+impl HandlerError {
+    fn as_error(&self) -> &anyhow::Error {
+        match self {
+            HandlerError::Permanent(e) | HandlerError::Transient(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for HandlerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HandlerError::Permanent(e) => write!(f, "permanent: {e:#}"),
+            HandlerError::Transient(e) => write!(f, "transient: {e:#}"),
+        }
+    }
+}
+
+impl std::fmt::Debug for HandlerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for HandlerError {}
+
+const NAK_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Payload published by scribe (or any other markdown producer) on
 /// `scribe.completed`. `key` is the storage key of the markdown object.
@@ -26,8 +56,7 @@ pub struct CompletedEvent {
 /// Retry a storage write up to 3 times with exponential backoff (100ms,
 /// 300ms, 900ms). Stamp writes are the bookkeeping side of the
 /// embedding pipeline — a single S3 blip must not make the catalog and
-/// Qdrant diverge, because that divergence is the source of the phantom
-/// "unembedded" backlog the reconciler exists to clean up.
+/// Qdrant diverge.
 async fn write_with_retry<F, Fut>(op_name: &str, stem: &str, mut op: F) -> Result<()>
 where
     F: FnMut() -> Fut,
@@ -68,7 +97,7 @@ pub async fn index_and_publish(
     distill: &DistillClient,
     bus: &dyn EventBus,
     event: &CompletedEvent,
-) -> Result<()> {
+) -> Result<(), HandlerError> {
     let stem = event
         .key
         .rsplit('/')
@@ -83,10 +112,7 @@ pub async fn index_and_publish(
     {
         Ok(r) => r,
         Err(e) => {
-            // Stamp the failure so it's visible to the reconciler. Without
-            // this, a dropped embed is indistinguishable from "never tried"
-            // and the document is invisible until someone runs a full
-            // markdown-vs-qdrant diff.
+            // Stamp the failure so the reconciler can find it later.
             tracing::error!(stem = %stem, key = %event.key, error = %e, "distill index failed");
             let reason = format!("embed_failed: {e}");
             if let Err(stamp_err) = write_with_retry("embed_failed stamp", stem, || {
@@ -96,13 +122,16 @@ pub async fn index_and_publish(
             {
                 tracing::error!(stem = %stem, error = %stamp_err, "failed to stamp embed_failed");
             }
-            return Err(e.context(format!("distill index failed for {}", event.key)));
+            // Index failures are transient by default — a flaky Qdrant
+            // or a slow VRAM recovery shouldn't throw away the event.
+            // JetStream's max_deliver bounds the retry count; a truly
+            // broken markdown will eventually TERM on its own.
+            return Err(HandlerError::Transient(
+                e.context(format!("distill index failed for {}", event.key)),
+            ));
         }
     };
 
-    // Stamp the embed outcome. Retry on transient S3/storage errors —
-    // a lost stamp here is the historical root cause of phantom
-    // "unembedded" docs (doc is in Qdrant but catalog doesn't know).
     if let Err(e) = write_with_retry("embedding stamp", stem, || {
         hs_common::catalog::record_embedding_outcome_via(
             storage,
@@ -115,7 +144,6 @@ pub async fn index_and_publish(
     })
     .await
     {
-        // Retries exhausted: the reconciler will catch this later.
         tracing::error!(stem = %stem, error = %e, "embedding catalog stamp lost after retries");
     }
 
@@ -136,13 +164,8 @@ pub async fn index_and_publish(
     Ok(())
 }
 
-/// Subscribe to `scribe.completed` and dispatch each event to `handler`.
-///
-/// Dispatches run concurrently up to `concurrency` at a time (via a
-/// semaphore). Failed handler invocations log the full anyhow chain at
-/// ERROR and die — no event-bus retry. Reconciliation is the explicit,
-/// operator-driven `hs distill reconcile`, which diffs markdown against
-/// Qdrant and re-indexes exactly the missing set.
+/// Pull-consume `scribe.completed` and dispatch each event to
+/// `handler`. See the parallel scribe `run_subscriber` for ack policy.
 pub async fn run_subscriber<F, Fut>(
     bus: Arc<dyn EventBus>,
     _storage: Arc<dyn Storage>,
@@ -151,18 +174,14 @@ pub async fn run_subscriber<F, Fut>(
 ) -> Result<()>
 where
     F: Fn(CompletedEvent) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), HandlerError>> + Send + 'static,
 {
-    // Queue-subscribe so a future second distill host load-balances
-    // `scribe.completed` instead of both embedding every doc. Only one
-    // distill runs today but the queue group is cheap and future-proofs.
-    let mut stream = bus
-        .queue_subscribe("scribe.completed", "distill-workers")
-        .await?;
+    let mut stream = bus.consume(&specs::SCRIBE_COMPLETED).await?;
     let concurrency = concurrency.max(1);
     tracing::info!(
         concurrency,
-        "distill subscribed to scribe.completed (queue: distill-workers)"
+        "distill consuming scribe.completed (durable: {})",
+        specs::SCRIBE_COMPLETED.durable_name
     );
 
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
@@ -172,7 +191,14 @@ where
         let parsed: CompletedEvent = match serde_json::from_slice(&event.payload) {
             Ok(p) => p,
             Err(e) => {
-                tracing::warn!(error = %e, "dropping malformed scribe.completed event");
+                tracing::error!(
+                    error = %e,
+                    payload_len = event.payload.len(),
+                    "malformed scribe.completed payload — terminating (will not redeliver)"
+                );
+                if let Err(term_err) = event.term().await {
+                    tracing::warn!(error = %term_err, "failed to term malformed event");
+                }
                 continue;
             }
         };
@@ -186,12 +212,36 @@ where
             let _permit = permit;
             let key = parsed.key.clone();
             tracing::info!(key = %key, "distill received completed event");
-            if let Err(e) = handler(parsed).await {
-                tracing::error!(
-                    key = %key,
-                    error = ?e,
-                    "distill handler failed — giving up; reconcile with `hs distill reconcile`"
-                );
+            match handler(parsed).await {
+                Ok(()) => {
+                    if let Err(e) = event.ack().await {
+                        tracing::warn!(key = %key, error = %e, "ack failed");
+                    }
+                }
+                Err(err) => {
+                    let is_perm = matches!(err, HandlerError::Permanent(_));
+                    let inner = err.as_error();
+                    if is_perm {
+                        tracing::error!(
+                            key = %key,
+                            error = ?inner,
+                            "distill handler permanent failure — terminating (will not redeliver)"
+                        );
+                        if let Err(e) = event.term().await {
+                            tracing::warn!(key = %key, error = %e, "term failed");
+                        }
+                    } else {
+                        tracing::warn!(
+                            key = %key,
+                            error = ?inner,
+                            backoff_secs = NAK_BACKOFF.as_secs(),
+                            "distill handler transient failure — redelivering after backoff"
+                        );
+                        if let Err(e) = event.nak(Some(NAK_BACKOFF)).await {
+                            tracing::warn!(key = %key, error = %e, "nak failed");
+                        }
+                    }
+                }
             }
         });
     }
@@ -219,50 +269,5 @@ mod tests {
             .unwrap_or(key)
             .trim_end_matches(".md");
         assert_eq!(stem, "10.1609_aaai.v38i16.29728");
-    }
-
-    #[tokio::test]
-    async fn live_distill_subscriber_receives_event() {
-        let Some(url) = std::env::var("HS_NATS_URL").ok() else {
-            eprintln!("skipping: set HS_NATS_URL to run");
-            return;
-        };
-        use hs_common::event_bus::nats::{NatsBus, NatsConfig};
-        use hs_common::storage::LocalFsStorage;
-
-        let bus: Arc<dyn EventBus> = Arc::new(NatsBus::connect(NatsConfig { url }).await.unwrap());
-        let tmp = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(tmp.path()));
-
-        let received = Arc::new(tokio::sync::Mutex::new(Vec::<CompletedEvent>::new()));
-        let received_clone = received.clone();
-        let sub_task = tokio::spawn(run_subscriber(bus.clone(), storage, 1, move |event| {
-            let received = received_clone.clone();
-            async move {
-                received.lock().await.push(event);
-                Ok(())
-            }
-        }));
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        bus.publish(
-            "scribe.completed",
-            br#"{"key":"ab/live.md","source_key":"ab/live.pdf"}"#,
-        )
-        .await
-        .unwrap();
-
-        for _ in 0..40 {
-            if !received.lock().await.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        let got = received.lock().await;
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].key, "ab/live.md");
-        sub_task.abort();
     }
 }

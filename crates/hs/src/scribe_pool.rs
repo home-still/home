@@ -21,11 +21,6 @@ impl ScribePool {
         }
     }
 
-    /// Number of concurrent conversions to allow (2 per server).
-    pub fn concurrency(&self) -> usize {
-        self.inner.concurrency()
-    }
-
     /// Convert one PDF via the best available server.
     /// Caller is responsible for limiting concurrency (e.g. via a semaphore).
     /// Returns (server_url, markdown) on success.
@@ -37,7 +32,7 @@ impl ScribePool {
         let mut last_err = None;
         for attempt in 0..3 {
             match self.inner.pick_server().await {
-                Ok(client) => {
+                Ok((client, _pick_guard)) => {
                     let url = client.url().to_string();
                     let short = url
                         .strip_prefix("http://")
@@ -49,7 +44,9 @@ impl ScribePool {
                         total_pages: 0,
                         message: format!("→ {short}"),
                     });
-                    let md = client.convert_with_progress(pdf_bytes, on_progress).await?;
+                    let md = client
+                        .convert_with_progress(pdf_bytes, None, on_progress)
+                        .await?;
                     return Ok((url, md));
                 }
                 Err(e) => {

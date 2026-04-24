@@ -1,11 +1,11 @@
-use crate::client::{HealthResponse, StreamLine};
+use crate::client::{HealthResponse, StreamLine, CONVERT_DEADLINE_HEADER};
 use crate::config::AppConfig;
 use crate::gpu;
 use crate::pipeline::processor::Processor;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Multipart, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -14,6 +14,23 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
+
+/// Resolve the per-request convert deadline. A caller-supplied
+/// `X-Convert-Deadline-Secs` header wins; otherwise fall back to the
+/// server's configured default. The subscriber sends this header so
+/// scaled deadlines stay in sync between client and server — without
+/// it, a 500-page book that needs 3600s would still be killed at the
+/// server's 900s default.
+fn resolve_deadline(headers: &HeaderMap, fallback_secs: u64) -> (Duration, bool) {
+    match headers
+        .get(CONVERT_DEADLINE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(secs) => (Duration::from_secs(secs), true),
+        None => (Duration::from_secs(fallback_secs), false),
+    }
+}
 
 pub struct ServerState {
     pub processor: Processor,
@@ -120,6 +137,66 @@ async fn extract_pdf(mut multipart: Multipart) -> Result<Vec<u8>, Response> {
     Err((StatusCode::BAD_REQUEST, "Missing 'pdf' field").into_response())
 }
 
+/// Gate the content-type before dispatching to the VLM. Paywall HTML
+/// renamed `.pdf`, truncated downloads, and encrypted binaries will never
+/// convert — the VLM would spend GPU time producing garbage or error out
+/// deep in the stack. Reject them at the door with HTTP 415 and a precise
+/// reason string so the caller (watch-events, MCP) can stamp
+/// `conversion_failed` and stop retrying. `%PDF` is the only acceptance
+/// criterion: `PDF-1.x` specifies the header exactly.
+#[allow(clippy::result_large_err)]
+fn verify_pdf_content(bytes: &[u8]) -> Result<(), Response> {
+    let head = &bytes[..bytes.len().min(4096)];
+    if head.starts_with(b"%PDF") {
+        return Ok(());
+    }
+    let reason = if hs_common::html::looks_like_html(head) {
+        "unsupported_content_type:html"
+    } else {
+        "unsupported_content_type:binary"
+    };
+    tracing::warn!(
+        reason,
+        bytes = bytes.len(),
+        "rejecting non-PDF body at /scribe gate"
+    );
+    Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, reason.to_string()).into_response())
+}
+
+#[cfg(test)]
+mod verify_pdf_tests {
+    use super::verify_pdf_content;
+    use axum::http::StatusCode;
+
+    fn status_of(resp: &axum::response::Response) -> StatusCode {
+        resp.status()
+    }
+
+    #[test]
+    fn pdf_header_is_accepted() {
+        assert!(verify_pdf_content(b"%PDF-1.7\n...").is_ok());
+        assert!(verify_pdf_content(b"%PDF-1.4\n%random binary").is_ok());
+    }
+
+    #[test]
+    fn html_body_is_rejected_with_415_and_html_reason() {
+        let err = verify_pdf_content(b"<!DOCTYPE html><html><body>paywall</body></html>")
+            .expect_err("HTML must not be accepted");
+        assert_eq!(status_of(&err), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn random_bytes_rejected_with_binary_reason() {
+        let err = verify_pdf_content(&[0u8, 1, 2, 3, 4, 5, 6, 7]).expect_err("binary must reject");
+        assert_eq!(status_of(&err), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn empty_body_rejected() {
+        assert!(verify_pdf_content(&[]).is_err());
+    }
+}
+
 /// Write PDF bytes to a temp file and return the handle (keeps file alive).
 #[allow(clippy::result_large_err)]
 fn write_tmp_pdf(pdf_bytes: &[u8]) -> Result<tempfile::NamedTempFile, Response> {
@@ -132,7 +209,11 @@ fn write_tmp_pdf(pdf_bytes: &[u8]) -> Result<tempfile::NamedTempFile, Response> 
 
 use hs_common::service::inflight::InFlightGuard;
 
-async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipart) -> Response {
+async fn handle_scribe(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
     let _guard = InFlightGuard::new(&state.in_flight);
 
     let pdf_bytes = match extract_pdf(multipart).await {
@@ -140,13 +221,17 @@ async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipa
         Err(resp) => return resp,
     };
 
+    if let Err(resp) = verify_pdf_content(&pdf_bytes) {
+        return resp;
+    }
+
     let tmp = match write_tmp_pdf(&pdf_bytes) {
         Ok(t) => t,
         Err(resp) => return resp,
     };
 
     let path = tmp.path().to_str().unwrap_or_default();
-    let deadline = Duration::from_secs(state.config.convert_deadline_secs);
+    let (deadline, from_header) = resolve_deadline(&headers, state.config.convert_deadline_secs);
     let fut = state.processor.process_pdf(path);
     match tokio::time::timeout(deadline, fut).await {
         Ok(Ok(md)) => {
@@ -163,15 +248,13 @@ async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipa
             // in-flight Ollama request aborts, stage-1 spawn_blocking exits on
             // the next send to a closed channel, VLM permit released.
             tracing::error!(
-                deadline_secs = state.config.convert_deadline_secs,
+                deadline_secs = deadline.as_secs(),
+                from_header,
                 "convert deadline exceeded — aborting; slot released"
             );
             (
                 StatusCode::GATEWAY_TIMEOUT,
-                format!(
-                    "convert deadline ({}s) exceeded",
-                    state.config.convert_deadline_secs
-                ),
+                format!("convert deadline ({}s) exceeded", deadline.as_secs()),
             )
                 .into_response()
         }
@@ -180,12 +263,17 @@ async fn handle_scribe(State(state): State<Arc<ServerState>>, multipart: Multipa
 
 async fn handle_scribe_stream(
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
     let pdf_bytes = match extract_pdf(multipart).await {
         Ok(b) => b,
         Err(resp) => return resp,
     };
+
+    if let Err(resp) = verify_pdf_content(&pdf_bytes) {
+        return resp;
+    }
 
     let tmp = match write_tmp_pdf(&pdf_bytes) {
         Ok(t) => t,
@@ -197,7 +285,7 @@ async fn handle_scribe_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
     let path = tmp.path().to_string_lossy().to_string();
 
-    let deadline = Duration::from_secs(state.config.convert_deadline_secs);
+    let (deadline, from_header) = resolve_deadline(&headers, state.config.convert_deadline_secs);
     tokio::spawn(async move {
         let _tmp = tmp; // keep temp file alive for the duration of processing
         let _guard = in_flight_guard;
@@ -231,12 +319,13 @@ async fn handle_scribe_stream(
             }
             Err(_elapsed) => {
                 tracing::error!(
-                    deadline_secs = state.config.convert_deadline_secs,
+                    deadline_secs = deadline.as_secs(),
+                    from_header,
                     "convert deadline exceeded — aborting stream; slot released"
                 );
                 let line = StreamLine::Error(format!(
                     "convert deadline ({}s) exceeded",
-                    state.config.convert_deadline_secs
+                    deadline.as_secs()
                 ));
                 if let Ok(json) = serde_json::to_string(&line) {
                     let _ = tx.send(Ok(format!("{json}\n"))).await;
