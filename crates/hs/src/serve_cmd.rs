@@ -983,15 +983,20 @@ fn check_system_service_conflict(service_type: &str) -> Result<()> {
             .output()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // launchctl list format: "PID\tStatus\tLabel"
-            // If PID is "-", the service is registered but not running.
-            // If PID matches our own, we ARE the launchd child — don't block ourselves.
+            // launchctl list format: "PID\tStatus\tLabel". Match the label
+            // column exactly — not as a substring — otherwise
+            // `com.home-still.scribe` false-positives on the separately
+            // managed `com.home-still.scribe-autotune` and the scribe
+            // wrapper refuses to start.
             let my_pid = std::process::id().to_string();
             for line in stdout.lines() {
-                if !line.contains(&label) {
+                let mut fields = line.split('\t');
+                let pid_field = fields.next().unwrap_or("-");
+                let _status = fields.next();
+                let label_field = fields.next().unwrap_or("");
+                if label_field != label {
                     continue;
                 }
-                let pid_field = line.split('\t').next().unwrap_or("-");
                 if pid_field == "-" || pid_field == my_pid {
                     // Not running, or we are the service — no conflict
                     continue;
