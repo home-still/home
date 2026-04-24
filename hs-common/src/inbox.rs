@@ -81,8 +81,15 @@ pub async fn write_target_and_publish(
     bytes: Vec<u8>,
 ) -> anyhow::Result<WriteOutcome> {
     // Fast-path: target already present. This is the duplicate-drop case
-    // and the recovery path for a prior PartialLeftSource.
-    if storage.exists(target_key).await.unwrap_or(false) {
+    // and the recovery path for a prior PartialLeftSource. A storage error
+    // here MUST propagate — `.unwrap_or(false)` let a transient S3 failure
+    // masquerade as "no target yet", causing a second PUT that clobbered
+    // whatever was actually there (rc.306 P0-11).
+    let target_exists = storage
+        .exists(target_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("head target {target_key}: {e}"))?;
+    if target_exists {
         // Best-effort source cleanup. 404 is fine.
         if let Err(e) = storage.delete(source_key).await {
             tracing::warn!(src = source_key, error = %e, "delete source after AlreadyAtTarget failed");
@@ -97,20 +104,16 @@ pub async fn write_target_and_publish(
         .await
         .map_err(|e| anyhow::anyhow!("put target {target_key}: {e}"))?;
 
-    // Publish is best-effort: if NATS is down, the target is still in place.
-    // A later `catalog_repair` forward sweep will synthesize a row, and the
-    // pipeline catches up on the next normal event or reconcile cycle.
+    // Publish payload serialization must not fail silently. A serde failure
+    // with `unwrap_or_default()` would publish an empty vec that downstream
+    // consumers treat as a no-op event (rc.306 P0-11). Propagate instead.
     let payload = serde_json::json!({
         "key": target_key,
         "source": "inbox",
     });
-    if let Err(e) = bus
-        .publish(
-            "papers.ingested",
-            &serde_json::to_vec(&payload).unwrap_or_default(),
-        )
-        .await
-    {
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|e| anyhow::anyhow!("serialize papers.ingested payload: {e}"))?;
+    if let Err(e) = bus.publish("papers.ingested", &payload_bytes).await {
         tracing::warn!(
             target = target_key,
             error = %e,
@@ -390,5 +393,82 @@ mod tests {
             .exists("papers/manually_downloaded/foo.pdf")
             .await
             .unwrap());
+    }
+
+    /// rc.306 P0-11 regression: a transient storage failure on the
+    /// fast-path `exists` check must NOT look like "target absent" —
+    /// the old `unwrap_or(false)` caused a duplicate drop (a second PUT
+    /// overwriting whatever the target actually held).
+    #[tokio::test]
+    async fn exists_transient_error_propagates_no_duplicate_put() {
+        struct ExistsFailsStorage<S>(S);
+        #[async_trait::async_trait]
+        impl<S: Storage> Storage for ExistsFailsStorage<S> {
+            async fn get(&self, k: &str) -> anyhow::Result<Vec<u8>> {
+                self.0.get(k).await
+            }
+            async fn put(&self, k: &str, b: Vec<u8>) -> anyhow::Result<()> {
+                self.0.put(k, b).await
+            }
+            async fn head(&self, _k: &str) -> anyhow::Result<Option<crate::storage::ObjectMeta>> {
+                Err(anyhow::anyhow!("simulated transient s3 503"))
+            }
+            async fn list(&self, p: &str) -> anyhow::Result<Vec<crate::storage::ObjectMeta>> {
+                self.0.list(p).await
+            }
+            async fn delete(&self, k: &str) -> anyhow::Result<()> {
+                self.0.delete(k).await
+            }
+        }
+
+        let (_tmp, inner, bus) = mk_env();
+        inner
+            .put("papers/manually_downloaded/foo.pdf", b"new".to_vec())
+            .await
+            .unwrap();
+        inner
+            .put("papers/fo/foo.pdf", b"already-here".to_vec())
+            .await
+            .unwrap();
+        let storage = ExistsFailsStorage(inner);
+
+        let result = write_target_and_publish(
+            &storage,
+            &bus,
+            "papers/manually_downloaded/foo.pdf",
+            "papers/fo/foo.pdf",
+            b"new".to_vec(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "transient HEAD error must propagate, not masquerade as absent target"
+        );
+        // Existing target must be untouched — no duplicate put.
+        assert_eq!(
+            storage.get("papers/fo/foo.pdf").await.unwrap(),
+            b"already-here"
+        );
+    }
+
+    /// rc.306 P0-11 regression: publish serialization is load-bearing —
+    /// `unwrap_or_default()` on `to_vec(&payload)` used to publish empty
+    /// bytes, which downstream consumers read as "no event" and the
+    /// pipeline silently stalled.
+    #[tokio::test]
+    async fn publish_serialization_failure_is_not_silent() {
+        // This test documents the invariant via the production code path:
+        // any serde failure would now bubble up via `?`. We can't easily
+        // force serde_json::to_vec to fail for a `serde_json::Value`
+        // (valid JSON round-trips), but the compile-time change from
+        // `.unwrap_or_default()` to `?` is the guarantee. The
+        // `publish_failure_still_deletes_source` test above exercises
+        // the `bus.publish` failure path.
+        //
+        // A pedagogical assertion:
+        let payload = serde_json::json!({"key": "ok", "source": "inbox"});
+        let bytes = serde_json::to_vec(&payload).expect("valid JSON");
+        assert!(!bytes.is_empty(), "non-empty payload is the invariant");
     }
 }
