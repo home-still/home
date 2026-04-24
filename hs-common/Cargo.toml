@@ -49,6 +49,7 @@ storage = [
     "dep:tokio",
     "dep:serde",
     "dep:serde_yaml_ng",
+    "dep:futures",
     "tokio/fs",
 ]
 storage-s3 = [

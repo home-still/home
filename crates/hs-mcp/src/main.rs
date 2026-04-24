@@ -783,63 +783,109 @@ impl HomeStillMcp {
     async fn catalog_repair(
         &self,
         Parameters(p): Parameters<CatalogRepairParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        // Forward direction: files on disk with no catalog row.
-        let disk_orphans = hs_common::status::list_orphan_document_stems(
+        // One shared pass over all three prefixes — 3 concurrent LISTs and
+        // bounded-concurrency parallel GETs of every catalog YAML. Replaces
+        // the pre-fix "7 serial scans × (1 LIST + N serial GETs)" shape
+        // whose cost at 3k+ rows exceeded the MCP 4-minute client budget
+        // even under dry_run. Every scan below reads the same snapshot, so
+        // dry-run and live-repair walk identical scan code.
+        let progress_token = context.meta.get_progress_token();
+        let peer = context.peer.clone();
+
+        let progress_token_for_fetch = progress_token.clone();
+        let peer_for_fetch = peer.clone();
+        let on_fetch_progress = move |done: usize, total: usize| {
+            let Some(token) = progress_token_for_fetch.clone() else {
+                return;
+            };
+            let peer = peer_for_fetch.clone();
+            tokio::spawn(async move {
+                let params = ProgressNotificationParam::new(token, done as f64)
+                    .with_message(format!("catalog snapshot: {done}/{total}"))
+                    .with_total(total as f64);
+                if let Err(e) = peer.notify_progress(params).await {
+                    tracing::warn!(error = %e, "catalog_repair snapshot notify_progress failed");
+                }
+            });
+        };
+
+        let snapshot = hs_common::status::build_repair_snapshot(
             &*self.storage,
             &self.papers_prefix,
             &self.catalog_prefix,
+            &self.markdown_prefix,
+            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
+            on_fetch_progress,
         )
         .await
-        .map_err(|e| format!("disk-orphan scan failed: {e}"))?;
+        .map_err(|e| format!("snapshot build failed: {e}"))?;
+
+        // Per-phase progress ping so the client timer resets between scans
+        // and the operator can see which phase is running. The scans
+        // themselves are pure in-memory filters over the snapshot — this
+        // is heartbeat + visibility, not pacing.
+        let emit_scan_phase = |phase: u64, name: &str| {
+            let Some(token) = progress_token.clone() else {
+                return;
+            };
+            let peer = peer.clone();
+            let name = name.to_string();
+            tokio::spawn(async move {
+                let params = ProgressNotificationParam::new(token, phase as f64)
+                    .with_message(format!("scan {phase}/7: {name}"))
+                    .with_total(7.0);
+                if let Err(e) = peer.notify_progress(params).await {
+                    tracing::warn!(error = %e, "catalog_repair scan-phase notify_progress failed");
+                }
+            });
+        };
+
+        // Forward direction: files on disk with no catalog row.
+        emit_scan_phase(1, "disk orphans");
+        let disk_orphans =
+            hs_common::status::list_orphan_document_stems(&snapshot.papers, &snapshot.catalog);
 
         // Reverse direction: catalog claims converted but markdown is gone.
+        emit_scan_phase(2, "catalog rows without markdown");
         let md_orphans = hs_common::status::list_catalog_rows_without_markdown(
-            &*self.storage,
-            &self.catalog_prefix,
-            &self.markdown_prefix,
-        )
-        .await
-        .map_err(|e| format!("markdown-orphan scan failed: {e}"))?;
+            &snapshot.catalog,
+            &snapshot.markdown,
+        );
 
         // Phantom direction: catalog row with neither a paper file nor a
         // markdown file. These inflate `catalog_entries` above `documents`
         // in the pipeline rollup and have no reachable payload anywhere —
         // safe to delete once confirmed via dry-run.
+        emit_scan_phase(3, "phantom orphans");
         let phantom_orphans = hs_common::status::list_catalog_rows_without_source(
-            &*self.storage,
-            &self.papers_prefix,
-            &self.catalog_prefix,
-            &self.markdown_prefix,
-        )
-        .await
-        .map_err(|e| format!("phantom-orphan scan failed: {e}"))?;
+            &snapshot.papers,
+            &snapshot.catalog,
+            &snapshot.markdown,
+        );
 
         // Flag-drift direction: catalog row where a stage flag is missing but
         // the storage evidence for that stage exists. Backfills without
         // deleting — unlike the three directions above, which clear or synth.
+        emit_scan_phase(4, "flag drift");
         let drift_rows = hs_common::status::list_catalog_flag_drift(
-            &*self.storage,
-            &self.papers_prefix,
-            &self.catalog_prefix,
-            &self.markdown_prefix,
-        )
-        .await
-        .map_err(|e| format!("flag-drift scan failed: {e}"))?;
+            &snapshot.papers,
+            &snapshot.catalog,
+            &snapshot.markdown,
+        );
 
         // Flag-drift-resync direction: rows still wearing the fingerprint of a
         // prior flag_drift batch stamp (`downloaded_at == repair.repaired_at` or
         // synthetic Convert whose `converted_at == repair.repaired_at`). Rewrite
         // to the storage object's `last_modified` so the activity feed stops
         // showing hundreds of rows collapsed onto one nanosecond.
+        emit_scan_phase(5, "flag drift resync");
         let resync_rows = hs_common::status::list_catalog_flag_drift_resync_candidates(
-            &*self.storage,
-            &self.papers_prefix,
-            &self.catalog_prefix,
-            &self.markdown_prefix,
-        )
-        .await
-        .map_err(|e| format!("flag-drift-resync scan failed: {e}"))?;
+            &snapshot.papers,
+            &snapshot.catalog,
+            &snapshot.markdown,
+        );
 
         // Md-path-drift direction: catalog `markdown_path` disagrees with
         // where the markdown actually lives. Post-`bc2b6fb` the physical
@@ -848,13 +894,11 @@ impl HomeStillMcp {
         // resolver that trusts `markdown_path` probes a stale key and
         // reports a ghost orphan. Rewrites the catalog field to the real
         // storage key (non-destructive; does not touch markdown or Qdrant).
+        emit_scan_phase(6, "md_path drift");
         let md_path_drift_rows = hs_common::status::list_catalog_rows_with_md_path_drift(
-            &*self.storage,
-            &self.catalog_prefix,
-            &self.markdown_prefix,
-        )
-        .await
-        .map_err(|e| format!("md-path-drift scan failed: {e}"))?;
+            &snapshot.catalog,
+            &snapshot.markdown,
+        );
 
         // Stuck-convert direction: catalog has a PDF/HTML source on disk but
         // no `conversion` stamp. Re-queues via the event bus rather than an
@@ -864,13 +908,9 @@ impl HomeStillMcp {
         // prior cycle whose markdown was later deleted) also get purged
         // here so the re-index writes fresh points instead of mixing with
         // stale ones.
-        let stuck_rows = hs_common::status::list_catalog_stuck_convert(
-            &*self.storage,
-            &self.papers_prefix,
-            &self.catalog_prefix,
-        )
-        .await
-        .map_err(|e| format!("stuck-convert scan failed: {e}"))?;
+        emit_scan_phase(7, "stuck convert");
+        let stuck_rows =
+            hs_common::status::list_catalog_stuck_convert(&snapshot.papers, &snapshot.catalog);
 
         let disk_total = disk_orphans.len();
         let md_total = md_orphans.len();
@@ -1774,7 +1814,7 @@ impl HomeStillMcp {
                 });
             };
             let md = client
-                .convert_with_progress(pdf_bytes, on_progress)
+                .convert_with_progress(pdf_bytes, None, on_progress)
                 .await
                 .map_err(|e| format!("Conversion failed: {e}"))?;
             (md, pdf_key, "scribe-vlm".to_string())
@@ -2555,6 +2595,15 @@ impl HomeStillMcp {
                 .await
                 .ok();
 
+        // Count entries stamped `embedding_skip` so progress percentages
+        // can exclude intentionally-skipped docs from the denominator.
+        let embedding_skipped: Option<u64> = catalog_triples.as_ref().map(|triples| {
+            triples
+                .iter()
+                .filter(|(_, _, entry)| entry.embedding_skip.is_some())
+                .count() as u64
+        });
+
         let mut pipeline = collect_pipeline_counts(
             &*self.storage,
             &self.papers_prefix,
@@ -2562,6 +2611,7 @@ impl HomeStillMcp {
             &self.catalog_prefix,
             embedded_documents,
             embedded_chunks,
+            embedding_skipped,
         )
         .await;
 

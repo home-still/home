@@ -308,6 +308,101 @@ pub async fn list_catalog_entries_via(
     Ok(out)
 }
 
+/// Default concurrency for the parallel catalog fetcher — one HTTP connection
+/// per fetch, bounded against local Garage's typical inflight ceiling.
+#[cfg(feature = "storage")]
+pub const CATALOG_FETCH_CONCURRENCY: usize = 24;
+
+/// Parallel variant of [`list_catalog_entries_via`] used by `catalog_repair`.
+///
+/// The serial version issues one awaited `storage.get` per YAML — fine for a
+/// dozen rows, but at O(N) × single-flight latency it blows through the
+/// MCP 4-minute client budget on a few-thousand-row catalog. This fetcher
+/// spreads the per-key GETs across `concurrency` in-flight requests via
+/// `futures::stream::buffer_unordered`, then re-slots them into their
+/// `storage.list` order so callers observe the same sequence the serial
+/// version would produce.
+///
+/// Error policy (divergent from `list_catalog_entries_via` by design):
+/// - Per-key `storage.get` failure or 10s timeout → `Err` from the whole
+///   fetcher, with the offending key in the message. `storage.list`
+///   already promised this key exists, so a GET failure signals a real
+///   storage-integrity problem worth surfacing loudly.
+/// - Deserialization failure of a fetched YAML → silently skipped, matching
+///   the existing lenient schema-evolution behavior.
+///
+/// `on_progress(done, total)` fires every 64 completed GETs and once at the
+/// end. `total` is the post-filter YAML count (skips `._` hidden files and
+/// non-`.yaml` extensions), not the raw list length.
+#[cfg(feature = "storage")]
+pub async fn list_catalog_entries_parallel(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    concurrency: usize,
+    mut on_progress: impl FnMut(usize, usize),
+) -> anyhow::Result<Vec<(String, crate::storage::ObjectMeta, CatalogEntry)>> {
+    use futures::stream::{self, StreamExt};
+    use std::time::Duration;
+
+    let objects = storage.list(prefix).await?;
+    let candidates: Vec<(usize, crate::storage::ObjectMeta, String)> = objects
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, obj)| {
+            if !obj.key.ends_with(".yaml") {
+                return None;
+            }
+            let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
+            if filename.starts_with("._") {
+                return None;
+            }
+            let stem = filename.trim_end_matches(".yaml").to_string();
+            Some((idx, obj, stem))
+        })
+        .collect();
+
+    let total = candidates.len();
+    let mut slotted: Vec<Option<(String, crate::storage::ObjectMeta, CatalogEntry)>> =
+        (0..total).map(|_| None).collect();
+    let mut done: usize = 0;
+
+    let mut stream = stream::iter(candidates.into_iter().enumerate().map(
+        |(slot, (_original_idx, obj, stem))| {
+            let key = obj.key.clone();
+            async move {
+                let res = tokio::time::timeout(Duration::from_secs(10), storage.get(&key)).await;
+                (slot, obj, stem, key, res)
+            }
+        },
+    ))
+    .buffer_unordered(concurrency.max(1));
+
+    while let Some((slot, obj, stem, key, res)) = stream.next().await {
+        let bytes = match res {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                return Err(anyhow::anyhow!(
+                    "list_catalog_entries_parallel: storage.get({key}) failed: {e}"
+                ));
+            }
+            Err(_elapsed) => {
+                return Err(anyhow::anyhow!(
+                    "list_catalog_entries_parallel: storage.get({key}) timed out after 10s"
+                ));
+            }
+        };
+        done += 1;
+        if done.is_multiple_of(64) || done == total {
+            on_progress(done, total);
+        }
+        if let Ok(entry) = serde_yaml_ng::from_slice::<CatalogEntry>(&bytes) {
+            slotted[slot] = Some((stem, obj, entry));
+        }
+    }
+
+    Ok(slotted.into_iter().flatten().collect())
+}
+
 #[cfg(feature = "storage")]
 #[allow(clippy::too_many_arguments)]
 pub async fn update_conversion_catalog_via(
@@ -427,7 +522,7 @@ pub async fn update_embedding_catalog_via(
 #[cfg(all(test, feature = "storage"))]
 mod storage_tests {
     use super::*;
-    use crate::storage::LocalFsStorage;
+    use crate::storage::{LocalFsStorage, Storage};
 
     #[tokio::test]
     async fn roundtrip_via_local_storage() {
@@ -504,5 +599,119 @@ conversion:
         let conv = entry.conversion.expect("conversion present");
         assert_eq!(conv.duration_secs, 5.0);
         assert_eq!(conv.total_pages, 12);
+    }
+
+    #[tokio::test]
+    async fn parallel_fetcher_matches_serial() {
+        // 100 valid catalog rows + 3 malformed YAML objects. Both fetchers
+        // must return the same (stem -> title) set — the malformed ones are
+        // silently skipped by both paths, and any other divergence is a bug.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        for i in 0..100 {
+            let stem = format!("doc_{i:03}");
+            let entry = CatalogEntry {
+                title: Some(format!("Title {i}")),
+                ..Default::default()
+            };
+            write_catalog_entry_via(&storage, "catalog", &stem, &entry)
+                .await
+                .unwrap();
+        }
+        for stem in ["bad_a", "bad_b", "bad_c"] {
+            let key = format!("catalog/{}", crate::sharded_key(stem, "yaml"));
+            storage
+                .put(&key, b"{{ not: valid ::: yaml }}\n".to_vec())
+                .await
+                .unwrap();
+        }
+
+        let serial = list_catalog_entries_via(&storage, "catalog").await.unwrap();
+        let parallel = list_catalog_entries_parallel(&storage, "catalog", 8, |_, _| {})
+            .await
+            .unwrap();
+
+        use std::collections::BTreeMap;
+        let serial_map: BTreeMap<String, Option<String>> = serial
+            .into_iter()
+            .map(|(stem, _meta, entry)| (stem, entry.title))
+            .collect();
+        let parallel_map: BTreeMap<String, Option<String>> = parallel
+            .into_iter()
+            .map(|(stem, _meta, entry)| (stem, entry.title))
+            .collect();
+
+        assert_eq!(serial_map.len(), 100, "100 valid rows, 3 malformed skipped");
+        assert_eq!(parallel_map, serial_map);
+    }
+
+    #[tokio::test]
+    async fn parallel_fetcher_fails_loud_on_get_error() {
+        // A storage where one key's `get` returns `Err` must cause the
+        // whole fetcher to fail — not skip the row silently — and the
+        // offending key has to appear in the error so operators can
+        // diagnose. Same match arm handles the 10s timeout branch; an
+        // error-based mock keeps the test synchronous and deterministic.
+        use crate::storage::{ObjectMeta, Storage};
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        struct FailOnKey {
+            keys: Vec<String>,
+            fail: String,
+        }
+
+        #[async_trait]
+        impl Storage for FailOnKey {
+            async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+                if key == self.fail {
+                    return Err(anyhow::anyhow!("simulated backend 500"));
+                }
+                let title = key.trim_end_matches(".yaml").rsplit('/').next().unwrap();
+                let entry = CatalogEntry {
+                    title: Some(title.into()),
+                    ..Default::default()
+                };
+                Ok(serde_yaml_ng::to_string(&entry)?.into_bytes())
+            }
+            async fn put(&self, _: &str, _: Vec<u8>) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn head(&self, _: &str) -> anyhow::Result<Option<ObjectMeta>> {
+                unimplemented!()
+            }
+            async fn list(&self, _: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+                Ok(self
+                    .keys
+                    .iter()
+                    .map(|k| ObjectMeta {
+                        key: k.clone(),
+                        size: 1,
+                        last_modified: None,
+                        etag: None,
+                    })
+                    .collect())
+            }
+            async fn delete(&self, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+        }
+
+        let keys: Vec<String> = (0..5).map(|i| format!("catalog/xx/doc_{i}.yaml")).collect();
+        let fail = keys[2].clone();
+        let storage = Arc::new(FailOnKey {
+            keys,
+            fail: fail.clone(),
+        });
+
+        let err = list_catalog_entries_parallel(&*storage, "catalog", 4, |_, _| {})
+            .await
+            .expect_err("must fail loud on GET error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&fail) && msg.contains("failed"),
+            "error must name the offending key: {msg}"
+        );
     }
 }

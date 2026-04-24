@@ -45,6 +45,12 @@ pub struct PipelineCounts {
     pub embedded_documents: Option<u64>,
     #[serde(default)]
     pub embedded_chunks: Option<u64>,
+    /// Catalog entries stamped `embedding_skip` (e.g. zero-chunk HTML
+    /// stubs). These count toward `markdown` but are intentionally not
+    /// embeddable, so TUI progress percentages should exclude them from
+    /// the denominator.
+    #[serde(default)]
+    pub embedding_skipped: Option<u64>,
     /// Unaccounted rows: `documents − markdown − in_flight`. Small
     /// residual (<= threshold) is expected due to stage-in-progress;
     /// larger values indicate a conversion error the operator needs to
@@ -266,37 +272,65 @@ pub async fn count_ext_via(storage: &dyn Storage, prefix: &str, ext: &str) -> u6
     }
 }
 
-/// Find document files (PDFs and HTML fallbacks) under `papers_prefix`
-/// that have no matching catalog YAML under `catalog_prefix`. Returns
-/// `(stem, ext)` pairs sorted by stem so output is deterministic.
+/// A single listing-and-deserialization pass over the three prefixes that
+/// `catalog_repair`'s seven scan directions all probe. Built once per
+/// `catalog_repair` invocation and lent to each scan by reference, so the
+/// storage-side cost is `3 LISTs + N parallel GETs` (concurrency-bounded)
+/// instead of the pre-fix `~15 LISTs + N serial GETs × 7` that exceeded
+/// the MCP 4-minute client budget at 3k+ rows.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub struct RepairSnapshot {
+    pub papers: Vec<crate::storage::ObjectMeta>,
+    pub catalog: Vec<(String, crate::storage::ObjectMeta, CatalogEntry)>,
+    pub markdown: Vec<crate::storage::ObjectMeta>,
+}
+
+/// Build a [`RepairSnapshot`] by listing the three prefixes concurrently
+/// and fetching every catalog YAML in parallel via
+/// [`crate::catalog::list_catalog_entries_parallel`]. The progress callback
+/// fires during the catalog fetch (every 64 completions and once at the end)
+/// so callers can reset the MCP client's tool-call timeout with heartbeats.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub async fn build_repair_snapshot(
+    storage: &dyn Storage,
+    papers_prefix: &str,
+    catalog_prefix: &str,
+    markdown_prefix: &str,
+    concurrency: usize,
+    on_catalog_fetch_progress: impl FnMut(usize, usize),
+) -> anyhow::Result<RepairSnapshot> {
+    let (papers, markdown, catalog) = tokio::try_join!(
+        storage.list(papers_prefix),
+        storage.list(markdown_prefix),
+        crate::catalog::list_catalog_entries_parallel(
+            storage,
+            catalog_prefix,
+            concurrency,
+            on_catalog_fetch_progress,
+        ),
+    )?;
+    Ok(RepairSnapshot {
+        papers,
+        catalog,
+        markdown,
+    })
+}
+
+/// Find document files (PDFs and HTML fallbacks) under `papers` that have
+/// no matching catalog row. Returns `(stem, ext)` pairs sorted by stem so
+/// output is deterministic.
 ///
 /// This is the primary diagnostic for the documents → catalog gap that
 /// the self-test surfaces. The repair tool consumes this list to
 /// synthesize minimal catalog rows for orphan files, restoring source-
 /// of-truth alignment without re-downloading.
-#[cfg(feature = "storage")]
-pub async fn list_orphan_document_stems(
-    storage: &dyn Storage,
-    papers_prefix: &str,
-    catalog_prefix: &str,
-) -> anyhow::Result<Vec<(String, String)>> {
-    let papers = storage.list(papers_prefix).await?;
-    let catalog = storage.list(catalog_prefix).await?;
-
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub fn list_orphan_document_stems(
+    papers: &[crate::storage::ObjectMeta],
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+) -> Vec<(String, String)> {
     use std::collections::HashSet;
-    let known: HashSet<String> = catalog
-        .iter()
-        .filter_map(|o| {
-            if !o.key.ends_with(".yaml") {
-                return None;
-            }
-            let filename = o.key.rsplit('/').next()?;
-            if filename.starts_with("._") {
-                return None;
-            }
-            Some(filename.trim_end_matches(".yaml").to_string())
-        })
-        .collect();
+    let known: HashSet<&str> = catalog.iter().map(|(stem, _, _)| stem.as_str()).collect();
 
     let mut orphans: Vec<(String, String)> = Vec::new();
     for obj in papers {
@@ -311,12 +345,12 @@ pub async fn list_orphan_document_stems(
             Some((s, e)) if e == "pdf" || e == "html" => (s.to_string(), e.to_string()),
             _ => continue,
         };
-        if !known.contains(&stem) {
+        if !known.contains(stem.as_str()) {
             orphans.push((stem, ext));
         }
     }
     orphans.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(orphans)
+    orphans
 }
 
 /// List stems of catalog rows that claim a successful conversion but whose
@@ -327,16 +361,12 @@ pub async fn list_orphan_document_stems(
 /// Rows with no `conversion` at all are skipped (they never claimed to have
 /// markdown in the first place).
 #[cfg(all(feature = "storage", feature = "catalog"))]
-pub async fn list_catalog_rows_without_markdown(
-    storage: &dyn Storage,
-    catalog_prefix: &str,
-    markdown_prefix: &str,
-) -> anyhow::Result<Vec<String>> {
-    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
-
-    let markdown_objects = storage.list(markdown_prefix).await?;
+pub fn list_catalog_rows_without_markdown(
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+    markdown: &[crate::storage::ObjectMeta],
+) -> Vec<String> {
     use std::collections::HashSet;
-    let markdown_stems: HashSet<String> = markdown_objects
+    let markdown_stems: HashSet<String> = markdown
         .iter()
         .filter_map(|o| {
             if !o.key.ends_with(".md") {
@@ -350,18 +380,18 @@ pub async fn list_catalog_rows_without_markdown(
         })
         .collect();
 
-    let mut orphans: Vec<String> = triples
-        .into_iter()
+    let mut orphans: Vec<String> = catalog
+        .iter()
         .filter_map(|(stem, _meta, entry)| {
-            if entry.conversion.is_some() && !markdown_stems.contains(&stem) {
-                Some(stem)
+            if entry.conversion.is_some() && !markdown_stems.contains(stem) {
+                Some(stem.clone())
             } else {
                 None
             }
         })
         .collect();
     orphans.sort();
-    Ok(orphans)
+    orphans
 }
 
 /// A catalog row whose recorded `markdown_path` disagrees with storage —
@@ -411,17 +441,13 @@ pub struct MdPathDrift {
 /// `catalog_no_markdown` direction handles by clearing the conversion
 /// stamp.
 #[cfg(all(feature = "storage", feature = "catalog"))]
-pub async fn list_catalog_rows_with_md_path_drift(
-    storage: &dyn Storage,
-    catalog_prefix: &str,
-    markdown_prefix: &str,
-) -> anyhow::Result<Vec<MdPathDrift>> {
-    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
-    let markdown_objects = storage.list(markdown_prefix).await?;
-
+pub fn list_catalog_rows_with_md_path_drift(
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+    markdown: &[crate::storage::ObjectMeta],
+) -> Vec<MdPathDrift> {
     use std::collections::HashMap;
     let mut md_by_filename: HashMap<String, String> = HashMap::new();
-    for obj in &markdown_objects {
+    for obj in markdown {
         if !obj.key.ends_with(".md") {
             continue;
         }
@@ -446,7 +472,7 @@ pub async fn list_catalog_rows_with_md_path_drift(
     }
 
     let mut drift = Vec::new();
-    for (stem, _meta, entry) in triples {
+    for (stem, _meta, entry) in catalog {
         let filename = format!("{stem}.md");
         let Some(resolved) = md_by_filename.get(&filename) else {
             continue;
@@ -454,14 +480,14 @@ pub async fn list_catalog_rows_with_md_path_drift(
         let current = entry.markdown_path.as_deref().unwrap_or("");
         if current != resolved.as_str() {
             drift.push(MdPathDrift {
-                stem,
+                stem: stem.clone(),
                 stale_path: current.to_string(),
                 resolved_path: resolved.clone(),
             });
         }
     }
     drift.sort_by(|a, b| a.stem.cmp(&b.stem));
-    Ok(drift)
+    drift
 }
 
 /// A catalog row whose stage flags contradict what's actually in storage.
@@ -493,16 +519,11 @@ pub struct FlagDriftRow {
 /// without deleting data (unlike the phantom-purge direction). Skips rows
 /// where neither drift condition is true (healthy row).
 #[cfg(all(feature = "storage", feature = "catalog"))]
-pub async fn list_catalog_flag_drift(
-    storage: &dyn Storage,
-    papers_prefix: &str,
-    catalog_prefix: &str,
-    markdown_prefix: &str,
-) -> anyhow::Result<Vec<FlagDriftRow>> {
-    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
-    let papers = storage.list(papers_prefix).await?;
-    let markdown = storage.list(markdown_prefix).await?;
-
+pub fn list_catalog_flag_drift(
+    papers: &[crate::storage::ObjectMeta],
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+    markdown: &[crate::storage::ObjectMeta],
+) -> Vec<FlagDriftRow> {
     use std::collections::HashMap;
     // Keep the `last_modified` per stem so the repair can emit per-object
     // timestamps. PDF wins over HTML when both exist, matching the preference
@@ -547,14 +568,14 @@ pub async fn list_catalog_flag_drift(
     }
 
     let mut drift: Vec<FlagDriftRow> = Vec::new();
-    for (stem, _meta, entry) in triples {
-        let md_hit = md_mtime_by_stem.get(&stem).copied();
-        let paper_hit = paper_mtime_by_stem.get(&stem).cloned();
+    for (stem, _meta, entry) in catalog {
+        let md_hit = md_mtime_by_stem.get(stem).copied();
+        let paper_hit = paper_mtime_by_stem.get(stem).cloned();
         let conversion_missing = entry.conversion.is_none() && md_hit.is_some();
         let download_missing = entry.downloaded_at.is_none() && paper_hit.is_some();
         if conversion_missing || download_missing {
             drift.push(FlagDriftRow {
-                stem,
+                stem: stem.clone(),
                 conversion_missing_with_markdown: conversion_missing,
                 download_stamp_missing_with_source: download_missing,
                 source_last_modified: paper_hit.and_then(|(_ext, mtime)| mtime),
@@ -563,7 +584,7 @@ pub async fn list_catalog_flag_drift(
         }
     }
     drift.sort_by(|a, b| a.stem.cmp(&b.stem));
-    Ok(drift)
+    drift
 }
 
 /// A catalog row whose `downloaded_at` or synthetic-Convert `converted_at`
@@ -596,16 +617,11 @@ pub struct FlagDriftResyncCandidate {
 /// returned — otherwise there's nothing better to rewrite to and the resync
 /// would be a no-op.
 #[cfg(all(feature = "storage", feature = "catalog"))]
-pub async fn list_catalog_flag_drift_resync_candidates(
-    storage: &dyn Storage,
-    papers_prefix: &str,
-    catalog_prefix: &str,
-    markdown_prefix: &str,
-) -> anyhow::Result<Vec<FlagDriftResyncCandidate>> {
-    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
-    let papers = storage.list(papers_prefix).await?;
-    let markdown = storage.list(markdown_prefix).await?;
-
+pub fn list_catalog_flag_drift_resync_candidates(
+    papers: &[crate::storage::ObjectMeta],
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+    markdown: &[crate::storage::ObjectMeta],
+) -> Vec<FlagDriftResyncCandidate> {
     use std::collections::HashMap;
     let mut paper_mtime_by_stem: HashMap<String, Option<std::time::SystemTime>> = HashMap::new();
     for o in papers.iter() {
@@ -646,34 +662,34 @@ pub async fn list_catalog_flag_drift_resync_candidates(
     }
 
     let mut out: Vec<FlagDriftResyncCandidate> = Vec::new();
-    for (stem, _meta, entry) in triples {
+    for (stem, _meta, entry) in catalog {
         let Some(ref repair) = entry.repair else {
             continue;
         };
         let repair_at = repair.repaired_at.as_str();
 
         let resync_download = match entry.downloaded_at.as_deref() {
-            Some(dl) if dl == repair_at => paper_mtime_by_stem.get(&stem).copied().flatten(),
+            Some(dl) if dl == repair_at => paper_mtime_by_stem.get(stem).copied().flatten(),
             _ => None,
         };
         let resync_conversion = match entry.conversion.as_ref() {
             Some(conv)
                 if conv.server == "catalog_repair:flag_drift" && conv.converted_at == repair_at =>
             {
-                md_mtime_by_stem.get(&stem).copied().flatten()
+                md_mtime_by_stem.get(stem).copied().flatten()
             }
             _ => None,
         };
         if resync_download.is_some() || resync_conversion.is_some() {
             out.push(FlagDriftResyncCandidate {
-                stem,
+                stem: stem.clone(),
                 resync_download,
                 resync_conversion,
             });
         }
     }
     out.sort_by(|a, b| a.stem.cmp(&b.stem));
-    Ok(out)
+    out
 }
 
 /// A stuck-convert row: catalog has no `conversion` stamp, but a source
@@ -698,14 +714,10 @@ pub struct StuckConvertRow {
 /// with neither source nor markdown) or [`list_catalog_flag_drift`] (flags
 /// missing but storage evidence present for an already-completed stage).
 #[cfg(all(feature = "storage", feature = "catalog"))]
-pub async fn list_catalog_stuck_convert(
-    storage: &dyn Storage,
-    papers_prefix: &str,
-    catalog_prefix: &str,
-) -> anyhow::Result<Vec<StuckConvertRow>> {
-    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
-    let papers = storage.list(papers_prefix).await?;
-
+pub fn list_catalog_stuck_convert(
+    papers: &[crate::storage::ObjectMeta],
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+) -> Vec<StuckConvertRow> {
     use std::collections::HashMap;
     // stem -> extension. PDF wins over HTML when both exist so we prefer
     // the richer source; the convert path handles either.
@@ -734,20 +746,20 @@ pub async fn list_catalog_stuck_convert(
     }
 
     let mut stuck: Vec<StuckConvertRow> = Vec::new();
-    for (stem, _meta, entry) in triples {
+    for (stem, _meta, entry) in catalog {
         if entry.conversion.is_some() {
             continue;
         }
-        let Some(ext) = source_by_stem.get(&stem) else {
+        let Some(ext) = source_by_stem.get(stem) else {
             continue;
         };
         stuck.push(StuckConvertRow {
-            stem,
+            stem: stem.clone(),
             source_ext: ext.clone(),
         });
     }
     stuck.sort_by(|a, b| a.stem.cmp(&b.stem));
-    Ok(stuck)
+    stuck
 }
 
 /// List stems of catalog rows with no backing file in storage — neither a
@@ -757,16 +769,11 @@ pub async fn list_catalog_stuck_convert(
 /// vanished). They inflate `catalog_entries` above `documents` in the
 /// pipeline rollup without being reachable by any downstream stage.
 #[cfg(all(feature = "storage", feature = "catalog"))]
-pub async fn list_catalog_rows_without_source(
-    storage: &dyn Storage,
-    papers_prefix: &str,
-    catalog_prefix: &str,
-    markdown_prefix: &str,
-) -> anyhow::Result<Vec<String>> {
-    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
-    let papers = storage.list(papers_prefix).await?;
-    let markdown = storage.list(markdown_prefix).await?;
-
+pub fn list_catalog_rows_without_source(
+    papers: &[crate::storage::ObjectMeta],
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+    markdown: &[crate::storage::ObjectMeta],
+) -> Vec<String> {
     use std::collections::HashSet;
     let paper_stems: HashSet<String> = papers
         .iter()
@@ -797,18 +804,18 @@ pub async fn list_catalog_rows_without_source(
         })
         .collect();
 
-    let mut orphans: Vec<String> = triples
-        .into_iter()
+    let mut orphans: Vec<String> = catalog
+        .iter()
         .filter_map(|(stem, _meta, _entry)| {
-            if paper_stems.contains(&stem) || md_stems.contains(&stem) {
+            if paper_stems.contains(stem) || md_stems.contains(stem) {
                 None
             } else {
-                Some(stem)
+                Some(stem.clone())
             }
         })
         .collect();
     orphans.sort();
-    Ok(orphans)
+    orphans
 }
 
 /// Pipeline counts via Storage. Same source of truth as MCP today.
@@ -820,6 +827,7 @@ pub async fn collect_pipeline_counts(
     catalog_prefix: &str,
     embedded_documents: Option<u64>,
     embedded_chunks: Option<u64>,
+    embedding_skipped: Option<u64>,
 ) -> PipelineCounts {
     let pdfs = count_ext_via(storage, papers_prefix, "pdf").await;
     let htmls = count_ext_via(storage, papers_prefix, "html").await;
@@ -836,6 +844,7 @@ pub async fn collect_pipeline_counts(
         catalog_entries,
         embedded_documents,
         embedded_chunks,
+        embedding_skipped,
         // Computed by caller once it knows total in_flight.
         pipeline_drift: 0,
         pipeline_drift_threshold: PIPELINE_DRIFT_THRESHOLD,
@@ -978,9 +987,10 @@ mod stuck_convert_tests {
             .await
             .unwrap();
 
-        let stuck_rows = list_catalog_stuck_convert(&storage, "papers", "catalog")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let stuck_rows = list_catalog_stuck_convert(&snap.papers, &snap.catalog);
 
         assert_eq!(stuck_rows.len(), 1, "got: {stuck_rows:?}");
         assert_eq!(stuck_rows[0].stem, "stuck");
@@ -1010,9 +1020,10 @@ mod stuck_convert_tests {
             .await
             .unwrap();
 
-        let rows = list_catalog_stuck_convert(&storage, "papers", "catalog")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let rows = list_catalog_stuck_convert(&snap.papers, &snap.catalog);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source_ext, "pdf");
     }
@@ -1045,9 +1056,10 @@ mod md_path_drift_tests {
             .await
             .unwrap();
 
-        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let drift = list_catalog_rows_with_md_path_drift(&snap.catalog, &snap.markdown);
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].stem, "04947b2f");
         assert_eq!(drift[0].stale_path, "markdown/04947b2f.md");
@@ -1073,9 +1085,10 @@ mod md_path_drift_tests {
             .await
             .unwrap();
 
-        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let drift = list_catalog_rows_with_md_path_drift(&snap.catalog, &snap.markdown);
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].stale_path, "");
         assert_eq!(drift[0].resolved_path, "markdown/gh/ghostpath.md");
@@ -1099,9 +1112,10 @@ mod md_path_drift_tests {
             .await
             .unwrap();
 
-        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let drift = list_catalog_rows_with_md_path_drift(&snap.catalog, &snap.markdown);
         assert!(drift.is_empty());
     }
 
@@ -1121,9 +1135,10 @@ mod md_path_drift_tests {
             .await
             .unwrap();
 
-        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let drift = list_catalog_rows_with_md_path_drift(&snap.catalog, &snap.markdown);
         assert!(drift.is_empty());
     }
 
@@ -1150,9 +1165,10 @@ mod md_path_drift_tests {
             .await
             .unwrap();
 
-        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let drift = list_catalog_rows_with_md_path_drift(&snap.catalog, &snap.markdown);
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].resolved_path, "markdown/du/duped.md");
     }
@@ -1185,9 +1201,10 @@ mod flag_drift_tests {
             .await
             .unwrap();
 
-        let drift = list_catalog_flag_drift(&storage, "papers", "catalog", "markdown")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let drift = list_catalog_flag_drift(&snap.papers, &snap.catalog, &snap.markdown);
         assert_eq!(drift.len(), 1);
         let row = &drift[0];
         assert_eq!(row.stem, "mtimed");
@@ -1223,10 +1240,11 @@ mod flag_drift_tests {
             .await
             .unwrap();
 
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
+            .await
+            .unwrap();
         let candidates =
-            list_catalog_flag_drift_resync_candidates(&storage, "papers", "catalog", "markdown")
-                .await
-                .unwrap();
+            list_catalog_flag_drift_resync_candidates(&snap.papers, &snap.catalog, &snap.markdown);
         assert_eq!(candidates.len(), 1);
         let cand = &candidates[0];
         assert_eq!(cand.stem, "resyncable");
@@ -1258,10 +1276,11 @@ mod flag_drift_tests {
             .await
             .unwrap();
 
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
+            .await
+            .unwrap();
         let candidates =
-            list_catalog_flag_drift_resync_candidates(&storage, "papers", "catalog", "markdown")
-                .await
-                .unwrap();
+            list_catalog_flag_drift_resync_candidates(&snap.papers, &snap.catalog, &snap.markdown);
         assert!(candidates.is_empty());
     }
 
@@ -1296,10 +1315,11 @@ mod flag_drift_tests {
             .await
             .unwrap();
 
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
+            .await
+            .unwrap();
         let candidates =
-            list_catalog_flag_drift_resync_candidates(&storage, "papers", "catalog", "markdown")
-                .await
-                .unwrap();
+            list_catalog_flag_drift_resync_candidates(&snap.papers, &snap.catalog, &snap.markdown);
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].resync_conversion.is_some());
         assert!(candidates[0].resync_download.is_none());
