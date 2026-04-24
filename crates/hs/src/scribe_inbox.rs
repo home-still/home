@@ -258,23 +258,25 @@ async fn cmd_run(reporter: &Arc<dyn Reporter>, _daemon_child: bool) -> Result<()
     // Boot-time heartbeat + sweep — drains any existing backlog before
     // starting the tick cycle. The heartbeat also signals to any `hs status`
     // client that the daemon is alive within one tick of starting, not
-    // after the first poll-interval. First stamp is `last_sweep=None`
-    // (no sweep has run yet); the post-sweep stamp immediately below
-    // populates the counts.
+    // after the first poll-interval.
+    //
+    // `last_sweep` carries the most recent completed sweep's counts across
+    // ticks. The pre-sweep stamp re-uses the PREVIOUS value (so the
+    // Watcher row keeps showing `swept N / M` during a long sweep instead
+    // of flickering to nothing); the post-sweep stamp updates it.
+    let mut last_sweep: Option<(u64, u64, u64)> = None;
     if let Err(e) =
-        hs_common::status::write_inbox_heartbeat(&*storage, sweep_interval_secs, None).await
+        hs_common::status::write_inbox_heartbeat(&*storage, sweep_interval_secs, last_sweep).await
     {
         tracing::warn!(error = %e, "initial heartbeat write failed");
     }
     match sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX).await {
         Ok(r) => {
             log_report(reporter, &r);
-            if let Err(e) = hs_common::status::write_inbox_heartbeat(
-                &*storage,
-                sweep_interval_secs,
-                Some((r.found as u64, r.relocated, r.errors.len() as u64)),
-            )
-            .await
+            last_sweep = Some((r.found as u64, r.relocated, r.errors.len() as u64));
+            if let Err(e) =
+                hs_common::status::write_inbox_heartbeat(&*storage, sweep_interval_secs, last_sweep)
+                    .await
             {
                 tracing::warn!(error = %e, "post-sweep heartbeat write failed");
             }
@@ -296,13 +298,15 @@ async fn cmd_run(reporter: &Arc<dyn Reporter>, _daemon_child: bool) -> Result<()
         }
         tokio::time::sleep(poll_interval).await;
         // Pre-sweep heartbeat keeps the Watcher row "running" even when
-        // a sweep stalls — `hs status` ages out the heartbeat at 2×
-        // poll_interval + 5s grace. Pre-sweep stamp carries no counts
-        // (`last_sweep=None`) so we don't rewrite stale stats into what
-        // should be a liveness signal; the post-sweep stamp updates the
-        // counts.
+        // a sweep stalls. `last_sweep` carries the previous completed
+        // sweep's counts forward so the `swept N / M` display doesn't
+        // flicker to null every 30s — `hs status` ages out the
+        // heartbeat at 2× poll_interval + 5s grace for the liveness
+        // signal; the numbers alongside are the most recent known
+        // counts, always.
         if let Err(e) =
-            hs_common::status::write_inbox_heartbeat(&*storage, sweep_interval_secs, None).await
+            hs_common::status::write_inbox_heartbeat(&*storage, sweep_interval_secs, last_sweep)
+                .await
         {
             tracing::warn!(error = %e, "heartbeat write failed; sweep will still run");
         }
@@ -313,12 +317,13 @@ async fn cmd_run(reporter: &Arc<dyn Reporter>, _daemon_child: bool) -> Result<()
                 } else {
                     tracing::debug!("sweep: nothing to do");
                 }
-                // Post-sweep stamp: give `hs status` the actual counts
-                // so the Watcher row can render `swept N / M`.
+                last_sweep = Some((r.found as u64, r.relocated, r.errors.len() as u64));
+                // Post-sweep stamp: refresh the Watcher row with the
+                // fresh counts.
                 if let Err(e) = hs_common::status::write_inbox_heartbeat(
                     &*storage,
                     sweep_interval_secs,
-                    Some((r.found as u64, r.relocated, r.errors.len() as u64)),
+                    last_sweep,
                 )
                 .await
                 {
