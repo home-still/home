@@ -234,8 +234,7 @@ mod tests {
         // must fail deserialization, not silently fall through to Cuda.
         let yaml = "compute_device: cpu\n";
         let err = serde_yaml_ng::from_str::<EmbeddingConfig>(yaml)
-            .err()
-            .expect("compute_device: cpu must reject");
+            .expect_err("compute_device: cpu must reject");
         let msg = err.to_string();
         assert!(
             msg.contains("variant") || msg.contains("cpu"),
@@ -247,8 +246,7 @@ mod tests {
     fn yaml_with_unknown_device_fails() {
         let yaml = "compute_device: rocm\n";
         let err = serde_yaml_ng::from_str::<EmbeddingConfig>(yaml)
-            .err()
-            .expect("unknown compute_device must reject");
+            .expect_err("unknown compute_device must reject");
         let _ = err.to_string();
     }
 }
