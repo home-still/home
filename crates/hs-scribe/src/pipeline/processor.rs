@@ -299,7 +299,15 @@ impl Processor {
                         return Ok((bbox, String::new()));
                     }
 
-                    let crop = crop_bbox(&image, &bbox);
+                    let Some(crop) = crop_bbox(&image, &bbox) else {
+                        tracing::warn!(
+                            class = %bbox.class_name,
+                            x1 = bbox.x1, y1 = bbox.y1, x2 = bbox.x2, y2 = bbox.y2,
+                            img_w = image.width(), img_h = image.height(),
+                            "region crop 0-dim after clamp — skipping region (page continues)"
+                        );
+                        return Ok((bbox, String::new()));
+                    };
                     let image_bytes = encode_jpeg(&crop)?;
 
                     tracing::debug!(
@@ -351,7 +359,14 @@ impl Processor {
 
         // Process table regions: SLANet-Plus structure → per-cell VLM OCR → HTML
         for bbox in table_bboxes {
-            let crop = crop_bbox(image, &bbox);
+            let Some(crop) = crop_bbox(image, &bbox) else {
+                tracing::warn!(
+                    class = %bbox.class_name,
+                    x1 = bbox.x1, y1 = bbox.y1, x2 = bbox.x2, y2 = bbox.y2,
+                    "table crop 0-dim after clamp — skipping table (page continues)"
+                );
+                continue;
+            };
             let html = self.recognize_table_html(&crop).await?;
             regions.push((bbox, html));
         }
@@ -406,9 +421,22 @@ impl Processor {
                 let table_img = Arc::clone(&table_arc);
                 async move {
                     let [x1, y1, x2, y2] = cell.bbox;
-                    let w = ((x2 - x1) as u32).max(1);
-                    let h = ((y2 - y1) as u32).max(1);
-                    let cell_crop = table_img.crop_imm(x1 as u32, y1 as u32, w, h);
+                    let x1u = x1.max(0.0) as u32;
+                    let y1u = y1.max(0.0) as u32;
+                    let w = (x2 - x1).max(0.0) as u32;
+                    let h = (y2 - y1).max(0.0) as u32;
+                    let Some(cell_crop) = crop_image_checked(&table_img, x1u, y1u, w, h) else {
+                        tracing::warn!(
+                            cell_x1 = x1,
+                            cell_y1 = y1,
+                            cell_x2 = x2,
+                            cell_y2 = y2,
+                            table_w = table_img.width(),
+                            table_h = table_img.height(),
+                            "cell crop 0-dim — emitting empty cell (table continues)"
+                        );
+                        return String::new();
+                    };
                     match encode_jpeg(&cell_crop) {
                         Ok(bytes) => match ocr.recognize_region(&bytes, RegionType::Text).await {
                             Ok(text) => text.trim().to_string(),
@@ -467,7 +495,7 @@ impl Processor {
             let parallel = self.config.parallel;
             let completed = Arc::new(AtomicU64::new(0));
 
-            let page_markdowns: Vec<Result<String>> = stream::iter(pages.into_iter().enumerate())
+            let markdowns: Vec<String> = stream::iter(pages.into_iter().enumerate())
                 .map(|(i, page)| {
                     let ocr = Arc::clone(&ocr);
                     let on_progress = Arc::clone(&on_progress);
@@ -480,7 +508,17 @@ impl Processor {
                             message: format!("Starting OCR page {}/{total}", i + 1),
                         });
                         let downscaled = maybe_downscale(&page.image, max_dim);
-                        let image_bytes = encode_jpeg(&downscaled)?;
+                        let image_bytes = match encode_jpeg(&downscaled) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    page = i + 1,
+                                    "full-page JPEG encode failed — emitting empty page (paper continues)"
+                                );
+                                return String::new();
+                            }
+                        };
                         tracing::info!(
                             "Processing page {}/{} ({}x{}, {} bytes JPEG)",
                             i + 1,
@@ -489,7 +527,17 @@ impl Processor {
                             page.image.height(),
                             image_bytes.len()
                         );
-                        let text = ocr.recognize(&image_bytes).await?;
+                        let text = match ocr.recognize(&image_bytes).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    page = i + 1,
+                                    "full-page VLM failed — emitting empty page (paper continues)"
+                                );
+                                String::new()
+                            }
+                        };
                         let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                         on_progress(ProgressEvent {
                             stage: "vlm".into(),
@@ -497,14 +545,13 @@ impl Processor {
                             total_pages: total,
                             message: format!("OCR page {done}/{total}"),
                         });
-                        Ok(text)
+                        text
                     }
                 })
                 .buffered(parallel)
                 .collect()
                 .await;
 
-            let markdowns: Vec<String> = page_markdowns.into_iter().collect::<Result<Vec<_>>>()?;
             return Ok(join_pages(&markdowns));
         }
 
@@ -611,12 +658,22 @@ impl Processor {
             let ocr = Arc::clone(&self.ocr);
             let max_dim = self.config.max_image_dim;
             let parallel = self.config.parallel;
-            let page_markdowns: Vec<Result<String>> = stream::iter(pages.into_iter().enumerate())
+            let markdowns: Vec<String> = stream::iter(pages.into_iter().enumerate())
                 .map(|(i, page)| {
                     let ocr = Arc::clone(&ocr);
                     async move {
                         let downscaled = maybe_downscale(&page.image, max_dim);
-                        let image_bytes = encode_jpeg(&downscaled)?;
+                        let image_bytes = match encode_jpeg(&downscaled) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    page = i + 1,
+                                    "full-page JPEG encode failed — emitting empty page (paper continues)"
+                                );
+                                return String::new();
+                            }
+                        };
                         tracing::info!(
                             "Processing page {}/{} ({}x{}, {} bytes JPEG)",
                             i + 1,
@@ -625,14 +682,23 @@ impl Processor {
                             page.image.height(),
                             image_bytes.len()
                         );
-                        ocr.recognize(&image_bytes).await
+                        match ocr.recognize(&image_bytes).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    page = i + 1,
+                                    "full-page VLM failed — emitting empty page (paper continues)"
+                                );
+                                String::new()
+                            }
+                        }
                     }
                 })
                 .buffered(parallel)
                 .collect()
                 .await;
 
-            let markdowns: Vec<String> = page_markdowns.into_iter().collect::<Result<Vec<_>>>()?;
             return Ok(join_pages(&markdowns));
         }
 
@@ -897,15 +963,40 @@ fn prepare_page(
         }
     }
 
-    // Prepare non-table regions: crop + JPEG encode
+    // Prepare non-table regions: crop + JPEG encode. A 0-dim crop
+    // (Fix A's layout guard missed it, or the bbox lands past an
+    // image edge after padding) or a per-region encode failure drops
+    // the region and emits a WARN; the page keeps the surviving
+    // regions instead of failing the whole PDF.
     let mut text_regions = Vec::with_capacity(other_bboxes.len());
+    let mut skipped_regions: usize = 0;
     for bbox in other_bboxes {
         let region_type = RegionType::from_class(&bbox.class_name);
         let jpeg_bytes = if region_type == RegionType::Figure || region_type == RegionType::Skip {
             Vec::new()
         } else {
-            let crop = crop_bbox(image, &bbox);
-            encode_jpeg(&crop)?
+            let Some(crop) = crop_bbox(image, &bbox) else {
+                tracing::warn!(
+                    class = %bbox.class_name,
+                    x1 = bbox.x1, y1 = bbox.y1, x2 = bbox.x2, y2 = bbox.y2,
+                    img_w = image.width(), img_h = image.height(),
+                    "region crop 0-dim after clamp — skipping region (page continues)"
+                );
+                skipped_regions += 1;
+                continue;
+            };
+            match encode_jpeg(&crop) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        class = %bbox.class_name,
+                        "region JPEG encode failed — skipping region (page continues)"
+                    );
+                    skipped_regions += 1;
+                    continue;
+                }
+            }
         };
         text_regions.push(PreparedRegion {
             bbox,
@@ -913,11 +1004,29 @@ fn prepare_page(
             jpeg_bytes,
         });
     }
+    if skipped_regions > 0 {
+        tracing::warn!(
+            skipped_regions,
+            kept_regions = text_regions.len(),
+            "page {} has skipped regions; page output will be partial",
+            page_idx + 1
+        );
+    }
 
-    // Prepare table regions: SLANet structure + per-cell crop + JPEG encode
+    // Prepare table regions: SLANet structure + per-cell crop + JPEG
+    // encode. A 0-dim table crop drops the whole table; a 0-dim cell
+    // crop emits an empty Vec for that cell (SLANet's structure still
+    // needs one slot per cell so alignment is preserved).
     let mut table_regions = Vec::with_capacity(table_bboxes.len());
     for bbox in table_bboxes {
-        let crop = crop_bbox(image, &bbox);
+        let Some(crop) = crop_bbox(image, &bbox) else {
+            tracing::warn!(
+                class = %bbox.class_name,
+                x1 = bbox.x1, y1 = bbox.y1, x2 = bbox.x2, y2 = bbox.y2,
+                "table crop 0-dim after clamp — skipping table (page continues)"
+            );
+            continue;
+        };
         let structure = {
             let pool = table.as_ref().expect("table_recognizers required");
             let mut rec = pool.acquire()?;
@@ -933,10 +1042,36 @@ fn prepare_page(
         let mut cell_jpegs = Vec::with_capacity(structure.cells.len());
         for cell in &structure.cells {
             let [x1, y1, x2, y2] = cell.bbox;
-            let w = ((x2 - x1) as u32).max(1);
-            let h = ((y2 - y1) as u32).max(1);
-            let cell_crop = crop.crop_imm(x1 as u32, y1 as u32, w, h);
-            cell_jpegs.push(encode_jpeg(&cell_crop)?);
+            let x1u = x1.max(0.0) as u32;
+            let y1u = y1.max(0.0) as u32;
+            let w = (x2 - x1).max(0.0) as u32;
+            let h = (y2 - y1).max(0.0) as u32;
+            let bytes = match crop_image_checked(&crop, x1u, y1u, w, h) {
+                Some(cell_crop) => match encode_jpeg(&cell_crop) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            err = %e,
+                            cell_x1 = x1, cell_y1 = y1,
+                            "cell JPEG encode failed — emitting empty cell (table continues)"
+                        );
+                        Vec::new()
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        cell_x1 = x1,
+                        cell_y1 = y1,
+                        cell_x2 = x2,
+                        cell_y2 = y2,
+                        table_w = crop.width(),
+                        table_h = crop.height(),
+                        "cell crop 0-dim — emitting empty cell (table continues)"
+                    );
+                    Vec::new()
+                }
+            };
+            cell_jpegs.push(bytes);
         }
 
         table_regions.push(PreparedTable {
@@ -969,11 +1104,29 @@ async fn execute_vlm_for_page(
             page_idx,
             jpeg_bytes,
         } => {
-            let _permit = sem
-                .acquire()
-                .await
-                .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
-            let text = ocr.recognize(&jpeg_bytes).await?;
+            let permit = match sem.acquire().await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        page_idx,
+                        "semaphore closed on full-page VLM — emitting empty page"
+                    );
+                    return Ok((page_idx, String::new()));
+                }
+            };
+            let text = match ocr.recognize(&jpeg_bytes).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        page_idx,
+                        "full-page VLM failed — emitting empty page (paper continues)"
+                    );
+                    String::new()
+                }
+            };
+            drop(permit);
             Ok((page_idx, text))
         }
         PreparedPage::Regions {
@@ -995,8 +1148,10 @@ async fn execute_vlm_for_page(
                 ),
             });
 
-            // Process text regions with semaphore-gated concurrency
-            let region_results: Vec<Result<(BBox, String)>> = stream::iter(text_regions)
+            // Process text regions with semaphore-gated concurrency.
+            // Inner closure is infallible — per-region failures degrade
+            // to empty string, the paper continues.
+            let region_results: Vec<(BBox, String)> = stream::iter(text_regions)
                 .map(|r| {
                     let ocr = Arc::clone(&ocr);
                     let sem = Arc::clone(&sem);
@@ -1006,13 +1161,36 @@ async fn execute_vlm_for_page(
                         if r.region_type == RegionType::Figure || r.region_type == RegionType::Skip
                         {
                             region_done.fetch_add(1, Ordering::Relaxed);
-                            return Ok((r.bbox, String::new()));
+                            return (r.bbox, String::new());
                         }
-                        let _permit = sem
-                            .acquire()
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
-                        let text = ocr.recognize_region(&r.jpeg_bytes, r.region_type).await?;
+                        if r.jpeg_bytes.is_empty() {
+                            // prepare_page logged the skip; keep the slot empty so
+                            // read-order assembly still has a placeholder.
+                            region_done.fetch_add(1, Ordering::Relaxed);
+                            return (r.bbox, String::new());
+                        }
+                        let permit = match sem.acquire().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "semaphore closed — emitting empty region"
+                                );
+                                return (r.bbox, String::new());
+                            }
+                        };
+                        let text = match ocr.recognize_region(&r.jpeg_bytes, r.region_type).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    region_type = ?r.region_type,
+                                    "region VLM failed — emitting empty region (paper continues)"
+                                );
+                                String::new()
+                            }
+                        };
+                        drop(permit);
                         let done = region_done.fetch_add(1, Ordering::Relaxed) + 1;
                         on_progress(ProgressEvent {
                             stage: "vlm".into(),
@@ -1022,15 +1200,14 @@ async fn execute_vlm_for_page(
                                 "OCR region {done}/{total_regions} on page {page_num}"
                             ),
                         });
-                        Ok((r.bbox, text))
+                        (r.bbox, text)
                     }
                 })
                 .buffer_unordered(region_parallel)
                 .collect()
                 .await;
 
-            let mut regions: Vec<(BBox, String)> =
-                region_results.into_iter().collect::<Result<Vec<_>>>()?;
+            let mut regions: Vec<(BBox, String)> = region_results;
 
             // Process table cells with semaphore-gated concurrency
             for (t_idx, table) in table_regions.into_iter().enumerate() {
@@ -1055,17 +1232,28 @@ async fn execute_vlm_for_page(
                         let on_progress = Arc::clone(&on_progress);
                         let cell_done = Arc::clone(&cell_done);
                         async move {
-                            let _permit = sem
-                                .acquire()
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
-                            let result = match ocr.recognize_region(&jpeg, RegionType::Text).await {
-                                Ok(text) => Ok(text.trim().to_string()),
+                            if jpeg.is_empty() {
+                                cell_done.fetch_add(1, Ordering::Relaxed);
+                                return String::new();
+                            }
+                            let permit = match sem.acquire().await {
+                                Ok(p) => p,
                                 Err(e) => {
-                                    tracing::warn!("Cell OCR failed: {e}");
-                                    Ok(String::new())
+                                    tracing::warn!(
+                                        error = %e,
+                                        "semaphore closed — emitting empty cell"
+                                    );
+                                    return String::new();
                                 }
                             };
+                            let result = match ocr.recognize_region(&jpeg, RegionType::Text).await {
+                                Ok(text) => text.trim().to_string(),
+                                Err(e) => {
+                                    tracing::warn!("Cell OCR failed: {e}");
+                                    String::new()
+                                }
+                            };
+                            drop(permit);
                             let done = cell_done.fetch_add(1, Ordering::Relaxed) + 1;
                             on_progress(ProgressEvent {
                                 stage: "vlm".into(),
@@ -1079,10 +1267,8 @@ async fn execute_vlm_for_page(
                         }
                     })
                     .buffer_unordered(region_parallel)
-                    .collect::<Vec<Result<String>>>()
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect::<Vec<String>>()
+                    .await;
 
                 let html = build_html_from_structure(&table.structure, &cell_texts);
                 regions.push((table.bbox, html));
@@ -1101,8 +1287,39 @@ async fn execute_vlm_for_page(
     }
 }
 
-/// Crop a bounding box region from the image with 2px padding, clamped to bounds.
-fn crop_bbox(image: &DynamicImage, bbox: &BBox) -> DynamicImage {
+/// Crop a rectangular subimage with explicit bounds checking. Returns
+/// `None` when the requested rectangle has zero width or height after
+/// being clipped to the source image. This is the single chokepoint
+/// for bbox-driven crops feeding `encode_jpeg` — a 0-dim `DynamicImage`
+/// crashes the JPEG encoder with `Invalid image size (NxM)`, which
+/// pre-rc.305 terminated the whole PDF convert. Callers that can skip
+/// a bad region (table cell, layout region) match on `None` and move
+/// on with an empty payload.
+pub(crate) fn crop_image_checked(
+    image: &DynamicImage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Option<DynamicImage> {
+    let img_w = image.width();
+    let img_h = image.height();
+    if x >= img_w || y >= img_h {
+        return None;
+    }
+    let w = w.min(img_w - x);
+    let h = h.min(img_h - y);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(image.crop_imm(x, y, w, h))
+}
+
+/// Crop a bounding-box region with 2px padding, clamped to image
+/// bounds. Returns `None` if the clamped rect is 0-dim — this happens
+/// when a layout bbox that slipped past Fix A lands entirely past
+/// an image edge, or when SLANet emits a bbox with reversed corners.
+pub(crate) fn crop_bbox(image: &DynamicImage, bbox: &BBox) -> Option<DynamicImage> {
     let (img_w, img_h) = (image.width() as f32, image.height() as f32);
     let pad = 2.0;
 
@@ -1111,15 +1328,107 @@ fn crop_bbox(image: &DynamicImage, bbox: &BBox) -> DynamicImage {
     let x2 = (bbox.x2 + pad).min(img_w) as u32;
     let y2 = (bbox.y2 + pad).min(img_h) as u32;
 
-    let w = x2.saturating_sub(x1).max(1);
-    let h = y2.saturating_sub(y1).max(1);
+    let w = x2.saturating_sub(x1);
+    let h = y2.saturating_sub(y1);
 
-    image.crop_imm(x1, y1, w, h)
+    crop_image_checked(image, x1, y1, w, h)
 }
 
 pub(crate) fn encode_jpeg(image: &DynamicImage) -> Result<Vec<u8>> {
+    // Final backstop: the `image` crate's Invalid-image-size error
+    // propagates as "Format error encoding Jpeg: Invalid image size
+    // (NxM)" and before rc.305 terminated the enclosing convert.
+    // Reject 0-dim at this boundary with a greppable error string;
+    // the happy path never hits this because `crop_image_checked`
+    // already filtered the crop out.
+    if image.width() == 0 || image.height() == 0 {
+        anyhow::bail!(
+            "encode_jpeg refused 0-dim image {}x{} — crop_image_checked should have filtered this upstream",
+            image.width(),
+            image.height()
+        );
+    }
     let mut buf = Cursor::new(Vec::new());
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
     image.write_with_encoder(encoder)?;
     Ok(buf.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, RgbImage};
+
+    fn img(w: u32, h: u32) -> DynamicImage {
+        DynamicImage::ImageRgb8(RgbImage::new(w, h))
+    }
+
+    fn bbox(x1: f32, y1: f32, x2: f32, y2: f32) -> BBox {
+        BBox {
+            x1,
+            y1,
+            x2,
+            y2,
+            confidence: 0.9,
+            class_id: 22,
+            class_name: "text".to_string(),
+            unique_id: 0,
+            read_order: 0.0,
+        }
+    }
+
+    #[test]
+    fn crop_image_checked_rejects_0_dim() {
+        let image = img(100, 80);
+        // x past right edge → None
+        assert!(crop_image_checked(&image, 100, 0, 10, 10).is_none());
+        assert!(crop_image_checked(&image, 200, 0, 10, 10).is_none());
+        // y past bottom edge → None
+        assert!(crop_image_checked(&image, 0, 80, 10, 10).is_none());
+        // w == 0 → None
+        assert!(crop_image_checked(&image, 0, 0, 0, 10).is_none());
+        // h == 0 → None
+        assert!(crop_image_checked(&image, 0, 0, 10, 0).is_none());
+        // normal crop → Some
+        let c = crop_image_checked(&image, 10, 10, 50, 30).unwrap();
+        assert_eq!(c.width(), 50);
+        assert_eq!(c.height(), 30);
+        // crop extending past right → clipped, not None
+        let c = crop_image_checked(&image, 90, 0, 50, 10).unwrap();
+        assert_eq!(c.width(), 10);
+    }
+
+    #[test]
+    fn crop_bbox_none_when_beyond_edge() {
+        let image = img(1600, 2400);
+        // bbox entirely past right edge — slipped past Fix A
+        assert!(crop_bbox(&image, &bbox(2000.0, 100.0, 2010.0, 200.0)).is_none());
+        // bbox entirely past bottom edge
+        assert!(crop_bbox(&image, &bbox(100.0, 2500.0, 200.0, 2510.0)).is_none());
+        // reversed corners (x2 < x1) — Fix A should catch but defense in depth
+        assert!(crop_bbox(&image, &bbox(500.0, 100.0, 400.0, 200.0)).is_none());
+        // normal bbox within bounds → Some
+        let c = crop_bbox(&image, &bbox(100.0, 100.0, 300.0, 400.0)).unwrap();
+        assert!(c.width() > 0 && c.height() > 0);
+    }
+
+    #[test]
+    fn encode_jpeg_rejects_0_dim_backstop() {
+        // 0×1 and 1×0 must not reach the `image` crate encoder.
+        let zero_w = img(0, 10);
+        let err = encode_jpeg(&zero_w).expect_err("0-width image must be rejected");
+        assert!(
+            err.to_string().contains("encode_jpeg refused"),
+            "err: {err}"
+        );
+        let zero_h = img(10, 0);
+        let err = encode_jpeg(&zero_h).expect_err("0-height image must be rejected");
+        assert!(
+            err.to_string().contains("encode_jpeg refused"),
+            "err: {err}"
+        );
+        // 1×1 encodes fine
+        let tiny = img(1, 1);
+        assert!(encode_jpeg(&tiny).is_ok());
+    }
 }
