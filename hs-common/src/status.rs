@@ -28,8 +28,54 @@ pub struct StatusSnapshot {
     pub qdrant: Option<QdrantInfo>,
     #[serde(default)]
     pub history: Vec<HistoryEvent>,
+    /// Cluster-wide inbox-sweeper health. Populated from the heartbeat key
+    /// the `hs scribe inbox` daemon writes each tick (see
+    /// [`INBOX_HEARTBEAT_KEY`]). `None` means the server found no heartbeat
+    /// at all; `Some(.running=false)` means a stale heartbeat (daemon
+    /// crashed or is asleep longer than its advertised sweep interval).
+    #[serde(default)]
+    pub inbox_heartbeat: Option<InboxHeartbeatSnapshot>,
     #[serde(default)]
     pub generated_at: Option<String>,
+}
+
+/// Storage key the inbox daemon writes its heartbeat to each sweep tick.
+/// Read by every `hs status` client via MCP `system_status`, so the TUI
+/// can render the `Watcher` row honestly regardless of which host the CLI
+/// is running on. Leading `.` keeps it out of top-level listings.
+pub const INBOX_HEARTBEAT_KEY: &str = ".heartbeats/scribe-inbox.yaml";
+
+/// Daemon heartbeat contents. Written by `hs scribe inbox` (cmd_run) at
+/// the top of each sweep tick; consumed by `system_status` / `hs status`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InboxHeartbeat {
+    pub host: String,
+    pub pid: u32,
+    /// RFC3339 timestamp of when the daemon wrote this heartbeat.
+    pub last_tick: String,
+    /// Configured poll interval; readers use this to decide whether the
+    /// observed `last_tick` age is "recent enough" to call the daemon
+    /// running.
+    pub sweep_interval_secs: u64,
+}
+
+/// Snapshot of the heartbeat plus derived freshness — serialised into
+/// `StatusSnapshot`. `running` is set by the MCP server when it classifies
+/// the last_tick_seconds_ago against the daemon's own sweep_interval_secs;
+/// clients just render what they're told.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InboxHeartbeatSnapshot {
+    pub host: String,
+    pub pid: u32,
+    pub last_tick: String,
+    pub sweep_interval_secs: u64,
+    /// Seconds elapsed between the heartbeat's `last_modified` (server's
+    /// clock) and when the snapshot was generated.
+    pub last_tick_seconds_ago: u64,
+    /// True if `last_tick_seconds_ago <= 2 * sweep_interval_secs + 5` —
+    /// daemon is alive and sweeping. 5s grace absorbs clock skew and tick
+    /// jitter.
+    pub running: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -818,6 +864,75 @@ pub fn list_catalog_rows_without_source(
     orphans
 }
 
+/// Stamp the inbox-sweeper heartbeat at the top of each sweep tick. Called
+/// by `hs scribe inbox` (`cmd_run`). Cost is one tiny `storage.put` per
+/// tick — negligible compared to the sweep itself. Failures are the
+/// caller's to surface; most daemons log-and-continue.
+#[cfg(feature = "storage")]
+pub async fn write_inbox_heartbeat(
+    storage: &dyn Storage,
+    sweep_interval_secs: u64,
+) -> anyhow::Result<()> {
+    let hb = InboxHeartbeat {
+        host: gethostname::gethostname().to_string_lossy().into_owned(),
+        pid: std::process::id(),
+        last_tick: chrono::Utc::now().to_rfc3339(),
+        sweep_interval_secs,
+    };
+    let yaml = serde_yaml_ng::to_string(&hb)?;
+    storage
+        .put(INBOX_HEARTBEAT_KEY, yaml.into_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("write_inbox_heartbeat: {e}"))
+}
+
+/// Classify a heartbeat's freshness. Pure: takes the parsed heartbeat,
+/// the storage object's `last_modified`, and the "now" reference clock.
+/// Split out so the threshold logic is unit-testable without having to
+/// manipulate filesystem mtimes.
+#[cfg(feature = "storage")]
+pub fn classify_inbox_heartbeat(
+    hb: InboxHeartbeat,
+    last_modified: std::time::SystemTime,
+    now: std::time::SystemTime,
+) -> InboxHeartbeatSnapshot {
+    let last_tick_seconds_ago = now
+        .duration_since(last_modified)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX);
+    // 5s grace absorbs clock skew + tick jitter. `saturating_mul` so a
+    // maliciously huge sweep_interval doesn't overflow.
+    let running =
+        last_tick_seconds_ago <= hb.sweep_interval_secs.saturating_mul(2).saturating_add(5);
+    InboxHeartbeatSnapshot {
+        host: hb.host,
+        pid: hb.pid,
+        last_tick: hb.last_tick,
+        sweep_interval_secs: hb.sweep_interval_secs,
+        last_tick_seconds_ago,
+        running,
+    }
+}
+
+/// Read the heartbeat and classify freshness. Returns `None` if the key
+/// doesn't exist or can't be parsed. Otherwise the caller can trust
+/// `running` — the server did the freshness math so every client renders
+/// the same verdict.
+#[cfg(feature = "storage")]
+pub async fn read_inbox_heartbeat(storage: &dyn Storage) -> Option<InboxHeartbeatSnapshot> {
+    let bytes = storage.get(INBOX_HEARTBEAT_KEY).await.ok()?;
+    let hb: InboxHeartbeat = serde_yaml_ng::from_slice(&bytes).ok()?;
+    let meta = storage.head(INBOX_HEARTBEAT_KEY).await.ok().flatten()?;
+    let last_modified = meta
+        .last_modified
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    Some(classify_inbox_heartbeat(
+        hb,
+        last_modified,
+        std::time::SystemTime::now(),
+    ))
+}
+
 /// Pipeline counts via Storage. Same source of truth as MCP today.
 #[cfg(feature = "storage")]
 pub async fn collect_pipeline_counts(
@@ -1171,6 +1286,85 @@ mod md_path_drift_tests {
         let drift = list_catalog_rows_with_md_path_drift(&snap.catalog, &snap.markdown);
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].resolved_path, "markdown/du/duped.md");
+    }
+}
+
+#[cfg(all(test, feature = "storage"))]
+mod inbox_heartbeat_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn hb(sweep_interval_secs: u64) -> InboxHeartbeat {
+        InboxHeartbeat {
+            host: "big".into(),
+            pid: 12345,
+            last_tick: "2026-04-24T13:00:00+00:00".into(),
+            sweep_interval_secs,
+        }
+    }
+
+    #[test]
+    fn fresh_heartbeat_is_running() {
+        let now = SystemTime::now();
+        let snap = classify_inbox_heartbeat(hb(5), now, now);
+        assert!(snap.running);
+        assert_eq!(snap.last_tick_seconds_ago, 0);
+        assert_eq!(snap.host, "big");
+    }
+
+    #[test]
+    fn within_two_intervals_plus_grace_still_running() {
+        // sweep_interval=5 → threshold 2*5+5 = 15s. 14s elapsed → running.
+        let now = SystemTime::now();
+        let stamp = now - Duration::from_secs(14);
+        let snap = classify_inbox_heartbeat(hb(5), stamp, now);
+        assert!(
+            snap.running,
+            "14s elapsed at interval=5 must still be running"
+        );
+    }
+
+    #[test]
+    fn beyond_threshold_is_stopped() {
+        // sweep_interval=5 → threshold 15s. 20s elapsed → stopped.
+        let now = SystemTime::now();
+        let stamp = now - Duration::from_secs(20);
+        let snap = classify_inbox_heartbeat(hb(5), stamp, now);
+        assert!(!snap.running);
+        assert_eq!(snap.last_tick_seconds_ago, 20);
+    }
+
+    #[test]
+    fn zero_sweep_interval_does_not_overflow() {
+        // Degenerate config. Threshold is just the 5s grace; 1s elapsed
+        // is still fresh but 10s is not. No panic either way.
+        let now = SystemTime::now();
+        let snap_fresh = classify_inbox_heartbeat(hb(0), now - Duration::from_secs(1), now);
+        assert!(snap_fresh.running);
+        let snap_stale = classify_inbox_heartbeat(hb(0), now - Duration::from_secs(10), now);
+        assert!(!snap_stale.running);
+    }
+
+    #[tokio::test]
+    async fn read_missing_heartbeat_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::LocalFsStorage::new(tmp.path());
+        assert!(read_inbox_heartbeat(&storage).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_then_read_roundtrips_to_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::LocalFsStorage::new(tmp.path());
+
+        write_inbox_heartbeat(&storage, 10).await.unwrap();
+        let snap = read_inbox_heartbeat(&storage)
+            .await
+            .expect("heartbeat just written");
+        assert!(snap.running);
+        assert_eq!(snap.sweep_interval_secs, 10);
+        assert!(!snap.host.is_empty());
+        assert_ne!(snap.pid, 0);
     }
 }
 

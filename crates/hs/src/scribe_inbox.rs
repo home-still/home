@@ -200,8 +200,8 @@ pub async fn sweep_inbox_once(
     Ok(report)
 }
 
-/// Canonical papers prefix used by all downstream tools. Matches
-/// `cmd_watch`'s `papers_prefix` and the server-side MCP / distill.
+/// Canonical papers prefix used by all downstream tools — server-side
+/// scribe watch-events, MCP, distill all read from the same prefix.
 const PAPERS_PREFIX: &str = "papers";
 
 /// Dispatch for `hs scribe inbox ...`.
@@ -253,7 +253,15 @@ async fn cmd_run(reporter: &Arc<dyn Reporter>, _daemon_child: bool) -> Result<()
         ),
     );
 
-    // Boot-time sweep drains any existing backlog before starting the tick.
+    let sweep_interval_secs = poll_interval.as_secs();
+
+    // Boot-time heartbeat + sweep — drains any existing backlog before
+    // starting the tick cycle. The heartbeat also signals to any `hs status`
+    // client that the daemon is alive within one tick of starting, not
+    // after the first poll-interval.
+    if let Err(e) = hs_common::status::write_inbox_heartbeat(&*storage, sweep_interval_secs).await {
+        tracing::warn!(error = %e, "initial heartbeat write failed");
+    }
     match sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX).await {
         Ok(r) => log_report(reporter, &r),
         Err(e) => tracing::warn!(error = %e, "initial sweep failed"),
@@ -272,6 +280,15 @@ async fn cmd_run(reporter: &Arc<dyn Reporter>, _daemon_child: bool) -> Result<()
             return Ok(());
         }
         tokio::time::sleep(poll_interval).await;
+        // Heartbeat before the sweep so a stalled sweep still looks alive
+        // to the Watcher row — `hs status` ages out the heartbeat after
+        // 2× poll_interval, catching genuinely hung daemons without false
+        // stopped-state on a slow sweep.
+        if let Err(e) =
+            hs_common::status::write_inbox_heartbeat(&*storage, sweep_interval_secs).await
+        {
+            tracing::warn!(error = %e, "heartbeat write failed; sweep will still run");
+        }
         match sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX).await {
             Ok(r) if r.relocated > 0 || !r.errors.is_empty() => log_report(reporter, &r),
             Ok(_) => tracing::debug!("sweep: nothing to do"),

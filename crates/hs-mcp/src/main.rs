@@ -1775,9 +1775,21 @@ impl HomeStillMcp {
         Parameters(p): Parameters<ScribeConvertParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        let pdf_key = hs_common::sharded_key(&p.stem, "pdf");
-        let html_key = hs_common::sharded_key(&p.stem, "html");
-        let epub_key = hs_common::sharded_key(&p.stem, "epub");
+        let pdf_key = format!(
+            "{}/{}",
+            self.papers_prefix.trim_end_matches('/'),
+            hs_common::sharded_key(&p.stem, "pdf"),
+        );
+        let html_key = format!(
+            "{}/{}",
+            self.papers_prefix.trim_end_matches('/'),
+            hs_common::sharded_key(&p.stem, "html"),
+        );
+        let epub_key = format!(
+            "{}/{}",
+            self.papers_prefix.trim_end_matches('/'),
+            hs_common::sharded_key(&p.stem, "epub"),
+        );
 
         let start = std::time::Instant::now();
         // Dispatch by source type — one path per file extension. No
@@ -2640,12 +2652,18 @@ impl HomeStillMcp {
             None => Vec::new(),
         };
 
+        // Inbox-sweeper heartbeat. Populated server-side so every client
+        // (mac_air, big, laptop) renders the same verdict. `None` = no
+        // heartbeat key in storage; `Some(.running=false)` = stale.
+        let inbox_heartbeat = hs_common::status::read_inbox_heartbeat(&*self.storage).await;
+
         StatusSnapshot {
             pipeline,
             scribe_instances,
             distill_instances,
             qdrant,
             history,
+            inbox_heartbeat,
             generated_at: Some(chrono::Utc::now().to_rfc3339()),
         }
     }

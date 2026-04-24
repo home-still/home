@@ -50,6 +50,8 @@ storage = [
     "dep:serde",
     "dep:serde_yaml_ng",
     "dep:futures",
+    "dep:chrono",
+    "dep:gethostname",
     "tokio/fs",
 ]
 storage-s3 = [

@@ -43,10 +43,10 @@ fn init_logging(
     let (service, force_info_stderr) = match &cli.command {
         TopCmd::Scribe {
             command: scribe_cmd::ScribeCmd::WatchEvents { .. },
-        } => ("hs-scribe-watch", false),
+        } => ("hs-scribe-watch", true),
         TopCmd::Distill {
             command: hs_distill::cli::DistillCmd::WatchEvents { .. },
-        } => ("hs-distill-watch", false),
+        } => ("hs-distill-watch", true),
         TopCmd::Scribe {
             command: scribe_cmd::ScribeCmd::Autotune,
         } => ("hs-scribe-autotune", true),
@@ -138,15 +138,7 @@ fn main() -> ExitCode {
         let work = async {
             match cli.command {
                 TopCmd::Paper { command } => {
-                    let is_download = matches!(&command, paper::cli::PaperCmd::Download { .. });
-                    let result =
-                        paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode)
-                            .await;
-                    // Auto-trigger: start scribe watcher after successful download
-                    if is_download && result.is_ok() {
-                        scribe_cmd::ensure_watcher_running(&reporter);
-                    }
-                    result
+                    paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode).await
                 }
                 TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
                 TopCmd::Serve { command } => serve_cmd::dispatch(command, &reporter).await,
@@ -155,7 +147,7 @@ fn main() -> ExitCode {
                 TopCmd::Distill { command } => {
                     distill_cmd::dispatch(command, &cli.global, &reporter).await
                 }
-                TopCmd::Status => status_cmd::run().await,
+                TopCmd::Status => status_cmd::run(&cli.global).await,
                 TopCmd::Restart => restart_cmd::run(&reporter).await,
                 TopCmd::Cloud { command } => cloud_cmd::dispatch(command, &reporter).await,
                 TopCmd::Mcp { command } => mcp_cmd::dispatch(command, &reporter).await,
@@ -164,6 +156,9 @@ fn main() -> ExitCode {
                 }
                 TopCmd::Migrate { command } => match command {
                     cli::MigrateAction::Sharding => migrate_cmd::run_sharding(&reporter).await,
+                    cli::MigrateAction::MoveRootOrphans { dry_run, limit } => {
+                        migrate_cmd::run_move_root_orphans(&reporter, dry_run, limit).await
+                    }
                 },
                 TopCmd::Pipeline { command } => pipeline_cmd::dispatch(command, &reporter).await,
             }

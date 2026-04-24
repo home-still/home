@@ -97,6 +97,18 @@ pub enum TopCmd {
 pub enum MigrateAction {
     /// Move flat files into 2-char prefix subdirectories (papers/, markdown/, catalog/)
     Sharding,
+    /// Relocate sharded files written to the bucket root back under
+    /// `papers/` (rc.297 pre-fix artifacts from `paper_download`). Invisible
+    /// to `hs status` until moved because `collect_pipeline_counts` only
+    /// walks the `papers/` prefix.
+    MoveRootOrphans {
+        /// Preview moves without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Cap on files to move in this run (for staged migration)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
