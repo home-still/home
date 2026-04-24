@@ -10,6 +10,25 @@ use hs_common::hardware_profile::HardwareProfile;
 use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
 
+/// Compute device for embedding inference. rc.306 P0-7: CUDA is the
+/// only accepted value — the distill binary ships with no CPU code path.
+/// Attempting to load a config with `compute_device: cpu` (or anything
+/// other than `cuda`) fails deserialization loudly.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputeDevice {
+    #[default]
+    Cuda,
+}
+
+impl std::fmt::Display for ComputeDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ComputeDevice::Cuda => write!(f, "Cuda"),
+        }
+    }
+}
+
 // ── Server Config ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,9 +99,8 @@ pub struct EmbeddingConfig {
     pub dimension: usize,
     pub batch_size: Option<usize>,
     /// Model pool size. Each model is ~600 MB resident; pool lets parallel
-    /// `embed_batch` callers avoid contending on one Mutex. `None` means
-    /// "pick per device": CUDA=1 (single GPU context is faster than N),
-    /// CPU= min(HardwareProfile::distill_concurrency, 4).
+    /// `embed_batch` callers avoid contending on one Mutex. Defaults to 1
+    /// (single GPU context is faster than N).
     pub pool_size: Option<usize>,
     /// Adaptive batch-size controller. When true (default), the embedder
     /// hill-climbs `batch_size` in-process against observed throughput
@@ -90,6 +108,10 @@ pub struct EmbeddingConfig {
     /// rather than a fixed value. Disable to pin batch_size exactly.
     pub adaptive_batch: bool,
     pub sparse_enabled: bool,
+    /// Compute device for the embedder. rc.306 P0-7: must be `cuda`.
+    /// Present in config for operator visibility and to ensure any
+    /// attempt to write a non-CUDA value fails loudly at deserialization.
+    pub compute_device: ComputeDevice,
 }
 
 impl Default for EmbeddingConfig {
@@ -101,6 +123,7 @@ impl Default for EmbeddingConfig {
             pool_size: None,
             adaptive_batch: true,
             sparse_enabled: true,
+            compute_device: ComputeDevice::Cuda,
         }
     }
 }
@@ -185,5 +208,47 @@ impl DistillClientConfig {
     /// Build the configured event bus.
     pub async fn build_event_bus(&self) -> anyhow::Result<Arc<dyn EventBus>> {
         self.events.build().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_device_default_is_cuda() {
+        let cfg = EmbeddingConfig::default();
+        assert!(matches!(cfg.compute_device, ComputeDevice::Cuda));
+    }
+
+    #[test]
+    fn yaml_with_cuda_loads() {
+        let yaml = "compute_device: cuda\n";
+        let cfg: EmbeddingConfig = serde_yaml_ng::from_str(yaml).expect("cuda should parse");
+        assert!(matches!(cfg.compute_device, ComputeDevice::Cuda));
+    }
+
+    #[test]
+    fn yaml_with_cpu_fails_loudly() {
+        // Distill ships with no CPU path; setting compute_device: cpu
+        // must fail deserialization, not silently fall through to Cuda.
+        let yaml = "compute_device: cpu\n";
+        let err = serde_yaml_ng::from_str::<EmbeddingConfig>(yaml)
+            .err()
+            .expect("compute_device: cpu must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("variant") || msg.contains("cpu"),
+            "error should name the bad variant: {msg}"
+        );
+    }
+
+    #[test]
+    fn yaml_with_unknown_device_fails() {
+        let yaml = "compute_device: rocm\n";
+        let err = serde_yaml_ng::from_str::<EmbeddingConfig>(yaml)
+            .err()
+            .expect("unknown compute_device must reject");
+        let _ = err.to_string();
     }
 }

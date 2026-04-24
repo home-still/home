@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use hs_common::hardware_profile::HardwareProfile;
 
 use super::{ComputeDevice, Embedder};
 use crate::adaptive_batch::{AdaptiveBatchController, AdaptiveConfig};
@@ -12,12 +11,8 @@ use crate::config::EmbeddingConfig;
 use crate::error::DistillError;
 use crate::types::EmbeddingOutput;
 
-/// ONNX-based embedder using fastembed-rs.
-///
-/// Owns a pool of `TextEmbedding` instances picked round-robin so
-/// concurrent `embed_batch` callers don't contend on one Mutex. CUDA
-/// hosts run one instance (single GPU context); CPU hosts run N where
-/// N = `min(HardwareProfile::distill_concurrency, 4)`.
+/// ONNX-based embedder using fastembed-rs. Always runs on CUDA — the
+/// distill binary ships with no CPU code path (rc.306 P0-7).
 pub struct OnnxEmbedder {
     models: Vec<Arc<Mutex<TextEmbedding>>>,
     next: AtomicUsize,
@@ -28,19 +23,11 @@ pub struct OnnxEmbedder {
 
 impl OnnxEmbedder {
     pub fn new(config: &EmbeddingConfig, device: ComputeDevice) -> Result<Self, DistillError> {
-        let initial_batch_size = config.batch_size.unwrap_or(match &device {
-            ComputeDevice::Cpu => 8,
-            ComputeDevice::Cuda => 32,
-        });
-
-        let pool_size = config.pool_size.unwrap_or_else(|| match &device {
-            ComputeDevice::Cuda => 1,
-            ComputeDevice::Cpu => {
-                let hw = HardwareProfile::detect();
-                hw.class.distill_concurrency(hw.cpu_count).min(4)
-            }
-        });
-        let pool_size = pool_size.max(1);
+        // Fixed CUDA tuning — the previous match on ComputeDevice::Cpu is
+        // gone (no CPU variant exists). Callers can still override via
+        // config.batch_size / config.pool_size.
+        let initial_batch_size = config.batch_size.unwrap_or(32);
+        let pool_size = config.pool_size.unwrap_or(1).max(1);
 
         let adaptive_cfg = if config.adaptive_batch {
             AdaptiveConfig::default_for_device(&device, initial_batch_size)
@@ -57,18 +44,16 @@ impl OnnxEmbedder {
             "initializing bge-m3 embedder pool"
         );
 
-        // Build the first model and, on CUDA, verify GPU residency before
-        // allocating the rest. Probe failure aborts — one path, no silent
-        // CPU substitute.
-        let mut first = build_text_embedding(&device)?;
-        if matches!(device, ComputeDevice::Cuda) {
-            verify_cuda_probe(&mut first)?;
-        }
+        // Build the first model and verify GPU residency before allocating
+        // the rest. Probe failure aborts — one path, no silent CPU
+        // substitute.
+        let mut first = build_text_embedding()?;
+        verify_cuda_probe(&mut first)?;
 
         let mut models: Vec<Arc<Mutex<TextEmbedding>>> = Vec::with_capacity(pool_size);
         models.push(Arc::new(Mutex::new(first)));
         for _ in 1..pool_size {
-            let model = build_text_embedding(&device)?;
+            let model = build_text_embedding()?;
             models.push(Arc::new(Mutex::new(model)));
         }
 
@@ -82,12 +67,11 @@ impl OnnxEmbedder {
     }
 }
 
-fn build_text_embedding(device: &ComputeDevice) -> Result<TextEmbedding, DistillError> {
-    let mut opts = InitOptions::new(EmbeddingModel::BGEM3).with_show_download_progress(true);
-    if matches!(device, ComputeDevice::Cuda) {
-        use ort::execution_providers::CUDAExecutionProvider;
-        opts = opts.with_execution_providers(vec![CUDAExecutionProvider::default().build()]);
-    }
+fn build_text_embedding() -> Result<TextEmbedding, DistillError> {
+    use ort::execution_providers::CUDAExecutionProvider;
+    let opts = InitOptions::new(EmbeddingModel::BGEM3)
+        .with_show_download_progress(true)
+        .with_execution_providers(vec![CUDAExecutionProvider::default().build()]);
     TextEmbedding::try_new(opts)
         .map_err(|e| DistillError::Embedding(format!("Failed to load model: {e}")))
 }
@@ -113,8 +97,8 @@ fn verify_cuda_probe(model: &mut TextEmbedding) -> Result<(), DistillError> {
     if gpu_mem_used < 200 {
         return Err(DistillError::Embedding(format!(
             "CUDA requested but model is not on GPU (only {gpu_mem_used} MB VRAM used). \
-             Check CUDA drivers, LD_LIBRARY_PATH, and libonnxruntime_providers_cuda.so. \
-             Set compute_device: cpu in config to run on CPU intentionally."
+             Fix CUDA: check driver, LD_LIBRARY_PATH, libonnxruntime_providers_cuda.so, \
+             and the pyke ort cache (~/.cache/ort.pyke.io/dfbin). Distill ships with no CPU path."
         )));
     }
     tracing::info!("CUDA verified: model loaded on GPU ({gpu_mem_used} MB VRAM)");

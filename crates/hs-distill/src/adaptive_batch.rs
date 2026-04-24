@@ -37,11 +37,10 @@ pub struct AdaptiveConfig {
 
 impl AdaptiveConfig {
     /// Device-default candidate set centered around a reasonable starting
-    /// batch size. CUDA spans 16..128; CPU spans 4..24.
+    /// batch size. CUDA is the only shipped device (rc.306 P0-7).
     pub fn default_for_device(device: &ComputeDevice, initial: usize) -> Self {
         let candidates: Vec<usize> = match device {
             ComputeDevice::Cuda => vec![16, 32, 48, 64, 96, 128],
-            ComputeDevice::Cpu => vec![4, 8, 12, 16, 24],
         };
         // Snap `initial` to the closest candidate at or above it.
         let initial_idx = candidates
