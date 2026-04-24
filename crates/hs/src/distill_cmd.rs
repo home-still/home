@@ -30,11 +30,13 @@ async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
     if let Some(s) = cli_server {
         return vec![s.to_string()];
     }
-    let config_servers = match DistillClientConfig::load() {
+    // Config is the sole source of truth — to route through a cloud
+    // gateway, set the gateway URL explicitly in config instead of
+    // relying on per-request registry discovery with a fallback.
+    match DistillClientConfig::load() {
         Ok(cfg) if !cfg.servers.is_empty() => cfg.servers,
         _ => vec![DEFAULT_SERVER.to_string()],
-    };
-    hs_common::service::registry::discover_or_fallback("distill", config_servers).await
+    }
 }
 
 fn hidden_dir() -> PathBuf {

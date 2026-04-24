@@ -37,14 +37,11 @@ let claims = token::validate_token(&secret, &token, false)?;
 `ServicePool<C>` — generic load-balanced server pool. Queries all servers for readiness, picks the least-loaded one, retries on failure.
 
 ### `service::registry`
-Client-side gateway registry queries. Requires `auth` + `service` features. Discovers running scribe/distill servers from the gateway service registry, with automatic fallback to config-defined server lists.
+Client-side gateway registry queries. Requires `auth` + `service` features. Discovers running scribe/distill servers from the gateway service registry. Discovery either returns a server list or an error — callers never fall back silently to a default or config-defined pool (ONE PATH).
 
 ```rust
-// Discover servers, fall back to config if gateway is unreachable
-let servers = discover_or_fallback(&gateway_url, "scribe", &config_servers).await;
-
-// Registry-only discovery (no fallback)
-let servers = discover_servers(&gateway_url, "scribe").await?;
+// Registry-only discovery — errors propagate.
+let servers = discover_servers(&auth, "scribe").await?;
 ```
 
 ### `catalog`

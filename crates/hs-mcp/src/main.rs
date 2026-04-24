@@ -304,17 +304,11 @@ impl HomeStillMcp {
             }
         };
 
-        // Discover servers from gateway registry, falling back to config
-        let scribe_servers = hs_common::service::registry::discover_or_fallback(
-            "scribe",
-            scribe_cfg.servers.clone(),
-        )
-        .await;
-        let distill_servers = hs_common::service::registry::discover_or_fallback(
-            "distill",
-            distill_cfg.servers.clone(),
-        )
-        .await;
+        // Config is the sole source of server URLs. To route through the
+        // gateway, set the gateway URL explicitly in config (e.g.
+        // `servers: [https://gateway.example/gateway/scribe]`).
+        let scribe_servers = scribe_cfg.servers.clone();
+        let distill_servers = distill_cfg.servers.clone();
 
         Self {
             storage,

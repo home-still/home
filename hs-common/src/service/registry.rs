@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::client::AuthenticatedClient;
 
-/// Maximum time to wait for gateway registry discovery before falling back.
+/// Maximum time to wait for gateway registry discovery. Discovery
+/// failures (incl. timeouts) propagate as errors — there is no fallback
+/// to a default or config-defined server pool (ONE PATH).
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Deserialize)]
@@ -85,24 +87,31 @@ pub async fn discover_instances(service_type: &str) -> Vec<ServiceInfo> {
     }
 }
 
-/// Try to discover servers from the gateway registry, falling back to the given defaults.
-/// Times out after 3 seconds to avoid blocking CLI commands when the gateway is down.
-pub async fn discover_or_fallback(
-    service_type: &str,
-    fallback_servers: Vec<String>,
-) -> Vec<String> {
-    match AuthenticatedClient::from_default_path() {
-        Ok(auth) => {
-            let result: Result<Vec<String>, _> =
-                tokio::time::timeout(DISCOVERY_TIMEOUT, discover_servers(&auth, service_type))
-                    .await
-                    .unwrap_or(Err(anyhow::anyhow!("timeout")));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::client::CloudCredentials;
 
-            match result {
-                Ok(urls) if !urls.is_empty() => urls,
-                _ => fallback_servers,
-            }
-        }
-        Err(_) => fallback_servers,
+    #[tokio::test]
+    async fn discover_servers_propagates_gateway_unreachable_error() {
+        // Point at a port nothing is listening on. `discover_servers` must
+        // return `Err` — never silently swallow into an empty Vec or a
+        // hardcoded default. This is the regression guard for the deleted
+        // `discover_or_fallback` helper.
+        let creds = CloudCredentials {
+            gateway_url: "http://127.0.0.1:1".to_string(),
+            device_name: "test-device".to_string(),
+            // Well-formed enough to build a client; the refresh will fail
+            // against port 1, which is what the test is checking.
+            refresh_token: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0In0.sig".to_string(),
+            cf_access_client_id: None,
+            cf_access_client_secret: None,
+        };
+        let auth = AuthenticatedClient::new(creds).expect("build client");
+        let result = discover_servers(&auth, "scribe").await;
+        assert!(
+            result.is_err(),
+            "gateway at port 1 should fail, got {result:?}"
+        );
     }
 }
