@@ -88,4 +88,14 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Delete every Qdrant chunk for a doc_id. CLI-only (no MCP) because
+    /// this is a destructive write — use to clear orphaned vectors after
+    /// markdown has been removed, or to force a clean re-index.
+    Purge {
+        /// doc_id whose chunks should be deleted from Qdrant
+        doc_id: String,
+        /// Override server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
 }

@@ -161,7 +161,22 @@ pub async fn dispatch(
             reembed,
             server,
         } => cmd_reconcile(fix_stamps, reembed, server.as_deref(), reporter).await,
+        DistillCmd::Purge { doc_id, server } => {
+            cmd_purge(&doc_id, server.as_deref(), reporter).await
+        }
     }
+}
+
+async fn cmd_purge(doc_id: &str, server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let servers = resolve_servers(server).await;
+    let client = DistillClient::new(&servers[0])?;
+    reporter.status("Purging", doc_id);
+    let deleted = client
+        .delete_doc(doc_id)
+        .await
+        .with_context(|| format!("delete_doc({doc_id})"))?;
+    reporter.finish(&format!("Deleted {deleted} chunk(s) for {doc_id}"));
+    Ok(())
 }
 
 pub(crate) async fn cmd_watch_events(

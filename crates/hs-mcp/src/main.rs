@@ -139,12 +139,6 @@ struct DistillIndexParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DistillPurgeParams {
-    #[schemars(description = "doc_id whose chunks should be deleted from Qdrant")]
-    doc_id: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DistillReconcileParams {
     #[schemars(description = "If true, report orphans without deleting. Default: true.")]
     #[serde(default = "default_true")]
@@ -188,10 +182,13 @@ struct CatalogRepairParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DedupeUrlEncodedParams {
+    // rc.306 P0-6: field accepted for schema compatibility but ignored
+    // server-side; MCP always runs in dry-run. The apply path is CLI-only.
     #[schemars(
-        description = "If true, report what would be deleted without writing. Default: true."
+        description = "Ignored by MCP (always dry-run). Use `hs catalog dedupe-url-encoded --apply` for the write path."
     )]
     #[serde(default = "default_true")]
+    #[allow(dead_code)]
     dry_run: bool,
 }
 
@@ -770,25 +767,30 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Reconcile catalog ↔ storage in seven directions. Forward: document files (PDFs/HTML) on disk with no catalog row → synthesize minimal catalog entries (carry a `repair` block). Reverse (catalog_no_markdown): catalog rows that claim a successful conversion but whose markdown object is missing → clear the stale `conversion` / `embedding` / `embedding_skip` blocks and purge any stranded Qdrant points so the row re-enters the convert queue (original `downloaded_at` / `sha256` / etc preserved). Phantom (catalog_no_source): catalog rows with neither a paper file nor a markdown in storage → delete the row outright (the YAML is the last trace; with no source to re-derive from, it's unreachable). Flag-drift: rows whose stage flags disagree with storage evidence → backfill the missing stamp from the storage object's `last_modified` (fallback `now()` only when storage can't report one). Flag-drift-resync: rows still carrying a prior flag_drift batch `now()` (fingerprint: `downloaded_at == repair.repaired_at`, or synthetic Convert whose `converted_at == repair.repaired_at`) → rewrite to the storage object's `last_modified` so the activity feed regains chronology. Md-path-drift: rows whose `markdown_path` points to a stale key (pre-`bc2b6fb` unsharded layout) or is absent while the file exists under a different key → rewrite `markdown_path` to the real storage location (non-destructive). Stuck-convert: rows with a paper file but no conversion stamp → purge any ghost Qdrant points and re-publish `papers.ingested` so the event-watch daemon converts + embeds. Use `dry_run=true` first to see counts in all seven directions.",
+        description = "Reports catalog ↔ storage reconciliation in seven directions (forward disk orphans, catalog_no_markdown, catalog_no_source phantoms, flag-drift, flag-drift-resync, md-path-drift, stuck-convert). DRY-RUN ONLY from MCP: the apply path was removed in rc.306 — use `hs distill reconcile --fix-stamps --reembed` or the planned `hs catalog repair --apply` CLI for the write path. Any `dry_run=false` argument is ignored with a notice in the response.",
         annotations(
-            read_only_hint = false,
-            destructive_hint = true,
+            read_only_hint = true,
+            destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
         )
     )]
     async fn catalog_repair(
         &self,
-        Parameters(p): Parameters<CatalogRepairParams>,
+        Parameters(mut p): Parameters<CatalogRepairParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        // One shared pass over all three prefixes — 3 concurrent LISTs and
-        // bounded-concurrency parallel GETs of every catalog YAML. Replaces
-        // the pre-fix "7 serial scans × (1 LIST + N serial GETs)" shape
-        // whose cost at 3k+ rows exceeded the MCP 4-minute client budget
-        // even under dry_run. Every scan below reads the same snapshot, so
-        // dry-run and live-repair walk identical scan code.
+        // rc.306 P0-6: MCP is a read-only surface. Any client-supplied
+        // `dry_run=false` is ignored; the apply path lives in the CLI.
+        let client_wanted_apply = !p.dry_run;
+        p.dry_run = true;
+        let _ = client_wanted_apply; // surfaced in the response via hint
+                                     // One shared pass over all three prefixes — 3 concurrent LISTs and
+                                     // bounded-concurrency parallel GETs of every catalog YAML. Replaces
+                                     // the pre-fix "7 serial scans × (1 LIST + N serial GETs)" shape
+                                     // whose cost at 3k+ rows exceeded the MCP 4-minute client budget
+                                     // even under dry_run. Every scan below reads the same snapshot, so
+                                     // dry-run and live-repair walk identical scan code.
         let progress_token = context.meta.get_progress_token();
         let peer = context.peer.clone();
 
@@ -1388,18 +1390,23 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Find and remove URL-encoded duplicate stems. When a PDF is ingested twice — once with the original filename containing unicode or unsafe chars, once with the URL-encoded form (e.g., `Anna%E2%80%99s Archive` + `Anna's Archive`) — both markdown objects get written and the decoded-form is usually the one that embeds. The encoded-form is a ghost: it may have a catalog row with only `embedding_skip`, a markdown in storage, and no Qdrant points. This tool finds pairs where both an encoded stem and its decoded twin exist as markdown, confirms the decoded twin is the one that was indexed, and deletes the encoded-form catalog row, markdown object, and any stray Qdrant points. Default is dry-run.",
+        description = "Reports URL-encoded duplicate stems (encoded-form + decoded-form pairs where the decoded twin is the one actually indexed). DRY-RUN ONLY from MCP: the apply path was removed in rc.306 — use the planned `hs catalog dedupe-url-encoded --apply` CLI for the write path. Any `dry_run=false` argument is ignored with a notice in the response.",
         annotations(
-            read_only_hint = false,
-            destructive_hint = true,
+            read_only_hint = true,
+            destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
         )
     )]
     async fn dedupe_url_encoded(
         &self,
-        Parameters(p): Parameters<DedupeUrlEncodedParams>,
+        Parameters(_p): Parameters<DedupeUrlEncodedParams>,
     ) -> Result<String, String> {
+        // rc.306 P0-6: MCP is a read-only surface. The caller's dry_run
+        // argument is intentionally ignored — this handler always reports
+        // without writing; the apply path lives in the (CLI-only) future
+        // `hs catalog dedupe-url-encoded --apply`.
+        let dry_run_forced = true;
         // Enumerate all markdown stems.
         let markdown = self
             .storage
@@ -1444,75 +1451,15 @@ impl HomeStillMcp {
             .map(|(e, d)| serde_json::json!({"encoded": e, "decoded": d}))
             .collect();
 
-        if p.dry_run {
-            return Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "dry_run": true,
-                "pairs_found": total,
-                "would_delete_encoded_rows": total,
-                "samples": samples,
-            }))
-            .unwrap_or_default());
-        }
-
-        let mut md_deleted = 0u64;
-        let mut md_missing = 0u64;
-        let mut cat_deleted = 0u64;
-        let mut errors: Vec<String> = Vec::new();
-
-        for (encoded, _decoded) in &pairs {
-            // 1. Delete the markdown storage object. Object-store's S3 bulk
-            // DeleteObjects path re-URL-encodes keys that already contain
-            // percent-sequences, producing a 404 — tolerate that, since the
-            // objective is to break the Embed/EmbedSkip loop, which the
-            // catalog-row delete alone accomplishes.
-            let md_key = format!(
-                "{}/{}",
-                self.markdown_prefix.trim_end_matches('/'),
-                hs_common::sharded_key(encoded, "md")
-            );
-            match self.storage.delete(&md_key).await {
-                Ok(()) => md_deleted += 1,
-                Err(e) => {
-                    let msg = format!("{e}");
-                    if msg.contains("NoSuchKey") || msg.contains("404") {
-                        md_missing += 1;
-                    } else {
-                        errors.push(format!("md/{encoded}: {msg}"));
-                    }
-                }
-            }
-
-            // 2. Delete the catalog YAML row. This is the load-bearing
-            // operation — with no row, the reconciler won't try to re-embed
-            // the encoded stem, and the Embed/EmbedSkip loop breaks.
-            match hs_common::catalog::delete_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                encoded,
-            )
-            .await
-            {
-                Ok(()) => cat_deleted += 1,
-                Err(e) => errors.push(format!("cat/{encoded}: {e}")),
-            }
-
-            // Deliberately NOT calling distill.delete_doc here: the reqwest
-            // client URL-encodes the path segment, axum URL-decodes it twice
-            // in the server router, and the encoded stem's doc_id round-
-            // trips to the decoded twin's doc_id — deleting the wrong (good)
-            // embeddings. Since the reconciler has already confirmed the
-            // encoded form is embed_missing, there's nothing to clean up in
-            // Qdrant anyway.
-        }
-
+        // rc.306 P0-6: apply path is CLI-only. MCP emits the report and stops.
+        let _ = dry_run_forced;
         Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "dry_run": false,
+            "dry_run": true,
+            "mcp_forced_dry_run": true,
+            "apply_hint": "use `hs catalog dedupe-url-encoded --apply` (CLI-only) for the write path",
             "pairs_found": total,
-            "markdown_deleted": md_deleted,
-            "markdown_already_missing": md_missing,
-            "catalog_rows_deleted": cat_deleted,
+            "would_delete_encoded_rows": total,
             "samples": samples,
-            "errors": errors,
         }))
         .unwrap_or_default())
     }
@@ -2094,38 +2041,15 @@ impl HomeStillMcp {
         }
     }
 
-    #[tool(
-        description = "Delete every Qdrant chunk for a given doc_id. Use to clear orphaned vectors after markdown has been removed, or to force a clean re-index.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn distill_purge(
-        &self,
-        Parameters(p): Parameters<DistillPurgeParams>,
-    ) -> Result<String, String> {
-        let client = self
-            .distill_client()
-            .map_err(|e| e.to_string())?
-            .ok_or("No distill server configured")?;
-        match client.delete_doc(&p.doc_id).await {
-            Ok(deleted) => Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "doc_id": p.doc_id,
-                "deleted": deleted,
-            }))
-            .unwrap_or_default()),
-            Err(e) => Err(format!("Purge failed: {e}")),
-        }
-    }
+    // distill_purge: removed in rc.306. Bulk-delete is CLI-only via
+    // `hs distill purge <doc_id>`. Agents can no longer reach the
+    // write path through MCP.
 
     #[tool(
-        description = "Reconcile Qdrant against markdown storage: find doc_ids whose markdown object is missing and optionally delete them. Defaults to dry_run=true — pass dry_run=false to actually delete.",
+        description = "Reports Qdrant doc_ids whose markdown object is missing. DRY-RUN ONLY from MCP: the delete path was removed in rc.306 — use `hs distill reconcile --reembed` or `hs distill purge <doc_id>` for the write path. Any `dry_run=false` argument is ignored with a notice in the response.",
         annotations(
-            read_only_hint = false,
-            destructive_hint = true,
+            read_only_hint = true,
+            destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
         )
@@ -2134,6 +2058,10 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<DistillReconcileParams>,
     ) -> Result<String, String> {
+        // rc.306 P0-6: MCP is read-only. The caller's dry_run argument
+        // is ignored; the delete path lives in `hs distill reconcile`
+        // (existing CLI) and `hs distill purge <doc_id>`.
+        let _ = p.dry_run;
         let client = self
             .distill_client()
             .map_err(|e| e.to_string())?
@@ -2146,9 +2074,6 @@ impl HomeStillMcp {
 
         let mut orphans: Vec<String> = Vec::new();
         for doc_id in &doc_ids {
-            // Consult the catalog for an authoritative markdown_path first.
-            // Pre-rc.241 rows can have an unsharded path; without this lookup
-            // we'd flag them as ghost orphans even though the object exists.
             let catalog_entry = hs_common::catalog::read_catalog_entry_via(
                 &*self.storage,
                 &self.catalog_prefix,
@@ -2169,22 +2094,14 @@ impl HomeStillMcp {
             }
         }
 
-        let mut deleted_total: u64 = 0;
-        if !p.dry_run {
-            for doc_id in &orphans {
-                match client.delete_doc(doc_id).await {
-                    Ok(n) => deleted_total += n,
-                    Err(e) => tracing::warn!("purge {doc_id} failed: {e}"),
-                }
-            }
-        }
-
         Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "dry_run": p.dry_run,
+            "dry_run": true,
+            "mcp_forced_dry_run": true,
+            "apply_hint": "use `hs distill reconcile --reembed` or `hs distill purge <doc_id>` (CLI-only) for the delete path",
             "scanned_doc_ids": doc_ids.len(),
             "orphan_count": orphans.len(),
             "orphans": orphans,
-            "points_deleted": deleted_total,
+            "points_deleted": 0,
         }))
         .unwrap_or_default())
     }
