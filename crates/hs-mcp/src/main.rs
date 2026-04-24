@@ -267,31 +267,29 @@ struct HomeStillMcp {
 }
 
 impl HomeStillMcp {
-    async fn new() -> Self {
+    async fn new() -> anyhow::Result<Self> {
         let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
         let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
 
-        // TODO: We don't want fallbacks, this leads to magical behavior.
-        // Storage backend: honor the `storage:` section in ~/.home-still/config.yaml
-        // (`backend: local` or `backend: s3`). If no storage section is present,
-        // fall back to LocalFsStorage rooted at the configured project_dir — that
-        // matches the legacy behavior of reading {project_dir}/{catalog,markdown,papers}.
-        let storage: Arc<dyn Storage> = match hs_common::logging::load_config_sections().0 {
-            Some(cfg) => cfg.build().unwrap_or_else(|e| {
-                tracing::warn!(
-                    "storage config invalid ({e}); falling back to LocalFsStorage at project_dir"
-                );
-                Arc::new(hs_common::storage::LocalFsStorage::new(
-                    hs_common::resolve_project_dir(),
-                ))
-            }),
-            None => Arc::new(hs_common::storage::LocalFsStorage::new(
-                hs_common::resolve_project_dir(),
-            )),
-        };
-        if let Err(e) = storage.ensure_ready().await {
-            tracing::warn!("storage ensure_ready failed: {e:#}");
-        }
+        // Storage backend: honor the `storage:` section in
+        // ~/.home-still/config.yaml. Missing or malformed config is fatal —
+        // we do not fall back to LocalFsStorage at project_dir because that
+        // masks typos and serves unrelated data silently (ONE PATH).
+        let storage_cfg = hs_common::logging::load_config_sections()
+            .0
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "hs-mcp requires a `storage:` section in ~/.home-still/config.yaml \
+                     (backend: local|s3)"
+                )
+            })?;
+        let storage: Arc<dyn Storage> = storage_cfg
+            .build()
+            .map_err(|e| anyhow::anyhow!("storage config invalid: {e:#}"))?;
+        storage
+            .ensure_ready()
+            .await
+            .map_err(|e| anyhow::anyhow!("storage ensure_ready failed: {e:#}"))?;
 
         // Event bus: reuse the events section already parsed into ScribeConfig.
         // Any failure (missing config, broker down, feature not compiled)
@@ -310,7 +308,7 @@ impl HomeStillMcp {
         let scribe_servers = scribe_cfg.servers.clone();
         let distill_servers = distill_cfg.servers.clone();
 
-        Self {
+        Ok(Self {
             storage,
             events,
             catalog_prefix: "catalog".to_string(),
@@ -324,7 +322,7 @@ impl HomeStillMcp {
             distill_servers,
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
-        }
+        })
     }
 
     fn scribe_client(&self) -> anyhow::Result<Option<hs_scribe::client::ScribeClient>> {
@@ -3023,7 +3021,7 @@ async fn main() -> anyhow::Result<()> {
     // bucket like every other service.
     let logging_handle = install_logging(args.serve.is_some()).await;
 
-    let server = HomeStillMcp::new().await;
+    let server = HomeStillMcp::new().await?;
 
     let result: anyhow::Result<()> = if let Some(addr) = args.serve {
         tracing::info!("Starting MCP SSE server on {addr}");
@@ -3164,5 +3162,39 @@ mod provider_arg_tests {
             "error should name the bad value: {err}"
         );
         assert!(err.contains("pmc"), "error should hint at pmc alias: {err}");
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::HomeStillMcp;
+
+    /// Regression for P0-4: when `~/.home-still/config.yaml` has no
+    /// `storage:` section, the MCP server must refuse to start instead
+    /// of silently falling back to LocalFsStorage rooted at project_dir.
+    #[tokio::test]
+    async fn refuses_to_start_without_storage_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: #[tokio::test] default runtime is single-threaded; this
+        // block brackets the HOME mutation to a single await region.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let result = HomeStillMcp::new().await;
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let err = result
+            .err()
+            .expect("new() must fail without storage config");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("storage"),
+            "error should mention storage; got: {msg}"
+        );
     }
 }
