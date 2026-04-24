@@ -135,9 +135,17 @@ impl<C: ServiceClient> ServicePool<C> {
             .enumerate()
             .map(|(i, (_, r))| {
                 let r = r.as_ref().ok()?;
-                if !r.is_ready() {
-                    return None;
-                }
+                // Deliberately NOT gating on `r.is_ready()`. Scribe servers
+                // report `ready: false` when Ollama has unloaded the model
+                // (keep_alive expiry), which creates a self-reinforcing
+                // starvation loop: the pool never dispatches → Ollama
+                // never warms → ready never flips true. Use our own
+                // reservation accounting + the server's slot count as the
+                // sole eligibility signal; if the picked server turns
+                // out to be cold, it pays the reload tax on the actual
+                // request and unsticks itself for future picks. With
+                // OLLAMA_KEEP_ALIVE set high this path is only hit once
+                // per boot.
                 let reserved = self.reservations[i].load(Ordering::Relaxed);
                 let avail = r.available_slots().saturating_sub(reserved);
                 if avail == 0 {
@@ -187,5 +195,110 @@ impl<C: ServiceClient> ServicePool<C> {
     /// Get a reference to all clients.
     pub fn clients(&self) -> &[C] {
         &self.clients
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::protocol::{ReadinessInfo, ServiceClient};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    #[derive(serde::Deserialize, Clone)]
+    struct Health {
+        _ok: Option<bool>,
+    }
+
+    #[derive(serde::Deserialize, Clone)]
+    struct Readiness {
+        ready: bool,
+        avail: usize,
+    }
+
+    impl ReadinessInfo for Readiness {
+        fn is_ready(&self) -> bool {
+            self.ready
+        }
+        fn available_slots(&self) -> usize {
+            self.avail
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockClient {
+        url: String,
+        ready: Arc<AtomicBool>,
+        avail: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ServiceClient for MockClient {
+        type Health = Health;
+        type Readiness = Readiness;
+
+        fn url(&self) -> &str {
+            &self.url
+        }
+        async fn health(&self) -> Result<Health> {
+            Ok(Health { _ok: Some(true) })
+        }
+        async fn readiness(&self) -> Result<Readiness> {
+            Ok(Readiness {
+                ready: self.ready.load(AtomicOrdering::Relaxed),
+                avail: self.avail.load(AtomicOrdering::Relaxed),
+            })
+        }
+    }
+
+    fn mk(url: &str, ready: bool, avail: usize) -> MockClient {
+        MockClient {
+            url: url.into(),
+            ready: Arc::new(AtomicBool::new(ready)),
+            avail: Arc::new(AtomicUsize::new(avail)),
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_server_includes_cold_server_reporting_not_ready() {
+        // rc.304 invariant: a server reporting `ready: false` but with
+        // free slots must still be dispatch-eligible. Ollama's keep_alive
+        // unload flips `ready` to false even though the VLM slots are
+        // free — the pre-rc.304 pool starved such a server forever.
+        let cold_only = ServicePool::new(vec![mk("http://cold:7433", false, 4)]);
+        let (client, _guard) = cold_only
+            .pick_server()
+            .await
+            .expect("cold server must be dispatch-eligible");
+        assert_eq!(client.url(), "http://cold:7433");
+    }
+
+    #[tokio::test]
+    async fn pick_server_excludes_zero_slot_servers() {
+        // A server with no free slots (reservation + in-flight = capacity)
+        // is still correctly excluded. Reliability: we never send a
+        // request to a scribe that definitely can't take it.
+        let all_full = ServicePool::new(vec![
+            mk("http://a:7433", true, 0),
+            mk("http://b:7433", false, 0),
+        ]);
+        // Use try_pick_once directly so the test doesn't wait
+        // PICK_READY_TIMEOUT seconds for availability.
+        let res = all_full.try_pick_once().await.unwrap();
+        assert!(res.is_none(), "all-full pool must return None, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn pick_server_uses_cold_when_warm_is_saturated() {
+        // Two servers: a "warm" one at its ceiling (ready:true but zero
+        // slots), a "cold" one with spare slots (ready:false). Before
+        // rc.304, the pool would loop forever polling the warm server;
+        // after rc.304, the cold server is picked immediately.
+        let pool = ServicePool::new(vec![
+            mk("http://warm:7433", true, 0),
+            mk("http://cold:7433", false, 3),
+        ]);
+        let (client, _guard) = pool.pick_server().await.unwrap();
+        assert_eq!(client.url(), "http://cold:7433");
     }
 }

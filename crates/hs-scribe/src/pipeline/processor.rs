@@ -319,8 +319,35 @@ impl Processor {
             .collect()
             .await;
 
-        let mut regions: Vec<(BBox, String)> =
-            region_results.into_iter().collect::<Result<Vec<_>>>()?;
+        // Per-region failures (bad JPEG encode, VLM error on one region)
+        // degrade the page to partial markdown instead of killing the
+        // whole paper. Mirrors the table-cell handling in
+        // `recognize_table_html` where individual cell encode failures
+        // return an empty string. If every region fails we fall through
+        // with an empty `regions` vec; the outer caller will surface
+        // "no regions produced output" as a page-level failure.
+        let total_regions = region_results.len();
+        let mut regions: Vec<(BBox, String)> = Vec::with_capacity(total_regions);
+        let mut failed_regions: usize = 0;
+        for r in region_results {
+            match r {
+                Ok(pair) => regions.push(pair),
+                Err(e) => {
+                    failed_regions += 1;
+                    tracing::warn!(
+                        error = %e,
+                        "region failed; dropping from page output (paper continues)"
+                    );
+                }
+            }
+        }
+        if failed_regions > 0 {
+            tracing::warn!(
+                failed_regions,
+                total_regions,
+                "page produced partial markdown due to per-region failures"
+            );
+        }
 
         // Process table regions: SLANet-Plus structure → per-cell VLM OCR → HTML
         for bbox in table_bboxes {
