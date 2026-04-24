@@ -635,6 +635,133 @@ async fn inspect_and_quarantine(
     Ok(QuarantineOutcome::Quarantined)
 }
 
+/// Storage prefix the migration walks when purging legacy `local-html`
+/// converter rows. Kept as a constant so the integration test and the
+/// production path read the same value.
+const LEGACY_LOCAL_HTML_SERVER: &str = "local-html";
+
+/// Summary returned by [`purge_local_html_rows`].
+#[derive(Debug, Default)]
+struct LocalHtmlPurgeStats {
+    total_rows: u64,
+    deleted_catalog: u64,
+    deleted_markdown: u64,
+    deleted_paper: u64,
+    errors: Vec<String>,
+}
+
+/// Core logic of the `drop-local-html` migration, factored so tests can
+/// drive it against an in-memory `LocalFsStorage`.
+async fn purge_local_html_rows(
+    storage: &dyn hs_common::storage::Storage,
+    dry_run: bool,
+) -> Result<LocalHtmlPurgeStats> {
+    let mut entries = hs_common::catalog::list_catalog_entries_via(storage, "catalog").await?;
+    entries.retain(|(_, _, e)| {
+        e.conversion
+            .as_ref()
+            .is_some_and(|c| c.server == LEGACY_LOCAL_HTML_SERVER)
+    });
+
+    let mut stats = LocalHtmlPurgeStats {
+        total_rows: entries.len() as u64,
+        ..Default::default()
+    };
+
+    if dry_run {
+        return Ok(stats);
+    }
+
+    for (stem, _meta, _entry) in entries {
+        match hs_common::catalog::delete_catalog_entry_via(storage, "catalog", &stem).await {
+            Ok(()) => stats.deleted_catalog += 1,
+            Err(e) => {
+                stats.errors.push(format!("catalog/{stem}: {e}"));
+                continue;
+            }
+        }
+
+        let md_key = format!("markdown/{}", hs_common::sharded_key(&stem, "md"));
+        if storage.exists(&md_key).await.unwrap_or(false) {
+            match storage.delete(&md_key).await {
+                Ok(()) => stats.deleted_markdown += 1,
+                Err(e) => stats.errors.push(format!("markdown/{stem}: {e}")),
+            }
+        }
+
+        for ext in ["html", "htm"] {
+            let key = format!("papers/{}", hs_common::sharded_key(&stem, ext));
+            if !storage.exists(&key).await.unwrap_or(false) {
+                continue;
+            }
+            match storage.delete(&key).await {
+                Ok(()) => stats.deleted_paper += 1,
+                Err(e) => stats.errors.push(format!("papers/{stem}.{ext}: {e}")),
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// One-shot migration that deletes every catalog row stamped with
+/// `conversion.server == "local-html"` — the legacy dual-converter output
+/// removed in rc.306. The markdown and any source `.html`/`.htm` keys are
+/// deleted alongside each row so downstream pipeline stages treat the stem
+/// as absent rather than "converted but missing markdown" (which would
+/// trip `catalog_repair` into a stuck-convert loop).
+pub async fn run_drop_local_html(reporter: &Arc<dyn Reporter>, dry_run: bool) -> Result<()> {
+    use hs_common::storage::Storage;
+
+    let paper_cfg = paper::config::Config::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage: Arc<dyn Storage> = paper_cfg
+        .build_storage()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    reporter.status("Scan", "listing catalog/ for local-html rows...");
+    let stats = purge_local_html_rows(&*storage, dry_run).await?;
+
+    if stats.total_rows == 0 {
+        reporter.finish("No local-html catalog rows found");
+        return Ok(());
+    }
+    reporter.status(
+        "Plan",
+        &format!(
+            "{} local-html row(s) to purge ({})",
+            stats.total_rows,
+            if dry_run { "dry-run" } else { "live" }
+        ),
+    );
+
+    for e in &stats.errors {
+        reporter.warn(e);
+    }
+
+    if dry_run {
+        reporter.finish(&format!(
+            "Dry-run: {} local-html row(s) would be deleted",
+            stats.total_rows
+        ));
+    } else {
+        reporter.finish(&format!(
+            "Purged {} catalog, {} markdown, {} paper key(s); {} error(s)",
+            stats.deleted_catalog,
+            stats.deleted_markdown,
+            stats.deleted_paper,
+            stats.errors.len()
+        ));
+    }
+
+    if !stats.errors.is_empty() {
+        anyhow::bail!(
+            "drop-local-html finished with {} error(s)",
+            stats.errors.len()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod root_orphan_tests {
     use super::*;
@@ -868,5 +995,111 @@ mod quarantine_tests {
         // Dry-run: file still where it was.
         assert!(storage.exists("papers/ab/fake.pdf").await.unwrap());
         assert!(!storage.exists("papers/ab/fake.html").await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod drop_local_html_tests {
+    use super::*;
+    use hs_common::catalog::{CatalogEntry, ConversionMeta};
+    use hs_common::storage::{LocalFsStorage, Storage};
+
+    async fn seed_row(storage: &LocalFsStorage, stem: &str, server: &str) {
+        let entry = CatalogEntry {
+            conversion: Some(ConversionMeta {
+                server: server.to_string(),
+                duration_secs: 0.1,
+                total_pages: 1,
+                converted_at: "2026-04-24T00:00:00Z".to_string(),
+                pages: vec![],
+            }),
+            ..Default::default()
+        };
+        hs_common::catalog::write_catalog_entry_via(storage, "catalog", stem, &entry)
+            .await
+            .unwrap();
+        // Companion markdown + source html so we can verify the purge
+        // deletes them too.
+        storage
+            .put(
+                &format!("markdown/{}", hs_common::sharded_key(stem, "md")),
+                b"# stub".to_vec(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                &format!("papers/{}", hs_common::sharded_key(stem, "html")),
+                b"<html/>".to_vec(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn purges_only_local_html_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        seed_row(&storage, "legacy_stem", "local-html").await;
+        seed_row(&storage, "scribe_stem", "scribe-vlm").await;
+
+        let stats = purge_local_html_rows(&storage, false).await.unwrap();
+        assert_eq!(stats.total_rows, 1, "only the local-html row should match");
+        assert_eq!(stats.deleted_catalog, 1);
+        assert_eq!(stats.deleted_markdown, 1);
+        assert_eq!(stats.deleted_paper, 1);
+        assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
+
+        // Legacy row and companions are gone.
+        let legacy_cat =
+            hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "legacy_stem").await;
+        assert!(
+            legacy_cat.is_none(),
+            "local-html catalog row should be gone"
+        );
+        assert!(!storage
+            .exists(&format!(
+                "markdown/{}",
+                hs_common::sharded_key("legacy_stem", "md")
+            ))
+            .await
+            .unwrap());
+        assert!(!storage
+            .exists(&format!(
+                "papers/{}",
+                hs_common::sharded_key("legacy_stem", "html")
+            ))
+            .await
+            .unwrap());
+
+        // Unrelated scribe-vlm row survives untouched.
+        let survivor =
+            hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "scribe_stem")
+                .await
+                .expect("scribe-vlm row must remain");
+        assert_eq!(
+            survivor.conversion.as_ref().unwrap().server,
+            "scribe-vlm",
+            "non-local-html rows must not be touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        seed_row(&storage, "legacy_stem", "local-html").await;
+
+        let stats = purge_local_html_rows(&storage, true).await.unwrap();
+        assert_eq!(stats.total_rows, 1);
+        assert_eq!(stats.deleted_catalog, 0);
+        assert_eq!(stats.deleted_markdown, 0);
+        assert_eq!(stats.deleted_paper, 0);
+
+        // Row still there.
+        let still_there =
+            hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "legacy_stem").await;
+        assert!(still_there.is_some(), "dry-run must not delete");
     }
 }

@@ -73,13 +73,6 @@ pub enum ScribeCmd {
     /// Backfill catalog entries for markdown files that were converted
     /// before the catalog feature.
     CatalogBackfill,
-    /// Remove junk HTML papers (paywall pages, landing pages) from the
-    /// collection.
-    CleanJunk {
-        /// Dry run: show what would be removed without deleting.
-        #[arg(long)]
-        dry_run: bool,
-    },
     /// Auto-tune `OLLAMA_NUM_PARALLEL` against the local scribe-server's
     /// observed throughput. Install as a root systemd service via
     /// `sudo hs serve scribe-autotune --install`.
@@ -124,7 +117,6 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
             crate::scribe_inbox::dispatch(action.unwrap_or(InboxAction::Run), reporter).await
         }
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
-        ScribeCmd::CleanJunk { dry_run } => cmd_clean_junk(dry_run, reporter).await,
         ScribeCmd::Autotune => cmd_autotune(reporter).await,
     }
 }
@@ -747,90 +739,3 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
 }
 
 // ── Clean junk HTML papers ────────────────────────────────────
-
-async fn cmd_clean_junk(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
-    let catalog_dir = &scribe_cfg.catalog_dir;
-    let output_dir = &scribe_cfg.output_dir;
-    let watch_dir = &scribe_cfg.watch_dir;
-
-    reporter.status(
-        "Scan",
-        "looking for junk HTML papers (1-page, low quality)...",
-    );
-
-    let catalog_files = hs_common::collect_files_recursive(catalog_dir, "yaml");
-    let mut junk_count = 0u64;
-    let mut kept_count = 0u64;
-
-    for catalog_path in &catalog_files {
-        let stem = match catalog_path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-
-        let entry = match crate::catalog::read_catalog_entry(catalog_dir, &stem) {
-            Some(e) => e,
-            None => continue,
-        };
-
-        // Only check HTML-converted papers (1 page, local-html server)
-        let is_html_convert = entry
-            .conversion
-            .as_ref()
-            .is_some_and(|c| c.server == "local-html" && c.total_pages <= 1);
-        if !is_html_convert {
-            continue;
-        }
-
-        // Read the markdown and check quality
-        let md_path = hs_common::sharded_path(output_dir, &stem, "md");
-        let markdown = match std::fs::read_to_string(&md_path) {
-            Ok(m) => m,
-            Err(_) => continue, // markdown missing, skip
-        };
-
-        // If the entire content fails the quality check, it's junk.
-        // Also catch known loading stubs (PMC "Preparing to download" etc.)
-        // that aren't short enough to trip the quality filter's 50-char floor.
-        let lower = markdown.to_lowercase();
-        let is_junk = hs_distill::quality::is_low_quality(markdown.trim())
-            || lower.contains("preparing to download")
-            || lower.contains("please wait while the document loads")
-            || (lower.contains("hhs vulnerability disclosure") && markdown.len() < 2000);
-
-        if !is_junk {
-            kept_count += 1;
-            continue;
-        }
-
-        junk_count += 1;
-
-        if dry_run {
-            let title = entry.title.as_deref().unwrap_or(&stem);
-            reporter.status("Junk", &format!("{title} ({stem})"));
-            continue;
-        }
-
-        // Delete markdown, catalog, and source HTML
-        let _ = std::fs::remove_file(&md_path);
-        let _ = std::fs::remove_file(catalog_path);
-        // Try both .html and .htm extensions in the sharded papers dir
-        for ext in ["html", "htm"] {
-            let src = hs_common::sharded_path(watch_dir, &stem, ext);
-            let _ = std::fs::remove_file(&src);
-        }
-    }
-
-    if dry_run {
-        reporter.finish(&format!(
-            "Dry run: {junk_count} junk files would be removed, {kept_count} HTML papers kept"
-        ));
-    } else {
-        reporter.finish(&format!(
-            "Cleaned {junk_count} junk files, kept {kept_count} valid HTML papers"
-        ));
-    }
-
-    Ok(())
-}

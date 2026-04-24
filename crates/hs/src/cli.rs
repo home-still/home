@@ -123,6 +123,15 @@ pub enum MigrateAction {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Delete catalog rows whose conversion.server == "local-html" (the
+    /// legacy dual-converter path removed in rc.306). Also deletes the
+    /// associated markdown + source HTML so the pipeline treats those
+    /// stems as new if they are re-downloaded.
+    DropLocalHtml {
+        /// Preview without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

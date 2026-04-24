@@ -162,6 +162,9 @@ fn main() -> ExitCode {
                     cli::MigrateAction::QuarantineBadContent { dry_run, limit } => {
                         migrate_cmd::run_quarantine_bad_content(&reporter, dry_run, limit).await
                     }
+                    cli::MigrateAction::DropLocalHtml { dry_run } => {
+                        migrate_cmd::run_drop_local_html(&reporter, dry_run).await
+                    }
                 },
                 TopCmd::Pipeline { command } => pipeline_cmd::dispatch(command, &reporter).await,
             }
