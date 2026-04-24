@@ -333,16 +333,21 @@ impl HomeStillMcp {
         }
     }
 
-    fn scribe_client(&self) -> Option<hs_scribe::client::ScribeClient> {
-        self.scribe_servers.first().map(|url| {
-            hs_scribe::client::ScribeClient::new_with_timeout(url, self.scribe_convert_timeout)
-        })
+    fn scribe_client(&self) -> anyhow::Result<Option<hs_scribe::client::ScribeClient>> {
+        match self.scribe_servers.first() {
+            Some(url) => Ok(Some(hs_scribe::client::ScribeClient::new_with_timeout(
+                url,
+                self.scribe_convert_timeout,
+            )?)),
+            None => Ok(None),
+        }
     }
 
-    fn distill_client(&self) -> Option<hs_distill::client::DistillClient> {
-        self.distill_servers
-            .first()
-            .map(|url| hs_distill::client::DistillClient::new(url))
+    fn distill_client(&self) -> anyhow::Result<Option<hs_distill::client::DistillClient>> {
+        match self.distill_servers.first() {
+            Some(url) => Ok(Some(hs_distill::client::DistillClient::new(url)?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -1063,7 +1068,7 @@ impl HomeStillMcp {
         // sha256 / file_size_bytes untouched — that data is still
         // authoritative and lets the convert queue re-pick the row without
         // re-downloading.
-        let distill_client_for_purge = self.distill_client();
+        let distill_client_for_purge = self.distill_client().map_err(|e| e.to_string())?;
         let mut md_qdrant_purged = 0u64;
         for stem in md_orphans.iter().take(limit) {
             let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
@@ -1750,7 +1755,10 @@ impl HomeStillMcp {
         )
     )]
     async fn scribe_health(&self) -> Result<String, String> {
-        let client = self.scribe_client().ok_or("No scribe server configured")?;
+        let client = self
+            .scribe_client()
+            .map_err(|e| e.to_string())?
+            .ok_or("No scribe server configured")?;
 
         let health = client.health().await.ok();
         let readiness = client.readiness().await.ok();
@@ -1798,7 +1806,10 @@ impl HomeStillMcp {
         // error loudly instead of silently converting something else.
         let (md, source_key, server_label) = if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await
         {
-            let client = self.scribe_client().ok_or("No scribe server configured")?;
+            let client = self
+                .scribe_client()
+                .map_err(|e| e.to_string())?
+                .ok_or("No scribe server configured")?;
             // Stream scribe's per-page progress through the MCP peer as
             // notifications/progress events. Each event resets Claude
             // Desktop's 4-min tool-call timeout, so multi-page PDFs that
@@ -1941,6 +1952,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         let filters = hs_distill::client::SearchFilters {
@@ -1969,6 +1981,7 @@ impl HomeStillMcp {
     async fn distill_status(&self) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         let health = client.health().await.ok();
@@ -1996,6 +2009,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         match client.doc_exists(&p.doc_id).await {
@@ -2023,6 +2037,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         // Load the catalog entry first so we can prefer the exact key scribe
@@ -2102,6 +2117,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
         match client.delete_doc(&p.doc_id).await {
             Ok(deleted) => Ok(serde_json::to_string_pretty(&serde_json::json!({
@@ -2128,6 +2144,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
         let limit = p.limit.unwrap_or(100_000);
         let doc_ids = client
@@ -2270,6 +2287,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         let deleted = client
@@ -2383,6 +2401,7 @@ impl HomeStillMcp {
 
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         let mut indexed = 0u64;
@@ -2489,7 +2508,13 @@ impl HomeStillMcp {
         let mut embedded_chunks: Option<u64> = None;
         let mut qdrant: Option<QdrantInfo> = None;
         for url in &self.distill_servers {
-            let client = hs_distill::client::DistillClient::new(url);
+            let client = match hs_distill::client::DistillClient::new(url) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("distill client build for {url} failed: {e}");
+                    continue;
+                }
+            };
             let health = client.health().await.ok();
             let readiness = client.readiness().await.ok();
             let status = client.status().await.ok();
@@ -2562,7 +2587,13 @@ impl HomeStillMcp {
         // Per-scribe health fanout.
         let mut scribe_instances: Vec<ServiceInstance> = Vec::new();
         for url in &self.scribe_servers {
-            let client = hs_scribe::client::ScribeClient::new(url);
+            let client = match hs_scribe::client::ScribeClient::new(url) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("scribe client build for {url} failed: {e}");
+                    continue;
+                }
+            };
             let health = client.health().await.ok();
             let readiness = client.readiness().await.ok();
 

@@ -226,7 +226,7 @@ async fn cmd_rebuild(
         .first()
         .cloned()
         .unwrap_or_else(|| DEFAULT_DISTILL_URL.to_string());
-    let client = DistillClient::new(&server_url);
+    let client = DistillClient::new(&server_url)?;
 
     // Inventory: used for both dry-run report and live-run "before" snapshot.
     let inv = inventory(&storage, &client).await?;

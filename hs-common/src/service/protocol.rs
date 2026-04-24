@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -63,12 +61,4 @@ where
         }
     }
     anyhow::bail!("Server closed connection without sending result")
-}
-
-/// Build a reqwest client with a standard connect timeout.
-pub fn default_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
 }

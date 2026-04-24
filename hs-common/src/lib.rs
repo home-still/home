@@ -1,6 +1,8 @@
 pub mod exit_codes;
 pub mod hardware_profile;
 pub mod html;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod mode;
 pub mod pipe_reporter;
 pub mod reporter;

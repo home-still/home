@@ -1074,10 +1074,15 @@ impl RegistryGuard {
         };
 
         // Shared HTTP client for register, heartbeats, and deregister
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let http = match hs_common::http::http_client(std::time::Duration::from_secs(10)) {
+            Ok(c) => c,
+            Err(e) => {
+                reporter.warn(&format!(
+                    "gateway registration skipped: HTTP client build failed: {e}"
+                ));
+                return None;
+            }
+        };
 
         // Register
         let body = serde_json::json!({

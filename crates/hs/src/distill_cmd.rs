@@ -20,7 +20,7 @@ async fn make_distill_client(url: &str) -> Result<DistillClient> {
         let http = auth.build_reqwest_client().await?;
         Ok(DistillClient::new_with_client(url, http))
     } else {
-        Ok(DistillClient::new(url))
+        DistillClient::new(url)
     }
 }
 const QDRANT_REST_PORT: u16 = 6333;
@@ -177,7 +177,7 @@ pub(crate) async fn cmd_watch_events(
     let server_url = server_override
         .or_else(|| cfg.servers.first().cloned())
         .unwrap_or_else(|| "http://localhost:7434".into());
-    let distill = Arc::new(DistillClient::new(&server_url));
+    let distill = Arc::new(DistillClient::new(&server_url)?);
 
     let concurrency = cfg.resolved_concurrency();
     tracing::info!(%server_url, concurrency, "starting distill event-bus watcher");
@@ -649,7 +649,13 @@ pub async fn ensure_index_running() -> bool {
         .ok()
         .and_then(|cfg| cfg.servers.into_iter().next())
         .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-    let client = DistillClient::new(&server_url);
+    let client = match DistillClient::new(&server_url) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("Skipping auto-index: DistillClient build failed: {e}");
+            return false;
+        }
+    };
     if client.health().await.is_err() {
         tracing::debug!("Skipping auto-index: distill server not reachable at {server_url}");
         return false;
@@ -696,7 +702,7 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
 
     // Collection info (if server is reachable)
     let servers = resolve_servers(server).await;
-    let client = DistillClient::new(&servers[0]);
+    let client = DistillClient::new(&servers[0])?;
     match client.status().await {
         Ok(status) => {
             reporter.status("Collection", &status.collection);
@@ -827,7 +833,7 @@ async fn cmd_index(
 
     // Health check before spawning
     let servers = resolve_servers(server).await;
-    let client = DistillClient::new(&servers[0]);
+    let client = DistillClient::new(&servers[0])?;
     match client.health().await {
         Ok(h) => reporter.status(
             "Connected",
@@ -922,7 +928,7 @@ async fn cmd_index_daemon(
     crate::daemon::write_pid_file(&pid_path)?;
 
     let servers = resolve_servers(server).await;
-    let client = DistillClient::new(&servers[0]);
+    let client = DistillClient::new(&servers[0])?;
 
     // Health check
     client

@@ -24,10 +24,7 @@ async fn make_scribe_client(
         let http = auth.build_reqwest_client().await?;
         Ok(hs_scribe::client::ScribeClient::new_with_client(url, http))
     } else {
-        Ok(hs_scribe::client::ScribeClient::new_with_timeout(
-            url,
-            convert_timeout,
-        ))
+        hs_scribe::client::ScribeClient::new_with_timeout(url, convert_timeout)
     }
 }
 
@@ -205,7 +202,7 @@ pub(crate) async fn cmd_watch_events(
     let clients: Vec<ScribeClient> = servers
         .iter()
         .map(|u| ScribeClient::new_with_timeout(u, convert_timeout))
-        .collect();
+        .collect::<Result<_>>()?;
     let pool = Arc::new(ServicePool::new(clients));
     let timeout_policy = Arc::new(cfg.timeout_policy.clone());
 
@@ -375,7 +372,7 @@ async fn cmd_convert(
         }
     } else {
         check_stage.set_message(&format!("{} servers", servers.len()));
-        let pool = ScribePool::new(&servers, convert_timeout);
+        let pool = ScribePool::new(&servers, convert_timeout)?;
         let results = pool.check_all().await;
         let reachable = results.iter().filter(|(_, ok)| *ok).count();
         if reachable == 0 {
@@ -408,7 +405,7 @@ async fn cmd_convert(
             .await
             .map(|md| (servers[0].clone(), md))
     } else {
-        let pool = ScribePool::new(&servers, convert_timeout);
+        let pool = ScribePool::new(&servers, convert_timeout)?;
         pool.convert_one(pdf_bytes, on_progress).await
     };
 

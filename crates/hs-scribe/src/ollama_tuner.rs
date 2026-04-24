@@ -558,7 +558,7 @@ pub async fn run_forever(cfg: AutotuneConfig) -> Result<()> {
     let fallback = cfg.values.first().copied().unwrap_or(2);
     let starting_n = detected.unwrap_or(fallback);
     let mut state = State::load_or_bootstrap(&cfg.state_path, starting_n);
-    let client = ScribeClient::new(&cfg.scribe_url);
+    let client = ScribeClient::new(&cfg.scribe_url)?;
 
     tracing::info!(
         starting_n = state.current_n,

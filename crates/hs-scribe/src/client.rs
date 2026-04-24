@@ -130,15 +130,15 @@ pub struct ScribeClient {
 const DEFAULT_CONVERT_TIMEOUT_SECS: u64 = 900;
 
 impl ScribeClient {
-    pub fn new(server_url: &str) -> Self {
+    pub fn new(server_url: &str) -> Result<Self> {
         Self::new_with_timeout(
             server_url,
             Duration::from_secs(DEFAULT_CONVERT_TIMEOUT_SECS),
         )
     }
 
-    pub fn new_with_timeout(server_url: &str, convert_timeout: Duration) -> Self {
-        let http = Client::builder()
+    pub fn new_with_timeout(server_url: &str, convert_timeout: Duration) -> Result<Self> {
+        let http = hs_common::http::client_builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(convert_timeout)
             // Detect half-open TCP connections within ~30 s instead of the
@@ -146,11 +146,11 @@ impl ScribeClient {
             // strand watcher permits for the full 900 s convert_timeout.
             .tcp_keepalive(Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| Client::new());
-        Self {
+            .context("failed to build ScribeClient reqwest Client")?;
+        Ok(Self {
             http,
             server_url: server_url.trim_end_matches('/').to_string(),
-        }
+        })
     }
 
     /// Create a client with a pre-configured reqwest Client (e.g., with auth headers).

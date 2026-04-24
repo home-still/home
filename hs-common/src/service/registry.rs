@@ -38,11 +38,7 @@ async fn fetch_all(auth: &AuthenticatedClient) -> anyhow::Result<Vec<ServiceInfo
     let token = auth.get_access_token().await?;
     let gateway_url = auth.gateway_url();
 
-    let http = reqwest::Client::builder()
-        .connect_timeout(DISCOVERY_TIMEOUT)
-        .timeout(DISCOVERY_TIMEOUT)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let http = crate::http::http_client(DISCOVERY_TIMEOUT)?;
 
     let resp: ServicesResponse = http
         .get(format!("{gateway_url}/registry/services"))

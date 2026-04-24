@@ -11,14 +11,14 @@ impl ScribePool {
     /// Build a pool whose `ScribeClient`s carry the given convert-request
     /// timeout. The timeout caps each PDF conversion so a stuck backend
     /// (e.g. Ollama hang) can't pin dispatchers indefinitely.
-    pub fn new(servers: &[String], convert_timeout: Duration) -> Self {
+    pub fn new(servers: &[String], convert_timeout: Duration) -> Result<Self> {
         let clients: Vec<ScribeClient> = servers
             .iter()
             .map(|url| ScribeClient::new_with_timeout(url, convert_timeout))
-            .collect();
-        Self {
+            .collect::<Result<_>>()?;
+        Ok(Self {
             inner: ServicePool::new(clients),
-        }
+        })
     }
 
     /// Convert one PDF via the best available server.
