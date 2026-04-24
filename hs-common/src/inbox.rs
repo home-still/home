@@ -15,6 +15,45 @@
 use crate::event_bus::EventBus;
 use crate::storage::Storage;
 
+/// File extensions the inbox sweeper (and the `Inbox` pipeline count that
+/// surfaces it in `hs status`) treat as first-class ingestable sources.
+/// Anything else under `papers/manually_downloaded/` is ignored.
+pub const INBOX_SUPPORTED_EXTS: &[&str] = &["pdf", "html", "htm", "epub"];
+
+/// True iff a filename dropped into `papers/manually_downloaded/` is a
+/// convertible paper source. Shared by the sweeper's per-file dispatch
+/// and by `hs status`'s inbox-queue counter, so the dashboard number can
+/// never lie about what the daemon will actually relocate on the next tick.
+///
+/// Rejects:
+/// - Empty names and `._*` macOS AppleDouble resource forks.
+/// - Names with no `.` (no extension).
+/// - Known in-flight / transient suffixes: `.download`, `.part`,
+///   `.crdownload`, `.tmp` (browser downloads still writing).
+/// - E-book formats we don't support end-to-end: `.azw3`, `.azw`, `.mobi`.
+///
+/// Accepts only the case-insensitive extensions in [`INBOX_SUPPORTED_EXTS`].
+pub fn is_inbox_candidate_filename(filename: &str) -> bool {
+    if filename.is_empty() || filename.starts_with("._") {
+        return false;
+    }
+    let Some((_stem, ext)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    let ext_lc = ext.to_ascii_lowercase();
+    // Fast reject: transient / unsupported extensions the sweeper already
+    // blacklists at `crates/hs/src/scribe_inbox.rs:97-101`.
+    if matches!(
+        ext_lc.as_str(),
+        "download" | "part" | "crdownload" | "tmp" | "azw3" | "azw" | "mobi"
+    ) {
+        return false;
+    }
+    INBOX_SUPPORTED_EXTS
+        .iter()
+        .any(|allowed| *allowed == ext_lc)
+}
+
 /// Outcome of a single relocate attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteOutcome {
@@ -90,6 +129,55 @@ pub async fn write_target_and_publish(
                 "delete source after successful put+publish failed; will be cleaned next sweep"
             );
             Ok(WriteOutcome::PartialLeftSource)
+        }
+    }
+}
+
+#[cfg(test)]
+mod candidate_filter_tests {
+    use super::is_inbox_candidate_filename;
+
+    #[test]
+    fn accepts_supported_extensions_case_insensitively() {
+        for name in [
+            "foo.pdf",
+            "foo.PDF",
+            "bar.html",
+            "bar.HTM",
+            "baz.epub",
+            "W12345.pdf",
+        ] {
+            assert!(is_inbox_candidate_filename(name), "expected accept: {name}");
+        }
+    }
+
+    #[test]
+    fn rejects_macos_resource_forks_and_empty() {
+        for name in ["", "._foo.pdf", "._Archive.pdf", "._", "._.epub"] {
+            assert!(
+                !is_inbox_candidate_filename(name),
+                "expected reject: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_extensionless_and_transient_suffixes() {
+        for name in [
+            "README",
+            "no_dot",
+            "foo.pdf.download",
+            "foo.pdf.part",
+            "foo.pdf.crdownload",
+            "foo.tmp",
+            "book.azw3",
+            "book.mobi",
+            "book.azw",
+        ] {
+            assert!(
+                !is_inbox_candidate_filename(name),
+                "expected reject: {name}"
+            );
         }
     }
 }

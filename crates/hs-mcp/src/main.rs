@@ -2626,6 +2626,24 @@ impl HomeStillMcp {
                 .count() as u64
         });
 
+        // Inbox queue — files waiting in `papers/manually_downloaded/` for
+        // the next sweep tick. Filtered by the same whitelist the sweeper
+        // applies, so the dashboard number tracks what the daemon will
+        // actually relocate. `.ok()` swallows storage blips — we'd rather
+        // show `Inbox ···` than fail the whole `system_status`.
+        let inbox_prefix = format!(
+            "{}/manually_downloaded/",
+            self.papers_prefix.trim_end_matches('/')
+        );
+        let inbox_pending: Option<u64> = self.storage.list(&inbox_prefix).await.ok().map(|objs| {
+            objs.iter()
+                .filter(|o| {
+                    let fn_ = o.key.rsplit('/').next().unwrap_or("");
+                    hs_common::inbox::is_inbox_candidate_filename(fn_)
+                })
+                .count() as u64
+        });
+
         let mut pipeline = collect_pipeline_counts(
             &*self.storage,
             &self.papers_prefix,
@@ -2651,6 +2669,8 @@ impl HomeStillMcp {
             .saturating_sub(total_in_flight);
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
         pipeline.corrupted_pdfs = corrupted_pdfs;
+        pipeline.inbox_pending = inbox_pending;
+        pipeline.in_flight_conversions = Some(total_in_flight);
 
         // History from the catalog — same source and same default filter as
         // `catalog_recent` so the two activity feeds can never disagree.

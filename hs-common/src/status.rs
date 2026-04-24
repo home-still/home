@@ -47,6 +47,12 @@ pub const INBOX_HEARTBEAT_KEY: &str = ".heartbeats/scribe-inbox.yaml";
 
 /// Daemon heartbeat contents. Written by `hs scribe inbox` (cmd_run) at
 /// the top of each sweep tick; consumed by `system_status` / `hs status`.
+///
+/// `last_sweep_*` fields are populated by the POST-tick stamp with the
+/// `SweepReport` from `sweep_inbox_once`. They're `Option<u64>` so the
+/// first heartbeat after the daemon starts (before any sweep completes)
+/// and heartbeats written by pre-rc.301 daemons serialize without the
+/// fields — `hs status` just shows "running · host" in that case.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InboxHeartbeat {
     pub host: String,
@@ -57,6 +63,18 @@ pub struct InboxHeartbeat {
     /// observed `last_tick` age is "recent enough" to call the daemon
     /// running.
     pub sweep_interval_secs: u64,
+    /// Total files seen in `papers/manually_downloaded/` on the most
+    /// recent completed sweep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sweep_found: Option<u64>,
+    /// Of those, how many were relocated to `papers/XX/<stem>.ext` and
+    /// published to `papers.ingested`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sweep_relocated: Option<u64>,
+    /// Count of per-file errors on the last sweep. Nonzero should color
+    /// the Watcher row yellow in the TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sweep_errors: Option<u64>,
 }
 
 /// Snapshot of the heartbeat plus derived freshness — serialised into
@@ -76,6 +94,18 @@ pub struct InboxHeartbeatSnapshot {
     /// daemon is alive and sweeping. 5s grace absorbs clock skew and tick
     /// jitter.
     pub running: bool,
+    /// Pass-through of [`InboxHeartbeat::last_sweep_found`]. Rendered as
+    /// the second half of `swept N / M` on the TUI Watcher row.
+    #[serde(default)]
+    pub last_sweep_found: Option<u64>,
+    /// Pass-through of [`InboxHeartbeat::last_sweep_relocated`] — the
+    /// `N` in `swept N / M`.
+    #[serde(default)]
+    pub last_sweep_relocated: Option<u64>,
+    /// Pass-through of [`InboxHeartbeat::last_sweep_errors`]. Nonzero
+    /// colors the Watcher row yellow.
+    #[serde(default)]
+    pub last_sweep_errors: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -104,6 +134,19 @@ pub struct PipelineCounts {
     /// convertible work only.
     #[serde(default)]
     pub corrupted_pdfs: Option<u64>,
+    /// Files sitting in `papers/manually_downloaded/` waiting for the
+    /// inbox sweeper's next tick. Counted with the same whitelist the
+    /// sweeper itself uses (`hs_common::inbox::is_inbox_candidate_filename`)
+    /// so the dashboard number matches what the daemon will relocate.
+    /// Rendered as the `Inbox` row in `hs status`.
+    #[serde(default)]
+    pub inbox_pending: Option<u64>,
+    /// Sum of `scribe_instances[*].in_flight` — concurrent conversions
+    /// across the entire scribe pool. Rendered as the `In-flight` row in
+    /// `hs status` so a queued burst of papers is visible in the Pipeline
+    /// panel, not just in the per-scribe Services rows.
+    #[serde(default)]
+    pub in_flight_conversions: Option<u64>,
     /// Unaccounted rows: `documents − markdown − in_flight`. Small
     /// residual (<= threshold) is expected due to stage-in-progress;
     /// larger values indicate a conversion error the operator needs to
@@ -881,20 +924,31 @@ pub fn list_catalog_rows_without_source(
     orphans
 }
 
-/// Stamp the inbox-sweeper heartbeat at the top of each sweep tick. Called
-/// by `hs scribe inbox` (`cmd_run`). Cost is one tiny `storage.put` per
-/// tick — negligible compared to the sweep itself. Failures are the
-/// caller's to surface; most daemons log-and-continue.
+/// Stamp the inbox-sweeper heartbeat. The daemon writes twice per tick:
+/// once BEFORE the sweep starts (`last_sweep=None`, keeps the TUI's
+/// Watcher row "running" during a slow sweep), and once AFTER it
+/// completes with the actual `(found, relocated, errors)` so the TUI
+/// can show `swept N / M`. Cost is one tiny `storage.put` per call —
+/// negligible compared to the sweep itself. Failures are the caller's
+/// to surface; most daemons log-and-continue.
 #[cfg(feature = "storage")]
 pub async fn write_inbox_heartbeat(
     storage: &dyn Storage,
     sweep_interval_secs: u64,
+    last_sweep: Option<(u64, u64, u64)>,
 ) -> anyhow::Result<()> {
+    let (found, relocated, errors) = match last_sweep {
+        Some((f, r, e)) => (Some(f), Some(r), Some(e)),
+        None => (None, None, None),
+    };
     let hb = InboxHeartbeat {
         host: gethostname::gethostname().to_string_lossy().into_owned(),
         pid: std::process::id(),
         last_tick: chrono::Utc::now().to_rfc3339(),
         sweep_interval_secs,
+        last_sweep_found: found,
+        last_sweep_relocated: relocated,
+        last_sweep_errors: errors,
     };
     let yaml = serde_yaml_ng::to_string(&hb)?;
     storage
@@ -928,6 +982,9 @@ pub fn classify_inbox_heartbeat(
         sweep_interval_secs: hb.sweep_interval_secs,
         last_tick_seconds_ago,
         running,
+        last_sweep_found: hb.last_sweep_found,
+        last_sweep_relocated: hb.last_sweep_relocated,
+        last_sweep_errors: hb.last_sweep_errors,
     }
 }
 
@@ -979,7 +1036,10 @@ pub async fn collect_pipeline_counts(
         embedding_skipped,
         // Computed by caller (needs the full catalog in memory).
         corrupted_pdfs: None,
+        // Computed by caller (extra storage.list call for a sub-prefix).
+        inbox_pending: None,
         // Computed by caller once it knows total in_flight.
+        in_flight_conversions: None,
         pipeline_drift: 0,
         pipeline_drift_threshold: PIPELINE_DRIFT_THRESHOLD,
     }
@@ -1357,6 +1417,9 @@ mod inbox_heartbeat_tests {
             pid: 12345,
             last_tick: "2026-04-24T13:00:00+00:00".into(),
             sweep_interval_secs,
+            last_sweep_found: None,
+            last_sweep_relocated: None,
+            last_sweep_errors: None,
         }
     }
 
@@ -1414,7 +1477,7 @@ mod inbox_heartbeat_tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = crate::storage::LocalFsStorage::new(tmp.path());
 
-        write_inbox_heartbeat(&storage, 10).await.unwrap();
+        write_inbox_heartbeat(&storage, 10, None).await.unwrap();
         let snap = read_inbox_heartbeat(&storage)
             .await
             .expect("heartbeat just written");
@@ -1422,6 +1485,29 @@ mod inbox_heartbeat_tests {
         assert_eq!(snap.sweep_interval_secs, 10);
         assert!(!snap.host.is_empty());
         assert_ne!(snap.pid, 0);
+        // Boot-time stamp has no sweep counts yet.
+        assert_eq!(snap.last_sweep_found, None);
+        assert_eq!(snap.last_sweep_relocated, None);
+        assert_eq!(snap.last_sweep_errors, None);
+    }
+
+    #[tokio::test]
+    async fn post_sweep_heartbeat_carries_sweep_stats() {
+        // rc.301 contract: the post-sweep stamp gives the Watcher row
+        // the `swept N / M · K err` signal. Round-tripping the tuple
+        // proves the fields land on both sides of serde.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::LocalFsStorage::new(tmp.path());
+
+        write_inbox_heartbeat(&storage, 30, Some((66, 18, 0)))
+            .await
+            .unwrap();
+        let snap = read_inbox_heartbeat(&storage)
+            .await
+            .expect("heartbeat just written");
+        assert_eq!(snap.last_sweep_found, Some(66));
+        assert_eq!(snap.last_sweep_relocated, Some(18));
+        assert_eq!(snap.last_sweep_errors, Some(0));
     }
 }
 

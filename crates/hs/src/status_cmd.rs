@@ -26,6 +26,14 @@ struct DashboardData {
     /// Excluded from the Embedded-% denominator so the bar reflects
     /// embeddable docs, not intentional skips.
     embedding_skipped: u64,
+    /// Files sitting in `papers/manually_downloaded/` waiting for the
+    /// next sweep. `None` on the loading frame before the first snapshot
+    /// arrives; `Some(0)` once a real snapshot confirms empty.
+    inbox_pending: Option<u64>,
+    /// Sum of `in_flight` across all scribes. Rendered as the `In-flight`
+    /// row so a busy pool is visible in the Pipeline panel, not just in
+    /// per-scribe Services rows.
+    in_flight_conversions: Option<u64>,
 
     scribe_servers: Vec<ServiceStatus>,
     distill_servers: Vec<ServiceStatus>,
@@ -51,6 +59,14 @@ enum WatcherInfo {
     Running {
         host: String,
         last_tick_seconds_ago: u64,
+        /// Last-completed sweep's relocated count. `None` when the daemon
+        /// has written its boot-time heartbeat but hasn't finished a
+        /// sweep yet, or when upgrading from a pre-rc.301 daemon.
+        last_sweep_relocated: Option<u64>,
+        last_sweep_found: Option<u64>,
+        /// Per-file error count from the most recent sweep. Nonzero
+        /// colors the row yellow in the renderer.
+        last_sweep_errors: Option<u64>,
     },
 }
 
@@ -60,6 +76,9 @@ impl From<Option<hs_common::status::InboxHeartbeatSnapshot>> for WatcherInfo {
             Some(hb) if hb.running => WatcherInfo::Running {
                 host: hb.host,
                 last_tick_seconds_ago: hb.last_tick_seconds_ago,
+                last_sweep_relocated: hb.last_sweep_relocated,
+                last_sweep_found: hb.last_sweep_found,
+                last_sweep_errors: hb.last_sweep_errors,
             },
             _ => WatcherInfo::Stopped,
         }
@@ -113,6 +132,8 @@ async fn collect_data() -> DashboardData {
             embedded_docs: 0,
             embedded_chunks: 0,
             embedding_skipped: 0,
+            inbox_pending: None,
+            in_flight_conversions: None,
             scribe_servers: Vec::new(),
             distill_servers: Vec::new(),
             qdrant_healthy: false,
@@ -218,6 +239,8 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         embedded_docs: snap.pipeline.embedded_documents.unwrap_or(0),
         embedded_chunks: snap.pipeline.embedded_chunks.unwrap_or(0),
         embedding_skipped: snap.pipeline.embedding_skipped.unwrap_or(0),
+        inbox_pending: snap.pipeline.inbox_pending,
+        in_flight_conversions: snap.pipeline.in_flight_conversions,
         scribe_servers,
         distill_servers,
         qdrant_healthy,
@@ -325,9 +348,9 @@ fn fmt_ago(dt: &chrono::DateTime<chrono::Utc>) -> String {
 
 fn render(frame: &mut Frame, data: &DashboardData) {
     let outer = Layout::vertical([
-        Constraint::Length(1), // title
-        Constraint::Length(9), // pipeline (includes watcher row)
-        Constraint::Length(1), // spacer
+        Constraint::Length(1),  // title
+        Constraint::Length(11), // pipeline (Documents/Markdown/Cataloged/Embedded/In-flight/Inbox/Corrupted/Watcher/Indexer + header + padding)
+        Constraint::Length(1),  // spacer
         Constraint::Length((data.scribe_servers.len() + data.distill_servers.len() + 3) as u16), // services
         Constraint::Length(1), // spacer
         Constraint::Min(4),    // recent
@@ -465,6 +488,48 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Cell::from(format!("{:>5.1}%", md_to_embed * 100.0)),
         ]),
         Row::new(vec![
+            Cell::from("In-flight"),
+            Cell::from(match data.in_flight_conversions {
+                Some(n) => format!("{n:>6}"),
+                None => scanning.clone(),
+            })
+            .style(match data.in_flight_conversions {
+                Some(n) if n > 0 => Style::default().fg(Color::Green),
+                _ => Style::default().fg(Color::DarkGray),
+            }),
+            Cell::from(match data.in_flight_conversions {
+                Some(n) if n > 0 => format!(
+                    "converting across {} scribe{}",
+                    data.scribe_servers.len(),
+                    if data.scribe_servers.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                Some(_) => "idle".to_string(),
+                None => String::new(),
+            }),
+            Cell::from(""),
+        ]),
+        Row::new(vec![
+            Cell::from("Inbox"),
+            Cell::from(match data.inbox_pending {
+                Some(n) => format!("{n:>6}"),
+                None => scanning.clone(),
+            })
+            .style(match data.inbox_pending {
+                Some(n) if n > 0 => Style::default().fg(Color::Yellow),
+                _ => Style::default().fg(Color::DarkGray),
+            }),
+            Cell::from(match data.inbox_pending {
+                Some(n) if n > 0 => format!("pending in manually_downloaded/ ({n})"),
+                Some(_) => "manually_downloaded/ empty".to_string(),
+                None => String::new(),
+            }),
+            Cell::from(""),
+        ]),
+        Row::new(vec![
             Cell::from("Corrupted PDFs").style(Style::default().fg(Color::Red)),
             Cell::from(if data.corrupted_count.is_some() {
                 format!("{:>6}", corrupted_count)
@@ -485,12 +550,31 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
             WatcherInfo::Running {
                 host,
                 last_tick_seconds_ago,
-            } => Row::new(vec![
-                Cell::from("Watcher").style(Style::default().fg(Color::Green)),
-                Cell::from("●".to_string()).style(Style::default().fg(Color::Green)),
-                Cell::from(format!("running · {host}")),
-                Cell::from(format!("last tick {last_tick_seconds_ago}s ago")),
-            ]),
+                last_sweep_relocated,
+                last_sweep_found,
+                last_sweep_errors,
+            } => {
+                let sweep_frag = match (last_sweep_relocated, last_sweep_found) {
+                    (Some(r), Some(f)) => format!(" · swept {r} / {f}"),
+                    _ => String::new(),
+                };
+                let errs = last_sweep_errors.unwrap_or(0);
+                let color = if errs > 0 {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                };
+                Row::new(vec![
+                    Cell::from("Watcher").style(Style::default().fg(color)),
+                    Cell::from("●".to_string()).style(Style::default().fg(color)),
+                    Cell::from(format!("running · {host}{sweep_frag}")),
+                    Cell::from(if errs > 0 {
+                        format!("last tick {last_tick_seconds_ago}s ago · {errs} err")
+                    } else {
+                        format!("last tick {last_tick_seconds_ago}s ago")
+                    }),
+                ])
+            }
         },
         match &data.indexer {
             IndexerInfo::Running {
@@ -849,6 +933,8 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
         embedded_docs: 0,
         embedded_chunks: 0,
         embedding_skipped: 0,
+        inbox_pending: None,
+        in_flight_conversions: None,
         scribe_servers: vec![],
         distill_servers: vec![],
         qdrant_healthy: false,
@@ -880,6 +966,10 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
                         data.markdown_counts = new_data.markdown_counts.or(data.markdown_counts);
                         data.catalog_count = new_data.catalog_count.or(data.catalog_count);
                         data.corrupted_count = new_data.corrupted_count.or(data.corrupted_count);
+                        data.inbox_pending = new_data.inbox_pending.or(data.inbox_pending);
+                        data.in_flight_conversions = new_data
+                            .in_flight_conversions
+                            .or(data.in_flight_conversions);
                         // Always update network-sourced fields
                         data.scribe_servers = new_data.scribe_servers;
                         data.distill_servers = new_data.distill_servers;
