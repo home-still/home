@@ -630,8 +630,16 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
         [
             Constraint::Length(16), // Label
             Constraint::Length(8),  // Count
-            Constraint::Length(14), // Size
-            Constraint::Min(8),     // Progress
+            // Detail column: holds byte counts (Documents/Markdown),
+            // "X chunks · Y skipped" (Embedded), "converting across N
+            // scribes" (In-flight), "pending in manually_downloaded/"
+            // (Inbox), and the Watcher "running · host · swept N / M"
+            // string. Widened from 14 → Min(38) because the rc.301
+            // rows overflowed the 14-char slot.
+            Constraint::Min(38),
+            // Trailing column: % for Documents/Markdown/Embedded, or
+            // "last tick Ns ago · K err" for Watcher.
+            Constraint::Min(8),
         ],
     )
     .header(
