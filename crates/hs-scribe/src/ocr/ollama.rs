@@ -1,5 +1,5 @@
 use super::region::RegionType;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ollama_rs::{
     generation::completion::request::GenerationRequest, generation::images::Image,
     models::ModelOptions, Ollama,
@@ -12,25 +12,28 @@ pub struct OllamaBackend {
 }
 
 impl OllamaBackend {
-    pub fn new(url: &str, model: &str) -> Self {
+    /// Construct a backend pointing at `url`. Returns `Err` if `url` is
+    /// not a parseable URL or lacks a host component — no silent fallback
+    /// to localhost (ONE PATH).
+    pub fn new(url: &str, model: &str) -> Result<Self> {
         if std::env::var("OLLAMA_NUM_PARALLEL").is_err() {
             tracing::warn!(
                 "OLLAMA_NUM_PARALLEL is not set. Set it to 2 when starting Ollama \
                  for parallel processing: OLLAMA_NUM_PARALLEL=2 ollama serve"
             );
         }
-        let parsed =
-            Url::parse(url).unwrap_or_else(|_| Url::parse("http://localhost:11434").unwrap());
-        let host = format!(
-            "{}://{}",
-            parsed.scheme(),
-            parsed.host_str().unwrap_or("localhost")
-        );
-        let port = parsed.port().unwrap_or(11434);
-        Self {
+        let parsed = Url::parse(url).with_context(|| format!("invalid ollama URL: {url}"))?;
+        let host_str = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("ollama URL has no host: {url}"))?;
+        let host = format!("{}://{}", parsed.scheme(), host_str);
+        let port = parsed
+            .port()
+            .ok_or_else(|| anyhow::anyhow!("ollama URL has no explicit port: {url}"))?;
+        Ok(Self {
             client: Ollama::new(host, port),
             model: model.to_string(),
-        }
+        })
     }
 
     pub async fn recognize(&self, image_bytes: &[u8]) -> Result<String> {
@@ -67,5 +70,45 @@ impl OllamaBackend {
         })?;
 
         Ok(response.response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expect_err(res: Result<OllamaBackend>) -> anyhow::Error {
+        match res {
+            Ok(_) => panic!("expected OllamaBackend::new to error"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn rejects_non_url_input() {
+        let err = expect_err(OllamaBackend::new("not a url", "model"));
+        assert!(
+            format!("{err:#}").contains("invalid ollama URL"),
+            "error should mention invalid URL, got {err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_url_missing_port() {
+        // Scheme+host parses, but there's no explicit port — the previous
+        // fallback path quietly rewrote this to 11434 and sent traffic to
+        // the local Ollama. Refuse loudly instead.
+        let err = expect_err(OllamaBackend::new("http://remote-host/", "model"));
+        assert!(
+            format!("{err:#}").contains("no explicit port"),
+            "error should mention missing port, got {err:#}"
+        );
+    }
+
+    #[test]
+    fn accepts_well_formed_url() {
+        let backend = OllamaBackend::new("http://127.0.0.1:11434", "gemma")
+            .expect("well-formed URL should parse");
+        assert_eq!(backend.model, "gemma");
     }
 }

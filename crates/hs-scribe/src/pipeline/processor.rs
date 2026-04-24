@@ -109,7 +109,7 @@ pub struct Processor {
 
 impl Processor {
     pub fn new(config: AppConfig) -> Result<Self> {
-        let ocr = Arc::new(OcrEngine::from_config(&config));
+        let ocr = Arc::new(OcrEngine::from_config(&config)?);
 
         let pool_size = HardwareProfile::detect().class.detector_pool_size();
 

@@ -13,10 +13,10 @@ pub enum OcrEngine {
 }
 
 impl OcrEngine {
-    pub fn from_config(config: &AppConfig) -> Self {
-        match config.backend {
+    pub fn from_config(config: &AppConfig) -> Result<Self> {
+        Ok(match config.backend {
             BackendChoice::Ollama => {
-                OcrEngine::Ollama(OllamaBackend::new(&config.ollama_url, &config.model))
+                OcrEngine::Ollama(OllamaBackend::new(&config.ollama_url, &config.model)?)
             }
             BackendChoice::Cloud => OcrEngine::Cloud(CloudBackend::new(
                 &config.cloud_url,
@@ -25,7 +25,7 @@ impl OcrEngine {
             BackendChoice::OpenAi => {
                 OcrEngine::OpenAi(OpenAiBackend::new(&config.openai_url, &config.model))
             }
-        }
+        })
     }
 
     pub async fn recognize(&self, image_bytes: &[u8]) -> Result<String> {
