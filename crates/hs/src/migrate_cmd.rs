@@ -359,7 +359,10 @@ async fn relocate_one(
     // key. `hs_common::catalog::read_catalog_entry_via` looks up by stem and
     // uses the sharded layout under `catalog/`, which is already correct.
     let catalog_updated =
-        match hs_common::catalog::read_catalog_entry_via(storage, "catalog", &stem).await {
+        match hs_common::catalog::read_catalog_entry_via(storage, "catalog", &stem)
+            .await
+            .map_err(|e| anyhow::anyhow!("catalog read for {stem}: {e}"))?
+        {
             Some(mut entry) if entry.pdf_path.as_deref() == Some(src) => {
                 entry.pdf_path = Some(tgt.to_string());
                 hs_common::catalog::write_catalog_entry_via(storage, "catalog", &stem, &entry)
@@ -842,7 +845,8 @@ mod root_orphan_tests {
         let roundtripped =
             hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "abcdef")
                 .await
-                .unwrap();
+                .expect("catalog read")
+                .expect("entry present");
         assert_eq!(
             roundtripped.pdf_path.as_deref(),
             Some("papers/ab/abcdef.pdf")
@@ -970,6 +974,7 @@ mod quarantine_tests {
             .unwrap());
         let entry = hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "binary")
             .await
+            .expect("catalog read")
             .expect("conversion_failed stamped");
         assert_eq!(
             entry.conversion_failed.unwrap().reason,
@@ -1053,7 +1058,9 @@ mod drop_local_html_tests {
 
         // Legacy row and companions are gone.
         let legacy_cat =
-            hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "legacy_stem").await;
+            hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "legacy_stem")
+                .await
+                .expect("catalog read succeeds");
         assert!(
             legacy_cat.is_none(),
             "local-html catalog row should be gone"
@@ -1077,6 +1084,7 @@ mod drop_local_html_tests {
         let survivor =
             hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "scribe_stem")
                 .await
+                .expect("catalog read succeeds")
                 .expect("scribe-vlm row must remain");
         assert_eq!(
             survivor.conversion.as_ref().unwrap().server,
@@ -1099,7 +1107,9 @@ mod drop_local_html_tests {
 
         // Row still there.
         let still_there =
-            hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "legacy_stem").await;
+            hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "legacy_stem")
+                .await
+                .expect("catalog read succeeds");
         assert!(still_there.is_some(), "dry-run must not delete");
     }
 }

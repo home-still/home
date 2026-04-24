@@ -168,15 +168,21 @@ pub fn read_catalog_entry(catalog_dir: &Path, stem: &str) -> Option<CatalogEntry
     serde_yaml_ng::from_str(&contents).ok()
 }
 
-/// Write a catalog entry to disk (atomic write).
-pub fn write_catalog_entry(catalog_dir: &Path, stem: &str, entry: &CatalogEntry) {
+/// Write a catalog entry to disk. Errors (disk full, permission denied,
+/// missing parent dir we couldn't create, serde failure) propagate — no
+/// silent discard of the `Result` (rc.306 P0-9).
+pub fn write_catalog_entry(
+    catalog_dir: &Path,
+    stem: &str,
+    entry: &CatalogEntry,
+) -> std::io::Result<()> {
     let path = crate::sharded_path(catalog_dir, stem, "yaml");
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    if let Ok(yaml) = serde_yaml_ng::to_string(entry) {
-        let _ = std::fs::write(&path, yaml);
-    }
+    let yaml = serde_yaml_ng::to_string(entry)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, yaml)
 }
 
 /// Update only the conversion section of an existing catalog entry.
@@ -189,7 +195,7 @@ pub fn update_conversion_catalog(
     total_pages: u64,
     pages: Vec<PageOffset>,
     markdown_path: &str,
-) {
+) -> std::io::Result<()> {
     let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
 
     entry.markdown_path = Some(markdown_path.to_string());
@@ -201,7 +207,7 @@ pub fn update_conversion_catalog(
         pages,
     });
 
-    write_catalog_entry(catalog_dir, stem, &entry);
+    write_catalog_entry(catalog_dir, stem, &entry)
 }
 
 /// Update only the embedding section of an existing catalog entry.
@@ -214,9 +220,9 @@ pub fn update_embedding_catalog(
     server: &str,
     chunks_indexed: u32,
     compute_device: &str,
-) {
+) -> std::io::Result<()> {
     if chunks_indexed == 0 {
-        return;
+        return Ok(());
     }
     let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
 
@@ -227,7 +233,7 @@ pub fn update_embedding_catalog(
         embedded_at: chrono::Utc::now().to_rfc3339(),
     });
 
-    write_catalog_entry(catalog_dir, stem, &entry);
+    write_catalog_entry(catalog_dir, stem, &entry)
 }
 
 // ── Storage-backed variants ─────────────────────────────────────────────
@@ -248,15 +254,30 @@ fn catalog_key(prefix: &str, stem: &str) -> String {
     }
 }
 
+/// Read a catalog entry through storage. Distinguishes three states:
+/// `Ok(Some(entry))` on a successful read, `Ok(None)` when the object is
+/// genuinely absent, `Err(_)` on a transient storage error or a corrupt
+/// YAML row. rc.306 P0-10: a corrupt row is not an orphan — earlier code
+/// chained `.ok()` on both the storage GET and the YAML parse, collapsing
+/// both into "missing", which let catalog_repair misclassify corruption
+/// as a deletion candidate.
 #[cfg(feature = "storage")]
 pub async fn read_catalog_entry_via(
     storage: &dyn crate::storage::Storage,
     prefix: &str,
     stem: &str,
-) -> Option<CatalogEntry> {
+) -> anyhow::Result<Option<CatalogEntry>> {
     let key = catalog_key(prefix, stem);
-    let bytes = storage.get(&key).await.ok()?;
-    serde_yaml_ng::from_slice(&bytes).ok()
+    // Prefer `head` to distinguish absent (Ok(None)) from a storage-layer
+    // failure — `get` surfaces both as Err, which is exactly the ambiguity
+    // we're trying to eliminate.
+    if storage.head(&key).await?.is_none() {
+        return Ok(None);
+    }
+    let bytes = storage.get(&key).await?;
+    let entry: CatalogEntry = serde_yaml_ng::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("catalog YAML parse failed for {key}: {e}"))?;
+    Ok(Some(entry))
 }
 
 #[cfg(feature = "storage")]
@@ -450,7 +471,7 @@ pub async fn update_conversion_catalog_via(
     markdown_path: &str,
 ) -> anyhow::Result<()> {
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
-        .await
+        .await?
         .unwrap_or_default();
 
     entry.markdown_path = Some(markdown_path.to_string());
@@ -479,7 +500,7 @@ pub async fn update_conversion_failed_via(
     reason: &str,
 ) -> anyhow::Result<()> {
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
-        .await
+        .await?
         .unwrap_or_default();
     let attempts = entry
         .conversion_failed
@@ -536,7 +557,7 @@ pub async fn update_embedding_skip_via(
     reason: &str,
 ) -> anyhow::Result<()> {
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
-        .await
+        .await?
         .unwrap_or_default();
     entry.embedding_skip = Some(EmbeddingSkip {
         reason: reason.to_string(),
@@ -547,13 +568,13 @@ pub async fn update_embedding_skip_via(
 
 /// Path-variant of `update_embedding_skip_via` for the local-CLI flows that
 /// still walk the filesystem directly.
-pub fn update_embedding_skip(catalog_dir: &Path, stem: &str, reason: &str) {
+pub fn update_embedding_skip(catalog_dir: &Path, stem: &str, reason: &str) -> std::io::Result<()> {
     let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
     entry.embedding_skip = Some(EmbeddingSkip {
         reason: reason.to_string(),
         at: chrono::Utc::now().to_rfc3339(),
     });
-    write_catalog_entry(catalog_dir, stem, &entry);
+    write_catalog_entry(catalog_dir, stem, &entry)
 }
 
 #[cfg(feature = "storage")]
@@ -569,7 +590,7 @@ pub async fn update_embedding_catalog_via(
         return Ok(());
     }
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
-        .await
+        .await?
         .unwrap_or_default();
 
     entry.embedding = Some(EmbeddingMeta {
@@ -604,7 +625,8 @@ mod storage_tests {
 
         let got = read_catalog_entry_via(&storage, "catalog", "ab123")
             .await
-            .unwrap();
+            .expect("read succeeds")
+            .expect("entry present");
         assert_eq!(got.title.as_deref(), Some("Example"));
         assert_eq!(got.sha256.as_deref(), Some("deadbeef"));
 
@@ -614,6 +636,7 @@ mod storage_tests {
             .unwrap();
         assert!(read_catalog_entry_via(&storage, "", "ab123")
             .await
+            .expect("read succeeds")
             .is_some());
     }
 
@@ -640,7 +663,8 @@ mod storage_tests {
 
         let got = read_catalog_entry_via(&storage, "catalog", "stub")
             .await
-            .unwrap();
+            .expect("read succeeds")
+            .expect("entry present");
         let conv = got.conversion.unwrap();
         assert_eq!(conv.duration_secs, 0.42);
     }
@@ -682,6 +706,7 @@ conversion:
         .unwrap();
         let entry = read_catalog_entry_via(&storage, "catalog", "paywalled")
             .await
+            .expect("read succeeds")
             .expect("row stamped");
         let f1 = entry.conversion_failed.expect("field present");
         assert_eq!(f1.reason, "unsupported_content_type:html");
@@ -697,7 +722,8 @@ conversion:
         .unwrap();
         let entry2 = read_catalog_entry_via(&storage, "catalog", "paywalled")
             .await
-            .unwrap();
+            .expect("read succeeds")
+            .expect("row still present");
         assert_eq!(entry2.conversion_failed.unwrap().attempts, 2);
     }
 
@@ -812,6 +838,101 @@ conversion:
         assert!(
             msg.contains(&fail) && msg.contains("failed"),
             "error must name the offending key: {msg}"
+        );
+    }
+
+    // ── P0-10 regression: three-state read ────────────────────────────
+
+    #[tokio::test]
+    async fn read_missing_entry_returns_ok_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let out = read_catalog_entry_via(&storage, "catalog", "no-such-stem")
+            .await
+            .expect("missing object → Ok(None), not Err");
+        assert!(out.is_none(), "missing object should be Ok(None)");
+    }
+
+    #[tokio::test]
+    async fn read_corrupt_entry_returns_err_not_none() {
+        // A corrupt row is NOT an orphan — earlier code returned None on a
+        // parse failure, which let catalog_repair misclassify it as
+        // "catalog vanished" and synthesize a replacement row, masking the
+        // underlying corruption. P0-10 requires a distinct Err path.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let key = format!("catalog/{}", crate::sharded_key("corrupt", "yaml"));
+        storage
+            .put(&key, b"{{ not valid yaml ::: at all }}\n".to_vec())
+            .await
+            .unwrap();
+        let err = read_catalog_entry_via(&storage, "catalog", "corrupt")
+            .await
+            .expect_err("corrupt YAML must surface as Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("YAML parse") || msg.contains("parse"),
+            "error should mention YAML parse failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn write_catalog_entry_surfaces_io_errors() {
+        // Pointing write at a file path as the "directory" forces
+        // create_dir_all to error — exactly the class of failure that the
+        // pre-P0-9 `let _ = ...` shrugged off. We need the error to
+        // propagate.
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = tmp.path().join("not-a-dir");
+        std::fs::write(&sentinel, b"blocking file\n").unwrap();
+        // `sentinel` is a file; using it as catalog_dir means create_dir_all
+        // on a subpath fails with NotADirectory/AlreadyExists.
+        let entry = CatalogEntry {
+            title: Some("doomed".into()),
+            ..Default::default()
+        };
+        let res = write_catalog_entry(&sentinel, "abcdef", &entry);
+        assert!(
+            res.is_err(),
+            "write into a path blocked by a regular file must error"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_storage_error_returns_err() {
+        // Storage-layer failures (transient S3, permission, etc.) must
+        // NOT collapse to None — orphan-detection logic can't distinguish
+        // "gone" from "can't reach the backend right now" otherwise.
+        use crate::storage::{ObjectMeta, Storage};
+        use async_trait::async_trait;
+
+        struct BrokenStorage;
+
+        #[async_trait]
+        impl Storage for BrokenStorage {
+            async fn get(&self, _key: &str) -> anyhow::Result<Vec<u8>> {
+                Err(anyhow::anyhow!("simulated transient backend failure"))
+            }
+            async fn put(&self, _: &str, _: Vec<u8>) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn head(&self, _key: &str) -> anyhow::Result<Option<ObjectMeta>> {
+                Err(anyhow::anyhow!("simulated transient backend failure"))
+            }
+            async fn list(&self, _: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+                Ok(Vec::new())
+            }
+            async fn delete(&self, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+        }
+
+        let err = read_catalog_entry_via(&BrokenStorage, "catalog", "whatever")
+            .await
+            .expect_err("storage error must propagate, not collapse to Ok(None)");
+        assert!(
+            err.to_string().contains("transient backend failure"),
+            "storage error should bubble up verbatim: {err}"
         );
     }
 }

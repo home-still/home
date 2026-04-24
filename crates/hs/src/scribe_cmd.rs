@@ -730,7 +730,8 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
             ..Default::default()
         };
 
-        hs_common::catalog::write_catalog_entry(catalog_dir, stem, &entry);
+        hs_common::catalog::write_catalog_entry(catalog_dir, stem, &entry)
+            .with_context(|| format!("write catalog {stem}.yaml"))?;
         created += 1;
     }
 

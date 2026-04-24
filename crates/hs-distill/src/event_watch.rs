@@ -104,7 +104,12 @@ pub async fn index_and_publish(
         .next()
         .unwrap_or(&event.key)
         .trim_end_matches(".md");
-    let catalog = hs_common::catalog::read_catalog_entry_via(storage, "catalog", stem).await;
+    // Transient read errors propagate; a missing row is Ok(None) — the
+    // indexer is happy to proceed without prior metadata. A corrupt row
+    // bubbles up as Err here (correctness fix from P0-10).
+    let catalog = hs_common::catalog::read_catalog_entry_via(storage, "catalog", stem)
+        .await
+        .map_err(|e| HandlerError::Transient(anyhow::anyhow!("catalog read for {stem}: {e}")))?;
 
     let result = match distill
         .index_from_storage_with_catalog(storage, &event.key, catalog.as_ref())

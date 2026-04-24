@@ -993,13 +993,15 @@ async fn cmd_index_daemon(
             Ok(result) => {
                 status.total_chunks += result.chunks_indexed;
                 status.indexed += 1;
-                hs_common::catalog::update_embedding_catalog(
+                if let Err(e) = hs_common::catalog::update_embedding_catalog(
                     &catalog_dir,
                     stem,
                     &servers[0],
                     result.chunks_indexed,
                     &result.embedding_device,
-                );
+                ) {
+                    tracing::warn!("{stem}: embedding stamp write failed: {e}");
+                }
             }
             Err(e) => {
                 status.failed += 1;
@@ -1121,8 +1123,9 @@ async fn cmd_diagnose(stem: &str, verbose: bool, reporter: &Arc<dyn Reporter>) -
         return Ok(());
     }
 
-    let catalog_entry =
-        hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem).await;
+    let catalog_entry = hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem)
+        .await
+        .with_context(|| format!("catalog read for {stem}"))?;
     let page_offsets = catalog_entry
         .as_ref()
         .and_then(|e| e.conversion.as_ref())
@@ -1424,7 +1427,9 @@ async fn cmd_reconcile(
             // Fall back to re-derivation for pre-rc.241 rows that predate
             // the `markdown_path` field.
             let catalog_entry =
-                hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem).await;
+                hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem)
+                    .await
+                    .with_context(|| format!("catalog read for {stem}"))?;
             let md_key = catalog_entry
                 .as_ref()
                 .and_then(|e| e.markdown_path.clone())

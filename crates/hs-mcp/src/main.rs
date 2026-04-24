@@ -760,6 +760,7 @@ impl HomeStillMcp {
             &p.stem,
         )
         .await
+        .map_err(|e| e.to_string())?
         {
             Some(entry) => Ok(serde_json::to_string_pretty(&entry).unwrap_or_default()),
             None => Err(format!("No catalog entry found for '{}'", p.stem)),
@@ -1029,6 +1030,7 @@ impl HomeStillMcp {
                 stem,
             )
             .await
+            .map_err(|e| e.to_string())?
             .unwrap_or_default();
             if entry.pdf_path.is_none() {
                 entry.pdf_path = Some(format!(
@@ -1071,6 +1073,7 @@ impl HomeStillMcp {
                 stem,
             )
             .await
+            .map_err(|e| e.to_string())?
             else {
                 errors.push(format!("md/{stem}: catalog entry vanished mid-repair"));
                 continue;
@@ -1152,6 +1155,7 @@ impl HomeStillMcp {
                 &row.stem,
             )
             .await
+            .map_err(|e| e.to_string())?
             else {
                 errors.push(format!(
                     "drift/{}: catalog entry vanished mid-repair",
@@ -1216,6 +1220,7 @@ impl HomeStillMcp {
                 &row.stem,
             )
             .await
+            .map_err(|e| e.to_string())?
             else {
                 errors.push(format!(
                     "resync/{}: catalog entry vanished mid-repair",
@@ -1273,6 +1278,7 @@ impl HomeStillMcp {
                 &d.stem,
             )
             .await
+            .map_err(|e| e.to_string())?
             else {
                 errors.push(format!(
                     "md_path_drift/{}: catalog entry vanished mid-repair",
@@ -1496,6 +1502,7 @@ impl HomeStillMcp {
                 &stem,
             )
             .await
+            .map_err(|e| e.to_string())?
             .and_then(|c| c.conversion)
             .map(|cv| cv.total_pages)
             .unwrap_or(0);
@@ -1989,7 +1996,8 @@ impl HomeStillMcp {
             &self.catalog_prefix,
             &p.stem,
         )
-        .await;
+        .await
+        .map_err(|e| e.to_string())?;
 
         let key = hs_common::markdown::resolve_markdown_key_verified(
             &*self.storage,
@@ -2079,7 +2087,8 @@ impl HomeStillMcp {
                 &self.catalog_prefix,
                 doc_id,
             )
-            .await;
+            .await
+            .map_err(|e| e.to_string())?;
             let key = hs_common::markdown::resolve_markdown_key_verified(
                 &*self.storage,
                 &self.markdown_prefix,
@@ -2211,7 +2220,8 @@ impl HomeStillMcp {
             &self.catalog_prefix,
             &p.stem,
         )
-        .await;
+        .await
+        .map_err(|e| e.to_string())?;
 
         let key = hs_common::markdown::resolve_markdown_key_verified(
             &*self.storage,
@@ -2323,7 +2333,8 @@ impl HomeStillMcp {
                 &self.catalog_prefix,
                 stem,
             )
-            .await;
+            .await
+            .map_err(|e| e.to_string())?;
             let key = hs_common::markdown::resolve_markdown_key_verified(
                 &*self.storage,
                 &self.markdown_prefix,
@@ -2859,6 +2870,7 @@ impl ServerHandler for HomeStillMcp {
                 stem,
             )
             .await
+            .map_err(|e| ErrorData::internal_error(format!("catalog read: {e}"), None))?
             .ok_or_else(|| ErrorData::resource_not_found("catalog entry not found", None))?;
             let yaml = serde_json::to_string_pretty(&entry)
                 .map_err(|e| ErrorData::internal_error(format!("serialize error: {e}"), None))?;
