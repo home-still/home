@@ -280,7 +280,8 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
     if find_distill_binary().is_none() {
         reporter.warn(
             "hs-distill-server binary not found. Build with:\n  \
-             cargo build --release -p hs-distill --features server",
+             cargo build --release -p hs-distill --features server,cuda\n  \
+             (the `cuda` feature is required — the binary refuses to compile without it).",
         );
     } else {
         reporter.status("Binary", "hs-distill-server found");

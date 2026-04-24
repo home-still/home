@@ -1,3 +1,13 @@
+// rc.306 P0-8 / P3-11: the distill server binary MUST be built with the
+// `cuda` feature. Without it, ort wouldn't link the CUDA provider and we
+// would silently run on CPU — directly violating the project's
+// "no CPU fallback" non-negotiable. Refuse to compile.
+#[cfg(not(feature = "cuda"))]
+compile_error!(
+    "hs-distill-server requires --features cuda. Rebuild with:\n\
+     cargo build --release -p hs-distill --features server,cuda --bin hs-distill-server"
+);
+
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
