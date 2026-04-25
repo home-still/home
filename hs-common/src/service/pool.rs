@@ -71,6 +71,29 @@ impl<C: ServiceClient> ServicePool<C> {
         (self.clients.len() * 4).max(1)
     }
 
+    /// Probe each server's `/readiness` once and sum advertised slot
+    /// capacity. Use this at consumer startup to size the in-flight
+    /// semaphore correctly for heterogeneous fleets where
+    /// `clients.len() * 4` undercounts capacity (e.g. an RTX 3090 host
+    /// advertising 12 slots paired with two 6-slot Apple Silicon hosts —
+    /// real ceiling is 24, not 12). Falls back to [`Self::concurrency`]
+    /// when every probe fails so callers never get a worse-than-baseline
+    /// cap.
+    pub async fn probed_concurrency(&self) -> usize {
+        let futs = self.clients.iter().map(|c| c.readiness());
+        let results = futures::future::join_all(futs).await;
+        let summed: usize = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|info| info.total_slots())
+            .sum();
+        if summed == 0 {
+            self.concurrency()
+        } else {
+            summed
+        }
+    }
+
     /// Pick the least-loaded ready server with round-robin tie-breaking.
     /// When every probed server reports zero available slots, poll at
     /// [`PICK_POLL_INTERVAL`] until a slot frees up or

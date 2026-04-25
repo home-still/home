@@ -117,6 +117,9 @@ impl ReadinessInfo for ReadinessResponse {
     fn available_slots(&self) -> usize {
         self.vlm_slots_available
     }
+    fn total_slots(&self) -> usize {
+        self.vlm_slots_total
+    }
 }
 
 pub struct ScribeClient {

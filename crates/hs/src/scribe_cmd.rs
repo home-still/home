@@ -213,7 +213,8 @@ pub(crate) async fn cmd_watch_events(
 
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
-    let concurrency = pool.concurrency();
+    let concurrency = pool.probed_concurrency().await;
+    tracing::info!(concurrency, "scribe-watch consumer in-flight cap");
     run_subscriber(bus.clone(), storage.clone(), concurrency, move |event| {
         let storage = storage_for_handler.clone();
         let bus = bus_for_handler.clone();

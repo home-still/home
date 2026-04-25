@@ -15,6 +15,13 @@ pub enum StreamLine<P, R> {
 pub trait ReadinessInfo {
     fn is_ready(&self) -> bool;
     fn available_slots(&self) -> usize;
+    /// Total advertised slot capacity (busy + free), used at consumer
+    /// startup to size the in-flight semaphore for heterogeneous fleets.
+    /// Defaults to [`Self::available_slots`] so single-slot services
+    /// (distill, mocks) need no change.
+    fn total_slots(&self) -> usize {
+        self.available_slots()
+    }
 }
 
 /// Common service client interface for health/readiness checks.
