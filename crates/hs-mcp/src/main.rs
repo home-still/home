@@ -2608,11 +2608,13 @@ impl HomeStillMcp {
 
         // Pipeline drift: source documents that haven't produced markdown
         // yet. Saturating subtraction so stage lag never yields a negative.
-        // With no "failed" catalog semantics, drift is simply
-        // `documents - markdown - in_flight`. Values above
-        // `pipeline_drift_threshold` indicate stems that errored during
-        // conversion (no catalog row is written on error — the operator
-        // sees the cause in scribe/event-watch logs).
+        // Drift = `documents - markdown - in_flight`. By design, catalog
+        // rows stamped `conversion_failed` (surfaced separately as
+        // `corrupted_pdfs`) are NOT subtracted — drift is meant to surface
+        // them too, since failed converts represent stuck pipeline state
+        // the operator should see. Values above `pipeline_drift_threshold`
+        // indicate either stamped failures or stems that errored without a
+        // stamp; check scribe/event-watch logs for the latter.
         let total_in_flight: u64 = scribe_instances.iter().map(|s| s.in_flight).sum();
         pipeline.pipeline_drift = pipeline
             .documents
