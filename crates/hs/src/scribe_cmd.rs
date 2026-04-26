@@ -75,6 +75,16 @@ pub enum ScribeCmd {
     /// Backfill catalog entries for markdown files that were converted
     /// before the catalog feature.
     CatalogBackfill,
+    /// Clear a stem's `conversion` / `conversion_failed` stamps and
+    /// republish `papers.ingested` so the watcher reconverts it. The
+    /// only supported escape hatch for rows that the QC gate terminally
+    /// rejected (e.g. `vlm_repetition_loop`); without this, those rows
+    /// are stuck because the source-scan refuses to re-queue terminal
+    /// failures by design.
+    Reconvert {
+        /// Catalog stem (no extension), e.g. `10.48550_arxiv.2312.10997`.
+        stem: String,
+    },
     /// Auto-tune `OLLAMA_NUM_PARALLEL` against the local scribe-server's
     /// observed throughput. Install as a root systemd service via
     /// `sudo hs serve scribe-autotune --install`.
@@ -119,8 +129,80 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
             crate::scribe_inbox::dispatch(action.unwrap_or(InboxAction::Run), reporter).await
         }
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
+        ScribeCmd::Reconvert { stem } => cmd_reconvert(&stem, reporter).await,
         ScribeCmd::Autotune => cmd_autotune(reporter).await,
     }
+}
+
+/// Clear `conversion` / `conversion_failed` on a single catalog row and
+/// republish `papers.ingested` so the watcher reconverts it. The terminal-
+/// failure stamp is what stops `list_catalog_stuck_convert` from re-queueing
+/// the source on its own — without this command, a row stamped with
+/// `vlm_repetition_loop` (or any other terminal reason) is permanently
+/// stuck. Operator-driven; CLI-only by design.
+async fn cmd_reconvert(stem: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    const PAPERS_PREFIX: &str = "papers";
+    const CATALOG_PREFIX: &str = "catalog";
+    const CANDIDATE_EXTS: &[&str] = &["pdf", "html", "htm", "epub"];
+
+    let cfg = ScribeConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage()?;
+    let bus = cfg.build_event_bus().await?;
+
+    let entry = hs_common::catalog::read_catalog_entry_via(&*storage, CATALOG_PREFIX, stem)
+        .await
+        .with_context(|| format!("read catalog row for {stem}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no catalog row for stem `{stem}` — use `hs scribe convert` for first-time conversions"
+            )
+        })?;
+
+    if entry.conversion.is_none() && entry.conversion_failed.is_none() {
+        anyhow::bail!(
+            "stem `{stem}` has no `conversion` or `conversion_failed` stamp — \
+             nothing to retry. The watcher will pick this row up on its next sweep."
+        );
+    }
+
+    let mut source_key: Option<String> = None;
+    for ext in CANDIDATE_EXTS {
+        let key = format!("{PAPERS_PREFIX}/{}", hs_common::sharded_key(stem, ext));
+        if storage
+            .exists(&key)
+            .await
+            .with_context(|| format!("storage exists check for {key}"))?
+        {
+            source_key = Some(key);
+            break;
+        }
+    }
+    let source_key = source_key.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no source file (.pdf/.html/.htm/.epub) under `{PAPERS_PREFIX}/` for stem `{stem}`"
+        )
+    })?;
+
+    let mut cleared = entry;
+    cleared.conversion = None;
+    cleared.conversion_failed = None;
+    hs_common::catalog::write_catalog_entry_via(&*storage, CATALOG_PREFIX, stem, &cleared)
+        .await
+        .with_context(|| format!("write cleared catalog row for {stem}"))?;
+
+    let payload = serde_json::json!({
+        "key": source_key,
+        "source": "hs scribe reconvert",
+    });
+    let bytes = serde_json::to_vec(&payload).context("serialize papers.ingested payload")?;
+    bus.publish("papers.ingested", &bytes)
+        .await
+        .with_context(|| format!("publish papers.ingested for {source_key}"))?;
+
+    reporter.finish(&format!(
+        "Reconvert queued: stem={stem} source_key={source_key}"
+    ));
+    Ok(())
 }
 
 async fn cmd_autotune(_reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -410,6 +492,7 @@ async fn cmd_convert(
     }
 
     let (_server, md) = result?;
+    let longest_run = hs_scribe::postprocess::longest_repeated_run_bytes(&md);
     let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
     if truncations > 0 {
         tracing::info!("Cleaned {} repetition site(s)", truncations);
@@ -417,11 +500,12 @@ async fn cmd_convert(
 
     let page_offsets = hs_common::catalog::compute_page_offsets(&md);
     let total_pages = page_offsets.len() as u64;
-    if hs_scribe::postprocess::qc_verdict(truncations, total_pages)
+    if hs_scribe::postprocess::qc_verdict(truncations, total_pages, longest_run)
         == hs_scribe::postprocess::QcVerdict::RejectLoop
     {
         anyhow::bail!(
-            "VLM repetition loop: {truncations} truncation site(s) across {total_pages} page(s). Output not persisted; re-run or investigate the source PDF.",
+            "VLM repetition loop: {truncations} truncation site(s), longest_run={longest_run}B \
+             across {total_pages} page(s). Output not persisted; re-run or investigate the source PDF.",
         );
     }
 

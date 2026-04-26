@@ -241,32 +241,6 @@ impl Processor {
             .filter(|b| RegionType::from_class(&b.class_name) != RegionType::Skip)
             .collect();
 
-        // Detect text-heavy pages where full-page VLM is better than per-region cropping.
-        // Dense multi-column pages (newspapers) get garbled by per-region crops that split
-        // mid-sentence or merge columns. Full-page VLM handles these natively.
-        let has_tables = bboxes
-            .iter()
-            .any(|b| RegionType::from_class(&b.class_name) == RegionType::Table);
-        let has_formulas = bboxes.iter().any(|b| {
-            matches!(
-                RegionType::from_class(&b.class_name),
-                RegionType::Formula | RegionType::InlineFormula
-            )
-        });
-        if !has_tables && !has_formulas {
-            tracing::info!("Text-only page (no tables/formulas) → full-page VLM");
-            let downscaled = maybe_downscale(image, self.config.max_image_dim);
-            let image_bytes = encode_jpeg(&downscaled)?;
-            let text = self.ocr.recognize(&image_bytes).await?;
-            return Ok(ProcessedPage {
-                markdown: text.clone(),
-                regions: vec![RegionResult {
-                    class_name: "text".into(),
-                    text,
-                }],
-            });
-        }
-
         // Save detection order (native read_order from PP-DocLayout-V3) before splitting
         let detection_order: Vec<usize> = bboxes.iter().map(|b| b.unique_id).collect();
 
@@ -930,26 +904,6 @@ fn prepare_page(
         .into_iter()
         .filter(|b| RegionType::from_class(&b.class_name) != RegionType::Skip)
         .collect();
-
-    // Text-only page check
-    let has_tables = bboxes
-        .iter()
-        .any(|b| RegionType::from_class(&b.class_name) == RegionType::Table);
-    let has_formulas = bboxes.iter().any(|b| {
-        matches!(
-            RegionType::from_class(&b.class_name),
-            RegionType::Formula | RegionType::InlineFormula
-        )
-    });
-    if !has_tables && !has_formulas {
-        tracing::info!("Page {}: text-only → full-page VLM", page_idx + 1);
-        let downscaled = maybe_downscale(image, config.max_image_dim);
-        let jpeg_bytes = encode_jpeg(&downscaled)?;
-        return Ok(PreparedPage::FullPage {
-            page_idx,
-            jpeg_bytes,
-        });
-    }
 
     let detection_order: Vec<usize> = bboxes.iter().map(|b| b.unique_id).collect();
 

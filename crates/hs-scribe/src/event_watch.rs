@@ -164,17 +164,52 @@ pub async fn convert_and_upload(
             // VLM-only QC. HTML/EPUB parsers don't repeat tokens, and
             // their natural structural repetition (headings, tables)
             // trips clean_repetitions and explodes into a retry storm.
-            let (md, truncations) = crate::postprocess::clean_repetitions(&md);
-            if truncations > 0 {
-                tracing::info!(stem = %stem, truncations, "cleaned VLM repetition site(s)");
+            //
+            // Reject-on-loop terminally stamps `conversion_failed` so the
+            // source-scan in `hs-common/src/status.rs:856` skips it on
+            // future passes — the prior attempt at rejection (disabled
+            // 2026-04-23) didn't write the terminal stamp and the source
+            // got re-queued forever. Operators retry via `hs scribe
+            // reconvert`, which clears the stamp and republishes once.
+            let original_md = md.clone();
+            let (md_clean, truncations) = crate::postprocess::clean_repetitions(&md);
+            let longest_run = crate::postprocess::longest_repeated_run_bytes(&original_md);
+            let pages_for_qc = hs_common::catalog::compute_page_offsets(&md_clean).len() as u64;
+            match crate::postprocess::qc_verdict(truncations, pages_for_qc, longest_run) {
+                crate::postprocess::QcVerdict::RejectLoop => {
+                    if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+                        storage,
+                        "catalog",
+                        stem,
+                        "vlm_repetition_loop",
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            stem = %stem,
+                            error = %e,
+                            "stamp conversion_failed failed",
+                        );
+                    }
+                    return Err(HandlerError::Permanent(anyhow::anyhow!(
+                        "VLM repetition loop on {} (truncations={}, longest_run={}B)",
+                        event.key,
+                        truncations,
+                        longest_run
+                    )));
+                }
+                crate::postprocess::QcVerdict::Accept => {
+                    if truncations > 0 {
+                        tracing::info!(
+                            stem = %stem,
+                            truncations,
+                            longest_run,
+                            "cleaned VLM repetition site(s)",
+                        );
+                    }
+                }
             }
-            // QC repetition-loop rejection disabled by operator decision
-            // (2026-04-23): partial/truncated markdown is still useful
-            // and we'd rather keep it than discard the whole paper.
-            // `clean_repetitions` above already trims the worst bursts;
-            // what remains is mostly-good content with "...truncated..."
-            // markers where VLM went off the rails.
-            (md, "scribe-vlm")
+            (md_clean, "scribe-vlm")
         }
         "html" | "htm" => {
             let html = String::from_utf8(raw_bytes).map_err(|e| {

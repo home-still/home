@@ -52,8 +52,12 @@ impl OllamaBackend {
         // num_ctx=8192 is the minimum safe value: image tokens consume ~4672 for a
         // 200 DPI letter page, plus ~500 prompt tokens, plus output headroom.
         // num_ctx=4096 silently truncates the image and produces garbage.
+        // repeat_penalty/repeat_last_n match the OpenAI-compat backend; without them,
+        // greedy decoding (temperature=0.0) deterministically rides one phrase to num_predict.
         let options = ModelOptions::default()
             .temperature(0.0)
+            .repeat_penalty(1.3)
+            .repeat_last_n(256)
             .num_predict(4096)
             .num_ctx(8192);
 

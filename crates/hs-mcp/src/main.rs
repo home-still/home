@@ -1805,6 +1805,7 @@ impl HomeStillMcp {
         };
         let duration_secs = start.elapsed().as_secs_f64();
 
+        let longest_run = hs_scribe::postprocess::longest_repeated_run_bytes(&md);
         let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
         if truncations > 0 {
             tracing::info!("{}: cleaned {} repetition site(s)", p.stem, truncations);
@@ -1815,12 +1816,12 @@ impl HomeStillMcp {
 
         // VLM repetition-loop check: propagate as a hard error. No catalog
         // row is written — operator sees it in MCP error response + logs.
-        if hs_scribe::postprocess::qc_verdict(truncations, total_pages)
+        if hs_scribe::postprocess::qc_verdict(truncations, total_pages, longest_run)
             == hs_scribe::postprocess::QcVerdict::RejectLoop
         {
             return Err(format!(
-                "{}: VLM repetition loop ({} truncation site(s) across {} page(s)) — not persisted",
-                p.stem, truncations, total_pages
+                "{}: VLM repetition loop ({} truncation site(s), longest_run={}B across {} page(s)) — not persisted",
+                p.stem, truncations, longest_run, total_pages
             ));
         }
 
