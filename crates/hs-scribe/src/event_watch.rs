@@ -114,10 +114,39 @@ pub async fn convert_and_upload(
         return Ok(md_key);
     }
 
-    let raw_bytes = storage
-        .get(&event.key)
-        .await
-        .map_err(|e| HandlerError::Transient(e.context(format!("get({}) failed", event.key))))?;
+    let raw_bytes = match storage.get(&event.key).await {
+        Ok(b) => b,
+        Err(e) => {
+            // S3 NotFound (or LocalFs ErrorKind::NotFound) means the
+            // source bytes don't exist. Re-delivering won't conjure
+            // them — term the message and stamp `conversion_failed:
+            // source_missing` on the catalog so source-scan skips it
+            // on future reconciles. Other GET failures (network,
+            // 5xx, auth) are transient cluster state.
+            if hs_common::storage::is_not_found(&e) {
+                if let Err(stamp_err) = hs_common::catalog::update_conversion_failed_via(
+                    storage,
+                    "catalog",
+                    stem,
+                    "source_missing",
+                )
+                .await
+                {
+                    tracing::error!(
+                        stem = %stem,
+                        error = %stamp_err,
+                        "stamp source_missing failed",
+                    );
+                }
+                return Err(HandlerError::Permanent(
+                    e.context(format!("source bytes missing for {}", event.key)),
+                ));
+            }
+            return Err(HandlerError::Transient(
+                e.context(format!("get({}) failed", event.key)),
+            ));
+        }
+    };
 
     let start = std::time::Instant::now();
     let (markdown, server) = match ext.as_str() {
