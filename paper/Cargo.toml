@@ -34,3 +34,6 @@ sha2 = "0.10"
 futures = "0.3"
 strsim = "0.11"
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

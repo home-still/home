@@ -131,10 +131,7 @@ pub async fn check_command(cmd: &str, args: &[&str]) -> bool {
 
 /// Poll a URL until it returns 200 OK, or bail after `timeout_secs`.
 pub async fn wait_for_url(url: &str, timeout_secs: u64, label: &str) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let client = crate::http::http_client(std::time::Duration::from_secs(5))?;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
     loop {
         if tokio::time::Instant::now() > deadline {

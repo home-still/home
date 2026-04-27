@@ -4,6 +4,7 @@ Academic research engine: 211M+ vector search with OpenAlex + PMC OA + Qdrant.
 
 ## Non-negotiables
 
+- **ONE PATH per feature. No fallbacks. No legacy shims. No stub placeholders. No "backup" modes. No rollover behavior.** Every operation has exactly one execution path. When the primary path can't produce a usable result, **fail loudly** — don't write a degraded substitute to storage, don't emit silent defaults, don't stamp rows `conversion_failed: true` as a substitute for "we shouldn't have ingested this in the first place." Validate at system boundaries; reject bad input at the door. Two paths = magic results that take hours to trace. If you find a legacy/backup branch, delete it and make the primary right. Concrete anti-patterns this project has suffered from: `local-html` event-watch converter, `is_stub_pdf` silent-skip gate, `html_fallbacks` download path. Do not reintroduce any equivalent.
 - **Distill MUST run on CUDA.** Do not "fall back to CPU" for distill / embedding — not as a quick fix, not temporarily, not as a workaround. `compute_device: cuda` stays in `~/.home-still/config.yaml`. If CUDA is broken, fix CUDA (driver, `libonnxruntime_providers_cuda.so`, pyke-ort `~/.cache/ort.pyke.io/dfbin`, `LD_LIBRARY_PATH`) — don't flip the switch. CPU embedding is too slow to be useful at this corpus size and will silently degrade throughput/latency for every downstream consumer.
 
 ## Working Style
@@ -14,7 +15,7 @@ Academic research engine: 211M+ vector search with OpenAlex + PMC OA + Qdrant.
 ## Debugging Philosophy
 
 - Before proposing any fix: state the observed symptom, list 2–3 competing hypotheses with evidence, and name a cheap test that discriminates between them. No code until the diagnosis is confirmed.
-- No band-aid guards or legacy-compatibility fallbacks in this greenfield project — fix root causes.
+- No band-aid guards or legacy-compatibility fallbacks in this greenfield project — fix root causes. See the "ONE PATH per feature" non-negotiable above.
 
 ## Release Process
 

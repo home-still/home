@@ -20,7 +20,7 @@ async fn make_distill_client(url: &str) -> Result<DistillClient> {
         let http = auth.build_reqwest_client().await?;
         Ok(DistillClient::new_with_client(url, http))
     } else {
-        Ok(DistillClient::new(url))
+        DistillClient::new(url)
     }
 }
 const QDRANT_REST_PORT: u16 = 6333;
@@ -30,11 +30,13 @@ async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
     if let Some(s) = cli_server {
         return vec![s.to_string()];
     }
-    let config_servers = match DistillClientConfig::load() {
+    // Config is the sole source of truth — to route through a cloud
+    // gateway, set the gateway URL explicitly in config instead of
+    // relying on per-request registry discovery with a fallback.
+    match DistillClientConfig::load() {
         Ok(cfg) if !cfg.servers.is_empty() => cfg.servers,
         _ => vec![DEFAULT_SERVER.to_string()],
-    };
-    hs_common::service::registry::discover_or_fallback("distill", config_servers).await
+    }
 }
 
 fn hidden_dir() -> PathBuf {
@@ -136,13 +138,12 @@ pub async fn dispatch(
             force,
             file,
             server,
-            no_yield,
             daemon_child,
         } => {
             if daemon_child {
-                cmd_index_daemon(file, server.as_deref(), no_yield, force).await
+                cmd_index_daemon(file, server.as_deref(), force).await
             } else {
-                cmd_index(file, server.as_deref(), no_yield, force, reporter).await
+                cmd_index(file, server.as_deref(), force, reporter).await
             }
         }
         DistillCmd::Search {
@@ -160,10 +161,25 @@ pub async fn dispatch(
             reembed,
             server,
         } => cmd_reconcile(fix_stamps, reembed, server.as_deref(), reporter).await,
+        DistillCmd::Purge { doc_id, server } => {
+            cmd_purge(&doc_id, server.as_deref(), reporter).await
+        }
     }
 }
 
-async fn cmd_watch_events(
+async fn cmd_purge(doc_id: &str, server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let servers = resolve_servers(server).await;
+    let client = DistillClient::new(&servers[0])?;
+    reporter.status("Purging", doc_id);
+    let deleted = client
+        .delete_doc(doc_id)
+        .await
+        .with_context(|| format!("delete_doc({doc_id})"))?;
+    reporter.finish(&format!("Deleted {deleted} chunk(s) for {doc_id}"));
+    Ok(())
+}
+
+pub(crate) async fn cmd_watch_events(
     server_override: Option<String>,
     _reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
@@ -178,20 +194,26 @@ async fn cmd_watch_events(
     let server_url = server_override
         .or_else(|| cfg.servers.first().cloned())
         .unwrap_or_else(|| "http://localhost:7434".into());
-    let distill = Arc::new(DistillClient::new(&server_url));
+    let distill = Arc::new(DistillClient::new(&server_url)?);
 
-    tracing::info!(%server_url, "starting distill event-bus watcher");
+    let concurrency = cfg.resolved_concurrency();
+    tracing::info!(%server_url, concurrency, "starting distill event-bus watcher");
 
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
-    run_subscriber(bus.clone(), storage.clone(), move |event| {
-        let storage = storage_for_handler.clone();
-        let bus = bus_for_handler.clone();
-        let distill = distill.clone();
-        async move {
-            index_and_publish(storage.as_ref(), distill.as_ref(), bus.as_ref(), &event).await
-        }
-    })
+    run_subscriber(
+        bus.clone(),
+        storage.clone(),
+        concurrency,
+        move |event| {
+            let storage = storage_for_handler.clone();
+            let bus = bus_for_handler.clone();
+            let distill = distill.clone();
+            async move {
+                index_and_publish(storage.as_ref(), distill.as_ref(), bus.as_ref(), &event).await
+            }
+        },
+    )
     .await
 }
 
@@ -258,7 +280,8 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
     if find_distill_binary().is_none() {
         reporter.warn(
             "hs-distill-server binary not found. Build with:\n  \
-             cargo build --release -p hs-distill --features server",
+             cargo build --release -p hs-distill --features server,cuda\n  \
+             (the `cuda` feature is required — the binary refuses to compile without it).",
         );
     } else {
         reporter.status("Binary", "hs-distill-server found");
@@ -364,15 +387,20 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
             ld_path.push_str(extra);
         }
     }
-    // Include ~/.local/lib for user-created compat symlinks
+    // Include ~/.local/lib for user-created compat symlinks and the
+    // home-still CUDA-12 runtime-compat dir (rc.267: the pyke cu12 ort
+    // bundle needs cublas/cudart/cufft .so.12/.so.11 that a CUDA-13-only
+    // host lacks; NVIDIA's runtime-only wheels drop into this dir).
     if let Some(home) = dirs::home_dir() {
-        let user_lib = home.join(".local/lib");
-        let user_lib_str = user_lib.to_string_lossy().to_string();
-        if !ld_path.contains(&user_lib_str) {
-            if !ld_path.is_empty() {
-                ld_path.push(':');
+        for rel in [".local/lib", ".home-still/cuda12-libs"] {
+            let dir = home.join(rel);
+            let s = dir.to_string_lossy().to_string();
+            if !ld_path.contains(&s) {
+                if !ld_path.is_empty() {
+                    ld_path.push(':');
+                }
+                ld_path.push_str(&s);
             }
-            ld_path.push_str(&user_lib_str);
         }
     }
 
@@ -544,13 +572,15 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         }
     }
     if let Some(home) = dirs::home_dir() {
-        let user_lib = home.join(".local/lib");
-        let user_lib_str = user_lib.to_string_lossy().to_string();
-        if !ld_path.contains(&user_lib_str) {
-            if !ld_path.is_empty() {
-                ld_path.push(':');
+        for rel in [".local/lib", ".home-still/cuda12-libs"] {
+            let dir = home.join(rel);
+            let s = dir.to_string_lossy().to_string();
+            if !ld_path.contains(&s) {
+                if !ld_path.is_empty() {
+                    ld_path.push(':');
+                }
+                ld_path.push_str(&s);
             }
-            ld_path.push_str(&user_lib_str);
         }
     }
 
@@ -637,14 +667,20 @@ pub async fn ensure_index_running() -> bool {
         .ok()
         .and_then(|cfg| cfg.servers.into_iter().next())
         .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-    let client = DistillClient::new(&server_url);
+    let client = match DistillClient::new(&server_url) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("Skipping auto-index: DistillClient build failed: {e}");
+            return false;
+        }
+    };
     if client.health().await.is_err() {
         tracing::debug!("Skipping auto-index: distill server not reachable at {server_url}");
         return false;
     }
 
     // Spawn index daemon with defaults (no specific files, no force)
-    match spawn_index_daemon(&None, None, false, false) {
+    match spawn_index_daemon(&None, None, false) {
         Ok(pid) => {
             tracing::info!("Auto-started index daemon (PID {pid})");
             true
@@ -684,7 +720,7 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
 
     // Collection info (if server is reachable)
     let servers = resolve_servers(server).await;
-    let client = DistillClient::new(&servers[0]);
+    let client = DistillClient::new(&servers[0])?;
     match client.status().await {
         Ok(status) => {
             reporter.status("Collection", &status.collection);
@@ -729,7 +765,6 @@ pub struct IndexStatus {
     pub total_files: usize,
     pub indexed: usize,
     pub failed: usize,
-    pub gpu_yield: bool,
     pub total_chunks: u32,
     pub current_file: String,
     pub done: bool,
@@ -750,7 +785,6 @@ fn write_index_status(status: &IndexStatus) {
 fn spawn_index_daemon(
     files: &Option<Vec<PathBuf>>,
     server: Option<&str>,
-    no_yield: bool,
     force: bool,
 ) -> Result<u32> {
     let exe = std::env::current_exe().context("Cannot find current executable")?;
@@ -760,9 +794,6 @@ fn spawn_index_daemon(
         "index".to_string(),
         "--daemon-child".to_string(),
     ];
-    if no_yield {
-        args.push("--no-yield".to_string());
-    }
     if force {
         args.push("--force".to_string());
     }
@@ -802,7 +833,6 @@ fn spawn_index_daemon(
 async fn cmd_index(
     files: Option<Vec<PathBuf>>,
     server: Option<&str>,
-    no_yield: bool,
     force: bool,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
@@ -821,7 +851,7 @@ async fn cmd_index(
 
     // Health check before spawning
     let servers = resolve_servers(server).await;
-    let client = DistillClient::new(&servers[0]);
+    let client = DistillClient::new(&servers[0])?;
     match client.health().await {
         Ok(h) => reporter.status(
             "Connected",
@@ -833,7 +863,7 @@ async fn cmd_index(
     };
 
     // Spawn daemon
-    let pid = spawn_index_daemon(&files, server, no_yield, force)?;
+    let pid = spawn_index_daemon(&files, server, force)?;
     reporter.status(
         "Index",
         &format!("daemon started (PID {pid}). Press q to detach."),
@@ -883,15 +913,6 @@ async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
                     let _ = crossterm::terminal::enable_raw_mode();
                 }
                 last_indexed = status.indexed;
-            } else if status.gpu_yield {
-                let _ = crossterm::terminal::disable_raw_mode();
-                eprint!(
-                    "\r  [{}/{}] yielding to scribe...   ",
-                    status.indexed, status.total_files
-                );
-                if raw_enabled {
-                    let _ = crossterm::terminal::enable_raw_mode();
-                }
             }
 
             if status.done {
@@ -918,7 +939,6 @@ async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
 async fn cmd_index_daemon(
     files: Option<Vec<PathBuf>>,
     server: Option<&str>,
-    no_yield: bool,
     force: bool,
 ) -> Result<()> {
     // Write PID
@@ -926,7 +946,7 @@ async fn cmd_index_daemon(
     crate::daemon::write_pid_file(&pid_path)?;
 
     let servers = resolve_servers(server).await;
-    let client = DistillClient::new(&servers[0]);
+    let client = DistillClient::new(&servers[0])?;
 
     // Health check
     client
@@ -953,16 +973,6 @@ async fn cmd_index_daemon(
     write_index_status(&status);
 
     for path in &paths {
-        // Yield GPU to scribe if it has work queued
-        if !no_yield && hs_common::gpu_priority::scribe_is_active() {
-            status.gpu_yield = true;
-            write_index_status(&status);
-            tracing::info!("Yielding to scribe (has active work)");
-            hs_common::gpu_priority::wait_for_scribe_idle().await;
-            status.gpu_yield = false;
-            tracing::info!("Scribe idle, resuming indexing");
-        }
-
         let path_str = path.to_string_lossy().to_string();
         let stem = path
             .file_stem()
@@ -983,13 +993,15 @@ async fn cmd_index_daemon(
             Ok(result) => {
                 status.total_chunks += result.chunks_indexed;
                 status.indexed += 1;
-                hs_common::catalog::update_embedding_catalog(
+                if let Err(e) = hs_common::catalog::update_embedding_catalog(
                     &catalog_dir,
                     stem,
                     &servers[0],
                     result.chunks_indexed,
                     &result.embedding_device,
-                );
+                ) {
+                    tracing::warn!("{stem}: embedding stamp write failed: {e}");
+                }
             }
             Err(e) => {
                 status.failed += 1;
@@ -1111,8 +1123,9 @@ async fn cmd_diagnose(stem: &str, verbose: bool, reporter: &Arc<dyn Reporter>) -
         return Ok(());
     }
 
-    let catalog_entry =
-        hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem).await;
+    let catalog_entry = hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem)
+        .await
+        .with_context(|| format!("catalog read for {stem}"))?;
     let page_offsets = catalog_entry
         .as_ref()
         .and_then(|e| e.conversion.as_ref())
@@ -1276,7 +1289,6 @@ async fn cmd_reconcile(
                 stem,
                 CatalogState {
                     has_embedding_stamp: entry.embedding.is_some(),
-                    conversion_failed: entry.conversion.as_ref().is_some_and(|c| c.failed),
                     embedding_skip_reason: entry.embedding_skip.map(|s| s.reason),
                 },
             )
@@ -1415,7 +1427,9 @@ async fn cmd_reconcile(
             // Fall back to re-derivation for pre-rc.241 rows that predate
             // the `markdown_path` field.
             let catalog_entry =
-                hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem).await;
+                hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem)
+                    .await
+                    .with_context(|| format!("catalog read for {stem}"))?;
             let md_key = catalog_entry
                 .as_ref()
                 .and_then(|e| e.markdown_path.clone())

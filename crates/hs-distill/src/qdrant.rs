@@ -256,6 +256,48 @@ pub async fn collection_info(client: &Qdrant, collection_name: &str) -> Result<u
         .unwrap_or(0))
 }
 
+/// Drop the collection (if it exists) and recreate it with the same schema.
+/// Returns the pre-drop point count so the caller can report how much was
+/// purged. Preserves vector config / indexes via [`ensure_collection`] —
+/// this is the "factory reset for embeddings" primitive used by
+/// `pipeline_rebuild`. Idempotent: calling when the collection is absent
+/// just recreates it and reports `0`.
+pub async fn reset_collection(
+    client: &Qdrant,
+    collection_name: &str,
+    dimension: usize,
+) -> Result<u64, DistillError> {
+    let existing = client
+        .list_collections()
+        .await
+        .map_err(|e| DistillError::Qdrant(format!("Failed to list collections: {e}")))?;
+    let exists = existing
+        .collections
+        .iter()
+        .any(|c| c.name == collection_name);
+
+    let prior_points = if exists {
+        collection_info(client, collection_name).await.unwrap_or(0)
+    } else {
+        0
+    };
+
+    if exists {
+        client
+            .delete_collection(collection_name)
+            .await
+            .map_err(|e| DistillError::Qdrant(format!("Failed to drop collection: {e}")))?;
+        tracing::info!(
+            "Dropped collection '{}' ({} points)",
+            collection_name,
+            prior_points
+        );
+    }
+
+    ensure_collection(client, collection_name, dimension).await?;
+    Ok(prior_points)
+}
+
 /// Check if a document has any chunks in the collection.
 pub async fn doc_exists(
     client: &Qdrant,

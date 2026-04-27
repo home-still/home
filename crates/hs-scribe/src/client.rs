@@ -6,14 +6,67 @@ use hs_common::service::protocol::{ReadinessInfo, ServiceClient};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::config::TimeoutPolicy;
+
+/// HTTP header name carrying the per-request convert deadline. The
+/// server reads this and wraps `process_pdf` in
+/// `tokio::time::timeout(header_value)`, so client and server agree on
+/// how long to wait for a given PDF instead of drifting between
+/// independent config defaults.
+pub const CONVERT_DEADLINE_HEADER: &str = "X-Convert-Deadline-Secs";
+
+/// Compute the per-request convert timeout from a PDF's page count.
+///
+/// `pages = None` (parse failed, non-PDF payload) → `policy.fallback_secs`.
+/// Otherwise: `clamp(base + pages * per_page, floor, ceiling)`.
+pub fn compute_convert_timeout(pages: Option<u32>, policy: &TimeoutPolicy) -> Duration {
+    let secs = match pages {
+        None => policy.fallback_secs,
+        Some(n) => {
+            let raw = policy
+                .base_secs
+                .saturating_add(policy.per_page_secs.saturating_mul(n as u64));
+            raw.clamp(policy.floor_secs, policy.ceiling_secs)
+        }
+    };
+    Duration::from_secs(secs)
+}
+
 // ── NDJSON streaming protocol types ──────────────────────────────
+
+/// Result of a successful PDF→markdown conversion. Carries the assembled
+/// markdown plus the per-page list of PP-DocLayout-V3 region class names
+/// (index-aligned with `compute_page_offsets` on `markdown`). The class
+/// list is empty for pages produced by FullPage mode (no layout
+/// detection happens) or by the streaming-fallback path that goes through
+/// the plain `/scribe` endpoint — both yield an empty `Vec<Vec<String>>`,
+/// which downstream QC treats as "not bibliography" (strict default).
+///
+/// `per_page_diags` carries one [`crate::diag::PageDiagRecord`] per page
+/// for the `<output>/<stem>.diag.jsonl` artifact. When the server is
+/// older than rc.312 or the streaming-fallback path is taken, this vec
+/// is empty and the consumer simply doesn't write a JSONL file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConversionResult {
+    pub markdown: String,
+    #[serde(default)]
+    pub per_page_region_classes: Vec<Vec<String>>,
+    #[serde(default)]
+    pub per_page_diags: Vec<crate::diag::PageDiagRecord>,
+}
 
 /// A single line in the NDJSON progress stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamLine {
     Progress(ProgressEvent),
-    Result { markdown: String },
+    Result {
+        markdown: String,
+        #[serde(default)]
+        per_page_region_classes: Vec<Vec<String>>,
+        #[serde(default)]
+        per_page_diags: Vec<crate::diag::PageDiagRecord>,
+    },
     Error(String),
 }
 
@@ -63,6 +116,12 @@ pub struct HealthResponse {
     /// the last activity and the health probe.
     #[serde(default)]
     pub last_conversion_at: Option<String>,
+    /// Total successful conversions since server startup. Monotonic
+    /// counter, cheap atomic increment. Consumers (e.g. `hs scribe
+    /// autotune`) diff this across polls to compute throughput without
+    /// needing log parsing. Resets to 0 on every scribe-server restart.
+    #[serde(default)]
+    pub total_conversions: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,8 +136,16 @@ impl ReadinessInfo for ReadinessResponse {
     fn is_ready(&self) -> bool {
         self.ready
     }
+    /// Live VLM permit count from the server-side shared semaphore
+    /// (`Processor::vlm_sem().available_permits()`). Because scribe now
+    /// owns exactly one semaphore per process (see rc.286), this is the
+    /// truthful "free slot" signal the pool uses to pick the least-loaded
+    /// host.
     fn available_slots(&self) -> usize {
         self.vlm_slots_available
+    }
+    fn total_slots(&self) -> usize {
+        self.vlm_slots_total
     }
 }
 
@@ -93,23 +160,27 @@ pub struct ScribeClient {
 const DEFAULT_CONVERT_TIMEOUT_SECS: u64 = 900;
 
 impl ScribeClient {
-    pub fn new(server_url: &str) -> Self {
+    pub fn new(server_url: &str) -> Result<Self> {
         Self::new_with_timeout(
             server_url,
             Duration::from_secs(DEFAULT_CONVERT_TIMEOUT_SECS),
         )
     }
 
-    pub fn new_with_timeout(server_url: &str, convert_timeout: Duration) -> Self {
-        let http = Client::builder()
+    pub fn new_with_timeout(server_url: &str, convert_timeout: Duration) -> Result<Self> {
+        let http = hs_common::http::client_builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(convert_timeout)
+            // Detect half-open TCP connections within ~30 s instead of the
+            // kernel's default ~2 h. Wi-Fi drops on a laptop scribe used to
+            // strand watcher permits for the full 900 s convert_timeout.
+            .tcp_keepalive(Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| Client::new());
-        Self {
+            .context("failed to build ScribeClient reqwest Client")?;
+        Ok(Self {
             http,
             server_url: server_url.trim_end_matches('/').to_string(),
-        }
+        })
     }
 
     /// Create a client with a pre-configured reqwest Client (e.g., with auth headers).
@@ -178,18 +249,27 @@ impl ServiceClient for ScribeClient {
 }
 
 impl ScribeClient {
-    pub async fn convert(&self, pdf_bytes: Vec<u8>) -> Result<String> {
+    /// Convert a PDF. When `timeout` is `Some`, applies it as the
+    /// reqwest per-request timeout and sends the same value in the
+    /// `X-Convert-Deadline-Secs` header so the server's
+    /// `tokio::time::timeout` wrapper matches. `None` uses the client's
+    /// construction-time baseline.
+    pub async fn convert(
+        &self,
+        pdf_bytes: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> Result<ConversionResult> {
         let url = format!("{}/scribe", self.server_url);
         let part = reqwest::multipart::Part::bytes(pdf_bytes).file_name("input.pdf");
         let form = reqwest::multipart::Form::new().part("pdf", part);
 
-        let resp = self
-            .http
-            .post(&url)
-            .multipart(form)
-            .send()
-            .await
-            .context("Failed to send PDF")?;
+        let mut req = self.http.post(&url).multipart(form);
+        if let Some(d) = timeout {
+            req = req
+                .timeout(d)
+                .header(CONVERT_DEADLINE_HEADER, d.as_secs().to_string());
+        }
+        let resp = req.send().await.context("Failed to send PDF")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -197,30 +277,48 @@ impl ScribeClient {
             anyhow::bail!("Server error {status}: {body}");
         }
 
-        resp.text().await.context("Failed to read response")
+        // The non-streaming endpoint returns just markdown bytes — there's
+        // no place in the response to carry `per_page_region_classes`.
+        // Callers needing region-class info (event_watch's per-page QC)
+        // must use convert_with_progress instead. Return an empty class
+        // vec here; downstream QC treats it as "not bibliography" and
+        // applies the strict default ceiling everywhere — safe.
+        let markdown = resp.text().await.context("Failed to read response")?;
+        Ok(ConversionResult {
+            markdown,
+            per_page_region_classes: Vec::new(),
+            per_page_diags: Vec::new(),
+        })
     }
 
     /// Convert a PDF with streaming progress updates via NDJSON.
     /// Falls back to the plain `/scribe` endpoint if the server doesn't
-    /// support streaming (404).
+    /// support streaming (404). `timeout` semantics match
+    /// [`ScribeClient::convert`].
     pub async fn convert_with_progress(
         &self,
         pdf_bytes: Vec<u8>,
+        timeout: Option<Duration>,
         on_progress: impl Fn(ProgressEvent),
-    ) -> Result<String> {
+    ) -> Result<ConversionResult> {
         let url = format!("{}/scribe/stream", self.server_url);
         let part = reqwest::multipart::Part::bytes(pdf_bytes.clone()).file_name("input.pdf");
         let form = reqwest::multipart::Form::new().part("pdf", part);
 
-        let mut resp = self
-            .http
-            .post(&url)
-            .multipart(form)
-            .send()
-            .await
-            .context("Failed to send PDF")?;
+        let mut req = self.http.post(&url).multipart(form);
+        if let Some(d) = timeout {
+            req = req
+                .timeout(d)
+                .header(CONVERT_DEADLINE_HEADER, d.as_secs().to_string());
+        }
+        let mut resp = req.send().await.context("Failed to send PDF")?;
 
-        // Server doesn't support streaming — fall back to plain endpoint
+        // Server doesn't support streaming — fall back to plain endpoint.
+        // The fallback path's ConversionResult has empty
+        // per_page_region_classes; QC treats it as no-bibliography (strict
+        // default ceiling everywhere). Old servers can't supply layout
+        // metadata; bumping them is the only way to get bibliography-aware
+        // thresholds.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             on_progress(ProgressEvent {
                 stage: "info".into(),
@@ -228,7 +326,7 @@ impl ScribeClient {
                 total_pages: 0,
                 message: "server does not support progress (update server image)".into(),
             });
-            return self.convert(pdf_bytes).await;
+            return self.convert(pdf_bytes, timeout).await;
         }
 
         if !resp.status().is_success() {
@@ -251,7 +349,17 @@ impl ScribeClient {
                 }
                 match serde_json::from_str::<StreamLine>(line) {
                     Ok(StreamLine::Progress(event)) => on_progress(event),
-                    Ok(StreamLine::Result { markdown }) => return Ok(markdown),
+                    Ok(StreamLine::Result {
+                        markdown,
+                        per_page_region_classes,
+                        per_page_diags,
+                    }) => {
+                        return Ok(ConversionResult {
+                            markdown,
+                            per_page_region_classes,
+                            per_page_diags,
+                        })
+                    }
                     Ok(StreamLine::Error(msg)) => {
                         anyhow::bail!("Server error: {msg}");
                     }
@@ -263,5 +371,54 @@ impl ScribeClient {
         }
 
         anyhow::bail!("Server closed connection without sending result")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy() -> TimeoutPolicy {
+        TimeoutPolicy::default()
+    }
+
+    #[test]
+    fn unknown_page_count_uses_fallback() {
+        let d = compute_convert_timeout(None, &policy());
+        assert_eq!(d.as_secs(), 900);
+    }
+
+    #[test]
+    fn one_page_clamps_to_floor() {
+        let d = compute_convert_timeout(Some(1), &policy());
+        assert_eq!(d.as_secs(), 300);
+    }
+
+    #[test]
+    fn midsize_scales_linearly() {
+        let d = compute_convert_timeout(Some(50), &policy());
+        // 60 + 50 * 15 = 810
+        assert_eq!(d.as_secs(), 810);
+    }
+
+    #[test]
+    fn huge_book_clamps_to_ceiling() {
+        let d = compute_convert_timeout(Some(1000), &policy());
+        assert_eq!(d.as_secs(), 3600);
+    }
+
+    #[test]
+    fn custom_policy_respected() {
+        let p = TimeoutPolicy {
+            base_secs: 10,
+            per_page_secs: 5,
+            floor_secs: 30,
+            ceiling_secs: 200,
+            fallback_secs: 60,
+        };
+        assert_eq!(compute_convert_timeout(Some(20), &p).as_secs(), 110);
+        assert_eq!(compute_convert_timeout(Some(1), &p).as_secs(), 30);
+        assert_eq!(compute_convert_timeout(Some(500), &p).as_secs(), 200);
+        assert_eq!(compute_convert_timeout(None, &p).as_secs(), 60);
     }
 }

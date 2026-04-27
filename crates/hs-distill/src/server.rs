@@ -38,17 +38,22 @@ pub fn app(state: Arc<DistillServerState>) -> Router {
         .route("/exists/{doc_id}", get(handle_exists))
         .route("/doc/{doc_id}", axum::routing::delete(handle_delete_doc))
         .route("/docs", get(handle_list_docs))
+        .route("/collection/reset", post(handle_reset_collection))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
 
 async fn handle_health(State(state): State<Arc<DistillServerState>>) -> impl IntoResponse {
-    let qdrant_version = state
-        .qdrant
-        .health_check()
-        .await
-        .map(|r| r.version)
-        .unwrap_or_default();
+    let qdrant_version = match state.qdrant.health_check().await {
+        Ok(r) => r.version,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("qdrant unreachable: {e}"),
+            )
+                .into_response();
+        }
+    };
 
     Json(HealthResponse {
         status: "ok".into(),
@@ -59,6 +64,7 @@ async fn handle_health(State(state): State<Arc<DistillServerState>>) -> impl Int
         embed_model: state.config.embedding.model.clone(),
         qdrant_url: state.config.qdrant_url.clone(),
     })
+    .into_response()
 }
 
 async fn handle_readiness(State(state): State<Arc<DistillServerState>>) -> impl IntoResponse {
@@ -71,20 +77,24 @@ async fn handle_readiness(State(state): State<Arc<DistillServerState>>) -> impl 
 
 async fn handle_status(State(state): State<Arc<DistillServerState>>) -> impl IntoResponse {
     let collection = &state.config.collection_name;
-    let points = crate::qdrant::collection_info(&state.qdrant, collection).await;
-    let docs = crate::qdrant::distinct_doc_count(&state.qdrant, collection).await;
-
-    match points {
-        Ok(points_count) => Json(StatusResponse {
-            collection: collection.clone(),
-            points_count,
-            documents_count: docs.unwrap_or(0),
-            compute_device: state.embedder.device().to_string(),
-            embed_model: state.config.embedding.model.clone(),
-        })
-        .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+    let points_count = match crate::qdrant::collection_info(&state.qdrant, collection).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    let documents_count = match crate::qdrant::distinct_doc_count(&state.qdrant, collection).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response();
+        }
+    };
+    Json(StatusResponse {
+        collection: collection.clone(),
+        points_count,
+        documents_count,
+        compute_device: state.embedder.device().to_string(),
+        embed_model: state.config.embedding.model.clone(),
+    })
+    .into_response()
 }
 
 async fn handle_delete_doc(
@@ -108,6 +118,22 @@ async fn handle_list_docs(
     let limit = q.limit.unwrap_or(100_000);
     match crate::qdrant::list_doc_ids(&state.qdrant, &state.config.collection_name, limit).await {
         Ok(ids) => Json(serde_json::json!({"doc_ids": ids})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+async fn handle_reset_collection(
+    State(state): State<Arc<DistillServerState>>,
+) -> impl IntoResponse {
+    let dimension = state.embedder.dimension();
+    match crate::qdrant::reset_collection(&state.qdrant, &state.config.collection_name, dimension)
+        .await
+    {
+        Ok(deleted) => Json(serde_json::json!({
+            "collection": state.config.collection_name,
+            "deleted_points": deleted,
+        }))
+        .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }
