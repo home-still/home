@@ -34,12 +34,30 @@ pub fn compute_convert_timeout(pages: Option<u32>, policy: &TimeoutPolicy) -> Du
 
 // ── NDJSON streaming protocol types ──────────────────────────────
 
+/// Result of a successful PDF→markdown conversion. Carries the assembled
+/// markdown plus the per-page list of PP-DocLayout-V3 region class names
+/// (index-aligned with `compute_page_offsets` on `markdown`). The class
+/// list is empty for pages produced by FullPage mode (no layout
+/// detection happens) or by the streaming-fallback path that goes through
+/// the plain `/scribe` endpoint — both yield an empty `Vec<Vec<String>>`,
+/// which downstream QC treats as "not bibliography" (strict default).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConversionResult {
+    pub markdown: String,
+    #[serde(default)]
+    pub per_page_region_classes: Vec<Vec<String>>,
+}
+
 /// A single line in the NDJSON progress stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamLine {
     Progress(ProgressEvent),
-    Result { markdown: String },
+    Result {
+        markdown: String,
+        #[serde(default)]
+        per_page_region_classes: Vec<Vec<String>>,
+    },
     Error(String),
 }
 
@@ -227,7 +245,11 @@ impl ScribeClient {
     /// `X-Convert-Deadline-Secs` header so the server's
     /// `tokio::time::timeout` wrapper matches. `None` uses the client's
     /// construction-time baseline.
-    pub async fn convert(&self, pdf_bytes: Vec<u8>, timeout: Option<Duration>) -> Result<String> {
+    pub async fn convert(
+        &self,
+        pdf_bytes: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> Result<ConversionResult> {
         let url = format!("{}/scribe", self.server_url);
         let part = reqwest::multipart::Part::bytes(pdf_bytes).file_name("input.pdf");
         let form = reqwest::multipart::Form::new().part("pdf", part);
@@ -246,7 +268,17 @@ impl ScribeClient {
             anyhow::bail!("Server error {status}: {body}");
         }
 
-        resp.text().await.context("Failed to read response")
+        // The non-streaming endpoint returns just markdown bytes — there's
+        // no place in the response to carry `per_page_region_classes`.
+        // Callers needing region-class info (event_watch's per-page QC)
+        // must use convert_with_progress instead. Return an empty class
+        // vec here; downstream QC treats it as "not bibliography" and
+        // applies the strict default ceiling everywhere — safe.
+        let markdown = resp.text().await.context("Failed to read response")?;
+        Ok(ConversionResult {
+            markdown,
+            per_page_region_classes: Vec::new(),
+        })
     }
 
     /// Convert a PDF with streaming progress updates via NDJSON.
@@ -258,7 +290,7 @@ impl ScribeClient {
         pdf_bytes: Vec<u8>,
         timeout: Option<Duration>,
         on_progress: impl Fn(ProgressEvent),
-    ) -> Result<String> {
+    ) -> Result<ConversionResult> {
         let url = format!("{}/scribe/stream", self.server_url);
         let part = reqwest::multipart::Part::bytes(pdf_bytes.clone()).file_name("input.pdf");
         let form = reqwest::multipart::Form::new().part("pdf", part);
@@ -271,7 +303,12 @@ impl ScribeClient {
         }
         let mut resp = req.send().await.context("Failed to send PDF")?;
 
-        // Server doesn't support streaming — fall back to plain endpoint
+        // Server doesn't support streaming — fall back to plain endpoint.
+        // The fallback path's ConversionResult has empty
+        // per_page_region_classes; QC treats it as no-bibliography (strict
+        // default ceiling everywhere). Old servers can't supply layout
+        // metadata; bumping them is the only way to get bibliography-aware
+        // thresholds.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             on_progress(ProgressEvent {
                 stage: "info".into(),
@@ -302,7 +339,15 @@ impl ScribeClient {
                 }
                 match serde_json::from_str::<StreamLine>(line) {
                     Ok(StreamLine::Progress(event)) => on_progress(event),
-                    Ok(StreamLine::Result { markdown }) => return Ok(markdown),
+                    Ok(StreamLine::Result {
+                        markdown,
+                        per_page_region_classes,
+                    }) => {
+                        return Ok(ConversionResult {
+                            markdown,
+                            per_page_region_classes,
+                        })
+                    }
                     Ok(StreamLine::Error(msg)) => {
                         anyhow::bail!("Server error: {msg}");
                     }

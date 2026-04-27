@@ -52,11 +52,19 @@ impl OllamaBackend {
         // num_ctx=8192 is the minimum safe value: image tokens consume ~4672 for a
         // 200 DPI letter page, plus ~500 prompt tokens, plus output headroom.
         // num_ctx=4096 silently truncates the image and produces garbage.
-        // repeat_penalty/repeat_last_n match the OpenAI-compat backend; without them,
-        // greedy decoding (temperature=0.0) deterministically rides one phrase to num_predict.
+        //
+        // Penalty params: Ollama's Go VLM runner silently drops repeat_penalty,
+        // frequency_penalty, and presence_penalty (ollama#14493 / #10767). We set
+        // them anyway because (a) future Ollama fix lands them on the wire,
+        // (b) symmetry with the OpenAI-compat backend serving vLLM where they
+        // DO fire. 1.10 is the safe band (per the project's analysis doc); 1.3
+        // substitutes visually similar tokens (0→O, l→1) on numeric/tabular
+        // OCR. top_k=1 is defensive against samplers that mis-handle T=0;
+        // at T=0 it's a no-op on engines that resolve argmax correctly.
         let options = ModelOptions::default()
             .temperature(0.0)
-            .repeat_penalty(1.3)
+            .top_k(1)
+            .repeat_penalty(1.10)
             .repeat_last_n(256)
             .num_predict(4096)
             .num_ctx(8192);

@@ -167,8 +167,16 @@ pub async fn convert_and_upload(
                 timeout_secs = timeout.as_secs(),
                 "dispatching pdf to scribe with page-scaled timeout"
             );
-            let md = scribe
-                .convert(raw_bytes, Some(timeout))
+            // Use the streaming endpoint so we get per-page PP-DocLayout-V3
+            // region class names alongside the markdown — required for QC's
+            // bibliography multiplier. Pass a no-op progress callback; this
+            // handler has no UI to drive. If the server doesn't support
+            // streaming (older binary), the client falls back to plain
+            // /scribe and the per-page class list comes back empty, which
+            // QC treats as "not bibliography" → strict default ceiling
+            // everywhere.
+            let conversion = scribe
+                .convert_with_progress(raw_bytes, Some(timeout), |_| {})
                 .await
                 .map_err(|e| {
                     // Server-side format errors ("Invalid image size",
@@ -190,6 +198,8 @@ pub async fn convert_and_upload(
                         HandlerError::Transient(ctx)
                     }
                 })?;
+            let md = conversion.markdown;
+            let per_page_region_classes = conversion.per_page_region_classes;
             // VLM-only QC. HTML/EPUB parsers don't repeat tokens, and
             // their natural structural repetition (headings, tables)
             // trips clean_repetitions and explodes into a retry storm.
@@ -201,10 +211,28 @@ pub async fn convert_and_upload(
             // got re-queued forever. Operators retry via `hs scribe
             // reconvert`, which clears the stamp and republishes once.
             let original_md = md.clone();
-            let (md_clean, truncations) = crate::postprocess::clean_repetitions(&md);
+            let (md_clean, per_page_truncations) =
+                crate::postprocess::clean_repetitions_per_page(&md);
+            let truncations: usize = per_page_truncations.iter().sum();
             let longest_run = crate::postprocess::longest_repeated_run_bytes(&original_md);
-            let pages_for_qc = hs_common::catalog::compute_page_offsets(&md_clean).len() as u64;
-            match crate::postprocess::qc_verdict(truncations, pages_for_qc, longest_run) {
+            // Align the bibliography flags with per_page_truncations.len().
+            // The wire-protocol fallback (old server) supplies an empty
+            // class vec; pad with empty class lists so qc_verdict sees the
+            // same length on both sides, all flagged as non-bibliography.
+            let total_pages = per_page_truncations.len();
+            let per_page_is_bibliography: Vec<bool> = (0..total_pages)
+                .map(|i| {
+                    per_page_region_classes
+                        .get(i)
+                        .map(|classes| crate::postprocess::is_bibliography_page(classes))
+                        .unwrap_or(false)
+                })
+                .collect();
+            match crate::postprocess::qc_verdict(
+                &per_page_truncations,
+                &per_page_is_bibliography,
+                longest_run,
+            ) {
                 crate::postprocess::QcVerdict::RejectLoop => {
                     if let Err(e) = hs_common::catalog::update_conversion_failed_via(
                         storage,

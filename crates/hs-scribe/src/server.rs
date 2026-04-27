@@ -302,9 +302,16 @@ async fn handle_scribe_stream(
             .processor
             .process_pdf_with_progress(&path, on_progress);
         match tokio::time::timeout(deadline, fut).await {
-            Ok(Ok(md)) => {
-                record_success(&state.last_conversion_ms, &state.total_conversions, &md);
-                let line = StreamLine::Result { markdown: md };
+            Ok(Ok(result)) => {
+                record_success(
+                    &state.last_conversion_ms,
+                    &state.total_conversions,
+                    &result.markdown,
+                );
+                let line = StreamLine::Result {
+                    markdown: result.markdown,
+                    per_page_region_classes: result.per_page_region_classes,
+                };
                 if let Ok(json) = serde_json::to_string(&line) {
                     let _ = tx.send(Ok(format!("{json}\n"))).await;
                 }

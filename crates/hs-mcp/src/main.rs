@@ -1750,74 +1750,91 @@ impl HomeStillMcp {
         // Dispatch by source type — one path per file extension. No
         // fallback between types; if the named source isn't present, we
         // error loudly instead of silently converting something else.
-        let (md, source_key, server_label) = if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await
-        {
-            let client = self
-                .scribe_client()
-                .map_err(|e| e.to_string())?
-                .ok_or("No scribe server configured")?;
-            // Stream scribe's per-page progress through the MCP peer as
-            // notifications/progress events. Each event resets Claude
-            // Desktop's 4-min tool-call timeout, so multi-page PDFs that
-            // take longer than 240s end-to-end can complete.
-            let progress_token = context.meta.get_progress_token();
-            let peer = context.peer.clone();
-            let stem_for_progress = p.stem.clone();
-            let on_progress = move |event: hs_scribe::client::ProgressEvent| {
-                let Some(token) = progress_token.clone() else {
-                    return;
+        let (md, per_page_region_classes, source_key, server_label) =
+            if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await {
+                let client = self
+                    .scribe_client()
+                    .map_err(|e| e.to_string())?
+                    .ok_or("No scribe server configured")?;
+                // Stream scribe's per-page progress through the MCP peer as
+                // notifications/progress events. Each event resets Claude
+                // Desktop's 4-min tool-call timeout, so multi-page PDFs that
+                // take longer than 240s end-to-end can complete.
+                let progress_token = context.meta.get_progress_token();
+                let peer = context.peer.clone();
+                let stem_for_progress = p.stem.clone();
+                let on_progress = move |event: hs_scribe::client::ProgressEvent| {
+                    let Some(token) = progress_token.clone() else {
+                        return;
+                    };
+                    let peer = peer.clone();
+                    let stem = stem_for_progress.clone();
+                    tokio::spawn(async move {
+                        let mut params = ProgressNotificationParam::new(token, event.page as f64)
+                            .with_message(format!(
+                                "{stem}: {} {}/{}",
+                                event.stage, event.page, event.total_pages
+                            ));
+                        if event.total_pages > 0 {
+                            params = params.with_total(event.total_pages as f64);
+                        }
+                        if let Err(e) = peer.notify_progress(params).await {
+                            tracing::warn!(stem = %stem, error = %e, "notify_progress failed");
+                        }
+                    });
                 };
-                let peer = peer.clone();
-                let stem = stem_for_progress.clone();
-                tokio::spawn(async move {
-                    let mut params = ProgressNotificationParam::new(token, event.page as f64)
-                        .with_message(format!(
-                            "{stem}: {} {}/{}",
-                            event.stage, event.page, event.total_pages
-                        ));
-                    if event.total_pages > 0 {
-                        params = params.with_total(event.total_pages as f64);
-                    }
-                    if let Err(e) = peer.notify_progress(params).await {
-                        tracing::warn!(stem = %stem, error = %e, "notify_progress failed");
-                    }
-                });
-            };
-            let md = client
-                .convert_with_progress(pdf_bytes, None, on_progress)
-                .await
-                .map_err(|e| format!("Conversion failed: {e}"))?;
-            (md, pdf_key, "scribe-vlm".to_string())
-        } else if let Ok(html_bytes) = self.storage.get(&html_key).await {
-            let html = String::from_utf8(html_bytes)
-                .map_err(|e| format!("HTML at {html_key} is not valid UTF-8: {e}"))?;
-            let md = hs_scribe::html::convert_html_to_markdown(&html);
-            (md, html_key, "html-parser".to_string())
-        } else if let Ok(epub_bytes) = self.storage.get(&epub_key).await {
-            let md = hs_scribe::epub::convert_epub_to_markdown(&epub_bytes)
-                .map_err(|e| format!("EPUB parse failed for {epub_key}: {e}"))?;
-            (md, epub_key, "epub-parser".to_string())
-        } else {
-            return Err(format!(
+                let conversion = client
+                    .convert_with_progress(pdf_bytes, None, on_progress)
+                    .await
+                    .map_err(|e| format!("Conversion failed: {e}"))?;
+                (
+                    conversion.markdown,
+                    conversion.per_page_region_classes,
+                    pdf_key,
+                    "scribe-vlm".to_string(),
+                )
+            } else if let Ok(html_bytes) = self.storage.get(&html_key).await {
+                let html = String::from_utf8(html_bytes)
+                    .map_err(|e| format!("HTML at {html_key} is not valid UTF-8: {e}"))?;
+                let md = hs_scribe::html::convert_html_to_markdown(&html);
+                (md, Vec::new(), html_key, "html-parser".to_string())
+            } else if let Ok(epub_bytes) = self.storage.get(&epub_key).await {
+                let md = hs_scribe::epub::convert_epub_to_markdown(&epub_bytes)
+                    .map_err(|e| format!("EPUB parse failed for {epub_key}: {e}"))?;
+                (md, Vec::new(), epub_key, "epub-parser".to_string())
+            } else {
+                return Err(format!(
                 "No PDF, HTML, or EPUB found for '{}' (tried {pdf_key}, {html_key}, {epub_key})",
                 p.stem
             ));
-        };
+            };
         let duration_secs = start.elapsed().as_secs_f64();
 
         let longest_run = hs_scribe::postprocess::longest_repeated_run_bytes(&md);
-        let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
+        let (md, per_page_truncations) = hs_scribe::postprocess::clean_repetitions_per_page(&md);
+        let truncations: usize = per_page_truncations.iter().sum();
         if truncations > 0 {
             tracing::info!("{}: cleaned {} repetition site(s)", p.stem, truncations);
         }
 
         let page_offsets = hs_common::catalog::compute_page_offsets(&md);
         let total_pages = page_offsets.len() as u64;
+        let per_page_is_bibliography: Vec<bool> = (0..per_page_truncations.len())
+            .map(|i| {
+                per_page_region_classes
+                    .get(i)
+                    .map(|classes| hs_scribe::postprocess::is_bibliography_page(classes))
+                    .unwrap_or(false)
+            })
+            .collect();
 
         // VLM repetition-loop check: propagate as a hard error. No catalog
         // row is written — operator sees it in MCP error response + logs.
-        if hs_scribe::postprocess::qc_verdict(truncations, total_pages, longest_run)
-            == hs_scribe::postprocess::QcVerdict::RejectLoop
+        if hs_scribe::postprocess::qc_verdict(
+            &per_page_truncations,
+            &per_page_is_bibliography,
+            longest_run,
+        ) == hs_scribe::postprocess::QcVerdict::RejectLoop
         {
             return Err(format!(
                 "{}: VLM repetition loop ({} truncation site(s), longest_run={}B across {} page(s)) — not persisted",

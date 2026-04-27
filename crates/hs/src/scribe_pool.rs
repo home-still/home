@@ -1,6 +1,6 @@
 use anyhow::Result;
 use hs_common::service::pool::ServicePool;
-use hs_scribe::client::{ProgressEvent, ScribeClient};
+use hs_scribe::client::{ConversionResult, ProgressEvent, ScribeClient};
 use std::time::Duration;
 
 pub struct ScribePool {
@@ -23,12 +23,12 @@ impl ScribePool {
 
     /// Convert one PDF via the best available server.
     /// Caller is responsible for limiting concurrency (e.g. via a semaphore).
-    /// Returns (server_url, markdown) on success.
+    /// Returns `(server_url, ConversionResult)` on success.
     pub async fn convert_one(
         &self,
         pdf_bytes: Vec<u8>,
         on_progress: impl Fn(ProgressEvent) + Send + Sync + 'static,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, ConversionResult)> {
         let mut last_err = None;
         for attempt in 0..3 {
             match self.inner.pick_server().await {
@@ -44,10 +44,10 @@ impl ScribePool {
                         total_pages: 0,
                         message: format!("→ {short}"),
                     });
-                    let md = client
+                    let result = client
                         .convert_with_progress(pdf_bytes, None, on_progress)
                         .await?;
-                    return Ok((url, md));
+                    return Ok((url, result));
                 }
                 Err(e) => {
                     last_err = Some(e);

@@ -45,17 +45,17 @@ struct PreparedTable {
     cell_jpegs: Vec<Vec<u8>>,
 }
 
-enum PreparedPage {
-    FullPage {
-        page_idx: usize,
-        jpeg_bytes: Vec<u8>,
-    },
-    Regions {
-        page_idx: usize,
-        detection_order: Vec<usize>,
-        text_regions: Vec<PreparedRegion>,
-        table_regions: Vec<PreparedTable>,
-    },
+struct PreparedPage {
+    page_idx: usize,
+    /// PP-DocLayout-V3 class names for every region detected on this page,
+    /// in detection (read) order. Threaded through to the document-level
+    /// `ConversionResult` so the QC layer can apply the bibliography
+    /// multiplier without an additional layout-detection pass. Empty for
+    /// pages with no detected regions (the empty-page early return).
+    region_classes: Vec<String>,
+    detection_order: Vec<usize>,
+    text_regions: Vec<PreparedRegion>,
+    table_regions: Vec<PreparedTable>,
 }
 
 /// Round-robin pool of ONNX detectors. Each detector holds an `ort::Session`
@@ -222,16 +222,18 @@ impl Processor {
         let bboxes = filter_contained_regions(bboxes);
 
         if bboxes.is_empty() {
-            tracing::info!("No layout detections, falling back to full-page OCR");
-            let downscaled = maybe_downscale(image, self.config.max_image_dim);
-            let image_bytes = encode_jpeg(&downscaled)?;
-            let text = self.ocr.recognize(&image_bytes).await?;
+            // ONE PATH: zero layout regions => no VLM call, emit empty page.
+            // Full-page VLM with no spatial constraints is exactly the path
+            // that rides one phrase to num_predict on dense multi-column text
+            // (see ollama#10767, #14493 — penalty params silently dropped on
+            // the Go VLM runner). Real blank pages legitimately produce zero
+            // regions and should produce zero markdown, not invented VLM text.
+            // A pathological layout regression that drops every page is caught
+            // by qc_verdict's bad-page-ratio gate.
+            tracing::info!("layout returned zero regions; emitting empty page (no VLM call)");
             return Ok(ProcessedPage {
-                markdown: text.clone(),
-                regions: vec![RegionResult {
-                    class_name: "text".into(),
-                    text,
-                }],
+                markdown: String::new(),
+                regions: vec![],
             });
         }
 
@@ -437,7 +439,7 @@ impl Processor {
         &self,
         pdf_path: &str,
         on_progress: F,
-    ) -> Result<String>
+    ) -> Result<crate::client::ConversionResult>
     where
         F: Fn(ProgressEvent) + Send + Sync + 'static,
     {
@@ -526,7 +528,16 @@ impl Processor {
                 .collect()
                 .await;
 
-            return Ok(join_pages(&markdowns));
+            // FullPage mode bypasses layout detection — no per-page region
+            // class info exists. Empty class lists tell QC "not bibliography",
+            // which means strict default ceiling everywhere — the safer choice
+            // when layout context is absent.
+            let markdown = join_pages(&markdowns);
+            let per_page_region_classes = vec![Vec::new(); markdowns.len()];
+            return Ok(crate::client::ConversionResult {
+                markdown,
+                per_page_region_classes,
+            });
         }
 
         // Per-region mode: 2-stage async pipeline
@@ -535,7 +546,6 @@ impl Processor {
 
         let layout = self.layout_detectors.clone();
         let table = self.table_recognizers.clone();
-        let config = self.config.clone();
         let on_progress_s1 = Arc::clone(&on_progress);
 
         let stage1 = tokio::task::spawn_blocking(move || {
@@ -553,7 +563,7 @@ impl Processor {
                     page.image.width(),
                     page.image.height(),
                 );
-                let prepared = prepare_page(idx, &page.image, &layout, &table, &config)?;
+                let prepared = prepare_page(idx, &page.image, &layout, &table)?;
                 on_progress_s1(ProgressEvent {
                     stage: "layout".into(),
                     page: (idx + 1) as u64,
@@ -600,11 +610,11 @@ impl Processor {
             });
         }
 
-        let mut results: Vec<(usize, String)> = Vec::with_capacity(total as usize);
+        let mut results: Vec<(usize, String, Vec<String>)> = Vec::with_capacity(total as usize);
         while let Some(res) = tasks.join_next().await {
             results.push(res??);
         }
-        results.sort_by_key(|(idx, _)| *idx);
+        results.sort_by_key(|(idx, _, _)| *idx);
 
         stage1.await??;
 
@@ -615,9 +625,16 @@ impl Processor {
             message: "Assembling markdown...".into(),
         });
 
-        Ok(join_pages(
-            &results.into_iter().map(|(_, md)| md).collect::<Vec<_>>(),
-        ))
+        let mut markdowns = Vec::with_capacity(results.len());
+        let mut per_page_region_classes = Vec::with_capacity(results.len());
+        for (_, md, classes) in results {
+            markdowns.push(md);
+            per_page_region_classes.push(classes);
+        }
+        Ok(crate::client::ConversionResult {
+            markdown: join_pages(&markdowns),
+            per_page_region_classes,
+        })
     }
 
     pub async fn process_pdf(&self, pdf_path: &str) -> Result<String> {
@@ -685,7 +702,6 @@ impl Processor {
 
         let layout = self.layout_detectors.clone();
         let table = self.table_recognizers.clone();
-        let config = self.config.clone();
 
         let stage1 = tokio::task::spawn_blocking(move || {
             for (idx, page) in pages.into_iter().enumerate() {
@@ -696,7 +712,7 @@ impl Processor {
                     page.image.width(),
                     page.image.height(),
                 );
-                let prepared = prepare_page(idx, &page.image, &layout, &table, &config)?;
+                let prepared = prepare_page(idx, &page.image, &layout, &table)?;
                 if tx.blocking_send(prepared).is_err() {
                     break;
                 }
@@ -718,16 +734,19 @@ impl Processor {
             });
         }
 
-        // Collect results, sort by page index
-        let mut results: Vec<(usize, String)> = Vec::with_capacity(total);
+        // Collect results, sort by page index. process_pdf only returns
+        // markdown — the per-page region classes (third tuple element) are
+        // collected by execute_vlm_for_page but dropped here. Callers that
+        // need them (event_watch's per-page QC) use process_pdf_with_progress.
+        let mut results: Vec<(usize, String, Vec<String>)> = Vec::with_capacity(total);
         while let Some(res) = tasks.join_next().await {
             results.push(res??);
         }
-        results.sort_by_key(|(idx, _)| *idx);
+        results.sort_by_key(|(idx, _, _)| *idx);
 
         stage1.await??;
         Ok(join_pages(
-            &results.into_iter().map(|(_, md)| md).collect::<Vec<_>>(),
+            &results.into_iter().map(|(_, md, _)| md).collect::<Vec<_>>(),
         ))
     }
 }
@@ -873,7 +892,6 @@ fn prepare_page(
     image: &DynamicImage,
     layout: &Option<Arc<DetectorPool<LayoutDetector>>>,
     table: &Option<Arc<DetectorPool<TableStructureRecognizer>>>,
-    config: &AppConfig,
 ) -> Result<PreparedPage> {
     let bboxes = {
         let pool = layout
@@ -887,17 +905,28 @@ fn prepare_page(
     let bboxes = filter_contained_regions(bboxes);
 
     if bboxes.is_empty() {
+        // ONE PATH: zero layout regions => no VLM call, emit empty page.
+        // Same rationale as process_image_regions_full above — full-page VLM
+        // on dense multi-column text is the path that triggers repetition
+        // loops (ollama#10767, #14493). A pathological layout regression
+        // dropping every page is caught by qc_verdict's bad-page-ratio gate.
         tracing::info!(
-            "Page {}: no layout detections → full-page VLM",
+            "Page {}: layout returned zero regions; emitting empty page (no VLM call)",
             page_idx + 1
         );
-        let downscaled = maybe_downscale(image, config.max_image_dim);
-        let jpeg_bytes = encode_jpeg(&downscaled)?;
-        return Ok(PreparedPage::FullPage {
+        return Ok(PreparedPage {
             page_idx,
-            jpeg_bytes,
+            region_classes: vec![],
+            detection_order: vec![],
+            text_regions: vec![],
+            table_regions: vec![],
         });
     }
+
+    // Snapshot per-page region class names BEFORE the table/text split
+    // and Skip-filter consume `bboxes`. These are surfaced to the
+    // document-level QC gate via `ConversionResult.per_page_region_classes`.
+    let region_classes: Vec<String> = bboxes.iter().map(|b| b.class_name.clone()).collect();
 
     // Filter out Skip regions
     let bboxes: Vec<BBox> = bboxes
@@ -1035,8 +1064,9 @@ fn prepare_page(
         });
     }
 
-    Ok(PreparedPage::Regions {
+    Ok(PreparedPage {
         page_idx,
+        region_classes,
         detection_order,
         text_regions,
         table_regions,
@@ -1044,6 +1074,10 @@ fn prepare_page(
 }
 
 /// Stage 2: execute VLM inference for a single prepared page.
+/// Returns `(page_idx, markdown, region_classes)`. `region_classes` is the
+/// per-page list of PP-DocLayout-V3 class names threaded straight through
+/// from `prepare_page` — used by the document-level QC gate to apply the
+/// bibliography multiplier.
 async fn execute_vlm_for_page(
     prepared: PreparedPage,
     ocr: Arc<OcrEngine>,
@@ -1052,193 +1086,158 @@ async fn execute_vlm_for_page(
     on_progress: Arc<dyn Fn(ProgressEvent) + Send + Sync>,
     page_num: u64,
     total_pages: u64,
-) -> Result<(usize, String)> {
-    match prepared {
-        PreparedPage::FullPage {
-            page_idx,
-            jpeg_bytes,
-        } => {
-            let permit = match sem.acquire().await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        page_idx,
-                        "semaphore closed on full-page VLM — emitting empty page"
-                    );
-                    return Ok((page_idx, String::new()));
-                }
-            };
-            let text = match ocr.recognize(&jpeg_bytes).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        page_idx,
-                        "full-page VLM failed — emitting empty page (paper continues)"
-                    );
-                    String::new()
-                }
-            };
-            drop(permit);
-            Ok((page_idx, text))
-        }
-        PreparedPage::Regions {
-            page_idx,
-            detection_order,
-            text_regions,
-            table_regions,
-        } => {
-            let total_regions = text_regions.len();
-            let region_done = Arc::new(AtomicU64::new(0));
+) -> Result<(usize, String, Vec<String>)> {
+    let PreparedPage {
+        page_idx,
+        region_classes,
+        detection_order,
+        text_regions,
+        table_regions,
+    } = prepared;
 
-            on_progress(ProgressEvent {
-                stage: "vlm".into(),
-                page: page_num,
-                total_pages,
-                message: format!(
-                    "OCR page {page_num}/{total_pages} ({total_regions} regions, {} tables)",
-                    table_regions.len()
-                ),
-            });
+    let total_regions = text_regions.len();
+    let region_done = Arc::new(AtomicU64::new(0));
 
-            // Process text regions with semaphore-gated concurrency.
-            // Inner closure is infallible — per-region failures degrade
-            // to empty string, the paper continues.
-            let region_results: Vec<(BBox, String)> = stream::iter(text_regions)
-                .map(|r| {
-                    let ocr = Arc::clone(&ocr);
-                    let sem = Arc::clone(&sem);
-                    let on_progress = Arc::clone(&on_progress);
-                    let region_done = Arc::clone(&region_done);
-                    async move {
-                        if r.region_type == RegionType::Figure || r.region_type == RegionType::Skip
-                        {
-                            region_done.fetch_add(1, Ordering::Relaxed);
-                            return (r.bbox, String::new());
-                        }
-                        if r.jpeg_bytes.is_empty() {
-                            // prepare_page logged the skip; keep the slot empty so
-                            // read-order assembly still has a placeholder.
-                            region_done.fetch_add(1, Ordering::Relaxed);
-                            return (r.bbox, String::new());
-                        }
-                        let permit = match sem.acquire().await {
-                            Ok(p) => p,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "semaphore closed — emitting empty region"
-                                );
-                                return (r.bbox, String::new());
-                            }
-                        };
-                        let text = match ocr.recognize_region(&r.jpeg_bytes, r.region_type).await {
-                            Ok(t) => t,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    region_type = ?r.region_type,
-                                    "region VLM failed — emitting empty region (paper continues)"
-                                );
-                                String::new()
-                            }
-                        };
-                        drop(permit);
-                        let done = region_done.fetch_add(1, Ordering::Relaxed) + 1;
-                        on_progress(ProgressEvent {
-                            stage: "vlm".into(),
-                            page: page_num,
-                            total_pages,
-                            message: format!(
-                                "OCR region {done}/{total_regions} on page {page_num}"
-                            ),
-                        });
-                        (r.bbox, text)
+    on_progress(ProgressEvent {
+        stage: "vlm".into(),
+        page: page_num,
+        total_pages,
+        message: format!(
+            "OCR page {page_num}/{total_pages} ({total_regions} regions, {} tables)",
+            table_regions.len()
+        ),
+    });
+
+    // Process text regions with semaphore-gated concurrency.
+    // Inner closure is infallible — per-region failures degrade
+    // to empty string, the paper continues.
+    let region_results: Vec<(BBox, String)> = stream::iter(text_regions)
+        .map(|r| {
+            let ocr = Arc::clone(&ocr);
+            let sem = Arc::clone(&sem);
+            let on_progress = Arc::clone(&on_progress);
+            let region_done = Arc::clone(&region_done);
+            async move {
+                if r.region_type == RegionType::Figure || r.region_type == RegionType::Skip {
+                    region_done.fetch_add(1, Ordering::Relaxed);
+                    return (r.bbox, String::new());
+                }
+                if r.jpeg_bytes.is_empty() {
+                    // prepare_page logged the skip; keep the slot empty so
+                    // read-order assembly still has a placeholder.
+                    region_done.fetch_add(1, Ordering::Relaxed);
+                    return (r.bbox, String::new());
+                }
+                let permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "semaphore closed — emitting empty region"
+                        );
+                        return (r.bbox, String::new());
                     }
-                })
-                .buffer_unordered(region_parallel)
-                .collect()
-                .await;
-
-            let mut regions: Vec<(BBox, String)> = region_results;
-
-            // Process table cells with semaphore-gated concurrency
-            for (t_idx, table) in table_regions.into_iter().enumerate() {
-                let total_cells = table.cell_jpegs.len();
-                let cell_done = Arc::new(AtomicU64::new(0));
-
+                };
+                let text = match ocr.recognize_region(&r.jpeg_bytes, r.region_type).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            region_type = ?r.region_type,
+                            "region VLM failed — emitting empty region (paper continues)"
+                        );
+                        String::new()
+                    }
+                };
+                drop(permit);
+                let done = region_done.fetch_add(1, Ordering::Relaxed) + 1;
                 on_progress(ProgressEvent {
                     stage: "vlm".into(),
                     page: page_num,
                     total_pages,
-                    message: format!(
-                        "OCR table {}/{} ({total_cells} cells) on page {page_num}",
-                        t_idx + 1,
-                        t_idx + 1
-                    ),
+                    message: format!("OCR region {done}/{total_regions} on page {page_num}"),
                 });
-
-                let cell_texts: Vec<String> = stream::iter(table.cell_jpegs)
-                    .map(|jpeg| {
-                        let ocr = Arc::clone(&ocr);
-                        let sem = Arc::clone(&sem);
-                        let on_progress = Arc::clone(&on_progress);
-                        let cell_done = Arc::clone(&cell_done);
-                        async move {
-                            if jpeg.is_empty() {
-                                cell_done.fetch_add(1, Ordering::Relaxed);
-                                return String::new();
-                            }
-                            let permit = match sem.acquire().await {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "semaphore closed — emitting empty cell"
-                                    );
-                                    return String::new();
-                                }
-                            };
-                            let result = match ocr.recognize_region(&jpeg, RegionType::Text).await {
-                                Ok(text) => text.trim().to_string(),
-                                Err(e) => {
-                                    tracing::warn!("Cell OCR failed: {e}");
-                                    String::new()
-                                }
-                            };
-                            drop(permit);
-                            let done = cell_done.fetch_add(1, Ordering::Relaxed) + 1;
-                            on_progress(ProgressEvent {
-                                stage: "vlm".into(),
-                                page: page_num,
-                                total_pages,
-                                message: format!(
-                                    "OCR table cell {done}/{total_cells} on page {page_num}"
-                                ),
-                            });
-                            result
-                        }
-                    })
-                    .buffer_unordered(region_parallel)
-                    .collect::<Vec<String>>()
-                    .await;
-
-                let html = build_html_from_structure(&table.structure, &cell_texts);
-                regions.push((table.bbox, html));
+                (r.bbox, text)
             }
+        })
+        .buffer_unordered(region_parallel)
+        .collect()
+        .await;
 
-            // Re-sort by detection order
-            let order_map: std::collections::HashMap<usize, usize> = detection_order
-                .iter()
-                .enumerate()
-                .map(|(pos, &id)| (id, pos))
-                .collect();
-            regions.sort_by_key(|(bbox, _)| *order_map.get(&bbox.unique_id).unwrap_or(&usize::MAX));
+    let mut regions: Vec<(BBox, String)> = region_results;
 
-            Ok((page_idx, assemble_page_markdown(&regions)))
-        }
+    // Process table cells with semaphore-gated concurrency
+    for (t_idx, table) in table_regions.into_iter().enumerate() {
+        let total_cells = table.cell_jpegs.len();
+        let cell_done = Arc::new(AtomicU64::new(0));
+
+        on_progress(ProgressEvent {
+            stage: "vlm".into(),
+            page: page_num,
+            total_pages,
+            message: format!(
+                "OCR table {}/{} ({total_cells} cells) on page {page_num}",
+                t_idx + 1,
+                t_idx + 1
+            ),
+        });
+
+        let cell_texts: Vec<String> = stream::iter(table.cell_jpegs)
+            .map(|jpeg| {
+                let ocr = Arc::clone(&ocr);
+                let sem = Arc::clone(&sem);
+                let on_progress = Arc::clone(&on_progress);
+                let cell_done = Arc::clone(&cell_done);
+                async move {
+                    if jpeg.is_empty() {
+                        cell_done.fetch_add(1, Ordering::Relaxed);
+                        return String::new();
+                    }
+                    let permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "semaphore closed — emitting empty cell"
+                            );
+                            return String::new();
+                        }
+                    };
+                    let result = match ocr.recognize_region(&jpeg, RegionType::Text).await {
+                        Ok(text) => text.trim().to_string(),
+                        Err(e) => {
+                            tracing::warn!("Cell OCR failed: {e}");
+                            String::new()
+                        }
+                    };
+                    drop(permit);
+                    let done = cell_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    on_progress(ProgressEvent {
+                        stage: "vlm".into(),
+                        page: page_num,
+                        total_pages,
+                        message: format!("OCR table cell {done}/{total_cells} on page {page_num}"),
+                    });
+                    result
+                }
+            })
+            .buffer_unordered(region_parallel)
+            .collect::<Vec<String>>()
+            .await;
+
+        let html = build_html_from_structure(&table.structure, &cell_texts);
+        regions.push((table.bbox, html));
     }
+
+    // Re-sort by detection order
+    let order_map: std::collections::HashMap<usize, usize> = detection_order
+        .iter()
+        .enumerate()
+        .map(|(pos, &id)| (id, pos))
+        .collect();
+    regions.sort_by_key(|(bbox, _)| *order_map.get(&bbox.unique_id).unwrap_or(&usize::MAX));
+
+    Ok((page_idx, assemble_page_markdown(&regions), region_classes))
 }
 
 /// Crop a rectangular subimage with explicit bounds checking. Returns

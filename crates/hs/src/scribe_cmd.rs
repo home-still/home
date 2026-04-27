@@ -480,7 +480,7 @@ async fn cmd_convert(
         client
             .convert_with_progress(pdf_bytes, Some(convert_timeout), on_progress)
             .await
-            .map(|md| (servers[0].clone(), md))
+            .map(|conv| (servers[0].clone(), conv))
     } else {
         let pool = ScribePool::new(&servers, convert_timeout)?;
         pool.convert_one(pdf_bytes, on_progress).await
@@ -491,17 +491,31 @@ async fn cmd_convert(
         Err(e) => stage.finish_failed(&format!("{e:#}")),
     }
 
-    let (_server, md) = result?;
-    let longest_run = hs_scribe::postprocess::longest_repeated_run_bytes(&md);
-    let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
+    let (_server, conversion) = result?;
+    let raw_md = conversion.markdown;
+    let per_page_region_classes = conversion.per_page_region_classes;
+    let longest_run = hs_scribe::postprocess::longest_repeated_run_bytes(&raw_md);
+    let (md, per_page_truncations) = hs_scribe::postprocess::clean_repetitions_per_page(&raw_md);
+    let truncations: usize = per_page_truncations.iter().sum();
     if truncations > 0 {
         tracing::info!("Cleaned {} repetition site(s)", truncations);
     }
 
     let page_offsets = hs_common::catalog::compute_page_offsets(&md);
     let total_pages = page_offsets.len() as u64;
-    if hs_scribe::postprocess::qc_verdict(truncations, total_pages, longest_run)
-        == hs_scribe::postprocess::QcVerdict::RejectLoop
+    let per_page_is_bibliography: Vec<bool> = (0..per_page_truncations.len())
+        .map(|i| {
+            per_page_region_classes
+                .get(i)
+                .map(|classes| hs_scribe::postprocess::is_bibliography_page(classes))
+                .unwrap_or(false)
+        })
+        .collect();
+    if hs_scribe::postprocess::qc_verdict(
+        &per_page_truncations,
+        &per_page_is_bibliography,
+        longest_run,
+    ) == hs_scribe::postprocess::QcVerdict::RejectLoop
     {
         anyhow::bail!(
             "VLM repetition loop: {truncations} truncation site(s), longest_run={longest_run}B \

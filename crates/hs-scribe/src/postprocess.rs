@@ -51,9 +51,21 @@ pub enum QcVerdict {
 /// Absolute truncation ceiling: more than this across the whole doc is a
 /// runaway VLM loop regardless of length.
 const QC_ABSOLUTE_MAX: usize = 20;
-/// Per-page truncation ceiling: catches papers that are long enough to
-/// dilute the absolute ceiling but still have loopy content on some pages.
-const QC_PER_PAGE_MAX: usize = 5;
+/// Per-page truncation ceiling for non-bibliography pages. A single page
+/// with more than this many truncation sites is loopy enough to reject
+/// the whole document — long-tail dilution of the absolute ceiling no
+/// longer hides a single bad page.
+const QC_PER_PAGE_MAX: usize = 3;
+/// Bibliography pages legitimately repeat citation boilerplate ("et al.",
+/// year prefixes, separator chars), so we apply a 3× multiplier — effective
+/// per-page ceiling = 9 — to avoid over-truncating clean reference lists.
+/// Non-bibliography pages stay strict.
+const QC_BIBLIOGRAPHY_MULTIPLIER: usize = 3;
+/// Maximum percentage of pages allowed to have any truncation activity.
+/// Catches the "many slightly-loopy pages" mode that no per-page or
+/// absolute gate trips: 100 pages × 1 truncation each evades both, but
+/// 100% of pages being touched is itself the failure signal.
+const QC_BAD_PAGE_RATIO_PCT: usize = 10;
 /// Longest contiguous repeated-substring run, in bytes. The truncation-site
 /// count alone misses single fat loops: one continuous 9 KB run of "the
 /// retrieval of" collapses to a single site under `clean_repetitions` and
@@ -65,23 +77,67 @@ const QC_LONGEST_RUN_BYTES_MAX: usize = 1024;
 /// `clean_repetitions` (4-gram >3×).
 const LOOP_MIN_REPS: usize = 4;
 
-/// Decide whether the markdown that came out of `clean_repetitions` is
-/// trustworthy. Trips on any of:
-/// - absolute truncation count > `QC_ABSOLUTE_MAX`
-/// - per-page truncation density > `QC_PER_PAGE_MAX`
+/// PP-DocLayout-V3 region class names that indicate a bibliography page.
+/// These are the canonical strings emitted by `models/layout.rs` (idx 18,
+/// 19 in the 25-class taxonomy). A page with any region of these classes
+/// gets the `QC_BIBLIOGRAPHY_MULTIPLIER` applied to its per-page ceiling.
+const BIBLIOGRAPHY_CLASSES: &[&str] = &["reference", "reference_content"];
+
+/// Returns true if any of the page's PP-DocLayout-V3 region classes marks
+/// the page as bibliography content. Empty class lists (e.g. blank pages,
+/// FullPage-mode pages with no layout info) are NOT bibliography — they
+/// get the strict default ceiling, which is the safer choice.
+pub fn is_bibliography_page(class_names: &[String]) -> bool {
+    class_names
+        .iter()
+        .any(|c| BIBLIOGRAPHY_CLASSES.contains(&c.as_str()))
+}
+
+/// Decide whether the markdown that came out of `clean_repetitions_per_page`
+/// is trustworthy. Trips on any of:
+/// - total truncation count > `QC_ABSOLUTE_MAX`
+/// - any single page with `truncations > QC_PER_PAGE_MAX` (or × the
+///   bibliography multiplier when that page's region classes flag it)
+/// - more than `QC_BAD_PAGE_RATIO_PCT`% of pages have any truncation activity
 /// - longest contiguous repeated-substring run > `QC_LONGEST_RUN_BYTES_MAX`
 ///
-/// `longest_run_bytes` should be computed on the **original** (pre-cleanup)
-/// markdown via [`longest_repeated_run_bytes`]. Without that signal a single
-/// fat loop registers as one truncation site and slips both count gates.
-pub fn qc_verdict(truncations: usize, total_pages: u64, longest_run_bytes: usize) -> QcVerdict {
-    if truncations > QC_ABSOLUTE_MAX {
+/// `per_page_truncations` and `per_page_is_bibliography` must have the same
+/// length and index alignment. `longest_run_bytes` is computed on the
+/// **original** (pre-cleanup) markdown via [`longest_repeated_run_bytes`].
+pub fn qc_verdict(
+    per_page_truncations: &[usize],
+    per_page_is_bibliography: &[bool],
+    longest_run_bytes: usize,
+) -> QcVerdict {
+    debug_assert_eq!(
+        per_page_truncations.len(),
+        per_page_is_bibliography.len(),
+        "qc_verdict: per_page vec lengths must match"
+    );
+
+    let total: usize = per_page_truncations.iter().sum();
+    if total > QC_ABSOLUTE_MAX {
         return QcVerdict::RejectLoop;
     }
-    let pages = total_pages.max(1) as usize;
-    if truncations > pages.saturating_mul(QC_PER_PAGE_MAX) {
+
+    for (i, &t) in per_page_truncations.iter().enumerate() {
+        let is_bib = per_page_is_bibliography.get(i).copied().unwrap_or(false);
+        let ceiling = if is_bib {
+            QC_PER_PAGE_MAX.saturating_mul(QC_BIBLIOGRAPHY_MULTIPLIER)
+        } else {
+            QC_PER_PAGE_MAX
+        };
+        if t > ceiling {
+            return QcVerdict::RejectLoop;
+        }
+    }
+
+    let total_pages = per_page_truncations.len().max(1);
+    let bad_pages = per_page_truncations.iter().filter(|&&t| t >= 1).count();
+    if bad_pages.saturating_mul(100) > total_pages.saturating_mul(QC_BAD_PAGE_RATIO_PCT) {
         return QcVerdict::RejectLoop;
     }
+
     if longest_run_bytes > QC_LONGEST_RUN_BYTES_MAX {
         return QcVerdict::RejectLoop;
     }
@@ -184,6 +240,28 @@ fn collect_word_positions(line: &str) -> Vec<(usize, &str)> {
         out.push((start, &line[start..end]));
     }
     out
+}
+
+/// Clean repetition artifacts from a doc-wide markdown string per-page,
+/// returning the cleaned markdown plus a `Vec<usize>` of per-page
+/// truncation counts (index-aligned with `compute_page_offsets`).
+///
+/// Pages are split on the same `\n\n---\n\n` separator that
+/// [`hs_common::catalog::compute_page_offsets`] uses, so the returned
+/// per-page counts correspond 1:1 with the offset entries downstream.
+///
+/// Invariant: the sum of returned counts equals
+/// `clean_repetitions(text).1` for the same input.
+pub fn clean_repetitions_per_page(text: &str) -> (String, Vec<usize>) {
+    const SEPARATOR: &str = "\n\n---\n\n";
+    let mut cleaned_pages: Vec<String> = Vec::new();
+    let mut per_page_counts: Vec<usize> = Vec::new();
+    for page in text.split(SEPARATOR) {
+        let (cleaned, count) = clean_repetitions(page);
+        cleaned_pages.push(cleaned);
+        per_page_counts.push(count);
+    }
+    (cleaned_pages.join(SEPARATOR), per_page_counts)
 }
 
 /// Clean repetition artifacts from markdown text.
@@ -398,44 +476,148 @@ mod tests {
         assert!(output.contains("end"));
     }
 
+    fn pages_with(truncations: &[usize]) -> Vec<bool> {
+        // Default: no bibliography pages.
+        vec![false; truncations.len()]
+    }
+
     #[test]
     fn qc_verdict_accepts_clean_doc() {
-        assert_eq!(qc_verdict(0, 10, 0), QcVerdict::Accept);
-        assert_eq!(qc_verdict(5, 10, 0), QcVerdict::Accept);
+        let truncs = vec![0; 10];
+        let bib = pages_with(&truncs);
+        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
+        // 1 truncation on a single page in a 100-page doc — within the
+        // 10% bad-page ratio gate.
+        let mut truncs = vec![0; 100];
+        truncs[0] = 1;
+        let bib = pages_with(&truncs);
+        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
     }
 
     #[test]
     fn qc_verdict_rejects_absolute_runaway() {
-        // 1-page doc with 21 truncations — clear loop.
-        assert_eq!(qc_verdict(21, 1, 0), QcVerdict::RejectLoop);
+        // Doc-wide total > 20 = reject. Spread across multiple pages so
+        // no single page trips the per-page gate first.
+        let truncs = vec![3; 7]; // total = 21
+        let bib = pages_with(&truncs);
+        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
     }
 
     #[test]
     fn qc_verdict_rejects_per_page_runaway() {
-        // 5-page doc with 30 truncations — over the per-page ceiling
-        // (5 * 5 = 25) and also over the absolute ceiling (20).
-        assert_eq!(qc_verdict(30, 5, 0), QcVerdict::RejectLoop);
+        // Single page > 3 truncations → reject (one bad page poisons doc).
+        let truncs = vec![0, 4, 0, 0]; // page 1 has 4 > 3
+        let bib = pages_with(&truncs);
+        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
     }
 
     #[test]
-    fn qc_verdict_tolerates_long_docs() {
-        // 30-page survey with 18 truncations — within both ceilings.
-        assert_eq!(qc_verdict(18, 30, 0), QcVerdict::Accept);
+    fn qc_verdict_tolerates_clean_long_docs() {
+        // 30-page survey with 0 truncations on every page.
+        let truncs = vec![0; 30];
+        let bib = pages_with(&truncs);
+        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
     }
 
     #[test]
     fn qc_verdict_rejects_single_long_run() {
         // F1 incident shape: one 9.4 KB contiguous run of "the retrieval of"
-        // collapses to a single truncation site. Count and per-page would
-        // pass; longest-run gate must trip.
-        assert_eq!(qc_verdict(1, 21, 9400), QcVerdict::RejectLoop);
+        // collapses to a single truncation site on one page. Per-page = 1
+        // (passes) but longest-run gate trips.
+        let truncs = vec![1, 0, 0];
+        let bib = pages_with(&truncs);
+        assert_eq!(qc_verdict(&truncs, &bib, 9400), QcVerdict::RejectLoop);
     }
 
     #[test]
     fn qc_verdict_tolerates_short_legitimate_repeats() {
-        // Citation boilerplate / table separators stay below 1 KB and
-        // shouldn't trip even when the count is 0.
-        assert_eq!(qc_verdict(0, 10, 800), QcVerdict::Accept);
+        // Citation boilerplate / table separators stay below 1 KB.
+        let truncs = vec![0; 10];
+        let bib = pages_with(&truncs);
+        assert_eq!(qc_verdict(&truncs, &bib, 800), QcVerdict::Accept);
+    }
+
+    #[test]
+    fn qc_verdict_bibliography_page_gets_3x_ceiling() {
+        // 8 truncations on a bibliography page passes (≤9), but trips
+        // the 10% bad-page ratio (1/4 = 25% > 10%) — so use a longer doc.
+        let truncs = vec![8, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // 1/10 = 10%, not > 10%
+        let bib = vec![
+            true, false, false, false, false, false, false, false, false, false,
+        ];
+        // 8 ≤ 3*3 = 9, so per-page gate passes; bad-page ratio is 10% (not > 10%).
+        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
+    }
+
+    #[test]
+    fn qc_verdict_bibliography_page_still_caps_at_multiplier() {
+        // A bibliography page with > 9 truncations is still rejected.
+        let truncs = vec![10, 0, 0, 0];
+        let bib = vec![true, false, false, false];
+        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
+    }
+
+    #[test]
+    fn qc_verdict_rejects_too_many_loopy_pages() {
+        // 11% of pages with truncation activity → reject even when no
+        // single page exceeds the ceiling and the absolute is fine.
+        // 100 pages × (11 with 1 truncation, 89 with 0) = 11 total, 11%.
+        let mut truncs = vec![0; 100];
+        for t in truncs.iter_mut().take(11) {
+            *t = 1;
+        }
+        let bib = pages_with(&truncs);
+        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
+    }
+
+    #[test]
+    fn qc_verdict_tolerates_at_threshold_loopy_pages() {
+        // 10% exactly → accept (10 of 100 pages with 1 truncation).
+        let mut truncs = vec![0; 100];
+        for t in truncs.iter_mut().take(10) {
+            *t = 1;
+        }
+        let bib = pages_with(&truncs);
+        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
+    }
+
+    #[test]
+    fn is_bibliography_page_detects_canonical_classes() {
+        assert!(is_bibliography_page(&["reference".to_string()]));
+        assert!(is_bibliography_page(&["reference_content".to_string()]));
+        assert!(is_bibliography_page(&[
+            "text".to_string(),
+            "reference".to_string()
+        ]));
+    }
+
+    #[test]
+    fn is_bibliography_page_rejects_other_classes() {
+        assert!(!is_bibliography_page(&[]));
+        assert!(!is_bibliography_page(&["text".to_string()]));
+        assert!(!is_bibliography_page(&[
+            "abstract".to_string(),
+            "paragraph_title".to_string()
+        ]));
+        // Substring matches must not trigger.
+        assert!(!is_bibliography_page(&["xreference".to_string()]));
+    }
+
+    #[test]
+    fn clean_repetitions_per_page_invariant_sum() {
+        // Sum of per-page counts must equal the doc-wide count.
+        let pages = [
+            "clean text".to_string(),
+            "P, P, P, P, P, P repeat".to_string(),
+            "the retrieval of ".repeat(50),
+            "more clean text".to_string(),
+        ];
+        let joined = pages.join("\n\n---\n\n");
+        let (_, doc_total) = clean_repetitions(&joined);
+        let (_, per_page) = clean_repetitions_per_page(&joined);
+        let per_page_sum: usize = per_page.iter().sum();
+        assert_eq!(per_page.len(), 4);
+        assert_eq!(per_page_sum, doc_total);
     }
 
     #[test]
@@ -463,9 +645,13 @@ mod tests {
 
     #[test]
     fn qc_verdict_zero_pages_treated_as_one() {
-        // Defensive: page count of 0 shouldn't divide-by-zero or let
-        // runaway truncations through.
-        assert_eq!(qc_verdict(21, 0, 0), QcVerdict::RejectLoop);
+        // Defensive: an empty per-page vec shouldn't divide-by-zero.
+        // Doc-wide total = 0, no per-page entries to check, longest-run
+        // dominant — used to assert 0-page input doesn't panic.
+        let truncs: Vec<usize> = vec![];
+        let bib: Vec<bool> = vec![];
+        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 9999), QcVerdict::RejectLoop);
     }
 
     #[test]
