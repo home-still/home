@@ -44,4 +44,14 @@ impl OcrEngine {
             OcrEngine::OpenAi(backend) => backend.recognize_region(image_bytes, region_type).await,
         }
     }
+
+    /// Short identifier of the active backend for the diag JSONL.
+    /// Stable values: `"ollama"`, `"cloud"`, `"openai-compat"`.
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            OcrEngine::Ollama(_) => "ollama",
+            OcrEngine::Cloud(_) => "cloud",
+            OcrEngine::OpenAi(_) => "openai-compat",
+        }
+    }
 }

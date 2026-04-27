@@ -1812,7 +1812,7 @@ impl HomeStillMcp {
 
         let longest_run = hs_scribe::postprocess::longest_repeated_run_bytes(&md);
         let (md, per_page_truncations) = hs_scribe::postprocess::clean_repetitions_per_page(&md);
-        let truncations: usize = per_page_truncations.iter().sum();
+        let truncations: usize = per_page_truncations.iter().map(|t| t.total()).sum();
         if truncations > 0 {
             tracing::info!("{}: cleaned {} repetition site(s)", p.stem, truncations);
         }
@@ -2178,7 +2178,8 @@ impl HomeStillMcp {
                     continue;
                 }
             };
-            let (cleaned, truncations) = hs_scribe::postprocess::clean_repetitions(&original);
+            let (cleaned, breakdown) = hs_scribe::postprocess::clean_repetitions(&original);
+            let truncations = breakdown.total();
             if truncations <= threshold {
                 continue;
             }
@@ -2195,6 +2196,7 @@ impl HomeStillMcp {
                 "stem": stem,
                 "key": obj.key,
                 "truncations": truncations,
+                "truncations_by_pass": breakdown,
                 "offending_snippet": snippet,
             }));
         }

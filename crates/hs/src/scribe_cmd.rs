@@ -494,9 +494,11 @@ async fn cmd_convert(
     let (_server, conversion) = result?;
     let raw_md = conversion.markdown;
     let per_page_region_classes = conversion.per_page_region_classes;
+    let per_page_diags = conversion.per_page_diags;
+    let qc_started = std::time::Instant::now();
     let longest_run = hs_scribe::postprocess::longest_repeated_run_bytes(&raw_md);
     let (md, per_page_truncations) = hs_scribe::postprocess::clean_repetitions_per_page(&raw_md);
-    let truncations: usize = per_page_truncations.iter().sum();
+    let truncations: usize = per_page_truncations.iter().map(|t| t.total()).sum();
     if truncations > 0 {
         tracing::info!("Cleaned {} repetition site(s)", truncations);
     }
@@ -511,12 +513,32 @@ async fn cmd_convert(
                 .unwrap_or(false)
         })
         .collect();
-    if hs_scribe::postprocess::qc_verdict(
+    let verdict = hs_scribe::postprocess::qc_verdict(
         &per_page_truncations,
         &per_page_is_bibliography,
         longest_run,
-    ) == hs_scribe::postprocess::QcVerdict::RejectLoop
-    {
+    );
+    // Optional --diag JSONL: opt-in via HS_SCRIBE_DIAG_DIR env var. Same
+    // semantics as the watch-events daemon path — one JSONL per stem.
+    let diag_dir = std::env::var_os("HS_SCRIBE_DIAG_DIR").map(PathBuf::from);
+    let diag_stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let mut diag = hs_scribe::diag::DiagWriter::open(diag_dir.as_ref(), &diag_stem);
+    for record in &per_page_diags {
+        diag.write_page(&diag_stem, record.clone());
+    }
+    diag.write_document(hs_scribe::diag::DocSummaryRecord {
+        stem: diag_stem.clone(),
+        total_pages: per_page_truncations.len(),
+        per_page_truncation_counts: per_page_truncations.clone(),
+        longest_run_bytes: longest_run,
+        qc_verdict: format!("{verdict:?}"),
+        wall_clock_ms: qc_started.elapsed().as_millis() as u64,
+    });
+    if verdict == hs_scribe::postprocess::QcVerdict::RejectLoop {
         anyhow::bail!(
             "VLM repetition loop: {truncations} truncation site(s), longest_run={longest_run}B \
              across {total_pages} page(s). Output not persisted; re-run or investigate the source PDF.",

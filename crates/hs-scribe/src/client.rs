@@ -41,11 +41,18 @@ pub fn compute_convert_timeout(pages: Option<u32>, policy: &TimeoutPolicy) -> Du
 /// detection happens) or by the streaming-fallback path that goes through
 /// the plain `/scribe` endpoint — both yield an empty `Vec<Vec<String>>`,
 /// which downstream QC treats as "not bibliography" (strict default).
+///
+/// `per_page_diags` carries one [`crate::diag::PageDiagRecord`] per page
+/// for the `<output>/<stem>.diag.jsonl` artifact. When the server is
+/// older than rc.312 or the streaming-fallback path is taken, this vec
+/// is empty and the consumer simply doesn't write a JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConversionResult {
     pub markdown: String,
     #[serde(default)]
     pub per_page_region_classes: Vec<Vec<String>>,
+    #[serde(default)]
+    pub per_page_diags: Vec<crate::diag::PageDiagRecord>,
 }
 
 /// A single line in the NDJSON progress stream.
@@ -57,6 +64,8 @@ pub enum StreamLine {
         markdown: String,
         #[serde(default)]
         per_page_region_classes: Vec<Vec<String>>,
+        #[serde(default)]
+        per_page_diags: Vec<crate::diag::PageDiagRecord>,
     },
     Error(String),
 }
@@ -278,6 +287,7 @@ impl ScribeClient {
         Ok(ConversionResult {
             markdown,
             per_page_region_classes: Vec::new(),
+            per_page_diags: Vec::new(),
         })
     }
 
@@ -342,10 +352,12 @@ impl ScribeClient {
                     Ok(StreamLine::Result {
                         markdown,
                         per_page_region_classes,
+                        per_page_diags,
                     }) => {
                         return Ok(ConversionResult {
                             markdown,
                             per_page_region_classes,
+                            per_page_diags,
                         })
                     }
                     Ok(StreamLine::Error(msg)) => {

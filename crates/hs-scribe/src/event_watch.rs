@@ -200,6 +200,7 @@ pub async fn convert_and_upload(
                 })?;
             let md = conversion.markdown;
             let per_page_region_classes = conversion.per_page_region_classes;
+            let per_page_diags = conversion.per_page_diags;
             // VLM-only QC. HTML/EPUB parsers don't repeat tokens, and
             // their natural structural repetition (headings, tables)
             // trips clean_repetitions and explodes into a retry storm.
@@ -210,10 +211,11 @@ pub async fn convert_and_upload(
             // 2026-04-23) didn't write the terminal stamp and the source
             // got re-queued forever. Operators retry via `hs scribe
             // reconvert`, which clears the stamp and republishes once.
+            let qc_started = std::time::Instant::now();
             let original_md = md.clone();
             let (md_clean, per_page_truncations) =
                 crate::postprocess::clean_repetitions_per_page(&md);
-            let truncations: usize = per_page_truncations.iter().sum();
+            let truncations: usize = per_page_truncations.iter().map(|t| t.total()).sum();
             let longest_run = crate::postprocess::longest_repeated_run_bytes(&original_md);
             // Align the bibliography flags with per_page_truncations.len().
             // The wire-protocol fallback (old server) supplies an empty
@@ -228,11 +230,30 @@ pub async fn convert_and_upload(
                         .unwrap_or(false)
                 })
                 .collect();
-            match crate::postprocess::qc_verdict(
+            let verdict = crate::postprocess::qc_verdict(
                 &per_page_truncations,
                 &per_page_is_bibliography,
                 longest_run,
-            ) {
+            );
+            // Optional --diag JSONL: opt-in via HS_SCRIBE_DIAG_DIR env var.
+            // Server-side per-page records (collected during conversion)
+            // and the document summary land in one append-only file per
+            // stem for grep/jq inspection. Disabled in steady state via
+            // the Option::is_none() check inside DiagWriter.
+            let diag_dir = std::env::var_os("HS_SCRIBE_DIAG_DIR").map(std::path::PathBuf::from);
+            let mut diag = crate::diag::DiagWriter::open(diag_dir.as_ref(), stem);
+            for record in &per_page_diags {
+                diag.write_page(stem, record.clone());
+            }
+            diag.write_document(crate::diag::DocSummaryRecord {
+                stem: stem.to_string(),
+                total_pages,
+                per_page_truncation_counts: per_page_truncations.clone(),
+                longest_run_bytes: longest_run,
+                qc_verdict: format!("{verdict:?}"),
+                wall_clock_ms: qc_started.elapsed().as_millis() as u64,
+            });
+            match verdict {
                 crate::postprocess::QcVerdict::RejectLoop => {
                     if let Err(e) = hs_common::catalog::update_conversion_failed_via(
                         storage,

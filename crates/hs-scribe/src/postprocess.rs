@@ -105,7 +105,7 @@ pub fn is_bibliography_page(class_names: &[String]) -> bool {
 /// length and index alignment. `longest_run_bytes` is computed on the
 /// **original** (pre-cleanup) markdown via [`longest_repeated_run_bytes`].
 pub fn qc_verdict(
-    per_page_truncations: &[usize],
+    per_page_truncations: &[crate::diag::TruncationCounts],
     per_page_is_bibliography: &[bool],
     longest_run_bytes: usize,
 ) -> QcVerdict {
@@ -115,25 +115,28 @@ pub fn qc_verdict(
         "qc_verdict: per_page vec lengths must match"
     );
 
-    let total: usize = per_page_truncations.iter().sum();
+    let total: usize = per_page_truncations.iter().map(|t| t.total()).sum();
     if total > QC_ABSOLUTE_MAX {
         return QcVerdict::RejectLoop;
     }
 
-    for (i, &t) in per_page_truncations.iter().enumerate() {
+    for (i, t) in per_page_truncations.iter().enumerate() {
         let is_bib = per_page_is_bibliography.get(i).copied().unwrap_or(false);
         let ceiling = if is_bib {
             QC_PER_PAGE_MAX.saturating_mul(QC_BIBLIOGRAPHY_MULTIPLIER)
         } else {
             QC_PER_PAGE_MAX
         };
-        if t > ceiling {
+        if t.total() > ceiling {
             return QcVerdict::RejectLoop;
         }
     }
 
     let total_pages = per_page_truncations.len().max(1);
-    let bad_pages = per_page_truncations.iter().filter(|&&t| t >= 1).count();
+    let bad_pages = per_page_truncations
+        .iter()
+        .filter(|t| t.total() >= 1)
+        .count();
     if bad_pages.saturating_mul(100) > total_pages.saturating_mul(QC_BAD_PAGE_RATIO_PCT) {
         return QcVerdict::RejectLoop;
     }
@@ -243,19 +246,19 @@ fn collect_word_positions(line: &str) -> Vec<(usize, &str)> {
 }
 
 /// Clean repetition artifacts from a doc-wide markdown string per-page,
-/// returning the cleaned markdown plus a `Vec<usize>` of per-page
-/// truncation counts (index-aligned with `compute_page_offsets`).
+/// returning the cleaned markdown plus a `Vec<TruncationCounts>` of
+/// per-page breakdowns (index-aligned with `compute_page_offsets`).
 ///
 /// Pages are split on the same `\n\n---\n\n` separator that
 /// [`hs_common::catalog::compute_page_offsets`] uses, so the returned
 /// per-page counts correspond 1:1 with the offset entries downstream.
 ///
-/// Invariant: the sum of returned counts equals
-/// `clean_repetitions(text).1` for the same input.
-pub fn clean_repetitions_per_page(text: &str) -> (String, Vec<usize>) {
+/// Invariant: the sum of `.total()` across the returned vec equals
+/// `clean_repetitions(text).1.total()` for the same input.
+pub fn clean_repetitions_per_page(text: &str) -> (String, Vec<crate::diag::TruncationCounts>) {
     const SEPARATOR: &str = "\n\n---\n\n";
     let mut cleaned_pages: Vec<String> = Vec::new();
-    let mut per_page_counts: Vec<usize> = Vec::new();
+    let mut per_page_counts: Vec<crate::diag::TruncationCounts> = Vec::new();
     for page in text.split(SEPARATOR) {
         let (cleaned, count) = clean_repetitions(page);
         cleaned_pages.push(cleaned);
@@ -266,35 +269,35 @@ pub fn clean_repetitions_per_page(text: &str) -> (String, Vec<usize>) {
 
 /// Clean repetition artifacts from markdown text.
 ///
-/// Returns `(cleaned_text, truncation_count)` where `truncation_count`
-/// is the number of repetition sites that were truncated.
-pub fn clean_repetitions(text: &str) -> (String, usize) {
+/// Returns `(cleaned_text, breakdown)` where `breakdown` is the per-pass
+/// truncation count. Total truncations = `breakdown.total()`.
+pub fn clean_repetitions(text: &str) -> (String, crate::diag::TruncationCounts) {
     let mut result = text.to_string();
-    let mut total_truncations = 0;
+    let mut breakdown = crate::diag::TruncationCounts::default();
 
     // Pass 1: character-level repetition (>10 consecutive identical chars)
     let (cleaned, count) = clean_char_repetitions(&result);
     result = cleaned;
-    total_truncations += count;
+    breakdown.char += count;
 
     // Pass 2: word n-gram repetition (4-gram repeating >3 consecutive times)
     let (cleaned, count) = clean_ngram_repetitions(&result, 4, 3);
     result = cleaned;
-    total_truncations += count;
+    breakdown.ngram4 += count;
 
     // Pass 3: shorter n-grams (2-gram repeating >4 consecutive times)
     let (cleaned, count) = clean_ngram_repetitions(&result, 2, 4);
     result = cleaned;
-    total_truncations += count;
+    breakdown.ngram2 += count;
 
     // Pass 4: unigram runs (same word repeating >5 consecutive times).
     // Catches VLM artifacts like "P, P, P, P, P" and ". . . . ." where
     // alternating tokens prevent the 2-gram pass from engaging.
     let (cleaned, count) = clean_ngram_repetitions(&result, 1, 5);
     result = cleaned;
-    total_truncations += count;
+    breakdown.ngram1 += count;
 
-    (result, total_truncations)
+    (result, breakdown)
 }
 
 /// Remove runs of >threshold consecutive identical characters.
@@ -382,12 +385,24 @@ fn clean_ngram_repetitions(text: &str, n: usize, max_repeats: usize) -> (String,
 mod tests {
     use super::*;
 
+    use crate::diag::TruncationCounts;
+
+    /// Build a TruncationCounts with all the count parked in `.char`
+    /// for tests that only care about totals (qc_verdict semantics).
+    fn tc(n: usize) -> TruncationCounts {
+        TruncationCounts {
+            char: n,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn char_repetition_truncated() {
         let input = "hello ggggggggggggggggggg world";
         let (output, count) = clean_repetitions(input);
         assert_eq!(output, "hello g world");
-        assert_eq!(count, 1);
+        assert_eq!(count.total(), 1);
+        assert_eq!(count.char, 1);
     }
 
     #[test]
@@ -398,7 +413,8 @@ mod tests {
         assert!(output.contains("and modeling"));
         assert!(!output.contains("and modeling and modeling and modeling and modeling"));
         assert!(output.ends_with("done"));
-        assert!(count > 0);
+        assert!(count.total() > 0);
+        assert!(count.ngram2 > 0 || count.ngram4 > 0);
     }
 
     #[test]
@@ -406,7 +422,7 @@ mod tests {
         let input = "This is fine.";
         let (output, count) = clean_repetitions(input);
         assert_eq!(output, input);
-        assert_eq!(count, 0);
+        assert_eq!(count.total(), 0);
     }
 
     #[test]
@@ -423,7 +439,7 @@ mod tests {
         let (output, count) = clean_repetitions(input);
         assert!(output.contains("J J"));
         assert!(output.ends_with("done"));
-        assert!(count > 0);
+        assert!(count.total() > 0);
     }
 
     #[test]
@@ -431,14 +447,14 @@ mod tests {
         let input = "Line one\n\nLine two\n\n---\n\nLine three";
         let (output, count) = clean_repetitions(input);
         assert_eq!(output, input);
-        assert_eq!(count, 0);
+        assert_eq!(count.total(), 0);
     }
 
     #[test]
     fn mixed_repetitions() {
         let input = "eseseseseseseseseseseseseses and the model the model the model the model the model the model end";
         let (output, count) = clean_repetitions(input);
-        assert!(count >= 1); // "the model" bigram repetition is caught
+        assert!(count.total() >= 1); // "the model" bigram repetition is caught
         assert!(output.contains("end"));
         assert!(!output.contains("the model the model the model the model the model"));
     }
@@ -451,7 +467,7 @@ mod tests {
         // because the surrounding tokens differ.
         let input = "Bywaters, Pover, P, P, P, P, P, P, P, P, Featherstone, B";
         let (output, count) = clean_repetitions(input);
-        assert!(count > 0, "expected at least one truncation");
+        assert!(count.total() > 0, "expected at least one truncation");
         assert!(
             !output.contains("P, P, P, P, P, P"),
             "unigram run should be collapsed: {output}"
@@ -476,20 +492,20 @@ mod tests {
         assert!(output.contains("end"));
     }
 
-    fn pages_with(truncations: &[usize]) -> Vec<bool> {
+    fn pages_with(truncations: &[TruncationCounts]) -> Vec<bool> {
         // Default: no bibliography pages.
         vec![false; truncations.len()]
     }
 
     #[test]
     fn qc_verdict_accepts_clean_doc() {
-        let truncs = vec![0; 10];
+        let truncs = vec![tc(0); 10];
         let bib = pages_with(&truncs);
         assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
         // 1 truncation on a single page in a 100-page doc — within the
         // 10% bad-page ratio gate.
-        let mut truncs = vec![0; 100];
-        truncs[0] = 1;
+        let mut truncs = vec![tc(0); 100];
+        truncs[0] = tc(1);
         let bib = pages_with(&truncs);
         assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
     }
@@ -498,7 +514,7 @@ mod tests {
     fn qc_verdict_rejects_absolute_runaway() {
         // Doc-wide total > 20 = reject. Spread across multiple pages so
         // no single page trips the per-page gate first.
-        let truncs = vec![3; 7]; // total = 21
+        let truncs = vec![tc(3); 7]; // total = 21
         let bib = pages_with(&truncs);
         assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
     }
@@ -506,7 +522,7 @@ mod tests {
     #[test]
     fn qc_verdict_rejects_per_page_runaway() {
         // Single page > 3 truncations → reject (one bad page poisons doc).
-        let truncs = vec![0, 4, 0, 0]; // page 1 has 4 > 3
+        let truncs = vec![tc(0), tc(4), tc(0), tc(0)]; // page 1 has 4 > 3
         let bib = pages_with(&truncs);
         assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
     }
@@ -514,7 +530,7 @@ mod tests {
     #[test]
     fn qc_verdict_tolerates_clean_long_docs() {
         // 30-page survey with 0 truncations on every page.
-        let truncs = vec![0; 30];
+        let truncs = vec![tc(0); 30];
         let bib = pages_with(&truncs);
         assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
     }
@@ -524,7 +540,7 @@ mod tests {
         // F1 incident shape: one 9.4 KB contiguous run of "the retrieval of"
         // collapses to a single truncation site on one page. Per-page = 1
         // (passes) but longest-run gate trips.
-        let truncs = vec![1, 0, 0];
+        let truncs = vec![tc(1), tc(0), tc(0)];
         let bib = pages_with(&truncs);
         assert_eq!(qc_verdict(&truncs, &bib, 9400), QcVerdict::RejectLoop);
     }
@@ -532,7 +548,7 @@ mod tests {
     #[test]
     fn qc_verdict_tolerates_short_legitimate_repeats() {
         // Citation boilerplate / table separators stay below 1 KB.
-        let truncs = vec![0; 10];
+        let truncs = vec![tc(0); 10];
         let bib = pages_with(&truncs);
         assert_eq!(qc_verdict(&truncs, &bib, 800), QcVerdict::Accept);
     }
@@ -541,7 +557,18 @@ mod tests {
     fn qc_verdict_bibliography_page_gets_3x_ceiling() {
         // 8 truncations on a bibliography page passes (≤9), but trips
         // the 10% bad-page ratio (1/4 = 25% > 10%) — so use a longer doc.
-        let truncs = vec![8, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // 1/10 = 10%, not > 10%
+        let truncs = vec![
+            tc(8),
+            tc(0),
+            tc(0),
+            tc(0),
+            tc(0),
+            tc(0),
+            tc(0),
+            tc(0),
+            tc(0),
+            tc(0),
+        ]; // 1/10 = 10%, not > 10%
         let bib = vec![
             true, false, false, false, false, false, false, false, false, false,
         ];
@@ -552,7 +579,7 @@ mod tests {
     #[test]
     fn qc_verdict_bibliography_page_still_caps_at_multiplier() {
         // A bibliography page with > 9 truncations is still rejected.
-        let truncs = vec![10, 0, 0, 0];
+        let truncs = vec![tc(10), tc(0), tc(0), tc(0)];
         let bib = vec![true, false, false, false];
         assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
     }
@@ -562,9 +589,9 @@ mod tests {
         // 11% of pages with truncation activity → reject even when no
         // single page exceeds the ceiling and the absolute is fine.
         // 100 pages × (11 with 1 truncation, 89 with 0) = 11 total, 11%.
-        let mut truncs = vec![0; 100];
+        let mut truncs = vec![tc(0); 100];
         for t in truncs.iter_mut().take(11) {
-            *t = 1;
+            *t = tc(1);
         }
         let bib = pages_with(&truncs);
         assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
@@ -573,9 +600,9 @@ mod tests {
     #[test]
     fn qc_verdict_tolerates_at_threshold_loopy_pages() {
         // 10% exactly → accept (10 of 100 pages with 1 truncation).
-        let mut truncs = vec![0; 100];
+        let mut truncs = vec![tc(0); 100];
         for t in truncs.iter_mut().take(10) {
-            *t = 1;
+            *t = tc(1);
         }
         let bib = pages_with(&truncs);
         assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
@@ -615,9 +642,9 @@ mod tests {
         let joined = pages.join("\n\n---\n\n");
         let (_, doc_total) = clean_repetitions(&joined);
         let (_, per_page) = clean_repetitions_per_page(&joined);
-        let per_page_sum: usize = per_page.iter().sum();
+        let per_page_sum: usize = per_page.iter().map(|t| t.total()).sum();
         assert_eq!(per_page.len(), 4);
-        assert_eq!(per_page_sum, doc_total);
+        assert_eq!(per_page_sum, doc_total.total());
     }
 
     #[test]
@@ -648,7 +675,7 @@ mod tests {
         // Defensive: an empty per-page vec shouldn't divide-by-zero.
         // Doc-wide total = 0, no per-page entries to check, longest-run
         // dominant — used to assert 0-page input doesn't panic.
-        let truncs: Vec<usize> = vec![];
+        let truncs: Vec<TruncationCounts> = vec![];
         let bib: Vec<bool> = vec![];
         assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
         assert_eq!(qc_verdict(&truncs, &bib, 9999), QcVerdict::RejectLoop);
@@ -706,6 +733,6 @@ mod tests {
         let input = "A A A A rest";
         let (output, count) = clean_repetitions(input);
         assert_eq!(output, input);
-        assert_eq!(count, 0);
+        assert_eq!(count.total(), 0);
     }
 }

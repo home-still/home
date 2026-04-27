@@ -53,6 +53,10 @@ struct PreparedPage {
     /// multiplier without an additional layout-detection pass. Empty for
     /// pages with no detected regions (the empty-page early return).
     region_classes: Vec<String>,
+    /// Original page raster dimensions captured pre-crop. Carried purely
+    /// for the diag JSONL — not used by any production code path.
+    image_width: u32,
+    image_height: u32,
     detection_order: Vec<usize>,
     text_regions: Vec<PreparedRegion>,
     table_regions: Vec<PreparedTable>,
@@ -534,9 +538,29 @@ impl Processor {
             // when layout context is absent.
             let markdown = join_pages(&markdowns);
             let per_page_region_classes = vec![Vec::new(); markdowns.len()];
+            // FullPage mode bypasses prepare_page so we don't have layout
+            // metadata. Emit minimal diag rows so downstream JSONL alignment
+            // (one record per page) still holds.
+            let backend_name = self.ocr.backend_name().to_string();
+            let dpi = self.config.dpi;
+            let per_page_diags: Vec<crate::diag::PageDiagRecord> = markdowns
+                .iter()
+                .enumerate()
+                .map(|(i, md)| crate::diag::PageDiagRecord {
+                    page_index: i,
+                    dpi,
+                    routing_path: "full-page".to_string(),
+                    backend: backend_name.clone(),
+                    raw_vlm_output_len: md.len(),
+                    raw_vlm_output_first_1k: crate::diag::truncate_at_char_boundary(md, 1024),
+                    output_byte_count: md.len(),
+                    ..Default::default()
+                })
+                .collect();
             return Ok(crate::client::ConversionResult {
                 markdown,
                 per_page_region_classes,
+                per_page_diags,
             });
         }
 
@@ -580,6 +604,7 @@ impl Processor {
         // Stage 2: VLM inference
         let ocr = Arc::clone(&self.ocr);
         let region_parallel = self.config.region_parallel;
+        let dpi = self.config.dpi;
         let vlm_completed = Arc::new(AtomicU64::new(0));
         let mut tasks = tokio::task::JoinSet::new();
 
@@ -598,6 +623,7 @@ impl Processor {
                     Arc::clone(&on_progress),
                     done,
                     total,
+                    dpi,
                 )
                 .await;
                 on_progress(ProgressEvent {
@@ -610,11 +636,12 @@ impl Processor {
             });
         }
 
-        let mut results: Vec<(usize, String, Vec<String>)> = Vec::with_capacity(total as usize);
+        let mut results: Vec<(usize, String, Vec<String>, crate::diag::PageDiagRecord)> =
+            Vec::with_capacity(total as usize);
         while let Some(res) = tasks.join_next().await {
             results.push(res??);
         }
-        results.sort_by_key(|(idx, _, _)| *idx);
+        results.sort_by_key(|(idx, _, _, _)| *idx);
 
         stage1.await??;
 
@@ -627,13 +654,16 @@ impl Processor {
 
         let mut markdowns = Vec::with_capacity(results.len());
         let mut per_page_region_classes = Vec::with_capacity(results.len());
-        for (_, md, classes) in results {
+        let mut per_page_diags = Vec::with_capacity(results.len());
+        for (_, md, classes, diag) in results {
             markdowns.push(md);
             per_page_region_classes.push(classes);
+            per_page_diags.push(diag);
         }
         Ok(crate::client::ConversionResult {
             markdown: join_pages(&markdowns),
             per_page_region_classes,
+            per_page_diags,
         })
     }
 
@@ -723,6 +753,7 @@ impl Processor {
         // Stage 2: VLM inference (concurrent across pages)
         let ocr = Arc::clone(&self.ocr);
         let region_parallel = self.config.region_parallel;
+        let dpi = self.config.dpi;
         let mut tasks = tokio::task::JoinSet::new();
 
         while let Some(prepared) = rx.recv().await {
@@ -730,23 +761,28 @@ impl Processor {
             let sem = Arc::clone(&vlm_sem);
             let noop: Arc<dyn Fn(ProgressEvent) + Send + Sync> = Arc::new(|_| {});
             tasks.spawn(async move {
-                execute_vlm_for_page(prepared, ocr, sem, region_parallel, noop, 0, 0).await
+                execute_vlm_for_page(prepared, ocr, sem, region_parallel, noop, 0, 0, dpi).await
             });
         }
 
         // Collect results, sort by page index. process_pdf only returns
-        // markdown — the per-page region classes (third tuple element) are
-        // collected by execute_vlm_for_page but dropped here. Callers that
-        // need them (event_watch's per-page QC) use process_pdf_with_progress.
-        let mut results: Vec<(usize, String, Vec<String>)> = Vec::with_capacity(total);
+        // markdown — region classes and diag records (the tail tuple
+        // elements) are collected by execute_vlm_for_page but dropped here.
+        // Callers that need them (event_watch's per-page QC, --diag JSONL)
+        // use process_pdf_with_progress.
+        let mut results: Vec<(usize, String, Vec<String>, crate::diag::PageDiagRecord)> =
+            Vec::with_capacity(total);
         while let Some(res) = tasks.join_next().await {
             results.push(res??);
         }
-        results.sort_by_key(|(idx, _, _)| *idx);
+        results.sort_by_key(|(idx, _, _, _)| *idx);
 
         stage1.await??;
         Ok(join_pages(
-            &results.into_iter().map(|(_, md, _)| md).collect::<Vec<_>>(),
+            &results
+                .into_iter()
+                .map(|(_, md, _, _)| md)
+                .collect::<Vec<_>>(),
         ))
     }
 }
@@ -904,6 +940,8 @@ fn prepare_page(
     let bboxes = deduplicate_boxes(bboxes);
     let bboxes = filter_contained_regions(bboxes);
 
+    let (image_width, image_height) = (image.width(), image.height());
+
     if bboxes.is_empty() {
         // ONE PATH: zero layout regions => no VLM call, emit empty page.
         // Same rationale as process_image_regions_full above — full-page VLM
@@ -917,6 +955,8 @@ fn prepare_page(
         return Ok(PreparedPage {
             page_idx,
             region_classes: vec![],
+            image_width,
+            image_height,
             detection_order: vec![],
             text_regions: vec![],
             table_regions: vec![],
@@ -1067,6 +1107,8 @@ fn prepare_page(
     Ok(PreparedPage {
         page_idx,
         region_classes,
+        image_width,
+        image_height,
         detection_order,
         text_regions,
         table_regions,
@@ -1074,10 +1116,11 @@ fn prepare_page(
 }
 
 /// Stage 2: execute VLM inference for a single prepared page.
-/// Returns `(page_idx, markdown, region_classes)`. `region_classes` is the
-/// per-page list of PP-DocLayout-V3 class names threaded straight through
-/// from `prepare_page` — used by the document-level QC gate to apply the
-/// bibliography multiplier.
+/// Returns `(page_idx, markdown, region_classes, diag)`. `region_classes`
+/// is the per-page list of PP-DocLayout-V3 class names threaded straight
+/// through from `prepare_page` — used by the document-level QC gate to
+/// apply the bibliography multiplier. `diag` is the per-page record
+/// surfaced to the optional `<output_dir>/<stem>.diag.jsonl`.
 async fn execute_vlm_for_page(
     prepared: PreparedPage,
     ocr: Arc<OcrEngine>,
@@ -1086,10 +1129,14 @@ async fn execute_vlm_for_page(
     on_progress: Arc<dyn Fn(ProgressEvent) + Send + Sync>,
     page_num: u64,
     total_pages: u64,
-) -> Result<(usize, String, Vec<String>)> {
+    dpi: u16,
+) -> Result<(usize, String, Vec<String>, crate::diag::PageDiagRecord)> {
+    let started = std::time::Instant::now();
     let PreparedPage {
         page_idx,
         region_classes,
+        image_width,
+        image_height,
         detection_order,
         text_regions,
         table_regions,
@@ -1237,7 +1284,40 @@ async fn execute_vlm_for_page(
         .collect();
     regions.sort_by_key(|(bbox, _)| *order_map.get(&bbox.unique_id).unwrap_or(&usize::MAX));
 
-    Ok((page_idx, assemble_page_markdown(&regions), region_classes))
+    let markdown = assemble_page_markdown(&regions);
+    let routing_path = if region_classes.is_empty() {
+        "empty-page"
+    } else {
+        "per-region"
+    };
+    let has_tables = region_classes
+        .iter()
+        .any(|c| RegionType::from_class(c) == RegionType::Table);
+    let has_formulas = region_classes.iter().any(|c| {
+        matches!(
+            RegionType::from_class(c),
+            RegionType::Formula | RegionType::InlineFormula
+        )
+    });
+    let diag = crate::diag::PageDiagRecord {
+        page_index: page_idx,
+        dpi,
+        image_width,
+        image_height,
+        layout_region_count: region_classes.len(),
+        layout_region_classes: region_classes.clone(),
+        has_tables,
+        has_formulas,
+        routing_path: routing_path.to_string(),
+        backend: ocr.backend_name().to_string(),
+        sampling_params: serde_json::Value::Null,
+        prompt: String::new(),
+        raw_vlm_output_len: markdown.len(),
+        raw_vlm_output_first_1k: crate::diag::truncate_at_char_boundary(&markdown, 1024),
+        output_byte_count: markdown.len(),
+        wall_clock_ms: started.elapsed().as_millis() as u64,
+    };
+    Ok((page_idx, markdown, region_classes, diag))
 }
 
 /// Crop a rectangular subimage with explicit bounds checking. Returns

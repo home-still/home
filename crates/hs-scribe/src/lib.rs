@@ -1,5 +1,6 @@
 pub mod client;
 pub mod config;
+pub mod diag;
 pub mod epub;
 pub mod event_watch;
 pub mod html;

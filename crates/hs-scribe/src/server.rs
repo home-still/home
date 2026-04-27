@@ -311,6 +311,7 @@ async fn handle_scribe_stream(
                 let line = StreamLine::Result {
                     markdown: result.markdown,
                     per_page_region_classes: result.per_page_region_classes,
+                    per_page_diags: result.per_page_diags,
                 };
                 if let Ok(json) = serde_json::to_string(&line) {
                     let _ = tx.send(Ok(format!("{json}\n"))).await;
