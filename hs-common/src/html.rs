@@ -75,6 +75,22 @@ pub fn is_paywall_html(content: &str) -> bool {
         return true;
     }
 
+    // Site-template chrome that VLM/HTML extraction has historically pulled
+    // in place of article content. Each set of markers is the diagnostic /
+    // navigation furniture of the host site; real papers don't carry them.
+    // Guarded by `!has_article` so a real paper that happens to mention one
+    // of these strings is not false-positived.
+    let is_cambridge_chrome = lower.contains("hostname:")
+        && lower.contains("render date:")
+        && lower.contains("page-component-");
+    let is_pmc_chrome =
+        lower.contains("pmcid") && lower.contains("pmid") && lower.contains("copyright notice");
+    let is_openalex_chrome = lower.contains("find articles by")
+        || lower.contains("create github issue for staff review");
+    if (is_cambridge_chrome || is_pmc_chrome || is_openalex_chrome) && !has_article {
+        return true;
+    }
+
     false
 }
 
@@ -131,5 +147,38 @@ mod tests {
     #[test]
     fn looks_like_html_rejects_pdf() {
         assert!(!looks_like_html(b"%PDF-1.7\n..."));
+    }
+
+    #[test]
+    fn detects_cambridge_core_paywall_chrome() {
+        let html = "<html><body><div id=\"page-component-77f85d65b8\">Login\
+            </div><footer>Hostname: page-component-77f85d65b8 Render date: \
+            2026-04-15 Total loading time: 0</footer></body></html>";
+        assert!(is_paywall_html(html));
+    }
+
+    #[test]
+    fn detects_pmc_chrome_without_article() {
+        let html = "<html><body>PMCID: PMC1234 PMID: 5678 Copyright notice \
+            All rights reserved</body></html>";
+        assert!(is_paywall_html(html));
+    }
+
+    #[test]
+    fn detects_openalex_landing_page() {
+        let html = "<html><body><nav>Find articles by author or title</nav>\
+            <div>Create GitHub issue for staff review</div></body></html>";
+        assert!(is_paywall_html(html));
+    }
+
+    #[test]
+    fn pmc_chrome_with_real_article_is_not_paywall() {
+        // Real PMC-hosted paper still has those identifier strings; the
+        // !has_article guard must let it through.
+        let html = "<html><body><article><h1>Real paper</h1>\
+            <h2>Abstract</h2><p>...</p>\
+            <h2>References</h2><ol><li>x</li></ol>\
+            PMCID: PMC1234 PMID: 5678 Copyright notice</article></body></html>";
+        assert!(!is_paywall_html(html));
     }
 }

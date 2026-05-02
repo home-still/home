@@ -15,6 +15,15 @@ use crate::config::TimeoutPolicy;
 /// independent config defaults.
 pub const CONVERT_DEADLINE_HEADER: &str = "X-Convert-Deadline-Secs";
 
+/// HTTP header carrying the catalog stem the dispatcher is converting.
+/// The server has no stem of its own — it sees raw multipart bytes — so
+/// without this header the deadline-abort log line on the server
+/// identifies *which* PDF wedged only by indirect reasoning. Pass the
+/// stem here and the server includes it in `convert deadline exceeded`
+/// and `Processing failed` log lines, making `journalctl -u
+/// hs-serve-scribe | grep deadline` self-sufficient.
+pub const CONVERT_STEM_HEADER: &str = "X-Convert-Stem";
+
 /// Compute the per-request convert timeout from a PDF's page count.
 ///
 /// `pages = None` (parse failed, non-PDF payload) → `policy.fallback_secs`.
@@ -258,6 +267,7 @@ impl ScribeClient {
         &self,
         pdf_bytes: Vec<u8>,
         timeout: Option<Duration>,
+        stem: Option<&str>,
     ) -> Result<ConversionResult> {
         let url = format!("{}/scribe", self.server_url);
         let part = reqwest::multipart::Part::bytes(pdf_bytes).file_name("input.pdf");
@@ -268,6 +278,9 @@ impl ScribeClient {
             req = req
                 .timeout(d)
                 .header(CONVERT_DEADLINE_HEADER, d.as_secs().to_string());
+        }
+        if let Some(s) = stem {
+            req = req.header(CONVERT_STEM_HEADER, s);
         }
         let resp = req.send().await.context("Failed to send PDF")?;
 
@@ -299,6 +312,7 @@ impl ScribeClient {
         &self,
         pdf_bytes: Vec<u8>,
         timeout: Option<Duration>,
+        stem: Option<&str>,
         on_progress: impl Fn(ProgressEvent),
     ) -> Result<ConversionResult> {
         let url = format!("{}/scribe/stream", self.server_url);
@@ -310,6 +324,9 @@ impl ScribeClient {
             req = req
                 .timeout(d)
                 .header(CONVERT_DEADLINE_HEADER, d.as_secs().to_string());
+        }
+        if let Some(s) = stem {
+            req = req.header(CONVERT_STEM_HEADER, s);
         }
         let mut resp = req.send().await.context("Failed to send PDF")?;
 
@@ -326,7 +343,7 @@ impl ScribeClient {
                 total_pages: 0,
                 message: "server does not support progress (update server image)".into(),
             });
-            return self.convert(pdf_bytes, timeout).await;
+            return self.convert(pdf_bytes, timeout, stem).await;
         }
 
         if !resp.status().is_success() {

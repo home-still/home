@@ -10,7 +10,9 @@ Academic research engine: 211M+ vector search with OpenAlex + PMC OA + Qdrant.
 ## Working Style
 
 - **Guided walkthrough mode.** When the user asks for a "walkthrough", "guide me", or "mentor me", do NOT write the implementation. Propose ONE small chunk with explanation, wait for the user to write it, review their actual code, then propose the next chunk.
-- **Execute remote commands directly.** Run SSH / build / deploy commands via Bash yourself. Do not hand shell work back to the user.
+- **Execute remote commands directly.** Run SSH / build / deploy commands via Bash yourself. Do not hand shell work back to the user. When deploying, name the target host explicitly (e.g., "deploying to `big_mac`") — never ask "run where?".
+- **Verify before declaring done.** After a deploy, either (a) run the self-test / targeted smoke check and paste the green output, or (b) explicitly identify the blocker and log it as a P0 in `BACKLOG.md`. Do not close on code changes alone.
+- **Parallel-audit count is exact.** When the user asks for N parallel agents, dispatch exactly N in a single message — never silently launch fewer.
 
 ## Debugging Philosophy
 
@@ -20,10 +22,18 @@ Academic research engine: 211M+ vector search with OpenAlex + PMC OA + Qdrant.
 ## Release Process
 
 - Before tagging any `rc.*`: run `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test`. Only tag if all three pass.
+- After building per-arch artifacts, verify each binary's architecture with `file` before deploying — `x86_64` to `big`/`one`, `aarch64` to the Pis, `arm64` Mach-O to Apple Silicon hosts. Wrong-arch ships have wasted entire RCs.
 
 ## Documentation / Privacy
 
 - Never hardcode real LAN IPs, hostnames, or private network details in docs/READMEs committed to the repo. Use `<host>` or `example.local` placeholders.
+- Same rule for credentials of any kind: invite codes, S3 keys, Cloudflare tunnel tokens, OAuth client secrets. Use `<token>` / `<s3-key>` placeholders.
+
+## Project Conventions
+
+- **Bad-PDF folder is `corrupted/`.** Do not invent alternatives like `quarantine/`, `rejected/`, `bad/` — there's exactly one and it's already wired up.
+- **Watcher liveness is heartbeat-based**, not PID-file-based. When diagnosing "is the watcher alive?" check `last_tick_seconds_ago` from status, not `/var/run/*.pid`.
+- **Status counters can have multiple writers.** Multiple daemons may stamp the same status field — if a counter looks like it's "bouncing", check for multi-writer races before chasing a logic bug in any single writer.
 
 ## Build & Test
 

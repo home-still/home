@@ -79,6 +79,16 @@ pub struct AppConfig {
     pub layout_model_path: String,
     pub table_model_path: String,
     pub region_parallel: usize,
+    /// Cap on concurrent pages-in-flight per single PDF conversion.
+    /// Inserted between stage-1 (CPU layout) and stage-2 (GPU VLM) so a
+    /// single large paper can't fan out to dozens of pages × N regions
+    /// against a llama-server slot pool sized for the whole cluster.
+    /// `dispatcher_concurrency × page_parallel × region_parallel` is the
+    /// real worst-case concurrent VLM call count — keep that ≤ a small
+    /// multiple of llama-server's `--parallel` to avoid prompt-cache
+    /// eviction thrash. Empirically: 2 keeps a 3090 + 8-slot llama
+    /// healthy under sustained load.
+    pub page_parallel: usize,
     pub use_cuda: bool,
     pub max_image_dim: u32,
     pub vlm_concurrency: usize,
@@ -100,6 +110,7 @@ impl Default for AppConfig {
             layout_model_path: "pp-doclayoutv3.onnx".into(),
             table_model_path: "slanet-plus.onnx".into(),
             region_parallel: class.region_parallel(),
+            page_parallel: 2,
             use_cuda: true,
             max_image_dim: 1800,
             vlm_concurrency: class.vlm_concurrency(),

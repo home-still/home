@@ -352,6 +352,19 @@ impl DownloadService for PaperDownloader {
         let size_bytes = buf.len() as u64;
         let sha256 = format!("{:x}", hasher.finalize());
 
+        // Reject sub-`MIN_PDF_BYTES` bodies before they pollute the catalog.
+        // The smallest valid PDF is ~70 bytes (`%PDF-1.x` + xref + trailer);
+        // 100 is well below that. Catches 0-byte stubs (servers that returned
+        // 200 with empty body) and HTML error pages that came through as
+        // empty after gzip-strip. Without this gate, a 0-byte stub would be
+        // stamped `downloaded: true` with sha256 of the empty string.
+        const MIN_PDF_BYTES: u64 = 100;
+        if size_bytes < MIN_PDF_BYTES {
+            return Err(PaperError::NotFound(format!(
+                "Server returned {size_bytes} bytes (< {MIN_PDF_BYTES}); rejecting as stub for {url}"
+            )));
+        }
+
         // Validate and decide final key
         let head = &buf[..buf.len().min(4096)];
         let (final_key, final_bytes) = if head.starts_with(b"%PDF") {
@@ -365,8 +378,15 @@ impl DownloadService for PaperDownloader {
             }
             (self.build_key(stem, "html"), buf)
         } else {
-            // Unknown format — keep it as-is (might be a valid binary format)
-            (key, buf)
+            // Anything that's not %PDF and not HTML is garbage by the time
+            // it reaches a paper-download response (graphical-abstract JPEG,
+            // gzipped landing page, login binary blob). Storing under the
+            // expected PDF key inflates `documents` and triggers convert
+            // dispatch that fails 415 every time. Reject at the door —
+            // catalog isn't stamped, file isn't written.
+            return Err(PaperError::NotFound(format!(
+                "downloaded body is neither PDF nor HTML ({size_bytes} bytes); rejecting for {url}"
+            )));
         };
 
         self.storage

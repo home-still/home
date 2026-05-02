@@ -128,7 +128,12 @@ async fn repro_2col_e2e() {
 
         let pdf_bytes = std::fs::read(pdf).expect("read fixture pdf");
         let conv = match client
-            .convert_with_progress(pdf_bytes, Some(Duration::from_secs(1800)), |_| {})
+            .convert_with_progress(
+                pdf_bytes,
+                Some(Duration::from_secs(1800)),
+                Some(stem.as_str()),
+                |_| {},
+            )
             .await
         {
             Ok(c) => c,

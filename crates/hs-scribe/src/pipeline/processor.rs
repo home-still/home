@@ -9,8 +9,8 @@ use crate::ocr::OcrEngine;
 use crate::pipeline::markdown_generator::{assemble_page_markdown, join_pages};
 use crate::pipeline::PdfParser;
 use crate::utils::deduplication::{deduplicate_boxes, filter_contained_regions};
-use anyhow::Result;
-use futures::stream::{self, StreamExt};
+use anyhow::{Context, Result};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use hs_common::hardware_profile::HardwareProfile;
 use image::DynamicImage;
 use std::io::Cursor;
@@ -608,12 +608,28 @@ impl Processor {
         let vlm_completed = Arc::new(AtomicU64::new(0));
         let mut tasks = tokio::task::JoinSet::new();
 
+        // Per-paper page-fanout cap. Without this the JoinSet below would
+        // spawn one task per page as fast as stage-1 produces them, and a
+        // single 50-page paper × `region_parallel` regions could put 100+
+        // concurrent VLM calls against llama-server's small slot pool —
+        // every new request evicts another slot's 50–64 MB prompt cache,
+        // which is what manifests as `prompt cache update took 32993 ms`
+        // and 1.55 t/s eval. Cap pages-in-flight per paper so the
+        // worst-case fanout stays inside the slot pool's capacity. Tune
+        // via `HS_SCRIBE_PAGE_PARALLEL`; default 2 in `AppConfig`.
+        let page_sem = Arc::new(tokio::sync::Semaphore::new(self.config.page_parallel));
+
         while let Some(prepared) = rx.recv().await {
+            let page_permit = Arc::clone(&page_sem)
+                .acquire_owned()
+                .await
+                .map_err(|e| anyhow::anyhow!("page semaphore closed mid-paper: {e}"))?;
             let ocr = Arc::clone(&ocr);
             let sem = Arc::clone(&vlm_sem);
             let on_progress = Arc::clone(&on_progress);
             let vlm_completed = Arc::clone(&vlm_completed);
             tasks.spawn(async move {
+                let _page_permit = page_permit; // released when this page's VLM finishes
                 let done = vlm_completed.fetch_add(1, Ordering::Relaxed) + 1;
                 let result = execute_vlm_for_page(
                     prepared,
@@ -1156,8 +1172,13 @@ async fn execute_vlm_for_page(
     });
 
     // Process text regions with semaphore-gated concurrency.
-    // Inner closure is infallible — per-region failures degrade
-    // to empty string, the paper continues.
+    // Per-region VLM failures fail the whole page (and therefore the
+    // whole paper) — silently emitting empty regions is the silent
+    // degradation path CLAUDE.md prohibits, and the resulting markdown
+    // would have invisible holes the operator can't tell from a clean
+    // conversion. Figure/Skip and empty-jpeg regions still return an
+    // empty placeholder because those are intentional non-VLM slots,
+    // not failures.
     let region_results: Vec<(BBox, String)> = stream::iter(text_regions)
         .map(|r| {
             let ocr = Arc::clone(&ocr);
@@ -1167,35 +1188,27 @@ async fn execute_vlm_for_page(
             async move {
                 if r.region_type == RegionType::Figure || r.region_type == RegionType::Skip {
                     region_done.fetch_add(1, Ordering::Relaxed);
-                    return (r.bbox, String::new());
+                    return Ok::<_, anyhow::Error>((r.bbox, String::new()));
                 }
                 if r.jpeg_bytes.is_empty() {
                     // prepare_page logged the skip; keep the slot empty so
                     // read-order assembly still has a placeholder.
                     region_done.fetch_add(1, Ordering::Relaxed);
-                    return (r.bbox, String::new());
+                    return Ok((r.bbox, String::new()));
                 }
-                let permit = match sem.acquire().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "semaphore closed — emitting empty region"
-                        );
-                        return (r.bbox, String::new());
-                    }
-                };
-                let text = match ocr.recognize_region(&r.jpeg_bytes, r.region_type).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            region_type = ?r.region_type,
-                            "region VLM failed — emitting empty region (paper continues)"
-                        );
-                        String::new()
-                    }
-                };
+                let permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("VLM semaphore closed mid-page: {e}"))?;
+                let text = ocr
+                    .recognize_region(&r.jpeg_bytes, r.region_type)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "region VLM failed on page {page_num} (region_type={:?})",
+                            r.region_type
+                        )
+                    })?;
                 drop(permit);
                 let done = region_done.fetch_add(1, Ordering::Relaxed) + 1;
                 on_progress(ProgressEvent {
@@ -1204,12 +1217,12 @@ async fn execute_vlm_for_page(
                     total_pages,
                     message: format!("OCR region {done}/{total_regions} on page {page_num}"),
                 });
-                (r.bbox, text)
+                Ok((r.bbox, text))
             }
         })
         .buffer_unordered(region_parallel)
-        .collect()
-        .await;
+        .try_collect()
+        .await?;
 
     let mut regions: Vec<(BBox, String)> = region_results;
 
@@ -1229,6 +1242,10 @@ async fn execute_vlm_for_page(
             ),
         });
 
+        // Same fail-loud rule as text regions above: a cell whose VLM
+        // call errors fails the whole conversion, not just the cell.
+        // Empty-jpeg cells stay as intentional placeholders (prepare_page
+        // emitted the warn) because they're not VLM failures.
         let cell_texts: Vec<String> = stream::iter(table.cell_jpegs)
             .map(|jpeg| {
                 let ocr = Arc::clone(&ocr);
@@ -1238,25 +1255,16 @@ async fn execute_vlm_for_page(
                 async move {
                     if jpeg.is_empty() {
                         cell_done.fetch_add(1, Ordering::Relaxed);
-                        return String::new();
+                        return Ok::<String, anyhow::Error>(String::new());
                     }
-                    let permit = match sem.acquire().await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "semaphore closed — emitting empty cell"
-                            );
-                            return String::new();
-                        }
-                    };
-                    let result = match ocr.recognize_region(&jpeg, RegionType::Text).await {
-                        Ok(text) => text.trim().to_string(),
-                        Err(e) => {
-                            tracing::warn!("Cell OCR failed: {e}");
-                            String::new()
-                        }
-                    };
+                    let permit = sem
+                        .acquire()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("VLM semaphore closed mid-table: {e}"))?;
+                    let text = ocr
+                        .recognize_region(&jpeg, RegionType::Text)
+                        .await
+                        .with_context(|| format!("table cell VLM failed on page {page_num}"))?;
                     drop(permit);
                     let done = cell_done.fetch_add(1, Ordering::Relaxed) + 1;
                     on_progress(ProgressEvent {
@@ -1265,12 +1273,12 @@ async fn execute_vlm_for_page(
                         total_pages,
                         message: format!("OCR table cell {done}/{total_cells} on page {page_num}"),
                     });
-                    result
+                    Ok(text.trim().to_string())
                 }
             })
             .buffer_unordered(region_parallel)
-            .collect::<Vec<String>>()
-            .await;
+            .try_collect::<Vec<String>>()
+            .await?;
 
         let html = build_html_from_structure(&table.structure, &cell_texts);
         regions.push((table.bbox, html));

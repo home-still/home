@@ -72,14 +72,19 @@ impl HostClass {
     }
 
     /// Scribe per-page region parallelism during per-region pipeline mode.
-    /// See `hs-scribe::config::AppConfig::region_parallel`.
+    /// See `hs-scribe::config::AppConfig::region_parallel`. Sized to keep
+    /// `dispatcher_concurrency × page_parallel × region_parallel` close to
+    /// the VLM backend's slot pool — overshoot causes prompt-cache
+    /// eviction thrash that collapses eval throughput (see incident
+    /// 2026-04-29: NvidiaHigh @ 6 fanned to 144+ concurrent calls
+    /// against an 8-slot llama-server, eval rate dropped to 1.55 t/s).
     pub fn region_parallel(self) -> usize {
         match self {
             HostClass::Pi => 2,
             HostClass::AppleSiliconLow => 3,
             HostClass::AppleSiliconHigh => 4,
-            HostClass::NvidiaMid => 4,
-            HostClass::NvidiaHigh => 6,
+            HostClass::NvidiaMid => 3,
+            HostClass::NvidiaHigh => 3,
             HostClass::GenericCpu => 2,
         }
     }

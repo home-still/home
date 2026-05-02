@@ -341,16 +341,19 @@ mod tests {
 
     #[test]
     fn default_for_device_snaps_initial() {
-        let cpu = AdaptiveConfig::default_for_device(&ComputeDevice::Cpu, 8);
-        assert_eq!(cpu.candidates[cpu.initial_idx], 8);
-        let cuda = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 32);
-        assert_eq!(cuda.candidates[cuda.initial_idx], 32);
+        // Cuda candidates: [16, 32, 48, 64, 96, 128].
+        // CPU was removed in rc.306 P0-7 (no CPU code path ships).
+        let exact = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 32);
+        assert_eq!(exact.candidates[exact.initial_idx], 32);
         // Out-of-range initial snaps to next candidate up.
-        let oddball = AdaptiveConfig::default_for_device(&ComputeDevice::Cpu, 10);
-        assert_eq!(oddball.candidates[oddball.initial_idx], 12);
+        let oddball = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 20);
+        assert_eq!(oddball.candidates[oddball.initial_idx], 32);
+        // Bottom of the range — snaps to the smallest candidate ≥ initial.
+        let bottom = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 1);
+        assert_eq!(bottom.candidates[bottom.initial_idx], 16);
         // Above max → top candidate.
-        let above = AdaptiveConfig::default_for_device(&ComputeDevice::Cpu, 999);
-        assert_eq!(above.candidates[above.initial_idx], 24);
+        let above = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 999);
+        assert_eq!(above.candidates[above.initial_idx], 128);
     }
 
     #[test]

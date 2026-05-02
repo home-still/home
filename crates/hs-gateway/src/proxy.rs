@@ -1,47 +1,85 @@
 //! Reverse proxy — forward authenticated requests to LAN backend services.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use hs_common::auth::token::{self, TokenError};
+use hs_common::auth::token::{self, TokenClaims, TokenError};
 
 use crate::state::GatewayState;
 
 /// Round-robin counter for load balancing across registry backends.
 static PROXY_RR: AtomicUsize = AtomicUsize::new(0);
 
+/// LAN-zone trust policy. Requests originating from RFC1918 source IPs
+/// (10/8, 172.16/12, 192.168/16) skip the bearer-token check and are
+/// treated as fully scoped. The cloudflared tunnel terminates on
+/// `localhost`, NOT on a private address, so cloud traffic still hits the
+/// bearer path. `is_private()` excludes loopback by design.
+fn is_rfc1918_source(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(ip) => ip.is_private(),
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// Build a synthetic claim set for LAN-zone callers — wildcard scope,
+/// short notional TTL (the value is unused; nothing checks it for LAN
+/// callers, but keeping it small surfaces any accidental serialization
+/// to the wire as obviously-fake).
+fn lan_zone_claims(peer: &SocketAddr) -> TokenClaims {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    TokenClaims {
+        sub: format!("lan-zone:{}", peer.ip()),
+        iat: now,
+        exp: now + 60,
+        scope: vec!["*".into()],
+    }
+}
+
 /// Generic proxy handler for service routes.
 ///
-/// Validates the bearer token, checks scope, then forwards the request
-/// to the appropriate backend service.
-pub async fn proxy_handler(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
-    // Extract bearer token
-    let auth_header = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+/// LAN-zone callers (RFC1918 source IPs) skip auth with synthetic full-scope
+/// claims. All other callers must present a valid bearer token. Once a
+/// claim set is in hand (synthetic or validated), the handler checks scope
+/// against the resolved service and forwards to the backend.
+pub async fn proxy_handler(
+    State(state): State<Arc<GatewayState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    let claims = if is_rfc1918_source(&peer) {
+        lan_zone_claims(&peer)
+    } else {
+        let auth_header = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
 
-    let token_str = match auth_header {
-        Some(t) => t.to_string(),
-        None => {
-            return unauthorized_response(&state.gateway_url);
-        }
-    };
+        let token_str = match auth_header {
+            Some(t) => t.to_string(),
+            None => {
+                return unauthorized_response(&state.gateway_url);
+            }
+        };
 
-    // Validate token
-    let claims = match token::validate_token(&state.secret, &token_str, false) {
-        Ok(c) => c,
-        Err(TokenError::Expired) => {
-            return unauthorized_response(&state.gateway_url);
-        }
-        Err(_) => {
-            return unauthorized_response(&state.gateway_url);
+        match token::validate_token(&state.secret, &token_str, false) {
+            Ok(c) => c,
+            Err(TokenError::Expired) => {
+                return unauthorized_response(&state.gateway_url);
+            }
+            Err(_) => {
+                return unauthorized_response(&state.gateway_url);
+            }
         }
     };
 

@@ -1,7 +1,5 @@
 # Claude Desktop Self-Test Prompt — home-still
 
-Please stop and write your report at the first issue.  DO NOT CONTINUE TESTING.
-
 Paste the prompt below into Claude Desktop with the `hs-mcp` server connected. It exercises the MCP tool surface and emits a debug-focused report covering the topology described in `docs/deployment.md`.
 
 > **Companion check:** this prompt covers what's reachable through MCP. For LAN/host-side verification (NFS export, Garage admin port, Qdrant gRPC, NVIDIA driver, gateway systemd unit), run the shell commands in `docs/deployment.md` §9 in parallel. The two together are the full self-test.

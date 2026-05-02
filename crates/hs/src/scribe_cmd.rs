@@ -478,7 +478,7 @@ async fn cmd_convert(
     let result = if servers.len() == 1 {
         let client = make_scribe_client(&servers[0], convert_timeout).await?;
         client
-            .convert_with_progress(pdf_bytes, Some(convert_timeout), on_progress)
+            .convert_with_progress(pdf_bytes, Some(convert_timeout), None, on_progress)
             .await
             .map(|conv| (servers[0].clone(), conv))
     } else {

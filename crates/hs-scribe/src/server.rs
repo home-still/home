@@ -1,4 +1,4 @@
-use crate::client::{HealthResponse, StreamLine, CONVERT_DEADLINE_HEADER};
+use crate::client::{HealthResponse, StreamLine, CONVERT_DEADLINE_HEADER, CONVERT_STEM_HEADER};
 use crate::config::AppConfig;
 use crate::gpu;
 use crate::pipeline::processor::Processor;
@@ -30,6 +30,18 @@ fn resolve_deadline(headers: &HeaderMap, fallback_secs: u64) -> (Duration, bool)
         Some(secs) => (Duration::from_secs(secs), true),
         None => (Duration::from_secs(fallback_secs), false),
     }
+}
+
+/// Read the catalog stem the dispatcher is converting from request
+/// headers. Returns `"<unknown>"` when absent so deadline-abort and
+/// processing-failed logs always carry a value — older clients that
+/// don't send the header still get something printable, and the
+/// canonical token makes "header missing" easy to grep.
+fn resolve_stem(headers: &HeaderMap) -> &str {
+    headers
+        .get(CONVERT_STEM_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<unknown>")
 }
 
 pub struct ServerState {
@@ -232,6 +244,7 @@ async fn handle_scribe(
 
     let path = tmp.path().to_str().unwrap_or_default();
     let (deadline, from_header) = resolve_deadline(&headers, state.config.convert_deadline_secs);
+    let stem = resolve_stem(&headers).to_string();
     let fut = state.processor.process_pdf(path);
     match tokio::time::timeout(deadline, fut).await {
         Ok(Ok(md)) => {
@@ -239,7 +252,7 @@ async fn handle_scribe(
             (StatusCode::OK, md).into_response()
         }
         Ok(Err(e)) => {
-            tracing::error!("Processing failed: {e:#}");
+            tracing::error!(stem = %stem, "Processing failed: {e:#}");
             tracing::debug!("Full error chain: {e:?}");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
         }
@@ -248,6 +261,7 @@ async fn handle_scribe(
             // in-flight Ollama request aborts, stage-1 spawn_blocking exits on
             // the next send to a closed channel, VLM permit released.
             tracing::error!(
+                stem = %stem,
                 deadline_secs = deadline.as_secs(),
                 from_header,
                 "convert deadline exceeded — aborting; slot released"
@@ -286,6 +300,7 @@ async fn handle_scribe_stream(
     let path = tmp.path().to_string_lossy().to_string();
 
     let (deadline, from_header) = resolve_deadline(&headers, state.config.convert_deadline_secs);
+    let stem = resolve_stem(&headers).to_string();
     tokio::spawn(async move {
         let _tmp = tmp; // keep temp file alive for the duration of processing
         let _guard = in_flight_guard;
@@ -318,7 +333,7 @@ async fn handle_scribe_stream(
                 }
             }
             Ok(Err(e)) => {
-                tracing::error!("Processing failed: {e:#}");
+                tracing::error!(stem = %stem, "Processing failed: {e:#}");
                 tracing::debug!("Full error chain: {e:?}");
                 let line = StreamLine::Error(format!("{e:#}"));
                 if let Ok(json) = serde_json::to_string(&line) {
@@ -327,6 +342,7 @@ async fn handle_scribe_stream(
             }
             Err(_elapsed) => {
                 tracing::error!(
+                    stem = %stem,
                     deadline_secs = deadline.as_secs(),
                     from_header,
                     "convert deadline exceeded — aborting stream; slot released"

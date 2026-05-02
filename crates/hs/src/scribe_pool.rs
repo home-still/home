@@ -45,7 +45,7 @@ impl ScribePool {
                         message: format!("→ {short}"),
                     });
                     let result = client
-                        .convert_with_progress(pdf_bytes, None, on_progress)
+                        .convert_with_progress(pdf_bytes, None, None, on_progress)
                         .await?;
                     return Ok((url, result));
                 }

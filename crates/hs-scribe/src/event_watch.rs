@@ -176,7 +176,7 @@ pub async fn convert_and_upload(
             // QC treats as "not bibliography" → strict default ceiling
             // everywhere.
             let conversion = scribe
-                .convert_with_progress(raw_bytes, Some(timeout), |_| {})
+                .convert_with_progress(raw_bytes, Some(timeout), Some(stem), |_| {})
                 .await
                 .map_err(|e| {
                     // Server-side format errors ("Invalid image size",

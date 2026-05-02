@@ -1,5 +1,12 @@
 use crate::models::Paper;
 
+/// Below this fraction of query terms appearing in the title, the paper's
+/// score is hard-capped just under [`super::ranking::CITATION_SORT_MIN_RELEVANCE`].
+/// Stops off-topic high-citation papers from surfacing in "sort by citations"
+/// searches purely on the strength of an abstract mention. Tuned to keep
+/// papers where ≥half the query is in the title.
+const TITLE_PRESENCE_FLOOR: f64 = 0.5;
+
 /// Scores how well a paper matches the query.  Returns 0.0-1.0.
 pub fn relevance_score(query: &str, paper: &Paper) -> f64 {
     let query_lower = query.to_lowercase();
@@ -59,6 +66,16 @@ pub fn relevance_score(query: &str, paper: &Paper) -> f64 {
         meta += 0.25;
     }
 
-    // Weighted combination
-    0.4 * term_coverage + 0.3 * phrase_score + 0.2 * title_density + 0.1 * meta
+    let weighted = 0.4 * term_coverage + 0.3 * phrase_score + 0.2 * title_density + 0.1 * meta;
+
+    // Title-presence floor: when the user wanted topical-AND-cited results
+    // (sort=citations), an abstract-only match shouldn't lift a paper above
+    // the citation-sort relevance floor. `min()` so we never *raise* a low
+    // score — we only cap high ones.
+    let title_coverage = title_hits as f64 / query_terms.len() as f64;
+    if title_coverage < TITLE_PRESENCE_FLOOR {
+        return weighted.min(super::ranking::CITATION_SORT_MIN_RELEVANCE - 0.001);
+    }
+
+    weighted
 }
