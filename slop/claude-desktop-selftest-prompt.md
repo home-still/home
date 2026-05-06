@@ -1,7 +1,5 @@
 # Claude Desktop Self-Test Prompt — home-still
 
-Please stop and write your report at the first issue.  DO NOT CONTINUE TESTING.
-
 Paste the prompt below into Claude Desktop with the `hs-mcp` server connected. It exercises the MCP tool surface and emits a debug-focused report covering the topology described in `docs/deployment.md`.
 
 > **Companion check:** this prompt covers what's reachable through MCP. For LAN/host-side verification (NFS export, Garage admin port, Qdrant gRPC, NVIDIA driver, gateway systemd unit), run the shell commands in `docs/deployment.md` §9 in parallel. The two together are the full self-test.
@@ -22,7 +20,7 @@ a. **Tool surface.** Ask: *"What `home-still` MCP tools do you see? I'm specific
 
 b. **Schema fields.** Ask: *"Call `system_status` and show me the `pipeline` object."* Both `pipeline_drift` and `pipeline_drift_threshold` must be present. Same diagnosis as (a) if missing: stale client binary.
 
-c. **Arithmetic spot-check.** Compute `documents − markdown − conversion_failed − Σ(scribe.in_flight)` client-side and compare to the server's `pipeline_drift`. They must match. Divergence means the server-side formula has changed vs what this prompt documents — file an issue rather than debugging the cluster from a moving spec.
+c. **Arithmetic spot-check.** Compute `documents − markdown − Σ(scribe.in_flight)` client-side and compare to the server's `pipeline_drift`. They must match. Note: `conversion_failed` rows (surfaced separately in the snapshot as `corrupted_pdfs`) are deliberately NOT subtracted — drift is meant to surface failed converts as stuck pipeline state. Divergence means the server-side formula has changed vs what this prompt documents — file an issue rather than debugging the cluster from a moving spec.
 
 Only after all three pass: proceed to Phase 0.
 
@@ -34,7 +32,7 @@ Before any pipeline work, establish what cluster you are looking at. None of the
    - **Storage backend** in use — infer from object key shapes returned by `markdown_list` / `catalog_list` later (S3 keys vs local POSIX paths).
    - **Service registry**: count and per-host URL of `scribe_instances` and `distill_instances`, with each one's `healthy`, `version`, `compute_device`, `embed_model`, `collection`, `activity`, `in_flight`, `slots_available`/`slots_total`.
    - **Qdrant rollup**: `qdrant.collection`, `qdrant.qdrant_url`, `qdrant.qdrant_version`, `qdrant.compute_device`.
-   - **Pipeline counts**: `documents`, `pdfs`, `html_fallbacks`, `markdown`, `catalog_entries`, `conversion_failed`, `embedded_documents`, `embedded_chunks`.
+   - **Pipeline counts**: `documents`, `pdfs`, `htmls`, `markdown`, `catalog_entries`, `corrupted_pdfs`, `embedded_documents`, `embedded_chunks`.
 2. Note whether you reached MCP **directly on-LAN** or **through the gateway** (token / origin clue from your client config). Record which path is exercising the rest of this test.
 
 ## Phase 1 — Health gates (read-only, hard pass/fail)
@@ -43,7 +41,7 @@ Before any pipeline work, establish what cluster you are looking at. None of the
 4. **Scribe gate.** `scribe_health` for each scribe instance. Server up? GPU name + utilization, queue depth, last conversion timestamp, slot availability. A scribe instance reporting CPU-only compute is also a FAIL per the same rule.
 5. **Qdrant gate.** From `distill_status`: collection exists? Vector count plausible (non-zero on a populated cluster)? Indexed vs pending. URL matches what `system_status` reported.
 6. **Pipeline math.** The snapshot carries two fields that make this a single-assertion gate:
-   - `pipeline.pipeline_drift` — computed server-side as `documents − markdown − conversion_failed − (sum of scribe in_flight)`. Saturating subtraction, so never negative.
+   - `pipeline.pipeline_drift` — computed server-side as `documents − markdown − (sum of scribe in_flight)`. Saturating subtraction, so never negative. `corrupted_pdfs` (catalog rows stamped `conversion_failed`) is intentionally NOT subtracted — drift is meant to surface them as stuck pipeline state alongside genuinely-orphaned downloads.
    - `pipeline.pipeline_drift_threshold` — the threshold above which the gate fails (currently 3).
    Acceptance: **`pipeline_drift <= pipeline_drift_threshold` is PASS.** Anything above is FAIL — report both values and which stage is likely over-counting. The absence of either field in the snapshot is itself a FAIL (the MCP server is older than this prompt expects).
    If there's an operator running `hs scribe inbox` on a client, note it: on a healthy cluster with an active inbox watcher, the drift balances within seconds of any drop into `papers/manually_downloaded/`.
@@ -113,7 +111,7 @@ Produce a markdown report with these sections:
 - **Verdict** — one line: PASS / FAIL. If FAIL, include the rule(s) that fired (e.g. "CUDA non-negotiable violated on http://big:7434", "pipeline math drift of 17 documents").
 - **Topology snapshot** (Phase 0) — backend, gateway-or-direct, instance counts and URLs, Qdrant info, pipeline counts.
 - **Health gate results** (Phase 1) — pass/fail per gate with the evidence.
-- **Pipeline gap table** — counts at each stage (downloaded → converted → conversion_failed → embedded) and the deltas.
+- **Pipeline gap table** — counts at each stage (downloaded → converted → corrupted_pdfs → embedded) and the deltas.
 - **Reconciler results** (Phase 2 steps 10–11) — phantom embeds and disk/catalog orphans, with sample stems if any.
 - **Per-tool results** — one row per tool call: tool, args (abbreviated), outcome (ok/err), latency, salient field or error message.
 - **Round-trip trace** (Phase 4) — the stem with timestamp at each stage; which scribe + distill instance handled it.

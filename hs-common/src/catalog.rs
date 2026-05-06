@@ -39,6 +39,16 @@ pub struct CatalogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversion: Option<ConversionMeta>,
 
+    /// Recorded when the source bytes are not a valid PDF (or EPUB / HTML)
+    /// at all — e.g. a paywall HTML renamed `.pdf`, truncated downloads,
+    /// ransomware stubs. This is not a retry-able error: the *content* is
+    /// wrong, so no number of reconvert attempts will succeed. `catalog_
+    /// repair`'s `stuck_convert` direction skips rows with this stamp, and
+    /// the scribe watch-events daemon writes it before acking NATS so the
+    /// queue drains instead of re-processing the same dead files forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversion_failed: Option<ConversionFailure>,
+
     // Embedding metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<EmbeddingMeta>,
@@ -57,28 +67,47 @@ pub struct CatalogEntry {
     pub repair: Option<RepairMeta>,
 }
 
+/// A successful conversion. The presence of this struct on a catalog
+/// entry means "markdown exists and is usable" — there is no `failed`
+/// state. If a converter errors, the operator sees it in logs and no
+/// `conversion` block is written. One path per feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversionMeta {
+    /// Descriptive name of the converter that produced this markdown:
+    /// `"scribe-vlm"`, `"html-parser"`, `"epub-parser"`, or a
+    /// `"catalog_repair:<direction>"` marker for synthesized repair rows.
     pub server: String,
     /// Wall-clock convert time. Stored as `f64` so sub-second conversions
-    /// (e.g. stub PDFs that fail in 200 ms) don't read as zero. YAML 1.2
-    /// scalar conversion lets older integer-valued rows continue to parse.
+    /// (tiny EPUBs / HTMLs) don't read as zero.
     pub duration_secs: f64,
     pub total_pages: u64,
     pub converted_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<PageOffset>,
-    /// Set when the conversion path detected a degenerate result (e.g.
-    /// empty output) and chose to record the failure rather than emit a
-    /// silent success row.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub failed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
-fn is_false(b: &bool) -> bool {
-    !*b
+/// Terminal convert failure — written when the source is unconvertable by
+/// content, not by transient error. Presence of this stamp means "stop
+/// trying; look at the reason and either re-download or quarantine."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversionFailure {
+    /// Short machine-readable reason. Canonical values:
+    /// `"unsupported_content_type:html"` (paywall HTML saved as .pdf),
+    /// `"unsupported_content_type:binary"` (random bytes, truncated
+    /// download, encrypted PDF, etc.), `"quarantine_scan:html"` /
+    /// `"quarantine_scan:binary"` (flagged by the offline quarantine
+    /// sweeper).
+    pub reason: String,
+    /// RFC3339 timestamp of when this failure was recorded.
+    pub at: String,
+    /// Attempt counter. Always 1 today (terminal on first detection); the
+    /// field is carried so a future retry policy has a place to increment.
+    #[serde(default = "default_attempts")]
+    pub attempts: u32,
+}
+
+fn default_attempts() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,15 +168,21 @@ pub fn read_catalog_entry(catalog_dir: &Path, stem: &str) -> Option<CatalogEntry
     serde_yaml_ng::from_str(&contents).ok()
 }
 
-/// Write a catalog entry to disk (atomic write).
-pub fn write_catalog_entry(catalog_dir: &Path, stem: &str, entry: &CatalogEntry) {
+/// Write a catalog entry to disk. Errors (disk full, permission denied,
+/// missing parent dir we couldn't create, serde failure) propagate — no
+/// silent discard of the `Result` (rc.306 P0-9).
+pub fn write_catalog_entry(
+    catalog_dir: &Path,
+    stem: &str,
+    entry: &CatalogEntry,
+) -> std::io::Result<()> {
     let path = crate::sharded_path(catalog_dir, stem, "yaml");
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    if let Ok(yaml) = serde_yaml_ng::to_string(entry) {
-        let _ = std::fs::write(&path, yaml);
-    }
+    let yaml = serde_yaml_ng::to_string(entry)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, yaml)
 }
 
 /// Update only the conversion section of an existing catalog entry.
@@ -160,7 +195,7 @@ pub fn update_conversion_catalog(
     total_pages: u64,
     pages: Vec<PageOffset>,
     markdown_path: &str,
-) {
+) -> std::io::Result<()> {
     let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
 
     entry.markdown_path = Some(markdown_path.to_string());
@@ -170,11 +205,9 @@ pub fn update_conversion_catalog(
         total_pages,
         converted_at: chrono::Utc::now().to_rfc3339(),
         pages,
-        failed: false,
-        reason: None,
     });
 
-    write_catalog_entry(catalog_dir, stem, &entry);
+    write_catalog_entry(catalog_dir, stem, &entry)
 }
 
 /// Update only the embedding section of an existing catalog entry.
@@ -187,9 +220,9 @@ pub fn update_embedding_catalog(
     server: &str,
     chunks_indexed: u32,
     compute_device: &str,
-) {
+) -> std::io::Result<()> {
     if chunks_indexed == 0 {
-        return;
+        return Ok(());
     }
     let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
 
@@ -200,7 +233,7 @@ pub fn update_embedding_catalog(
         embedded_at: chrono::Utc::now().to_rfc3339(),
     });
 
-    write_catalog_entry(catalog_dir, stem, &entry);
+    write_catalog_entry(catalog_dir, stem, &entry)
 }
 
 // ── Storage-backed variants ─────────────────────────────────────────────
@@ -221,15 +254,30 @@ fn catalog_key(prefix: &str, stem: &str) -> String {
     }
 }
 
+/// Read a catalog entry through storage. Distinguishes three states:
+/// `Ok(Some(entry))` on a successful read, `Ok(None)` when the object is
+/// genuinely absent, `Err(_)` on a transient storage error or a corrupt
+/// YAML row. rc.306 P0-10: a corrupt row is not an orphan — earlier code
+/// chained `.ok()` on both the storage GET and the YAML parse, collapsing
+/// both into "missing", which let catalog_repair misclassify corruption
+/// as a deletion candidate.
 #[cfg(feature = "storage")]
 pub async fn read_catalog_entry_via(
     storage: &dyn crate::storage::Storage,
     prefix: &str,
     stem: &str,
-) -> Option<CatalogEntry> {
+) -> anyhow::Result<Option<CatalogEntry>> {
     let key = catalog_key(prefix, stem);
-    let bytes = storage.get(&key).await.ok()?;
-    serde_yaml_ng::from_slice(&bytes).ok()
+    // Prefer `head` to distinguish absent (Ok(None)) from a storage-layer
+    // failure — `get` surfaces both as Err, which is exactly the ambiguity
+    // we're trying to eliminate.
+    if storage.head(&key).await?.is_none() {
+        return Ok(None);
+    }
+    let bytes = storage.get(&key).await?;
+    let entry: CatalogEntry = serde_yaml_ng::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("catalog YAML parse failed for {key}: {e}"))?;
+    Ok(Some(entry))
 }
 
 #[cfg(feature = "storage")]
@@ -315,6 +363,101 @@ pub async fn list_catalog_entries_via(
     Ok(out)
 }
 
+/// Default concurrency for the parallel catalog fetcher — one HTTP connection
+/// per fetch, bounded against local Garage's typical inflight ceiling.
+#[cfg(feature = "storage")]
+pub const CATALOG_FETCH_CONCURRENCY: usize = 24;
+
+/// Parallel variant of [`list_catalog_entries_via`] used by `catalog_repair`.
+///
+/// The serial version issues one awaited `storage.get` per YAML — fine for a
+/// dozen rows, but at O(N) × single-flight latency it blows through the
+/// MCP 4-minute client budget on a few-thousand-row catalog. This fetcher
+/// spreads the per-key GETs across `concurrency` in-flight requests via
+/// `futures::stream::buffer_unordered`, then re-slots them into their
+/// `storage.list` order so callers observe the same sequence the serial
+/// version would produce.
+///
+/// Error policy (divergent from `list_catalog_entries_via` by design):
+/// - Per-key `storage.get` failure or 10s timeout → `Err` from the whole
+///   fetcher, with the offending key in the message. `storage.list`
+///   already promised this key exists, so a GET failure signals a real
+///   storage-integrity problem worth surfacing loudly.
+/// - Deserialization failure of a fetched YAML → silently skipped, matching
+///   the existing lenient schema-evolution behavior.
+///
+/// `on_progress(done, total)` fires every 64 completed GETs and once at the
+/// end. `total` is the post-filter YAML count (skips `._` hidden files and
+/// non-`.yaml` extensions), not the raw list length.
+#[cfg(feature = "storage")]
+pub async fn list_catalog_entries_parallel(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    concurrency: usize,
+    mut on_progress: impl FnMut(usize, usize),
+) -> anyhow::Result<Vec<(String, crate::storage::ObjectMeta, CatalogEntry)>> {
+    use futures::stream::{self, StreamExt};
+    use std::time::Duration;
+
+    let objects = storage.list(prefix).await?;
+    let candidates: Vec<(usize, crate::storage::ObjectMeta, String)> = objects
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, obj)| {
+            if !obj.key.ends_with(".yaml") {
+                return None;
+            }
+            let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
+            if filename.starts_with("._") {
+                return None;
+            }
+            let stem = filename.trim_end_matches(".yaml").to_string();
+            Some((idx, obj, stem))
+        })
+        .collect();
+
+    let total = candidates.len();
+    let mut slotted: Vec<Option<(String, crate::storage::ObjectMeta, CatalogEntry)>> =
+        (0..total).map(|_| None).collect();
+    let mut done: usize = 0;
+
+    let mut stream = stream::iter(candidates.into_iter().enumerate().map(
+        |(slot, (_original_idx, obj, stem))| {
+            let key = obj.key.clone();
+            async move {
+                let res = tokio::time::timeout(Duration::from_secs(10), storage.get(&key)).await;
+                (slot, obj, stem, key, res)
+            }
+        },
+    ))
+    .buffer_unordered(concurrency.max(1));
+
+    while let Some((slot, obj, stem, key, res)) = stream.next().await {
+        let bytes = match res {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                return Err(anyhow::anyhow!(
+                    "list_catalog_entries_parallel: storage.get({key}) failed: {e}"
+                ));
+            }
+            Err(_elapsed) => {
+                return Err(anyhow::anyhow!(
+                    "list_catalog_entries_parallel: storage.get({key}) timed out after 10s"
+                ));
+            }
+        };
+        done += 1;
+        if done.is_multiple_of(64) || done == total {
+            on_progress(done, total);
+        }
+        if let Ok(entry) = serde_yaml_ng::from_slice::<CatalogEntry>(&bytes) {
+            slotted[slot] = Some((stem, obj, entry));
+        }
+    }
+
+    Ok(slotted.into_iter().flatten().collect())
+}
+
 #[cfg(feature = "storage")]
 #[allow(clippy::too_many_arguments)]
 pub async fn update_conversion_catalog_via(
@@ -328,7 +471,7 @@ pub async fn update_conversion_catalog_via(
     markdown_path: &str,
 ) -> anyhow::Result<()> {
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
-        .await
+        .await?
         .unwrap_or_default();
 
     entry.markdown_path = Some(markdown_path.to_string());
@@ -338,38 +481,36 @@ pub async fn update_conversion_catalog_via(
         total_pages,
         converted_at: chrono::Utc::now().to_rfc3339(),
         pages,
-        failed: false,
-        reason: None,
     });
 
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
 
-/// Stamp a failed conversion (e.g. empty-output guard tripped) instead of
-/// emitting a silent success row. Pairs with `update_conversion_catalog_via`
-/// so callers can branch on a content-quality check before recording the
-/// outcome.
+/// Stamp a terminal convert failure on the catalog row. Called by the
+/// scribe watch-events daemon when the `/convert` endpoint rejects the
+/// source bytes as unconvertable (e.g. HTML masquerading as PDF), and by
+/// the `hs migrate quarantine-bad-content` sweeper when it relocates a
+/// bad file. Idempotent: overwrites any prior stamp (the `attempts`
+/// counter is preserved across stamps for future retry policies).
 #[cfg(feature = "storage")]
 pub async fn update_conversion_failed_via(
     storage: &dyn crate::storage::Storage,
     prefix: &str,
     stem: &str,
-    server: &str,
-    duration_secs: f64,
-    total_pages: u64,
     reason: &str,
 ) -> anyhow::Result<()> {
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
-        .await
+        .await?
         .unwrap_or_default();
-    entry.conversion = Some(ConversionMeta {
-        server: server.to_string(),
-        duration_secs,
-        total_pages,
-        converted_at: chrono::Utc::now().to_rfc3339(),
-        pages: Vec::new(),
-        failed: true,
-        reason: Some(reason.to_string()),
+    let attempts = entry
+        .conversion_failed
+        .as_ref()
+        .map(|f| f.attempts.saturating_add(1))
+        .unwrap_or(1);
+    entry.conversion_failed = Some(ConversionFailure {
+        reason: reason.to_string(),
+        at: chrono::Utc::now().to_rfc3339(),
+        attempts,
     });
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
@@ -416,7 +557,7 @@ pub async fn update_embedding_skip_via(
     reason: &str,
 ) -> anyhow::Result<()> {
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
-        .await
+        .await?
         .unwrap_or_default();
     entry.embedding_skip = Some(EmbeddingSkip {
         reason: reason.to_string(),
@@ -427,13 +568,13 @@ pub async fn update_embedding_skip_via(
 
 /// Path-variant of `update_embedding_skip_via` for the local-CLI flows that
 /// still walk the filesystem directly.
-pub fn update_embedding_skip(catalog_dir: &Path, stem: &str, reason: &str) {
+pub fn update_embedding_skip(catalog_dir: &Path, stem: &str, reason: &str) -> std::io::Result<()> {
     let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
     entry.embedding_skip = Some(EmbeddingSkip {
         reason: reason.to_string(),
         at: chrono::Utc::now().to_rfc3339(),
     });
-    write_catalog_entry(catalog_dir, stem, &entry);
+    write_catalog_entry(catalog_dir, stem, &entry)
 }
 
 #[cfg(feature = "storage")]
@@ -449,7 +590,7 @@ pub async fn update_embedding_catalog_via(
         return Ok(());
     }
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
-        .await
+        .await?
         .unwrap_or_default();
 
     entry.embedding = Some(EmbeddingMeta {
@@ -465,7 +606,7 @@ pub async fn update_embedding_catalog_via(
 #[cfg(all(test, feature = "storage"))]
 mod storage_tests {
     use super::*;
-    use crate::storage::LocalFsStorage;
+    use crate::storage::{LocalFsStorage, Storage};
 
     #[tokio::test]
     async fn roundtrip_via_local_storage() {
@@ -484,7 +625,8 @@ mod storage_tests {
 
         let got = read_catalog_entry_via(&storage, "catalog", "ab123")
             .await
-            .unwrap();
+            .expect("read succeeds")
+            .expect("entry present");
         assert_eq!(got.title.as_deref(), Some("Example"));
         assert_eq!(got.sha256.as_deref(), Some("deadbeef"));
 
@@ -494,6 +636,7 @@ mod storage_tests {
             .unwrap();
         assert!(read_catalog_entry_via(&storage, "", "ab123")
             .await
+            .expect("read succeeds")
             .is_some());
     }
 
@@ -506,13 +649,11 @@ mod storage_tests {
 
         let entry = CatalogEntry {
             conversion: Some(ConversionMeta {
-                server: "scribe".into(),
+                server: "scribe-vlm".into(),
                 duration_secs: 0.42,
                 total_pages: 1,
                 converted_at: "2026-04-15T19:50:02Z".into(),
                 pages: vec![],
-                failed: true,
-                reason: Some("stub_document".into()),
             }),
             ..Default::default()
         };
@@ -522,7 +663,8 @@ mod storage_tests {
 
         let got = read_catalog_entry_via(&storage, "catalog", "stub")
             .await
-            .unwrap();
+            .expect("read succeeds")
+            .expect("entry present");
         let conv = got.conversion.unwrap();
         assert_eq!(conv.duration_secs, 0.42);
     }
@@ -544,5 +686,253 @@ conversion:
         let conv = entry.conversion.expect("conversion present");
         assert_eq!(conv.duration_secs, 5.0);
         assert_eq!(conv.total_pages, 12);
+    }
+
+    #[tokio::test]
+    async fn conversion_failed_roundtrip_and_increments_attempts() {
+        // Stamp, read back, stamp again — attempts counter should
+        // increment so a future retry policy can see how many tries the
+        // file has already eaten.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        update_conversion_failed_via(
+            &storage,
+            "catalog",
+            "paywalled",
+            "unsupported_content_type:html",
+        )
+        .await
+        .unwrap();
+        let entry = read_catalog_entry_via(&storage, "catalog", "paywalled")
+            .await
+            .expect("read succeeds")
+            .expect("row stamped");
+        let f1 = entry.conversion_failed.expect("field present");
+        assert_eq!(f1.reason, "unsupported_content_type:html");
+        assert_eq!(f1.attempts, 1);
+
+        update_conversion_failed_via(
+            &storage,
+            "catalog",
+            "paywalled",
+            "unsupported_content_type:html",
+        )
+        .await
+        .unwrap();
+        let entry2 = read_catalog_entry_via(&storage, "catalog", "paywalled")
+            .await
+            .expect("read succeeds")
+            .expect("row still present");
+        assert_eq!(entry2.conversion_failed.unwrap().attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_fetcher_matches_serial() {
+        // 100 valid catalog rows + 3 malformed YAML objects. Both fetchers
+        // must return the same (stem -> title) set — the malformed ones are
+        // silently skipped by both paths, and any other divergence is a bug.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        for i in 0..100 {
+            let stem = format!("doc_{i:03}");
+            let entry = CatalogEntry {
+                title: Some(format!("Title {i}")),
+                ..Default::default()
+            };
+            write_catalog_entry_via(&storage, "catalog", &stem, &entry)
+                .await
+                .unwrap();
+        }
+        for stem in ["bad_a", "bad_b", "bad_c"] {
+            let key = format!("catalog/{}", crate::sharded_key(stem, "yaml"));
+            storage
+                .put(&key, b"{{ not: valid ::: yaml }}\n".to_vec())
+                .await
+                .unwrap();
+        }
+
+        let serial = list_catalog_entries_via(&storage, "catalog").await.unwrap();
+        let parallel = list_catalog_entries_parallel(&storage, "catalog", 8, |_, _| {})
+            .await
+            .unwrap();
+
+        use std::collections::BTreeMap;
+        let serial_map: BTreeMap<String, Option<String>> = serial
+            .into_iter()
+            .map(|(stem, _meta, entry)| (stem, entry.title))
+            .collect();
+        let parallel_map: BTreeMap<String, Option<String>> = parallel
+            .into_iter()
+            .map(|(stem, _meta, entry)| (stem, entry.title))
+            .collect();
+
+        assert_eq!(serial_map.len(), 100, "100 valid rows, 3 malformed skipped");
+        assert_eq!(parallel_map, serial_map);
+    }
+
+    #[tokio::test]
+    async fn parallel_fetcher_fails_loud_on_get_error() {
+        // A storage where one key's `get` returns `Err` must cause the
+        // whole fetcher to fail — not skip the row silently — and the
+        // offending key has to appear in the error so operators can
+        // diagnose. Same match arm handles the 10s timeout branch; an
+        // error-based mock keeps the test synchronous and deterministic.
+        use crate::storage::{ObjectMeta, Storage};
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        struct FailOnKey {
+            keys: Vec<String>,
+            fail: String,
+        }
+
+        #[async_trait]
+        impl Storage for FailOnKey {
+            async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+                if key == self.fail {
+                    return Err(anyhow::anyhow!("simulated backend 500"));
+                }
+                let title = key.trim_end_matches(".yaml").rsplit('/').next().unwrap();
+                let entry = CatalogEntry {
+                    title: Some(title.into()),
+                    ..Default::default()
+                };
+                Ok(serde_yaml_ng::to_string(&entry)?.into_bytes())
+            }
+            async fn put(&self, _: &str, _: Vec<u8>) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn head(&self, _: &str) -> anyhow::Result<Option<ObjectMeta>> {
+                unimplemented!()
+            }
+            async fn list(&self, _: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+                Ok(self
+                    .keys
+                    .iter()
+                    .map(|k| ObjectMeta {
+                        key: k.clone(),
+                        size: 1,
+                        last_modified: None,
+                        etag: None,
+                    })
+                    .collect())
+            }
+            async fn delete(&self, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+        }
+
+        let keys: Vec<String> = (0..5).map(|i| format!("catalog/xx/doc_{i}.yaml")).collect();
+        let fail = keys[2].clone();
+        let storage = Arc::new(FailOnKey {
+            keys,
+            fail: fail.clone(),
+        });
+
+        let err = list_catalog_entries_parallel(&*storage, "catalog", 4, |_, _| {})
+            .await
+            .expect_err("must fail loud on GET error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&fail) && msg.contains("failed"),
+            "error must name the offending key: {msg}"
+        );
+    }
+
+    // ── P0-10 regression: three-state read ────────────────────────────
+
+    #[tokio::test]
+    async fn read_missing_entry_returns_ok_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let out = read_catalog_entry_via(&storage, "catalog", "no-such-stem")
+            .await
+            .expect("missing object → Ok(None), not Err");
+        assert!(out.is_none(), "missing object should be Ok(None)");
+    }
+
+    #[tokio::test]
+    async fn read_corrupt_entry_returns_err_not_none() {
+        // A corrupt row is NOT an orphan — earlier code returned None on a
+        // parse failure, which let catalog_repair misclassify it as
+        // "catalog vanished" and synthesize a replacement row, masking the
+        // underlying corruption. P0-10 requires a distinct Err path.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let key = format!("catalog/{}", crate::sharded_key("corrupt", "yaml"));
+        storage
+            .put(&key, b"{{ not valid yaml ::: at all }}\n".to_vec())
+            .await
+            .unwrap();
+        let err = read_catalog_entry_via(&storage, "catalog", "corrupt")
+            .await
+            .expect_err("corrupt YAML must surface as Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("YAML parse") || msg.contains("parse"),
+            "error should mention YAML parse failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn write_catalog_entry_surfaces_io_errors() {
+        // Pointing write at a file path as the "directory" forces
+        // create_dir_all to error — exactly the class of failure that the
+        // pre-P0-9 `let _ = ...` shrugged off. We need the error to
+        // propagate.
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = tmp.path().join("not-a-dir");
+        std::fs::write(&sentinel, b"blocking file\n").unwrap();
+        // `sentinel` is a file; using it as catalog_dir means create_dir_all
+        // on a subpath fails with NotADirectory/AlreadyExists.
+        let entry = CatalogEntry {
+            title: Some("doomed".into()),
+            ..Default::default()
+        };
+        let res = write_catalog_entry(&sentinel, "abcdef", &entry);
+        assert!(
+            res.is_err(),
+            "write into a path blocked by a regular file must error"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_storage_error_returns_err() {
+        // Storage-layer failures (transient S3, permission, etc.) must
+        // NOT collapse to None — orphan-detection logic can't distinguish
+        // "gone" from "can't reach the backend right now" otherwise.
+        use crate::storage::{ObjectMeta, Storage};
+        use async_trait::async_trait;
+
+        struct BrokenStorage;
+
+        #[async_trait]
+        impl Storage for BrokenStorage {
+            async fn get(&self, _key: &str) -> anyhow::Result<Vec<u8>> {
+                Err(anyhow::anyhow!("simulated transient backend failure"))
+            }
+            async fn put(&self, _: &str, _: Vec<u8>) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn head(&self, _key: &str) -> anyhow::Result<Option<ObjectMeta>> {
+                Err(anyhow::anyhow!("simulated transient backend failure"))
+            }
+            async fn list(&self, _: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+                Ok(Vec::new())
+            }
+            async fn delete(&self, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+        }
+
+        let err = read_catalog_entry_via(&BrokenStorage, "catalog", "whatever")
+            .await
+            .expect_err("storage error must propagate, not collapse to Ok(None)");
+        assert!(
+            err.to_string().contains("transient backend failure"),
+            "storage error should bubble up verbatim: {err}"
+        );
     }
 }

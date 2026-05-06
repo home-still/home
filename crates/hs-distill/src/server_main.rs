@@ -1,3 +1,13 @@
+// rc.306 P0-8 / P3-11: the distill server binary MUST be built with the
+// `cuda` feature. Without it, ort wouldn't link the CUDA provider and we
+// would silently run on CPU — directly violating the project's
+// "no CPU fallback" non-negotiable. Refuse to compile.
+#[cfg(not(feature = "cuda"))]
+compile_error!(
+    "hs-distill-server requires --features cuda. Rebuild with:\n\
+     cargo build --release -p hs-distill --features server,cuda --bin hs-distill-server"
+);
+
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
@@ -16,8 +26,18 @@ struct Args {
     port: u16,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Must run before ANY dlopen or tokio init — re-execs self with the
+    // platform's dynamic-lib search path augmented so ort's CUDA provider
+    // (Linux) loads from our bundled directories.
+    hs_common::service::lib_bootstrap::ensure_lib_paths_or_reexec();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let _ = hs_common::secrets::load_default_secrets();
     let logging_handle = install_logging().await;
     let args = Args::parse();

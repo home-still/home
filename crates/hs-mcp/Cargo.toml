@@ -26,3 +26,6 @@ chrono = "0.4"
 clap = { workspace = true }
 tracing = { workspace = true }
 percent-encoding = "2"
+
+[dev-dependencies]
+tempfile = "3"
