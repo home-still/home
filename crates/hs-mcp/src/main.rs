@@ -57,6 +57,24 @@ struct PaperGetParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PaperReferencesParams {
+    #[schemars(description = "DOI of the paper whose reference list to return")]
+    doi: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PaperCitationsParams {
+    #[schemars(description = "DOI of the paper to find citing works for")]
+    doi: String,
+    #[schemars(description = "Maximum citations to return (default 100, max 1000)")]
+    limit: Option<u32>,
+    #[schemars(description = "Optional minimum publication year filter (post-fetch)")]
+    year_from: Option<u16>,
+    #[schemars(description = "Sort order: 'year' (default) or 'citations'")]
+    sort: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct CatalogReadParams {
     #[schemars(description = "Paper stem name (filename without extension)")]
     stem: String,
@@ -419,6 +437,62 @@ impl HomeStillMcp {
             Ok(Some(paper)) => Ok(serde_json::to_string_pretty(&paper).unwrap_or_default()),
             Ok(None) => Err(format!("No paper found for DOI: {}", p.doi)),
             Err(e) => Err(format!("Lookup failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Return the structured reference list of a paper by DOI. Returns JSON with each reference's DOI, title, year, authors, venue, and citation count. Source: Semantic Scholar Graph API.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn paper_references(
+        &self,
+        Parameters(p): Parameters<PaperReferencesParams>,
+    ) -> Result<String, String> {
+        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
+        let provider = paper::providers::semantic_scholar::SemanticScholarProvider::new(
+            &config.providers.semantic_scholar,
+        )
+        .map_err(|e| format!("Provider error: {e}"))?;
+
+        match provider.references(&p.doi).await {
+            Ok(resp) => Ok(serde_json::to_string_pretty(&resp).unwrap_or_default()),
+            Err(e) => Err(format!("References lookup failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Return the list of papers that cite a given paper by DOI (forward citation chaining). Supports limit (default 100, max 1000) and optional year_from / sort filters. Returns JSON with each citing paper's DOI, title, year, authors, venue, and citation count. Source: Semantic Scholar Graph API.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn paper_citations(
+        &self,
+        Parameters(p): Parameters<PaperCitationsParams>,
+    ) -> Result<String, String> {
+        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
+        let provider = paper::providers::semantic_scholar::SemanticScholarProvider::new(
+            &config.providers.semantic_scholar,
+        )
+        .map_err(|e| format!("Provider error: {e}"))?;
+
+        let opts = paper::providers::semantic_scholar::CitationsOpts {
+            limit: p.limit,
+            year_from: p.year_from,
+            sort: p.sort,
+        };
+
+        match provider.citations(&p.doi, opts).await {
+            Ok(resp) => Ok(serde_json::to_string_pretty(&resp).unwrap_or_default()),
+            Err(e) => Err(format!("Citations lookup failed: {e}")),
         }
     }
 
