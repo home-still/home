@@ -1195,6 +1195,10 @@ async fn execute_vlm_for_page(
 
     let total_regions = text_regions.len();
     let region_done = Arc::new(AtomicU64::new(0));
+    // Counter for streaming-detector aborts. Threaded into the diag
+    // record so post-mortems can gauge per-page and per-corpus abort
+    // rates without re-running OCR.
+    let aborted_count = Arc::new(AtomicU64::new(0));
 
     on_progress(ProgressEvent {
         stage: "vlm".into(),
@@ -1207,19 +1211,30 @@ async fn execute_vlm_for_page(
     });
 
     // Process text regions with semaphore-gated concurrency.
-    // Per-region VLM failures fail the whole page (and therefore the
-    // whole paper) — silently emitting empty regions is the silent
-    // degradation path CLAUDE.md prohibits, and the resulting markdown
-    // would have invisible holes the operator can't tell from a clean
-    // conversion. Figure/Skip and empty-jpeg regions still return an
-    // empty placeholder because those are intentional non-VLM slots,
-    // not failures.
+    //
+    // **Failure handling.** Two distinct paths:
+    //
+    // - **Repetition-loop abort** (RepetitionLoopError, raised by the
+    //   streaming OCR backend mid-generation): the region's output is a
+    //   degenerate cycle that the VLM was about to spam to max_tokens.
+    //   Treat as a per-region drop, NOT a page failure. The page assembles
+    //   markdown from the surviving regions; the doc continues. Increment
+    //   `aborted_count` so the per-page diag records the abort.
+    //
+    // - **Other VLM errors** (transport, server 5xx, semaphore closed):
+    //   propagate as page-fatal via `?`. Silent fallthrough on these is
+    //   the bug class CLAUDE.md prohibits — invisible holes in the
+    //   markdown that an operator can't tell from a clean convert.
+    //
+    // Figure/Skip and empty-jpeg regions return empty placeholders
+    // because those are intentional non-VLM slots, not failures.
     let region_results: Vec<(BBox, String)> = stream::iter(text_regions)
         .map(|r| {
             let ocr = Arc::clone(&ocr);
             let sem = Arc::clone(&sem);
             let on_progress = Arc::clone(&on_progress);
             let region_done = Arc::clone(&region_done);
+            let aborted_count = Arc::clone(&aborted_count);
             async move {
                 if r.region_type == RegionType::Figure || r.region_type == RegionType::Skip {
                     region_done.fetch_add(1, Ordering::Relaxed);
@@ -1235,15 +1250,34 @@ async fn execute_vlm_for_page(
                     .acquire()
                     .await
                     .map_err(|e| anyhow::anyhow!("VLM semaphore closed mid-page: {e}"))?;
-                let text = ocr
-                    .recognize_region(&r.jpeg_bytes, r.region_type)
-                    .await
-                    .with_context(|| {
-                        format!(
+                let text = match ocr.recognize_region(&r.jpeg_bytes, r.region_type).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // Discriminate the controlled streaming-abort from
+                        // a transport/server failure. Aborts produce an
+                        // empty region (page continues); other errors
+                        // bubble up as page-fatal.
+                        if let Some(loop_err) = e.downcast_ref::<crate::ocr::RepetitionLoopError>()
+                        {
+                            tracing::warn!(
+                                page = page_num,
+                                region_type = ?r.region_type,
+                                reason = %loop_err.reason,
+                                bytes_at_abort = loop_err.bytes_at_abort,
+                                "streaming repetition detector aborted region; \
+                                 dropping from page output (paper continues)"
+                            );
+                            aborted_count.fetch_add(1, Ordering::Relaxed);
+                            drop(permit);
+                            region_done.fetch_add(1, Ordering::Relaxed);
+                            return Ok((r.bbox, String::new()));
+                        }
+                        return Err(e.context(format!(
                             "region VLM failed on page {page_num} (region_type={:?})",
                             r.region_type
-                        )
-                    })?;
+                        )));
+                    }
+                };
                 drop(permit);
                 let done = region_done.fetch_add(1, Ordering::Relaxed) + 1;
                 on_progress(ProgressEvent {
@@ -1258,6 +1292,7 @@ async fn execute_vlm_for_page(
         .buffer_unordered(region_parallel)
         .try_collect()
         .await?;
+    let aborted_count = aborted_count.load(Ordering::Relaxed) as u32;
 
     let mut regions: Vec<(BBox, String)> = region_results;
 
@@ -1360,6 +1395,7 @@ async fn execute_vlm_for_page(
         output_byte_count: markdown.len(),
         wall_clock_ms: started.elapsed().as_millis() as u64,
         column_split_shadow,
+        repetition_aborted_regions: aborted_count,
     };
     Ok((page_idx, markdown, region_classes, diag))
 }

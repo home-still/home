@@ -1,5 +1,8 @@
 use super::region::RegionType;
+use super::repetition_detector::{RepetitionDetector, RepetitionLoopError};
+use super::sse_buffer::SseBuffer;
 use anyhow::Result;
+use futures_util::StreamExt;
 
 pub struct OpenAiBackend {
     client: reqwest::Client,
@@ -21,6 +24,14 @@ impl OpenAiBackend {
             .await
     }
 
+    /// Streamed VLM call with mid-stream repetition-loop detection. The
+    /// request goes out with `stream: true`; deltas are accumulated into
+    /// `output` and fed into a [`RepetitionDetector`]. When the detector
+    /// fires we drop the response stream (closes the TCP connection,
+    /// llama.cpp's `llama-server` checks per-token and stops generation
+    /// within ~50 ms) and return a [`RepetitionLoopError`] carrying the
+    /// partial output. The caller treats that as a per-region failure
+    /// and the page assembles markdown from surviving regions.
     pub async fn recognize_region(
         &self,
         image_bytes: &[u8],
@@ -28,7 +39,6 @@ impl OpenAiBackend {
     ) -> Result<String> {
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, image_bytes);
         let image_url = format!("data:image/jpeg;base64,{}", b64);
-
         let body = build_request_body(&self.model, region_type, &image_url);
 
         let resp = self
@@ -39,15 +49,57 @@ impl OpenAiBackend {
             .await?
             .error_for_status()?;
 
-        let json: serde_json::Value = resp.json().await?;
+        let mut stream = resp.bytes_stream();
+        let mut sse = SseBuffer::new();
+        let mut detector = RepetitionDetector::default();
+        let mut output = String::new();
 
-        let content = json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-
-        Ok(content)
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk?;
+            for event in sse.feed(&bytes) {
+                if event == "[DONE]" {
+                    return Ok(output);
+                }
+                let Some(delta) = parse_delta_content(&event) else {
+                    continue;
+                };
+                if delta.is_empty() {
+                    continue;
+                }
+                output.push_str(&delta);
+                detector.feed(&delta);
+                if let Some(reason) = detector.check() {
+                    let bytes_at_abort = output.len();
+                    // Dropping the stream closes the underlying reqwest
+                    // body, which signals the server to stop generation.
+                    drop(stream);
+                    return Err(anyhow::Error::new(RepetitionLoopError {
+                        reason,
+                        partial_output: output,
+                        bytes_at_abort,
+                    }));
+                }
+            }
+        }
+        // Stream ended without `[DONE]`. llama-server emits `[DONE]`
+        // reliably on graceful completion; we got here either because
+        // the connection dropped mid-stream (treat as transport error)
+        // or the server closed without a sentinel (some non-llama.cpp
+        // backends). Return what we have rather than fail — the
+        // postprocess QC gate will catch a truncated output as low
+        // quality if it's actually broken.
+        Ok(output)
     }
+}
+
+/// Extract `choices[0].delta.content` from a streamed event payload.
+/// Returns `None` for events that don't carry a content delta (e.g. the
+/// initial `role` event, the final usage event with `stream_options`).
+fn parse_delta_content(event_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(event_json).ok()?;
+    v["choices"][0]["delta"]["content"]
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 /// Sampling parameters tuned for verbatim OCR on academic layouts.
@@ -94,7 +146,15 @@ fn build_request_body(model: &str, region_type: RegionType, image_url: &str) -> 
         "repetition_penalty": 1.10,
         "frequency_penalty": 0.2,
         "presence_penalty": 0.0,
-        "extra_body": { "no_repeat_ngram_size": 12 }
+        "extra_body": { "no_repeat_ngram_size": 12 },
+        // Streaming enables per-delta repetition-loop detection. When the
+        // RepetitionDetector fires we drop the response body, which closes
+        // the TCP connection — llama.cpp's `llama-server` polls the
+        // connection state per-token and stops generation within ~50 ms.
+        // include_usage is harmless on llama-server; vLLM uses it to emit
+        // a final usage event we ignore.
+        "stream": true,
+        "stream_options": { "include_usage": true }
     })
 }
 
@@ -117,6 +177,43 @@ mod tests {
         assert_eq!(body["frequency_penalty"], 0.2);
         assert_eq!(body["presence_penalty"], 0.0);
         assert_eq!(body["extra_body"]["no_repeat_ngram_size"], 12);
+    }
+
+    #[test]
+    fn request_body_carries_stream_flags() {
+        // The whole point of v1 is streaming + mid-stream loop abort.
+        // Regression guard: dropping `stream: true` silently reverts
+        // every call to non-streaming, defeating the detector entirely.
+        let body = build_request_body("glm-ocr", RegionType::Text, "data:image/jpeg;base64,Zm9v");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn parse_delta_content_extracts_streaming_chunk() {
+        let event = r#"{"choices":[{"delta":{"content":"Hello"}}]}"#;
+        assert_eq!(parse_delta_content(event), Some("Hello".to_string()));
+    }
+
+    #[test]
+    fn parse_delta_content_returns_none_for_role_only_event() {
+        // First event in a stream typically carries only role, no content.
+        let event = r#"{"choices":[{"delta":{"role":"assistant"}}]}"#;
+        assert_eq!(parse_delta_content(event), None);
+    }
+
+    #[test]
+    fn parse_delta_content_returns_none_for_final_usage_event() {
+        // With stream_options.include_usage=true, the final event has
+        // empty choices and a usage block we don't care about.
+        let event = r#"{"choices":[],"usage":{"prompt_tokens":42}}"#;
+        assert_eq!(parse_delta_content(event), None);
+    }
+
+    #[test]
+    fn parse_delta_content_returns_none_for_malformed_json() {
+        let event = "not json";
+        assert_eq!(parse_delta_content(event), None);
     }
 
     #[test]

@@ -62,6 +62,19 @@ pub struct PageDiagRecord {
     /// mode — Phase 2 wires the verdict into the routing path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column_split_shadow: Option<ColumnSplitShadow>,
+    /// Number of regions on this page where the streaming repetition
+    /// detector aborted the VLM call mid-stream. Each aborted region
+    /// surfaces as an empty placeholder in the assembled markdown — the
+    /// page continues, the doc continues. Tracking the count lets
+    /// post-mortems gauge how often the detector fires per page and
+    /// per corpus without re-running OCR. Zero on pages where every
+    /// region completed cleanly.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub repetition_aborted_regions: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// What the column-detector decided for a page. Serialized into the
