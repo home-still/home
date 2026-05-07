@@ -55,6 +55,46 @@ pub struct PageDiagRecord {
     /// for per-region pipelines without table HTML wrapping.
     pub output_byte_count: usize,
     pub wall_clock_ms: u64,
+    /// Phase 1 (shadow) defensive-column-detection record. `Some` when
+    /// the layout pool emitted at least one bbox AND the column detector
+    /// ran; `None` for pages with zero regions or where the detector
+    /// short-circuited. The field is purely informational in shadow
+    /// mode — Phase 2 wires the verdict into the routing path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_split_shadow: Option<ColumnSplitShadow>,
+}
+
+/// What the column-detector decided for a page. Serialized into the
+/// per-page diag JSONL so a corpus-level review can compute precision/
+/// recall against ground-truth column counts. Defined in `diag` rather
+/// than `pipeline::column_detect` because the diag module is shared by
+/// the client (no `server` feature) and server, while the column
+/// detector itself is server-only.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ColumnSplitShadow {
+    /// Index in the post-Skip-filter bbox vector of the suspect region,
+    /// or `None` if no region tripped the wide-bbox heuristic.
+    pub suspect_idx: Option<usize>,
+    /// Class name of the suspect region (only meaningful if `suspect_idx
+    /// .is_some()`).
+    pub suspect_class: Option<String>,
+    /// `relative_width` of the suspect region, recorded so a corpus
+    /// review can re-tune the wide-ratio threshold without rerunning OCR.
+    pub suspect_relative_width: Option<f32>,
+    /// Whether the projection-profile verifier confirmed two columns on
+    /// the suspect region. `false` on suspect regions that turned out to
+    /// be legitimate single-column wide blocks (definition lists,
+    /// boxed callouts).
+    pub verifier_passed: bool,
+    /// Confirmed gutter x-coordinate, in absolute image pixels (NOT
+    /// relative to the bbox crop). Set only when `verifier_passed` is
+    /// true. Phase 2 uses this as the cut x for splitting.
+    pub gutter_x: Option<u32>,
+    /// What the system *would* do if Phase 2 (active split) were
+    /// enabled: `"split"` if both detector AND verifier agreed,
+    /// `"detector_only"` if the detector flagged but the verifier
+    /// rejected, `"clean"` if the detector saw nothing suspect.
+    pub would_action: String,
 }
 
 /// Per-pass truncation breakdown from `clean_repetitions`. Sum equals
@@ -89,10 +129,13 @@ pub struct DocSummaryRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DiagLine {
+    // PageDiagRecord is much larger than DocSummaryRecord (page records
+    // grow with each diagnostic field; doc summaries stay stable). Box
+    // the page variant so the enum's size stays bounded by the summary.
     Page {
         stem: String,
         #[serde(flatten)]
-        record: PageDiagRecord,
+        record: Box<PageDiagRecord>,
     },
     Document(DocSummaryRecord),
 }
@@ -155,7 +198,7 @@ impl DiagWriter {
     pub fn write_page(&mut self, stem: &str, record: PageDiagRecord) {
         let line = DiagLine::Page {
             stem: stem.to_string(),
-            record,
+            record: Box::new(record),
         };
         self.write_line(&line);
     }

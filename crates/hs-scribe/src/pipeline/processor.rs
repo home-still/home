@@ -60,6 +60,11 @@ struct PreparedPage {
     detection_order: Vec<usize>,
     text_regions: Vec<PreparedRegion>,
     table_regions: Vec<PreparedTable>,
+    /// Shadow-mode defensive-column-detection record. Populated by
+    /// `prepare_page`, threaded through to the per-page diag JSONL by
+    /// `execute_vlm_for_page`. `None` only on the empty-page early
+    /// return — every other path computes and records a verdict.
+    column_split_shadow: Option<crate::diag::ColumnSplitShadow>,
 }
 
 /// Round-robin pool of ONNX detectors. Each detector holds an `ort::Session`
@@ -976,6 +981,7 @@ fn prepare_page(
             detection_order: vec![],
             text_regions: vec![],
             table_regions: vec![],
+            column_split_shadow: None,
         });
     }
 
@@ -989,6 +995,16 @@ fn prepare_page(
         .into_iter()
         .filter(|b| RegionType::from_class(&b.class_name) != RegionType::Skip)
         .collect();
+
+    // Defensive column detection (Phase 1 — shadow only). Runs after the
+    // Skip-filter so the suspect-counter sees only content-bearing
+    // regions. Verdict is recorded into the per-page diag JSONL by
+    // `execute_vlm_for_page`; the bbox vector is NOT mutated yet (Phase
+    // 2 will replace the suspect with the split pair once a corpus run
+    // confirms the false-positive rate is acceptable).
+    let column_split_shadow = Some(crate::pipeline::column_detect::shadow_decide(
+        image, &bboxes,
+    ));
 
     let detection_order: Vec<usize> = bboxes.iter().map(|b| b.unique_id).collect();
 
@@ -1128,6 +1144,7 @@ fn prepare_page(
         detection_order,
         text_regions,
         table_regions,
+        column_split_shadow,
     })
 }
 
@@ -1156,6 +1173,7 @@ async fn execute_vlm_for_page(
         detection_order,
         text_regions,
         table_regions,
+        column_split_shadow,
     } = prepared;
 
     let total_regions = text_regions.len();
@@ -1324,6 +1342,7 @@ async fn execute_vlm_for_page(
         raw_vlm_output_first_1k: crate::diag::truncate_at_char_boundary(&markdown, 1024),
         output_byte_count: markdown.len(),
         wall_clock_ms: started.elapsed().as_millis() as u64,
+        column_split_shadow,
     };
     Ok((page_idx, markdown, region_classes, diag))
 }
