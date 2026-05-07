@@ -251,6 +251,12 @@ fn classify_permanent_reason(err: &anyhow::Error) -> String {
         "html_not_utf8".to_string()
     } else if msg.contains("unsupported source type") {
         "unsupported_extension".to_string()
+    } else if msg.contains("VLM repetition loop") {
+        // event_watch.rs's QC stamps `vlm_repetition_loop` directly
+        // before returning the Permanent error. Mirror that reason here
+        // so the outer-handler stamp doesn't clobber the inner one with
+        // a generic label.
+        "vlm_repetition_loop".to_string()
     } else {
         "permanent_convert_failure".to_string()
     }
@@ -863,3 +869,35 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
 }
 
 // ── Clean junk HTML papers ────────────────────────────────────
+
+#[cfg(test)]
+mod classify_permanent_reason_tests {
+    use super::classify_permanent_reason;
+
+    #[test]
+    fn vlm_repetition_loop_message_maps_to_specific_reason() {
+        // Verbatim shape of the error event_watch.rs constructs at the
+        // RejectLoop arm. The outer handler must classify this back to
+        // `vlm_repetition_loop` so `update_conversion_failed_via` writes
+        // the same reason both stampers wrote, instead of the generic
+        // `permanent_convert_failure` clobber.
+        let err = anyhow::anyhow!(
+            "VLM repetition loop on papers/10/x.pdf (truncations=23, longest_run=9009B)"
+        );
+        assert_eq!(classify_permanent_reason(&err), "vlm_repetition_loop");
+    }
+
+    #[test]
+    fn unrecognized_message_falls_back_to_generic() {
+        let err = anyhow::anyhow!("scribe convert failed: some novel failure mode");
+        assert_eq!(classify_permanent_reason(&err), "permanent_convert_failure");
+    }
+
+    #[test]
+    fn pdf_parse_error_takes_precedence_over_vlm() {
+        // FormatError is a hard PDF-parse problem; route to pdf_parse_error
+        // even if a downstream layer happens to mention "VLM" in its chain.
+        let err = anyhow::anyhow!("scribe convert failed: FormatError on page 3");
+        assert_eq!(classify_permanent_reason(&err), "pdf_parse_error");
+    }
+}

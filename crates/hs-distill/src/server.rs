@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use axum::{
 };
 use hs_common::service::inflight::InFlightGuard;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::client::{
@@ -19,12 +21,45 @@ use crate::client::{
 };
 use crate::config::DistillServerConfig;
 use crate::embed::{Embedder, FallbackEmbedder};
+use crate::error::DistillError;
 
 pub struct DistillServerState {
     pub embedder: Arc<FallbackEmbedder>,
     pub qdrant: Arc<qdrant_client::Qdrant>,
     pub config: DistillServerConfig,
     pub in_flight: Arc<AtomicUsize>,
+    /// Collections we've already verified/created since process start. The
+    /// configured default is seeded at startup; non-default names supplied
+    /// via per-request `collection` are lazily ensured on first use, then
+    /// recorded here so subsequent requests skip the round-trip.
+    pub known_collections: Arc<Mutex<HashSet<String>>>,
+}
+
+impl DistillServerState {
+    /// Pick the collection for this request and ensure the Qdrant collection
+    /// exists. Missing `requested` means "use the configured default" — that
+    /// path was vetted at startup, so it short-circuits the lazy-create
+    /// machinery.
+    pub async fn resolve_collection(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<String, DistillError> {
+        let name = requested
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.config.collection_name.clone());
+
+        if name == self.config.collection_name {
+            return Ok(name);
+        }
+
+        let mut known = self.known_collections.lock().await;
+        if !known.contains(&name) {
+            crate::qdrant::ensure_collection(&self.qdrant, &name, self.embedder.dimension())
+                .await?;
+            known.insert(name.clone());
+        }
+        Ok(name)
+    }
 }
 
 pub fn app(state: Arc<DistillServerState>) -> Router {
@@ -39,6 +74,7 @@ pub fn app(state: Arc<DistillServerState>) -> Router {
         .route("/doc/{doc_id}", axum::routing::delete(handle_delete_doc))
         .route("/docs", get(handle_list_docs))
         .route("/collection/reset", post(handle_reset_collection))
+        .route("/scrub-interstitials", post(handle_scrub_interstitials))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
@@ -75,20 +111,27 @@ async fn handle_readiness(State(state): State<Arc<DistillServerState>>) -> impl 
     })
 }
 
-async fn handle_status(State(state): State<Arc<DistillServerState>>) -> impl IntoResponse {
-    let collection = &state.config.collection_name;
-    let points_count = match crate::qdrant::collection_info(&state.qdrant, collection).await {
+async fn handle_status(
+    State(state): State<Arc<DistillServerState>>,
+    axum::extract::Query(q): axum::extract::Query<CollectionQuery>,
+) -> impl IntoResponse {
+    let collection = match state.resolve_collection(q.collection.as_deref()).await {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     };
-    let documents_count = match crate::qdrant::distinct_doc_count(&state.qdrant, collection).await {
+    let points_count = match crate::qdrant::collection_info(&state.qdrant, &collection).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    let documents_count = match crate::qdrant::distinct_doc_count(&state.qdrant, &collection).await
+    {
         Ok(d) => d,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response();
         }
     };
     Json(StatusResponse {
-        collection: collection.clone(),
+        collection,
         points_count,
         documents_count,
         compute_device: state.embedder.device().to_string(),
@@ -100,10 +143,13 @@ async fn handle_status(State(state): State<Arc<DistillServerState>>) -> impl Int
 async fn handle_delete_doc(
     State(state): State<Arc<DistillServerState>>,
     axum::extract::Path(doc_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<CollectionQuery>,
 ) -> impl IntoResponse {
-    match crate::qdrant::delete_by_doc_id(&state.qdrant, &state.config.collection_name, &doc_id)
-        .await
-    {
+    let collection = match state.resolve_collection(q.collection.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    match crate::qdrant::delete_by_doc_id(&state.qdrant, &collection, &doc_id).await {
         Ok(deleted) => {
             Json(serde_json::json!({"doc_id": doc_id, "deleted": deleted})).into_response()
         }
@@ -116,7 +162,11 @@ async fn handle_list_docs(
     axum::extract::Query(q): axum::extract::Query<ListDocsQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(100_000);
-    match crate::qdrant::list_doc_ids(&state.qdrant, &state.config.collection_name, limit).await {
+    let collection = match state.resolve_collection(q.collection.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    match crate::qdrant::list_doc_ids(&state.qdrant, &collection, limit).await {
         Ok(ids) => Json(serde_json::json!({"doc_ids": ids})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
@@ -124,13 +174,16 @@ async fn handle_list_docs(
 
 async fn handle_reset_collection(
     State(state): State<Arc<DistillServerState>>,
+    axum::extract::Query(q): axum::extract::Query<CollectionQuery>,
 ) -> impl IntoResponse {
     let dimension = state.embedder.dimension();
-    match crate::qdrant::reset_collection(&state.qdrant, &state.config.collection_name, dimension)
-        .await
-    {
+    let collection = match state.resolve_collection(q.collection.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    match crate::qdrant::reset_collection(&state.qdrant, &collection, dimension).await {
         Ok(deleted) => Json(serde_json::json!({
-            "collection": state.config.collection_name,
+            "collection": collection,
             "deleted_points": deleted,
         }))
         .into_response(),
@@ -139,15 +192,48 @@ async fn handle_reset_collection(
 }
 
 #[derive(Deserialize)]
+struct CollectionQuery {
+    collection: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ScrubQuery {
+    /// When true, scan and report only — do not delete. Default false.
+    #[serde(default)]
+    dry_run: bool,
+    collection: Option<String>,
+}
+
+async fn handle_scrub_interstitials(
+    State(state): State<Arc<DistillServerState>>,
+    axum::extract::Query(q): axum::extract::Query<ScrubQuery>,
+) -> impl IntoResponse {
+    let collection = match state.resolve_collection(q.collection.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    match crate::qdrant::scrub_interstitial_chunks(&state.qdrant, &collection, q.dry_run).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 struct ListDocsQuery {
     limit: Option<u64>,
+    collection: Option<String>,
 }
 
 async fn handle_exists(
     State(state): State<Arc<DistillServerState>>,
     axum::extract::Path(doc_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<CollectionQuery>,
 ) -> impl IntoResponse {
-    match crate::qdrant::doc_exists(&state.qdrant, &state.config.collection_name, &doc_id).await {
+    let collection = match state.resolve_collection(q.collection.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    match crate::qdrant::doc_exists(&state.qdrant, &collection, &doc_id).await {
         Ok((exists, chunks)) => {
             Json(serde_json::json!({"exists": exists, "chunks": chunks})).into_response()
         }
@@ -165,6 +251,12 @@ struct IndexRequest {
     /// Storage, pass it in so the server doesn't need its own filesystem
     /// copy of the catalog.
     catalog: Option<hs_common::catalog::CatalogEntry>,
+    /// Override the target collection. Missing means use the configured
+    /// default (`academic_papers`). Non-default names are lazily created on
+    /// first use; once created they share the same vector schema and field
+    /// indexes as the default.
+    #[serde(default)]
+    collection: Option<String>,
 }
 
 async fn handle_distill(
@@ -173,12 +265,18 @@ async fn handle_distill(
 ) -> Response {
     let _guard = InFlightGuard::new(&state.in_flight);
 
+    let collection = match state.resolve_collection(req.collection.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+
     let path = std::path::Path::new(&req.path);
     match crate::pipeline::index_document(
         path,
         req.content.as_deref(),
         req.catalog.clone(),
         &state.config,
+        &collection,
         state.embedder.as_ref(),
         &state.qdrant,
         |_| {}, // no progress for non-streaming
@@ -208,6 +306,11 @@ async fn handle_distill_stream(
 ) -> Response {
     let guard = InFlightGuard::new(&state.in_flight);
 
+    let collection = match state.resolve_collection(req.collection.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
     let path = req.path.clone();
     let content = req.content.clone();
@@ -230,6 +333,7 @@ async fn handle_distill_stream(
             content.as_deref(),
             catalog,
             &state.config,
+            &collection,
             state.embedder.as_ref(),
             &state.qdrant,
             on_progress,
@@ -277,6 +381,10 @@ struct SearchRequest {
     query: String,
     limit: Option<u64>,
     filters: Option<SearchFilters>,
+    /// Override the target collection. Missing means use the configured
+    /// default. See [`IndexRequest::collection`] for routing semantics.
+    #[serde(default)]
+    collection: Option<String>,
 }
 
 async fn handle_search(
@@ -286,6 +394,11 @@ async fn handle_search(
     if req.query.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "Search query cannot be empty").into_response();
     }
+
+    let collection = match state.resolve_collection(req.collection.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
 
     // Embed the query
     let query_texts = vec![req.query.clone()];
@@ -309,20 +422,11 @@ async fn handle_search(
 
     let limit = req.limit.unwrap_or(10);
 
-    let filter = req
-        .filters
-        .as_ref()
-        .and_then(|f| crate::qdrant::build_filter(f.year.as_deref(), f.topic.as_deref()));
+    let filter = req.filters.as_ref().and_then(|f| {
+        crate::qdrant::build_filter(f.year.as_deref(), f.topic.as_deref(), f.category.as_deref())
+    });
 
-    match crate::qdrant::search(
-        &state.qdrant,
-        &state.config.collection_name,
-        query_vector,
-        limit,
-        filter,
-    )
-    .await
-    {
+    match crate::qdrant::search(&state.qdrant, &collection, query_vector, limit, filter).await {
         Ok(results) => {
             let hits: Vec<SearchHit> = results
                 .into_iter()
@@ -374,6 +478,9 @@ async fn handle_search(
                             .get("page")
                             .and_then(|v| v.as_integer())
                             .map(|v| v as usize),
+                        category: payload
+                            .get("category")
+                            .and_then(|v| v.as_str().map(|s| s.to_string())),
                     })
                 })
                 .collect();

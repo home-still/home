@@ -68,11 +68,14 @@ async fn async_main() -> Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!("Failed to ensure collection: {e}"))?;
 
+    let mut known = std::collections::HashSet::new();
+    known.insert(config.collection_name.clone());
     let state = Arc::new(DistillServerState {
         embedder: Arc::new(embedder),
         qdrant: Arc::new(qdrant),
         config,
         in_flight: Arc::new(AtomicUsize::new(0)),
+        known_collections: Arc::new(tokio::sync::Mutex::new(known)),
     });
 
     let addr = format!("{}:{}", args.host, args.port);

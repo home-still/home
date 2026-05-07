@@ -245,6 +245,57 @@ fn default_true() -> bool {
     true
 }
 
+// ── Personal Tools params ─────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PersonalSearchParams {
+    #[schemars(description = "Search query for the personal-documents collection")]
+    query: String,
+    #[schemars(description = "Maximum results (default 10)")]
+    limit: Option<usize>,
+    #[schemars(
+        description = "Restrict to a single category (medical, financial, education, legal, employment, tax, insurance, correspondence, other). Omit to search across all categories."
+    )]
+    category: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PersonalListParams {
+    #[schemars(description = "Maximum entries to return (default 50)")]
+    limit: Option<usize>,
+    #[schemars(description = "Restrict to a single category. Omit to list all categories.")]
+    category: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PersonalReadParams {
+    #[schemars(description = "Document stem (filename without extension)")]
+    stem: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PersonalAddParams {
+    #[schemars(
+        description = "Filename inside the personal-store inbox (no path separators, no leading dot, no absolute paths). Drop the file under cfg.inbox_dir() yourself before calling."
+    )]
+    filename: String,
+    #[schemars(
+        description = "Override the LLM-picked category. Must be one of the configured categories."
+    )]
+    category: Option<String>,
+    #[schemars(description = "Override the LLM-picked title.")]
+    title: Option<String>,
+    #[schemars(description = "If true, replace an existing document with the same stem.")]
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PersonalReindexParams {
+    #[schemars(description = "Document stem to re-chunk and re-embed.")]
+    stem: String,
+}
+
 /// Format a `SystemTime` as an RFC3339 UTC string. Used by `catalog_repair`
 /// to stamp per-object timestamps drawn from storage `last_modified` instead
 /// of a shared batch `now()` — which was the root cause of the `catalog_recent`
@@ -612,6 +663,8 @@ impl HomeStillMcp {
             embedding: None,
             embedding_skip: None,
             repair: None,
+            category: None,
+            original_format: None,
         };
         if let Err(e) = hs_common::catalog::write_catalog_entry_via(
             &*self.storage,
@@ -1996,6 +2049,7 @@ impl HomeStillMcp {
         let filters = hs_distill::client::SearchFilters {
             year: p.year,
             topic: None,
+            category: None,
         };
 
         match client
@@ -2483,6 +2537,161 @@ impl HomeStillMcp {
         .unwrap_or_default())
     }
 
+    // ── Personal Tools ─────────────────────────────────────────
+    //
+    // Read tools (search/list/read) are unconstrained. Write tools
+    // (add/reindex) are scoped: `personal_add` accepts a filename and
+    // resolves it under the configured inbox (cfg.inbox_dir()), refusing
+    // any path separator, leading dot, or symlink-escape — see
+    // `personal::services::inbox::resolve_inbox_path` for the constraints.
+    // Delete is intentionally still CLI-only (`hs personal delete <stem>`).
+
+    #[tool(
+        description = "Semantic search over the personal-documents collection. Use category to scope to medical, financial, etc. Read-only — for ingest, run `hs personal add` from the CLI.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn personal_search(
+        &self,
+        Parameters(p): Parameters<PersonalSearchParams>,
+    ) -> Result<String, String> {
+        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let hits = personal::services::search::search(
+            &cfg,
+            &p.query,
+            p.category.as_deref(),
+            p.limit.unwrap_or(10),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let json: Vec<serde_json::Value> = hits
+            .into_iter()
+            .map(|h| {
+                serde_json::json!({
+                    "stem": h.stem,
+                    "title": h.title,
+                    "category": h.category,
+                    "snippet": h.snippet,
+                    "score": h.score,
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string_pretty(&json).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "List ingested personal documents (most recent first), optionally filtered by category. Read-only — for ingest, run `hs personal add` from the CLI.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn personal_list(
+        &self,
+        Parameters(p): Parameters<PersonalListParams>,
+    ) -> Result<String, String> {
+        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let entries = personal::services::catalog::list_entries(
+            &cfg,
+            p.category.as_deref(),
+            p.limit.unwrap_or(50),
+        )
+        .map_err(|e| e.to_string())?;
+        let json: Vec<serde_json::Value> = entries
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "stem": e.stem,
+                    "title": e.title,
+                    "category": e.category,
+                    "original_format": e.original_format,
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string_pretty(&json).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Read the converted markdown of a single personal document by stem. Read-only.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn personal_read(
+        &self,
+        Parameters(p): Parameters<PersonalReadParams>,
+    ) -> Result<String, String> {
+        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        personal::services::catalog::read_markdown(&cfg, &p.stem).map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "Ingest a file already staged in the personal inbox. Provide just the FILENAME (e.g. 'medical-record.pdf') — absolute paths and path separators are rejected. The user drops the file under the configured inbox directory; this tool resolves the name, runs the same ingest pipeline as `hs personal add`, and reports the assigned stem/title/category. PDF conversion of long documents can take many minutes; the tool blocks until indexing finishes.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn personal_add(
+        &self,
+        Parameters(p): Parameters<PersonalAddParams>,
+    ) -> Result<String, String> {
+        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let path = personal::services::inbox::resolve_inbox_path(&cfg, &p.filename)
+            .map_err(|e| e.to_string())?;
+        let opts = personal::services::ingest::IngestOptions {
+            category_override: p.category,
+            title_override: p.title,
+            force: p.force,
+        };
+        let outcome = personal::services::ingest::ingest(&cfg, &path, opts)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "stem": outcome.stem,
+            "title": outcome.title,
+            "category": outcome.category,
+            "chunks_indexed": outcome.chunk_count,
+            "source_file": p.filename,
+        }))
+        .unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Re-chunk and re-embed an already-ingested personal document by stem. Useful after chunker/embedder changes. Deletes the existing Qdrant points for the stem and re-creates them from the stored markdown.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn personal_reindex(
+        &self,
+        Parameters(p): Parameters<PersonalReindexParams>,
+    ) -> Result<String, String> {
+        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let chunks = personal::services::catalog::reindex(&cfg, &p.stem)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "stem": p.stem,
+            "chunks_indexed": chunks,
+        }))
+        .unwrap_or_default())
+    }
+
     // ── System Tools ───────────────────────────────────────────
 
     #[tool(
@@ -2850,6 +3059,12 @@ impl ServerHandler for HomeStillMcp {
              6. SEARCH: distill_search (semantic search across all indexed papers)\n\
              7. MONITOR: system_status, scribe_health, distill_status\n\n\
              To add a new paper to the pipeline: paper_search → paper_download → scribe_convert → distill_index\n\n\
+             Personal documents: personal_search, personal_list, personal_read are read-only \
+             over the user's private medical/financial/school records. Writes are scoped: \
+             personal_add takes a FILENAME (not a path) and resolves it under the configured \
+             inbox directory (default ~/home-still/personal/inbox/); the user drops the file \
+             there, the tool ingests it. personal_reindex re-chunks an existing stem. Delete \
+             is intentionally CLI-only — run `hs personal delete <stem>`.\n\n\
              Prompts: research_paper, summarize_document, compare_papers",
         )
     }

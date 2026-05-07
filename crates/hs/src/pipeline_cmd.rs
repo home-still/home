@@ -70,6 +70,37 @@ pub enum PipelineCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Delete *embedded* poison: markdown stubs that passed the chunk-quality
+    /// floor and reached Qdrant as 1-chunk vectors but whose visible text
+    /// matches a known anti-bot / cookie-wall interstitial signature
+    /// (PMC "Checking your browser", Wiley "Cookies disabled", PMC
+    /// "Preparing to download"). Sister command to `purge-skipped`:
+    /// `purge-skipped` handles `embedding_skip = zero_chunks_or_empty`
+    /// stubs that never reached Qdrant; this handles the residue that
+    /// did. For each victim: deletes the Qdrant points by doc_id,
+    /// the markdown, the source PDF/HTML, and the catalog yaml.
+    PurgePoisoned {
+        /// Report what would be deleted without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Per-chunk parallel to `purge-poisoned`: scan every Qdrant point and
+    /// delete only those individual chunks whose `chunk_text` matches a
+    /// known interstitial / cookie-banner signature, leaving the rest of
+    /// each document intact. Use when a real paper has been contaminated
+    /// by a trailing cookie banner the conversion swept up — the doc is
+    /// worth keeping, just not that one chunk.
+    PurgePoisonedChunks {
+        /// Report what would be deleted without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -83,6 +114,12 @@ pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<
         PipelineCmd::EventsReset => cmd_events_reset(reporter).await,
         PipelineCmd::PurgeSkipped { dry_run, yes } => {
             cmd_purge_skipped(dry_run, yes, reporter).await
+        }
+        PipelineCmd::PurgePoisoned { dry_run, yes } => {
+            cmd_purge_poisoned(dry_run, yes, reporter).await
+        }
+        PipelineCmd::PurgePoisonedChunks { dry_run, yes } => {
+            cmd_purge_poisoned_chunks(dry_run, yes, reporter).await
         }
     }
 }
@@ -559,5 +596,254 @@ async fn cmd_purge_skipped(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter
     if errors.len() > 10 {
         eprintln!("  ... and {} more", errors.len() - 10);
     }
+    Ok(())
+}
+
+async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    // Real research papers convert to >5 KB of markdown; nothing legitimate
+    // lives under this floor. Skipping anything larger keeps the GET cost
+    // bounded to a few hundred objects rather than the full 4k+ corpus.
+    const MAX_STUB_BYTES: u64 = 5_000;
+
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+    let server_url = cfg
+        .servers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_DISTILL_URL.to_string());
+    let client = DistillClient::new(&server_url)?;
+
+    reporter.status("Scan", "markdown for known interstitial signatures");
+    let markdown_objs = storage
+        .list("markdown")
+        .await
+        .context("list markdown prefix")?;
+
+    let small: Vec<_> = markdown_objs
+        .into_iter()
+        .filter(|m| m.size <= MAX_STUB_BYTES && m.key.ends_with(".md"))
+        .collect();
+    reporter.status(
+        "Candidates",
+        &format!("{} markdowns ≤ {} bytes", small.len(), MAX_STUB_BYTES),
+    );
+
+    struct Victim {
+        stem: String,
+        markdown_key: String,
+        size: u64,
+    }
+
+    let mut victims: Vec<Victim> = Vec::new();
+    let mut read_errors = 0u64;
+    for (i, obj) in small.iter().enumerate() {
+        let bytes = match storage.get(&obj.key).await {
+            Ok(b) => b,
+            Err(_) => {
+                read_errors += 1;
+                continue;
+            }
+        };
+        let content = match std::str::from_utf8(&bytes) {
+            Ok(s) => s,
+            // Markdown that isn't UTF-8 is broken regardless of interstitial
+            // status, but we don't delete on UTF-8 failure alone — that's
+            // outside this command's scope.
+            Err(_) => continue,
+        };
+        if hs_common::html::is_known_interstitial(content) {
+            let name = obj.key.rsplit('/').next().unwrap_or(&obj.key);
+            let stem = name.trim_end_matches(".md").to_string();
+            victims.push(Victim {
+                stem,
+                markdown_key: obj.key.clone(),
+                size: obj.size,
+            });
+        }
+        if (i + 1) % 200 == 0 {
+            reporter.status("Scan", &format!("read {}/{}", i + 1, small.len()));
+        }
+    }
+
+    reporter.status(
+        "Victims",
+        &format!(
+            "{} interstitial markdowns identified (read errors: {})",
+            victims.len(),
+            read_errors
+        ),
+    );
+    if victims.is_empty() {
+        reporter.finish("Nothing to purge — no known-interstitial markdowns found.");
+        return Ok(());
+    }
+
+    for v in victims.iter().take(5) {
+        reporter.status("Sample", &format!("{}B  {}", v.size, v.stem));
+    }
+    if victims.len() > 5 {
+        reporter.status("...", &format!("+{} more", victims.len() - 5));
+    }
+
+    if dry_run {
+        reporter.finish("Dry-run complete — no state changed.");
+        return Ok(());
+    }
+
+    if !yes {
+        let accept = Confirm::new()
+            .with_prompt(format!(
+                "Delete {} interstitials (Qdrant points + markdown + source + catalog)?",
+                victims.len()
+            ))
+            .default(false)
+            .interact()?;
+        if !accept {
+            reporter.finish("Aborted — no state changed.");
+            return Ok(());
+        }
+    }
+
+    let mut qdrant_deleted = 0u64;
+    let mut md_deleted = 0u64;
+    let mut cat_deleted = 0u64;
+    let mut src_deleted = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, v) in victims.iter().enumerate() {
+        // Qdrant first — if this fails, leaving the markdown/source/catalog
+        // in place lets a retry hit the same victim again. The reverse
+        // (delete files first, fail Qdrant) leaves a phantom 1-chunk doc
+        // that the reconciler can never reach.
+        match client.delete_doc(&v.stem).await {
+            Ok(_) => qdrant_deleted += 1,
+            Err(e) => errors.push(format!("qdrant/{}: {e}", v.stem)),
+        }
+
+        // Markdown
+        match storage.delete(&v.markdown_key).await {
+            Ok(()) => md_deleted += 1,
+            Err(e) => errors.push(format!("markdown/{}: {e}", v.stem)),
+        }
+
+        // Catalog yaml
+        let cat_key = format!("catalog/{}", hs_common::sharded_key(&v.stem, "yaml"));
+        match storage.delete(&cat_key).await {
+            Ok(()) => cat_deleted += 1,
+            Err(e) => errors.push(format!("catalog/{}: {e}", v.stem)),
+        }
+
+        // Source — extension may be html/htm/pdf; an interstitial saved as
+        // .pdf is rare but possible (origin returned 200 with HTML body
+        // under a PDF URL pre-rc.315). Try all three; one success per stem.
+        let mut src_hit = false;
+        for ext in ["html", "htm", "pdf"] {
+            let key = format!("papers/{}", hs_common::sharded_key(&v.stem, ext));
+            if storage.exists(&key).await.unwrap_or(false) {
+                match storage.delete(&key).await {
+                    Ok(()) => {
+                        src_hit = true;
+                        break;
+                    }
+                    Err(e) => errors.push(format!("papers/{}.{ext}: {e}", v.stem)),
+                }
+            }
+        }
+        if src_hit {
+            src_deleted += 1;
+        }
+
+        if (i + 1) % 50 == 0 {
+            reporter.status("Progress", &format!("purged {}/{}", i + 1, victims.len()));
+        }
+    }
+
+    reporter.finish(&format!(
+        "Purged interstitials — qdrant={qdrant_deleted} markdown={md_deleted} catalog={cat_deleted} source={src_deleted} errors={}",
+        errors.len()
+    ));
+    for e in errors.iter().take(10) {
+        eprintln!("  error: {e}");
+    }
+    if errors.len() > 10 {
+        eprintln!("  ... and {} more", errors.len() - 10);
+    }
+    Ok(())
+}
+
+async fn cmd_purge_poisoned_chunks(
+    dry_run: bool,
+    yes: bool,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let server_url = cfg
+        .servers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_DISTILL_URL.to_string());
+    let client = DistillClient::new(&server_url)?;
+
+    // First pass: dry-run scan so the user can see what would be deleted.
+    reporter.status("Scan", "Qdrant points for interstitial signatures");
+    let preview = client
+        .scrub_interstitials(true)
+        .await
+        .context("scrub-interstitials dry-run failed")?;
+
+    reporter.status(
+        "Scan complete",
+        &format!(
+            "{} points scanned, {} matched",
+            preview.total_scanned, preview.matched
+        ),
+    );
+    for s in preview.samples.iter().take(5) {
+        reporter.status(
+            "Sample",
+            &format!("{}  «{}…»", s.doc_id, s.excerpt.replace('\n', " ")),
+        );
+    }
+    if preview.samples.len() > 5 {
+        reporter.status(
+            "...",
+            &format!("+{} more samples", preview.samples.len() - 5),
+        );
+    }
+
+    if preview.matched == 0 {
+        reporter.finish("Nothing to scrub — no interstitial chunks found in Qdrant.");
+        return Ok(());
+    }
+
+    if dry_run {
+        reporter.finish("Dry-run complete — no Qdrant points deleted.");
+        return Ok(());
+    }
+
+    if !yes {
+        let accept = Confirm::new()
+            .with_prompt(format!(
+                "Delete {} interstitial chunks from Qdrant? (markdown / source / catalog are NOT touched)",
+                preview.matched
+            ))
+            .default(false)
+            .interact()?;
+        if !accept {
+            reporter.finish("Aborted — no state changed.");
+            return Ok(());
+        }
+    }
+
+    let report = client
+        .scrub_interstitials(false)
+        .await
+        .context("scrub-interstitials destructive call failed")?;
+
+    reporter.finish(&format!(
+        "Scrubbed Qdrant — scanned={} matched={} deleted={}",
+        report.total_scanned, report.matched, report.deleted
+    ));
     Ok(())
 }

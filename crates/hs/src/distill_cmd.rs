@@ -1035,7 +1035,11 @@ async fn cmd_search(
     let servers = resolve_servers(server).await;
     let client = make_distill_client(&servers[0]).await?;
 
-    let filters = hs_distill::client::SearchFilters { year, topic };
+    let filters = hs_distill::client::SearchFilters {
+        year,
+        topic,
+        category: None,
+    };
     let hits = client
         .search(query, limit, filters)
         .await

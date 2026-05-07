@@ -65,6 +65,19 @@ pub struct CatalogEntry {
     /// repaired rows from rows produced by the normal download path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repair: Option<RepairMeta>,
+
+    /// Personal-store category, set at ingest by the `personal` crate. Always
+    /// `None` for academic papers; `Some` only for documents that came in
+    /// through `hs personal add`. Indexed in Qdrant so personal_search can
+    /// filter by category without a sidecar walk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+
+    /// Original source format (`pdf`, `epub`, `docx`, `md`, `txt`). Set by the
+    /// `personal` crate alongside `category`. Lets the catalog distinguish
+    /// PDF from non-PDF inputs without having to stat the original file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_format: Option<String>,
 }
 
 /// A successful conversion. The presence of this struct on a catalog

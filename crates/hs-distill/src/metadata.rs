@@ -25,6 +25,9 @@ pub fn extract_rule_based(
         meta.abstract_text = cat.abstract_text.clone();
         meta.cited_by_count = cat.cited_by_count;
         meta.source = cat.source.clone();
+        meta.category = cat.category.clone();
+        meta.original_format = cat.original_format.clone();
+        meta.ingested_at = cat.downloaded_at.clone();
     }
 
     // Always derive pdf_path from the sharded storage key rather than the

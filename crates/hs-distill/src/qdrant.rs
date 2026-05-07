@@ -1,13 +1,14 @@
 use qdrant_client::qdrant::{
     Condition, CountPointsBuilder, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
     DeletePointsBuilder, Distance, FacetCountsBuilder, FieldType, Filter, HnswConfigDiffBuilder,
-    PointStruct, QueryPointsBuilder, SearchParamsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+    PointId, PointStruct, QueryPointsBuilder, ScrollPointsBuilder, SearchParamsBuilder,
+    UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use uuid::Uuid;
 
 use crate::error::DistillError;
-use crate::types::EmbeddedChunk;
+use crate::types::{EmbeddedChunk, ScrubReport, ScrubbedChunk};
 
 const NAMESPACE_UUID: Uuid = Uuid::from_bytes([
     0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
@@ -67,7 +68,15 @@ pub async fn ensure_collection(
 }
 
 async fn create_indexes(client: &Qdrant, collection_name: &str) -> Result<(), DistillError> {
-    let keyword_fields = ["doc_id", "authors", "topics", "keywords", "pdf_path"];
+    let keyword_fields = [
+        "doc_id",
+        "authors",
+        "topics",
+        "keywords",
+        "pdf_path",
+        "category",
+        "original_format",
+    ];
     let integer_fields = ["year", "line_start", "page"];
 
     for field in keyword_fields {
@@ -133,6 +142,9 @@ pub async fn upsert_chunks(
                 "line_end": ec.chunk.span.line_end as i64,
                 "page": ec.chunk.page.map(|p| p as i64),
                 "cited_by_count": meta.cited_by_count,
+                "category": meta.category,
+                "original_format": meta.original_format,
+                "ingested_at": meta.ingested_at,
             });
 
             let qdrant_payload: qdrant_client::Payload = payload.try_into().unwrap();
@@ -175,7 +187,11 @@ pub async fn search(
 }
 
 /// Build a Qdrant Filter from search filter strings.
-pub fn build_filter(year: Option<&str>, topic: Option<&str>) -> Option<Filter> {
+pub fn build_filter(
+    year: Option<&str>,
+    topic: Option<&str>,
+    category: Option<&str>,
+) -> Option<Filter> {
     let mut conditions = Vec::new();
 
     if let Some(year_str) = year {
@@ -186,6 +202,10 @@ pub fn build_filter(year: Option<&str>, topic: Option<&str>) -> Option<Filter> {
 
     if let Some(topic_str) = topic {
         conditions.push(Condition::matches("topics", topic_str.to_string()));
+    }
+
+    if let Some(cat) = category {
+        conditions.push(Condition::matches("category", cat.to_string()));
     }
 
     if conditions.is_empty() {
@@ -336,6 +356,88 @@ pub async fn delete_by_doc_id(
         .await
         .map_err(|e| DistillError::Qdrant(format!("Failed to delete points: {e}")))?;
     Ok(count)
+}
+
+/// Walk every point in the collection, identify chunks whose `chunk_text`
+/// payload matches a known anti-bot / cookie-banner interstitial signature,
+/// and (unless `dry_run`) delete just those points by ID — leaving the rest
+/// of each document intact. Used to scrub contamination from real papers
+/// where the conversion swept up a trailing cookie banner alongside the
+/// real article body. For full-stub markdowns the `purge-poisoned` CLI
+/// command is the right tool; this is the per-chunk parallel.
+pub async fn scrub_interstitial_chunks(
+    client: &Qdrant,
+    collection_name: &str,
+    dry_run: bool,
+) -> Result<ScrubReport, DistillError> {
+    const SCROLL_BATCH: u32 = 1024;
+    const SAMPLE_CAP: usize = 10;
+    const DELETE_BATCH: usize = 256;
+
+    let mut offset: Option<PointId> = None;
+    let mut total_scanned: u64 = 0;
+    let mut matched_ids: Vec<PointId> = Vec::new();
+    let mut samples: Vec<ScrubbedChunk> = Vec::new();
+
+    loop {
+        let mut builder = ScrollPointsBuilder::new(collection_name)
+            .limit(SCROLL_BATCH)
+            .with_payload(true)
+            .with_vectors(false);
+        if let Some(ofs) = offset.clone() {
+            builder = builder.offset(ofs);
+        }
+        let response = client
+            .scroll(builder)
+            .await
+            .map_err(|e| DistillError::Qdrant(format!("scroll failed: {e}")))?;
+
+        for point in &response.result {
+            total_scanned += 1;
+            let chunk_text = match point.payload.get("chunk_text").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            if hs_common::html::is_known_interstitial(chunk_text) {
+                if let Some(id) = point.id.clone() {
+                    if samples.len() < SAMPLE_CAP {
+                        let doc_id = point
+                            .payload
+                            .get("doc_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        let excerpt: String = chunk_text.chars().take(120).collect();
+                        samples.push(ScrubbedChunk { doc_id, excerpt });
+                    }
+                    matched_ids.push(id);
+                }
+            }
+        }
+
+        offset = response.next_page_offset;
+        if offset.is_none() {
+            break;
+        }
+    }
+
+    let mut deleted: u64 = 0;
+    if !dry_run && !matched_ids.is_empty() {
+        for batch in matched_ids.chunks(DELETE_BATCH) {
+            client
+                .delete_points(DeletePointsBuilder::new(collection_name).points(batch.to_vec()))
+                .await
+                .map_err(|e| DistillError::Qdrant(format!("delete failed: {e}")))?;
+            deleted += batch.len() as u64;
+        }
+    }
+
+    Ok(ScrubReport {
+        total_scanned,
+        matched: matched_ids.len() as u64,
+        deleted,
+        samples,
+    })
 }
 
 /// List every distinct `doc_id` present in the collection (via facet).

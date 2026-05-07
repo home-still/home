@@ -58,6 +58,54 @@ pub fn is_paywall_html(content: &str) -> bool {
         return true;
     }
 
+    // Bot-challenge interstitials. Origin servers (PMC, OUP, etc.) bounce
+    // suspected bot traffic to a Google reCAPTCHA challenge or a Cloudflare
+    // "checking your browser" page. The HTML is unmistakable — base href
+    // points at the challenge endpoint, or the page literally announces the
+    // check. Without this gate, the downloader saves the verbatim challenge
+    // HTML as if it were a legitimate article and the watcher renders a
+    // ~131-byte markdown stub.
+    if lower.contains("www.google.com/recaptcha/challengepage")
+        || lower.contains("checking your browser before accessing")
+        || lower.contains("just a moment...")
+    {
+        return true;
+    }
+
+    // Wiley "Cookies disabled" landing page. When Wiley Online Library
+    // refuses a request (no JS / no cookies / suspected bot), it returns a
+    // navigation-chrome stub whose visible text is dominated by the
+    // "Cookies are disabled for this browser. Wiley Online Library requires
+    // cookies for authentication..." sentence. Full HTML is large enough
+    // that the generic short-page heuristic misses it; the post-conversion
+    // markdown is ~366 bytes. The substring below is unique to Wiley's
+    // interstitial copy and won't appear in real article body text.
+    if lower.contains("wiley online library requires cookies") {
+        return true;
+    }
+
+    // Anubis / BotStopper Proof-of-Work bot challenges. Self-hosted
+    // anti-scraper pages some journals/repos now front their content with.
+    // The HTML body is ~5-7 KB (above the short-page heuristic), so anchor
+    // on the unique boilerplate phrase. "Verifying connection / one moment
+    // while we verify your network connection" is the third variant —
+    // short and origin-agnostic. Round-3: Elsevier PT cookie banner,
+    // Akamai-style CAPTCHA ("made us think that you are a bot"),
+    // generic "Request Rejected" anti-bot page.
+    if lower.contains("ai companies aggressively scraping")
+        || lower.contains("one moment while we verify your network connection")
+        || lower.contains("as páginas que você visitou e os links em que clicou")
+        || lower.contains("made us think that you are a bot")
+        || lower.contains("to protect our site from automated bots")
+        || lower.contains("this site requires cookies to be enabled to function")
+        || lower.contains("if you are trying to perform text/data mining")
+        || lower.contains("traffic control and bot detection")
+        || lower.contains("data, including cookies, are used to provide services")
+        || lower.contains("nós usamos cookies para melhorar sua experiência")
+    {
+        return true;
+    }
+
     // Journal metadata pages (impact factor, citescore) with no paper body
     let is_journal_meta = lower.contains("impact factor")
         || lower.contains("citescore")
@@ -92,6 +140,62 @@ pub fn is_paywall_html(content: &str) -> bool {
     }
 
     false
+}
+
+/// True when `content` matches a *known* anti-bot interstitial / cookie-wall
+/// stub signature. Narrower than [`is_paywall_html`] — does not include the
+/// heuristic short-page / no-article-structure rules, which can false-positive
+/// on a legitimately short editorial. Safe to use as a destructive-purge gate
+/// where false positives would delete real papers.
+pub fn is_known_interstitial(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("www.google.com/recaptcha/challengepage")
+        || lower.contains("checking your browser before accessing")
+        || lower.contains("just a moment...")
+        || lower.contains("wiley online library requires cookies")
+        || lower.contains("preparing to download")
+        || lower.contains("hhs vulnerability disclosure")
+        // Anubis / BotStopper Proof-of-Work bot challenges share the same
+        // boilerplate prose. The brand-name strings ("Anubis", "BotStopper")
+        // sometimes lose their surrounding whitespace through the
+        // HTML→markdown round-trip ("set upBotStopperto"), so anchor on a
+        // shared sentence fragment instead. The full phrase is unique to
+        // this anti-scraper page and won't appear in academic body text.
+        || lower.contains("ai companies aggressively scraping")
+        // Generic "verifying connection" stub seen on at least one DOI
+        // (10.24124_*). The full sentence is specific enough to avoid
+        // false-positives on body text that happens to mention "verify".
+        || lower.contains("one moment while we verify your network connection")
+        // Elsevier / ScienceDirect Portuguese cookie banner — surfaces when
+        // the request lands on the PT-BR locale and gets the consent page
+        // instead of the article. The phrase below is from the consent body.
+        || lower.contains("as páginas que você visitou e os links em que clicou")
+        // Akamai-style CAPTCHA / bot-block (Optica Publishing Group, others).
+        // Distinctive boilerplate; the "Incident ID" line is also unique but
+        // varies per request, so anchor on the static sentence.
+        || lower.contains("made us think that you are a bot")
+        // Generic "Request Rejected" / "Preserving Human Intellect" anti-bot
+        // page (seen on bjas.journals.ekb.eg etc.). Either substring alone is
+        // unique to this block-page boilerplate.
+        || lower.contains("to protect our site from automated bots")
+        // Generic "site requires cookies to be enabled" stub (seen on
+        // 10.1097_chi.* and similar). Stronger than the Wiley variant —
+        // unconditional on any markdown that says it.
+        || lower.contains("this site requires cookies to be enabled to function")
+        // Optica-style "Verification required ... text/data mining" challenge.
+        // The TDM-specific carve-out is the unique anchor; real papers don't
+        // tell readers to "contact Customer Service" if they're text-mining.
+        || lower.contains("if you are trying to perform text/data mining")
+        // Cambridge / CABI / Informa "Traffic control and bot detection"
+        // page. Specific enough that real article body text won't match.
+        || lower.contains("traffic control and bot detection")
+        // Polish / EU GDPR cookie consent banner that some publishers
+        // (versita.com, sciendo) prepend or append to the article body.
+        // Catches both the full-stub case and the contamination case.
+        || lower.contains("data, including cookies, are used to provide services")
+        // Brazilian gov.br / Capes cookie banner appended to articles
+        // accessed through the Capes federation. Same pattern as above.
+        || lower.contains("nós usamos cookies para melhorar sua experiência")
 }
 
 /// Strip HTML tags to get visible text content.
@@ -169,6 +273,170 @@ mod tests {
         let html = "<html><body><nav>Find articles by author or title</nav>\
             <div>Create GitHub issue for staff review</div></body></html>";
         assert!(is_paywall_html(html));
+    }
+
+    #[test]
+    fn detects_google_recaptcha_challenge_page() {
+        // Verbatim shape of the 21,285-byte challenge HTML observed on
+        // 2026-05-05 for three different DOIs that bounced to reCAPTCHA.
+        // The `<base href>` is the unmistakable marker — strip_html_tags
+        // surfaces the inline JavaScript as "text" so the generic length
+        // and login heuristics don't fire.
+        let html = "<!doctype html><html lang=\"en-US\" dir=\"ltr\">\
+            <head><base href=\"https://www.google.com/recaptcha/challengepage/\">\
+            <script>window['ppConfig'] = {productName: 'RecaptchaChallengePageUi'};\
+            </script></head><body></body></html>";
+        assert!(is_paywall_html(html));
+    }
+
+    #[test]
+    fn detects_cloudflare_browser_check_interstitial() {
+        let html = "<html><body>Checking your browser before accessing \
+            pmc.ncbi.nlm.nih.gov ... Click here if you are not automatically \
+            redirected after 5 seconds.</body></html>";
+        assert!(is_paywall_html(html));
+    }
+
+    #[test]
+    fn detects_wiley_cookies_disabled_landing() {
+        // Reproduction of the 366-byte markdown observed across 85 Wiley
+        // DOIs. The HTML version has enough chrome (scripts, navigation)
+        // that text_len < 500 doesn't fire — relies on the explicit
+        // substring match.
+        let html = "<html><body><nav>Journal · Articles · Actions</nav>\
+            <h3>Cookies disabled</h3>\
+            <p>Cookies are disabled for this browser. Wiley Online Library \
+            requires cookies for authentication and use of other site features; \
+            therefore, cookies must be enabled to browse the site.</p>\
+            </body></html>";
+        assert!(is_paywall_html(html));
+    }
+
+    #[test]
+    fn detects_wiley_landing_in_converted_markdown() {
+        // Same string survives the HTML → markdown round-trip; the gate
+        // must fire on the markdown form too so distill can refuse it
+        // even when an upstream gap let the HTML through.
+        let md = "- __Journal\n- __Articles\n## Tools\n### Cookies disabled\n\n\
+            Cookies are disabled for this browser. Wiley Online Library \
+            requires cookies for authentication and use of other site features.";
+        assert!(is_paywall_html(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_pmc_cloudflare() {
+        let md = "Checking your browser before accessing pmc.ncbi.nlm.nih.gov ...\n\
+                  Clickhereif you are not automatically redirected after 5 seconds.";
+        assert!(is_known_interstitial(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_wiley() {
+        let md = "### Cookies disabled\n\n\
+                  Cookies are disabled for this browser. Wiley Online Library \
+                  requires cookies for authentication and use of other site features.";
+        assert!(is_known_interstitial(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_anubis() {
+        let md = "# Making sure you're not a bot!\n\nLoading...\n\n\
+                  You are seeing this because the administrator of this website \
+                  has set up Anubis to protect the server against the scourge of \
+                  AI companies aggressively scraping websites.";
+        assert!(is_known_interstitial(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_botstopper() {
+        let md = "# Ensuring the security of your connection\n\nLoading...\n\n\
+                  You are seeing this because the administrator of this website \
+                  has set upBotStopperto protect the server against the scourge of \
+                  AI companies aggressively scraping websites.";
+        // The HTML→markdown round-trip can collapse "set up BotStopper to" into
+        // "set upBotStopperto" — tolerate that by lowercasing on the substring.
+        assert!(is_known_interstitial(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_verifying_connection() {
+        let md = "# Verifying connection\n\nOne moment while we verify your network connection.";
+        assert!(is_known_interstitial(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_elsevier_pt_cookie_banner() {
+        let md = "as páginas que você visitou e os links em que clicou. \
+                  Nenhuma dessas informações pode ser usada para identificá-lo.";
+        assert!(is_known_interstitial(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_akamai_captcha() {
+        let md = "# We apologize for the inconvenience...\n\n\
+                  ...but your activity and behavior on this site made us think \
+                  that you are a bot.";
+        assert!(is_known_interstitial(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_request_rejected() {
+        let md = "## Request Rejected\n\n\
+                  To protect our site from automated bots, your request has been flagged.";
+        assert!(is_known_interstitial(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_cookies_required_stub() {
+        let md = "This site requires Cookies to be enabled to function. \
+                  Please ensure Cookies are turned on and then re-visit the desired page.";
+        assert!(is_known_interstitial(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_optica_verification() {
+        let md =
+            "# Verification required!\n\nIn order to better serve you and keep this site secure, \
+                  please complete this challenge. If you are trying to perform text/data mining, \
+                  please contact Customer Service for assistance.";
+        assert!(is_known_interstitial(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_cambridge_traffic_control() {
+        let md = "# Traffic control and bot detection...\n\n\
+                  If this check is preventing you from making use of our resources, \
+                  make sure you have cookies enabled.";
+        assert!(is_known_interstitial(md));
+    }
+
+    #[test]
+    fn known_interstitial_matches_eu_cookie_banner_trailer() {
+        // Mixed-content case: the chunk lands at the END of a real article
+        // markdown. The signature must match the chunk itself, not the whole
+        // doc — used by the per-chunk scrub.
+        let chunk = "Data, including cookies, are used to provide services, \
+                     improve the user experience and to analyze the traffic.";
+        assert!(is_known_interstitial(chunk));
+    }
+
+    #[test]
+    fn known_interstitial_matches_capes_pt_cookie_banner() {
+        let chunk = "Nós usamos cookies para melhorar sua experiência de navegação no portal.";
+        assert!(is_known_interstitial(chunk));
+    }
+
+    #[test]
+    fn known_interstitial_rejects_short_real_article() {
+        // A short editorial that `is_paywall_html` would heuristically flag
+        // (no <article>, no abstract/references headings, < 500 chars).
+        // `is_known_interstitial` must NOT delete this — destructive-purge
+        // path needs a tighter gate.
+        let md = "# Editorial: New approaches to X\n\n\
+                  Recent advances in field Y have prompted reconsideration of \
+                  longstanding assumptions about Z. We argue that the field \
+                  should adopt a different framework.";
+        assert!(!is_known_interstitial(md));
     }
 
     #[test]

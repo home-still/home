@@ -31,6 +31,14 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     let _ = hs_common::secrets::load_default_secrets();
     let logging_handle = install_logging().await;
+    // libonnxruntime defaults to "warning" verbosity, which floods the log with
+    // shape-inference noise (logical_and_0.tmp_0.0, fill_constant_27.tmp_0.0)
+    // for every page. The only API in ort 2.0.0-rc.11 to silence this on the
+    // global env is `Environment::set_log_level`; `get_environment()` lazily
+    // commits if needed, so this also serves as the single ort init point.
+    if let Ok(env) = ort::environment::get_environment() {
+        env.set_log_level(ort::logging::LogLevel::Error);
+    }
     let args = Args::parse();
 
     let config = AppConfig::load().unwrap_or_else(|e| {

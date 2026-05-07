@@ -4,8 +4,11 @@ use backon::{ExponentialBuilder, Retryable};
 
 /// Retries an async operation with exponential backoff.
 ///
-/// Only retries on transient errors as determined by error categorization.
-/// Uses configuration for max attempts and backoff durations.
+/// Only retries on transient errors (network/5xx). `RateLimited` is
+/// intentionally NOT retried here: per-request 429 backoff already happens
+/// inside `providers::response::send_with_429_retry`, and stacking the
+/// outer retry on top of it just burns the per-provider 30s timeout
+/// spinning on the same exhausted bucket.
 pub async fn retry_with_backoff<F, Fut, T>(
     config: &ResilienceConfig,
     operation: F,
@@ -22,11 +25,6 @@ where
 
     operation
         .retry(backoff)
-        .when(|err| {
-            matches!(
-                err.category(),
-                ErrorCategory::Transient | ErrorCategory::RateLimited
-            )
-        })
+        .when(|err| matches!(err.category(), ErrorCategory::Transient))
         .await
 }

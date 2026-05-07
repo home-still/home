@@ -49,6 +49,8 @@ const PAPERS_STREAM: &str = "PAPERS";
 const PAPERS_SUBJECTS: &[&str] = &["papers.>"];
 const SCRIBE_STREAM: &str = "SCRIBE";
 const SCRIBE_SUBJECTS: &[&str] = &["scribe.>"];
+const DISTILL_STREAM: &str = "DISTILL";
+const DISTILL_SUBJECTS: &[&str] = &["distill.>"];
 
 pub struct NatsBus {
     jetstream: async_nats::jetstream::Context,
@@ -64,6 +66,7 @@ impl NatsBus {
         // on a cold broker doesn't race. get_or_create is idempotent.
         bus.ensure_stream(PAPERS_STREAM, PAPERS_SUBJECTS).await?;
         bus.ensure_stream(SCRIBE_STREAM, SCRIBE_SUBJECTS).await?;
+        bus.ensure_stream(DISTILL_STREAM, DISTILL_SUBJECTS).await?;
         Ok(bus)
     }
 

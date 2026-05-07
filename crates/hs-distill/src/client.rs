@@ -44,6 +44,10 @@ pub struct SearchHit {
     pub line_start: usize,
     pub line_end: usize,
     pub page: Option<usize>,
+    /// Personal-store category. Always `None` for academic-papers hits;
+    /// populated only on hits originating from the personal pipeline.
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 /// Search filters for the /search endpoint.
@@ -51,6 +55,9 @@ pub struct SearchHit {
 pub struct SearchFilters {
     pub year: Option<String>,
     pub topic: Option<String>,
+    /// Restrict hits to a single personal-store category.
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 /// Health response from the distill server.
@@ -179,10 +186,26 @@ impl DistillClient {
         content: &str,
         catalog: Option<&hs_common::catalog::CatalogEntry>,
     ) -> Result<IndexResult> {
+        self.index_content_in(path_hint, content, catalog, None)
+            .await
+    }
+
+    /// Same as `index_content` but routes the upsert to a non-default Qdrant
+    /// collection. The server lazily creates the collection on first use.
+    pub async fn index_content_in(
+        &self,
+        path_hint: &str,
+        content: &str,
+        catalog: Option<&hs_common::catalog::CatalogEntry>,
+        collection: Option<&str>,
+    ) -> Result<IndexResult> {
         let url = format!("{}/distill", self.server_url);
         let mut body = serde_json::json!({ "path": path_hint, "content": content });
         if let Some(cat) = catalog {
             body["catalog"] = serde_json::to_value(cat).unwrap_or(serde_json::Value::Null);
+        }
+        if let Some(c) = collection {
+            body["collection"] = serde_json::Value::String(c.to_string());
         }
         let resp = self
             .http
@@ -267,15 +290,32 @@ impl DistillClient {
         limit: u64,
         filters: SearchFilters,
     ) -> Result<Vec<SearchHit>> {
+        self.search_in(query, limit, filters, None).await
+    }
+
+    /// Same as `search` but targets a non-default collection (e.g.
+    /// `personal_docs`). The server lazily creates the collection on first
+    /// use; an empty result on a fresh collection is still a successful call.
+    pub async fn search_in(
+        &self,
+        query: &str,
+        limit: u64,
+        filters: SearchFilters,
+        collection: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
         let url = format!("{}/search", self.server_url);
+        let mut body = serde_json::json!({
+            "query": query,
+            "limit": limit,
+            "filters": filters,
+        });
+        if let Some(c) = collection {
+            body["collection"] = serde_json::Value::String(c.to_string());
+        }
         let resp = self
             .http
             .post(&url)
-            .json(&serde_json::json!({
-                "query": query,
-                "limit": limit,
-                "filters": filters,
-            }))
+            .json(&body)
             .timeout(Duration::from_secs(30))
             .send()
             .await
@@ -328,7 +368,15 @@ impl DistillClient {
     /// Delete every point whose `doc_id` matches. Returns the number of
     /// points that were deleted.
     pub async fn delete_doc(&self, doc_id: &str) -> Result<u64> {
-        let url = format!("{}/doc/{}", self.server_url, doc_id);
+        self.delete_doc_in(doc_id, None).await
+    }
+
+    /// Same as `delete_doc` but targets a non-default collection.
+    pub async fn delete_doc_in(&self, doc_id: &str, collection: Option<&str>) -> Result<u64> {
+        let mut url = format!("{}/doc/{}", self.server_url, doc_id);
+        if let Some(c) = collection {
+            url.push_str(&format!("?collection={c}"));
+        }
         let resp = self
             .http
             .delete(&url)
@@ -366,6 +414,38 @@ impl DistillClient {
             .await
             .context("Invalid reset_collection response")?;
         Ok(data["deleted_points"].as_u64().unwrap_or(0))
+    }
+
+    /// Scan every point in the collection for chunks whose `chunk_text`
+    /// matches a known anti-bot / cookie-banner interstitial signature.
+    /// When `dry_run` is true, returns counts and samples without
+    /// deleting. Used by the `hs pipeline purge-poisoned-chunks` CLI to
+    /// scrub contamination from real papers (cookie banner appended to
+    /// the article body) without dropping the whole document.
+    pub async fn scrub_interstitials(&self, dry_run: bool) -> Result<crate::types::ScrubReport> {
+        let url = format!(
+            "{}/scrub-interstitials?dry_run={}",
+            self.server_url, dry_run
+        );
+        let resp = self
+            .http
+            .post(&url)
+            // Scroll over an entire collection can take minutes on a large
+            // corpus; let the server set the pace rather than timing it out.
+            .timeout(Duration::from_secs(900))
+            .send()
+            .await
+            .context("Failed to reach distill server")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Server error {status}: {body}");
+        }
+        let report: crate::types::ScrubReport = resp
+            .json()
+            .await
+            .context("Invalid scrub_interstitials response")?;
+        Ok(report)
     }
 
     /// List every distinct `doc_id` present in the collection.

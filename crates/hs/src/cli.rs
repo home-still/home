@@ -33,6 +33,17 @@ pub enum TopCmd {
         #[command(subcommand)]
         command: paper::cli::PaperCmd,
     },
+    /// Personal documents: ingest medical/financial/etc records into a private store
+    #[command(after_help = "\
+  Examples:
+    hs personal add ~/Downloads/lab-results.pdf
+    hs personal add tax-2024.docx --category tax
+    hs personal search \"blood pressure\"
+    hs personal list --category medical")]
+    Personal {
+        #[command(subcommand)]
+        command: personal::cli::PersonalCmd,
+    },
     /// Distill markdown into vector embeddings for semantic search
     Distill {
         #[command(subcommand)]

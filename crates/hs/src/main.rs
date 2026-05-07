@@ -107,6 +107,7 @@ fn main() -> ExitCode {
     // Capture exit code mapper before cli.command is moved
     let exit_code_mapper: fn(&anyhow::Error) -> ExitCode = match &cli.command {
         TopCmd::Paper { .. } => paper::exit_codes::from_error,
+        TopCmd::Personal { .. } => |_| ExitCode::FAILURE,
         TopCmd::Config { .. } => |_| ExitCode::FAILURE,
         TopCmd::Serve { .. } => |_| ExitCode::FAILURE,
         TopCmd::Server { .. } => |_| ExitCode::FAILURE,
@@ -140,6 +141,9 @@ fn main() -> ExitCode {
                 TopCmd::Paper { command } => {
                     paper::commands::dispatch(command, &cli.global, &reporter, &styles, &mode).await
                 }
+                TopCmd::Personal { command } => personal::commands::dispatch(command)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e)),
                 TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
                 TopCmd::Serve { command } => serve_cmd::dispatch(command, &reporter).await,
                 TopCmd::Server { command } => server_cmd::dispatch(command, &reporter).await,
