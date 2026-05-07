@@ -752,9 +752,12 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
             Err(e) => errors.push(format!("catalog/{}: {e}", v.stem)),
         }
 
-        // Source — extension may be html/htm/pdf; an interstitial saved as
-        // .pdf is rare but possible (origin returned 200 with HTML body
-        // under a PDF URL pre-rc.315). Try all three; one success per stem.
+        // Source — extension may be html/htm/pdf, and a single stem can
+        // legitimately have BOTH a poisoned HTML (the interstitial scribe
+        // captured) AND a real downloaded PDF. The original implementation
+        // broke after the first match and left orphan PDFs in S3 with no
+        // catalog/markdown/Qdrant — invisible to the pipeline and only
+        // recoverable via `catch-up`. Delete every matching extension.
         let mut src_hit = false;
         for ext in ["html", "htm", "pdf"] {
             let key = format!("papers/{}", hs_common::sharded_key(&v.stem, ext));
@@ -762,7 +765,6 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
                 match storage.delete(&key).await {
                     Ok(()) => {
                         src_hit = true;
-                        break;
                     }
                     Err(e) => errors.push(format!("papers/{}.{ext}: {e}", v.stem)),
                 }
