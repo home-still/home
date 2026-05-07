@@ -61,11 +61,22 @@ impl OllamaBackend {
         // substitutes visually similar tokens (0→O, l→1) on numeric/tabular
         // OCR. top_k=1 is defensive against samplers that mis-handle T=0;
         // at T=0 it's a no-op on engines that resolve argmax correctly.
+        //
+        // Mirostat 2.0 (mirostat=2) is a perplexity-feedback sampler that runs
+        // on a different code path than repeat_penalty — it's not affected by
+        // the Go VLM runner bug above. It targets a constant perplexity τ and
+        // dynamically adjusts to escape degenerate loops. Defaults: η=0.1
+        // (responsiveness), τ=5.0 (perplexity target — lower = more focused).
+        // Adding this is the cheapest available defense against runaway
+        // VLM repetition with the current Ollama-backed scribe stack.
         let options = ModelOptions::default()
             .temperature(0.0)
             .top_k(1)
             .repeat_penalty(1.10)
             .repeat_last_n(256)
+            .mirostat(2)
+            .mirostat_eta(0.1)
+            .mirostat_tau(5.0)
             .num_predict(4096)
             .num_ctx(8192);
 
