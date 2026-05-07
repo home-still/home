@@ -275,6 +275,60 @@ pub fn shadow_decide(image: &DynamicImage, bboxes: &[BBox]) -> ColumnSplitShadow
     }
 }
 
+/// Phase 2: replace the suspect bbox with two split bboxes at the
+/// confirmed gutter x. Reading order: left first, then right (within
+/// the suspect's vertical span — PP-DocLayoutV3's outer read-order
+/// drives across-block ordering, so we don't need to renumber other
+/// bboxes). Only the `read_order` field on the new pair gets a small
+/// epsilon offset to keep the assembler's stable sort deterministic.
+///
+/// Caller responsibility: only invoke when `shadow_decide` returned
+/// `would_action == "split"` AND the active-split feature gate is
+/// enabled. This function is a pure mutation helper — it does not
+/// re-verify the decision.
+pub fn split_suspect_at_gutter(bboxes: &mut Vec<BBox>, suspect_idx: usize, gutter_x_abs: u32) {
+    if suspect_idx >= bboxes.len() {
+        return;
+    }
+    let suspect = bboxes[suspect_idx].clone();
+    // Reject pathological gutter coords that would produce zero-width
+    // children — safer to leave the suspect intact than emit a degenerate
+    // bbox that the cropper would later reject.
+    let gx = gutter_x_abs as f32;
+    if gx <= suspect.x1 + 1.0 || gx >= suspect.x2 - 1.0 {
+        return;
+    }
+    let mut left = suspect.clone();
+    let mut right = suspect.clone();
+    left.x2 = gx;
+    right.x1 = gx;
+    // Tiny offsets so the page assembler's stable sort places left
+    // before right when their nominal y-bands overlap.
+    right.read_order = suspect.read_order + 0.5;
+    // unique_id collisions are fine for downstream code (the unique_id
+    // is the row in detection order, used only for read-order recovery
+    // post-VLM) but we keep the suspect's id on the left half and bump
+    // the right by one — trivial uniqueness within a page.
+    right.unique_id = suspect.unique_id.saturating_add(1);
+    bboxes[suspect_idx] = left;
+    bboxes.insert(suspect_idx + 1, right);
+}
+
+/// Whether the active-split feature gate is enabled. Reads
+/// `HS_SCRIBE_COLUMN_SPLIT_ACTIVE` at call time so an operator can flip
+/// the gate without rebuilding (set the env var to `1`/`true`/`yes` on
+/// the scribe-server unit, restart, and the next conversion uses
+/// active split). Default off — Phase 1 is shadow-only.
+pub fn active_split_enabled() -> bool {
+    match std::env::var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE")
+        .ok()
+        .as_deref()
+    {
+        Some("1") | Some("true") | Some("yes") | Some("TRUE") | Some("YES") => true,
+        _ => false,
+    }
+}
+
 /// Otsu's threshold for an 8-bit luma image. Returns the threshold value
 /// in `0..=255`. Pixels strictly darker than the returned value are
 /// treated as foreground (dark) by the projection profile.
@@ -559,6 +613,79 @@ mod tests {
         let s = shadow_decide(&img, &bs);
         assert_eq!(s.would_action, "clean");
         assert!(s.suspect_idx.is_none());
+    }
+
+    #[test]
+    fn split_replaces_suspect_with_left_right_pair() {
+        let mut bs = vec![
+            bbox("page_number", 470.0, 950.0, 530.0, 980.0),
+            bbox("text", 50.0, 100.0, 950.0, 900.0),
+            bbox("figure_title", 100.0, 920.0, 900.0, 940.0),
+        ];
+        // Gutter at x=500 (midline); suspect is index 1.
+        split_suspect_at_gutter(&mut bs, 1, 500);
+        // Vec grew by one — left+right replaced the single suspect.
+        assert_eq!(bs.len(), 4);
+        // Untouched bboxes still surround the split pair.
+        assert_eq!(bs[0].class_name, "page_number");
+        assert_eq!(bs[3].class_name, "figure_title");
+        // Left half: original.x1..gutter.
+        assert_eq!(bs[1].x1, 50.0);
+        assert_eq!(bs[1].x2, 500.0);
+        assert_eq!(bs[1].class_name, "text");
+        // Right half: gutter..original.x2.
+        assert_eq!(bs[2].x1, 500.0);
+        assert_eq!(bs[2].x2, 950.0);
+        assert_eq!(bs[2].class_name, "text");
+        // Right read_order is offset so stable-sort places left first.
+        assert!(bs[2].read_order > bs[1].read_order);
+    }
+
+    #[test]
+    fn split_rejects_degenerate_gutter() {
+        // Gutter at x=51 → left bbox would be 1px wide. No-op.
+        let mut bs = vec![bbox("text", 50.0, 100.0, 950.0, 900.0)];
+        split_suspect_at_gutter(&mut bs, 0, 51);
+        assert_eq!(bs.len(), 1, "should not split when child would be ~0-wide");
+        assert_eq!(bs[0].x1, 50.0);
+        assert_eq!(bs[0].x2, 950.0);
+    }
+
+    #[test]
+    fn split_rejects_out_of_range_index() {
+        // Index past end — silent no-op rather than panic. The caller
+        // gets the unchanged vec and the error is recoverable.
+        let mut bs = vec![bbox("text", 50.0, 100.0, 950.0, 900.0)];
+        split_suspect_at_gutter(&mut bs, 99, 500);
+        assert_eq!(bs.len(), 1);
+    }
+
+    #[test]
+    fn active_split_gate_default_off() {
+        // Gate must default OFF — we will not silently start splitting
+        // bboxes on a freshly-deployed scribe just because the env var
+        // is unset.
+        std::env::remove_var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE");
+        assert!(!active_split_enabled());
+    }
+
+    #[test]
+    fn active_split_gate_on_when_env_truthy() {
+        for v in ["1", "true", "yes", "TRUE", "YES"] {
+            std::env::set_var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE", v);
+            assert!(
+                active_split_enabled(),
+                "expected gate ON for env value `{v}`"
+            );
+        }
+        for v in ["0", "false", "no", "off", ""] {
+            std::env::set_var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE", v);
+            assert!(
+                !active_split_enabled(),
+                "expected gate OFF for env value `{v}`"
+            );
+        }
+        std::env::remove_var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE");
     }
 
     #[test]

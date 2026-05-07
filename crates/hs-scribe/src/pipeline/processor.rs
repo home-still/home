@@ -996,15 +996,32 @@ fn prepare_page(
         .filter(|b| RegionType::from_class(&b.class_name) != RegionType::Skip)
         .collect();
 
-    // Defensive column detection (Phase 1 — shadow only). Runs after the
-    // Skip-filter so the suspect-counter sees only content-bearing
-    // regions. Verdict is recorded into the per-page diag JSONL by
-    // `execute_vlm_for_page`; the bbox vector is NOT mutated yet (Phase
-    // 2 will replace the suspect with the split pair once a corpus run
-    // confirms the false-positive rate is acceptable).
+    // Defensive column detection. Phase 1: shadow_decide records what
+    // the system *would* do (clean / detector_only / split) into the
+    // per-page diag JSONL. Phase 2: when the operator flips
+    // `HS_SCRIBE_COLUMN_SPLIT_ACTIVE=1` on the scribe-server unit,
+    // confirmed splits are also applied — the suspect bbox is replaced
+    // with two half-width bboxes at the gutter. Default is shadow-only;
+    // the gate flips per host so a regression on the active path can
+    // be reverted by clearing the env var, no rebuild needed.
     let column_split_shadow = Some(crate::pipeline::column_detect::shadow_decide(
         image, &bboxes,
     ));
+    let mut bboxes = bboxes;
+    if let Some(shadow) = column_split_shadow.as_ref() {
+        if shadow.would_action == "split" && crate::pipeline::column_detect::active_split_enabled()
+        {
+            if let (Some(idx), Some(gx)) = (shadow.suspect_idx, shadow.gutter_x) {
+                tracing::info!(
+                    page = page_idx + 1,
+                    suspect_idx = idx,
+                    gutter_x = gx,
+                    "column-split: replacing wide suspect with left/right pair"
+                );
+                crate::pipeline::column_detect::split_suspect_at_gutter(&mut bboxes, idx, gx);
+            }
+        }
+    }
 
     let detection_order: Vec<usize> = bboxes.iter().map(|b| b.unique_id).collect();
 
