@@ -116,6 +116,26 @@ pub enum PipelineCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Bulk-trigger `hs scribe reconvert` on every catalog row stamped
+    /// `conversion_failed` (any reason). Clears the failure stamp and
+    /// republishes `papers.ingested` so scribe + distill re-process the
+    /// paper with the current binary's logic. Use after deploying a
+    /// scribe-side fix (Phase 3 streaming abort, postprocess change, new
+    /// VLM, etc.) to measure the fix's recovery rate at corpus scale.
+    /// Honors --dry-run for a count-only inventory.
+    ReconvertFailed {
+        /// Report what would be reconverted without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Limit how many failed papers to reconvert. Useful for staged
+        /// rollouts (e.g. `--limit 25` to size up before committing the
+        /// full corpus). Default: all.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -139,6 +159,11 @@ pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<
         PipelineCmd::ReapPhantoms { dry_run, yes } => {
             cmd_reap_phantoms(dry_run, yes, reporter).await
         }
+        PipelineCmd::ReconvertFailed {
+            dry_run,
+            yes,
+            limit,
+        } => cmd_reconvert_failed(dry_run, yes, limit, reporter).await,
     }
 }
 
@@ -962,5 +987,163 @@ async fn cmd_purge_poisoned_chunks(
         "Scrubbed Qdrant — scanned={} matched={} deleted={}",
         report.total_scanned, report.matched, report.deleted
     ));
+    Ok(())
+}
+
+async fn cmd_reconvert_failed(
+    dry_run: bool,
+    yes: bool,
+    limit: Option<usize>,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    const PAPERS_PREFIX: &str = "papers";
+    const CATALOG_PREFIX: &str = "catalog";
+    const CANDIDATE_EXTS: &[&str] = &["pdf", "html", "htm", "epub"];
+
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+
+    reporter.status("Scan", "catalog for conversion_failed stamps");
+    let triples = hs_common::catalog::list_catalog_entries_via(&*storage, CATALOG_PREFIX)
+        .await
+        .context("list catalog entries")?;
+
+    let mut victims: Vec<(String, String)> = triples
+        .into_iter()
+        .filter_map(|(stem, _obj, entry)| {
+            entry
+                .conversion_failed
+                .as_ref()
+                .map(|f| (stem, f.reason.clone()))
+        })
+        .collect();
+    let total_found = victims.len();
+    if let Some(n) = limit {
+        victims.truncate(n);
+    }
+
+    reporter.status(
+        "Found",
+        &format!(
+            "{total_found} papers with conversion_failed stamp{}",
+            if let Some(n) = limit {
+                format!(" (limiting to {n})")
+            } else {
+                String::new()
+            }
+        ),
+    );
+
+    // Group by reason so the operator can spot a single dominant failure
+    // mode at a glance before kicking off the bulk republish.
+    let mut by_reason: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (_, reason) in &victims {
+        *by_reason.entry(reason.clone()).or_default() += 1;
+    }
+    for (r, n) in &by_reason {
+        reporter.status("Reason", &format!("{n:>4} × {r}"));
+    }
+
+    if victims.is_empty() {
+        reporter.finish("Nothing to reconvert.");
+        return Ok(());
+    }
+    if dry_run {
+        reporter.finish("Dry-run complete.");
+        return Ok(());
+    }
+
+    if !yes {
+        let accept = Confirm::new()
+            .with_prompt(format!(
+                "Clear conversion_failed and republish papers.ingested for {} papers? \
+                 (no destructive op — only the failure stamp clears so the watcher reprocesses)",
+                victims.len()
+            ))
+            .default(false)
+            .interact()?;
+        if !accept {
+            reporter.finish("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let bus = cfg
+        .build_event_bus()
+        .await
+        .context("building event bus for papers.ingested publish")?;
+
+    let mut succeeded = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    for (i, (stem, _reason)) in victims.iter().enumerate() {
+        match reconvert_one(
+            &*storage,
+            bus.as_ref(),
+            stem,
+            PAPERS_PREFIX,
+            CATALOG_PREFIX,
+            CANDIDATE_EXTS,
+        )
+        .await
+        {
+            Ok(()) => succeeded += 1,
+            Err(e) => errors.push(format!("{stem}: {e:#}")),
+        }
+        if (i + 1) % 25 == 0 {
+            reporter.status("Progress", &format!("queued {}/{}", i + 1, victims.len()));
+        }
+    }
+
+    reporter.finish(&format!(
+        "Reconvert queued: succeeded={succeeded} errors={}",
+        errors.len()
+    ));
+    for e in errors.iter().take(10) {
+        eprintln!("  error: {e}");
+    }
+    if errors.len() > 10 {
+        eprintln!("  ... and {} more", errors.len() - 10);
+    }
+    Ok(())
+}
+
+/// Per-stem reconvert: clear stamps, locate source, republish event.
+/// Mirrors the body of `hs scribe reconvert <stem>` so a corpus-scale run
+/// gets the same semantics as the single-stem CLI flow without coupling
+/// the two crates' command modules.
+async fn reconvert_one(
+    storage: &dyn hs_common::storage::Storage,
+    bus: &dyn hs_common::event_bus::EventBus,
+    stem: &str,
+    papers_prefix: &str,
+    catalog_prefix: &str,
+    candidate_exts: &[&str],
+) -> Result<()> {
+    let mut entry = hs_common::catalog::read_catalog_entry_via(storage, catalog_prefix, stem)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no catalog row for stem"))?;
+
+    let mut source_key: Option<String> = None;
+    for ext in candidate_exts {
+        let key = format!("{papers_prefix}/{}", hs_common::sharded_key(stem, ext));
+        if storage.exists(&key).await? {
+            source_key = Some(key);
+            break;
+        }
+    }
+    let source_key = source_key
+        .ok_or_else(|| anyhow::anyhow!("no source file under {papers_prefix}/ for stem"))?;
+
+    entry.conversion = None;
+    entry.conversion_failed = None;
+    hs_common::catalog::write_catalog_entry_via(storage, catalog_prefix, stem, &entry).await?;
+
+    let payload = serde_json::json!({
+        "key": source_key,
+        "source": "hs pipeline reconvert-failed",
+    });
+    let bytes = serde_json::to_vec(&payload)?;
+    bus.publish("papers.ingested", &bytes).await?;
     Ok(())
 }
