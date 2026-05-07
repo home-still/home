@@ -87,6 +87,21 @@ pub enum PipelineCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Reap phantom catalog rows: entries with no downloaded paper, no
+    /// markdown, no embed record. These accumulate from intent-cataloged
+    /// stems where the download attempt failed silently or was abandoned
+    /// (Anna's Archive search-result placeholders, citation-graph DOIs
+    /// that never resolved). Inflates pipeline_drift but doesn't break
+    /// anything. Deletes the orphan catalog yaml only — there's nothing
+    /// else to delete.
+    ReapPhantoms {
+        /// Report what would be deleted without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Per-chunk parallel to `purge-poisoned`: scan every Qdrant point and
     /// delete only those individual chunks whose `chunk_text` matches a
     /// known interstitial / cookie-banner signature, leaving the rest of
@@ -120,6 +135,9 @@ pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<
         }
         PipelineCmd::PurgePoisonedChunks { dry_run, yes } => {
             cmd_purge_poisoned_chunks(dry_run, yes, reporter).await
+        }
+        PipelineCmd::ReapPhantoms { dry_run, yes } => {
+            cmd_reap_phantoms(dry_run, yes, reporter).await
         }
     }
 }
@@ -761,6 +779,103 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
 
     reporter.finish(&format!(
         "Purged interstitials — qdrant={qdrant_deleted} markdown={md_deleted} catalog={cat_deleted} source={src_deleted} errors={}",
+        errors.len()
+    ));
+    for e in errors.iter().take(10) {
+        eprintln!("  error: {e}");
+    }
+    if errors.len() > 10 {
+        eprintln!("  ... and {} more", errors.len() - 10);
+    }
+    Ok(())
+}
+
+async fn cmd_reap_phantoms(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+
+    reporter.status("Scan", "catalog for phantom rows");
+    let triples = hs_common::catalog::list_catalog_entries_via(&*storage, "catalog")
+        .await
+        .context("list catalog entries")?;
+
+    // A phantom is a catalog row with no downloaded paper, no markdown,
+    // no conversion attempt, no embedding outcome, no repair record.
+    // It only exists because some intent-cataloged path (Anna's Archive
+    // search-result, citation-graph DOI, manually-added stem) wrote a
+    // yaml without ever materializing a file.
+    struct Phantom {
+        stem: String,
+        catalog_key: String,
+    }
+    let phantoms: Vec<Phantom> = triples
+        .into_iter()
+        .filter_map(|(stem, obj, entry)| {
+            let no_download = entry.downloaded_at.is_none() && entry.pdf_path.is_none();
+            let no_markdown = entry.markdown_path.is_none() && entry.conversion.is_none();
+            let no_embed = entry.embedding.is_none() && entry.embedding_skip.is_none();
+            let no_repair = entry.repair.is_none();
+            let no_failure = entry.conversion_failed.is_none();
+            if no_download && no_markdown && no_embed && no_repair && no_failure {
+                Some(Phantom {
+                    stem,
+                    catalog_key: obj.key,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    reporter.status(
+        "Phantoms",
+        &format!("{} catalog rows have no underlying state", phantoms.len()),
+    );
+    if phantoms.is_empty() {
+        reporter.finish("Nothing to reap — no phantom catalog rows.");
+        return Ok(());
+    }
+
+    for p in phantoms.iter().take(5) {
+        reporter.status("Sample", &p.stem);
+    }
+    if phantoms.len() > 5 {
+        reporter.status("...", &format!("+{} more", phantoms.len() - 5));
+    }
+
+    if dry_run {
+        reporter.finish("Dry-run complete — no state changed.");
+        return Ok(());
+    }
+
+    if !yes {
+        let accept = Confirm::new()
+            .with_prompt(format!(
+                "Delete {} phantom catalog rows? (no other state to clean — these rows reference no files)",
+                phantoms.len()
+            ))
+            .default(false)
+            .interact()?;
+        if !accept {
+            reporter.finish("Aborted — no state changed.");
+            return Ok(());
+        }
+    }
+
+    let mut deleted = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    for (i, p) in phantoms.iter().enumerate() {
+        match storage.delete(&p.catalog_key).await {
+            Ok(()) => deleted += 1,
+            Err(e) => errors.push(format!("catalog/{}: {e}", p.stem)),
+        }
+        if (i + 1) % 50 == 0 {
+            reporter.status("Progress", &format!("reaped {}/{}", i + 1, phantoms.len()));
+        }
+    }
+
+    reporter.finish(&format!(
+        "Reaped phantoms — catalog={deleted} errors={}",
         errors.len()
     ));
     for e in errors.iter().take(10) {
