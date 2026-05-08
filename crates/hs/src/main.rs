@@ -12,6 +12,7 @@ mod distill_cmd;
 mod mcp_client;
 mod mcp_cmd;
 mod migrate_cmd;
+mod openalex_cmd;
 mod pipeline_cmd;
 mod restart_cmd;
 mod scribe_cmd;
@@ -120,6 +121,7 @@ fn main() -> ExitCode {
         TopCmd::Mcp { .. } => |_| ExitCode::FAILURE,
         TopCmd::Migrate { .. } => |_| ExitCode::FAILURE,
         TopCmd::Pipeline { .. } => |_| ExitCode::FAILURE,
+        TopCmd::Openalex { .. } => |_| ExitCode::FAILURE,
     };
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio  runtime");
@@ -171,6 +173,7 @@ fn main() -> ExitCode {
                     }
                 },
                 TopCmd::Pipeline { command } => pipeline_cmd::dispatch(command, &reporter).await,
+                TopCmd::Openalex { command } => openalex_cmd::dispatch(command).await,
             }
         };
 

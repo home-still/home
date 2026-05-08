@@ -17,6 +17,8 @@ hs-common = { workspace = true, features = ["cli", "service", "catalog", "compos
 owo-colors = { workspace = true }
 paper = { path = "../../paper" }
 personal = { path = "../../personal" }
+openalex-ingest = { path = "../openalex-ingest" }
+duckdb = { workspace = true }
 dirs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

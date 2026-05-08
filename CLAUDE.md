@@ -18,10 +18,13 @@ Academic research engine: 211M+ vector search with OpenAlex + PMC OA + Qdrant.
 
 - Before proposing any fix: state the observed symptom, list 2–3 competing hypotheses with evidence, and name a cheap test that discriminates between them. No code until the diagnosis is confirmed.
 - No band-aid guards or legacy-compatibility fallbacks in this greenfield project — fix root causes. See the "ONE PATH per feature" non-negotiable above.
+- Before declaring a fix shipped, grep the repo for the original failure pattern (panic message, error string, the crashing code path) and confirm zero remaining sites. rc.304's JPEG 0-dim guard covered one of several call sites — the rest crashed in production and forced rc.305.
 
 ## Release Process
 
 - Before tagging any `rc.*`: run `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test`. Only tag if all three pass.
+- All deployments go through tagged CI/CD release artifacts (GitHub Actions → `gh release` → `hs upgrade` on each host). Never hand-`scp` a locally-built binary to a deploy target. If `hs upgrade` doesn't cover a path (e.g., raw scribe/distill server binaries), fix `hs upgrade` — don't sidestep with manual copy.
+- Verify the version string is correctly baked into each artifact BEFORE pushing the tag: run `./target/<arch>/release/hs --version` and confirm it matches the tag. `git describe` silently falls back to the prior tag when `GITHUB_REF_NAME` isn't set on local builds — rc.245 shipped with rc.244's binary because of this.
 - After building per-arch artifacts, verify each binary's architecture with `file` before deploying — `x86_64` to `big`/`one`, `aarch64` to the Pis, `arm64` Mach-O to Apple Silicon hosts. Wrong-arch ships have wasted entire RCs.
 
 ## Documentation / Privacy

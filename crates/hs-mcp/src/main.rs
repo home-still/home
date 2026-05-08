@@ -74,6 +74,60 @@ struct PaperCitationsParams {
     sort: Option<String>,
 }
 
+// ── OpenAlex (local DuckDB) parameter types ─────────────────────
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OpenAlexSearchParams {
+    #[schemars(description = "Free-text search over works title + abstract (BM25)")]
+    query: String,
+    #[schemars(description = "Maximum results (default 10, max 200)")]
+    max_results: Option<u16>,
+    #[schemars(description = "Minimum publication year filter")]
+    year_from: Option<u16>,
+    #[schemars(description = "Maximum publication year filter")]
+    year_to: Option<u16>,
+    #[schemars(description = "Minimum cited_by_count filter")]
+    min_citations: Option<u32>,
+    #[schemars(description = "Sort: 'relevance' (default), 'citations', 'year'")]
+    sort: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OpenAlexGetParams {
+    #[schemars(description = "OpenAlex work ID (e.g. W2741809807) or DOI (e.g. 10.1234/x)")]
+    id_or_doi: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OpenAlexReferencesParams {
+    #[schemars(description = "OpenAlex work ID whose outbound references to list")]
+    openalex_id: String,
+    #[schemars(description = "Maximum results (default 100, max 1000)")]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OpenAlexCitationsParams {
+    #[schemars(description = "OpenAlex work ID to find citing works for")]
+    openalex_id: String,
+    #[schemars(description = "Maximum results (default 100, max 1000)")]
+    limit: Option<u32>,
+    #[schemars(description = "Optional minimum publication year filter")]
+    year_from: Option<u16>,
+    #[schemars(description = "Sort: 'citations' (default) or 'year'")]
+    sort: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OpenAlexAuthorsByTopicParams {
+    #[schemars(
+        description = "OpenAlex topic ID (e.g. T13975) — get from `openalex_search` or `topics` table"
+    )]
+    topic_id: String,
+    #[schemars(description = "Maximum authors (default 25, max 200)")]
+    limit: Option<u16>,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct CatalogReadParams {
     #[schemars(description = "Paper stem name (filename without extension)")]
@@ -304,6 +358,132 @@ fn system_time_to_rfc3339(t: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
 }
 
+// ── OpenAlex DuckDB helpers ─────────────────────────────────────
+
+fn openalex_unavailable_error() -> String {
+    "OpenAlex DB not configured. Add an `openalex:` section to ~/.home-still/config.yaml \
+     with `db_path` and `snapshot_dir`, then run `hs openalex load <entity>`."
+        .to_string()
+}
+
+/// Open the local OpenAlex DuckDB read-only. Reads `~/.home-still/config.yaml`
+/// for the `openalex.db_path` setting. Errors if the section or file is
+/// missing — caller decides whether to log+continue.
+fn open_openalex_readonly() -> anyhow::Result<duckdb::Connection> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no $HOME"))?;
+    let cfg_path = home.join(".home-still").join("config.yaml");
+    let raw = std::fs::read_to_string(&cfg_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", cfg_path.display()))?;
+    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&raw)?;
+    let oa = v
+        .get("openalex")
+        .ok_or_else(|| anyhow::anyhow!("missing 'openalex:' section in {}", cfg_path.display()))?;
+    let db_path_str = oa
+        .get("db_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("openalex.db_path missing"))?;
+    let db_path = if let Some(rest) = db_path_str.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        std::path::PathBuf::from(db_path_str)
+    };
+    if !db_path.exists() {
+        anyhow::bail!(
+            "openalex db not found at {} — run `hs openalex load <entity>` first",
+            db_path.display()
+        );
+    }
+    let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
+    let conn = duckdb::Connection::open_with_flags(&db_path, cfg)?;
+    Ok(conn)
+}
+
+/// Run an OpenAlex SQL query inside spawn_blocking, return rows serialized as
+/// a JSON array (pretty-printed). Single entry point for all 4 simple
+/// SELECT-driven openalex_* tools.
+async fn run_openalex_query_json(
+    server: &HomeStillMcp,
+    sql: &str,
+    params: Vec<duckdb::types::Value>,
+) -> Result<String, String> {
+    let conn_arc = server
+        .openalex_db
+        .as_ref()
+        .ok_or_else(openalex_unavailable_error)?
+        .clone();
+    let sql = sql.to_string();
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let conn = conn_arc
+            .lock()
+            .map_err(|_| "openalex DB mutex poisoned".to_string())?;
+        let rows_json = collect_rows_json(&conn, &sql, duckdb::params_from_iter(params.iter()))?;
+        Ok(serde_json::to_string_pretty(&rows_json).unwrap_or_default())
+    })
+    .await
+    .map_err(|e| format!("join: {e}"))?
+}
+
+/// Build a `duckdb::types::Value` from a typed Option, mapping None → Null.
+/// Used by tool handlers to construct the params Vec inline.
+fn opt_value<T: Into<duckdb::types::Value>>(v: Option<T>) -> duckdb::types::Value {
+    v.map(Into::into).unwrap_or(duckdb::types::Value::Null)
+}
+
+/// Run a query and return the result rows as a Vec<serde_json::Value>.
+fn collect_rows_json(
+    conn: &duckdb::Connection,
+    sql: &str,
+    params: impl duckdb::Params,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
+    let mut rows = stmt.query(params).map_err(|e| format!("query: {e}"))?;
+    let cols: Vec<String> = rows
+        .as_ref()
+        .map(|s| s.column_names().into_iter().map(String::from).collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| format!("next: {e}"))? {
+        out.push(row_to_json(row, &cols)?);
+    }
+    Ok(out)
+}
+
+fn row_to_json(row: &duckdb::Row, cols: &[String]) -> Result<serde_json::Value, String> {
+    let mut m = serde_json::Map::with_capacity(cols.len());
+    for (i, name) in cols.iter().enumerate() {
+        let v: duckdb::types::Value = row.get(i).map_err(|e| format!("col {i}: {e}"))?;
+        m.insert(name.clone(), duckdb_value_to_json(v));
+    }
+    Ok(serde_json::Value::Object(m))
+}
+
+fn duckdb_value_to_json(v: duckdb::types::Value) -> serde_json::Value {
+    use duckdb::types::Value as V;
+    use serde_json::Value as J;
+    match v {
+        V::Null => J::Null,
+        V::Boolean(b) => J::Bool(b),
+        V::TinyInt(n) => J::from(n),
+        V::SmallInt(n) => J::from(n),
+        V::Int(n) => J::from(n),
+        V::BigInt(n) => J::from(n),
+        V::HugeInt(n) => J::from(n.to_string()),
+        V::UTinyInt(n) => J::from(n),
+        V::USmallInt(n) => J::from(n),
+        V::UInt(n) => J::from(n),
+        V::UBigInt(n) => J::from(n),
+        V::Float(f) => serde_json::Number::from_f64(f as f64)
+            .map(J::Number)
+            .unwrap_or(J::Null),
+        V::Double(f) => serde_json::Number::from_f64(f)
+            .map(J::Number)
+            .unwrap_or(J::Null),
+        V::Text(s) => J::String(s),
+        V::Blob(b) => J::String(format!("<{} bytes>", b.len())),
+        other => J::String(format!("{:?}", other)),
+    }
+}
+
 // ── MCP Server ──────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -328,6 +508,10 @@ struct HomeStillMcp {
     scribe_servers: Vec<String>,
     scribe_convert_timeout: std::time::Duration,
     distill_servers: Vec<String>,
+    /// Read-only handle to the local OpenAlex DuckDB (when `openalex:` section
+    /// is present in config and the file exists). `None` when the section is
+    /// absent — `openalex_*` tools then return a configuration error.
+    openalex_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -374,6 +558,17 @@ impl HomeStillMcp {
         let scribe_servers = scribe_cfg.servers.clone();
         let distill_servers = distill_cfg.servers.clone();
 
+        // Best-effort open of the local OpenAlex DuckDB. Missing config section
+        // = `None`, tools return a clear error. Missing file = `None` (don't
+        // create here — let `hs openalex` own DB lifecycle).
+        let openalex_db = open_openalex_readonly()
+            .map_err(|e| {
+                tracing::warn!("openalex DB unavailable: {e:#}");
+                e
+            })
+            .ok()
+            .map(|conn| Arc::new(std::sync::Mutex::new(conn)));
+
         Ok(Self {
             storage,
             events,
@@ -386,6 +581,7 @@ impl HomeStillMcp {
             scribe_servers,
             scribe_convert_timeout: std::time::Duration::from_secs(scribe_cfg.convert_timeout_secs),
             distill_servers,
+            openalex_db,
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         })
@@ -2710,6 +2906,259 @@ impl HomeStillMcp {
         let include_repaired = p.include_repaired.unwrap_or(false);
         let snap = self.build_status_snapshot(20, include_repaired).await;
         Ok(serde_json::to_string_pretty(&snap).unwrap_or_default())
+    }
+
+    // ── OpenAlex (local DuckDB) Tools ────────────────────────────
+
+    #[tool(
+        description = "Search the local OpenAlex catalog by free text (BM25 over title+abstract). Returns JSON array of works with openalex_id, doi, title, year, citations, and bm25 score. Local DB — no external API calls. Requires `hs openalex build-fts` to have been run.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn openalex_search(
+        &self,
+        Parameters(p): Parameters<OpenAlexSearchParams>,
+    ) -> Result<String, String> {
+        let limit = p.max_results.unwrap_or(10).min(200) as i64;
+        let sort = p.sort.as_deref().unwrap_or("relevance");
+        let order_by = match sort {
+            "citations" => "ORDER BY cited_by_count DESC NULLS LAST, bm25 DESC",
+            "year" => "ORDER BY publication_year DESC NULLS LAST, bm25 DESC",
+            _ => "ORDER BY bm25 DESC",
+        };
+        let sql = format!(
+            r#"
+            WITH ranked AS (
+              SELECT
+                openalex_id, doi, title, publication_year, cited_by_count,
+                fts_main_works.match_bm25(openalex_id, ?) AS bm25
+              FROM works
+            )
+            SELECT openalex_id, doi, title, publication_year, cited_by_count, bm25
+            FROM ranked
+            WHERE bm25 IS NOT NULL
+              AND publication_year >= COALESCE(?, 0)
+              AND publication_year <= COALESCE(?, 9999)
+              AND cited_by_count >= COALESCE(?, 0)
+            {order_by}
+            LIMIT ?;
+            "#
+        );
+        run_openalex_query_json(
+            self,
+            &sql,
+            vec![
+                duckdb::types::Value::Text(p.query),
+                opt_value(p.year_from.map(i64::from)),
+                opt_value(p.year_to.map(i64::from)),
+                opt_value(p.min_citations.map(i64::from)),
+                duckdb::types::Value::BigInt(limit),
+            ],
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Look up a single work in the local OpenAlex catalog by OpenAlex ID (e.g. W2741809807) or DOI (e.g. 10.1234/x). Returns JSON with the work + its denormalized authors and topics.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn openalex_get(
+        &self,
+        Parameters(p): Parameters<OpenAlexGetParams>,
+    ) -> Result<String, String> {
+        let conn_arc = self
+            .openalex_db
+            .as_ref()
+            .ok_or_else(openalex_unavailable_error)?
+            .clone();
+        let id = p.id_or_doi.clone();
+        let result: Result<serde_json::Value, String> = tokio::task::spawn_blocking(move || {
+            let conn = conn_arc
+                .lock()
+                .map_err(|_| "openalex DB mutex poisoned".to_string())?;
+
+            // Work row
+            let work = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT openalex_id, doi, title, abstract_text, publication_year,
+                                publication_date, language, type, cited_by_count, is_retracted,
+                                is_oa, oa_url, primary_source_id
+                         FROM works
+                         WHERE openalex_id = ? OR doi = ?
+                         LIMIT 1",
+                    )
+                    .map_err(|e| format!("prepare: {e}"))?;
+                let mut rows = stmt
+                    .query(duckdb::params![id, id])
+                    .map_err(|e| format!("query: {e}"))?;
+                let cols: Vec<String> = rows
+                    .as_ref()
+                    .map(|s| s.column_names().into_iter().map(String::from).collect())
+                    .unwrap_or_default();
+                if let Some(row) = rows.next().map_err(|e| format!("next: {e}"))? {
+                    Some(row_to_json(row, &cols)?)
+                } else {
+                    None
+                }
+            };
+            let work = match work {
+                Some(w) => w,
+                None => {
+                    return Ok(serde_json::json!({"error": "not_found", "id_or_doi": id}));
+                }
+            };
+            let work_id = work
+                .get("openalex_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let authors = collect_rows_json(
+                &conn,
+                "SELECT a.openalex_id, a.display_name, wa.author_position,
+                        wa.raw_affiliation_string, wa.institution_id
+                 FROM work_authorships wa
+                 LEFT JOIN authors a ON a.openalex_id = wa.author_id
+                 WHERE wa.work_id = ?
+                 ORDER BY wa.author_position",
+                duckdb::params![work_id],
+            )?;
+            let topics = collect_rows_json(
+                &conn,
+                "SELECT t.openalex_id, t.display_name, wt.score
+                 FROM work_topics wt
+                 LEFT JOIN topics t ON t.openalex_id = wt.topic_id
+                 WHERE wt.work_id = ?
+                 ORDER BY wt.score DESC NULLS LAST",
+                duckdb::params![work_id],
+            )?;
+
+            let mut out = work;
+            if let serde_json::Value::Object(ref mut m) = out {
+                m.insert("authors".into(), serde_json::Value::Array(authors));
+                m.insert("topics".into(), serde_json::Value::Array(topics));
+            }
+            Ok::<serde_json::Value, String>(out)
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))?;
+
+        let v = result?;
+        Ok(serde_json::to_string_pretty(&v).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "List works that the given OpenAlex work cites (outbound references). Returns JSON array of cited works with openalex_id, doi, title, year, cited_by_count.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn openalex_references(
+        &self,
+        Parameters(p): Parameters<OpenAlexReferencesParams>,
+    ) -> Result<String, String> {
+        let limit = p.limit.unwrap_or(100).min(1000) as i64;
+        let sql = "SELECT w.openalex_id, w.doi, w.title, w.publication_year, w.cited_by_count
+                   FROM work_references wr
+                   LEFT JOIN works w ON w.openalex_id = wr.referenced_work_id
+                   WHERE wr.work_id = ?
+                   ORDER BY w.cited_by_count DESC NULLS LAST
+                   LIMIT ?";
+        run_openalex_query_json(
+            self,
+            sql,
+            vec![
+                duckdb::types::Value::Text(p.openalex_id),
+                duckdb::types::Value::BigInt(limit),
+            ],
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List works that cite the given OpenAlex work (forward citation chaining). Returns JSON array of citing works.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn openalex_citations(
+        &self,
+        Parameters(p): Parameters<OpenAlexCitationsParams>,
+    ) -> Result<String, String> {
+        let limit = p.limit.unwrap_or(100).min(1000) as i64;
+        let order_by = match p.sort.as_deref() {
+            Some("year") => "ORDER BY w.publication_year DESC NULLS LAST",
+            _ => "ORDER BY w.cited_by_count DESC NULLS LAST",
+        };
+        let sql = format!(
+            "SELECT w.openalex_id, w.doi, w.title, w.publication_year, w.cited_by_count
+             FROM work_references wr
+             LEFT JOIN works w ON w.openalex_id = wr.work_id
+             WHERE wr.referenced_work_id = ?
+               AND w.publication_year >= COALESCE(?, 0)
+             {order_by}
+             LIMIT ?"
+        );
+        run_openalex_query_json(
+            self,
+            &sql,
+            vec![
+                duckdb::types::Value::Text(p.openalex_id),
+                opt_value(p.year_from.map(i64::from)),
+                duckdb::types::Value::BigInt(limit),
+            ],
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Top authors for an OpenAlex topic, ranked by total cited_by_count. Joins work_topics → work_authorships → authors. Returns JSON array of (openalex_id, display_name, cited_by_count, papers_in_topic).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn openalex_authors_by_topic(
+        &self,
+        Parameters(p): Parameters<OpenAlexAuthorsByTopicParams>,
+    ) -> Result<String, String> {
+        let limit = p.limit.unwrap_or(25).min(200) as i64;
+        let sql = "SELECT a.openalex_id, a.display_name, a.cited_by_count,
+                          COUNT(*) AS papers_in_topic
+                   FROM work_topics wt
+                   JOIN work_authorships wa ON wa.work_id = wt.work_id
+                   JOIN authors a ON a.openalex_id = wa.author_id
+                   WHERE wt.topic_id = ?
+                   GROUP BY a.openalex_id, a.display_name, a.cited_by_count
+                   ORDER BY a.cited_by_count DESC NULLS LAST
+                   LIMIT ?";
+        run_openalex_query_json(
+            self,
+            sql,
+            vec![
+                duckdb::types::Value::Text(p.topic_id),
+                duckdb::types::Value::BigInt(limit),
+            ],
+        )
+        .await
     }
 }
 

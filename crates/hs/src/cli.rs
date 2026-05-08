@@ -102,6 +102,18 @@ pub enum TopCmd {
         #[command(subcommand)]
         command: super::pipeline_cmd::PipelineCmd,
     },
+    /// Local OpenAlex catalog (DuckDB) — bulk-load entities, query, build FTS
+    #[command(after_help = "\
+  Examples:
+    hs openalex load concepts
+    hs openalex load-works --partition updated_date=2024-01-01
+    hs openalex status
+    hs openalex query \"SELECT COUNT(*) FROM works\"
+    hs openalex build-fts")]
+    Openalex {
+        #[command(subcommand)]
+        command: super::openalex_cmd::OpenAlexCmd,
+    },
 }
 
 #[derive(Subcommand, Debug)]
