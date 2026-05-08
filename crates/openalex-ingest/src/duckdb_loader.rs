@@ -56,8 +56,13 @@ impl OpenAlexDb {
         // without it, DuckDB buffers entire result sets to keep input ordering
         // visible, which OOMs on huge JSONL partitions. We don't care about
         // physical row order for an OLAP catalog.
+        // Memory headroom on `big`: 32 GB total, ~10 GB pinned by services
+        // (llama-server, hs-scribe-server). 10 GB DuckDB + 1-2 GB Rust leaves
+        // ~10 GB for everything else. Bumped from 8 → 10 after observing OOMs
+        // at the works merge step (live works table grows past 20M rows, the
+        // ON CONFLICT hash anti-join needs proportionally more headroom).
         let pragmas = format!(
-            "PRAGMA memory_limit='8GB';\n\
+            "PRAGMA memory_limit='10GB';\n\
              PRAGMA temp_directory='{}';\n\
              PRAGMA threads=6;\n\
              PRAGMA preserve_insertion_order=false;",
@@ -197,69 +202,129 @@ impl OpenAlexDb {
             });
         }
 
-        // Wrap the partition in one transaction so the per-row INSERTs don't
-        // each pay an autocommit fsync. Commit at the end alongside the
-        // _ingest_log row.
-        self.conn.execute_batch("BEGIN TRANSACTION")?;
-
+        // Per-file processing keeps memory bounded on the giant 2025-11-06
+        // partition (2.59 TB). Each JSONL file (~1 GB) gets its own staging
+        // tables → bulk INSERT … SELECT … ON CONFLICT cycle. Errors are
+        // localized per file. Per-partition transaction would still work for
+        // small partitions, but the unified file-level approach keeps a
+        // single code path (ONE PATH).
         let result = self.load_works_partition_inner(partition_dir);
 
         match result {
             Ok((rows, parse_errors)) => {
                 self.log_partition("works", &part_name, "ok", rows, parse_errors)?;
-                self.conn.execute_batch("COMMIT")?;
                 Ok(EntityStats {
                     partitions_loaded: 1,
                     rows_inserted: rows,
                     ..Default::default()
                 })
             }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
     fn load_works_partition_inner(&self, partition_dir: &Path) -> Result<(u64, u64)> {
-        let mut stmt_works = self.conn.prepare(
-            "INSERT INTO works(openalex_id, doi, title, abstract_text, publication_year, \
-             publication_date, language, type, cited_by_count, is_retracted, is_oa, oa_url, \
-             primary_source_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (openalex_id) DO NOTHING",
-        )?;
-        let mut stmt_auth = self.conn.prepare(
-            "INSERT INTO work_authorships(work_id, author_id, author_position, \
-             raw_affiliation_string, institution_id) VALUES (?, ?, ?, ?, ?)",
-        )?;
-        let mut stmt_topic = self.conn.prepare(
-            "INSERT INTO work_topics(work_id, topic_id, score) VALUES (?, ?, ?) \
-             ON CONFLICT (work_id, topic_id) DO NOTHING",
-        )?;
-        let mut stmt_concept = self.conn.prepare(
-            "INSERT INTO work_concepts(work_id, concept_id, score) VALUES (?, ?, ?) \
-             ON CONFLICT (work_id, concept_id) DO NOTHING",
-        )?;
-        let mut stmt_ref = self.conn.prepare(
-            "INSERT INTO work_references(work_id, referenced_work_id) VALUES (?, ?) \
-             ON CONFLICT (work_id, referenced_work_id) DO NOTHING",
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(partition_dir)
+            .with_context(|| format!("read_dir {}", partition_dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        files.sort();
+
+        let mut total_rows = 0u64;
+        let mut total_errs = 0u64;
+        for f in files {
+            let (rows, errs) = self
+                .load_works_file(&f)
+                .with_context(|| format!("load file {}", f.display()))?;
+            total_rows += rows;
+            total_errs += errs;
+        }
+        Ok((total_rows, total_errs))
+    }
+
+    /// Bulk-load one JSONL file via Appender → unconstrained temp tables →
+    /// `INSERT … SELECT … ON CONFLICT DO NOTHING` merge into live tables.
+    /// This is much faster than per-row prepared statements because the
+    /// Appender is binary-bulk path and the bulk merge is one query.
+    fn load_works_file(&self, file: &std::path::Path) -> Result<(u64, u64)> {
+        // Temp tables live for the connection lifetime; we DROP at the end
+        // of each file so the next file starts clean. CREATE OR REPLACE so
+        // a partial run doesn't leave them behind.
+        self.conn.execute_batch(
+            "CREATE OR REPLACE TEMP TABLE _stage_works (
+               openalex_id VARCHAR, doi VARCHAR, title VARCHAR, abstract_text VARCHAR,
+               publication_year USMALLINT, publication_date DATE, language VARCHAR,
+               type VARCHAR, cited_by_count UBIGINT, is_retracted BOOLEAN, is_oa BOOLEAN,
+               oa_url VARCHAR, primary_source_id VARCHAR
+             );
+             CREATE OR REPLACE TEMP TABLE _stage_auth (
+               work_id VARCHAR, author_id VARCHAR, author_position VARCHAR,
+               raw_affiliation_string VARCHAR, institution_id VARCHAR
+             );
+             CREATE OR REPLACE TEMP TABLE _stage_topic (
+               work_id VARCHAR, topic_id VARCHAR, score REAL
+             );
+             CREATE OR REPLACE TEMP TABLE _stage_concept (
+               work_id VARCHAR, concept_id VARCHAR, score REAL
+             );
+             CREATE OR REPLACE TEMP TABLE _stage_ref (
+               work_id VARCHAR, referenced_work_id VARCHAR
+             );",
         )?;
 
+        let mut works_app = self.conn.appender("_stage_works")?;
+        let mut auth_app = self.conn.appender("_stage_auth")?;
+        let mut topic_app = self.conn.appender("_stage_topic")?;
+        let mut concept_app = self.conn.appender("_stage_concept")?;
+        let mut ref_app = self.conn.appender("_stage_ref")?;
+
         let mut rows = 0u64;
-        let parse_stats = read_partition::<Work, _>(partition_dir, |w| {
-            insert_work(
-                &mut stmt_works,
-                &mut stmt_auth,
-                &mut stmt_topic,
-                &mut stmt_concept,
-                &mut stmt_ref,
+        let stats = crate::reader::read_jsonl_file::<Work, _>(file, &mut |w| {
+            stage_work(
+                &mut works_app,
+                &mut auth_app,
+                &mut topic_app,
+                &mut concept_app,
+                &mut ref_app,
                 &w,
             );
             rows += 1;
         })?;
 
-        Ok((rows, parse_stats.parse_errors))
+        // Drop appenders so they flush before the merge.
+        drop(ref_app);
+        drop(concept_app);
+        drop(topic_app);
+        drop(auth_app);
+        drop(works_app);
+
+        // Bulk merge into live tables. DuckDB optimizes ON CONFLICT
+        // bulk-INSERT into a single hash-anti-join → no per-row overhead.
+        self.conn.execute_batch(
+            "INSERT INTO works
+               SELECT * FROM _stage_works
+               ON CONFLICT (openalex_id) DO NOTHING;
+             INSERT INTO work_authorships
+               SELECT * FROM _stage_auth;
+             INSERT INTO work_topics
+               SELECT * FROM _stage_topic
+               ON CONFLICT (work_id, topic_id) DO NOTHING;
+             INSERT INTO work_concepts
+               SELECT * FROM _stage_concept
+               ON CONFLICT (work_id, concept_id) DO NOTHING;
+             INSERT INTO work_references
+               SELECT * FROM _stage_ref
+               ON CONFLICT (work_id, referenced_work_id) DO NOTHING;
+             DROP TABLE _stage_works;
+             DROP TABLE _stage_auth;
+             DROP TABLE _stage_topic;
+             DROP TABLE _stage_concept;
+             DROP TABLE _stage_ref;",
+        )?;
+
+        Ok((rows, stats.parse_errors))
     }
 
     pub fn load_works(&self, snapshot_root: &Path) -> Result<EntityStats> {
@@ -267,7 +332,17 @@ impl OpenAlexDb {
         let partitions = list_partitions(&works_dir)?;
         let mut total = EntityStats::default();
         for part in partitions {
-            let s = self.load_works_partition(&part)?;
+            let s = match self.load_works_partition(&part) {
+                Ok(s) => s,
+                Err(e) => {
+                    let pname = part.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    tracing::error!(partition = %pname, error = %e, "partition failed; skipping");
+                    eprintln!("  ✗ partition {pname} failed: {e}");
+                    // Best-effort rollback in case the inner path didn't.
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    continue;
+                }
+            };
             total.partitions_loaded += s.partitions_loaded;
             total.skipped_partitions += s.skipped_partitions;
             total.rows_inserted += s.rows_inserted;
@@ -381,16 +456,15 @@ fn append_author(app: &mut duckdb::Appender, a: &Author) -> Result<()> {
     Ok(())
 }
 
-/// Insert one Work and its edges via prepared statements with ON CONFLICT
-/// handling. Errors on individual rows are swallowed silently — the catalog
-/// is read-only ground truth and most failures here are cross-partition
-/// duplicates we deliberately want to skip.
-fn insert_work(
-    stmt_works: &mut duckdb::Statement,
-    stmt_auth: &mut duckdb::Statement,
-    stmt_topic: &mut duckdb::Statement,
-    stmt_concept: &mut duckdb::Statement,
-    stmt_ref: &mut duckdb::Statement,
+/// Append one Work and its edges to the per-file staging tables. Uses
+/// Appender (fastest path), and the staging tables have no PK / NOT NULL so
+/// nothing fails per row. Conflict handling happens during the bulk merge.
+fn stage_work(
+    works_app: &mut duckdb::Appender,
+    auth_app: &mut duckdb::Appender,
+    topic_app: &mut duckdb::Appender,
+    concept_app: &mut duckdb::Appender,
+    ref_app: &mut duckdb::Appender,
     w: &Work,
 ) {
     let work_id = strip_openalex_id(&w.id).to_string();
@@ -409,7 +483,7 @@ fn insert_work(
     let oa_url = w.open_access.as_ref().and_then(|o| o.oa_url.clone());
     let is_oa = w.open_access.as_ref().and_then(|o| o.is_oa);
 
-    let _ = stmt_works.execute(params![
+    let _ = works_app.append_row(params![
         work_id,
         doi,
         title,
@@ -436,7 +510,7 @@ fn insert_work(
             .unwrap_or_else(|| format!("p{}", idx));
         let raw_aff = a.raw_affiliation_strings.first().cloned();
         if a.institutions.is_empty() {
-            let _ = stmt_auth.execute(params![
+            let _ = auth_app.append_row(params![
                 work_id,
                 author_id,
                 pos,
@@ -449,22 +523,22 @@ fn insert_work(
                     .id
                     .as_deref()
                     .map(|id| strip_openalex_id(id).to_string());
-                let _ = stmt_auth.execute(params![work_id, author_id, pos, raw_aff, inst_id]);
+                let _ = auth_app.append_row(params![work_id, author_id, pos, raw_aff, inst_id]);
             }
         }
     }
 
     for t in &w.topics {
         let tid = strip_openalex_id(&t.id).to_string();
-        let _ = stmt_topic.execute(params![work_id, tid, t.score]);
+        let _ = topic_app.append_row(params![work_id, tid, t.score]);
     }
     for c in &w.concepts {
         let cid = strip_openalex_id(&c.id).to_string();
-        let _ = stmt_concept.execute(params![work_id, cid, c.score]);
+        let _ = concept_app.append_row(params![work_id, cid, c.score]);
     }
     for r in &w.referenced_works {
         let rid = strip_openalex_id(r).to_string();
-        let _ = stmt_ref.execute(params![work_id, rid]);
+        let _ = ref_app.append_row(params![work_id, rid]);
     }
 }
 
