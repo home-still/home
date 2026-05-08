@@ -439,7 +439,7 @@ fn collect_rows_json(
     let mut rows = stmt.query(params).map_err(|e| format!("query: {e}"))?;
     let cols: Vec<String> = rows
         .as_ref()
-        .map(|s| s.column_names().into_iter().map(String::from).collect())
+        .map(|s| s.column_names().into_iter().collect())
         .unwrap_or_default();
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(|e| format!("next: {e}"))? {
@@ -3003,7 +3003,7 @@ impl HomeStillMcp {
                     .map_err(|e| format!("query: {e}"))?;
                 let cols: Vec<String> = rows
                     .as_ref()
-                    .map(|s| s.column_names().into_iter().map(String::from).collect())
+                    .map(|s| s.column_names().into_iter().collect())
                     .unwrap_or_default();
                 if let Some(row) = rows.next().map_err(|e| format!("next: {e}"))? {
                     Some(row_to_json(row, &cols)?)

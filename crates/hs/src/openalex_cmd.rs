@@ -109,7 +109,7 @@ pub async fn dispatch(cmd: OpenAlexCmd) -> Result<()> {
             // duckdb-rs requires .query() before column metadata is valid.
             let col_names: Vec<String> = rows
                 .as_ref()
-                .map(|s| s.column_names().into_iter().map(String::from).collect())
+                .map(|s| s.column_names().into_iter().collect())
                 .unwrap_or_default();
             let mut count = 0u64;
             while let Some(row) = rows.next()? {
