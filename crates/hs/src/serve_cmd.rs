@@ -54,6 +54,39 @@ pub enum ServeCmd {
         #[arg(long, conflicts_with = "install")]
         uninstall: bool,
     },
+    /// NATS event-watch daemon that converts `papers.ingested` events into
+    /// markdown via the scribe pool. Runs as a user-level service.
+    ScribeWatch {
+        /// Install as a user service (systemd --user on Linux, LaunchAgent on
+        /// macOS) and start it. Runs under the current user — no sudo.
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Stop and remove the user service
+        #[arg(long, conflicts_with = "install")]
+        uninstall: bool,
+    },
+    /// NATS event-watch daemon that indexes `scribe.completed` events into
+    /// Qdrant via the distill server. Runs as a user-level service.
+    DistillWatch {
+        /// Install as a user service and start it
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Stop and remove the user service
+        #[arg(long, conflicts_with = "install")]
+        uninstall: bool,
+    },
+    /// `OLLAMA_NUM_PARALLEL` auto-tuner daemon. Runs as a root-level
+    /// systemd unit (Linux only; macOS is a stub — see
+    /// `hs_scribe::ollama_tuner`). Needs root so it can rewrite the
+    /// `/etc/systemd/system/ollama.service.d/` drop-in.
+    ScribeAutotune {
+        /// Install as a root system service and start it (requires sudo).
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Stop and remove the system service.
+        #[arg(long, conflicts_with = "install")]
+        uninstall: bool,
+    },
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -91,6 +124,39 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
         ServeCmd::Mcp {
             uninstall: true, ..
         } => uninstall_service("mcp", reporter).await,
+        ServeCmd::ScribeWatch { install: true, .. } => {
+            install_user_service(
+                "scribe-watch-events",
+                &["scribe", "watch-events"],
+                "Home-Still scribe event-watch daemon (NATS papers.ingested → scribe pool)",
+                reporter,
+            )
+            .await
+        }
+        ServeCmd::DistillWatch { install: true, .. } => {
+            install_user_service(
+                "distill-watch-events",
+                &["distill", "watch-events"],
+                "Home-Still distill event-watch daemon (NATS scribe.completed → distill index)",
+                reporter,
+            )
+            .await
+        }
+        ServeCmd::ScribeWatch {
+            uninstall: true, ..
+        } => uninstall_user_service("scribe-watch-events", reporter).await,
+        ServeCmd::DistillWatch {
+            uninstall: true, ..
+        } => uninstall_user_service("distill-watch-events", reporter).await,
+        ServeCmd::ScribeAutotune { install: true, .. } => install_autotune_service(reporter).await,
+        ServeCmd::ScribeAutotune {
+            uninstall: true, ..
+        } => uninstall_service("scribe-autotune", reporter).await,
+        ServeCmd::ScribeWatch { .. } => serve_scribe_watch(reporter).await,
+        ServeCmd::DistillWatch { .. } => serve_distill_watch(reporter).await,
+        ServeCmd::ScribeAutotune { .. } => {
+            crate::scribe_cmd::dispatch(crate::scribe_cmd::ScribeCmd::Autotune, reporter).await
+        }
 
         // -- start / stop (background) --
         ServeCmd::Scribe {
@@ -139,10 +205,6 @@ async fn serve_scribe(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     reporter.status("Serve", &format!("scribe on port {port}"));
-
-    // Auto-init (idempotent — skips already-present steps)
-    reporter.status("Init", "checking scribe prerequisites");
-    super::scribe_cmd::ensure_init(false).await?;
 
     // Register with gateway (best-effort); auto-deregisters on drop
     let my_url = format!("http://{}:{port}", local_ip_hint());
@@ -230,6 +292,241 @@ async fn serve_mcp(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
 
     reporter.finish("mcp server stopped");
     Ok(())
+}
+
+// ── Watchers (user-level services) ──────────────────────────────
+
+async fn serve_scribe_watch(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    reporter.status("Serve", "scribe watch-events");
+    crate::scribe_cmd::cmd_watch_events(None, reporter).await
+}
+
+async fn serve_distill_watch(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    reporter.status("Serve", "distill watch-events");
+    crate::distill_cmd::cmd_watch_events(None, reporter).await
+}
+
+/// Install a user-level systemd unit (Linux) or LaunchAgent (macOS) that
+/// runs `hs <exec_args...>` under the invoking user. Used for the event-
+/// watch daemons — they need the user's NATS creds and S3 secrets, so a
+/// root-owned system unit isn't appropriate.
+async fn install_user_service(
+    service_name: &str,
+    exec_args: &[&str],
+    description: &str,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (service_name, exec_args, description, reporter);
+        anyhow::bail!("--install is only supported on Linux and macOS");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
+        let hs_path = hs_bin.display().to_string();
+        let home_dir =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+        let secrets_path = home_dir.join(".home-still").join("secrets.env");
+
+        #[cfg(target_os = "linux")]
+        {
+            let unit_dir = home_dir.join(".config/systemd/user");
+            std::fs::create_dir_all(&unit_dir)?;
+            let unit_path = unit_dir.join(format!("hs-{service_name}.service"));
+
+            let env_file_line = if secrets_path.exists() {
+                format!("EnvironmentFile=-{}\n", secrets_path.display())
+            } else {
+                String::new()
+            };
+            let exec_spaced = exec_args.join(" ");
+            let unit = format!(
+                r#"[Unit]
+Description={description}
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={home}
+{env_file_line}ExecStart={hs_path} {exec_spaced}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"#,
+                home = home_dir.display(),
+            );
+
+            reporter.status("Install", &format!("{}", unit_path.display()));
+            std::fs::write(&unit_path, &unit).context("Failed to write user unit file")?;
+
+            let status = tokio::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status()
+                .await
+                .context("systemctl --user daemon-reload failed")?;
+            if !status.success() {
+                anyhow::bail!("systemctl --user daemon-reload failed");
+            }
+            let full_name = format!("hs-{service_name}.service");
+            let status = tokio::process::Command::new("systemctl")
+                .args(["--user", "enable", "--now", &full_name])
+                .status()
+                .await?;
+            if !status.success() {
+                anyhow::bail!("systemctl --user enable --now {full_name} failed");
+            }
+
+            reporter.finish(&format!(
+                "Installed and started {full_name}\n\
+             View logs: journalctl --user -u {full_name} -f\n\
+             Stop:      systemctl --user stop {full_name}\n\
+             Disable:   systemctl --user disable {full_name}"
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = description;
+            let label = format!("com.home-still.{service_name}");
+            let plist_dir = home_dir.join("Library/LaunchAgents");
+            std::fs::create_dir_all(&plist_dir)?;
+            let plist_path = plist_dir.join(format!("{label}.plist"));
+
+            let exec_joined = exec_args
+                .iter()
+                .map(|a| format!("<string>{a}</string>"))
+                .collect::<Vec<_>>()
+                .join("\n        ");
+
+            let mut secret_entries = String::new();
+            if let Ok(contents) = std::fs::read_to_string(&secrets_path) {
+                for line in contents.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((k, v)) = line.split_once('=') {
+                        let v = v.trim_matches('"').trim_matches('\'');
+                        secret_entries.push_str(&format!(
+                            "        <key>{k}</key>\n        <string>{v}</string>\n"
+                        ));
+                    }
+                }
+            }
+
+            let plist = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://schemas.apple.com/dtds/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{hs_path}</string>
+        {exec_joined}
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+{secret_entries}    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/hs-{service_name}.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/hs-{service_name}.log</string>
+</dict>
+</plist>
+"#
+            );
+
+            reporter.status("Install", &format!("{}", plist_path.display()));
+            std::fs::write(&plist_path, &plist)?;
+
+            let _ = tokio::process::Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .status()
+                .await;
+            let status = tokio::process::Command::new("launchctl")
+                .args(["load", &plist_path.to_string_lossy()])
+                .status()
+                .await?;
+            if !status.success() {
+                anyhow::bail!("launchctl load failed");
+            }
+
+            reporter.finish(&format!(
+                "Installed and started {label}\n\
+             View logs: tail -f /tmp/hs-{service_name}.log\n\
+             Stop:      launchctl unload {}\n\
+             Remove:    rm {}",
+                plist_path.display(),
+                plist_path.display()
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+async fn uninstall_user_service(service_name: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (service_name, reporter);
+        anyhow::bail!("--uninstall is only supported on Linux and macOS");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let home_dir =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let full_name = format!("hs-{service_name}.service");
+            let unit_path = home_dir.join(".config/systemd/user").join(&full_name);
+            reporter.status("Stop", &full_name);
+            let _ = tokio::process::Command::new("systemctl")
+                .args(["--user", "stop", &full_name])
+                .status()
+                .await;
+            let _ = tokio::process::Command::new("systemctl")
+                .args(["--user", "disable", &full_name])
+                .status()
+                .await;
+            let _ = std::fs::remove_file(&unit_path);
+            let _ = tokio::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status()
+                .await;
+            reporter.finish(&format!("Removed {full_name}"));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let label = format!("com.home-still.{service_name}");
+            let plist_path = home_dir
+                .join("Library/LaunchAgents")
+                .join(format!("{label}.plist"));
+            reporter.status("Unload", &label);
+            let _ = tokio::process::Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .status()
+                .await;
+            let _ = std::fs::remove_file(&plist_path);
+            reporter.finish(&format!("Removed {label}"));
+        }
+
+        Ok(())
+    }
 }
 
 // ── Service Installation ───────────────────────────────────────
@@ -427,6 +724,172 @@ WantedBy=multi-user.target
     } // cfg(any(linux, macos))
 }
 
+/// Install the OLLAMA_NUM_PARALLEL auto-tuner as a root-level systemd
+/// service. Root is required because the tuner rewrites the Ollama
+/// drop-in under `/etc/systemd/system/ollama.service.d/` and calls
+/// `systemctl restart ollama` each tick. macOS is not yet supported —
+/// the inner `apply_num_parallel` returns Err on that platform.
+async fn install_autotune_service(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return install_autotune_service_macos(reporter).await;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = reporter;
+        anyhow::bail!("scribe-autotune is only supported on Linux and macOS");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
+        let hs_path = hs_bin.display();
+        let service_name = "hs-serve-scribe-autotune";
+        let unit_path = format!("/etc/systemd/system/{service_name}.service");
+        let unit = format!(
+            r#"[Unit]
+Description=Home-Still OLLAMA_NUM_PARALLEL auto-tuner
+After=network.target ollama.service hs-serve-scribe.service
+Wants=ollama.service hs-serve-scribe.service
+
+[Service]
+Type=simple
+User=root
+Environment=RUST_LOG=info
+ExecStart={hs_path} scribe autotune
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+"#
+        );
+        reporter.status("Install", &format!("writing {unit_path}"));
+        let tmp = format!("/tmp/{service_name}.service");
+        std::fs::write(&tmp, &unit).context("Failed to write temp unit file")?;
+        let status = tokio::process::Command::new("sudo")
+            .args(["cp", &tmp, &unit_path])
+            .status()
+            .await
+            .context("sudo cp failed")?;
+        if !status.success() {
+            anyhow::bail!("Failed to install systemd unit (sudo cp)");
+        }
+        let _ = std::fs::remove_file(&tmp);
+        for args in [
+            &["systemctl", "daemon-reload"][..],
+            &["systemctl", "enable", "--now", service_name][..],
+        ] {
+            let status = tokio::process::Command::new("sudo")
+                .args(args)
+                .status()
+                .await
+                .context("sudo systemctl failed")?;
+            if !status.success() {
+                anyhow::bail!("sudo {} failed", args.join(" "));
+            }
+        }
+        reporter.finish(&format!(
+            "Installed and started {service_name}\n\
+             Logs: sudo journalctl -u {service_name} -f\n\
+             State: /root/.home-still/autotune-state.json (root owns it)\n\
+             Remove: sudo hs serve scribe-autotune --uninstall"
+        ));
+        Ok(())
+    }
+}
+
+/// macOS counterpart to [`install_autotune_service`]. Installs a
+/// user-level LaunchAgent — no sudo. All three macOS Ollama control
+/// variants (Homebrew, Desktop app, custom LaunchAgent) restart Ollama
+/// via `launchctl` under the invoking user's GUI domain, so the
+/// autotuner itself must also run as that user.
+#[cfg(target_os = "macos")]
+async fn install_autotune_service_macos(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
+    let hs_path = hs_bin.display().to_string();
+    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+    let label = "com.home-still.scribe-autotune";
+    let plist_dir = home_dir.join("Library/LaunchAgents");
+    std::fs::create_dir_all(&plist_dir)?;
+    let plist_path = plist_dir.join(format!("{label}.plist"));
+
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://schemas.apple.com/dtds/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{hs_path}</string>
+        <string>scribe</string>
+        <string>autotune</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/hs-scribe-autotune.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/hs-scribe-autotune.log</string>
+</dict>
+</plist>
+"#
+    );
+
+    reporter.status("Install", &format!("{}", plist_path.display()));
+    std::fs::write(&plist_path, &plist)?;
+
+    // Bootout+bootstrap: load in the GUI user domain and start.
+    // Use the target name (`gui/<uid>/<label>`) for bootout so a
+    // re-install is idempotent. Ignore bootout exit status — missing
+    // is fine on a fresh install.
+    let uid_out = tokio::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .await
+        .context("id -u")?;
+    let uid = String::from_utf8(uid_out.stdout)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| anyhow::anyhow!("could not read uid from `id -u`"))?;
+    let domain = format!("gui/{uid}");
+    let _ = tokio::process::Command::new("launchctl")
+        .args(["bootout", &format!("{domain}/{label}")])
+        .status()
+        .await;
+    let status = tokio::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, plist_path.to_string_lossy().as_ref()])
+        .status()
+        .await
+        .context("launchctl bootstrap failed")?;
+    if !status.success() {
+        anyhow::bail!(
+            "launchctl bootstrap {domain} {} failed",
+            plist_path.display()
+        );
+    }
+
+    reporter.finish(&format!(
+        "Installed and started {label}\n\
+         Logs: tail -f /tmp/hs-scribe-autotune.log\n\
+         State: ~/.home-still/autotune-state.json\n\
+         Remove: hs serve scribe-autotune --uninstall\n\n\
+         Heads up — the autotuner restarts local Ollama on each step,\n\
+         causing ~30-60s VLM outages during its 10-30 minute cycles."
+    ));
+    Ok(())
+}
+
 async fn uninstall_service(service_type: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -516,15 +979,20 @@ fn check_system_service_conflict(service_type: &str) -> Result<()> {
             .output()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // launchctl list format: "PID\tStatus\tLabel"
-            // If PID is "-", the service is registered but not running.
-            // If PID matches our own, we ARE the launchd child — don't block ourselves.
+            // launchctl list format: "PID\tStatus\tLabel". Match the label
+            // column exactly — not as a substring — otherwise
+            // `com.home-still.scribe` false-positives on the separately
+            // managed `com.home-still.scribe-autotune` and the scribe
+            // wrapper refuses to start.
             let my_pid = std::process::id().to_string();
             for line in stdout.lines() {
-                if !line.contains(&label) {
+                let mut fields = line.split('\t');
+                let pid_field = fields.next().unwrap_or("-");
+                let _status = fields.next();
+                let label_field = fields.next().unwrap_or("");
+                if label_field != label {
                     continue;
                 }
-                let pid_field = line.split('\t').next().unwrap_or("-");
                 if pid_field == "-" || pid_field == my_pid {
                     // Not running, or we are the service — no conflict
                     continue;
@@ -606,10 +1074,15 @@ impl RegistryGuard {
         };
 
         // Shared HTTP client for register, heartbeats, and deregister
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let http = match hs_common::http::http_client(std::time::Duration::from_secs(10)) {
+            Ok(c) => c,
+            Err(e) => {
+                reporter.warn(&format!(
+                    "gateway registration skipped: HTTP client build failed: {e}"
+                ));
+                return None;
+            }
+        };
 
         // Register
         let body = serde_json::json!({

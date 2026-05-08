@@ -1,3 +1,4 @@
+pub mod column_detect;
 pub mod markdown_generator;
 pub mod pdf_parser;
 pub mod processor;

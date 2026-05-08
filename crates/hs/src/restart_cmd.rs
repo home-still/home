@@ -7,9 +7,8 @@ use hs_common::reporter::Reporter;
 ///
 /// Detects what's running and restarts each:
 /// 1. System services (systemd/launchd) — scribe, distill, mcp
-/// 2. Scribe watch daemon (PID-tracked)
-/// 3. Distill index daemon (PID-tracked)
-/// 4. Docker compose containers (Ollama, Qdrant)
+/// 2. Distill index daemon (PID-tracked)
+/// 3. Docker compose containers (Ollama, Qdrant)
 pub async fn run(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let mut restarted = 0u32;
 
@@ -20,17 +19,12 @@ pub async fn run(reporter: &Arc<dyn Reporter>) -> Result<()> {
         }
     }
 
-    // 2. Scribe watch daemon
-    if restart_scribe_watcher(reporter)? {
-        restarted += 1;
-    }
-
-    // 3. Distill index daemon
+    // 2. Distill index daemon
     if restart_index_daemon(reporter).await? {
         restarted += 1;
     }
 
-    // 4. Docker compose services
+    // 3. Docker compose services
     restarted += restart_compose_services(reporter).await?;
 
     if restarted == 0 {
@@ -106,38 +100,6 @@ async fn restart_system_service(service_type: &str, reporter: &Arc<dyn Reporter>
     let _ = (service_type, reporter);
 
     Ok(false)
-}
-
-// ── Scribe watch daemon ────────────────────────────────────────
-
-fn restart_scribe_watcher(reporter: &Arc<dyn Reporter>) -> Result<bool> {
-    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
-    let watch_dir = &scribe_cfg.watch_dir;
-
-    // Check if watcher is running
-    let pid_path = crate::daemon::pid_file_path(watch_dir);
-    let pid = crate::daemon::read_pid(&pid_path);
-
-    match pid {
-        Some(pid) if crate::daemon::is_process_alive(pid) => {
-            reporter.status("Restart", &format!("scribe watcher (PID {pid})"));
-            crate::daemon::stop_daemon(watch_dir)?;
-            crate::daemon::spawn_daemon(None, None, None)?;
-            reporter.status("OK", "scribe watcher restarted");
-            Ok(true)
-        }
-        _ => {
-            // Watcher is dead — start it if there's a watch directory configured
-            if watch_dir.exists() {
-                reporter.status("Start", "scribe watcher (was stopped)");
-                crate::daemon::spawn_daemon(None, None, None)?;
-                reporter.status("OK", "scribe watcher started");
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        }
-    }
 }
 
 // ── Distill index daemon ───────────────────────────────────────

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use hs_common::service::pool::ServicePool;
-use hs_scribe::client::{ProgressEvent, ScribeClient};
+use hs_scribe::client::{ConversionResult, ProgressEvent, ScribeClient};
 use std::time::Duration;
 
 pub struct ScribePool {
@@ -11,33 +11,28 @@ impl ScribePool {
     /// Build a pool whose `ScribeClient`s carry the given convert-request
     /// timeout. The timeout caps each PDF conversion so a stuck backend
     /// (e.g. Ollama hang) can't pin dispatchers indefinitely.
-    pub fn new(servers: &[String], convert_timeout: Duration) -> Self {
+    pub fn new(servers: &[String], convert_timeout: Duration) -> Result<Self> {
         let clients: Vec<ScribeClient> = servers
             .iter()
             .map(|url| ScribeClient::new_with_timeout(url, convert_timeout))
-            .collect();
-        Self {
+            .collect::<Result<_>>()?;
+        Ok(Self {
             inner: ServicePool::new(clients),
-        }
-    }
-
-    /// Number of concurrent conversions to allow (2 per server).
-    pub fn concurrency(&self) -> usize {
-        self.inner.concurrency()
+        })
     }
 
     /// Convert one PDF via the best available server.
     /// Caller is responsible for limiting concurrency (e.g. via a semaphore).
-    /// Returns (server_url, markdown) on success.
+    /// Returns `(server_url, ConversionResult)` on success.
     pub async fn convert_one(
         &self,
         pdf_bytes: Vec<u8>,
         on_progress: impl Fn(ProgressEvent) + Send + Sync + 'static,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, ConversionResult)> {
         let mut last_err = None;
         for attempt in 0..3 {
             match self.inner.pick_server().await {
-                Ok(client) => {
+                Ok((client, _pick_guard)) => {
                     let url = client.url().to_string();
                     let short = url
                         .strip_prefix("http://")
@@ -49,8 +44,10 @@ impl ScribePool {
                         total_pages: 0,
                         message: format!("→ {short}"),
                     });
-                    let md = client.convert_with_progress(pdf_bytes, on_progress).await?;
-                    return Ok((url, md));
+                    let result = client
+                        .convert_with_progress(pdf_bytes, None, None, on_progress)
+                        .await?;
+                    return Ok((url, result));
                 }
                 Err(e) => {
                     last_err = Some(e);

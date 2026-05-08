@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -8,6 +8,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
+use hs_common::global_args::{GlobalArgs, OutputFormat};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
 
@@ -18,12 +19,21 @@ struct DashboardData {
     doc_counts: Option<(u64, u64)>,
     markdown_counts: Option<(u64, u64)>,
     catalog_count: Option<u64>,
-    /// Catalog rows with `conversion.failed == true` — accounts for the
-    /// Documents − Markdown gap so the pipeline math reconciles on screen.
-    failed_count: Option<u64>,
     corrupted_count: Option<u64>,
     embedded_docs: u64,
     embedded_chunks: u64,
+    /// Catalog rows stamped `embedding_skip` (zero-chunk / junk-HTML).
+    /// Excluded from the Embedded-% denominator so the bar reflects
+    /// embeddable docs, not intentional skips.
+    embedding_skipped: u64,
+    /// Files sitting in `papers/manually_downloaded/` waiting for the
+    /// next sweep. `None` on the loading frame before the first snapshot
+    /// arrives; `Some(0)` once a real snapshot confirms empty.
+    inbox_pending: Option<u64>,
+    /// Sum of `in_flight` across all scribes. Rendered as the `In-flight`
+    /// row so a busy pool is visible in the Pipeline panel, not just in
+    /// per-scribe Services rows.
+    in_flight_conversions: Option<u64>,
 
     scribe_servers: Vec<ServiceStatus>,
     distill_servers: Vec<ServiceStatus>,
@@ -38,26 +48,41 @@ struct DashboardData {
 
     /// True before the first data collection completes.
     loading: bool,
-    /// Per-directory NFS stall flags.
-    fs_stalled_docs: bool,
-    fs_stalled_markdown: bool,
-    fs_stalled_catalog: bool,
 }
 
+/// Status of the inbox-sweeper daemon (`hs scribe inbox` cmd_run). Derived
+/// from a heartbeat the daemon writes each sweep tick to
+/// `hs_common::status::INBOX_HEARTBEAT_KEY`; the MCP server classifies
+/// freshness so every CLI host renders the same verdict.
 enum WatcherInfo {
-    /// Watcher is running (PID alive)
-    Running {
-        processing: u64,
-        queued: u64,
-        completed: u64,
-        failed: u64,
-    },
-    /// PID is dead, exited cleanly (no failures)
-    Finished { completed: u64 },
-    /// PID is dead but had failures — needs attention
-    Failed { completed: u64, failed: u64 },
-    /// No status file, no PID file — watcher never started
     Stopped,
+    Running {
+        host: String,
+        last_tick_seconds_ago: u64,
+        /// Last-completed sweep's relocated count. `None` when the daemon
+        /// has written its boot-time heartbeat but hasn't finished a
+        /// sweep yet, or when upgrading from a pre-rc.301 daemon.
+        last_sweep_relocated: Option<u64>,
+        last_sweep_found: Option<u64>,
+        /// Per-file error count from the most recent sweep. Nonzero
+        /// colors the row yellow in the renderer.
+        last_sweep_errors: Option<u64>,
+    },
+}
+
+impl From<Option<hs_common::status::InboxHeartbeatSnapshot>> for WatcherInfo {
+    fn from(hb: Option<hs_common::status::InboxHeartbeatSnapshot>) -> Self {
+        match hb {
+            Some(hb) if hb.running => WatcherInfo::Running {
+                host: hb.host,
+                last_tick_seconds_ago: hb.last_tick_seconds_ago,
+                last_sweep_relocated: hb.last_sweep_relocated,
+                last_sweep_found: hb.last_sweep_found,
+                last_sweep_errors: hb.last_sweep_errors,
+            },
+            _ => WatcherInfo::Stopped,
+        }
+    }
 }
 
 enum IndexerInfo {
@@ -68,7 +93,6 @@ enum IndexerInfo {
         failed: u64,
         chunks: u64,
         current_file: String,
-        gpu_yield: bool,
     },
     /// Indexer finished all files
     Finished { indexed: u64, chunks: u64 },
@@ -96,66 +120,37 @@ struct HistoryEvent {
 async fn collect_data() -> DashboardData {
     // Single source of truth: the MCP gateway's `system_status` tool, whose
     // counts come from the Storage trait and therefore work for both LocalFs
-    // and S3/Garage backends. The previous filesystem-count path only worked
-    // on nodes where the storage backend happened to be LocalFs at the
-    // configured paths, producing bogus zeros on S3-backed deployments. On
-    // MCP failure we return a blank dashboard with watcher/indexer still
-    // read locally — zeros are accurate ("we don't know yet") rather than
-    // confidently wrong.
+    // and S3/Garage backends. On MCP failure we return a blank dashboard —
+    // zeros are accurate ("we don't know yet") rather than confidently wrong.
     match collect_data_via_mcp().await {
         Ok(data) => data,
-        Err(_) => {
-            let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
-            let (watcher, indexer) = read_local_daemon_state(&scribe_cfg).await;
-            DashboardData {
-                doc_counts: None,
-                markdown_counts: None,
-                catalog_count: None,
-                failed_count: None,
-                corrupted_count: None,
-                embedded_docs: 0,
-                embedded_chunks: 0,
-                scribe_servers: Vec::new(),
-                distill_servers: Vec::new(),
-                qdrant_healthy: false,
-                qdrant_url: String::new(),
-                qdrant_version: String::new(),
-                watcher,
-                indexer,
-                history: Vec::new(),
-                loading: false,
-                fs_stalled_docs: false,
-                fs_stalled_markdown: false,
-                fs_stalled_catalog: false,
-            }
-        }
+        Err(_) => DashboardData {
+            doc_counts: None,
+            markdown_counts: None,
+            catalog_count: None,
+            corrupted_count: None,
+            embedded_docs: 0,
+            embedded_chunks: 0,
+            embedding_skipped: 0,
+            inbox_pending: None,
+            in_flight_conversions: None,
+            scribe_servers: Vec::new(),
+            distill_servers: Vec::new(),
+            qdrant_healthy: false,
+            qdrant_url: String::new(),
+            qdrant_version: String::new(),
+            watcher: WatcherInfo::Stopped,
+            indexer: read_indexer_status(),
+            history: Vec::new(),
+            loading: false,
+        },
     }
-}
-
-/// Read the two local daemon-state signals (watcher + indexer). Both read
-/// local status files that have no relationship to the storage backend, so
-/// they remain useful even when pipeline counts come exclusively from MCP.
-/// Returns `(Stopped, Stopped)` if the configured dirs don't exist — the
-/// `read_*` helpers already handle missing files gracefully.
-async fn read_local_daemon_state(
-    scribe_cfg: &hs_scribe::config::ScribeConfig,
-) -> (WatcherInfo, IndexerInfo) {
-    let output_dir = scribe_cfg.output_dir.clone();
-    let watch_dir = scribe_cfg.watch_dir.clone();
-    let fs_task = tokio::task::spawn_blocking(move || read_watcher_status(&output_dir, &watch_dir));
-    let watcher = match tokio::time::timeout(Duration::from_secs(20), fs_task).await {
-        Ok(Ok(w)) => w,
-        _ => WatcherInfo::Stopped,
-    };
-    let indexer = read_indexer_status();
-    (watcher, indexer)
 }
 
 /// Populate the dashboard from the MCP `system_status` tool — the single
 /// source of truth for pipeline counts and service health. Byte counts stay
-/// at 0 (system_status reports object counts, not sizes). Watcher / indexer
-/// rows are filled in from local daemon status files, which reflect the host
-/// the CLI is running on, not the remote gateway.
+/// at 0 (system_status reports object counts, not sizes). The `indexer` row
+/// reflects the distill-index daemon on the CLI host, not the remote gateway.
 async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
     use serde_json::Value;
 
@@ -165,12 +160,8 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
         .await?;
     let snap: hs_common::status::StatusSnapshot = serde_json::from_value(status_json)?;
 
-    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
-    let (watcher, indexer) = read_local_daemon_state(&scribe_cfg).await;
-
     let mut data = snapshot_to_dashboard(snap);
-    data.watcher = watcher;
-    data.indexer = indexer;
+    data.indexer = read_indexer_status();
     Ok(data)
 }
 
@@ -244,22 +235,21 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         doc_counts: Some((snap.pipeline.documents, 0)),
         markdown_counts: Some((snap.pipeline.markdown, 0)),
         catalog_count: Some(snap.pipeline.catalog_entries),
-        failed_count: Some(snap.pipeline.conversion_failed),
-        corrupted_count: None,
+        corrupted_count: snap.pipeline.corrupted_pdfs,
         embedded_docs: snap.pipeline.embedded_documents.unwrap_or(0),
         embedded_chunks: snap.pipeline.embedded_chunks.unwrap_or(0),
+        embedding_skipped: snap.pipeline.embedding_skipped.unwrap_or(0),
+        inbox_pending: snap.pipeline.inbox_pending,
+        in_flight_conversions: snap.pipeline.in_flight_conversions,
         scribe_servers,
         distill_servers,
         qdrant_healthy,
         qdrant_url,
         qdrant_version,
-        watcher: WatcherInfo::Stopped,
+        watcher: WatcherInfo::from(snap.inbox_heartbeat),
         indexer: IndexerInfo::Stopped,
         history,
         loading: false,
-        fs_stalled_docs: false,
-        fs_stalled_markdown: false,
-        fs_stalled_catalog: false,
     }
 }
 
@@ -276,63 +266,6 @@ fn instance_to_status(inst: &hs_common::status::ServiceInstance) -> ServiceStatu
         activity: inst.activity.clone(),
         version: inst.version.clone(),
     }
-}
-
-fn read_watcher_status(output_dir: &Path, watch_dir: &Path) -> WatcherInfo {
-    let status_path = output_dir.join(".scribe-watch-status.json");
-
-    // The watcher writes its status file every ~2s while running. A recent
-    // mtime is a cross-host liveness signal — PID checks only work when the
-    // dashboard and watcher run on the same machine.
-    let status_is_fresh = std::fs::metadata(&status_path)
-        .and_then(|m| m.modified())
-        .map(|t| {
-            std::time::SystemTime::now()
-                .duration_since(t)
-                .map(|d| d.as_secs() < 30)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-
-    if let Ok(contents) = std::fs::read_to_string(&status_path) {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&contents) {
-            let pid = data["pid"].as_u64().unwrap_or(0) as u32;
-            let processing = data["processing"].as_u64().unwrap_or(0);
-            let queued = data["queued"].as_u64().unwrap_or(0);
-            let completed = data["completed"].as_u64().unwrap_or(0);
-            let failed = data["failed"].as_u64().unwrap_or(0);
-
-            // Alive if the status file was touched recently OR the pid is local and alive
-            let is_alive = status_is_fresh || (pid > 0 && crate::daemon::is_process_alive(pid));
-            if is_alive {
-                return WatcherInfo::Running {
-                    processing,
-                    queued,
-                    completed,
-                    failed,
-                };
-            } else if failed > 0 {
-                return WatcherInfo::Failed { completed, failed };
-            } else {
-                return WatcherInfo::Finished { completed };
-            }
-        }
-    }
-
-    // No status file — check PID file (local-only fallback)
-    let pid_path = crate::daemon::pid_file_path(watch_dir);
-    if let Some(pid) = crate::daemon::read_pid(&pid_path) {
-        if crate::daemon::is_process_alive(pid) {
-            return WatcherInfo::Running {
-                processing: 0,
-                queued: 0,
-                completed: 0,
-                failed: 0,
-            };
-        }
-    }
-
-    WatcherInfo::Stopped
 }
 
 fn read_indexer_status() -> IndexerInfo {
@@ -380,7 +313,6 @@ fn read_indexer_status() -> IndexerInfo {
         failed: status.failed as u64,
         chunks: status.total_chunks as u64,
         current_file: status.current_file,
-        gpu_yield: status.gpu_yield,
     }
 }
 
@@ -416,9 +348,9 @@ fn fmt_ago(dt: &chrono::DateTime<chrono::Utc>) -> String {
 
 fn render(frame: &mut Frame, data: &DashboardData) {
     let outer = Layout::vertical([
-        Constraint::Length(1), // title
-        Constraint::Length(9), // pipeline (includes watcher row)
-        Constraint::Length(1), // spacer
+        Constraint::Length(1),  // title
+        Constraint::Length(11), // pipeline (Documents/Markdown/Cataloged/Embedded/In-flight/Inbox/Corrupted/Watcher/Indexer + header + padding)
+        Constraint::Length(1),  // spacer
         Constraint::Length((data.scribe_servers.len() + data.distill_servers.len() + 3) as u16), // services
         Constraint::Length(1), // spacer
         Constraint::Min(4),    // recent
@@ -455,14 +387,8 @@ fn render(frame: &mut Frame, data: &DashboardData) {
 }
 
 fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
-    let any_stall = data.fs_stalled_docs || data.fs_stalled_markdown || data.fs_stalled_catalog;
-    let title = if any_stall {
-        Line::from(vec![" Pipeline ".into(), "· NFS stall ".fg(Color::Red)])
-    } else {
-        Line::from(" Pipeline ")
-    };
     let block = Block::new()
-        .title(title)
+        .title(Line::from(" Pipeline "))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .padding(Padding::horizontal(1));
@@ -479,13 +405,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let markdown_count = data.markdown_counts.map(|(c, _)| c).unwrap_or(0);
     let markdown_bytes = data.markdown_counts.map(|(_, b)| b).unwrap_or(0);
     let catalog_count = data.catalog_count.unwrap_or(0);
-    let failed_count = data.failed_count.unwrap_or(0);
     let corrupted_count = data.corrupted_count.unwrap_or(0);
-    let failed_pct = if doc_count > 0 {
-        (failed_count as f64 / doc_count as f64).min(1.0)
-    } else {
-        0.0
-    };
 
     let convertible = doc_count.saturating_sub(corrupted_count);
     let pdf_to_md = if convertible > 0 {
@@ -493,39 +413,23 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     } else {
         0.0
     };
-    let md_to_embed = if markdown_count > 0 {
-        (data.embedded_docs as f64 / markdown_count as f64).min(1.0)
+    // Progress = embedded / embeddable, where embeddable excludes rows
+    // stamped `embedding_skip` (zero-chunk HTML stubs etc.). Those docs
+    // count toward markdown but will never be embedded, so including
+    // them in the denominator makes the bar permanently under 100%.
+    let embeddable = markdown_count.saturating_sub(data.embedding_skipped);
+    let md_to_embed = if embeddable > 0 {
+        (data.embedded_docs as f64 / embeddable as f64).min(1.0)
     } else {
         0.0
     };
 
-    // Helper: show "Scanning..." when None, count when Some, "NFS stall" suffix when stalled
+    // Helper: show "Scanning..." when None, count when Some.
     let scanning = "  ...".to_string();
-    let stall_style = Style::default().fg(Color::Yellow);
-
-    let doc_label = if data.fs_stalled_docs {
-        "Documents (stall)"
-    } else {
-        "Documents"
-    };
-    let md_label = if data.fs_stalled_markdown {
-        "Markdown (stall)"
-    } else {
-        "Markdown"
-    };
-    let cat_label = if data.fs_stalled_catalog {
-        "Cataloged (stall)"
-    } else {
-        "Cataloged"
-    };
 
     let rows = vec![
         Row::new(vec![
-            Cell::from(doc_label).style(if data.fs_stalled_docs {
-                stall_style
-            } else {
-                Style::default()
-            }),
+            Cell::from("Documents"),
             Cell::from(if data.doc_counts.is_some() {
                 format!("{:>6}", doc_count)
             } else {
@@ -539,11 +443,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Cell::from(""),
         ]),
         Row::new(vec![
-            Cell::from(md_label).style(if data.fs_stalled_markdown {
-                stall_style
-            } else {
-                Style::default()
-            }),
+            Cell::from("Markdown"),
             Cell::from(if data.markdown_counts.is_some() {
                 format!("{:>6}", markdown_count)
             } else {
@@ -561,26 +461,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
             }),
         ]),
         Row::new(vec![
-            Cell::from("Failed").style(Style::default().fg(Color::Yellow)),
-            Cell::from(if data.failed_count.is_some() {
-                format!("{:>6}", failed_count)
-            } else {
-                scanning.clone()
-            })
-            .style(Style::default().fg(Color::Yellow)),
-            Cell::from(""),
-            Cell::from(if data.failed_count.is_some() {
-                format!("{:>5.1}%", failed_pct * 100.0)
-            } else {
-                String::new()
-            }),
-        ]),
-        Row::new(vec![
-            Cell::from(cat_label).style(if data.fs_stalled_catalog {
-                stall_style
-            } else {
-                Style::default()
-            }),
+            Cell::from("Cataloged"),
             Cell::from(if data.catalog_count.is_some() {
                 format!("{:>6}", catalog_count)
             } else {
@@ -596,8 +477,57 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
             } else {
                 Style::default()
             }),
-            Cell::from(format!("{:>5} chunks", data.embedded_chunks)),
+            Cell::from(if data.embedding_skipped > 0 {
+                format!(
+                    "{:>5} chunks · {} skipped",
+                    data.embedded_chunks, data.embedding_skipped
+                )
+            } else {
+                format!("{:>5} chunks", data.embedded_chunks)
+            }),
             Cell::from(format!("{:>5.1}%", md_to_embed * 100.0)),
+        ]),
+        Row::new(vec![
+            Cell::from("In-flight"),
+            Cell::from(match data.in_flight_conversions {
+                Some(n) => format!("{n:>6}"),
+                None => scanning.clone(),
+            })
+            .style(match data.in_flight_conversions {
+                Some(n) if n > 0 => Style::default().fg(Color::Green),
+                _ => Style::default().fg(Color::DarkGray),
+            }),
+            Cell::from(match data.in_flight_conversions {
+                Some(n) if n > 0 => format!(
+                    "converting across {} scribe{}",
+                    data.scribe_servers.len(),
+                    if data.scribe_servers.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                Some(_) => "idle".to_string(),
+                None => String::new(),
+            }),
+            Cell::from(""),
+        ]),
+        Row::new(vec![
+            Cell::from("Inbox"),
+            Cell::from(match data.inbox_pending {
+                Some(n) => format!("{n:>6}"),
+                None => scanning.clone(),
+            })
+            .style(match data.inbox_pending {
+                Some(n) if n > 0 => Style::default().fg(Color::Yellow),
+                _ => Style::default().fg(Color::DarkGray),
+            }),
+            Cell::from(match data.inbox_pending {
+                Some(n) if n > 0 => format!("pending in manually_downloaded/ ({n})"),
+                Some(_) => "manually_downloaded/ empty".to_string(),
+                None => String::new(),
+            }),
+            Cell::from(""),
         ]),
         Row::new(vec![
             Cell::from("Corrupted PDFs").style(Style::default().fg(Color::Red)),
@@ -611,51 +541,40 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Cell::from(""),
         ]),
         match &data.watcher {
-            WatcherInfo::Running {
-                processing,
-                queued,
-                completed,
-                failed,
-            } => {
-                let (status_label, status_color) = if *processing > 0 || *queued > 0 {
-                    ("working", Color::Green)
-                } else if *completed > 0 && *failed == 0 {
-                    ("complete", Color::Green)
-                } else if *completed > 0 || *failed > 0 {
-                    ("idle", Color::Green)
-                } else {
-                    ("idle", Color::DarkGray)
-                };
-                let detail = if *processing > 0 || *queued > 0 {
-                    format!("{processing} active, {queued} queued")
-                } else {
-                    format!("{completed} done, {failed} failed")
-                };
-                Row::new(vec![
-                    Cell::from("Watcher").style(Style::default().fg(status_color)),
-                    Cell::from("●".to_string()).style(Style::default().fg(status_color)),
-                    Cell::from(status_label),
-                    Cell::from(detail),
-                ])
-            }
-            WatcherInfo::Finished { completed } => Row::new(vec![
-                Cell::from("Watcher").style(Style::default().fg(Color::Green)),
-                Cell::from("○".to_string()).style(Style::default().fg(Color::Green)),
-                Cell::from("done"),
-                Cell::from(format!("{completed} done")),
-            ]),
-            WatcherInfo::Failed { completed, failed } => Row::new(vec![
-                Cell::from("Watcher").style(Style::default().fg(Color::Red)),
-                Cell::from("○".to_string()).style(Style::default().fg(Color::Red)),
-                Cell::from("failed"),
-                Cell::from(format!("{completed} done, {failed} failed")),
-            ]),
             WatcherInfo::Stopped => Row::new(vec![
                 Cell::from("Watcher").style(Style::default().fg(Color::DarkGray)),
                 Cell::from("○".to_string()).style(Style::default().fg(Color::DarkGray)),
                 Cell::from("stopped"),
                 Cell::from(""),
             ]),
+            WatcherInfo::Running {
+                host,
+                last_tick_seconds_ago,
+                last_sweep_relocated,
+                last_sweep_found,
+                last_sweep_errors,
+            } => {
+                let sweep_frag = match (last_sweep_relocated, last_sweep_found) {
+                    (Some(r), Some(f)) => format!(" · swept {r} / {f}"),
+                    _ => String::new(),
+                };
+                let errs = last_sweep_errors.unwrap_or(0);
+                let color = if errs > 0 {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                };
+                Row::new(vec![
+                    Cell::from("Watcher").style(Style::default().fg(color)),
+                    Cell::from("●".to_string()).style(Style::default().fg(color)),
+                    Cell::from(format!("running · {host}{sweep_frag}")),
+                    Cell::from(if errs > 0 {
+                        format!("last tick {last_tick_seconds_ago}s ago · {errs} err")
+                    } else {
+                        format!("last tick {last_tick_seconds_ago}s ago")
+                    }),
+                ])
+            }
         },
         match &data.indexer {
             IndexerInfo::Running {
@@ -664,13 +583,8 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                 failed,
                 chunks,
                 current_file,
-                gpu_yield,
             } => {
-                let (label, color) = if *gpu_yield {
-                    ("yielding", Color::Yellow)
-                } else {
-                    ("indexing", Color::Green)
-                };
+                let color = Color::Green;
                 let pct = if *total > 0 {
                     (*indexed as f64 / *total as f64 * 100.0) as u64
                 } else {
@@ -681,20 +595,18 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                 } else {
                     current_file.clone()
                 };
-                let detail = if *gpu_yield {
-                    format!("{indexed}/{total} ({pct}%) · GPU yield")
+                let fail_str = if *failed > 0 {
+                    format!(" · {failed} failed")
                 } else {
-                    let fail_str = if *failed > 0 {
-                        format!(" · {failed} failed")
-                    } else {
-                        String::new()
-                    };
-                    format!("{indexed}/{total} ({pct}%) · {chunks} chunks{fail_str} · {file_short}")
+                    String::new()
                 };
+                let detail = format!(
+                    "{indexed}/{total} ({pct}%) · {chunks} chunks{fail_str} · {file_short}"
+                );
                 Row::new(vec![
                     Cell::from("Indexer").style(Style::default().fg(color)),
                     Cell::from("●".to_string()).style(Style::default().fg(color)),
-                    Cell::from(label),
+                    Cell::from("indexing"),
                     Cell::from(detail),
                 ])
             }
@@ -718,8 +630,16 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
         [
             Constraint::Length(16), // Label
             Constraint::Length(8),  // Count
-            Constraint::Length(14), // Size
-            Constraint::Min(8),     // Progress
+            // Detail column: holds byte counts (Documents/Markdown),
+            // "X chunks · Y skipped" (Embedded), "converting across N
+            // scribes" (In-flight), "pending in manually_downloaded/"
+            // (Inbox), and the Watcher "running · host · swept N / M"
+            // string. Widened from 14 → Min(38) because the rc.301
+            // rows overflowed the 14-char slot.
+            Constraint::Min(38),
+            // Trailing column: % for Documents/Markdown/Embedded, or
+            // "last tick Ns ago · K err" for Watcher.
+            Constraint::Min(8),
         ],
     )
     .header(
@@ -830,14 +750,8 @@ fn format_status_activity(healthy: bool, running_label: &str, activity: &str) ->
 }
 
 fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
-    let any_stall = data.fs_stalled_docs || data.fs_stalled_markdown || data.fs_stalled_catalog;
-    let title = if any_stall {
-        Line::from(vec![" History ".into(), "· NFS stall ".fg(Color::Red)])
-    } else {
-        Line::from(" History ")
-    };
     let block = Block::new()
-        .title(title)
+        .title(Line::from(" History "))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .padding(Padding::horizontal(1));
@@ -886,9 +800,107 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
     frame.render_widget(table, inner);
 }
 
+// ── One-shot (non-TUI) renderers ───────────────────────────────
+//
+// `hs status` was TUI-only — `enable_raw_mode()` failed unconditionally on
+// any host that couldn't put stdout into raw mode (macOS terminals where
+// crossterm sees ENXIO, redirected stdout, log scrapers). These two helpers
+// give the same data through a non-TTY path so `hs status --output json` and
+// `hs status > status.txt` work everywhere.
+
+async fn run_oneshot_json() -> Result<()> {
+    use serde_json::Value;
+    let client = crate::mcp_client::McpClient::from_default_creds().await?;
+    let snapshot = client
+        .call_tool("system_status", Value::Object(Default::default()))
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    Ok(())
+}
+
+async fn run_oneshot_text() -> Result<()> {
+    let data = collect_data().await;
+
+    // Pipeline counts
+    println!("Pipeline:");
+    if let Some((docs, _)) = data.doc_counts {
+        println!("  Documents : {docs}");
+    }
+    if let Some((md, _)) = data.markdown_counts {
+        println!("  Markdown  : {md}");
+    }
+    if let Some(cat) = data.catalog_count {
+        println!("  Cataloged : {cat}");
+    }
+    println!(
+        "  Embedded  : {} docs, {} chunks",
+        data.embedded_docs, data.embedded_chunks
+    );
+    if let Some(corrupted) = data.corrupted_count {
+        println!("  Corrupted : {corrupted}");
+    }
+    println!();
+
+    // Services
+    println!("Services:");
+    if data.scribe_servers.is_empty() && data.distill_servers.is_empty() {
+        println!("  (none registered)");
+    }
+    for s in &data.scribe_servers {
+        let dot = if s.healthy { "●" } else { "○" };
+        println!(
+            "  {dot} scribe   {:<35}  {} {}  {}",
+            s.url, s.activity, s.detail, s.version
+        );
+    }
+    for s in &data.distill_servers {
+        let dot = if s.healthy { "●" } else { "○" };
+        println!(
+            "  {dot} distill  {:<35}  {} {}  {}",
+            s.url, s.activity, s.detail, s.version
+        );
+    }
+    let qdot = if data.qdrant_healthy { "●" } else { "○" };
+    println!(
+        "  {qdot} qdrant   {:<35}  {}",
+        data.qdrant_url, data.qdrant_version
+    );
+    println!();
+
+    // Recent history
+    println!("Recent activity:");
+    if data.history.is_empty() {
+        println!("  (none)");
+    }
+    for h in data.history.iter().take(20) {
+        let when = h
+            .when
+            .as_ref()
+            .map(fmt_ago)
+            .unwrap_or_else(|| "—".to_string());
+        println!(
+            "  {:<10} {:<60}  {:<20}  {}",
+            h.activity, h.name, h.detail, when
+        );
+    }
+    Ok(())
+}
+
 // ── Entry point ─────────────────────────────────────────────────
 
-pub async fn run() -> Result<()> {
+pub async fn run(global: &GlobalArgs) -> Result<()> {
+    // Branch on output format + TTY availability so `hs status` works in
+    // contexts that can't enter raw mode: SSH-piped commands, macOS
+    // terminals where crossterm fails with "Device not configured (os
+    // error 6)", redirected stdout, log scrapers calling `--output json`.
+    // The TUI is preserved as the default for interactive terminals.
+    let interactive = io::stdout().is_terminal() && io::stdin().is_terminal();
+    match global.output {
+        OutputFormat::Json | OutputFormat::Ndjson => return run_oneshot_json().await,
+        OutputFormat::Text if !interactive => return run_oneshot_text().await,
+        OutputFormat::Text => {}
+    }
+
     // Install panic hook that restores terminal before printing the panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -925,10 +937,12 @@ pub async fn run() -> Result<()> {
         doc_counts: None,
         markdown_counts: None,
         catalog_count: None,
-        failed_count: None,
         corrupted_count: None,
         embedded_docs: 0,
         embedded_chunks: 0,
+        embedding_skipped: 0,
+        inbox_pending: None,
+        in_flight_conversions: None,
         scribe_servers: vec![],
         distill_servers: vec![],
         qdrant_healthy: false,
@@ -938,9 +952,6 @@ pub async fn run() -> Result<()> {
         indexer: IndexerInfo::Stopped,
         history: vec![],
         loading: true,
-        fs_stalled_docs: false,
-        fs_stalled_markdown: false,
-        fs_stalled_catalog: false,
     };
 
     let mut collect_task: Option<tokio::task::JoinHandle<DashboardData>> = None;
@@ -958,15 +969,15 @@ pub async fn run() -> Result<()> {
                 if let Some(task) = collect_task.take() {
                     if let Ok(new_data) = task.await {
                         // For each directory: if the new scan succeeded, use it;
-                        // if it stalled and we have previous data, keep the old value.
+                        // else keep the previous value so the display doesn't flicker.
                         data.doc_counts = new_data.doc_counts.or(data.doc_counts);
                         data.markdown_counts = new_data.markdown_counts.or(data.markdown_counts);
                         data.catalog_count = new_data.catalog_count.or(data.catalog_count);
-                        data.failed_count = new_data.failed_count.or(data.failed_count);
                         data.corrupted_count = new_data.corrupted_count.or(data.corrupted_count);
-                        data.fs_stalled_docs = new_data.fs_stalled_docs;
-                        data.fs_stalled_markdown = new_data.fs_stalled_markdown;
-                        data.fs_stalled_catalog = new_data.fs_stalled_catalog;
+                        data.inbox_pending = new_data.inbox_pending.or(data.inbox_pending);
+                        data.in_flight_conversions = new_data
+                            .in_flight_conversions
+                            .or(data.in_flight_conversions);
                         // Always update network-sourced fields
                         data.scribe_servers = new_data.scribe_servers;
                         data.distill_servers = new_data.distill_servers;

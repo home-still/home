@@ -28,35 +28,134 @@ pub struct StatusSnapshot {
     pub qdrant: Option<QdrantInfo>,
     #[serde(default)]
     pub history: Vec<HistoryEvent>,
+    /// Cluster-wide inbox-sweeper health. Populated from the heartbeat key
+    /// the `hs scribe inbox` daemon writes each tick (see
+    /// [`INBOX_HEARTBEAT_KEY`]). `None` means the server found no heartbeat
+    /// at all; `Some(.running=false)` means a stale heartbeat (daemon
+    /// crashed or is asleep longer than its advertised sweep interval).
+    #[serde(default)]
+    pub inbox_heartbeat: Option<InboxHeartbeatSnapshot>,
     #[serde(default)]
     pub generated_at: Option<String>,
 }
 
+/// Storage key the inbox daemon writes its heartbeat to each sweep tick.
+/// Read by every `hs status` client via MCP `system_status`, so the TUI
+/// can render the `Watcher` row honestly regardless of which host the CLI
+/// is running on. Leading `.` keeps it out of top-level listings.
+pub const INBOX_HEARTBEAT_KEY: &str = ".heartbeats/scribe-inbox.yaml";
+
+/// Daemon heartbeat contents. Written by `hs scribe inbox` (cmd_run) at
+/// the top of each sweep tick; consumed by `system_status` / `hs status`.
+///
+/// `last_sweep_*` fields are populated by the POST-tick stamp with the
+/// `SweepReport` from `sweep_inbox_once`. They're `Option<u64>` so the
+/// first heartbeat after the daemon starts (before any sweep completes)
+/// and heartbeats written by pre-rc.301 daemons serialize without the
+/// fields — `hs status` just shows "running · host" in that case.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InboxHeartbeat {
+    pub host: String,
+    pub pid: u32,
+    /// RFC3339 timestamp of when the daemon wrote this heartbeat.
+    pub last_tick: String,
+    /// Configured poll interval; readers use this to decide whether the
+    /// observed `last_tick` age is "recent enough" to call the daemon
+    /// running.
+    pub sweep_interval_secs: u64,
+    /// Total files seen in `papers/manually_downloaded/` on the most
+    /// recent completed sweep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sweep_found: Option<u64>,
+    /// Of those, how many were relocated to `papers/XX/<stem>.ext` and
+    /// published to `papers.ingested`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sweep_relocated: Option<u64>,
+    /// Count of per-file errors on the last sweep. Nonzero should color
+    /// the Watcher row yellow in the TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sweep_errors: Option<u64>,
+}
+
+/// Snapshot of the heartbeat plus derived freshness — serialised into
+/// `StatusSnapshot`. `running` is set by the MCP server when it classifies
+/// the last_tick_seconds_ago against the daemon's own sweep_interval_secs;
+/// clients just render what they're told.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InboxHeartbeatSnapshot {
+    pub host: String,
+    pub pid: u32,
+    pub last_tick: String,
+    pub sweep_interval_secs: u64,
+    /// Seconds elapsed between the heartbeat's `last_modified` (server's
+    /// clock) and when the snapshot was generated.
+    pub last_tick_seconds_ago: u64,
+    /// True if `last_tick_seconds_ago <= 2 * sweep_interval_secs + 5` —
+    /// daemon is alive and sweeping. 5s grace absorbs clock skew and tick
+    /// jitter.
+    pub running: bool,
+    /// Pass-through of [`InboxHeartbeat::last_sweep_found`]. Rendered as
+    /// the second half of `swept N / M` on the TUI Watcher row.
+    #[serde(default)]
+    pub last_sweep_found: Option<u64>,
+    /// Pass-through of [`InboxHeartbeat::last_sweep_relocated`] — the
+    /// `N` in `swept N / M`.
+    #[serde(default)]
+    pub last_sweep_relocated: Option<u64>,
+    /// Pass-through of [`InboxHeartbeat::last_sweep_errors`]. Nonzero
+    /// colors the Watcher row yellow.
+    #[serde(default)]
+    pub last_sweep_errors: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineCounts {
+    /// Total source documents: pdfs + htmls + epubs.
     pub documents: u64,
     pub pdfs: u64,
-    pub html_fallbacks: u64,
+    pub htmls: u64,
+    pub epubs: u64,
     pub markdown: u64,
     pub catalog_entries: u64,
-    /// Catalog rows stamped `conversion.failed == true` (stub_document et al).
-    /// These have a PDF in `papers/` and a YAML in `catalog/` but no markdown —
-    /// they account for the Documents − Markdown gap in the TUI pipeline panel.
-    #[serde(default)]
-    pub conversion_failed: u64,
     #[serde(default)]
     pub embedded_documents: Option<u64>,
     #[serde(default)]
     pub embedded_chunks: Option<u64>,
-    /// Unaccounted rows:
-    /// `documents − markdown − conversion_failed − in_flight`.
-    /// Small residual (<=3) is expected due to stage-in-progress; larger values
-    /// indicate catalog flag drift (rc.253). Testers assert
-    /// `pipeline_drift <= pipeline_drift_threshold`.
+    /// Catalog entries stamped `embedding_skip` (e.g. zero-chunk HTML
+    /// stubs). These count toward `markdown` but are intentionally not
+    /// embeddable, so TUI progress percentages should exclude them from
+    /// the denominator.
+    #[serde(default)]
+    pub embedding_skipped: Option<u64>,
+    /// Catalog entries stamped `conversion_failed` — terminal content-type
+    /// or parse failures (paywall HTML renamed .pdf, truncated downloads,
+    /// corrupt PDFs). Rendered in the "Corrupted PDFs" row and subtracted
+    /// from the convert denominator so the progress bar reflects
+    /// convertible work only.
+    #[serde(default)]
+    pub corrupted_pdfs: Option<u64>,
+    /// Files sitting in `papers/manually_downloaded/` waiting for the
+    /// inbox sweeper's next tick. Counted with the same whitelist the
+    /// sweeper itself uses (`hs_common::inbox::is_inbox_candidate_filename`)
+    /// so the dashboard number matches what the daemon will relocate.
+    /// Rendered as the `Inbox` row in `hs status`.
+    #[serde(default)]
+    pub inbox_pending: Option<u64>,
+    /// Sum of `scribe_instances[*].in_flight` — concurrent conversions
+    /// across the entire scribe pool. Rendered as the `In-flight` row in
+    /// `hs status` so a queued burst of papers is visible in the Pipeline
+    /// panel, not just in the per-scribe Services rows.
+    #[serde(default)]
+    pub in_flight_conversions: Option<u64>,
+    /// Unaccounted rows: `documents − markdown − in_flight`. Small
+    /// residual (<= threshold) is expected due to stage-in-progress;
+    /// larger values indicate a conversion error the operator needs to
+    /// investigate via logs (no "failed" catalog rows exist in this
+    /// pipeline — conversion either writes markdown + catalog or
+    /// propagates an error).
     #[serde(default)]
     pub pipeline_drift: u64,
     /// Threshold the self-test uses when asserting `pipeline_drift`.
-    /// Exposed alongside the value so the assertion is self-contained.
     #[serde(default)]
     pub pipeline_drift_threshold: u64,
 }
@@ -128,50 +227,71 @@ pub struct HistoryEvent {
     /// Embed metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunks: Option<u32>,
-    /// Convert / EmbedSkip outcome flags. Surfacing these prevents stub-PDF
-    /// failures and zero-chunk skips from being indistinguishable from clean
-    /// successes in the history pane.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failed: Option<bool>,
+    /// Reason string — populated for `EmbedSkip` events, unused otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Marks events whose timestamp came from a `catalog_repair` backfill
+    /// sweep. Only emitted when `build_history` is called with
+    /// `include_repaired = true` — `catalog_recent` uses the same flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<bool>,
 }
 
 /// Build the history event list from catalog entries, newest first.
+///
+/// When `include_repaired` is `false` (the default for both `system_status`
+/// and `catalog_recent`), rows whose timestamp is a `catalog_repair`
+/// backfill fingerprint are suppressed so the feed shows organic activity.
+/// When `true`, those rows reappear annotated with `repair: true`.
 #[cfg(feature = "catalog")]
-pub fn build_history(entries: &[(String, CatalogEntry)], limit: usize) -> Vec<HistoryEvent> {
+pub fn build_history(
+    entries: &[(String, CatalogEntry)],
+    limit: usize,
+    include_repaired: bool,
+) -> Vec<HistoryEvent> {
     let mut events: Vec<HistoryEvent> = Vec::new();
     for (stem, entry) in entries {
         let name = entry.title.clone().unwrap_or_else(|| stem.clone());
+        let repair_at: Option<&str> = entry.repair.as_ref().map(|r| r.repaired_at.as_str());
         if let Some(ref dl_at) = entry.downloaded_at {
-            let detail = entry
-                .file_size_bytes
-                .map(|b| b.to_string())
-                .unwrap_or_default();
-            events.push(HistoryEvent {
-                activity: "Download".into(),
-                stem: stem.clone(),
-                name: name.clone(),
-                detail,
-                at: dl_at.clone(),
-                detail_bytes: entry.file_size_bytes,
-                pages: None,
-                duration_secs: None,
-                chunks: None,
-                failed: None,
-                reason: None,
-            });
+            // Fingerprint: `downloaded_at` stamped by a prior
+            // `catalog_repair` flag_drift pass collapses hundreds of rows
+            // onto one nanosecond. Skip by default; mirror `catalog_recent`.
+            let is_repair = repair_at == Some(dl_at.as_str());
+            if is_repair && !include_repaired {
+                // skip
+            } else {
+                let detail = entry
+                    .file_size_bytes
+                    .map(|b| b.to_string())
+                    .unwrap_or_default();
+                events.push(HistoryEvent {
+                    activity: "Download".into(),
+                    stem: stem.clone(),
+                    name: name.clone(),
+                    detail,
+                    at: dl_at.clone(),
+                    detail_bytes: entry.file_size_bytes,
+                    pages: None,
+                    duration_secs: None,
+                    chunks: None,
+                    reason: None,
+                    repair: if is_repair { Some(true) } else { None },
+                });
+            }
         }
         if let Some(ref conv) = entry.conversion {
-            let detail = if conv.failed {
-                let reason = conv.reason.as_deref().unwrap_or("unknown");
-                format!(
-                    "FAILED: {reason} ({}pg {:.1}s)",
-                    conv.total_pages, conv.duration_secs
-                )
-            } else {
-                format!("{}pg {:.1}s", conv.total_pages, conv.duration_secs)
-            };
+            // Synthetic Convert fingerprint: flag_drift backfill stamps
+            // `server = "catalog_repair:flag_drift"` and shares the batch
+            // `now()` with `repair.repaired_at`. Matching on both guards
+            // against a real conversion finishing at the same instant as an
+            // unrelated repair on another row.
+            let is_repair = conv.server == "catalog_repair:flag_drift"
+                && repair_at == Some(conv.converted_at.as_str());
+            if is_repair && !include_repaired {
+                continue;
+            }
+            let detail = format!("{}pg {:.1}s", conv.total_pages, conv.duration_secs);
             events.push(HistoryEvent {
                 activity: "Convert".into(),
                 stem: stem.clone(),
@@ -182,8 +302,8 @@ pub fn build_history(entries: &[(String, CatalogEntry)], limit: usize) -> Vec<Hi
                 pages: Some(conv.total_pages),
                 duration_secs: Some(conv.duration_secs),
                 chunks: None,
-                failed: if conv.failed { Some(true) } else { None },
-                reason: conv.reason.clone(),
+                reason: None,
+                repair: if is_repair { Some(true) } else { None },
             });
         }
         if let Some(ref emb) = entry.embedding {
@@ -200,8 +320,8 @@ pub fn build_history(entries: &[(String, CatalogEntry)], limit: usize) -> Vec<Hi
                     pages: None,
                     duration_secs: None,
                     chunks: Some(emb.chunks_indexed),
-                    failed: None,
                     reason: None,
+                    repair: None,
                 });
             }
         }
@@ -219,8 +339,8 @@ pub fn build_history(entries: &[(String, CatalogEntry)], limit: usize) -> Vec<Hi
                 pages: None,
                 duration_secs: None,
                 chunks: None,
-                failed: None,
                 reason: Some(skip.reason.clone()),
+                repair: None,
             });
         }
     }
@@ -248,37 +368,65 @@ pub async fn count_ext_via(storage: &dyn Storage, prefix: &str, ext: &str) -> u6
     }
 }
 
-/// Find document files (PDFs and HTML fallbacks) under `papers_prefix`
-/// that have no matching catalog YAML under `catalog_prefix`. Returns
-/// `(stem, ext)` pairs sorted by stem so output is deterministic.
+/// A single listing-and-deserialization pass over the three prefixes that
+/// `catalog_repair`'s seven scan directions all probe. Built once per
+/// `catalog_repair` invocation and lent to each scan by reference, so the
+/// storage-side cost is `3 LISTs + N parallel GETs` (concurrency-bounded)
+/// instead of the pre-fix `~15 LISTs + N serial GETs × 7` that exceeded
+/// the MCP 4-minute client budget at 3k+ rows.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub struct RepairSnapshot {
+    pub papers: Vec<crate::storage::ObjectMeta>,
+    pub catalog: Vec<(String, crate::storage::ObjectMeta, CatalogEntry)>,
+    pub markdown: Vec<crate::storage::ObjectMeta>,
+}
+
+/// Build a [`RepairSnapshot`] by listing the three prefixes concurrently
+/// and fetching every catalog YAML in parallel via
+/// [`crate::catalog::list_catalog_entries_parallel`]. The progress callback
+/// fires during the catalog fetch (every 64 completions and once at the end)
+/// so callers can reset the MCP client's tool-call timeout with heartbeats.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub async fn build_repair_snapshot(
+    storage: &dyn Storage,
+    papers_prefix: &str,
+    catalog_prefix: &str,
+    markdown_prefix: &str,
+    concurrency: usize,
+    on_catalog_fetch_progress: impl FnMut(usize, usize),
+) -> anyhow::Result<RepairSnapshot> {
+    let (papers, markdown, catalog) = tokio::try_join!(
+        storage.list(papers_prefix),
+        storage.list(markdown_prefix),
+        crate::catalog::list_catalog_entries_parallel(
+            storage,
+            catalog_prefix,
+            concurrency,
+            on_catalog_fetch_progress,
+        ),
+    )?;
+    Ok(RepairSnapshot {
+        papers,
+        catalog,
+        markdown,
+    })
+}
+
+/// Find document files (PDFs and HTML fallbacks) under `papers` that have
+/// no matching catalog row. Returns `(stem, ext)` pairs sorted by stem so
+/// output is deterministic.
 ///
 /// This is the primary diagnostic for the documents → catalog gap that
 /// the self-test surfaces. The repair tool consumes this list to
 /// synthesize minimal catalog rows for orphan files, restoring source-
 /// of-truth alignment without re-downloading.
-#[cfg(feature = "storage")]
-pub async fn list_orphan_document_stems(
-    storage: &dyn Storage,
-    papers_prefix: &str,
-    catalog_prefix: &str,
-) -> anyhow::Result<Vec<(String, String)>> {
-    let papers = storage.list(papers_prefix).await?;
-    let catalog = storage.list(catalog_prefix).await?;
-
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub fn list_orphan_document_stems(
+    papers: &[crate::storage::ObjectMeta],
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+) -> Vec<(String, String)> {
     use std::collections::HashSet;
-    let known: HashSet<String> = catalog
-        .iter()
-        .filter_map(|o| {
-            if !o.key.ends_with(".yaml") {
-                return None;
-            }
-            let filename = o.key.rsplit('/').next()?;
-            if filename.starts_with("._") {
-                return None;
-            }
-            Some(filename.trim_end_matches(".yaml").to_string())
-        })
-        .collect();
+    let known: HashSet<&str> = catalog.iter().map(|(stem, _, _)| stem.as_str()).collect();
 
     let mut orphans: Vec<(String, String)> = Vec::new();
     for obj in papers {
@@ -293,12 +441,12 @@ pub async fn list_orphan_document_stems(
             Some((s, e)) if e == "pdf" || e == "html" => (s.to_string(), e.to_string()),
             _ => continue,
         };
-        if !known.contains(&stem) {
+        if !known.contains(stem.as_str()) {
             orphans.push((stem, ext));
         }
     }
     orphans.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(orphans)
+    orphans
 }
 
 /// List stems of catalog rows that claim a successful conversion but whose
@@ -306,20 +454,15 @@ pub async fn list_orphan_document_stems(
 /// orphans: the row says "I was converted" but the payload isn't where the
 /// pipeline wrote it.
 ///
-/// Rows with `conversion.failed == true` are skipped — those are intentional
-/// stub/failure stamps, not orphans. Rows with no `conversion` at all are
-/// also skipped (they never claimed to have markdown in the first place).
+/// Rows with no `conversion` at all are skipped (they never claimed to have
+/// markdown in the first place).
 #[cfg(all(feature = "storage", feature = "catalog"))]
-pub async fn list_catalog_rows_without_markdown(
-    storage: &dyn Storage,
-    catalog_prefix: &str,
-    markdown_prefix: &str,
-) -> anyhow::Result<Vec<String>> {
-    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
-
-    let markdown_objects = storage.list(markdown_prefix).await?;
+pub fn list_catalog_rows_without_markdown(
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+    markdown: &[crate::storage::ObjectMeta],
+) -> Vec<String> {
     use std::collections::HashSet;
-    let markdown_stems: HashSet<String> = markdown_objects
+    let markdown_stems: HashSet<String> = markdown
         .iter()
         .filter_map(|o| {
             if !o.key.ends_with(".md") {
@@ -333,19 +476,18 @@ pub async fn list_catalog_rows_without_markdown(
         })
         .collect();
 
-    let mut orphans: Vec<String> = triples
-        .into_iter()
+    let mut orphans: Vec<String> = catalog
+        .iter()
         .filter_map(|(stem, _meta, entry)| {
-            let claims_converted = entry.conversion.as_ref().is_some_and(|c| !c.failed);
-            if claims_converted && !markdown_stems.contains(&stem) {
-                Some(stem)
+            if entry.conversion.is_some() && !markdown_stems.contains(stem) {
+                Some(stem.clone())
             } else {
                 None
             }
         })
         .collect();
     orphans.sort();
-    Ok(orphans)
+    orphans
 }
 
 /// A catalog row whose recorded `markdown_path` disagrees with storage —
@@ -395,17 +537,13 @@ pub struct MdPathDrift {
 /// `catalog_no_markdown` direction handles by clearing the conversion
 /// stamp.
 #[cfg(all(feature = "storage", feature = "catalog"))]
-pub async fn list_catalog_rows_with_md_path_drift(
-    storage: &dyn Storage,
-    catalog_prefix: &str,
-    markdown_prefix: &str,
-) -> anyhow::Result<Vec<MdPathDrift>> {
-    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
-    let markdown_objects = storage.list(markdown_prefix).await?;
-
+pub fn list_catalog_rows_with_md_path_drift(
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+    markdown: &[crate::storage::ObjectMeta],
+) -> Vec<MdPathDrift> {
     use std::collections::HashMap;
     let mut md_by_filename: HashMap<String, String> = HashMap::new();
-    for obj in &markdown_objects {
+    for obj in markdown {
         if !obj.key.ends_with(".md") {
             continue;
         }
@@ -430,7 +568,7 @@ pub async fn list_catalog_rows_with_md_path_drift(
     }
 
     let mut drift = Vec::new();
-    for (stem, _meta, entry) in triples {
+    for (stem, _meta, entry) in catalog {
         let filename = format!("{stem}.md");
         let Some(resolved) = md_by_filename.get(&filename) else {
             continue;
@@ -438,14 +576,14 @@ pub async fn list_catalog_rows_with_md_path_drift(
         let current = entry.markdown_path.as_deref().unwrap_or("");
         if current != resolved.as_str() {
             drift.push(MdPathDrift {
-                stem,
+                stem: stem.clone(),
                 stale_path: current.to_string(),
                 resolved_path: resolved.clone(),
             });
         }
     }
     drift.sort_by(|a, b| a.stem.cmp(&b.stem));
-    Ok(drift)
+    drift
 }
 
 /// A catalog row whose stage flags contradict what's actually in storage.
@@ -461,74 +599,193 @@ pub struct FlagDriftRow {
     /// Row has `downloaded_at == None` but a PDF/HTML object exists — catalog
     /// pre-dates `downloaded_at`, or a synthetic repair row was upgraded.
     pub download_stamp_missing_with_source: bool,
+    /// `last_modified` of the source PDF/HTML object, if present. Lets the
+    /// repair write a per-object `downloaded_at` drawn from storage truth
+    /// instead of a shared batch `now()` — without this the whole repair
+    /// pass collapses into one nanosecond in the activity feed.
+    pub source_last_modified: Option<std::time::SystemTime>,
+    /// `last_modified` of the markdown object, if present. Same purpose for
+    /// the synthetic Convert stamp emitted when `conversion_missing_with_markdown`.
+    pub markdown_last_modified: Option<std::time::SystemTime>,
 }
 
 /// List catalog rows whose stage flags are out of sync with storage.
 ///
 /// Two drift cases — see [`FlagDriftRow`]. Callers can repair either side
 /// without deleting data (unlike the phantom-purge direction). Skips rows
-/// that look like they're waiting on a downstream stage rather than
-/// genuinely drifted:
-/// - `conversion.failed == true` (intentional failure stamp, not drift).
-/// - Neither drift condition true (healthy row).
+/// where neither drift condition is true (healthy row).
 #[cfg(all(feature = "storage", feature = "catalog"))]
-pub async fn list_catalog_flag_drift(
-    storage: &dyn Storage,
-    papers_prefix: &str,
-    catalog_prefix: &str,
-    markdown_prefix: &str,
-) -> anyhow::Result<Vec<FlagDriftRow>> {
-    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
-    let papers = storage.list(papers_prefix).await?;
-    let markdown = storage.list(markdown_prefix).await?;
-
-    use std::collections::HashSet;
-    let paper_stems: HashSet<String> = papers
-        .iter()
-        .filter_map(|o| {
-            let filename = o.key.rsplit('/').next()?;
-            if filename.starts_with("._") {
-                return None;
-            }
-            let (stem, ext) = filename.rsplit_once('.')?;
-            if ext == "pdf" || ext == "html" {
-                Some(stem.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-    let md_stems: HashSet<String> = markdown
-        .iter()
-        .filter_map(|o| {
-            if !o.key.ends_with(".md") {
-                return None;
-            }
-            let filename = o.key.rsplit('/').next()?;
-            if filename.starts_with("._") {
-                return None;
-            }
-            Some(filename.trim_end_matches(".md").to_string())
-        })
-        .collect();
-
-    let mut drift: Vec<FlagDriftRow> = Vec::new();
-    for (stem, _meta, entry) in triples {
-        if entry.conversion.as_ref().is_some_and(|c| c.failed) {
+pub fn list_catalog_flag_drift(
+    papers: &[crate::storage::ObjectMeta],
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+    markdown: &[crate::storage::ObjectMeta],
+) -> Vec<FlagDriftRow> {
+    use std::collections::HashMap;
+    // Keep the `last_modified` per stem so the repair can emit per-object
+    // timestamps. PDF wins over HTML when both exist, matching the preference
+    // in `list_catalog_stuck_convert`.
+    let mut paper_mtime_by_stem: HashMap<String, (String, Option<std::time::SystemTime>)> =
+        HashMap::new();
+    for o in papers.iter() {
+        let Some(filename) = o.key.rsplit('/').next() else {
+            continue;
+        };
+        if filename.starts_with("._") {
             continue;
         }
-        let conversion_missing = entry.conversion.is_none() && md_stems.contains(&stem);
-        let download_missing = entry.downloaded_at.is_none() && paper_stems.contains(&stem);
+        let Some((stem, ext)) = filename.rsplit_once('.') else {
+            continue;
+        };
+        match ext {
+            "pdf" => {
+                paper_mtime_by_stem.insert(stem.to_string(), (ext.to_string(), o.last_modified));
+            }
+            "html" | "epub" => {
+                paper_mtime_by_stem
+                    .entry(stem.to_string())
+                    .or_insert_with(|| (ext.to_string(), o.last_modified));
+            }
+            _ => {}
+        }
+    }
+    let mut md_mtime_by_stem: HashMap<String, Option<std::time::SystemTime>> = HashMap::new();
+    for o in markdown.iter() {
+        if !o.key.ends_with(".md") {
+            continue;
+        }
+        let Some(filename) = o.key.rsplit('/').next() else {
+            continue;
+        };
+        if filename.starts_with("._") {
+            continue;
+        }
+        let stem = filename.trim_end_matches(".md").to_string();
+        md_mtime_by_stem.insert(stem, o.last_modified);
+    }
+
+    let mut drift: Vec<FlagDriftRow> = Vec::new();
+    for (stem, _meta, entry) in catalog {
+        let md_hit = md_mtime_by_stem.get(stem).copied();
+        let paper_hit = paper_mtime_by_stem.get(stem).cloned();
+        let conversion_missing = entry.conversion.is_none() && md_hit.is_some();
+        let download_missing = entry.downloaded_at.is_none() && paper_hit.is_some();
         if conversion_missing || download_missing {
             drift.push(FlagDriftRow {
-                stem,
+                stem: stem.clone(),
                 conversion_missing_with_markdown: conversion_missing,
                 download_stamp_missing_with_source: download_missing,
+                source_last_modified: paper_hit.and_then(|(_ext, mtime)| mtime),
+                markdown_last_modified: md_hit.flatten(),
             });
         }
     }
     drift.sort_by(|a, b| a.stem.cmp(&b.stem));
-    Ok(drift)
+    drift
+}
+
+/// A catalog row whose `downloaded_at` or synthetic-Convert `converted_at`
+/// matches its `repair.repaired_at` to the nanosecond — the fingerprint of a
+/// prior `catalog_repair` flag_drift pass that stamped every row with one
+/// batch `now()`. Rewritable to the storage object's `last_modified` so the
+/// activity feed recovers useful chronology.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+#[derive(Debug, Clone)]
+pub struct FlagDriftResyncCandidate {
+    pub stem: String,
+    /// `downloaded_at` currently equals `repair.repaired_at` and the source
+    /// object has a usable `last_modified`.
+    pub resync_download: Option<std::time::SystemTime>,
+    /// Synthetic flag_drift Convert whose `converted_at` equals
+    /// `repair.repaired_at`; replace with the markdown `last_modified`.
+    pub resync_conversion: Option<std::time::SystemTime>,
+}
+
+/// List catalog rows whose timestamps still carry a prior `catalog_repair`
+/// batch stamp (the "uniform nanosecond" pattern that poisons `catalog_recent`).
+///
+/// Fingerprint (both conditions must hold per field):
+/// - `entry.repair.is_some()` AND
+/// - For download: `entry.downloaded_at == entry.repair.repaired_at`.
+/// - For conversion: `conv.server == "catalog_repair:flag_drift"` AND
+///   `conv.converted_at == entry.repair.repaired_at`.
+///
+/// Only rows with a storage object that actually has a `last_modified` are
+/// returned — otherwise there's nothing better to rewrite to and the resync
+/// would be a no-op.
+#[cfg(all(feature = "storage", feature = "catalog"))]
+pub fn list_catalog_flag_drift_resync_candidates(
+    papers: &[crate::storage::ObjectMeta],
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+    markdown: &[crate::storage::ObjectMeta],
+) -> Vec<FlagDriftResyncCandidate> {
+    use std::collections::HashMap;
+    let mut paper_mtime_by_stem: HashMap<String, Option<std::time::SystemTime>> = HashMap::new();
+    for o in papers.iter() {
+        let Some(filename) = o.key.rsplit('/').next() else {
+            continue;
+        };
+        if filename.starts_with("._") {
+            continue;
+        }
+        let Some((stem, ext)) = filename.rsplit_once('.') else {
+            continue;
+        };
+        match ext {
+            "pdf" => {
+                paper_mtime_by_stem.insert(stem.to_string(), o.last_modified);
+            }
+            "html" => {
+                paper_mtime_by_stem
+                    .entry(stem.to_string())
+                    .or_insert(o.last_modified);
+            }
+            _ => {}
+        }
+    }
+    let mut md_mtime_by_stem: HashMap<String, Option<std::time::SystemTime>> = HashMap::new();
+    for o in markdown.iter() {
+        if !o.key.ends_with(".md") {
+            continue;
+        }
+        let Some(filename) = o.key.rsplit('/').next() else {
+            continue;
+        };
+        if filename.starts_with("._") {
+            continue;
+        }
+        let stem = filename.trim_end_matches(".md").to_string();
+        md_mtime_by_stem.insert(stem, o.last_modified);
+    }
+
+    let mut out: Vec<FlagDriftResyncCandidate> = Vec::new();
+    for (stem, _meta, entry) in catalog {
+        let Some(ref repair) = entry.repair else {
+            continue;
+        };
+        let repair_at = repair.repaired_at.as_str();
+
+        let resync_download = match entry.downloaded_at.as_deref() {
+            Some(dl) if dl == repair_at => paper_mtime_by_stem.get(stem).copied().flatten(),
+            _ => None,
+        };
+        let resync_conversion = match entry.conversion.as_ref() {
+            Some(conv)
+                if conv.server == "catalog_repair:flag_drift" && conv.converted_at == repair_at =>
+            {
+                md_mtime_by_stem.get(stem).copied().flatten()
+            }
+            _ => None,
+        };
+        if resync_download.is_some() || resync_conversion.is_some() {
+            out.push(FlagDriftResyncCandidate {
+                stem: stem.clone(),
+                resync_download,
+                resync_conversion,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.stem.cmp(&b.stem));
+    out
 }
 
 /// A stuck-convert row: catalog has no `conversion` stamp, but a source
@@ -553,14 +810,10 @@ pub struct StuckConvertRow {
 /// with neither source nor markdown) or [`list_catalog_flag_drift`] (flags
 /// missing but storage evidence present for an already-completed stage).
 #[cfg(all(feature = "storage", feature = "catalog"))]
-pub async fn list_catalog_stuck_convert(
-    storage: &dyn Storage,
-    papers_prefix: &str,
-    catalog_prefix: &str,
-) -> anyhow::Result<Vec<StuckConvertRow>> {
-    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
-    let papers = storage.list(papers_prefix).await?;
-
+pub fn list_catalog_stuck_convert(
+    papers: &[crate::storage::ObjectMeta],
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+) -> Vec<StuckConvertRow> {
     use std::collections::HashMap;
     // stem -> extension. PDF wins over HTML when both exist so we prefer
     // the richer source; the convert path handles either.
@@ -589,20 +842,30 @@ pub async fn list_catalog_stuck_convert(
     }
 
     let mut stuck: Vec<StuckConvertRow> = Vec::new();
-    for (stem, _meta, entry) in triples {
+    for (stem, _meta, entry) in catalog {
         if entry.conversion.is_some() {
             continue;
         }
-        let Some(ext) = source_by_stem.get(&stem) else {
+        // Rows stamped `conversion_failed` are terminal: the source is
+        // unconvertable by content (paywall HTML renamed .pdf, truncated
+        // download, corrupt PDF). Republishing them into the NATS queue
+        // would get another HTTP 415 and another stamp — infinite churn.
+        // The row isn't "stuck"; it's dead. Let `hs migrate
+        // quarantine-bad-content` relocate and `hs status` surface it
+        // via the corrupted-PDF count.
+        if entry.conversion_failed.is_some() {
+            continue;
+        }
+        let Some(ext) = source_by_stem.get(stem) else {
             continue;
         };
         stuck.push(StuckConvertRow {
-            stem,
+            stem: stem.clone(),
             source_ext: ext.clone(),
         });
     }
     stuck.sort_by(|a, b| a.stem.cmp(&b.stem));
-    Ok(stuck)
+    stuck
 }
 
 /// List stems of catalog rows with no backing file in storage — neither a
@@ -612,16 +875,11 @@ pub async fn list_catalog_stuck_convert(
 /// vanished). They inflate `catalog_entries` above `documents` in the
 /// pipeline rollup without being reachable by any downstream stage.
 #[cfg(all(feature = "storage", feature = "catalog"))]
-pub async fn list_catalog_rows_without_source(
-    storage: &dyn Storage,
-    papers_prefix: &str,
-    catalog_prefix: &str,
-    markdown_prefix: &str,
-) -> anyhow::Result<Vec<String>> {
-    let triples = crate::catalog::list_catalog_entries_via(storage, catalog_prefix).await?;
-    let papers = storage.list(papers_prefix).await?;
-    let markdown = storage.list(markdown_prefix).await?;
-
+pub fn list_catalog_rows_without_source(
+    papers: &[crate::storage::ObjectMeta],
+    catalog: &[(String, crate::storage::ObjectMeta, CatalogEntry)],
+    markdown: &[crate::storage::ObjectMeta],
+) -> Vec<String> {
     use std::collections::HashSet;
     let paper_stems: HashSet<String> = papers
         .iter()
@@ -652,18 +910,101 @@ pub async fn list_catalog_rows_without_source(
         })
         .collect();
 
-    let mut orphans: Vec<String> = triples
-        .into_iter()
+    let mut orphans: Vec<String> = catalog
+        .iter()
         .filter_map(|(stem, _meta, _entry)| {
-            if paper_stems.contains(&stem) || md_stems.contains(&stem) {
+            if paper_stems.contains(stem) || md_stems.contains(stem) {
                 None
             } else {
-                Some(stem)
+                Some(stem.clone())
             }
         })
         .collect();
     orphans.sort();
-    Ok(orphans)
+    orphans
+}
+
+/// Stamp the inbox-sweeper heartbeat. The daemon writes twice per tick:
+/// once BEFORE the sweep starts (`last_sweep=None`, keeps the TUI's
+/// Watcher row "running" during a slow sweep), and once AFTER it
+/// completes with the actual `(found, relocated, errors)` so the TUI
+/// can show `swept N / M`. Cost is one tiny `storage.put` per call —
+/// negligible compared to the sweep itself. Failures are the caller's
+/// to surface; most daemons log-and-continue.
+#[cfg(feature = "storage")]
+pub async fn write_inbox_heartbeat(
+    storage: &dyn Storage,
+    sweep_interval_secs: u64,
+    last_sweep: Option<(u64, u64, u64)>,
+) -> anyhow::Result<()> {
+    let (found, relocated, errors) = match last_sweep {
+        Some((f, r, e)) => (Some(f), Some(r), Some(e)),
+        None => (None, None, None),
+    };
+    let hb = InboxHeartbeat {
+        host: gethostname::gethostname().to_string_lossy().into_owned(),
+        pid: std::process::id(),
+        last_tick: chrono::Utc::now().to_rfc3339(),
+        sweep_interval_secs,
+        last_sweep_found: found,
+        last_sweep_relocated: relocated,
+        last_sweep_errors: errors,
+    };
+    let yaml = serde_yaml_ng::to_string(&hb)?;
+    storage
+        .put(INBOX_HEARTBEAT_KEY, yaml.into_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("write_inbox_heartbeat: {e}"))
+}
+
+/// Classify a heartbeat's freshness. Pure: takes the parsed heartbeat,
+/// the storage object's `last_modified`, and the "now" reference clock.
+/// Split out so the threshold logic is unit-testable without having to
+/// manipulate filesystem mtimes.
+#[cfg(feature = "storage")]
+pub fn classify_inbox_heartbeat(
+    hb: InboxHeartbeat,
+    last_modified: std::time::SystemTime,
+    now: std::time::SystemTime,
+) -> InboxHeartbeatSnapshot {
+    let last_tick_seconds_ago = now
+        .duration_since(last_modified)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX);
+    // 5s grace absorbs clock skew + tick jitter. `saturating_mul` so a
+    // maliciously huge sweep_interval doesn't overflow.
+    let running =
+        last_tick_seconds_ago <= hb.sweep_interval_secs.saturating_mul(2).saturating_add(5);
+    InboxHeartbeatSnapshot {
+        host: hb.host,
+        pid: hb.pid,
+        last_tick: hb.last_tick,
+        sweep_interval_secs: hb.sweep_interval_secs,
+        last_tick_seconds_ago,
+        running,
+        last_sweep_found: hb.last_sweep_found,
+        last_sweep_relocated: hb.last_sweep_relocated,
+        last_sweep_errors: hb.last_sweep_errors,
+    }
+}
+
+/// Read the heartbeat and classify freshness. Returns `None` if the key
+/// doesn't exist or can't be parsed. Otherwise the caller can trust
+/// `running` — the server did the freshness math so every client renders
+/// the same verdict.
+#[cfg(feature = "storage")]
+pub async fn read_inbox_heartbeat(storage: &dyn Storage) -> Option<InboxHeartbeatSnapshot> {
+    let bytes = storage.get(INBOX_HEARTBEAT_KEY).await.ok()?;
+    let hb: InboxHeartbeat = serde_yaml_ng::from_slice(&bytes).ok()?;
+    let meta = storage.head(INBOX_HEARTBEAT_KEY).await.ok().flatten()?;
+    let last_modified = meta
+        .last_modified
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    Some(classify_inbox_heartbeat(
+        hb,
+        last_modified,
+        std::time::SystemTime::now(),
+    ))
 }
 
 /// Pipeline counts via Storage. Same source of truth as MCP today.
@@ -675,24 +1016,30 @@ pub async fn collect_pipeline_counts(
     catalog_prefix: &str,
     embedded_documents: Option<u64>,
     embedded_chunks: Option<u64>,
+    embedding_skipped: Option<u64>,
 ) -> PipelineCounts {
     let pdfs = count_ext_via(storage, papers_prefix, "pdf").await;
-    let html_fallbacks = count_ext_via(storage, papers_prefix, "html").await;
-    let documents = pdfs + html_fallbacks;
+    let htmls = count_ext_via(storage, papers_prefix, "html").await;
+    let epubs = count_ext_via(storage, papers_prefix, "epub").await;
+    let documents = pdfs + htmls + epubs;
     let markdown = count_ext_via(storage, markdown_prefix, "md").await;
     let catalog_entries = count_ext_via(storage, catalog_prefix, "yaml").await;
     PipelineCounts {
         documents,
         pdfs,
-        html_fallbacks,
+        htmls,
+        epubs,
         markdown,
         catalog_entries,
-        // Populated separately by the caller after it scans the catalog
-        // bodies; `collect_pipeline_counts` only does cheap metadata listings.
-        conversion_failed: 0,
         embedded_documents,
         embedded_chunks,
-        // Computed by caller once it knows conversion_failed + total in_flight.
+        embedding_skipped,
+        // Computed by caller (needs the full catalog in memory).
+        corrupted_pdfs: None,
+        // Computed by caller (extra storage.list call for a sub-prefix).
+        inbox_pending: None,
+        // Computed by caller once it knows total in_flight.
+        in_flight_conversions: None,
         pipeline_drift: 0,
         pipeline_drift_threshold: PIPELINE_DRIFT_THRESHOLD,
     }
@@ -704,21 +1051,19 @@ mod history_tests {
     use crate::catalog::{CatalogEntry, ConversionMeta, EmbeddingMeta, EmbeddingSkip};
 
     #[test]
-    fn surfaces_failed_convert_and_embed_skip() {
-        // One entry has a failed (stub PDF) conversion and a downstream skip
-        // stamp; the other is a clean download + convert + embed. The history
-        // should expose both failure and skip distinctly, not silently drop them.
-        let stub = CatalogEntry {
-            title: Some("Stub".into()),
+    fn surfaces_convert_embed_and_embed_skip() {
+        // Entry with a downstream skip stamp (converted but zero-chunk embed)
+        // plus a clean download+convert+embed entry. History should surface
+        // both convert rows, the embed, and the skip distinctly.
+        let skipped = CatalogEntry {
+            title: Some("Skipped".into()),
             downloaded_at: Some("2026-04-15T19:50:01Z".into()),
             conversion: Some(ConversionMeta {
-                server: "scribe-1".into(),
+                server: "scribe-vlm".into(),
                 duration_secs: 0.42,
                 total_pages: 1,
                 converted_at: "2026-04-15T19:50:02Z".into(),
                 pages: vec![],
-                failed: true,
-                reason: Some("stub_document".into()),
             }),
             embedding_skip: Some(EmbeddingSkip {
                 reason: "zero_chunks_or_empty".into(),
@@ -730,13 +1075,11 @@ mod history_tests {
             title: Some("Real".into()),
             downloaded_at: Some("2026-04-15T18:00:00Z".into()),
             conversion: Some(ConversionMeta {
-                server: "scribe-1".into(),
+                server: "scribe-vlm".into(),
                 duration_secs: 12.5,
                 total_pages: 33,
                 converted_at: "2026-04-15T18:01:00Z".into(),
                 pages: vec![],
-                failed: false,
-                reason: None,
             }),
             embedding: Some(EmbeddingMeta {
                 server: "distill-1".into(),
@@ -747,52 +1090,27 @@ mod history_tests {
             ..Default::default()
         };
 
-        let entries = vec![("stub".to_string(), stub), ("real".to_string(), good)];
-        let events = build_history(&entries, 100);
+        let entries = vec![("skipped".to_string(), skipped), ("real".to_string(), good)];
+        let events = build_history(&entries, 100, false);
 
         // Expect 6 events: 2 downloads + 2 converts + 1 embed + 1 embed_skip.
         assert_eq!(events.len(), 6, "events: {events:#?}");
 
-        // Sorted newest-first by timestamp.
-        let activities: Vec<&str> = events.iter().map(|e| e.activity.as_str()).collect();
-        assert_eq!(
-            activities,
-            vec![
-                "EmbedSkip",
-                "Convert",
-                "Download",
-                "Embed",
-                "Convert",
-                "Download"
-            ]
-        );
-
-        // The failed convert must carry both the flag and a FAILED-prefixed detail.
-        let stub_convert = events
+        // Sub-second conversion duration round-trips through f64 with .1 precision.
+        let skipped_convert = events
             .iter()
-            .find(|e| e.activity == "Convert" && e.stem == "stub")
-            .expect("stub convert event present");
-        assert_eq!(stub_convert.failed, Some(true));
-        assert_eq!(stub_convert.reason.as_deref(), Some("stub_document"));
+            .find(|e| e.activity == "Convert" && e.stem == "skipped")
+            .expect("skipped convert event present");
         assert!(
-            stub_convert.detail.starts_with("FAILED:"),
-            "detail: {}",
-            stub_convert.detail
-        );
-
-        // Sub-second conversion duration must round-trip through f64 with .1 precision.
-        assert!(
-            stub_convert.detail.contains("0.4s"),
+            skipped_convert.detail.contains("0.4s"),
             "expected sub-second formatting in: {}",
-            stub_convert.detail
+            skipped_convert.detail
         );
 
-        // Clean convert has no failed flag (skip_serializing_if drops it from JSON).
         let real_convert = events
             .iter()
             .find(|e| e.activity == "Convert" && e.stem == "real")
             .unwrap();
-        assert_eq!(real_convert.failed, None);
         assert!(real_convert.detail.contains("12.5s"));
 
         // EmbedSkip carries the reason as both `reason` and `detail`.
@@ -838,13 +1156,11 @@ mod stuck_convert_tests {
             downloaded_at: Some("2026-04-15T16:00:00Z".into()),
             pdf_path: Some("10/converted.pdf".into()),
             conversion: Some(ConversionMeta {
-                server: "scribe-1".into(),
+                server: "scribe-vlm".into(),
                 duration_secs: 10.0,
                 total_pages: 5,
                 converted_at: "2026-04-15T16:01:00Z".into(),
                 pages: vec![],
-                failed: false,
-                reason: None,
             }),
             ..Default::default()
         };
@@ -865,13 +1181,52 @@ mod stuck_convert_tests {
             .await
             .unwrap();
 
-        let stuck_rows = list_catalog_stuck_convert(&storage, "papers", "catalog")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let stuck_rows = list_catalog_stuck_convert(&snap.papers, &snap.catalog);
 
         assert_eq!(stuck_rows.len(), 1, "got: {stuck_rows:?}");
         assert_eq!(stuck_rows[0].stem, "stuck");
         assert_eq!(stuck_rows[0].source_ext, "pdf");
+    }
+
+    #[tokio::test]
+    async fn skips_rows_stamped_conversion_failed() {
+        // A row with a PDF on disk, no conversion, BUT stamped
+        // conversion_failed is terminal — stuck_convert must not surface
+        // it, otherwise catalog_repair re-publishes and the queue loops.
+        use crate::catalog::ConversionFailure;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let dead = CatalogEntry {
+            downloaded_at: Some("2026-04-24T10:00:00Z".into()),
+            pdf_path: Some("papers/de/dead.pdf".into()),
+            conversion: None,
+            conversion_failed: Some(ConversionFailure {
+                reason: "unsupported_content_type:html".into(),
+                at: "2026-04-24T10:01:00Z".into(),
+                attempts: 1,
+            }),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "dead", &dead)
+            .await
+            .unwrap();
+        storage
+            .put("papers/de/dead.pdf", b"<html>paywall</html>".to_vec())
+            .await
+            .unwrap();
+
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
+            .await
+            .unwrap();
+        let stuck_rows = list_catalog_stuck_convert(&snap.papers, &snap.catalog);
+        assert!(
+            stuck_rows.is_empty(),
+            "dead row should not surface as stuck: {stuck_rows:?}"
+        );
     }
 
     #[tokio::test]
@@ -897,9 +1252,10 @@ mod stuck_convert_tests {
             .await
             .unwrap();
 
-        let rows = list_catalog_stuck_convert(&storage, "papers", "catalog")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let rows = list_catalog_stuck_convert(&snap.papers, &snap.catalog);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source_ext, "pdf");
     }
@@ -932,9 +1288,10 @@ mod md_path_drift_tests {
             .await
             .unwrap();
 
-        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let drift = list_catalog_rows_with_md_path_drift(&snap.catalog, &snap.markdown);
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].stem, "04947b2f");
         assert_eq!(drift[0].stale_path, "markdown/04947b2f.md");
@@ -960,9 +1317,10 @@ mod md_path_drift_tests {
             .await
             .unwrap();
 
-        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let drift = list_catalog_rows_with_md_path_drift(&snap.catalog, &snap.markdown);
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].stale_path, "");
         assert_eq!(drift[0].resolved_path, "markdown/gh/ghostpath.md");
@@ -986,9 +1344,10 @@ mod md_path_drift_tests {
             .await
             .unwrap();
 
-        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let drift = list_catalog_rows_with_md_path_drift(&snap.catalog, &snap.markdown);
         assert!(drift.is_empty());
     }
 
@@ -1008,9 +1367,10 @@ mod md_path_drift_tests {
             .await
             .unwrap();
 
-        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let drift = list_catalog_rows_with_md_path_drift(&snap.catalog, &snap.markdown);
         assert!(drift.is_empty());
     }
 
@@ -1037,10 +1397,268 @@ mod md_path_drift_tests {
             .await
             .unwrap();
 
-        let drift = list_catalog_rows_with_md_path_drift(&storage, "catalog", "markdown")
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
             .await
             .unwrap();
+        let drift = list_catalog_rows_with_md_path_drift(&snap.catalog, &snap.markdown);
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].resolved_path, "markdown/du/duped.md");
+    }
+}
+
+#[cfg(all(test, feature = "storage"))]
+mod inbox_heartbeat_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn hb(sweep_interval_secs: u64) -> InboxHeartbeat {
+        InboxHeartbeat {
+            host: "big".into(),
+            pid: 12345,
+            last_tick: "2026-04-24T13:00:00+00:00".into(),
+            sweep_interval_secs,
+            last_sweep_found: None,
+            last_sweep_relocated: None,
+            last_sweep_errors: None,
+        }
+    }
+
+    #[test]
+    fn fresh_heartbeat_is_running() {
+        let now = SystemTime::now();
+        let snap = classify_inbox_heartbeat(hb(5), now, now);
+        assert!(snap.running);
+        assert_eq!(snap.last_tick_seconds_ago, 0);
+        assert_eq!(snap.host, "big");
+    }
+
+    #[test]
+    fn within_two_intervals_plus_grace_still_running() {
+        // sweep_interval=5 → threshold 2*5+5 = 15s. 14s elapsed → running.
+        let now = SystemTime::now();
+        let stamp = now - Duration::from_secs(14);
+        let snap = classify_inbox_heartbeat(hb(5), stamp, now);
+        assert!(
+            snap.running,
+            "14s elapsed at interval=5 must still be running"
+        );
+    }
+
+    #[test]
+    fn beyond_threshold_is_stopped() {
+        // sweep_interval=5 → threshold 15s. 20s elapsed → stopped.
+        let now = SystemTime::now();
+        let stamp = now - Duration::from_secs(20);
+        let snap = classify_inbox_heartbeat(hb(5), stamp, now);
+        assert!(!snap.running);
+        assert_eq!(snap.last_tick_seconds_ago, 20);
+    }
+
+    #[test]
+    fn zero_sweep_interval_does_not_overflow() {
+        // Degenerate config. Threshold is just the 5s grace; 1s elapsed
+        // is still fresh but 10s is not. No panic either way.
+        let now = SystemTime::now();
+        let snap_fresh = classify_inbox_heartbeat(hb(0), now - Duration::from_secs(1), now);
+        assert!(snap_fresh.running);
+        let snap_stale = classify_inbox_heartbeat(hb(0), now - Duration::from_secs(10), now);
+        assert!(!snap_stale.running);
+    }
+
+    #[tokio::test]
+    async fn read_missing_heartbeat_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::LocalFsStorage::new(tmp.path());
+        assert!(read_inbox_heartbeat(&storage).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_then_read_roundtrips_to_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::LocalFsStorage::new(tmp.path());
+
+        write_inbox_heartbeat(&storage, 10, None).await.unwrap();
+        let snap = read_inbox_heartbeat(&storage)
+            .await
+            .expect("heartbeat just written");
+        assert!(snap.running);
+        assert_eq!(snap.sweep_interval_secs, 10);
+        assert!(!snap.host.is_empty());
+        assert_ne!(snap.pid, 0);
+        // Boot-time stamp has no sweep counts yet.
+        assert_eq!(snap.last_sweep_found, None);
+        assert_eq!(snap.last_sweep_relocated, None);
+        assert_eq!(snap.last_sweep_errors, None);
+    }
+
+    #[tokio::test]
+    async fn post_sweep_heartbeat_carries_sweep_stats() {
+        // rc.301 contract: the post-sweep stamp gives the Watcher row
+        // the `swept N / M · K err` signal. Round-tripping the tuple
+        // proves the fields land on both sides of serde.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::LocalFsStorage::new(tmp.path());
+
+        write_inbox_heartbeat(&storage, 30, Some((66, 18, 0)))
+            .await
+            .unwrap();
+        let snap = read_inbox_heartbeat(&storage)
+            .await
+            .expect("heartbeat just written");
+        assert_eq!(snap.last_sweep_found, Some(66));
+        assert_eq!(snap.last_sweep_relocated, Some(18));
+        assert_eq!(snap.last_sweep_errors, Some(0));
+    }
+}
+
+#[cfg(all(test, feature = "storage", feature = "catalog"))]
+mod flag_drift_tests {
+    use super::*;
+    use crate::catalog::{write_catalog_entry_via, CatalogEntry, ConversionMeta, RepairMeta};
+    use crate::storage::LocalFsStorage;
+
+    #[tokio::test]
+    async fn populates_source_last_modified_from_storage_mtime() {
+        // A catalog row with no `downloaded_at` but a PDF on disk → drift. The
+        // scanner must carry the PDF's `last_modified` through so the repair
+        // can stamp a per-object timestamp instead of a batch `now()`.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            downloaded_at: None,
+            conversion: None,
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "mtimed", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("papers/mt/mtimed.pdf", b"fake pdf".to_vec())
+            .await
+            .unwrap();
+
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
+            .await
+            .unwrap();
+        let drift = list_catalog_flag_drift(&snap.papers, &snap.catalog, &snap.markdown);
+        assert_eq!(drift.len(), 1);
+        let row = &drift[0];
+        assert_eq!(row.stem, "mtimed");
+        assert!(row.download_stamp_missing_with_source);
+        assert!(
+            row.source_last_modified.is_some(),
+            "scanner must thread the source object's last_modified through"
+        );
+    }
+
+    #[tokio::test]
+    async fn resync_candidate_detects_batch_stamp_fingerprint() {
+        // Fingerprint: `downloaded_at == repair.repaired_at`. The scanner must
+        // return the stem only when the source object also has a `last_modified`
+        // worth rewriting to — otherwise the resync would be a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let batch_stamp = "2026-04-20T15:09:23.905851118+00:00";
+        let entry = CatalogEntry {
+            downloaded_at: Some(batch_stamp.into()),
+            repair: Some(RepairMeta {
+                repaired_at: batch_stamp.into(),
+                reason: "flag_drift backfill".into(),
+            }),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "resyncable", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("papers/re/resyncable.pdf", b"fake".to_vec())
+            .await
+            .unwrap();
+
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
+            .await
+            .unwrap();
+        let candidates =
+            list_catalog_flag_drift_resync_candidates(&snap.papers, &snap.catalog, &snap.markdown);
+        assert_eq!(candidates.len(), 1);
+        let cand = &candidates[0];
+        assert_eq!(cand.stem, "resyncable");
+        assert!(cand.resync_download.is_some());
+        assert!(cand.resync_conversion.is_none());
+    }
+
+    #[tokio::test]
+    async fn resync_candidate_skips_organic_rows() {
+        // A row with `repair.is_some()` but `downloaded_at` DIFFERENT from
+        // `repair.repaired_at` is organic — someone downloaded a paper after a
+        // prior repair stamped the row. Must NOT be reported as resyncable.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let entry = CatalogEntry {
+            downloaded_at: Some("2026-04-19T10:00:00+00:00".into()),
+            repair: Some(RepairMeta {
+                repaired_at: "2026-04-20T15:09:23.905851118+00:00".into(),
+                reason: "flag_drift backfill".into(),
+            }),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "organic", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("papers/or/organic.pdf", b"fake".to_vec())
+            .await
+            .unwrap();
+
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
+            .await
+            .unwrap();
+        let candidates =
+            list_catalog_flag_drift_resync_candidates(&snap.papers, &snap.catalog, &snap.markdown);
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resync_candidate_detects_synthetic_conversion() {
+        // Synthetic Convert fingerprint: `server == "catalog_repair:flag_drift"`
+        // AND `converted_at == repair.repaired_at`. Must be reported with
+        // `resync_conversion` populated from the markdown mtime.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        let batch_stamp = "2026-04-20T15:09:23.905851118+00:00";
+        let entry = CatalogEntry {
+            conversion: Some(ConversionMeta {
+                server: "catalog_repair:flag_drift".into(),
+                duration_secs: 0.0,
+                total_pages: 0,
+                converted_at: batch_stamp.into(),
+                pages: vec![],
+            }),
+            repair: Some(RepairMeta {
+                repaired_at: batch_stamp.into(),
+                reason: "flag_drift backfill".into(),
+            }),
+            ..Default::default()
+        };
+        write_catalog_entry_via(&storage, "catalog", "synthconv", &entry)
+            .await
+            .unwrap();
+        storage
+            .put("markdown/sy/synthconv.md", b"md body".to_vec())
+            .await
+            .unwrap();
+
+        let snap = build_repair_snapshot(&storage, "papers", "catalog", "markdown", 8, |_, _| {})
+            .await
+            .unwrap();
+        let candidates =
+            list_catalog_flag_drift_resync_candidates(&snap.papers, &snap.catalog, &snap.markdown);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].resync_conversion.is_some());
+        assert!(candidates[0].resync_download.is_none());
     }
 }

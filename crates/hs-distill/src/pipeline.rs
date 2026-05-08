@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use hs_common::catalog::{read_catalog_entry, PageOffset};
 
 use crate::chunker::{chunk_markdown, ChunkerConfig};
@@ -17,11 +18,13 @@ use crate::types::EmbeddedChunk;
 /// filesystem-based catalog lookup — the canonical way for clients that
 /// already have the catalog entry (e.g. hs-mcp) to pass it in rather than
 /// relying on the distill server's local filesystem layout.
+#[allow(clippy::too_many_arguments)]
 pub async fn index_document(
     markdown_path: &Path,
     content: Option<&str>,
     catalog_override: Option<hs_common::catalog::CatalogEntry>,
     config: &DistillServerConfig,
+    collection_name: &str,
     embedder: &dyn Embedder,
     qdrant_client: &qdrant_client::Qdrant,
     on_progress: impl Fn(DistillProgress),
@@ -49,6 +52,22 @@ pub async fn index_document(
 
     if markdown.trim().is_empty() {
         tracing::warn!("Skipping empty document: {}", stem);
+        return Ok(0);
+    }
+
+    // Belt-and-suspenders: refuse markdown that looks like a paywall /
+    // anti-bot interstitial / stub even though the downloader and scribe
+    // already gate at ingress. A new origin-side anti-bot variant or a
+    // pre-rc.315 residual stub would otherwise be embedded as a 1-chunk
+    // vector and poison search. Returning Ok(0) routes through
+    // record_embedding_outcome_via → embedding_skip = zero_chunks_or_empty,
+    // which the reconciler treats as an intentional terminal skip.
+    if hs_common::html::is_paywall_html(&markdown) {
+        tracing::warn!(
+            stem,
+            len = markdown.len(),
+            "Skipping paywall/interstitial markdown stub"
+        );
         return Ok(0);
     }
 
@@ -170,9 +189,22 @@ pub async fn index_document(
         message: format!("Upserting {} chunks to Qdrant", total_chunks),
     });
 
-    // Upsert in batches of 500
-    for batch in embedded_chunks.chunks(500) {
-        qdrant::upsert_chunks(qdrant_client, &config.collection_name, batch).await?;
+    // Upsert in config-sized batches, several in flight at once — Qdrant
+    // handles concurrent writes to one collection cheaply, and the old
+    // sequential loop became the slow link once embed got faster.
+    let upsert_batch = config.qdrant_upsert_batch.max(1);
+    let parallelism = config.qdrant_upsert_parallelism.max(1);
+    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+    for batch in embedded_chunks.chunks(upsert_batch) {
+        in_flight.push(qdrant::upsert_chunks(qdrant_client, collection_name, batch));
+        if in_flight.len() >= parallelism {
+            if let Some(r) = in_flight.next().await {
+                r?;
+            }
+        }
+    }
+    while let Some(r) = in_flight.next().await {
+        r?;
     }
 
     on_progress(DistillProgress {

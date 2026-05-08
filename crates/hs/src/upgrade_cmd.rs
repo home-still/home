@@ -439,11 +439,15 @@ async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
 // ── Post-upgrade health check ───────────────────────────────────
 
 async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) {
-    let http = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let http = match hs_common::http::http_client(std::time::Duration::from_secs(10)) {
+        Ok(c) => c,
+        Err(e) => {
+            reporter.warn(&format!(
+                "skipping post-upgrade health check: HTTP client build failed: {e}"
+            ));
+            return;
+        }
+    };
 
     // Give containers a moment to start
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;

@@ -28,6 +28,16 @@ pub struct DocumentMeta {
     pub markdown_path: String,
     pub keywords: Vec<String>,
     pub topics: Vec<String>,
+    /// Personal-store category (`medical`, `financial`, …). Always `None` for
+    /// academic papers; `Some` only for documents ingested via `hs personal`.
+    pub category: Option<String>,
+    /// Original source format (`pdf`, `epub`, `docx`, `md`, `txt`). Set
+    /// alongside `category` by the personal pipeline.
+    pub original_format: Option<String>,
+    /// RFC3339 timestamp when the document was ingested. Set alongside
+    /// `category` by the personal pipeline; mirrors `downloaded_at` for
+    /// academic papers.
+    pub ingested_at: Option<String>,
 }
 
 /// A chunk of text with its position in the source markdown.
@@ -64,4 +74,24 @@ pub struct SparseVec {
 pub struct EmbeddedChunk {
     pub chunk: Chunk,
     pub embedding: EmbeddingOutput,
+}
+
+/// One match found by the per-chunk interstitial scrub — a poisoned point
+/// with enough context (doc_id + excerpt) for the operator to verify.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrubbedChunk {
+    pub doc_id: String,
+    pub excerpt: String,
+}
+
+/// Outcome of a per-chunk interstitial scrub pass. `total_scanned` is every
+/// point seen during the scroll; `matched` is points whose `chunk_text`
+/// matched a known interstitial signature; `deleted` equals `matched` when
+/// not in dry-run mode, otherwise 0.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrubReport {
+    pub total_scanned: u64,
+    pub matched: u64,
+    pub deleted: u64,
+    pub samples: Vec<ScrubbedChunk>,
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "hs-common", "paper"]
+members = ["crates/*", "hs-common", "paper", "personal"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -30,6 +30,10 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 uuid = { version = "1", features = ["v4", "v5"] }
 fastembed = "5"
 chrono = { version = "0.4", features = ["serde"] }
+duckdb = { version = "1", features = ["bundled"] }
+parquet = "58"
+arrow = "58"
+flate2 = "1"
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,1149 @@
+//! `hs pipeline` — cross-service pipeline operations.
+//!
+//! Commands here span scribe + distill + storage and are intentionally
+//! CLI-only (not exposed via MCP) because they wipe or mass-republish
+//! state that an agent should not invoke.
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use clap::Subcommand;
+use dialoguer::Confirm;
+use hs_common::reporter::Reporter;
+use hs_common::storage::Storage;
+use hs_distill::client::DistillClient;
+use hs_distill::config::DistillClientConfig;
+
+const CONFIRM_TOKEN: &str = "rebuild-from-papers";
+const DEFAULT_DISTILL_URL: &str = "http://localhost:7434";
+
+#[derive(Subcommand, Debug)]
+pub enum PipelineCmd {
+    /// Wipe derived state (markdown, catalog, Qdrant vectors) and republish
+    /// `papers.ingested` for every PDF/HTML under `papers/` so scribe + distill
+    /// rebuild the entire pipeline from source. Papers themselves are never
+    /// touched.
+    Rebuild {
+        /// Count what would be deleted / republished without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt. Still required:
+        /// `--confirm rebuild-from-papers` so scripted invocations can't
+        /// silently wipe the corpus.
+        #[arg(long)]
+        yes: bool,
+        /// Typed confirmation token. Must equal `rebuild-from-papers`.
+        /// Required when `--yes` is set; otherwise the interactive prompt
+        /// collects it.
+        #[arg(long)]
+        confirm: Option<String>,
+    },
+    /// Republish `papers.ingested` for every paper under `papers/` that does
+    /// not yet have a matching markdown file. Use after bringing a new scribe
+    /// worker online mid-rebuild so it can pitch in on the remaining queue.
+    /// Never deletes.
+    CatchUp {
+        /// Report what would be republished without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete the JetStream PAPERS and SCRIBE streams — all queued and
+    /// in-flight events are discarded. Use when a consumer is stuck
+    /// with a stale config (e.g. wrong ack_wait) and `create_or_update`
+    /// alone can't recover it. The worker daemons recreate the streams
+    /// on their next connect using the current `NatsConfig`. Follow
+    /// with `hs pipeline catch-up` to re-queue unconverted papers.
+    EventsReset,
+    /// Delete HTML paywall / loading-stub artifacts — source `.html`,
+    /// derived `.md`, and catalog `.yaml` — for every catalog entry
+    /// stamped `embedding_skip.reason = zero_chunks_or_empty` AND
+    /// produced by the html-parser. These are known-junk ingests
+    /// (PMC "Preparing to download" interstitials etc.) that a
+    /// newly-stricter pre-conversion guard now rejects at the door;
+    /// this removes the legacy residue so `hs pipeline catch-up`
+    /// stops re-queueing them.
+    PurgeSkipped {
+        /// Report what would be deleted without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete *embedded* poison: markdown stubs that passed the chunk-quality
+    /// floor and reached Qdrant as 1-chunk vectors but whose visible text
+    /// matches a known anti-bot / cookie-wall interstitial signature
+    /// (PMC "Checking your browser", Wiley "Cookies disabled", PMC
+    /// "Preparing to download"). Sister command to `purge-skipped`:
+    /// `purge-skipped` handles `embedding_skip = zero_chunks_or_empty`
+    /// stubs that never reached Qdrant; this handles the residue that
+    /// did. For each victim: deletes the Qdrant points by doc_id,
+    /// the markdown, the source PDF/HTML, and the catalog yaml.
+    PurgePoisoned {
+        /// Report what would be deleted without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Reap phantom catalog rows: entries with no downloaded paper, no
+    /// markdown, no embed record. These accumulate from intent-cataloged
+    /// stems where the download attempt failed silently or was abandoned
+    /// (Anna's Archive search-result placeholders, citation-graph DOIs
+    /// that never resolved). Inflates pipeline_drift but doesn't break
+    /// anything. Deletes the orphan catalog yaml only — there's nothing
+    /// else to delete.
+    ReapPhantoms {
+        /// Report what would be deleted without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Per-chunk parallel to `purge-poisoned`: scan every Qdrant point and
+    /// delete only those individual chunks whose `chunk_text` matches a
+    /// known interstitial / cookie-banner signature, leaving the rest of
+    /// each document intact. Use when a real paper has been contaminated
+    /// by a trailing cookie banner the conversion swept up — the doc is
+    /// worth keeping, just not that one chunk.
+    PurgePoisonedChunks {
+        /// Report what would be deleted without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Bulk-trigger `hs scribe reconvert` on every catalog row stamped
+    /// `conversion_failed` (any reason). Clears the failure stamp and
+    /// republishes `papers.ingested` so scribe + distill re-process the
+    /// paper with the current binary's logic. Use after deploying a
+    /// scribe-side fix (Phase 3 streaming abort, postprocess change, new
+    /// VLM, etc.) to measure the fix's recovery rate at corpus scale.
+    /// Honors --dry-run for a count-only inventory.
+    ReconvertFailed {
+        /// Report what would be reconverted without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Limit how many failed papers to reconvert. Useful for staged
+        /// rollouts (e.g. `--limit 25` to size up before committing the
+        /// full corpus). Default: all.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+}
+
+pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    match cmd {
+        PipelineCmd::Rebuild {
+            dry_run,
+            yes,
+            confirm,
+        } => cmd_rebuild(dry_run, yes, confirm, reporter).await,
+        PipelineCmd::CatchUp { dry_run } => cmd_catch_up(dry_run, reporter).await,
+        PipelineCmd::EventsReset => cmd_events_reset(reporter).await,
+        PipelineCmd::PurgeSkipped { dry_run, yes } => {
+            cmd_purge_skipped(dry_run, yes, reporter).await
+        }
+        PipelineCmd::PurgePoisoned { dry_run, yes } => {
+            cmd_purge_poisoned(dry_run, yes, reporter).await
+        }
+        PipelineCmd::PurgePoisonedChunks { dry_run, yes } => {
+            cmd_purge_poisoned_chunks(dry_run, yes, reporter).await
+        }
+        PipelineCmd::ReapPhantoms { dry_run, yes } => {
+            cmd_reap_phantoms(dry_run, yes, reporter).await
+        }
+        PipelineCmd::ReconvertFailed {
+            dry_run,
+            yes,
+            limit,
+        } => cmd_reconvert_failed(dry_run, yes, limit, reporter).await,
+    }
+}
+
+async fn cmd_events_reset(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let bus_cfg = cfg.events.clone();
+    if bus_cfg.backend != hs_common::event_bus::EventsBackend::Nats {
+        reporter.warn("events.backend is not `nats` — nothing to reset.");
+        return Ok(());
+    }
+    let nats =
+        hs_common::event_bus::nats::NatsBus::connect(hs_common::event_bus::nats::NatsConfig {
+            url: bus_cfg.nats.url.clone(),
+            ack_wait: std::time::Duration::from_secs(bus_cfg.nats.ack_wait_secs),
+            max_deliver: bus_cfg.nats.max_deliver,
+            max_age: std::time::Duration::from_secs(bus_cfg.nats.max_age_secs),
+            max_ack_pending: bus_cfg.nats.max_ack_pending,
+        })
+        .await
+        .context("connecting to NATS for stream reset")?;
+    nats.reset_streams()
+        .await
+        .context("reset JetStream streams")?;
+    reporter
+        .finish("Deleted JetStream streams PAPERS and SCRIBE. Next worker connect recreates them.");
+    Ok(())
+}
+
+async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+
+    let papers = storage.list("papers").await.context("list papers prefix")?;
+    let markdown = storage
+        .list("markdown")
+        .await
+        .context("list markdown prefix")?;
+
+    use std::collections::HashSet;
+    let md_stems: HashSet<String> = markdown
+        .iter()
+        .filter_map(|o| {
+            let name = o.key.rsplit('/').next()?;
+            if name.starts_with("._") || !name.ends_with(".md") {
+                return None;
+            }
+            Some(name.trim_end_matches(".md").to_string())
+        })
+        .collect();
+
+    let mut to_republish: Vec<String> = Vec::new();
+    for obj in &papers {
+        let name = match obj.key.rsplit('/').next() {
+            Some(n) if !n.starts_with("._") => n,
+            _ => continue,
+        };
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((s, e)) if e == "pdf" || e == "html" => (s, e),
+            _ => continue,
+        };
+        if md_stems.contains(stem) {
+            continue;
+        }
+        let _ = ext;
+        to_republish.push(obj.key.clone());
+    }
+
+    reporter.status(
+        "Papers",
+        &format!(
+            "{} total, {} have markdown, {} pending republish",
+            papers.len(),
+            md_stems.len(),
+            to_republish.len()
+        ),
+    );
+
+    if dry_run {
+        reporter.finish("Dry-run complete — no events published.");
+        return Ok(());
+    }
+    if to_republish.is_empty() {
+        reporter.finish("Nothing to do — every paper already has markdown.");
+        return Ok(());
+    }
+
+    let bus = cfg
+        .build_event_bus()
+        .await
+        .context("building event bus for papers.ingested publish")?;
+
+    let mut published = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    for (i, key) in to_republish.iter().enumerate() {
+        let payload = serde_json::json!({
+            "key": key,
+            "source": "hs pipeline catch-up",
+        });
+        match bus
+            .publish(
+                "papers.ingested",
+                serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
+            )
+            .await
+        {
+            Ok(()) => published += 1,
+            Err(e) => errors.push(format!("publish/{key}: {e}")),
+        }
+        if (i + 1) % 500 == 0 {
+            reporter.status(
+                "Republish",
+                &format!("published {published}/{}", to_republish.len()),
+            );
+        }
+    }
+
+    reporter.finish(&format!(
+        "Catch-up queued — papers_republished={published} errors={}",
+        errors.len()
+    ));
+    for e in errors.iter().take(10) {
+        eprintln!("  error: {e}");
+    }
+    if errors.len() > 10 {
+        eprintln!("  ... and {} more", errors.len() - 10);
+    }
+    Ok(())
+}
+
+async fn cmd_rebuild(
+    dry_run: bool,
+    yes: bool,
+    confirm: Option<String>,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+    let server_url = cfg
+        .servers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_DISTILL_URL.to_string());
+    let client = DistillClient::new(&server_url)?;
+
+    // Inventory: used for both dry-run report and live-run "before" snapshot.
+    let inv = inventory(&storage, &client).await?;
+    print_summary(&inv, reporter);
+
+    if dry_run {
+        reporter.finish("Dry-run complete — no state changed.");
+        return Ok(());
+    }
+
+    // Confirmation gate: either --yes with the right --confirm token, or
+    // interactive typed prompt that asks for the same token.
+    let confirmed = match (yes, confirm.as_deref()) {
+        (true, Some(CONFIRM_TOKEN)) => true,
+        (true, Some(other)) => {
+            anyhow::bail!("--confirm must be `{CONFIRM_TOKEN}` when --yes is set (got `{other}`)");
+        }
+        (true, None) => {
+            anyhow::bail!("--yes requires --confirm {CONFIRM_TOKEN}");
+        }
+        (false, _) => {
+            eprintln!();
+            eprintln!(
+                "This will delete {} markdown objects, {} catalog YAMLs, \
+                 and drop the Qdrant collection ({} points across {} docs).",
+                inv.markdown_count, inv.catalog_count, inv.qdrant_points, inv.qdrant_docs
+            );
+            eprintln!(
+                "{} papers under `papers/` will be republished for re-ingestion.",
+                inv.paper_keys.len()
+            );
+            eprintln!("Papers themselves are NOT touched.");
+            eprintln!();
+            let accept = Confirm::new()
+                .with_prompt("Proceed? (this cannot be undone — expect hours of scribe work)")
+                .default(false)
+                .interact()?;
+            if !accept {
+                reporter.finish("Aborted — no state changed.");
+                return Ok(());
+            }
+            // Second gate: typed token.
+            let typed: String = dialoguer::Input::new()
+                .with_prompt(format!("Type `{CONFIRM_TOKEN}` to confirm"))
+                .interact_text()?;
+            if typed.trim() != CONFIRM_TOKEN {
+                anyhow::bail!("confirmation token mismatch — aborted, no state changed");
+            }
+            true
+        }
+    };
+    debug_assert!(confirmed);
+
+    let bus = cfg
+        .build_event_bus()
+        .await
+        .context("building event bus for papers.ingested publish")?;
+
+    let started_at = chrono::Utc::now().to_rfc3339();
+    reporter.status("Pipeline rebuild", &format!("started at {started_at}"));
+
+    // 1. Drop + recreate Qdrant collection.
+    reporter.status("Qdrant", "drop + recreate collection");
+    let qdrant_deleted = client
+        .reset_collection()
+        .await
+        .context("distill reset_collection")?;
+
+    // 2. Delete every markdown object.
+    let mut markdown_deleted = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    for (i, obj) in inv.markdown_objs.iter().enumerate() {
+        match storage.delete(&obj.key).await {
+            Ok(()) => markdown_deleted += 1,
+            Err(e) => errors.push(format!("markdown-delete/{}: {e}", obj.key)),
+        }
+        if (i + 1) % 500 == 0 {
+            reporter.status(
+                "Markdown",
+                &format!("deleted {markdown_deleted}/{}", inv.markdown_count),
+            );
+        }
+    }
+
+    // 3. Delete every catalog YAML.
+    let mut catalog_deleted = 0u64;
+    for (i, obj) in inv.catalog_objs.iter().enumerate() {
+        match storage.delete(&obj.key).await {
+            Ok(()) => catalog_deleted += 1,
+            Err(e) => errors.push(format!("catalog-delete/{}: {e}", obj.key)),
+        }
+        if (i + 1) % 500 == 0 {
+            reporter.status(
+                "Catalog",
+                &format!("deleted {catalog_deleted}/{}", inv.catalog_count),
+            );
+        }
+    }
+
+    // 4. Republish papers.ingested for every paper.
+    let mut papers_republished = 0u64;
+    for (i, key) in inv.paper_keys.iter().enumerate() {
+        let payload = serde_json::json!({
+            "key": key,
+            "source": "hs pipeline rebuild",
+        });
+        match bus
+            .publish(
+                "papers.ingested",
+                serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
+            )
+            .await
+        {
+            Ok(()) => papers_republished += 1,
+            Err(e) => errors.push(format!("publish/{key}: {e}")),
+        }
+        if (i + 1) % 500 == 0 {
+            reporter.status(
+                "Republish",
+                &format!("published {papers_republished}/{}", inv.paper_keys.len()),
+            );
+        }
+    }
+
+    reporter.finish(&format!(
+        "Pipeline rebuild queued — markdown_deleted={markdown_deleted} \
+         catalog_deleted={catalog_deleted} qdrant_deleted={qdrant_deleted} \
+         papers_republished={papers_republished} errors={} \
+         (watch `hs status` for scribe + distill catch-up)",
+        errors.len()
+    ));
+
+    if !errors.is_empty() {
+        for e in errors.iter().take(10) {
+            eprintln!("  error: {e}");
+        }
+        if errors.len() > 10 {
+            eprintln!("  ... and {} more", errors.len() - 10);
+        }
+    }
+    Ok(())
+}
+
+struct Inventory {
+    paper_keys: Vec<String>,
+    markdown_objs: Vec<hs_common::storage::ObjectMeta>,
+    markdown_count: u64,
+    catalog_objs: Vec<hs_common::storage::ObjectMeta>,
+    catalog_count: u64,
+    qdrant_docs: u64,
+    qdrant_points: u64,
+}
+
+async fn inventory(storage: &Arc<dyn Storage>, client: &DistillClient) -> Result<Inventory> {
+    let papers = storage.list("papers").await.context("list papers prefix")?;
+    let paper_keys: Vec<String> = papers
+        .into_iter()
+        .filter_map(|o| {
+            let name = o.key.rsplit('/').next()?;
+            if name.starts_with("._") {
+                return None;
+            }
+            let ext = name.rsplit_once('.').map(|(_, e)| e)?;
+            if ext == "pdf" || ext == "html" {
+                Some(o.key)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let markdown_objs = storage
+        .list("markdown")
+        .await
+        .context("list markdown prefix")?;
+    let markdown_count = markdown_objs.len() as u64;
+
+    let catalog_objs = storage
+        .list("catalog")
+        .await
+        .context("list catalog prefix")?;
+    let catalog_count = catalog_objs.len() as u64;
+
+    let qdrant_ids = client.list_docs(u64::MAX).await.unwrap_or_default();
+    let qdrant_docs = qdrant_ids.len() as u64;
+    let qdrant_points = client.status().await.map(|s| s.points_count).unwrap_or(0);
+
+    Ok(Inventory {
+        paper_keys,
+        markdown_objs,
+        markdown_count,
+        catalog_objs,
+        catalog_count,
+        qdrant_docs,
+        qdrant_points,
+    })
+}
+
+fn print_summary(inv: &Inventory, reporter: &Arc<dyn Reporter>) {
+    reporter.status("Papers (keep)", &format!("{}", inv.paper_keys.len()));
+    reporter.status("Markdown to delete", &format!("{}", inv.markdown_count));
+    reporter.status("Catalog to delete", &format!("{}", inv.catalog_count));
+    reporter.status(
+        "Qdrant to purge",
+        &format!("{} points / {} docs", inv.qdrant_points, inv.qdrant_docs),
+    );
+    reporter.status("Papers to republish", &format!("{}", inv.paper_keys.len()));
+}
+
+async fn cmd_purge_skipped(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+
+    reporter.status("Scan", "catalog for embedding_skip stubs");
+    let triples = hs_common::catalog::list_catalog_entries_via(&*storage, "catalog")
+        .await
+        .context("list catalog entries")?;
+
+    // A "junk HTML stub" is an entry whose distill decision was
+    // `zero_chunks_or_empty` AND whose converter was `html-parser`.
+    // Restricting on both fields keeps this from ever nuking a PDF whose
+    // extraction legitimately failed — a PDF path would use `scribe-vlm`.
+    struct Victim {
+        stem: String,
+        catalog_key: String,
+    }
+    let victims: Vec<Victim> = triples
+        .into_iter()
+        .filter_map(|(stem, obj, entry)| {
+            let skip = entry.embedding_skip.as_ref()?;
+            if skip.reason != "zero_chunks_or_empty" {
+                return None;
+            }
+            let conv = entry.conversion.as_ref()?;
+            if conv.server != "html-parser" {
+                return None;
+            }
+            Some(Victim {
+                stem,
+                catalog_key: obj.key,
+            })
+        })
+        .collect();
+
+    reporter.status(
+        "Victims",
+        &format!("{} HTML stubs identified", victims.len()),
+    );
+    if victims.is_empty() {
+        reporter.finish("Nothing to purge — no HTML stubs stamped `zero_chunks_or_empty`.");
+        return Ok(());
+    }
+
+    for v in victims.iter().take(5) {
+        reporter.status("Sample", &v.stem);
+    }
+    if victims.len() > 5 {
+        reporter.status("...", &format!("+{} more", victims.len() - 5));
+    }
+
+    if dry_run {
+        reporter.finish("Dry-run complete — no state changed.");
+        return Ok(());
+    }
+
+    if !yes {
+        let accept = Confirm::new()
+            .with_prompt(format!(
+                "Delete {} HTML stubs (source .html + .md + catalog .yaml)?",
+                victims.len()
+            ))
+            .default(false)
+            .interact()?;
+        if !accept {
+            reporter.finish("Aborted — no state changed.");
+            return Ok(());
+        }
+    }
+
+    let mut md_deleted = 0u64;
+    let mut cat_deleted = 0u64;
+    let mut src_deleted = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, v) in victims.iter().enumerate() {
+        // Catalog yaml — we already have the exact key from the listing.
+        match storage.delete(&v.catalog_key).await {
+            Ok(()) => cat_deleted += 1,
+            Err(e) => errors.push(format!("catalog/{}: {e}", v.stem)),
+        }
+
+        // Markdown — always `markdown/{shard}/{stem}.md`.
+        let md_key = hs_common::markdown::markdown_storage_key(&v.stem);
+        match storage.delete(&md_key).await {
+            Ok(()) => md_deleted += 1,
+            Err(e) => errors.push(format!("markdown/{}: {e}", v.stem)),
+        }
+
+        // Source HTML — extension may be `html` or `htm`. Try both, count
+        // one success per stem. `delete` on a missing key is not an error.
+        let mut src_hit = false;
+        for ext in ["html", "htm"] {
+            let key = format!("papers/{}", hs_common::sharded_key(&v.stem, ext));
+            if storage.exists(&key).await.unwrap_or(false) {
+                match storage.delete(&key).await {
+                    Ok(()) => {
+                        src_hit = true;
+                        break;
+                    }
+                    Err(e) => errors.push(format!("papers/{}.{ext}: {e}", v.stem)),
+                }
+            }
+        }
+        if src_hit {
+            src_deleted += 1;
+        }
+
+        if (i + 1) % 50 == 0 {
+            reporter.status("Progress", &format!("purged {}/{}", i + 1, victims.len()));
+        }
+    }
+
+    reporter.finish(&format!(
+        "Purged HTML stubs — catalog={cat_deleted} markdown={md_deleted} source={src_deleted} errors={}",
+        errors.len()
+    ));
+    for e in errors.iter().take(10) {
+        eprintln!("  error: {e}");
+    }
+    if errors.len() > 10 {
+        eprintln!("  ... and {} more", errors.len() - 10);
+    }
+    Ok(())
+}
+
+async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    // Real research papers convert to >5 KB of markdown; nothing legitimate
+    // lives under this floor. Skipping anything larger keeps the GET cost
+    // bounded to a few hundred objects rather than the full 4k+ corpus.
+    const MAX_STUB_BYTES: u64 = 5_000;
+
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+    let server_url = cfg
+        .servers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_DISTILL_URL.to_string());
+    let client = DistillClient::new(&server_url)?;
+
+    reporter.status("Scan", "markdown for known interstitial signatures");
+    let markdown_objs = storage
+        .list("markdown")
+        .await
+        .context("list markdown prefix")?;
+
+    let small: Vec<_> = markdown_objs
+        .into_iter()
+        .filter(|m| m.size <= MAX_STUB_BYTES && m.key.ends_with(".md"))
+        .collect();
+    reporter.status(
+        "Candidates",
+        &format!("{} markdowns ≤ {} bytes", small.len(), MAX_STUB_BYTES),
+    );
+
+    struct Victim {
+        stem: String,
+        markdown_key: String,
+        size: u64,
+    }
+
+    let mut victims: Vec<Victim> = Vec::new();
+    let mut read_errors = 0u64;
+    for (i, obj) in small.iter().enumerate() {
+        let bytes = match storage.get(&obj.key).await {
+            Ok(b) => b,
+            Err(_) => {
+                read_errors += 1;
+                continue;
+            }
+        };
+        let content = match std::str::from_utf8(&bytes) {
+            Ok(s) => s,
+            // Markdown that isn't UTF-8 is broken regardless of interstitial
+            // status, but we don't delete on UTF-8 failure alone — that's
+            // outside this command's scope.
+            Err(_) => continue,
+        };
+        if hs_common::html::is_known_interstitial(content) {
+            let name = obj.key.rsplit('/').next().unwrap_or(&obj.key);
+            let stem = name.trim_end_matches(".md").to_string();
+            victims.push(Victim {
+                stem,
+                markdown_key: obj.key.clone(),
+                size: obj.size,
+            });
+        }
+        if (i + 1) % 200 == 0 {
+            reporter.status("Scan", &format!("read {}/{}", i + 1, small.len()));
+        }
+    }
+
+    reporter.status(
+        "Victims",
+        &format!(
+            "{} interstitial markdowns identified (read errors: {})",
+            victims.len(),
+            read_errors
+        ),
+    );
+    if victims.is_empty() {
+        reporter.finish("Nothing to purge — no known-interstitial markdowns found.");
+        return Ok(());
+    }
+
+    for v in victims.iter().take(5) {
+        reporter.status("Sample", &format!("{}B  {}", v.size, v.stem));
+    }
+    if victims.len() > 5 {
+        reporter.status("...", &format!("+{} more", victims.len() - 5));
+    }
+
+    if dry_run {
+        reporter.finish("Dry-run complete — no state changed.");
+        return Ok(());
+    }
+
+    if !yes {
+        let accept = Confirm::new()
+            .with_prompt(format!(
+                "Delete {} interstitials (Qdrant points + markdown + source + catalog)?",
+                victims.len()
+            ))
+            .default(false)
+            .interact()?;
+        if !accept {
+            reporter.finish("Aborted — no state changed.");
+            return Ok(());
+        }
+    }
+
+    let mut qdrant_deleted = 0u64;
+    let mut md_deleted = 0u64;
+    let mut cat_deleted = 0u64;
+    let mut src_deleted = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, v) in victims.iter().enumerate() {
+        // Qdrant first — if this fails, leaving the markdown/source/catalog
+        // in place lets a retry hit the same victim again. The reverse
+        // (delete files first, fail Qdrant) leaves a phantom 1-chunk doc
+        // that the reconciler can never reach.
+        match client.delete_doc(&v.stem).await {
+            Ok(_) => qdrant_deleted += 1,
+            Err(e) => errors.push(format!("qdrant/{}: {e}", v.stem)),
+        }
+
+        // Markdown
+        match storage.delete(&v.markdown_key).await {
+            Ok(()) => md_deleted += 1,
+            Err(e) => errors.push(format!("markdown/{}: {e}", v.stem)),
+        }
+
+        // Catalog yaml
+        let cat_key = format!("catalog/{}", hs_common::sharded_key(&v.stem, "yaml"));
+        match storage.delete(&cat_key).await {
+            Ok(()) => cat_deleted += 1,
+            Err(e) => errors.push(format!("catalog/{}: {e}", v.stem)),
+        }
+
+        // Source — extension may be html/htm/pdf, and a single stem can
+        // legitimately have BOTH a poisoned HTML (the interstitial scribe
+        // captured) AND a real downloaded PDF. The original implementation
+        // broke after the first match and left orphan PDFs in S3 with no
+        // catalog/markdown/Qdrant — invisible to the pipeline and only
+        // recoverable via `catch-up`. Delete every matching extension.
+        let mut src_hit = false;
+        for ext in ["html", "htm", "pdf"] {
+            let key = format!("papers/{}", hs_common::sharded_key(&v.stem, ext));
+            if storage.exists(&key).await.unwrap_or(false) {
+                match storage.delete(&key).await {
+                    Ok(()) => {
+                        src_hit = true;
+                    }
+                    Err(e) => errors.push(format!("papers/{}.{ext}: {e}", v.stem)),
+                }
+            }
+        }
+        if src_hit {
+            src_deleted += 1;
+        }
+
+        if (i + 1) % 50 == 0 {
+            reporter.status("Progress", &format!("purged {}/{}", i + 1, victims.len()));
+        }
+    }
+
+    reporter.finish(&format!(
+        "Purged interstitials — qdrant={qdrant_deleted} markdown={md_deleted} catalog={cat_deleted} source={src_deleted} errors={}",
+        errors.len()
+    ));
+    for e in errors.iter().take(10) {
+        eprintln!("  error: {e}");
+    }
+    if errors.len() > 10 {
+        eprintln!("  ... and {} more", errors.len() - 10);
+    }
+    Ok(())
+}
+
+async fn cmd_reap_phantoms(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+
+    reporter.status("Scan", "catalog for phantom rows");
+    let triples = hs_common::catalog::list_catalog_entries_via(&*storage, "catalog")
+        .await
+        .context("list catalog entries")?;
+
+    // A phantom is a catalog row with no downloaded paper, no markdown,
+    // no conversion attempt, no embedding outcome, no repair record.
+    // It only exists because some intent-cataloged path (Anna's Archive
+    // search-result, citation-graph DOI, manually-added stem) wrote a
+    // yaml without ever materializing a file.
+    struct Phantom {
+        stem: String,
+        catalog_key: String,
+    }
+    let phantoms: Vec<Phantom> = triples
+        .into_iter()
+        .filter_map(|(stem, obj, entry)| {
+            let no_download = entry.downloaded_at.is_none() && entry.pdf_path.is_none();
+            let no_markdown = entry.markdown_path.is_none() && entry.conversion.is_none();
+            let no_embed = entry.embedding.is_none() && entry.embedding_skip.is_none();
+            let no_repair = entry.repair.is_none();
+            let no_failure = entry.conversion_failed.is_none();
+            if no_download && no_markdown && no_embed && no_repair && no_failure {
+                Some(Phantom {
+                    stem,
+                    catalog_key: obj.key,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    reporter.status(
+        "Phantoms",
+        &format!("{} catalog rows have no underlying state", phantoms.len()),
+    );
+    if phantoms.is_empty() {
+        reporter.finish("Nothing to reap — no phantom catalog rows.");
+        return Ok(());
+    }
+
+    for p in phantoms.iter().take(5) {
+        reporter.status("Sample", &p.stem);
+    }
+    if phantoms.len() > 5 {
+        reporter.status("...", &format!("+{} more", phantoms.len() - 5));
+    }
+
+    if dry_run {
+        reporter.finish("Dry-run complete — no state changed.");
+        return Ok(());
+    }
+
+    if !yes {
+        let accept = Confirm::new()
+            .with_prompt(format!(
+                "Delete {} phantom catalog rows? (no other state to clean — these rows reference no files)",
+                phantoms.len()
+            ))
+            .default(false)
+            .interact()?;
+        if !accept {
+            reporter.finish("Aborted — no state changed.");
+            return Ok(());
+        }
+    }
+
+    let mut deleted = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    for (i, p) in phantoms.iter().enumerate() {
+        match storage.delete(&p.catalog_key).await {
+            Ok(()) => deleted += 1,
+            Err(e) => errors.push(format!("catalog/{}: {e}", p.stem)),
+        }
+        if (i + 1) % 50 == 0 {
+            reporter.status("Progress", &format!("reaped {}/{}", i + 1, phantoms.len()));
+        }
+    }
+
+    reporter.finish(&format!(
+        "Reaped phantoms — catalog={deleted} errors={}",
+        errors.len()
+    ));
+    for e in errors.iter().take(10) {
+        eprintln!("  error: {e}");
+    }
+    if errors.len() > 10 {
+        eprintln!("  ... and {} more", errors.len() - 10);
+    }
+    Ok(())
+}
+
+async fn cmd_purge_poisoned_chunks(
+    dry_run: bool,
+    yes: bool,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let server_url = cfg
+        .servers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_DISTILL_URL.to_string());
+    let client = DistillClient::new(&server_url)?;
+
+    // First pass: dry-run scan so the user can see what would be deleted.
+    reporter.status("Scan", "Qdrant points for interstitial signatures");
+    let preview = client
+        .scrub_interstitials(true)
+        .await
+        .context("scrub-interstitials dry-run failed")?;
+
+    reporter.status(
+        "Scan complete",
+        &format!(
+            "{} points scanned, {} matched",
+            preview.total_scanned, preview.matched
+        ),
+    );
+    for s in preview.samples.iter().take(5) {
+        reporter.status(
+            "Sample",
+            &format!("{}  «{}…»", s.doc_id, s.excerpt.replace('\n', " ")),
+        );
+    }
+    if preview.samples.len() > 5 {
+        reporter.status(
+            "...",
+            &format!("+{} more samples", preview.samples.len() - 5),
+        );
+    }
+
+    if preview.matched == 0 {
+        reporter.finish("Nothing to scrub — no interstitial chunks found in Qdrant.");
+        return Ok(());
+    }
+
+    if dry_run {
+        reporter.finish("Dry-run complete — no Qdrant points deleted.");
+        return Ok(());
+    }
+
+    if !yes {
+        let accept = Confirm::new()
+            .with_prompt(format!(
+                "Delete {} interstitial chunks from Qdrant? (markdown / source / catalog are NOT touched)",
+                preview.matched
+            ))
+            .default(false)
+            .interact()?;
+        if !accept {
+            reporter.finish("Aborted — no state changed.");
+            return Ok(());
+        }
+    }
+
+    let report = client
+        .scrub_interstitials(false)
+        .await
+        .context("scrub-interstitials destructive call failed")?;
+
+    reporter.finish(&format!(
+        "Scrubbed Qdrant — scanned={} matched={} deleted={}",
+        report.total_scanned, report.matched, report.deleted
+    ));
+    Ok(())
+}
+
+async fn cmd_reconvert_failed(
+    dry_run: bool,
+    yes: bool,
+    limit: Option<usize>,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    const PAPERS_PREFIX: &str = "papers";
+    const CATALOG_PREFIX: &str = "catalog";
+    const CANDIDATE_EXTS: &[&str] = &["pdf", "html", "htm", "epub"];
+
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+
+    reporter.status("Scan", "catalog for conversion_failed stamps");
+    let triples = hs_common::catalog::list_catalog_entries_via(&*storage, CATALOG_PREFIX)
+        .await
+        .context("list catalog entries")?;
+
+    let mut victims: Vec<(String, String)> = triples
+        .into_iter()
+        .filter_map(|(stem, _obj, entry)| {
+            entry
+                .conversion_failed
+                .as_ref()
+                .map(|f| (stem, f.reason.clone()))
+        })
+        .collect();
+    let total_found = victims.len();
+    if let Some(n) = limit {
+        victims.truncate(n);
+    }
+
+    reporter.status(
+        "Found",
+        &format!(
+            "{total_found} papers with conversion_failed stamp{}",
+            if let Some(n) = limit {
+                format!(" (limiting to {n})")
+            } else {
+                String::new()
+            }
+        ),
+    );
+
+    // Group by reason so the operator can spot a single dominant failure
+    // mode at a glance before kicking off the bulk republish.
+    let mut by_reason: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (_, reason) in &victims {
+        *by_reason.entry(reason.clone()).or_default() += 1;
+    }
+    for (r, n) in &by_reason {
+        reporter.status("Reason", &format!("{n:>4} × {r}"));
+    }
+
+    if victims.is_empty() {
+        reporter.finish("Nothing to reconvert.");
+        return Ok(());
+    }
+    if dry_run {
+        reporter.finish("Dry-run complete.");
+        return Ok(());
+    }
+
+    if !yes {
+        let accept = Confirm::new()
+            .with_prompt(format!(
+                "Clear conversion_failed and republish papers.ingested for {} papers? \
+                 (no destructive op — only the failure stamp clears so the watcher reprocesses)",
+                victims.len()
+            ))
+            .default(false)
+            .interact()?;
+        if !accept {
+            reporter.finish("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let bus = cfg
+        .build_event_bus()
+        .await
+        .context("building event bus for papers.ingested publish")?;
+
+    let mut succeeded = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    for (i, (stem, _reason)) in victims.iter().enumerate() {
+        match reconvert_one(
+            &*storage,
+            bus.as_ref(),
+            stem,
+            PAPERS_PREFIX,
+            CATALOG_PREFIX,
+            CANDIDATE_EXTS,
+        )
+        .await
+        {
+            Ok(()) => succeeded += 1,
+            Err(e) => errors.push(format!("{stem}: {e:#}")),
+        }
+        if (i + 1) % 25 == 0 {
+            reporter.status("Progress", &format!("queued {}/{}", i + 1, victims.len()));
+        }
+    }
+
+    reporter.finish(&format!(
+        "Reconvert queued: succeeded={succeeded} errors={}",
+        errors.len()
+    ));
+    for e in errors.iter().take(10) {
+        eprintln!("  error: {e}");
+    }
+    if errors.len() > 10 {
+        eprintln!("  ... and {} more", errors.len() - 10);
+    }
+    Ok(())
+}
+
+/// Per-stem reconvert: clear stamps, locate source, republish event.
+/// Mirrors the body of `hs scribe reconvert <stem>` so a corpus-scale run
+/// gets the same semantics as the single-stem CLI flow without coupling
+/// the two crates' command modules.
+async fn reconvert_one(
+    storage: &dyn hs_common::storage::Storage,
+    bus: &dyn hs_common::event_bus::EventBus,
+    stem: &str,
+    papers_prefix: &str,
+    catalog_prefix: &str,
+    candidate_exts: &[&str],
+) -> Result<()> {
+    let mut entry = hs_common::catalog::read_catalog_entry_via(storage, catalog_prefix, stem)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no catalog row for stem"))?;
+
+    let mut source_key: Option<String> = None;
+    for ext in candidate_exts {
+        let key = format!("{papers_prefix}/{}", hs_common::sharded_key(stem, ext));
+        if storage.exists(&key).await? {
+            source_key = Some(key);
+            break;
+        }
+    }
+    let source_key = source_key
+        .ok_or_else(|| anyhow::anyhow!("no source file under {papers_prefix}/ for stem"))?;
+
+    entry.conversion = None;
+    entry.conversion_failed = None;
+    hs_common::catalog::write_catalog_entry_via(storage, catalog_prefix, stem, &entry).await?;
+
+    let payload = serde_json::json!({
+        "key": source_key,
+        "source": "hs pipeline reconvert-failed",
+    });
+    let bytes = serde_json::to_vec(&payload)?;
+    bus.publish("papers.ingested", &bytes).await?;
+    Ok(())
+}

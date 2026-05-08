@@ -5,21 +5,10 @@ use async_trait::async_trait;
 use crate::error::DistillError;
 use crate::types::EmbeddingOutput;
 
-/// Compute device for embedding inference.
-#[derive(Debug, Clone)]
-pub enum ComputeDevice {
-    Cpu,
-    Cuda,
-}
-
-impl std::fmt::Display for ComputeDevice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ComputeDevice::Cpu => write!(f, "Cpu"),
-            ComputeDevice::Cuda => write!(f, "Cuda"),
-        }
-    }
-}
+// Re-export so existing `use crate::embed::ComputeDevice` paths continue
+// to compile. Canonical home of the enum is `crate::config`, where it
+// is referenced by `EmbeddingConfig::compute_device`.
+pub use crate::config::ComputeDevice;
 
 /// Trait for embedding backends.
 #[async_trait]
@@ -30,35 +19,8 @@ pub trait Embedder: Send + Sync {
     fn device(&self) -> &ComputeDevice;
 }
 
-/// Detect available compute device at startup.
-/// Checks that nvidia-smi succeeds AND reports at least one GPU.
-pub fn detect_device() -> ComputeDevice {
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=name", "--format=csv,noheader"])
-        .output()
-        .ok();
-
-    match output {
-        Some(o) if o.status.success() => {
-            let gpu_name = String::from_utf8_lossy(&o.stdout);
-            let gpu_name = gpu_name.trim();
-            if gpu_name.is_empty() {
-                tracing::warn!("nvidia-smi succeeded but reported no GPUs");
-                ComputeDevice::Cpu
-            } else {
-                tracing::info!("Detected GPU: {gpu_name}");
-                ComputeDevice::Cuda
-            }
-        }
-        _ => {
-            tracing::info!("No NVIDIA GPU detected (nvidia-smi not found or failed)");
-            ComputeDevice::Cpu
-        }
-    }
-}
-
-/// Wraps the selected embedder (GPU or CPU). No silent fallback —
-/// if the configured device doesn't work, startup fails.
+/// Wraps the selected embedder. The name `FallbackEmbedder` is historical;
+/// there is no fallback path — if CUDA fails, startup fails.
 pub struct FallbackEmbedder {
     primary: Box<dyn Embedder>,
 }
@@ -68,26 +30,13 @@ impl FallbackEmbedder {
         Self { primary }
     }
 
-    /// Build the right embedder configuration based on detected device.
-    /// If GPU is detected, CUDA must actually work — no silent CPU fallback.
+    /// Build the embedder strictly according to the configured device.
+    /// `OnnxEmbedder::new` verifies the CUDA probe succeeds; failure is
+    /// propagated — no silent CPU fallback (ONE PATH).
     pub fn build(config: &crate::config::EmbeddingConfig) -> Result<Self, DistillError> {
-        let device = detect_device();
-        tracing::info!("Detected compute device: {}", device);
-
-        match device {
-            ComputeDevice::Cuda => {
-                // OnnxEmbedder::new will verify CUDA actually works (probe embedding).
-                // If CUDA fails, it returns an error — no silent fallback.
-                let primary = onnx::OnnxEmbedder::new(config, ComputeDevice::Cuda)?;
-                tracing::info!("GPU embedder initialized (no CPU fallback)");
-                Ok(Self::new(Box::new(primary), None))
-            }
-            ComputeDevice::Cpu => {
-                let primary = onnx::OnnxEmbedder::new(config, ComputeDevice::Cpu)?;
-                tracing::info!("CPU embedder initialized");
-                Ok(Self::new(Box::new(primary), None))
-            }
-        }
+        tracing::info!("Using configured compute device: {}", config.compute_device);
+        let primary = onnx::OnnxEmbedder::new(config, config.compute_device.clone())?;
+        Ok(Self::new(Box::new(primary), None))
     }
 }
 

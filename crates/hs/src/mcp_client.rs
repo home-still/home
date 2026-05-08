@@ -26,8 +26,28 @@ pub struct McpClient {
 }
 
 impl McpClient {
-    /// Build a client from cached cloud creds and complete the MCP handshake.
+    /// Build a client and complete the MCP handshake. Two endpoint paths:
+    ///
+    /// - `HS_MCP_URL` env var set: use it verbatim, no auth. For same-host
+    ///   and LAN-direct operation where round-tripping through the cloud
+    ///   gateway (and depending on a 7-day refresh token) is unnecessary.
+    ///   Example: `HS_MCP_URL=http://localhost:7445/mcp`.
+    /// - Otherwise: load cached cloud creds and route through the gateway.
     pub async fn from_default_creds() -> Result<Self> {
+        if let Ok(direct) = std::env::var("HS_MCP_URL") {
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .context("build direct-mode http client for MCP")?;
+            let mut client = Self {
+                http,
+                endpoint: direct,
+                session_id: None,
+            };
+            client.handshake().await?;
+            return Ok(client);
+        }
+
         let auth = AuthenticatedClient::from_default_path()
             .context("load cloud credentials (hs cloud enroll --gateway <url>)")?;
         let http = auth

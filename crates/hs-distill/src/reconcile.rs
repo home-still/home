@@ -39,7 +39,6 @@ pub enum Classification {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatalogState {
     pub has_embedding_stamp: bool,
-    pub conversion_failed: bool,
     /// Reason from `embedding_skip`, if any. `"zero_chunks_or_empty"` is an
     /// intentional skip (treat as Ok). `"embed_failed: ..."` is a dropped-
     /// event marker the reconciler itself writes — these must remain
@@ -72,14 +71,11 @@ fn classify(in_qdrant: bool, state: &CatalogState) -> Classification {
         (true, true) => Classification::Ok,
         (true, false) => Classification::StampMissing,
         (false, _) => {
-            // Not in Qdrant. Conversion failures (stubs) are intentional
-            // non-embeds. Embedding skips are intentional *unless* the
+            // Not in Qdrant. Embedding skips are intentional *unless* the
             // reason is an embed failure we recorded ourselves — those
             // must stay retryable, otherwise a transient error
             // permanently hides the doc from the reconciler.
-            if state.conversion_failed
-                || is_intentional_skip(state.embedding_skip_reason.as_deref())
-            {
+            if is_intentional_skip(state.embedding_skip_reason.as_deref()) {
                 Classification::Ok
             } else {
                 Classification::EmbedMissing
@@ -158,24 +154,6 @@ mod tests {
         let cat = HashMap::new();
         let parts = partition(&md, &qdrant, &cat);
         assert_eq!(parts[0].1, Classification::EmbedMissing);
-    }
-
-    #[test]
-    fn stub_conversion_is_ok_even_without_qdrant_entry() {
-        // conversion_failed (stub_document) means we deliberately did not
-        // embed. Reconciler must not try to re-embed it.
-        let md = stems(&["a"]);
-        let qdrant = HashSet::new();
-        let mut cat = HashMap::new();
-        cat.insert(
-            "a".into(),
-            CatalogState {
-                conversion_failed: true,
-                ..Default::default()
-            },
-        );
-        let parts = partition(&md, &qdrant, &cat);
-        assert_eq!(parts[0].1, Classification::Ok);
     }
 
     #[test]

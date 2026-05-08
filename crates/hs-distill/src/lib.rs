@@ -9,6 +9,8 @@ pub mod reconcile;
 pub mod types;
 
 #[cfg(feature = "server")]
+pub mod adaptive_batch;
+#[cfg(feature = "server")]
 pub mod embed;
 #[cfg(feature = "server")]
 pub mod metadata;
