@@ -180,6 +180,49 @@ struct DistillSearchParams {
     limit: Option<u64>,
     #[schemars(description = "Year filter, e.g. '>2020', '2023', '>=2021'")]
     year: Option<String>,
+    #[schemars(
+        description = "When true (default), include the matched chunk_text in each hit. Set false for a metadata-only response — useful when an agent is ranking/deduping large result sets (e.g. building a DOI catalog) and the passages would overflow its context window. Score and ranking are unaffected."
+    )]
+    include_text: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+struct DistillSearchHitOut {
+    doc_id: String,
+    title: Option<String>,
+    authors: Vec<String>,
+    year: Option<u64>,
+    doi: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_text: Option<String>,
+    score: f32,
+    pdf_path: Option<String>,
+    line_start: usize,
+    line_end: usize,
+    page: Option<usize>,
+    category: Option<String>,
+}
+
+fn map_distill_search_hits(
+    hits: Vec<hs_distill::client::SearchHit>,
+    include_text: bool,
+) -> Vec<DistillSearchHitOut> {
+    hits.into_iter()
+        .map(|h| DistillSearchHitOut {
+            doc_id: h.doc_id,
+            title: h.title,
+            authors: h.authors,
+            year: h.year,
+            doi: h.doi,
+            chunk_text: include_text.then_some(h.chunk_text),
+            score: h.score,
+            pdf_path: h.pdf_path,
+            line_start: h.line_start,
+            line_end: h.line_end,
+            page: h.page,
+            category: h.category,
+        })
+        .collect()
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2225,7 +2268,7 @@ impl HomeStillMcp {
     // ── Distill Tools ──────────────────────────────────────────
 
     #[tool(
-        description = "Semantic search across indexed academic documents. Returns ranked results with text snippets, metadata, and relevance scores.",
+        description = "Semantic search across indexed academic documents. Returns ranked results with text snippets, metadata, and relevance scores. Pass include_text=false to omit chunk_text from each hit — a metadata-only response that lets an agent rank/dedupe large result sets (e.g. build a DOI catalog) without the passages overflowing its context window. Score and ranking are unaffected.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2252,7 +2295,11 @@ impl HomeStillMcp {
             .search(&p.query, p.limit.unwrap_or(10), filters)
             .await
         {
-            Ok(hits) => Ok(serde_json::to_string_pretty(&hits).unwrap_or_default()),
+            Ok(hits) => {
+                let include_text = p.include_text.unwrap_or(true);
+                let out = map_distill_search_hits(hits, include_text);
+                Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
+            }
             Err(e) => Err(format!("Search failed: {e}")),
         }
     }
@@ -3885,5 +3932,61 @@ mod startup_tests {
             msg.contains("storage"),
             "error should mention storage; got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod distill_search_mapping_tests {
+    use super::map_distill_search_hits;
+    use hs_distill::client::SearchHit;
+
+    fn fixture() -> Vec<SearchHit> {
+        vec![SearchHit {
+            doc_id: "10.1234_test".to_string(),
+            title: Some("Test paper".to_string()),
+            authors: vec!["Doe".to_string()],
+            year: Some(2024),
+            doi: Some("10.1234/test".to_string()),
+            chunk_text: "lorem ipsum dolor sit amet".to_string(),
+            score: 0.87,
+            pdf_path: Some("papers/10/10.1234_test.pdf".to_string()),
+            line_start: 12,
+            line_end: 16,
+            page: Some(3),
+            category: None,
+        }]
+    }
+
+    #[test]
+    fn include_text_true_preserves_chunk_text() {
+        let out = map_distill_search_hits(fixture(), true);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"chunk_text\""), "json: {json}");
+        assert!(json.contains("lorem ipsum"), "json: {json}");
+    }
+
+    #[test]
+    fn include_text_false_omits_chunk_text_key() {
+        let out = map_distill_search_hits(fixture(), false);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            !json.contains("\"chunk_text\""),
+            "chunk_text key should be absent; got: {json}"
+        );
+        assert!(
+            !json.contains("lorem ipsum"),
+            "passage text should not leak; got: {json}"
+        );
+        assert!(json.contains("\"doc_id\":\"10.1234_test\""));
+        assert!(json.contains("\"doi\":\"10.1234/test\""));
+        assert!(json.contains("\"score\":0.87"));
+    }
+
+    #[test]
+    fn empty_input_round_trips() {
+        let full = serde_json::to_string(&map_distill_search_hits(vec![], true)).unwrap();
+        let lite = serde_json::to_string(&map_distill_search_hits(vec![], false)).unwrap();
+        assert_eq!(full, "[]");
+        assert_eq!(lite, "[]");
     }
 }
