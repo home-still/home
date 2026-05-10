@@ -119,6 +119,7 @@ fn parse_delta_content(event_json: &str) -> Option<String> {
 ///     legitimate citation entries, small enough to catch loops.
 ///     vLLM-specific; non-vLLM OpenAI-compat servers ignore unknown
 ///     keys harmlessly.
+///
 /// Ollama's OpenAI-compat shim (if used) silently drops the penalty
 /// params per ollama#14493 — same caveat as the dedicated Ollama backend.
 fn build_request_body(model: &str, region_type: RegionType, image_url: &str) -> serde_json::Value {

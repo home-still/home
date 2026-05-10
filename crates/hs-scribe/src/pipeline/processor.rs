@@ -1171,6 +1171,7 @@ fn prepare_page(
 /// through from `prepare_page` — used by the document-level QC gate to
 /// apply the bibliography multiplier. `diag` is the per-page record
 /// surfaced to the optional `<output_dir>/<stem>.diag.jsonl`.
+#[allow(clippy::too_many_arguments)]
 async fn execute_vlm_for_page(
     prepared: PreparedPage,
     ocr: Arc<OcrEngine>,
