@@ -441,6 +441,21 @@ fn open_openalex_readonly() -> anyhow::Result<duckdb::Connection> {
     Ok(conn)
 }
 
+/// Probe whether the OpenAlex corpus has finished its end-to-end build
+/// (load, indexes, FTS). The signal is a single row in `_corpus_state`
+/// keyed `openalex_works`, written by `OpenAlexDb::build_fts` only after
+/// the FTS index is persisted. Returns `false` if the table doesn't exist
+/// (older DB from before the gate landed) or has no row — both mean
+/// "not ready, don't expose the openalex_* tools yet."
+fn is_openalex_corpus_ready(conn: &duckdb::Connection) -> bool {
+    let result: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM _corpus_state WHERE component = 'openalex_works'",
+        [],
+        |row| row.get(0),
+    );
+    matches!(result, Ok(n) if n > 0)
+}
+
 /// Run an OpenAlex SQL query inside spawn_blocking, return rows serialized as
 /// a JSON array (pretty-printed). Single entry point for all 4 simple
 /// SELECT-driven openalex_* tools.
@@ -612,6 +627,41 @@ impl HomeStillMcp {
             .ok()
             .map(|conn| Arc::new(std::sync::Mutex::new(conn)));
 
+        // Gate: check the readiness sentinel BEFORE building the tool
+        // router. If the openalex corpus isn't fully loaded + indexed + FTS'd,
+        // strip the 5 `openalex_*` tools from the router so they don't show
+        // up in tools/list — preventing downstream agents from calling them
+        // and getting empty/partial results during a migration window. The
+        // gate evaluates once at server startup; Phase 6 of the migration
+        // restarts hs-serve-mcp, which re-evaluates against the now-set
+        // sentinel and re-exposes the tools.
+        let openalex_corpus_ready = openalex_db
+            .as_ref()
+            .map(|arc| {
+                let conn = arc.lock().unwrap();
+                is_openalex_corpus_ready(&conn)
+            })
+            .unwrap_or(false);
+
+        let mut tool_router = Self::tool_router();
+        if !openalex_corpus_ready {
+            for name in [
+                "openalex_search",
+                "openalex_get",
+                "openalex_references",
+                "openalex_citations",
+                "openalex_authors_by_topic",
+            ] {
+                tool_router.remove_route(name);
+            }
+            tracing::info!(
+                "openalex corpus not ready (no _corpus_state sentinel); 5 openalex_* tools hidden \
+                 from tools/list — restart hs-serve-mcp after `hs openalex build-fts` to expose them"
+            );
+        } else {
+            tracing::info!("openalex corpus ready; openalex_* tools enabled");
+        }
+
         Ok(Self {
             storage,
             events,
@@ -625,7 +675,7 @@ impl HomeStillMcp {
             scribe_convert_timeout: std::time::Duration::from_secs(scribe_cfg.convert_timeout_secs),
             distill_servers,
             openalex_db,
-            tool_router: Self::tool_router(),
+            tool_router,
             prompt_router: Self::prompt_router(),
         })
     }
@@ -972,14 +1022,22 @@ impl HomeStillMcp {
                 let embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
                 let embedding_skipped = cat.embedding_skip.is_some();
                 let repaired = cat.repair.is_some();
+                // `corrupted` mirrors the `corrupted_pdfs` counter in
+                // system_status — the catalog row was stamped
+                // `conversion_failed` because the source bytes are not a
+                // valid PDF (paywall HTML stub, truncated download, etc.).
+                let corrupted = cat.conversion_failed.is_some();
+                let doi = cat.doi.clone().unwrap_or_default();
                 serde_json::json!({
                     "stem": stem,
                     "title": title,
+                    "doi": doi,
                     "downloaded": downloaded,
                     "converted": converted,
                     "embedded": embedded,
                     "embedding_skipped": embedding_skipped,
                     "repaired": repaired,
+                    "corrupted": corrupted,
                 })
             })
             .collect();

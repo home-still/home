@@ -7,16 +7,20 @@
 //!    JSONL files natively via `read_json` and projects / transforms columns
 //!    inline. No Rust round-trip — DuckDB handles arrays/structs directly.
 //!
-//! 2. **Works**: Rust parses each record (abstract reconstruction is the
-//!    irreducible reason Rust is in the loop here), then fans rows out to
-//!    five Appenders: `works`, `work_authorships`, `work_topics`,
-//!    `work_concepts`, `work_references`.
+//! 2. **Works**: streaming pre-dedupe. Walk partitions newest-first; for
+//!    each row, gate on a shared `SeenSet` keyed on integer work-ID. First
+//!    sighting → append to staging tables (5 Appenders); duplicate → skip.
+//!    At end of file, plain bulk INSERT per live table. No `ON CONFLICT`
+//!    is needed because the staging tables only ever contain first-sightings
+//!    that don't already exist in the live tables. PRIMARY KEY constraints
+//!    on works/work_topics/work_concepts/work_references are safe.
 //!
 //! Resumability: every partition load consults `_ingest_log` first and skips
-//! if status='ok'. Partial progress within a partition is NOT tracked — a
-//! crash mid-partition means re-doing that partition from scratch (the
-//! Appender's pending rows are dropped on connection close, so the partial
-//! state is invisible).
+//! if status='ok'. The `SeenSet` checkpoints to a sidecar file every N
+//! partitions — see `seen_set.rs`. Partial progress within a partition is
+//! NOT tracked — a crash mid-partition means re-doing that partition from
+//! scratch (the Appender's pending rows are dropped on connection close,
+//! so the partial state is invisible).
 
 use anyhow::{anyhow, Context, Result};
 use duckdb::{params, Connection};
@@ -26,6 +30,7 @@ use crate::model::{Author, Work};
 use crate::parser::{reconstruct_abstract, strip_doi, strip_openalex_id};
 use crate::reader::{list_partitions, read_partition};
 use crate::schema::{POST_LOAD_INDEXES, SCHEMA_DDL};
+use crate::seen_set::SeenSet;
 
 pub struct OpenAlexDb {
     conn: Connection,
@@ -56,15 +61,23 @@ impl OpenAlexDb {
         // without it, DuckDB buffers entire result sets to keep input ordering
         // visible, which OOMs on huge JSONL partitions. We don't care about
         // physical row order for an OLAP catalog.
-        // Memory headroom on `big`: 32 GB total, ~10 GB pinned by services
-        // (llama-server, hs-scribe-server). 10 GB DuckDB + 1-2 GB Rust leaves
-        // ~10 GB for everything else. Bumped from 8 → 10 after observing OOMs
-        // at the works merge step (live works table grows past 20M rows, the
-        // ON CONFLICT hash anti-join needs proportionally more headroom).
+        //
+        // memory_limit set to 14 GB. At corpus scale (17M+ works → ~50M
+        // edges with PK indexes), every ON CONFLICT bulk INSERT pins PK
+        // index pages in the buffer pool. 12 GB hit `failed to pin block`
+        // errors when re-processing partitions whose works already exist
+        // (the recovery case after an OOM kill). 14 GB gives the index
+        // pages enough headroom; combined with CHECKPOINT-between-
+        // partitions and `--parallel 4 → threads=4`, the working set is
+        // bounded.
+        // Earlier 14 GB OOM-kill was caused by 2.9 GB of WARN-per-line
+        // log spam (rclone partial-upload `.gz.<hex>` files being treated
+        // as JSONL). That's now fixed at the source via the .jsonl
+        // extension filter in load_works_partition_inner.
         let pragmas = format!(
-            "PRAGMA memory_limit='10GB';\n\
+            "PRAGMA memory_limit='14GB';\n\
              PRAGMA temp_directory='{}';\n\
-             PRAGMA threads=6;\n\
+             PRAGMA threads=4;\n\
              PRAGMA preserve_insertion_order=false;",
             temp_dir.display()
         );
@@ -79,13 +92,57 @@ impl OpenAlexDb {
 
     /// Apply the post-load secondary indexes. Slow on `works` (~minutes) and
     /// `work_references` (~hours at full corpus); call once after bulk load.
+    ///
+    /// Each index is built with its own statement + CHECKPOINT between, so the
+    /// buffer pool is released back between indexes — building all six in a
+    /// single `execute_batch` OOMed at the 14 GB cap because the 742M-row
+    /// `work_references.referenced_work_id` sort needs most of the budget on
+    /// its own. We also drop to `threads=1` for the build phase: parallel
+    /// merge-sort fans out per-thread sort buffers (4× the working set at
+    /// `threads=4`), which is what tipped the 742M-row sort over the cap. A
+    /// single-thread sort is slower (~30–60 min for the big one) but stays
+    /// bounded under 14 GB. After the build we restore `threads=4` so any
+    /// query path the same connection might serve isn't crippled.
     pub fn build_post_load_indexes(&self) -> Result<()> {
         self.conn
-            .execute_batch(POST_LOAD_INDEXES)
-            .context("build post-load indexes")
+            .execute_batch("PRAGMA threads=1;")
+            .context("set threads=1 for index build")?;
+        let mut result = Ok(());
+        for stmt in POST_LOAD_INDEXES
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            tracing::info!(target: "openalex_ingest", sql = %stmt, "building index");
+            let started = std::time::Instant::now();
+            if let Err(e) = self
+                .conn
+                .execute_batch(&format!("{stmt};"))
+                .with_context(|| format!("build index: {stmt}"))
+            {
+                result = Err(e);
+                break;
+            }
+            let _ = self.conn.execute_batch("CHECKPOINT;");
+            tracing::info!(
+                target: "openalex_ingest",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "index built"
+            );
+        }
+        // Restore threads even on error so the connection is usable for retry.
+        let _ = self.conn.execute_batch("PRAGMA threads=4;");
+        result
     }
 
-    /// Build the BM25 full-text index over works.title + works.abstract_text.
+    /// Build the BM25 full-text index over works.title + works.abstract_text,
+    /// then write the `openalex_works` readiness sentinel into
+    /// `_corpus_state`. The sentinel is the gate hs-mcp checks at startup to
+    /// decide whether to expose the 5 `openalex_*` MCP tools — by writing it
+    /// only AFTER the FTS index lands, we guarantee that if the tools are
+    /// visible, every code path they exercise (search, get, references,
+    /// citations, authors_by_topic) has the data it needs.
+    ///
     /// Loads the FTS extension if not already present. Slow at full corpus
     /// (~hour+) — run once after works ingest.
     pub fn build_fts(&self) -> Result<()> {
@@ -95,6 +152,11 @@ impl OpenAlexDb {
                 INSTALL fts;
                 LOAD fts;
                 PRAGMA create_fts_index('works', 'openalex_id', 'title', 'abstract_text', overwrite=1);
+                INSERT INTO _corpus_state(component, ready_at, notes)
+                VALUES ('openalex_works', CURRENT_TIMESTAMP, 'fts ready')
+                ON CONFLICT (component) DO UPDATE
+                  SET ready_at = excluded.ready_at,
+                      notes    = excluded.notes;
                 "#,
             )
             .context("build FTS index on works")
@@ -180,16 +242,22 @@ impl OpenAlexDb {
         Ok(stats)
     }
 
-    /// Load one works partition. Uses prepared `INSERT ... ON CONFLICT DO
-    /// NOTHING` statements (not Appender) because OpenAlex re-emits the same
-    /// work in multiple `updated_date=*` partitions when it gets updated, and
-    /// Appender has no PK-tolerance — it errors per row and rolled back whole
-    /// batches in the previous implementation, leaving asymmetric data (works
-    /// table populated but work_authorships near-empty).
+    /// Load one works partition through the streaming pre-dedupe pipeline.
+    /// Per-file: Appender → PK-less staging tables, gated by a shared
+    /// `SeenSet` so only first-sightings reach staging → plain bulk INSERT
+    /// into the live (PK'd) tables. No `ON CONFLICT` is needed because the
+    /// staging tables only contain first-sightings.
     ///
-    /// Cost: ~3x slower than Appender in steady state, but correct and
-    /// idempotent across cross-partition duplicates.
-    pub fn load_works_partition(&self, partition_dir: &Path) -> Result<EntityStats> {
+    /// **Walk order matters.** Callers must invoke `load_works` (which walks
+    /// partitions newest-first) so the first sighting of any work-ID is the
+    /// canonical (newest-snapshot) version. Calling this directly with an
+    /// out-of-order partition list will silently keep stale records and
+    /// drop newer ones — don't.
+    pub fn load_works_partition(
+        &self,
+        partition_dir: &Path,
+        seen: &mut SeenSet,
+    ) -> Result<EntityStats> {
         let part_name = partition_dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -204,11 +272,8 @@ impl OpenAlexDb {
 
         // Per-file processing keeps memory bounded on the giant 2025-11-06
         // partition (2.59 TB). Each JSONL file (~1 GB) gets its own staging
-        // tables → bulk INSERT … SELECT … ON CONFLICT cycle. Errors are
-        // localized per file. Per-partition transaction would still work for
-        // small partitions, but the unified file-level approach keeps a
-        // single code path (ONE PATH).
-        let result = self.load_works_partition_inner(partition_dir);
+        // tables → bulk INSERT cycle. Errors are localized per file.
+        let result = self.load_works_partition_inner(partition_dir, seen);
 
         match result {
             Ok((rows, parse_errors)) => {
@@ -223,12 +288,27 @@ impl OpenAlexDb {
         }
     }
 
-    fn load_works_partition_inner(&self, partition_dir: &Path) -> Result<(u64, u64)> {
+    fn load_works_partition_inner(
+        &self,
+        partition_dir: &Path,
+        seen: &mut SeenSet,
+    ) -> Result<(u64, u64)> {
+        // Strict `.jsonl` extension filter: rclone leaves `.gz.<hex>` partial-
+        // upload files in some snapshot directories (e.g. `part_0049.gz.19B6a7d8`),
+        // and the loader has no business reading those. Without this filter,
+        // millions of UTF-8 errors get logged per garbage file, blowing out
+        // stdout/stderr and contributing to OOM-kills.
         let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(partition_dir)
             .with_context(|| format!("read_dir {}", partition_dir.display()))?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.is_file())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e == "jsonl")
+                        .unwrap_or(false)
+            })
             .collect();
         files.sort();
 
@@ -236,7 +316,7 @@ impl OpenAlexDb {
         let mut total_errs = 0u64;
         for f in files {
             let (rows, errs) = self
-                .load_works_file(&f)
+                .load_works_file(&f, seen)
                 .with_context(|| format!("load file {}", f.display()))?;
             total_rows += rows;
             total_errs += errs;
@@ -244,11 +324,15 @@ impl OpenAlexDb {
         Ok((total_rows, total_errs))
     }
 
-    /// Bulk-load one JSONL file via Appender → unconstrained temp tables →
-    /// `INSERT … SELECT … ON CONFLICT DO NOTHING` merge into live tables.
-    /// This is much faster than per-row prepared statements because the
-    /// Appender is binary-bulk path and the bulk merge is one query.
-    fn load_works_file(&self, file: &std::path::Path) -> Result<(u64, u64)> {
+    /// Bulk-load one JSONL file. For each parsed `Work`, gate on the
+    /// `SeenSet`: first sighting → append to staging tables, duplicate →
+    /// skip. After parsing, drop the appenders (flushes) and run plain bulk
+    /// INSERT … SELECT into the live PK'd tables.
+    ///
+    /// Returns `(inserted_rows, parse_errors)`. `inserted_rows` counts only
+    /// works that survived the dedupe gate; per-file skip counts can be
+    /// inferred from the JSONL line count vs `inserted_rows` if needed.
+    fn load_works_file(&self, file: &std::path::Path, seen: &mut SeenSet) -> Result<(u64, u64)> {
         // Temp tables live for the connection lifetime; we DROP at the end
         // of each file so the next file starts clean. CREATE OR REPLACE so
         // a partial run doesn't leave them behind.
@@ -280,17 +364,34 @@ impl OpenAlexDb {
         let mut concept_app = self.conn.appender("_stage_concept")?;
         let mut ref_app = self.conn.appender("_stage_ref")?;
 
-        let mut rows = 0u64;
+        let mut inserted = 0u64;
         let stats = crate::reader::read_jsonl_file::<Work, _>(file, &mut |w| {
-            stage_work(
-                &mut works_app,
-                &mut auth_app,
-                &mut topic_app,
-                &mut concept_app,
-                &mut ref_app,
-                &w,
-            );
-            rows += 1;
+            // Streaming dedupe gate. `insert` returns Ok(true) on first
+            // sighting, Ok(false) on duplicate, Err on a malformed ID.
+            // Malformed IDs are logged and skipped — they shouldn't happen
+            // in a well-formed snapshot, but if they do we don't want one
+            // bad row to abort a partition.
+            match seen.insert(&w.id) {
+                Ok(true) => {
+                    stage_work(
+                        &mut works_app,
+                        &mut auth_app,
+                        &mut topic_app,
+                        &mut concept_app,
+                        &mut ref_app,
+                        &w,
+                    );
+                    inserted += 1;
+                }
+                Ok(false) => {
+                    // Duplicate — already saw a newer version in an earlier
+                    // (newer) partition. Skip silently; this is the expected
+                    // dedupe path.
+                }
+                Err(e) => {
+                    tracing::warn!(work_id = %w.id, error = %e, "skipping work with malformed id");
+                }
+            }
         })?;
 
         // Drop appenders so they flush before the merge.
@@ -300,23 +401,68 @@ impl OpenAlexDb {
         drop(auth_app);
         drop(works_app);
 
-        // Bulk merge into live tables. DuckDB optimizes ON CONFLICT
-        // bulk-INSERT into a single hash-anti-join → no per-row overhead.
+        // Bulk INSERTs into the PK'd live tables. Each INSERT auto-commits
+        // (no BEGIN/COMMIT wrapping) so DuckDB can release the WAL between
+        // statements — important on huge JSONL files where wrapping all 5
+        // INSERTs in one transaction held all dirty pages until COMMIT and
+        // hit `TransactionContext Error: Failed to commit` at the
+        // memory_limit cap.
+        //
+        // The SeenSet gate keeps the staging tables free of cross-work
+        // duplicates, but OpenAlex can emit the same edge target twice
+        // WITHIN a single work's `concepts[]` / `topics[]` /
+        // `referenced_works[]` array. The PK on each edge table is the
+        // (work_id, edge_id) pair, so we collapse intra-work duplicates
+        // here at merge time via SELECT DISTINCT ON (...).
+        //
+        // ON CONFLICT DO NOTHING on works (and edge tables) is a safety net
+        // for the rare partial-merge consistency-break case: if (say)
+        // `works` INSERT succeeds but `work_topics` INSERT fails on memory
+        // pressure, the partition is logged as failed and the loader moves
+        // on. A subsequent older partition will re-emit those work_ids
+        // (the SeenSet only adds IDs after a clean parse, but data may
+        // have committed before the failure); ON CONFLICT lets that
+        // re-emission no-op instead of cascading PK violations through
+        // every following partition.
+        //
+        // Cost of ON CONFLICT under streaming pre-dedupe: minimal. The
+        // SeenSet handles 99% of dedup; ON CONFLICT only fires on the rare
+        // collision. Hash anti-join builds against the staging side
+        // (small) and probes the live PK index (B-tree lookup, log n).
+        //
+        // work_authorships has no PK (the same author can legitimately
+        // appear multiple times on a work via different positions /
+        // institutions) so we don't dedupe it.
+        // ON CONFLICT removed at this stage of the migration: at corpus
+        // scale (200+ GB DB, ~36M PK rows) DuckDB's ON CONFLICT path pins
+        // the entire PK index in the buffer pool to do anti-join lookups,
+        // which exceeds the 14 GB memory_limit on big and triggers cascade
+        // OOMs. The SeenSet (~290 MB on disk, all parsed work_ids) already
+        // catches cross-partition duplicates with 100% accuracy in normal
+        // operation; ON CONFLICT was a safety net for the rare partial-
+        // merge case where a previous loader crashed mid-INSERT. With
+        // 309/311 partitions clean and only the two giant partitions
+        // (2025-11-06 / 2025-10-10) still being retried, the safety net
+        // is no longer worth its memory cost. Plain INSERTs let the buffer
+        // pool stay small enough to actually finish.
+        //
+        // Risk: if a work_id is in `works` but not in SeenSet (previous
+        // partial-merge artifact), this hits a PK violation that aborts
+        // the partition. The SeenSet rehydrates from seen_set.bin on
+        // restart, so this can only happen for IDs whose disk-checkpoint
+        // hasn't fired yet — narrow window.
         self.conn.execute_batch(
-            "INSERT INTO works
-               SELECT * FROM _stage_works
-               ON CONFLICT (openalex_id) DO NOTHING;
-             INSERT INTO work_authorships
-               SELECT * FROM _stage_auth;
+            "INSERT INTO works            SELECT * FROM _stage_works;
+             INSERT INTO work_authorships SELECT * FROM _stage_auth;
              INSERT INTO work_topics
-               SELECT * FROM _stage_topic
-               ON CONFLICT (work_id, topic_id) DO NOTHING;
+                 SELECT DISTINCT ON (work_id, topic_id) work_id, topic_id, score
+                 FROM _stage_topic;
              INSERT INTO work_concepts
-               SELECT * FROM _stage_concept
-               ON CONFLICT (work_id, concept_id) DO NOTHING;
+                 SELECT DISTINCT ON (work_id, concept_id) work_id, concept_id, score
+                 FROM _stage_concept;
              INSERT INTO work_references
-               SELECT * FROM _stage_ref
-               ON CONFLICT (work_id, referenced_work_id) DO NOTHING;
+                 SELECT DISTINCT work_id, referenced_work_id
+                 FROM _stage_ref;
              DROP TABLE _stage_works;
              DROP TABLE _stage_auth;
              DROP TABLE _stage_topic;
@@ -324,20 +470,50 @@ impl OpenAlexDb {
              DROP TABLE _stage_ref;",
         )?;
 
-        Ok((rows, stats.parse_errors))
+        Ok((inserted, stats.parse_errors))
     }
 
-    pub fn load_works(&self, snapshot_root: &Path) -> Result<EntityStats> {
+    /// Load every works partition under `snapshot_root/works/` using the
+    /// streaming pre-dedupe pipeline. Walks partitions **newest-first**
+    /// (descending by `updated_date`) so the first sighting of any work-ID
+    /// is the canonical (newest) version. Maintains a single `SeenSet`
+    /// across the whole walk; checkpoints it to a sidecar file every N
+    /// partitions for crash recovery.
+    ///
+    /// `seen_set_path` is where the sidecar checkpoint lives — typically
+    /// `~/home-still/data/openalex/seen_set.bin`. If the file exists, the
+    /// set rehydrates from it on entry; otherwise we start with an empty
+    /// set. The `_ingest_log` table independently tracks completed
+    /// partitions, so `load_works` is safe to re-run from any state.
+    pub fn load_works(
+        &self,
+        snapshot_root: &Path,
+        seen_set_path: std::path::PathBuf,
+    ) -> Result<EntityStats> {
         let works_dir = snapshot_root.join("works");
-        let partitions = list_partitions(&works_dir)?;
+        let mut partitions = list_partitions(&works_dir)?;
+        // Walk newest-first. `list_partitions` sorts ascending by name; the
+        // OpenAlex partition naming convention is `updated_date=YYYY-MM-DD`,
+        // so reverse alphabetical = reverse chronological.
+        partitions.reverse();
+
+        let mut seen = SeenSet::load_or_default(seen_set_path)?;
         let mut total = EntityStats::default();
         for part in partitions {
-            let s = match self.load_works_partition(&part) {
+            let pname = part
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let s = match self.load_works_partition(&part, &mut seen) {
                 Ok(s) => s,
                 Err(e) => {
-                    let pname = part.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                    tracing::error!(partition = %pname, error = %e, "partition failed; skipping");
-                    eprintln!("  ✗ partition {pname} failed: {e}");
+                    // Chained Display ({e:#}) walks the anyhow source chain
+                    // so the root cause is visible — without :# we only see
+                    // the outer "load file <path>" context wrapper, which
+                    // tells you which file but not why it failed.
+                    tracing::error!(partition = %pname, error = %format!("{:#}", e), "partition failed; skipping");
+                    eprintln!("  ✗ partition {pname} failed: {e:#}");
                     // Best-effort rollback in case the inner path didn't.
                     let _ = self.conn.execute_batch("ROLLBACK");
                     continue;
@@ -346,7 +522,29 @@ impl OpenAlexDb {
             total.partitions_loaded += s.partitions_loaded;
             total.skipped_partitions += s.skipped_partitions;
             total.rows_inserted += s.rows_inserted;
+            // Maybe-checkpoint counts only successful partitions.
+            if s.partitions_loaded > 0 {
+                seen.maybe_checkpoint()?;
+                tracing::info!(
+                    partition = %pname,
+                    inserted = s.rows_inserted,
+                    seen_total = seen.len(),
+                    "works partition done"
+                );
+                // Force DuckDB to flush its WAL to disk between partitions
+                // so the buffer pool doesn't grow unbounded across hours of
+                // ingest. Without this, accumulated dirty pages from
+                // already-committed partitions stay resident and squeeze
+                // out the working set for the current partition's commit
+                // — which manifested as silent kernel OOM-kills around
+                // partition 2026-01-13 (50 files, biggest in the corpus).
+                if let Err(e) = self.conn.execute_batch("CHECKPOINT;") {
+                    tracing::warn!(error = %format!("{:#}", e), "CHECKPOINT after partition failed (continuing)");
+                }
+            }
         }
+        // Final checkpoint so the sidecar reflects the end-of-load state.
+        seen.force_checkpoint()?;
         Ok(total)
     }
 
