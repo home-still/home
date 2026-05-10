@@ -40,7 +40,9 @@
 //!   * Homebrew services (`homebrew.mxcl.ollama`).
 //!   * Ollama.app Desktop at `/Applications/Ollama.app`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(target_os = "linux", test))]
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -522,6 +524,7 @@ fn nix_uid() -> u32 {
 /// Parse an `Environment="OLLAMA_NUM_PARALLEL=<n>"` line out of a
 /// systemd drop-in. Tolerant of quoting + whitespace; scans every
 /// line so the directive doesn't need to be first.
+#[cfg(any(target_os = "linux", test))]
 fn parse_num_parallel_from_systemd_snippet(txt: &str) -> Option<u32> {
     txt.lines().find_map(|line| {
         let line = line.trim();
