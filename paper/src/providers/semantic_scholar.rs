@@ -393,8 +393,8 @@ impl SemanticScholarProvider {
 
         let sort_key = opts.sort.as_deref().unwrap_or("year");
         match sort_key {
-            "citations" => entries.sort_by(|a, b| b.citation_count.cmp(&a.citation_count)),
-            _ => entries.sort_by(|a, b| b.year.cmp(&a.year)),
+            "citations" => entries.sort_by_key(|e| std::cmp::Reverse(e.citation_count)),
+            _ => entries.sort_by_key(|e| std::cmp::Reverse(e.year)),
         }
 
         if entries.len() > effective_limit {
