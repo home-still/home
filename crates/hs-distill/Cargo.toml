@@ -5,7 +5,10 @@ edition = "2021"
 
 [features]
 default = ["client"]
-client = []
+# `client` pulls regex because the `abstracts` module (coalesce + markdown
+# `## Abstract` extraction) is needed by the CLI `hs distill abstracts`
+# subcommand, which links against the client-only feature set.
+client = ["dep:regex"]
 server = [
     "dep:axum",
     "dep:fastembed",

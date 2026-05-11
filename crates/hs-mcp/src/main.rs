@@ -959,6 +959,7 @@ impl HomeStillMcp {
             conversion_failed: None,
             embedding: None,
             embedding_skip: None,
+            abstract_embed: None,
             repair: None,
             category: None,
             original_format: None,
@@ -2367,6 +2368,48 @@ impl HomeStillMcp {
                 Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
             }
             Err(e) => Err(format!("Search failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Semantic search over downloaded papers' abstracts. Targets the `paper_abstracts` Qdrant collection — one point per paper (not per chunk), embedded from `{title}\\n\\n{abstract}` where the abstract is sourced from the local OpenAlex catalog (preferred), the converted markdown's `## Abstract` section (fallback), or the title alone (last resort). Higher-precision than `distill_search` for 'find me the paper that argues X' queries because body-section noise (methods, references, citations) is excluded. Returns ranked hits with score, title, doi, year, and the embedded abstract text.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn abstract_search(
+        &self,
+        Parameters(p): Parameters<DistillSearchParams>,
+    ) -> Result<String, String> {
+        let client = self
+            .distill_client()
+            .map_err(|e| e.to_string())?
+            .ok_or("No distill server configured")?;
+
+        let filters = hs_distill::client::SearchFilters {
+            year: p.year,
+            topic: None,
+            category: None,
+        };
+
+        match client
+            .search_in(
+                &p.query,
+                p.limit.unwrap_or(10),
+                filters,
+                Some("paper_abstracts"),
+            )
+            .await
+        {
+            Ok(hits) => {
+                let include_text = p.include_text.unwrap_or(true);
+                let out = map_distill_search_hits(hits, include_text);
+                Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
+            }
+            Err(e) => Err(format!("abstract_search failed: {e}")),
         }
     }
 

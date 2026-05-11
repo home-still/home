@@ -60,6 +60,14 @@ pub struct CatalogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_skip: Option<EmbeddingSkip>,
 
+    /// Recorded by the abstracts pipeline when this paper has been
+    /// embedded into the `paper_abstracts` Qdrant collection. Distinct
+    /// from `embedding` — that one tracks full-body chunks in
+    /// `academic_papers`. Used by `hs distill abstracts reconcile` to
+    /// idempotently re-run only entries that haven't been embedded yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abstract_embed: Option<AbstractEmbedStamp>,
+
     /// Recorded when `catalog_repair` synthesized a row for an orphan file
     /// (PDF/HTML on disk with no prior catalog entry). Distinguishes
     /// repaired rows from rows produced by the normal download path.
@@ -142,6 +150,24 @@ pub struct EmbeddingMeta {
     pub server: String,
     pub chunks_indexed: u32,
     pub compute_device: String,
+    pub embedded_at: String,
+}
+
+/// Stamp recorded when a paper's abstract has been embedded into the
+/// `paper_abstracts` Qdrant collection. Distinct from `EmbeddingMeta` —
+/// that one tracks the full-body chunks in `academic_papers`. The two
+/// pipelines run independently and stamp different fields.
+///
+/// `source` records which input the embed actually used so `abstracts
+/// status` can report coverage without re-running the coalesce.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbstractEmbedStamp {
+    /// `openalex` | `markdown` | `title_only` — see
+    /// `hs_distill::abstracts::AbstractSource`.
+    pub source: String,
+    /// Length of the abstract text that was actually embedded (excluding
+    /// the title prefix). `0` for `title_only`.
+    pub abstract_chars: u32,
     pub embedded_at: String,
 }
 
@@ -243,6 +269,27 @@ pub fn update_embedding_catalog(
         server: server.to_string(),
         chunks_indexed,
         compute_device: compute_device.to_string(),
+        embedded_at: chrono::Utc::now().to_rfc3339(),
+    });
+
+    write_catalog_entry(catalog_dir, stem, &entry)
+}
+
+/// Stamp the `paper_abstracts` embed result onto a catalog entry. Called
+/// by `hs distill abstracts build` after the embed + Qdrant upsert succeed.
+/// `source` is `"openalex"`, `"markdown"`, or `"title_only"` — matches the
+/// `AbstractSource` enum's serialized form in hs-distill.
+pub fn update_abstract_embed_catalog(
+    catalog_dir: &Path,
+    stem: &str,
+    source: &str,
+    abstract_chars: u32,
+) -> std::io::Result<()> {
+    let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
+
+    entry.abstract_embed = Some(AbstractEmbedStamp {
+        source: source.to_string(),
+        abstract_chars,
         embedded_at: chrono::Utc::now().to_rfc3339(),
     });
 
@@ -610,6 +657,27 @@ pub async fn update_embedding_catalog_via(
         server: server.to_string(),
         chunks_indexed,
         compute_device: compute_device.to_string(),
+        embedded_at: chrono::Utc::now().to_rfc3339(),
+    });
+
+    write_catalog_entry_via(storage, prefix, stem, &entry).await
+}
+
+/// Storage-backed sibling of [`update_abstract_embed_catalog`].
+pub async fn update_abstract_embed_catalog_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    stem: &str,
+    source: &str,
+    abstract_chars: u32,
+) -> anyhow::Result<()> {
+    let mut entry = read_catalog_entry_via(storage, prefix, stem)
+        .await?
+        .unwrap_or_default();
+
+    entry.abstract_embed = Some(AbstractEmbedStamp {
+        source: source.to_string(),
+        abstract_chars,
         embedded_at: chrono::Utc::now().to_rfc3339(),
     });
 

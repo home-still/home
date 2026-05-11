@@ -98,4 +98,39 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Manage the `paper_abstracts` Qdrant collection — a per-paper
+    /// (not per-chunk) embedding of `{title}\n\n{abstract}` for high-
+    /// precision semantic search over papers' core arguments. Distinct
+    /// from `academic_papers` (per-chunk body text). Abstract source is
+    /// `openalex` (DOI lookup) > `markdown` (`## Abstract` extraction) >
+    /// `title_only` last resort.
+    #[command(subcommand)]
+    Abstracts(AbstractsCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AbstractsCmd {
+    /// Iterate every catalog entry, coalesce title+abstract, embed into
+    /// the `paper_abstracts` collection, and stamp the catalog. Idempotent
+    /// — entries with an `abstract_embed` stamp are skipped unless
+    /// `--force`.
+    Build {
+        /// Re-embed entries that already have an `abstract_embed` stamp
+        #[arg(long)]
+        force: bool,
+        /// Override server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Embed only catalog entries that lack an `abstract_embed` stamp
+    /// (alias for `build` without `--force`). Use this for incremental
+    /// catch-up after new papers are downloaded.
+    Reconcile {
+        /// Override server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Report coverage: total catalog entries vs. abstract_embed stamps
+    /// broken down by source (openalex / markdown / title_only).
+    Status,
 }

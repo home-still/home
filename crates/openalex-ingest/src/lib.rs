@@ -1,4 +1,5 @@
 pub mod duckdb_loader;
+pub mod lookup;
 pub mod model;
 pub mod parser;
 pub mod reader;
@@ -6,6 +7,7 @@ pub mod schema;
 pub mod seen_set;
 
 pub use duckdb_loader::{EntityStats, OpenAlexDb, SimpleEntity};
+pub use lookup::{lookup_work_abstract_by_doi, WorkAbstract};
 pub use model::{
     Author, Concept, Domain, Field, Funder, Institution, Publisher, Source, Subfield, Topic, Work,
 };
