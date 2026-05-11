@@ -160,7 +160,20 @@ pub fn extract_markdown_abstract(md: &str) -> Option<String> {
         .expect("SECTION_BREAK regex")
     });
 
-    let head_len = md.len().min(8192);
+    // Round byte indices down to the nearest UTF-8 char boundary. The
+    // abstracts pipeline saw a crash on a Springer paper containing an
+    // em-dash (`–`, 3-byte UTF-8) right at the 4096-byte mark — `&str[..N]`
+    // panics when N lands inside a multi-byte char. `str::floor_char_boundary`
+    // is still nightly-only as of Rust 1.95, so do it by hand.
+    fn floor_boundary(s: &str, idx: usize) -> usize {
+        let mut i = idx.min(s.len());
+        while i > 0 && !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    }
+
+    let head_len = floor_boundary(md, md.len().min(8192));
     let head = &md[..head_len];
     let marker = abstract_marker.find(head)?;
     let start = marker.end();
@@ -174,7 +187,7 @@ pub fn extract_markdown_abstract(md: &str) -> Option<String> {
         return None;
     }
 
-    let cap_end = md.len().min(body_start + 4096);
+    let cap_end = floor_boundary(md, md.len().min(body_start + 4096));
     let body = &md[body_start..cap_end];
 
     let end_rel = section_break
@@ -230,6 +243,23 @@ mod tests {
         let body = "Lorem ipsum ".repeat(1000);
         let md = format!("## Abstract\n{body}");
         let got = extract_markdown_abstract(&md).unwrap();
+        assert!(got.len() <= 4096);
+    }
+
+    #[test]
+    fn does_not_panic_on_multibyte_at_cap() {
+        // Reproduces the rc.325-bootstrap crash: a Springer page where an
+        // em-dash (`–`, 3-byte UTF-8) straddles the 4096-byte cap boundary
+        // and panicked the naive slice. `floor_boundary` should make this
+        // safe.
+        let prefix = "x".repeat(4094);
+        // After 4094 "x"s the next char starts at byte 4094; pad with one
+        // more "x", then put the em-dash so its 3 bytes span 4095..4098 —
+        // straddling the 4096 cap.
+        let md = format!("## Abstract\n{prefix}x–rest of abstract body that continues past the cap so the slice has to clip somewhere inside the em-dash.");
+        let got = extract_markdown_abstract(&md).unwrap();
+        // We just need it to NOT panic and return something non-empty.
+        assert!(!got.is_empty());
         assert!(got.len() <= 4096);
     }
 
