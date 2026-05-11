@@ -75,7 +75,7 @@ impl OpenAlexDb {
         // as JSONL). That's now fixed at the source via the .jsonl
         // extension filter in load_works_partition_inner.
         let pragmas = format!(
-            "PRAGMA memory_limit='14GB';\n\
+            "PRAGMA memory_limit='24GB';\n\
              PRAGMA temp_directory='{}';\n\
              PRAGMA threads=4;\n\
              PRAGMA preserve_insertion_order=false;",
@@ -90,24 +90,12 @@ impl OpenAlexDb {
         &self.conn
     }
 
-    /// Apply the post-load secondary indexes. Slow on `works` (~minutes) and
-    /// `work_references` (~hours at full corpus); call once after bulk load.
-    ///
-    /// Each index is built with its own statement + CHECKPOINT between, so the
-    /// buffer pool is released back between indexes — building all six in a
-    /// single `execute_batch` OOMed at the 14 GB cap because the 742M-row
-    /// `work_references.referenced_work_id` sort needs most of the budget on
-    /// its own. We also drop to `threads=1` for the build phase: parallel
-    /// merge-sort fans out per-thread sort buffers (4× the working set at
-    /// `threads=4`), which is what tipped the 742M-row sort over the cap. A
-    /// single-thread sort is slower (~30–60 min for the big one) but stays
-    /// bounded under 14 GB. After the build we restore `threads=4` so any
-    /// query path the same connection might serve isn't crippled.
+    /// Apply the post-load secondary indexes (minutes total at full corpus);
+    /// call once after bulk load. Each statement runs with its own
+    /// `execute_batch` + `CHECKPOINT` so the buffer pool is released between
+    /// indexes — `works` has ~56M rows and three indexes on it, so building
+    /// them in a single batch keeps tens of GB resident longer than needed.
     pub fn build_post_load_indexes(&self) -> Result<()> {
-        self.conn
-            .execute_batch("PRAGMA threads=1;")
-            .context("set threads=1 for index build")?;
-        let mut result = Ok(());
         for stmt in POST_LOAD_INDEXES
             .split(';')
             .map(str::trim)
@@ -115,14 +103,9 @@ impl OpenAlexDb {
         {
             tracing::info!(target: "openalex_ingest", sql = %stmt, "building index");
             let started = std::time::Instant::now();
-            if let Err(e) = self
-                .conn
+            self.conn
                 .execute_batch(&format!("{stmt};"))
-                .with_context(|| format!("build index: {stmt}"))
-            {
-                result = Err(e);
-                break;
-            }
+                .with_context(|| format!("build index: {stmt}"))?;
             let _ = self.conn.execute_batch("CHECKPOINT;");
             tracing::info!(
                 target: "openalex_ingest",
@@ -130,9 +113,7 @@ impl OpenAlexDb {
                 "index built"
             );
         }
-        // Restore threads even on error so the connection is usable for retry.
-        let _ = self.conn.execute_batch("PRAGMA threads=4;");
-        result
+        Ok(())
     }
 
     /// Build the BM25 full-text index over works.title + works.abstract_text,

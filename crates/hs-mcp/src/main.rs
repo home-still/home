@@ -438,6 +438,14 @@ fn open_openalex_readonly() -> anyhow::Result<duckdb::Connection> {
     }
     let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
     let conn = duckdb::Connection::open_with_flags(&db_path, cfg)?;
+    // Cap query memory so a single bad FTS call can't OOM-kill the entire
+    // mcp process and trigger a systemd restart loop. `match_bm25` on
+    // multi-term queries with common terms builds an ~11M-row intermediate
+    // CTE; under the default unlimited budget DuckDB tries to materialize
+    // it and the kernel OOM-killer fires. With a cap, DuckDB plans
+    // conservatively and either completes or raises a recoverable
+    // "Out of Memory" that surfaces cleanly to the MCP client.
+    conn.execute_batch("SET memory_limit='4GB';")?;
     Ok(conn)
 }
 
@@ -3035,12 +3043,17 @@ impl HomeStillMcp {
             "year" => "ORDER BY publication_year DESC NULLS LAST, bm25 DESC",
             _ => "ORDER BY bm25 DESC",
         };
+        // `conjunctive := 1` requires every query term to appear in the doc.
+        // Without it (default disjunctive), a multi-term query against a
+        // 56M-row corpus matches millions of docs and DuckDB's BM25
+        // implementation OOMs trying to score them all. Conjunctive matches
+        // are also the semantics users actually want for multi-word search.
         let sql = format!(
             r#"
             WITH ranked AS (
               SELECT
                 openalex_id, doi, title, publication_year, cited_by_count,
-                fts_main_works.match_bm25(openalex_id, ?) AS bm25
+                fts_main_works.match_bm25(openalex_id, ?, conjunctive := 1) AS bm25
               FROM works
             )
             SELECT openalex_id, doi, title, publication_year, cited_by_count, bm25

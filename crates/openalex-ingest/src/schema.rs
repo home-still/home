@@ -198,11 +198,17 @@ CREATE TABLE IF NOT EXISTS _corpus_state (
 /// applied at table-create time. There is no separate "post-dedupe unique
 /// index" step — the streaming pre-dedupe in the works loader guarantees
 /// the PKs are never violated at insert time.
+///
+/// `work_references` has no reverse-citation index by design: building an
+/// ART on `referenced_work_id` across 742M rows needs an estimated 18–60 GB
+/// of working memory and OOMs deterministically on a 32 GB host even with
+/// every other GPU/MCP service stopped. Reverse-citation queries scan the
+/// table, which is acceptable for the low-frequency snowball/citation-graph
+/// path. Do not re-add the index without a host RAM upgrade.
 pub const POST_LOAD_INDEXES: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_works_doi              ON works(doi);
 CREATE INDEX IF NOT EXISTS idx_works_year             ON works(publication_year);
 CREATE INDEX IF NOT EXISTS idx_works_cited_by         ON works(cited_by_count);
 CREATE INDEX IF NOT EXISTS idx_work_topics_topic      ON work_topics(topic_id);
 CREATE INDEX IF NOT EXISTS idx_work_concepts_concept  ON work_concepts(concept_id);
-CREATE INDEX IF NOT EXISTS idx_refs_referenced        ON work_references(referenced_work_id);
 "#;
