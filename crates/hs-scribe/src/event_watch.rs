@@ -184,13 +184,28 @@ pub async fn convert_and_upload(
                     // PDF itself is broken. HTTP 415 with the
                     // unsupported_content_type body is permanent too
                     // (the /scribe gate rejected non-PDF bytes at the
-                    // door). Everything else is a cluster-state problem
-                    // and should NAK.
+                    // door).
+                    //
+                    // VLM-content failures (`VLM repetition loop
+                    // detected`, `connection closed before message
+                    // completed` — llama-server closing a slot
+                    // mid-stream after its own repetition guard fires)
+                    // are also permanent: the same PDF will fail
+                    // identically on any scribe in the pool because the
+                    // VLM produces the same output for the same input
+                    // image. Without this, poison-pill papers NAK-and-
+                    // redeliver every 30 s on JetStream and hog every
+                    // in-flight slot, starving the rest of the queue.
+                    //
+                    // Everything else is a cluster-state problem and
+                    // should NAK.
                     let msg = format!("{e:#}");
                     let perm = msg.contains("FormatError")
                         || msg.contains("Invalid image size")
                         || msg.contains("PdfiumLibrary")
-                        || msg.contains("unsupported_content_type");
+                        || msg.contains("unsupported_content_type")
+                        || msg.contains("VLM repetition loop detected")
+                        || msg.contains("connection closed before message completed");
                     let ctx = e.context(format!("scribe convert failed for {}", event.key));
                     if perm {
                         HandlerError::Permanent(ctx)
