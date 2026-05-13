@@ -9,7 +9,7 @@ use crate::ocr::OcrEngine;
 use crate::pipeline::markdown_generator::{assemble_page_markdown, join_pages};
 use crate::pipeline::PdfParser;
 use crate::utils::deduplication::{deduplicate_boxes, filter_contained_regions};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use hs_common::hardware_profile::HardwareProfile;
 use image::DynamicImage;
@@ -1313,10 +1313,21 @@ async fn execute_vlm_for_page(
             ),
         });
 
-        // Same fail-loud rule as text regions above: a cell whose VLM
-        // call errors fails the whole conversion, not just the cell.
-        // Empty-jpeg cells stay as intentional placeholders (prepare_page
-        // emitted the warn) because they're not VLM failures.
+        // Text-region VLM failures abort the whole paper (fail-loud, ONE
+        // PATH). Table cells are different: each cell is a single-image
+        // VLM call whose output (often "0.5", "<.001", "Mean (SD)") is
+        // pathologically prone to tripping the streaming repetition
+        // detector. The detector firing on a 4-gram cycle ≥3 times is
+        // easy on tabular numerics — and aborting an entire 30-page
+        // paper because one cell on one page emitted "0.5 0.5 0.5 0.5"
+        // is a worse outcome than emitting an empty cell.
+        //
+        // So: a single cell's `RepetitionLoopError` degrades to an empty
+        // cell, the rest of the table is preserved, and the paper
+        // continues. This is NOT a generic "swallow VLM errors" path —
+        // only the repetition-loop class downgrades; transport errors
+        // and other failures still fail the conversion. The text-region
+        // path remains strict.
         let cell_texts: Vec<String> = stream::iter(table.cell_jpegs)
             .map(|jpeg| {
                 let ocr = Arc::clone(&ocr);
@@ -1332,10 +1343,26 @@ async fn execute_vlm_for_page(
                         .acquire()
                         .await
                         .map_err(|e| anyhow::anyhow!("VLM semaphore closed mid-table: {e}"))?;
-                    let text = ocr
+                    let text = match ocr
                         .recognize_region(&jpeg, RegionType::Text)
                         .await
-                        .with_context(|| format!("table cell VLM failed on page {page_num}"))?;
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            if e.downcast_ref::<crate::ocr::RepetitionLoopError>().is_some() {
+                                tracing::warn!(
+                                    page = page_num,
+                                    error = %e,
+                                    "table cell VLM repetition loop — emitting empty cell (table and paper continue)"
+                                );
+                                cell_done.fetch_add(1, Ordering::Relaxed);
+                                return Ok(String::new());
+                            }
+                            return Err(e.context(format!(
+                                "table cell VLM failed on page {page_num}"
+                            )));
+                        }
+                    };
                     drop(permit);
                     let done = cell_done.fetch_add(1, Ordering::Relaxed) + 1;
                     on_progress(ProgressEvent {
