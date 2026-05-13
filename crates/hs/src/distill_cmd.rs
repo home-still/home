@@ -250,6 +250,7 @@ async fn cmd_abstracts_build(
     reporter.status("Catalog", &format!("{total} entries"));
 
     let mut count_openalex = 0u32;
+    let mut count_catalog = 0u32;
     let mut count_markdown = 0u32;
     let mut count_title_only = 0u32;
     let mut count_skipped = 0u32;
@@ -273,14 +274,34 @@ async fn cmd_abstracts_build(
             .as_deref()
             .and_then(|doi| lookup_work_abstract_by_doi(&oa_conn, doi).ok().flatten());
         let openalex_abstract = oa_row.as_ref().and_then(|w| w.abstract_text.clone());
+        // Title coalesce: catalog > OpenAlex > stem. Falling back to the
+        // stem guarantees the embed_input is never empty, so every paper
+        // makes it into the `paper_abstracts` collection. The stem is a
+        // degraded signal for pure-DOI filenames but a useful one for
+        // author_year_topic personal-corpus naming.
         let title = entry
             .title
             .clone()
-            .or_else(|| oa_row.as_ref().and_then(|w| w.title.clone()));
+            .or_else(|| oa_row.as_ref().and_then(|w| w.title.clone()))
+            .unwrap_or_else(|| stem.clone());
 
-        // 2. Markdown fallback — only fetched if OpenAlex missed, since
-        //    every fetch is an S3 round-trip.
-        let markdown_text = if openalex_abstract.is_none() {
+        // 2. Catalog-stored abstract — captured at `paper_download` time
+        //    from whichever provider produced the hit (often Crossref,
+        //    Semantic Scholar, or arxiv for DOIs not in the OpenAlex
+        //    snapshot). Cheap to read — already on the entry we just
+        //    loaded.
+        let catalog_abstract = entry.abstract_text.clone();
+
+        // 3. Markdown fallback — only fetched if neither structured
+        //    source has an abstract, since every fetch is an S3
+        //    round-trip and many papers' converted markdown also lacks a
+        //    detectable Abstract section.
+        let need_markdown = openalex_abstract.is_none()
+            && catalog_abstract
+                .as_deref()
+                .map(|s| s.trim().chars().count() < hs_distill::abstracts::MIN_ABSTRACT_CHARS)
+                .unwrap_or(true);
+        let markdown_text = if need_markdown {
             if let Some(md_key) = entry.markdown_path.as_deref() {
                 match storage.get(md_key).await {
                     Ok(bytes) => String::from_utf8(bytes).ok(),
@@ -296,15 +317,13 @@ async fn cmd_abstracts_build(
             None
         };
 
-        let coalesced = coalesce_abstract(openalex_abstract, markdown_text.as_deref());
+        let coalesced = coalesce_abstract(
+            openalex_abstract,
+            catalog_abstract,
+            markdown_text.as_deref(),
+        );
         let abstract_chars = coalesced.abstract_chars();
-        let embed_input = build_embed_input(title.as_deref(), &coalesced);
-
-        if embed_input.trim().is_empty() {
-            tracing::warn!("{stem}: no title and no abstract — skipping");
-            count_errored += 1;
-            continue;
-        }
+        let embed_input = build_embed_input(Some(&title), &coalesced);
 
         // 3. POST to the existing /distill endpoint with a synthetic path
         //    so the doc_id resolves to the catalog stem.
@@ -313,7 +332,7 @@ async fn cmd_abstracts_build(
             .index_content_in(&path_hint, &embed_input, Some(&entry), Some(COLLECTION))
             .await
         {
-            Ok(_result) => {
+            Ok(result) if result.chunks_indexed > 0 => {
                 let source = coalesced.source.as_str();
                 if let Err(e) = hs_common::catalog::update_abstract_embed_catalog_via(
                     &*storage,
@@ -328,9 +347,18 @@ async fn cmd_abstracts_build(
                 }
                 match coalesced.source {
                     AbstractSource::Openalex => count_openalex += 1,
+                    AbstractSource::Catalog => count_catalog += 1,
                     AbstractSource::Markdown => count_markdown += 1,
                     AbstractSource::TitleOnly => count_title_only += 1,
                 }
+            }
+            Ok(_) => {
+                // Server returned success but produced 0 chunks (the
+                // pipeline's quality filter dropped them, or the chunker
+                // emitted nothing usable). Don't stamp — the catalog must
+                // never lie about Qdrant state.
+                tracing::warn!("{stem}: distill produced 0 chunks — not stamping");
+                count_errored += 1;
             }
             Err(e) => {
                 tracing::warn!("embed {stem}: {e}");
@@ -340,7 +368,7 @@ async fn cmd_abstracts_build(
     }
 
     reporter.finish(&format!(
-        "abstracts indexed: openalex={count_openalex} markdown={count_markdown} title_only={count_title_only} skipped={count_skipped} errors={count_errored}"
+        "abstracts indexed: openalex={count_openalex} catalog={count_catalog} markdown={count_markdown} title_only={count_title_only} skipped={count_skipped} errors={count_errored}"
     ));
     Ok(())
 }
@@ -358,6 +386,7 @@ async fn cmd_abstracts_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let total = entries.len();
 
     let mut count_openalex = 0u32;
+    let mut count_catalog = 0u32;
     let mut count_markdown = 0u32;
     let mut count_title_only = 0u32;
     let mut count_unstamped = 0u32;
@@ -365,6 +394,7 @@ async fn cmd_abstracts_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
     for (_stem, _meta, entry) in entries {
         match entry.abstract_embed.as_ref().map(|s| s.source.as_str()) {
             Some("openalex") => count_openalex += 1,
+            Some("catalog") => count_catalog += 1,
             Some("markdown") => count_markdown += 1,
             Some("title_only") => count_title_only += 1,
             _ => count_unstamped += 1,
@@ -372,8 +402,8 @@ async fn cmd_abstracts_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     reporter.finish(&format!(
-        "catalog={total} indexed={} (openalex={count_openalex} markdown={count_markdown} title_only={count_title_only}) unstamped={count_unstamped}",
-        count_openalex + count_markdown + count_title_only
+        "catalog={total} indexed={} (openalex={count_openalex} catalog={count_catalog} markdown={count_markdown} title_only={count_title_only}) unstamped={count_unstamped}",
+        count_openalex + count_catalog + count_markdown + count_title_only
     ));
     Ok(())
 }

@@ -37,6 +37,12 @@ pub const MIN_ABSTRACT_CHARS: usize = 100;
 pub enum AbstractSource {
     /// `works.abstract_text` from the local OpenAlex DuckDB.
     Openalex,
+    /// `CatalogEntry::abstract_text` — provider-provided abstract captured
+    /// at `paper_download` time (OpenAlex API, Crossref, Semantic Scholar,
+    /// arxiv, etc., whichever provider gave the hit). Used when the local
+    /// OpenAlex snapshot doesn't cover the DOI but the catalog has an
+    /// abstract from another provider.
+    Catalog,
     /// Extracted from the converted markdown's Abstract section.
     Markdown,
     /// No usable abstract from either source — embed the title alone.
@@ -47,6 +53,7 @@ impl AbstractSource {
     pub fn as_str(&self) -> &'static str {
         match self {
             AbstractSource::Openalex => "openalex",
+            AbstractSource::Catalog => "catalog",
             AbstractSource::Markdown => "markdown",
             AbstractSource::TitleOnly => "title_only",
         }
@@ -70,21 +77,38 @@ impl CoalescedAbstract {
     }
 }
 
-/// Pick the best of (openalex catalog abstract, markdown-extracted
-/// abstract, title-only). Each candidate must be `>= MIN_ABSTRACT_CHARS`
-/// to be accepted; otherwise we fall through.
+/// Pick the best of (openalex catalog abstract, catalog-stored abstract,
+/// markdown-extracted abstract, title-only). Each candidate must be
+/// `>= MIN_ABSTRACT_CHARS` to be accepted; otherwise we fall through.
 ///
 /// Inputs are pre-fetched so this function stays IO-free and testable.
 /// The caller (in the `hs distill abstracts build` flow) does the DOI
-/// lookup against the OpenAlex DuckDB and the markdown fetch via the
-/// storage backend, then passes the two `Option<String>` candidates in.
+/// lookup against the OpenAlex DuckDB, reads `entry.abstract_text` from
+/// the catalog, and fetches the markdown via the storage backend, then
+/// passes the three candidates in. Source priority:
+///
+/// 1. `Openalex` — most authoritative; reconstructed plain text from the
+///    OpenAlex snapshot.
+/// 2. `Catalog` — provider-provided at download time; identical content to
+///    (1) when OpenAlex was the provider, but also covers DOIs/papers not
+///    in the local snapshot (Crossref, Semantic Scholar, arxiv...).
+/// 3. `Markdown` — heuristic extraction from VLM-converted PDF.
+/// 4. `TitleOnly` — last resort.
 pub fn coalesce_abstract(
     openalex_abstract: Option<String>,
+    catalog_abstract: Option<String>,
     markdown_body: Option<&str>,
 ) -> CoalescedAbstract {
     if let Some(text) = openalex_abstract.filter(|s| s.trim().len() >= MIN_ABSTRACT_CHARS) {
         return CoalescedAbstract {
             source: AbstractSource::Openalex,
+            abstract_text: Some(text.trim().to_string()),
+        };
+    }
+
+    if let Some(text) = catalog_abstract.filter(|s| s.trim().len() >= MIN_ABSTRACT_CHARS) {
+        return CoalescedAbstract {
+            source: AbstractSource::Catalog,
             abstract_text: Some(text.trim().to_string()),
         };
     }
@@ -267,6 +291,7 @@ mod tests {
     fn coalesce_prefers_openalex() {
         let r = coalesce_abstract(
             Some("This is a long-enough OpenAlex abstract that exceeds the minimum character threshold of one hundred chars for sure.".to_string()),
+            Some("Catalog-stored abstract from a different provider that should not win because OpenAlex is present and authoritative.".to_string()),
             Some("## Abstract\nDifferent markdown content here that is also more than one hundred characters long."),
         );
         assert_eq!(r.source, AbstractSource::Openalex);
@@ -274,8 +299,25 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_falls_through_to_catalog() {
+        // OpenAlex missing; catalog has a provider-supplied abstract.
+        let r = coalesce_abstract(
+            None,
+            Some("Catalog-stored abstract from Semantic Scholar — plenty long for the minimum-chars threshold used by the coalesce.".to_string()),
+            Some("## Abstract\nMarkdown-derived would win if catalog were missing but the catalog tier sits above markdown."),
+        );
+        assert_eq!(r.source, AbstractSource::Catalog);
+        assert!(r
+            .abstract_text
+            .as_ref()
+            .unwrap()
+            .starts_with("Catalog-stored"));
+    }
+
+    #[test]
     fn coalesce_falls_through_to_markdown() {
         let r = coalesce_abstract(
+            None,
             None,
             Some("## Abstract\nMarkdown-derived abstract content that is plenty long for the minimum threshold check used by the coalesce.\n\n## Methods\nbody"),
         );
@@ -287,6 +329,7 @@ mod tests {
     fn coalesce_falls_through_to_title_only() {
         let r = coalesce_abstract(
             Some("too short".to_string()),
+            Some("also short".to_string()),
             Some("no abstract marker here"),
         );
         assert_eq!(r.source, AbstractSource::TitleOnly);

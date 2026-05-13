@@ -62,7 +62,13 @@ pub async fn index_document(
     // vector and poison search. Returning Ok(0) routes through
     // record_embedding_outcome_via → embedding_skip = zero_chunks_or_empty,
     // which the reconciler treats as an intentional terminal skip.
-    if hs_common::html::is_paywall_html(&markdown) {
+    //
+    // The `paper_abstracts` collection deliberately ships short content
+    // (title-only stems when no abstract was recovered), which trips the
+    // "short page without article structure = junk" rule inside
+    // `is_paywall_html`. Skip the check for that collection — every paper
+    // is supposed to make it in, even with degraded signal.
+    if collection_name != "paper_abstracts" && hs_common::html::is_paywall_html(&markdown) {
         tracing::warn!(
             stem,
             len = markdown.len(),
@@ -145,15 +151,26 @@ pub async fn index_document(
     let chunks = chunk_markdown(&markdown, &meta, &page_offsets, &chunker_config);
 
     // Filter out low-quality chunks (repetition loops, garbled text, etc.)
-    let pre_filter = chunks.len();
-    let chunks: Vec<_> = chunks
-        .into_iter()
-        .filter(|c| !crate::quality::is_low_quality(&c.raw_text))
-        .collect();
-    let filtered = pre_filter - chunks.len();
-    if filtered > 0 {
-        tracing::info!("{}: skipped {} low-quality chunk(s)", stem, filtered);
-    }
+    // The `paper_abstracts` collection deliberately ships short, single-chunk
+    // payloads (title-only when no abstract was recovered) which fail the
+    // 50-char `TooShort` rule. Bypass the filter for that collection —
+    // callers there have already made an informed decision to index
+    // degraded-signal content, and dropping points behind their back was
+    // causing 2,268 catalog stamps to point at non-existent Qdrant rows.
+    let chunks: Vec<_> = if collection_name == "paper_abstracts" {
+        chunks
+    } else {
+        let pre_filter = chunks.len();
+        let kept: Vec<_> = chunks
+            .into_iter()
+            .filter(|c| !crate::quality::is_low_quality(&c.raw_text))
+            .collect();
+        let filtered = pre_filter - kept.len();
+        if filtered > 0 {
+            tracing::info!("{}: skipped {} low-quality chunk(s)", stem, filtered);
+        }
+        kept
+    };
 
     let total_chunks = chunks.len() as u32;
 
