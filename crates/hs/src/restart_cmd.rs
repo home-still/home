@@ -78,13 +78,16 @@ async fn restart_system_service(service_type: &str, reporter: &Arc<dyn Reporter>
             }
         }
 
-        // Pre-check sudo NOPASSWD. Without it, the next call blocks waiting
-        // for password input from a tty we don't have. Better to fail fast
-        // with an actionable message.
-        if !sudo_noninteractive_available().await {
+        // Pre-check that `sudo systemctl restart <service>` is allowed
+        // without a password. The sudoers entry here is typically scoped
+        // to specific systemctl commands (e.g. `NOPASSWD: systemctl
+        // restart hs-serve-*`), so a blanket `sudo -n true` probe gives
+        // a false negative — `sudo -l <cmd>` checks the exact command's
+        // policy and respects scoped NOPASSWD entries.
+        if !sudo_can_restart(&service_name).await {
             reporter.warn(&format!(
-                "{service_name}: skipping restart — `sudo systemctl restart` requires NOPASSWD or \
-                 a tty. Configure /etc/sudoers.d/hs-systemd or run manually: \
+                "{service_name}: skipping restart — `sudo systemctl restart {service_name}` not \
+                 allowed without password. Configure /etc/sudoers.d/hs-systemd or run manually: \
                  `sudo systemctl restart {service_name}`"
             ));
             return Ok(false);
@@ -334,12 +337,22 @@ fn port_holder_not_under_unit(unit_name: &str, port: u16) -> Option<u32> {
     None
 }
 
-/// Probe whether `sudo systemctl ...` will run without prompting. Uses
-/// `sudo -n true` which exits non-zero if a password would be required.
+/// Probe whether `sudo systemctl restart <service>` is allowed without
+/// a password. Uses `sudo -nl <full-command>` which exits zero only if
+/// the exact command is permitted under the current sudoers policy.
+///
+/// `sudo -l <cmd>` respects scoped NOPASSWD entries (e.g. `NOPASSWD:
+/// /usr/bin/systemctl restart hs-serve-*`), so it returns true for the
+/// real-world case where users grant per-service restart rights without
+/// granting blanket NOPASSWD. Falling back to `sudo -n true` (the
+/// previous probe) returned false for that case and caused
+/// `hs upgrade` to skip every service restart with a misleading
+/// "requires NOPASSWD or a tty" warning even when the actual restart
+/// would have succeeded.
 #[cfg(target_os = "linux")]
-async fn sudo_noninteractive_available() -> bool {
+async fn sudo_can_restart(service_name: &str) -> bool {
     tokio::process::Command::new("sudo")
-        .args(["-n", "true"])
+        .args(["-nl", "/usr/bin/systemctl", "restart", service_name])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
