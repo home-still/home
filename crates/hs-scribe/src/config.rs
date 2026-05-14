@@ -61,6 +61,11 @@ pub struct AppConfig {
     pub cloud_api_key: Option<String>,
     pub cloud_url: String,
     pub openai_url: String,
+    /// Bearer token for the OpenAI-compatible VLM backend. `None` when the
+    /// backend is unauthenticated (e.g. a bare `llama-server` on big). Set
+    /// via `HS_SCRIBE_OPENAI_API_KEY` when routing through an auth-gated
+    /// proxy such as `llama-swap` on a daily-driver host.
+    pub openai_api_key: Option<String>,
     pub backend: BackendChoice,
     /// Wall-clock deadline (seconds) for a single PDF convert on the server.
     /// The handler wraps `process_pdf_*` in `tokio::time::timeout()` — when
@@ -102,6 +107,7 @@ impl Default for AppConfig {
             cloud_api_key: None,
             cloud_url: "https://api.z.ai/api/paas/v4/layout_parsing".into(),
             openai_url: "http://localhost:8080".into(),
+            openai_api_key: None,
             backend: BackendChoice::Ollama,
             convert_deadline_secs: 900,
             dpi: 200,

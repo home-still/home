@@ -21,14 +21,19 @@ pub struct OpenAiBackend {
     client: reqwest::Client,
     url: String,
     model: String,
+    /// Bearer token for auth-gated backends (e.g. `llama-swap`). `None`
+    /// for a bare `llama-server` that serves without auth — in which case
+    /// no `Authorization` header is sent at all.
+    api_key: Option<String>,
 }
 
 impl OpenAiBackend {
-    pub fn new(url: &str, model: &str) -> Self {
+    pub fn new(url: &str, model: &str, api_key: Option<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
             url: url.trim_end_matches('/').to_string(),
             model: model.strip_suffix(":latest").unwrap_or(model).to_string(),
+            api_key: api_key.filter(|k| !k.is_empty()),
         }
     }
 
@@ -110,7 +115,11 @@ impl OpenAiBackend {
         let endpoint = format!("{}/v1/chat/completions", self.url);
         let mut attempt = 0usize;
         loop {
-            let send_res = self.client.post(&endpoint).json(body).send().await;
+            let mut req = self.client.post(&endpoint).json(body);
+            if let Some(key) = &self.api_key {
+                req = req.bearer_auth(key);
+            }
+            let send_res = req.send().await;
             match send_res {
                 Ok(resp) => {
                     let status = resp.status();
