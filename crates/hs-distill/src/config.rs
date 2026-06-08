@@ -112,6 +112,17 @@ pub struct EmbeddingConfig {
     /// Present in config for operator visibility and to ensure any
     /// attempt to write a non-CUDA value fails loudly at deserialization.
     pub compute_device: ComputeDevice,
+    /// Drop the bge-m3 weights from GPU memory after this many seconds
+    /// of no embed requests. `None` (default) = never drop — the model
+    /// stays resident forever, matching pre-rc.NNN behavior. Set to a
+    /// value like 300 on hosts where another GPU service shares the card
+    /// (e.g. `big` running an olmocr VLM alongside distill); first
+    /// embed request after a release reloads the model from disk (~10s
+    /// warm-up). The release is verified at the ort layer — dropping
+    /// `fastembed::TextEmbedding` releases the underlying `ort::Session`
+    /// and its CUDA allocations.
+    #[serde(default)]
+    pub idle_release_secs: Option<u64>,
 }
 
 impl Default for EmbeddingConfig {
@@ -124,6 +135,7 @@ impl Default for EmbeddingConfig {
             adaptive_batch: true,
             sparse_enabled: true,
             compute_device: ComputeDevice::Cuda,
+            idle_release_secs: None,
         }
     }
 }
