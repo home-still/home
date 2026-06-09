@@ -82,12 +82,20 @@ pub struct IngestedEvent {
 /// - `Transient` — cluster state that will recover: storage GET/PUT
 ///   failure, scribe 5xx / connection reset / dispatch timeout, no ready
 ///   scribe servers. The caller NAKs with backoff.
+#[allow(clippy::too_many_arguments)]
 pub async fn convert_and_upload(
     storage: &dyn Storage,
     scribe: &ScribeClient,
     bus: &dyn EventBus,
     event: &IngestedEvent,
     timeout_policy: &TimeoutPolicy,
+    // Step 2d chain context. `converted_by` identifies which backend in
+    // `ScribeConfig.servers` ran this call so the catalog can record it;
+    // `attempts_log` is the audit trail of any earlier backends that
+    // escalated to this one. Both flow straight through to the success-
+    // path catalog stamp; ignored on failure.
+    converted_by: Option<String>,
+    attempts_log: Vec<hs_common::catalog::AttemptEntry>,
 ) -> Result<String, HandlerError> {
     let filename = event
         .key
@@ -364,8 +372,8 @@ pub async fn convert_and_upload(
         total_pages,
         page_offsets,
         &md_key,
-        None,
-        Vec::new(),
+        converted_by,
+        attempts_log,
     )
     .await
     {

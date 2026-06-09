@@ -308,11 +308,18 @@ pub(crate) fn classify_convert_failure(err: &anyhow::Error) -> ConvertClassifica
     }
 }
 
+/// One backend's HTTP client plus the operator-visible name from
+/// `ScribeConfig.servers[].backend`. Built once at startup so per-event
+/// dispatch isn't reconstructing reqwest clients.
+struct ChainEntry {
+    backend: String,
+    client: hs_scribe::client::ScribeClient,
+}
+
 pub(crate) async fn cmd_watch_events(
     server_override: Option<String>,
     _reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    use hs_common::service::pool::ServicePool;
     use hs_scribe::client::ScribeClient;
     use hs_scribe::config::ScribeConfig;
     use hs_scribe::event_watch::{convert_and_upload, run_subscriber};
@@ -321,134 +328,206 @@ pub(crate) async fn cmd_watch_events(
     let storage = cfg.build_storage()?;
     let bus = cfg.build_event_bus().await?;
 
-    // For now the dispatch pool only knows URLs (the chain logic in Step
-    // 2d will plumb backend metadata through). Drop the per-entry backend
-    // here so today's `ServicePool` keeps compiling.
-    let servers: Vec<String> = match server_override {
-        Some(s) => vec![s],
-        None if !cfg.servers.is_empty() => cfg.servers.iter().map(|e| e.url.clone()).collect(),
-        None => vec![DEFAULT_SERVER.to_string()],
-    };
     let convert_timeout = std::time::Duration::from_secs(cfg.convert_timeout_secs);
-    let clients: Vec<ScribeClient> = servers
-        .iter()
-        .map(|u| ScribeClient::new_with_timeout(u, convert_timeout))
-        .collect::<Result<_>>()?;
-    let pool = Arc::new(ServicePool::new(clients));
+    // Build the chain in operator-specified order. CLI `--server` override
+    // collapses to a singleton chain with an unknown backend label —
+    // catalog will record `converted_by: "unknown"` so an operator can
+    // still tell at a glance that the chain was bypassed.
+    let chain: Vec<ChainEntry> = match server_override {
+        Some(url) => vec![ChainEntry {
+            backend: "unknown".to_string(),
+            client: ScribeClient::new_with_timeout(&url, convert_timeout)?,
+        }],
+        None if !cfg.servers.is_empty() => cfg
+            .servers
+            .iter()
+            .map(|e| {
+                Ok(ChainEntry {
+                    backend: e.backend.clone(),
+                    client: ScribeClient::new_with_timeout(&e.url, convert_timeout)?,
+                })
+            })
+            .collect::<Result<_>>()?,
+        None => vec![ChainEntry {
+            backend: "glm_ocr".to_string(),
+            client: ScribeClient::new_with_timeout(DEFAULT_SERVER, convert_timeout)?,
+        }],
+    };
+    let chain = Arc::new(chain);
     let timeout_policy = Arc::new(cfg.timeout_policy.clone());
 
+    let chain_summary: Vec<String> = chain
+        .iter()
+        .map(|e| format!("{}@{}", e.backend, e.client.url()))
+        .collect();
     tracing::info!(
-        servers = ?servers,
+        chain = ?chain_summary,
         convert_timeout_secs = cfg.convert_timeout_secs,
         base_secs = timeout_policy.base_secs,
         per_page_secs = timeout_policy.per_page_secs,
         floor_secs = timeout_policy.floor_secs,
         ceiling_secs = timeout_policy.ceiling_secs,
-        "starting event-bus watcher with {}-server pool",
-        servers.len()
+        "starting event-bus watcher with {}-backend chain",
+        chain.len()
     );
 
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
-    let concurrency = pool.probed_concurrency().await;
+    // Chain processing is sequential per event; concurrency cap stays
+    // modest. The legacy `ServicePool::probed_concurrency` was sized for
+    // pool-wide fan-out which no longer matches the chain model — fall
+    // back to a fixed 8-in-flight cap so the watcher can still pipeline
+    // independent events through long chains without blowing up.
+    let concurrency = 8usize;
     tracing::info!(concurrency, "scribe-watch consumer in-flight cap");
     run_subscriber(bus.clone(), storage.clone(), concurrency, move |event| {
         let storage = storage_for_handler.clone();
         let bus = bus_for_handler.clone();
-        let pool = pool.clone();
+        let chain = chain.clone();
         let timeout_policy = timeout_policy.clone();
         async move {
-            // Dispatch retry: a /convert can fail mid-stream when a
-            // single scribe's link flaps. One fast retry on a different
-            // host is cheap, and convert_and_upload is idempotent via
-            // its head-check on the target markdown key. Permanent
-            // failures (VLM repetition, unsupported type, paywall HTML,
-            // PDF parse errors) short-circuit the retry — redelivery to
-            // a different server would fail identically.
-            let max_dispatch_attempts: u32 = 2;
+            // Walk the chain in order. On `Escalate` or `Transient`, log
+            // the attempt and continue to the next backend; the next
+            // backend may handle the content this one rejected. On
+            // `Permanent`, short-circuit immediately — the source is
+            // intrinsically unconvertable and no other backend will help.
+            // On success, the backend's own catalog stamp captures the
+            // chain context (converted_by + attempts_log).
+            let mut attempts_log: Vec<hs_common::catalog::AttemptEntry> = Vec::new();
             let mut last_err: Option<hs_scribe::event_watch::HandlerError> = None;
-            for attempt in 1..=max_dispatch_attempts {
-                let (client, _pick_guard) = match pool.pick_server().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        return Err(hs_scribe::event_watch::HandlerError::Transient(
-                            e.context("no ready scribe servers"),
-                        ));
-                    }
-                };
+
+            for entry in chain.iter() {
                 tracing::info!(
-                    server = %client.url(),
+                    server = %entry.client.url(),
+                    backend = %entry.backend,
                     key = %event.key,
-                    attempt,
-                    "dispatching event"
+                    chain_pos = attempts_log.len() + 1,
+                    "chain attempt"
                 );
-                match convert_and_upload(
+                let result = convert_and_upload(
                     storage.as_ref(),
-                    client,
+                    &entry.client,
                     bus.as_ref(),
                     &event,
                     timeout_policy.as_ref(),
+                    Some(entry.backend.clone()),
+                    attempts_log.clone(),
                 )
-                .await
-                {
+                .await;
+
+                let now = chrono::Utc::now().to_rfc3339();
+                match result {
                     Ok(_) => return Ok(()),
                     Err(hs_scribe::event_watch::HandlerError::Permanent(e)) => {
-                        // Terminal: source won't convert regardless of
-                        // retries. Stamp `conversion_failed` on the
-                        // catalog row so catalog_repair's stuck_convert
-                        // direction won't re-publish this stem, and
-                        // `hs status` surfaces it in the Corrupted PDFs
-                        // count. Best-effort — if the stamp itself fails
-                        // we still term the NATS message so the daemon
-                        // doesn't spin.
-                        if let Some(stem) = stem_from_event_key(&event.key) {
-                            // Today the chain is single-backend, so
-                            // Permanent and Escalate both end up
-                            // stamping immediately. Step 2d will branch
-                            // on the variant to walk a multi-backend
-                            // chain before stamping.
-                            let classification = classify_convert_failure(&e);
-                            let reason = classification.reason();
-                            if let Err(stamp_err) =
-                                hs_common::catalog::update_conversion_failed_via(
-                                    storage.as_ref(),
-                                    "catalog",
-                                    &stem,
-                                    reason,
-                                    Vec::new(),
-                                )
-                                .await
-                            {
+                        let classification = classify_convert_failure(&e);
+                        let reason = classification.reason().to_string();
+                        let outcome = match &classification {
+                            ConvertClassification::Permanent(_) => "permanent",
+                            ConvertClassification::Escalate(_) => "escalate",
+                        };
+                        attempts_log.push(hs_common::catalog::AttemptEntry {
+                            backend: entry.backend.clone(),
+                            outcome: outcome.to_string(),
+                            reason: Some(reason.clone()),
+                            at: now,
+                        });
+                        match classification {
+                            ConvertClassification::Permanent(_) => {
                                 tracing::warn!(
-                                    stem = %stem,
-                                    reason,
-                                    error = %stamp_err,
-                                    "failed to stamp conversion_failed; terminating anyway"
+                                    backend = %entry.backend,
+                                    key = %event.key,
+                                    reason = %reason,
+                                    "chain short-circuit: permanent failure"
                                 );
+                                if let Some(stem) = stem_from_event_key(&event.key) {
+                                    if let Err(stamp_err) =
+                                        hs_common::catalog::update_conversion_failed_via(
+                                            storage.as_ref(),
+                                            "catalog",
+                                            &stem,
+                                            &reason,
+                                            attempts_log.clone(),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            stem = %stem,
+                                            reason = %reason,
+                                            error = %stamp_err,
+                                            "failed to stamp conversion_failed; terminating anyway"
+                                        );
+                                    }
+                                }
+                                return Err(hs_scribe::event_watch::HandlerError::Permanent(e));
+                            }
+                            ConvertClassification::Escalate(_) => {
+                                tracing::info!(
+                                    backend = %entry.backend,
+                                    key = %event.key,
+                                    reason = %reason,
+                                    "chain escalating to next backend"
+                                );
+                                last_err = Some(hs_scribe::event_watch::HandlerError::Permanent(e));
                             }
                         }
-                        return Err(hs_scribe::event_watch::HandlerError::Permanent(e));
                     }
-                    Err(hs_scribe::event_watch::HandlerError::Transient(e))
-                        if attempt < max_dispatch_attempts =>
-                    {
+                    Err(hs_scribe::event_watch::HandlerError::Transient(e)) => {
+                        // Transient failures on this backend (network
+                        // flake, scribe 5xx) — try the next backend
+                        // before NAKing the event back to JetStream.
+                        // Different backend = different process =
+                        // different network path, so it may not share
+                        // the transient condition.
+                        attempts_log.push(hs_common::catalog::AttemptEntry {
+                            backend: entry.backend.clone(),
+                            outcome: "transient".to_string(),
+                            reason: Some(format!("{e:#}")),
+                            at: now,
+                        });
                         tracing::warn!(
-                            server = %client.url(),
+                            backend = %entry.backend,
                             key = %event.key,
-                            attempt,
                             error = %e,
-                            "convert failed — retrying on a different server"
+                            "chain transient: trying next backend"
                         );
                         last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
                     }
-                    Err(e) => return Err(e),
                 }
             }
-            Err(last_err.unwrap_or_else(|| {
-                hs_scribe::event_watch::HandlerError::Transient(anyhow::anyhow!(
-                    "dispatch retries exhausted"
-                ))
-            }))
+
+            // Chain exhausted. Whatever the last error was, surface it
+            // — `last_err` is `Some` because the loop ran at least once
+            // (the chain is non-empty by construction). If the last
+            // surviving error was Permanent, stamp it; if it was
+            // Transient, NAK and let JetStream redeliver.
+            match last_err {
+                Some(hs_scribe::event_watch::HandlerError::Permanent(e)) => {
+                    let reason = classify_convert_failure(&e).reason().to_string();
+                    if let Some(stem) = stem_from_event_key(&event.key) {
+                        if let Err(stamp_err) = hs_common::catalog::update_conversion_failed_via(
+                            storage.as_ref(),
+                            "catalog",
+                            &stem,
+                            &reason,
+                            attempts_log,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                stem = %stem,
+                                reason = %reason,
+                                error = %stamp_err,
+                                "failed to stamp chain-exhausted conversion_failed"
+                            );
+                        }
+                    }
+                    Err(hs_scribe::event_watch::HandlerError::Permanent(e))
+                }
+                Some(e) => Err(e),
+                None => Err(hs_scribe::event_watch::HandlerError::Transient(
+                    anyhow::anyhow!("chain was empty"),
+                )),
+            }
         }
     })
     .await
