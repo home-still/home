@@ -190,6 +190,8 @@ fn build_catalog(i: &CatalogInput<'_>) -> CatalogEntry {
             total_pages: 0,
             converted_at: now,
             pages: Vec::new(),
+            converted_by: None,
+            attempts_log: Vec::new(),
         }),
         category: Some(i.category.to_string()),
         original_format: Some(i.format.to_string()),

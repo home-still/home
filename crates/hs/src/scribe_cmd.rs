@@ -360,6 +360,7 @@ pub(crate) async fn cmd_watch_events(
                                     "catalog",
                                     &stem,
                                     &reason,
+                                    Vec::new(),
                                 )
                                 .await
                             {
@@ -853,6 +854,8 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
                 total_pages,
                 converted_at: chrono::Utc::now().to_rfc3339(),
                 pages: hs_common::catalog::compute_page_offsets(&content),
+                converted_by: None,
+                attempts_log: Vec::new(),
             }),
             ..Default::default()
         };

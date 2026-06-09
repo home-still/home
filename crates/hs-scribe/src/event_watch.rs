@@ -129,6 +129,7 @@ pub async fn convert_and_upload(
                     "catalog",
                     stem,
                     "source_missing",
+                    Vec::new(),
                 )
                 .await
                 {
@@ -275,6 +276,7 @@ pub async fn convert_and_upload(
                         "catalog",
                         stem,
                         "vlm_repetition_loop",
+                        Vec::new(),
                     )
                     .await
                     {
@@ -362,6 +364,8 @@ pub async fn convert_and_upload(
         total_pages,
         page_offsets,
         &md_key,
+        None,
+        Vec::new(),
     )
     .await
     {

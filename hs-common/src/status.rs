@@ -1064,6 +1064,8 @@ mod history_tests {
                 total_pages: 1,
                 converted_at: "2026-04-15T19:50:02Z".into(),
                 pages: vec![],
+                converted_by: None,
+                attempts_log: vec![],
             }),
             embedding_skip: Some(EmbeddingSkip {
                 reason: "zero_chunks_or_empty".into(),
@@ -1080,6 +1082,8 @@ mod history_tests {
                 total_pages: 33,
                 converted_at: "2026-04-15T18:01:00Z".into(),
                 pages: vec![],
+                converted_by: None,
+                attempts_log: vec![],
             }),
             embedding: Some(EmbeddingMeta {
                 server: "distill-1".into(),
@@ -1161,6 +1165,8 @@ mod stuck_convert_tests {
                 total_pages: 5,
                 converted_at: "2026-04-15T16:01:00Z".into(),
                 pages: vec![],
+                converted_by: None,
+                attempts_log: vec![],
             }),
             ..Default::default()
         };
@@ -1208,6 +1214,7 @@ mod stuck_convert_tests {
                 reason: "unsupported_content_type:html".into(),
                 at: "2026-04-24T10:01:00Z".into(),
                 attempts: 1,
+                attempts_log: vec![],
             }),
             ..Default::default()
         };
@@ -1637,6 +1644,8 @@ mod flag_drift_tests {
                 total_pages: 0,
                 converted_at: batch_stamp.into(),
                 pages: vec![],
+                converted_by: None,
+                attempts_log: vec![],
             }),
             repair: Some(RepairMeta {
                 repaired_at: batch_stamp.into(),

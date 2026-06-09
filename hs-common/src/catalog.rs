@@ -105,6 +105,18 @@ pub struct ConversionMeta {
     pub converted_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<PageOffset>,
+    /// Which backend in the scribe chain produced this markdown. Distinct
+    /// from `server` — `server` is the pipeline class ("scribe-vlm"),
+    /// `converted_by` identifies the specific VLM (`"olmocr"`, `"glm_ocr"`).
+    /// `None` for legacy rows written before the chain feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub converted_by: Option<String>,
+    /// Ordered log of backends tried before this success. Empty when the
+    /// primary backend succeeded on first attempt; populated when the
+    /// chain escalated past failed primaries before reaching the backend
+    /// recorded in `converted_by`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts_log: Vec<AttemptEntry>,
 }
 
 /// Terminal convert failure — written when the source is unconvertable by
@@ -121,10 +133,43 @@ pub struct ConversionFailure {
     pub reason: String,
     /// RFC3339 timestamp of when this failure was recorded.
     pub at: String,
-    /// Attempt counter. Always 1 today (terminal on first detection); the
-    /// field is carried so a future retry policy has a place to increment.
+    /// Attempt counter. Increments by 1 each time the catalog is stamped
+    /// for the same stem — orthogonal to `attempts_log`, which is per-
+    /// chain-walk. `attempts` is the rough redelivery count, useful for
+    /// "this stem failed N times across the whole cluster lifetime";
+    /// `attempts_log` is the audit trail of the most recent chain walk.
     #[serde(default = "default_attempts")]
     pub attempts: u32,
+    /// Ordered log of backends tried during the most recent chain walk
+    /// before all backends were exhausted. Lets operators see WHICH
+    /// backends rejected a doc and with WHAT reasons without grepping
+    /// scribe logs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts_log: Vec<AttemptEntry>,
+}
+
+/// One step in the scribe chain's attempt log, recorded by the orchestrator
+/// after each backend returns. Lives on both `ConversionMeta` (success
+/// case — shows the path through escalating backends) and
+/// `ConversionFailure` (exhaustion case — shows every backend tried).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptEntry {
+    /// Backend identifier from `ScribeConfig.servers[].backend` — e.g.
+    /// `"olmocr"`, `"glm_ocr"`. Matches the value written to
+    /// `ConversionMeta.converted_by` when this attempt was the one that
+    /// succeeded.
+    pub backend: String,
+    /// Classified outcome. Canonical values: `"success"`, `"escalate"`,
+    /// `"permanent"`, `"transient"`. The orchestrator maps each backend's
+    /// returned error class to one of these before logging.
+    pub outcome: String,
+    /// Short machine-readable failure reason when `outcome` is not
+    /// `"success"` — e.g. `"vlm_repetition_loop"`, `"pdf_parse_error"`,
+    /// `"transport_error"`. `None` when the attempt succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// RFC3339 timestamp of when this attempt completed.
+    pub at: String,
 }
 
 fn default_attempts() -> u32 {
@@ -226,6 +271,7 @@ pub fn write_catalog_entry(
 
 /// Update only the conversion section of an existing catalog entry.
 /// If no entry exists, creates a minimal one with just conversion metadata.
+#[allow(clippy::too_many_arguments)]
 pub fn update_conversion_catalog(
     catalog_dir: &Path,
     stem: &str,
@@ -234,6 +280,8 @@ pub fn update_conversion_catalog(
     total_pages: u64,
     pages: Vec<PageOffset>,
     markdown_path: &str,
+    converted_by: Option<String>,
+    attempts_log: Vec<AttemptEntry>,
 ) -> std::io::Result<()> {
     let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
 
@@ -244,6 +292,8 @@ pub fn update_conversion_catalog(
         total_pages,
         converted_at: chrono::Utc::now().to_rfc3339(),
         pages,
+        converted_by,
+        attempts_log,
     });
 
     write_catalog_entry(catalog_dir, stem, &entry)
@@ -529,6 +579,8 @@ pub async fn update_conversion_catalog_via(
     total_pages: u64,
     pages: Vec<PageOffset>,
     markdown_path: &str,
+    converted_by: Option<String>,
+    attempts_log: Vec<AttemptEntry>,
 ) -> anyhow::Result<()> {
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
         .await?
@@ -541,6 +593,8 @@ pub async fn update_conversion_catalog_via(
         total_pages,
         converted_at: chrono::Utc::now().to_rfc3339(),
         pages,
+        converted_by,
+        attempts_log,
     });
 
     write_catalog_entry_via(storage, prefix, stem, &entry).await
@@ -558,6 +612,7 @@ pub async fn update_conversion_failed_via(
     prefix: &str,
     stem: &str,
     reason: &str,
+    attempts_log: Vec<AttemptEntry>,
 ) -> anyhow::Result<()> {
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
         .await?
@@ -571,6 +626,7 @@ pub async fn update_conversion_failed_via(
         reason: reason.to_string(),
         at: chrono::Utc::now().to_rfc3339(),
         attempts,
+        attempts_log,
     });
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
@@ -735,6 +791,8 @@ mod storage_tests {
                 total_pages: 1,
                 converted_at: "2026-04-15T19:50:02Z".into(),
                 pages: vec![],
+                converted_by: None,
+                attempts_log: vec![],
             }),
             ..Default::default()
         };
@@ -782,6 +840,7 @@ conversion:
             "catalog",
             "paywalled",
             "unsupported_content_type:html",
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -798,6 +857,7 @@ conversion:
             "catalog",
             "paywalled",
             "unsupported_content_type:html",
+            Vec::new(),
         )
         .await
         .unwrap();

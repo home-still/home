@@ -622,6 +622,7 @@ async fn inspect_and_quarantine(
         "catalog",
         &stem,
         "quarantine_scan:binary",
+        Vec::new(),
     )
     .await
     {
@@ -1017,6 +1018,8 @@ mod drop_local_html_tests {
                 total_pages: 1,
                 converted_at: "2026-04-24T00:00:00Z".to_string(),
                 pages: vec![],
+                converted_by: None,
+                attempts_log: vec![],
             }),
             ..Default::default()
         };

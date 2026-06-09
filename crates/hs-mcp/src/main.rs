@@ -1608,6 +1608,8 @@ impl HomeStillMcp {
                     total_pages: 0,
                     converted_at,
                     pages: Vec::new(),
+                    converted_by: None,
+                    attempts_log: Vec::new(),
                 });
                 drift_conversion_repaired += 1;
                 changed = true;
@@ -2296,6 +2298,8 @@ impl HomeStillMcp {
             total_pages,
             page_offsets,
             &md_key,
+            None,
+            Vec::new(),
         )
         .await
         .map_err(|e| format!("Failed to update catalog for '{}': {e}", p.stem))?;
