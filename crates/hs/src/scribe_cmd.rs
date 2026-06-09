@@ -298,6 +298,13 @@ pub(crate) fn classify_convert_failure(err: &anyhow::Error) -> ConvertClassifica
         // guard fires — same VLM-class failure family as the explicit
         // repetition loop detection. Different VLM may not hit it.
         ConvertClassification::Escalate("vlm_transport_error".to_string())
+    } else if msg.contains("olmocr reported 0 completed pages") {
+        // Olmocr ran but produced nothing (output validation rejected
+        // every page, or its renderer couldn't open the PDF). Not proof
+        // the PDF is broken — observed on the Russian Code Complete,
+        // which has a clean text layer. Escalate; a genuinely broken
+        // PDF fails fast on the next backend with a real FormatError.
+        ConvertClassification::Escalate("olmocr_zero_pages".to_string())
     } else {
         // Unknown VLM-class failure. Escalate by default — the next
         // backend may succeed where this one failed for a reason we
@@ -1049,6 +1056,20 @@ mod classify_convert_failure_tests {
         let err = anyhow::anyhow!("scribe convert failed: some novel failure mode");
         match classify_convert_failure(&err) {
             ConvertClassification::Escalate(r) => assert_eq!(r, "permanent_convert_failure"),
+            other => panic!("expected Escalate, got {:?}", other.reason()),
+        }
+    }
+
+    #[test]
+    fn olmocr_zero_pages_escalates() {
+        // The mcconnell shape: olmocr ran 45 min on a Cyrillic book with
+        // a clean text layer, then reported 0 completed pages. Must
+        // Escalate so GLM-OCR gets its shot — the original Permanent
+        // classification short-circuited the chain incorrectly.
+        let err =
+            anyhow::anyhow!("Server error: olmocr reported 0 completed pages (failed=0); content may need a different backend");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Escalate(r) => assert_eq!(r, "olmocr_zero_pages"),
             other => panic!("expected Escalate, got {:?}", other.reason()),
         }
     }

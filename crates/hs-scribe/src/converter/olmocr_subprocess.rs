@@ -71,6 +71,10 @@ pub async fn convert(pdf_bytes: &[u8], config: &AppConfig) -> Result<String> {
         .arg("--pdfs")
         .arg(&pdf_path)
         .args(["--workers", "1", "--max_concurrent_requests", "4"])
+        // If the handler future is dropped (client disconnect, convert
+        // deadline), kill the CLI rather than orphan a process that keeps
+        // hammering vLLM for the rest of a 45-minute book.
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("spawning olmocr CLI at `{}`", config.olmocr_bin))?;
@@ -91,12 +95,33 @@ pub async fn convert(pdf_bytes: &[u8], config: &AppConfig) -> Result<String> {
     let (completed, failed) = parse_page_counts(&stdout);
     tracing::info!(completed, failed, "olmocr_subprocess: CLI exited cleanly");
     if completed == 0 {
-        // Olmocr's pypdfium2 couldn't open the PDF, or every page errored.
-        // Both shapes surface here. Map to `pdf_parse_error` so the chain
-        // treats it as Permanent (no other backend will succeed either
-        // when the PDF itself is structurally broken).
+        // Olmocr produced nothing — pypdfium2 couldn't open the PDF, or
+        // its output validation rejected every page (observed on the
+        // Russian Code Complete: 45 min of GPU work, then 0/0 counts).
+        // This is an OLMOCR-class failure, not proof the PDF is broken:
+        // classify_convert_failure treats the unrecognized message as
+        // Escalate, so the next backend gets its shot. A genuinely
+        // broken PDF dies in seconds there with a real FormatError
+        // (Permanent), so the wasted attempt is cheap. Log the CLI's
+        // stderr tail for post-mortem since the workspace tempdir is
+        // about to be dropped.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_tail: String = stderr
+            .lines()
+            .rev()
+            .take(15)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        tracing::warn!(
+            failed,
+            stderr_tail = %stderr_tail,
+            "olmocr_subprocess: 0 completed pages — escalating to next backend"
+        );
         return Err(anyhow!(
-            "FormatError: olmocr reported 0 completed pages (failed={failed})"
+            "olmocr reported 0 completed pages (failed={failed}); content may need a different backend"
         ));
     }
 
