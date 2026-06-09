@@ -621,7 +621,11 @@ impl HomeStillMcp {
         // Config is the sole source of server URLs. To route through the
         // gateway, set the gateway URL explicitly in config (e.g.
         // `servers: [https://gateway.example/gateway/scribe]`).
-        let scribe_servers = scribe_cfg.servers.clone();
+        // hs-mcp only needs URLs (health fanout + ScribeClient::new). The
+        // per-server backend metadata in `ScribeServerEntry` is consumed
+        // by the scribe-chain dispatcher in `cmd_watch_events`, not here.
+        let scribe_servers: Vec<String> =
+            scribe_cfg.servers.iter().map(|e| e.url.clone()).collect();
         let distill_servers = distill_cfg.servers.clone();
 
         // Best-effort open of the local OpenAlex DuckDB. Missing config section

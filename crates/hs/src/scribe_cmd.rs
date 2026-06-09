@@ -37,7 +37,7 @@ async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
         return vec![s.to_string()];
     }
     match ScribeConfig::load() {
-        Ok(cfg) if !cfg.servers.is_empty() => cfg.servers,
+        Ok(cfg) if !cfg.servers.is_empty() => cfg.servers.into_iter().map(|e| e.url).collect(),
         _ => vec![DEFAULT_SERVER.to_string()],
     }
 }
@@ -321,9 +321,12 @@ pub(crate) async fn cmd_watch_events(
     let storage = cfg.build_storage()?;
     let bus = cfg.build_event_bus().await?;
 
+    // For now the dispatch pool only knows URLs (the chain logic in Step
+    // 2d will plumb backend metadata through). Drop the per-entry backend
+    // here so today's `ServicePool` keeps compiling.
     let servers: Vec<String> = match server_override {
         Some(s) => vec![s],
-        None if !cfg.servers.is_empty() => cfg.servers.clone(),
+        None if !cfg.servers.is_empty() => cfg.servers.iter().map(|e| e.url.clone()).collect(),
         None => vec![DEFAULT_SERVER.to_string()],
     };
     let convert_timeout = std::time::Duration::from_secs(cfg.convert_timeout_secs);
