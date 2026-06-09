@@ -224,41 +224,87 @@ fn stem_from_event_key(key: &str) -> Option<String> {
     Some(stem.to_string())
 }
 
-/// Classify a permanent convert error into a short catalog-friendly reason
-/// token. The scribe HTTP server returns HTTP 415 + body
+/// Classified outcome of a convert failure, consumed by the scribe-chain
+/// dispatcher in `cmd_watch_events`.
+///
+/// `Permanent` means the source content is intrinsically unconvertable —
+/// HTML masquerading as PDF, a structurally broken PDF, a paywall. No
+/// other VLM backend will succeed on the same input, so the chain stops
+/// and `conversion_failed` is stamped immediately.
+///
+/// `Escalate` means a VLM-class failure: the current backend rejected
+/// the content (e.g. GLM-OCR's per-region repetition detector aborted on
+/// code-dense pages) but a different backend may handle it (e.g. olmocr
+/// with text-layer anchoring). The dispatcher should try the next
+/// backend in `ScribeConfig.servers` and only stamp `conversion_failed`
+/// when the chain is fully exhausted.
+///
+/// Both variants carry the catalog-friendly reason token so the stamp
+/// is consistent whether it lands immediately (Permanent) or after the
+/// chain runs dry (Escalate).
+pub(crate) enum ConvertClassification {
+    Permanent(String),
+    Escalate(String),
+}
+
+impl ConvertClassification {
+    /// Catalog-friendly reason token, regardless of variant. Used when
+    /// the caller needs the string but doesn't care about chain semantics
+    /// (e.g. when logging or when the chain has only one backend so
+    /// Escalate degenerates to Permanent).
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Self::Permanent(r) | Self::Escalate(r) => r,
+        }
+    }
+}
+
+/// Classify a convert failure as Permanent (stop chain) or Escalate
+/// (try next backend). The scribe HTTP server returns HTTP 415 + body
 /// `unsupported_content_type:{html,binary}` for content-type mismatches
 /// (see `hs-scribe/src/server.rs::verify_pdf_content`). PDF parse errors
 /// surface as `FormatError` / `Invalid image size` / `PdfiumLibrary` in
 /// the error chain. HTML paywall rejection embeds "paywall" in the
-/// message. Anything else we tag generically so the operator sees the
-/// full chain in the log but the catalog still gets a stamp.
-fn classify_permanent_reason(err: &anyhow::Error) -> String {
+/// message. VLM-class failures (`VLM repetition loop`, mid-stream
+/// `connection closed before message completed`) are Escalate so the
+/// next backend can take a swing.
+pub(crate) fn classify_convert_failure(err: &anyhow::Error) -> ConvertClassification {
     let msg = format!("{err:#}");
     if msg.contains("unsupported_content_type:html") {
-        "unsupported_content_type:html".to_string()
+        ConvertClassification::Permanent("unsupported_content_type:html".to_string())
     } else if msg.contains("unsupported_content_type:binary") {
-        "unsupported_content_type:binary".to_string()
+        ConvertClassification::Permanent("unsupported_content_type:binary".to_string())
     } else if msg.contains("paywall") {
-        "paywall_html".to_string()
+        ConvertClassification::Permanent("paywall_html".to_string())
     } else if msg.contains("FormatError")
         || msg.contains("Invalid image size")
         || msg.contains("PdfiumLibrary")
     {
-        "pdf_parse_error".to_string()
+        ConvertClassification::Permanent("pdf_parse_error".to_string())
     } else if msg.contains("EPUB parse failed") {
-        "epub_parse_error".to_string()
+        ConvertClassification::Permanent("epub_parse_error".to_string())
     } else if msg.contains("not valid UTF-8") {
-        "html_not_utf8".to_string()
+        ConvertClassification::Permanent("html_not_utf8".to_string())
     } else if msg.contains("unsupported source type") {
-        "unsupported_extension".to_string()
+        ConvertClassification::Permanent("unsupported_extension".to_string())
     } else if msg.contains("VLM repetition loop") {
         // event_watch.rs's QC stamps `vlm_repetition_loop` directly
         // before returning the Permanent error. Mirror that reason here
         // so the outer-handler stamp doesn't clobber the inner one with
         // a generic label.
-        "vlm_repetition_loop".to_string()
+        ConvertClassification::Escalate("vlm_repetition_loop".to_string())
+    } else if msg.contains("connection closed before message completed") {
+        // llama-server's slot eviction mid-stream after its own repetition
+        // guard fires — same VLM-class failure family as the explicit
+        // repetition loop detection. Different VLM may not hit it.
+        ConvertClassification::Escalate("vlm_transport_error".to_string())
     } else {
-        "permanent_convert_failure".to_string()
+        // Unknown VLM-class failure. Escalate by default — the next
+        // backend may succeed where this one failed for a reason we
+        // haven't catalogued yet. The chain naturally terminates if
+        // every backend rejects with the same unknown reason; cost is
+        // one extra backend attempt per unknown failure.
+        ConvertClassification::Escalate("permanent_convert_failure".to_string())
     }
 }
 
@@ -353,13 +399,19 @@ pub(crate) async fn cmd_watch_events(
                         // we still term the NATS message so the daemon
                         // doesn't spin.
                         if let Some(stem) = stem_from_event_key(&event.key) {
-                            let reason = classify_permanent_reason(&e);
+                            // Today the chain is single-backend, so
+                            // Permanent and Escalate both end up
+                            // stamping immediately. Step 2d will branch
+                            // on the variant to walk a multi-backend
+                            // chain before stamping.
+                            let classification = classify_convert_failure(&e);
+                            let reason = classification.reason();
                             if let Err(stamp_err) =
                                 hs_common::catalog::update_conversion_failed_via(
                                     storage.as_ref(),
                                     "catalog",
                                     &stem,
-                                    &reason,
+                                    reason,
                                     Vec::new(),
                                 )
                                 .await
@@ -874,33 +926,79 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
 // ── Clean junk HTML papers ────────────────────────────────────
 
 #[cfg(test)]
-mod classify_permanent_reason_tests {
-    use super::classify_permanent_reason;
+mod classify_convert_failure_tests {
+    use super::{classify_convert_failure, ConvertClassification};
 
     #[test]
-    fn vlm_repetition_loop_message_maps_to_specific_reason() {
+    fn vlm_repetition_loop_escalates_with_specific_reason() {
         // Verbatim shape of the error event_watch.rs constructs at the
-        // RejectLoop arm. The outer handler must classify this back to
-        // `vlm_repetition_loop` so `update_conversion_failed_via` writes
-        // the same reason both stampers wrote, instead of the generic
-        // `permanent_convert_failure` clobber.
+        // RejectLoop arm. Classification must preserve the specific
+        // reason so the catalog stamp lands as `vlm_repetition_loop`
+        // (not the generic clobber) when the chain runs out of backends.
+        // VLM-class failure → Escalate so a different backend gets a
+        // shot before the chain stamps failure.
         let err = anyhow::anyhow!(
             "VLM repetition loop on papers/10/x.pdf (truncations=23, longest_run=9009B)"
         );
-        assert_eq!(classify_permanent_reason(&err), "vlm_repetition_loop");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Escalate(r) => assert_eq!(r, "vlm_repetition_loop"),
+            other => panic!("expected Escalate, got {:?}", other.reason()),
+        }
     }
 
     #[test]
-    fn unrecognized_message_falls_back_to_generic() {
+    fn vlm_transport_error_escalates() {
+        // llama-server slot eviction mid-stream. Same VLM-class family
+        // as the repetition loop — escalate to next backend.
+        let err = anyhow::anyhow!(
+            "scribe convert failed: client error (SendRequest): connection closed before message completed"
+        );
+        match classify_convert_failure(&err) {
+            ConvertClassification::Escalate(r) => assert_eq!(r, "vlm_transport_error"),
+            other => panic!("expected Escalate, got {:?}", other.reason()),
+        }
+    }
+
+    #[test]
+    fn unrecognized_message_escalates_with_generic_reason() {
+        // Unknown failure → Escalate so the next backend gets a chance.
+        // If every backend rejects with the same unknown reason, the
+        // chain terminates naturally and stamps `permanent_convert_failure`.
         let err = anyhow::anyhow!("scribe convert failed: some novel failure mode");
-        assert_eq!(classify_permanent_reason(&err), "permanent_convert_failure");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Escalate(r) => assert_eq!(r, "permanent_convert_failure"),
+            other => panic!("expected Escalate, got {:?}", other.reason()),
+        }
     }
 
     #[test]
-    fn pdf_parse_error_takes_precedence_over_vlm() {
-        // FormatError is a hard PDF-parse problem; route to pdf_parse_error
-        // even if a downstream layer happens to mention "VLM" in its chain.
+    fn pdf_parse_error_is_permanent() {
+        // FormatError is a hard PDF-parse problem; no VLM backend will
+        // succeed because the PDF itself is unreadable to scribe's
+        // parser. Stop the chain immediately, don't burn other backends'
+        // compute on a hopeless input.
         let err = anyhow::anyhow!("scribe convert failed: FormatError on page 3");
-        assert_eq!(classify_permanent_reason(&err), "pdf_parse_error");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Permanent(r) => assert_eq!(r, "pdf_parse_error"),
+            other => panic!("expected Permanent, got {:?}", other.reason()),
+        }
+    }
+
+    #[test]
+    fn unsupported_content_type_is_permanent() {
+        let err = anyhow::anyhow!("scribe rejected: unsupported_content_type:html");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Permanent(r) => assert_eq!(r, "unsupported_content_type:html"),
+            other => panic!("expected Permanent, got {:?}", other.reason()),
+        }
+    }
+
+    #[test]
+    fn paywall_is_permanent() {
+        let err = anyhow::anyhow!("paywall HTML detected on download");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Permanent(r) => assert_eq!(r, "paywall_html"),
+            other => panic!("expected Permanent, got {:?}", other.reason()),
+        }
     }
 }
