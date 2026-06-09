@@ -54,6 +54,28 @@ pub enum PipelineMode {
     PerRegion,
 }
 
+/// Which converter the scribe server uses for the inbound `/scribe` POST.
+///
+/// `Legacy` is the per-region OcrEngine pipeline (render → layout-detect
+/// → per-region VLM via `BackendChoice`) — what scribe has always done.
+///
+/// `OlmOcr` shells out to the `olmocr` CLI (allenai/olmOCR-2-7B-1025-FP8
+/// via vLLM). Olmocr does its own rendering, anchoring against the PDF's
+/// text layer, and produces flat markdown. The per-region pipeline,
+/// streaming repetition detector, and QC postprocess are all bypassed —
+/// olmocr returns assembled markdown which the server returns as-is.
+///
+/// Selected at server startup via `HS_SCRIBE_CONVERTER=olmocr` so a
+/// single binary serves both backends (different scribe-server processes
+/// on different ports, each with its own env-selected converter).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConverterMode {
+    #[default]
+    Legacy,
+    Olmocr,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub ollama_url: String,
@@ -97,6 +119,21 @@ pub struct AppConfig {
     pub use_cuda: bool,
     pub max_image_dim: u32,
     pub vlm_concurrency: usize,
+    /// Which converter implements `/scribe`. Defaults to `Legacy` so
+    /// existing deployments are unaffected; set `HS_SCRIBE_CONVERTER=olmocr`
+    /// on hosts running the olmocr/vLLM scribe instance.
+    #[serde(default)]
+    pub converter: ConverterMode,
+    /// vLLM endpoint serving olmocr (OpenAI-compatible). Consumed only
+    /// when `converter == Olmocr`. Override via `HS_SCRIBE_OLMOCR_ENDPOINT`.
+    pub olmocr_endpoint: String,
+    /// Model name vLLM advertises for olmocr (matches its
+    /// `--served-model-name`). Override via `HS_SCRIBE_OLMOCR_MODEL`.
+    pub olmocr_model: String,
+    /// Path to the `olmocr` CLI binary. Override via `HS_SCRIBE_OLMOCR_BIN`.
+    /// Default `"olmocr"` lets the OS PATH lookup find it; on big the
+    /// pinned location is `~/.local/share/olmocr-vllm/venv/bin/olmocr`.
+    pub olmocr_bin: String,
 }
 impl Default for AppConfig {
     fn default() -> Self {
@@ -120,6 +157,10 @@ impl Default for AppConfig {
             use_cuda: true,
             max_image_dim: 1800,
             vlm_concurrency: class.vlm_concurrency(),
+            converter: ConverterMode::default(),
+            olmocr_endpoint: "http://localhost:8081/v1".into(),
+            olmocr_model: "olmocr".into(),
+            olmocr_bin: "olmocr".into(),
         }
     }
 }

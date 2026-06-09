@@ -245,8 +245,23 @@ async fn handle_scribe(
     let path = tmp.path().to_str().unwrap_or_default();
     let (deadline, from_header) = resolve_deadline(&headers, state.config.convert_deadline_secs);
     let stem = resolve_stem(&headers).to_string();
-    let fut = state.processor.process_pdf(path);
-    match tokio::time::timeout(deadline, fut).await {
+    // Branch on the configured converter. `Legacy` runs the per-region
+    // OcrEngine pipeline (Processor::process_pdf). `Olmocr` shells out
+    // to the olmocr CLI which handles render + anchor + prompt + parse +
+    // assemble end-to-end.
+    let state_for_convert = state.clone();
+    let convert_fut = async move {
+        match state_for_convert.config.converter {
+            crate::config::ConverterMode::Legacy => {
+                state_for_convert.processor.process_pdf(path).await
+            }
+            crate::config::ConverterMode::Olmocr => {
+                crate::converter::olmocr_subprocess::convert(&pdf_bytes, &state_for_convert.config)
+                    .await
+            }
+        }
+    };
+    match tokio::time::timeout(deadline, convert_fut).await {
         Ok(Ok(md)) => {
             record_success(&state.last_conversion_ms, &state.total_conversions, &md);
             (StatusCode::OK, md).into_response()
@@ -313,20 +328,40 @@ async fn handle_scribe_stream(
             }
         };
 
-        let fut = state
-            .processor
-            .process_pdf_with_progress(&path, on_progress);
-        match tokio::time::timeout(deadline, fut).await {
-            Ok(Ok(result)) => {
+        // Branch on the configured converter. Legacy streams per-page
+        // progress events natively; olmocr produces the markdown as one
+        // bundle so the stream emits a single Result line at the end
+        // (with empty per-page metadata — olmocr doesn't surface
+        // per-page region classes or diags).
+        let state_for_convert = state.clone();
+        let convert_fut = async move {
+            match state_for_convert.config.converter {
+                crate::config::ConverterMode::Legacy => state_for_convert
+                    .processor
+                    .process_pdf_with_progress(&path, on_progress)
+                    .await
+                    .map(|r| (r.markdown, r.per_page_region_classes, r.per_page_diags)),
+                crate::config::ConverterMode::Olmocr => {
+                    crate::converter::olmocr_subprocess::convert(
+                        &pdf_bytes,
+                        &state_for_convert.config,
+                    )
+                    .await
+                    .map(|md| (md, Vec::new(), Vec::new()))
+                }
+            }
+        };
+        match tokio::time::timeout(deadline, convert_fut).await {
+            Ok(Ok((markdown, per_page_region_classes, per_page_diags))) => {
                 record_success(
                     &state.last_conversion_ms,
                     &state.total_conversions,
-                    &result.markdown,
+                    &markdown,
                 );
                 let line = StreamLine::Result {
-                    markdown: result.markdown,
-                    per_page_region_classes: result.per_page_region_classes,
-                    per_page_diags: result.per_page_diags,
+                    markdown,
+                    per_page_region_classes,
+                    per_page_diags,
                 };
                 if let Ok(json) = serde_json::to_string(&line) {
                     let _ = tx.send(Ok(format!("{json}\n"))).await;

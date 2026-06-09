@@ -13,6 +13,8 @@ pub mod cli;
 
 // Server-side modules (heavy deps: ONNX, pdfium, image, etc.)
 #[cfg(feature = "server")]
+pub mod converter;
+#[cfg(feature = "server")]
 pub mod gpu;
 #[cfg(feature = "server")]
 pub mod models;
