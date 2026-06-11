@@ -181,11 +181,11 @@ fn parse_page_counts(stdout: &str) -> (u64, u64) {
     let mut failed = 0u64;
     for line in stdout.lines() {
         if let Some(rest) = line.split_once("Completed pages:") {
-            if let Some(n) = rest.1.trim().split_whitespace().next() {
+            if let Some(n) = rest.1.split_whitespace().next() {
                 completed = n.parse().unwrap_or(0);
             }
         } else if let Some(rest) = line.split_once("Failed pages:") {
-            if let Some(n) = rest.1.trim().split_whitespace().next() {
+            if let Some(n) = rest.1.split_whitespace().next() {
                 failed = n.parse().unwrap_or(0);
             }
         }
