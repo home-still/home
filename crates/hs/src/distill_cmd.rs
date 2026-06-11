@@ -13,7 +13,7 @@ use hs_distill::config::{DistillClientConfig, DistillServerConfig};
 const DEFAULT_SERVER: &str = "http://localhost:7434";
 
 /// Create a DistillClient, with auth headers if the URL is a cloud gateway.
-async fn make_distill_client(url: &str) -> Result<DistillClient> {
+pub(crate) async fn make_distill_client(url: &str) -> Result<DistillClient> {
     if is_cloud_url(url) {
         let auth = hs_common::auth::client::AuthenticatedClient::from_default_path()
             .context("Cloud credentials not found. Run `hs cloud enroll` first.")?;
@@ -26,7 +26,7 @@ async fn make_distill_client(url: &str) -> Result<DistillClient> {
 const QDRANT_REST_PORT: u16 = 6333;
 const QDRANT_GRPC_PORT: u16 = 6334;
 
-async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
+pub(crate) async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
     if let Some(s) = cli_server {
         return vec![s.to_string()];
     }

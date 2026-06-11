@@ -134,12 +134,25 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
     }
 }
 
-/// Clear `conversion` / `conversion_failed` on a single catalog row and
-/// republish `papers.ingested` so the watcher reconverts it. The terminal-
-/// failure stamp is what stops `list_catalog_stuck_convert` from re-queueing
-/// the source on its own — without this command, a row stamped with
-/// `vlm_repetition_loop` (or any other terminal reason) is permanently
-/// stuck. Operator-driven; CLI-only by design.
+/// Reset every derived artifact for a stem and republish `papers.ingested`
+/// so the watcher reconverts it from the source bytes:
+///
+/// 1. purge the stem's chunks from Qdrant (re-indexing upserts by
+///    `(doc_id, chunk_index)`, so a shorter new conversion would leave
+///    orphaned tail chunks from the old one),
+/// 2. delete the stale markdown object (the watcher's idempotency guard
+///    — "markdown already present; skipping" — would otherwise skip the
+///    reconvert entirely),
+/// 3. clear `conversion` / `conversion_failed` / `embedding` /
+///    `embedding_skip` (the stamps gate the source-scan and the distill
+///    reconcile; left in place they pin the old derived state forever).
+///
+/// Remote purge runs first so a failure aborts before any local state is
+/// destroyed. The terminal-failure stamp is what stops
+/// `list_catalog_stuck_convert` from re-queueing the source on its own —
+/// without this command, a row stamped with `vlm_repetition_loop` (or any
+/// other terminal reason) is permanently stuck. Operator-driven; CLI-only
+/// by design.
 async fn cmd_reconvert(stem: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
     const PAPERS_PREFIX: &str = "papers";
     const CATALOG_PREFIX: &str = "catalog";
@@ -183,9 +196,41 @@ async fn cmd_reconvert(stem: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
         )
     })?;
 
+    // Purge old vectors before touching anything else: if the distill
+    // server is unreachable this aborts with nothing mutated, instead of
+    // leaving a half-reset row whose stale chunks keep matching searches.
+    if entry.embedding.is_some() || entry.embedding_skip.is_some() {
+        let servers = crate::distill_cmd::resolve_servers(None).await;
+        let client = crate::distill_cmd::make_distill_client(&servers[0]).await?;
+        let deleted = client.delete_doc(stem).await.with_context(|| {
+            format!(
+                "purge old Qdrant chunks for {stem} via {} — start the distill \
+                 server (or fix the URL in config) and re-run",
+                servers[0]
+            )
+        })?;
+        reporter.status("Purged", &format!("{deleted} stale chunk(s) for {stem}"));
+    }
+
+    // Delete the stale markdown so the watcher actually reconverts.
+    let md_key = hs_common::markdown::markdown_storage_key(stem);
+    if storage
+        .exists(&md_key)
+        .await
+        .with_context(|| format!("storage exists check for {md_key}"))?
+    {
+        storage
+            .delete(&md_key)
+            .await
+            .with_context(|| format!("delete stale markdown {md_key}"))?;
+    }
+
     let mut cleared = entry;
     cleared.conversion = None;
     cleared.conversion_failed = None;
+    cleared.embedding = None;
+    cleared.embedding_skip = None;
+    cleared.markdown_path = None;
     hs_common::catalog::write_catalog_entry_via(&*storage, CATALOG_PREFIX, stem, &cleared)
         .await
         .with_context(|| format!("write cleared catalog row for {stem}"))?;
