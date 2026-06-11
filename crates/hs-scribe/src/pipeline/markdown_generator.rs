@@ -1,8 +1,29 @@
 use crate::models::layout::BBox;
 
 /// Join per-page markdown strings into a single document.
+///
+/// The page separator (`\n\n---\n\n`) is RESERVED: every downstream
+/// consumer (`postprocess::clean_repetitions_per_page`, the QC
+/// bibliography alignment, `hs_common::catalog::compute_page_offsets`)
+/// recovers page boundaries by splitting on this exact byte sequence.
+/// A VLM transcribing a visual rule can emit a thematic break inside a
+/// page's content; left as-is, that splits one real page into two
+/// segments and misaligns every per-page array (the bibliography 3×
+/// ceiling lands on the wrong page, total_pages inflates). So any
+/// in-page occurrence is normalized to `***` — markdown's equivalent
+/// thematic break, identical when rendered. This applies even inside
+/// fenced code blocks: a blank-line-flanked `---` line in OCR'd code is
+/// far rarer than an unfenced rule, and one cosmetically-altered code
+/// line beats silently corrupting QC for the whole document. One
+/// invariant, enforced at the one place pages are joined.
 pub fn join_pages(pages: &[String]) -> String {
-    pages.join("\n\n---\n\n")
+    const SEPARATOR: &str = "\n\n---\n\n";
+    const HR_EQUIVALENT: &str = "\n\n***\n\n";
+    let reserved: Vec<String> = pages
+        .iter()
+        .map(|p| p.replace(SEPARATOR, HR_EQUIVALENT))
+        .collect();
+    reserved.join(SEPARATOR)
 }
 
 /// Assemble per-region OCR results into a single page's markdown.
@@ -94,6 +115,35 @@ mod tests {
             unique_id: 0,
             read_order: 0.0,
         }
+    }
+
+    #[test]
+    fn join_pages_reserves_separator_for_page_boundaries() {
+        // A VLM-emitted thematic break inside a page's content must not
+        // create a phantom page boundary — it is normalized to the
+        // rendering-equivalent `***` so splitting on the separator
+        // recovers exactly the original page count.
+        let pages = vec![
+            "intro\n\n---\n\nstill page one".to_string(),
+            "page two".to_string(),
+        ];
+        let joined = join_pages(&pages);
+        assert_eq!(joined, "intro\n\n***\n\nstill page one\n\n---\n\npage two");
+
+        let split: Vec<&str> = joined.split("\n\n---\n\n").collect();
+        assert_eq!(split.len(), pages.len(), "split must recover page count");
+    }
+
+    #[test]
+    fn join_pages_page_consisting_of_bare_rule_keeps_count() {
+        // A page whose entire content is `---` (no flanking blank lines
+        // inside the page itself) must still round-trip to 3 segments:
+        // the left-to-right non-overlapping split absorbs the doubled
+        // sequence at the boundary.
+        let pages = vec!["a".to_string(), "---".to_string(), "b".to_string()];
+        let joined = join_pages(&pages);
+        let split: Vec<&str> = joined.split("\n\n---\n\n").collect();
+        assert_eq!(split.len(), 3, "got {split:?}");
     }
 
     #[test]
