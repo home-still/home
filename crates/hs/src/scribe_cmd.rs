@@ -422,6 +422,19 @@ pub(crate) async fn cmd_watch_events(
             let mut attempts_log: Vec<hs_common::catalog::AttemptEntry> = Vec::new();
             let mut last_err: Option<hs_scribe::event_watch::HandlerError> = None;
 
+            // Fetch + parse the source ONCE per event. Every backend
+            // attempt reuses the same Arc'd bytes and page count —
+            // escalation used to re-download and re-parse the whole
+            // book from storage per backend. prepare_source handles
+            // its own failure stamping (source_missing) and
+            // classification: Permanent → TERM, Transient → NAK.
+            let source =
+                match hs_scribe::event_watch::prepare_source(storage.as_ref(), &event).await {
+                    Ok(hs_scribe::event_watch::SourcePrep::AlreadyConverted(_)) => return Ok(()),
+                    Ok(hs_scribe::event_watch::SourcePrep::Fetched(src)) => src,
+                    Err(e) => return Err(e),
+                };
+
             for entry in chain.iter() {
                 tracing::info!(
                     server = %entry.client.url(),
@@ -436,6 +449,7 @@ pub(crate) async fn cmd_watch_events(
                     bus.as_ref(),
                     &event,
                     timeout_policy.as_ref(),
+                    &source,
                     Some(entry.backend.clone()),
                     attempts_log.clone(),
                 )

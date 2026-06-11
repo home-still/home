@@ -258,56 +258,17 @@ impl ServiceClient for ScribeClient {
 }
 
 impl ScribeClient {
-    /// Convert a PDF. When `timeout` is `Some`, applies it as the
-    /// reqwest per-request timeout and sends the same value in the
-    /// `X-Convert-Deadline-Secs` header so the server's
-    /// `tokio::time::timeout` wrapper matches. `None` uses the client's
-    /// construction-time baseline.
-    pub async fn convert(
-        &self,
-        pdf_bytes: Vec<u8>,
-        timeout: Option<Duration>,
-        stem: Option<&str>,
-    ) -> Result<ConversionResult> {
-        let url = format!("{}/scribe", self.server_url);
-        let part = reqwest::multipart::Part::bytes(pdf_bytes).file_name("input.pdf");
-        let form = reqwest::multipart::Form::new().part("pdf", part);
-
-        let mut req = self.http.post(&url).multipart(form);
-        if let Some(d) = timeout {
-            req = req
-                .timeout(d)
-                .header(CONVERT_DEADLINE_HEADER, d.as_secs().to_string());
-        }
-        if let Some(s) = stem {
-            req = req.header(CONVERT_STEM_HEADER, s);
-        }
-        let resp = req.send().await.context("Failed to send PDF")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Server error {status}: {body}");
-        }
-
-        // The non-streaming endpoint returns just markdown bytes — there's
-        // no place in the response to carry `per_page_region_classes`.
-        // Callers needing region-class info (event_watch's per-page QC)
-        // must use convert_with_progress instead. Return an empty class
-        // vec here; downstream QC treats it as "not bibliography" and
-        // applies the strict default ceiling everywhere — safe.
-        let markdown = resp.text().await.context("Failed to read response")?;
-        Ok(ConversionResult {
-            markdown,
-            per_page_region_classes: Vec::new(),
-            per_page_diags: Vec::new(),
-        })
-    }
-
-    /// Convert a PDF with streaming progress updates via NDJSON.
-    /// Falls back to the plain `/scribe` endpoint if the server doesn't
-    /// support streaming (404). `timeout` semantics match
-    /// [`ScribeClient::convert`].
+    /// Convert a PDF with streaming progress updates via NDJSON. When
+    /// `timeout` is `Some`, applies it as the reqwest per-request timeout
+    /// and sends the same value in the `X-Convert-Deadline-Secs` header
+    /// so the server's `tokio::time::timeout` wrapper matches. `None`
+    /// uses the client's construction-time baseline.
+    ///
+    /// `/scribe/stream` is the ONE convert path. A 404 means the server
+    /// predates streaming — that's a deploy-discipline error (`hs
+    /// upgrade` the host), not something to paper over with a degraded
+    /// non-streaming request whose empty region-class list silently
+    /// weakens QC.
     pub async fn convert_with_progress(
         &self,
         pdf_bytes: Vec<u8>,
@@ -316,7 +277,7 @@ impl ScribeClient {
         on_progress: impl Fn(ProgressEvent),
     ) -> Result<ConversionResult> {
         let url = format!("{}/scribe/stream", self.server_url);
-        let part = reqwest::multipart::Part::bytes(pdf_bytes.clone()).file_name("input.pdf");
+        let part = reqwest::multipart::Part::bytes(pdf_bytes).file_name("input.pdf");
         let form = reqwest::multipart::Form::new().part("pdf", part);
 
         let mut req = self.http.post(&url).multipart(form);
@@ -330,20 +291,12 @@ impl ScribeClient {
         }
         let mut resp = req.send().await.context("Failed to send PDF")?;
 
-        // Server doesn't support streaming — fall back to plain endpoint.
-        // The fallback path's ConversionResult has empty
-        // per_page_region_classes; QC treats it as no-bibliography (strict
-        // default ceiling everywhere). Old servers can't supply layout
-        // metadata; bumping them is the only way to get bibliography-aware
-        // thresholds.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            on_progress(ProgressEvent {
-                stage: "info".into(),
-                page: 0,
-                total_pages: 0,
-                message: "server does not support progress (update server image)".into(),
-            });
-            return self.convert(pdf_bytes, timeout, stem).await;
+            anyhow::bail!(
+                "scribe server {} has no /scribe/stream endpoint — binary predates \
+                 streaming; run `hs upgrade` on that host",
+                self.server_url
+            );
         }
 
         if !resp.status().is_success() {
