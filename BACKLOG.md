@@ -251,7 +251,37 @@ Security and documentation stories are intentionally excluded.
 
 ---
 
+## P1 — rc.335 deploy follow-ups (2026-06-11)
+
+### P1-D1. `hs upgrade` restart list misses `hs-serve-scribe-olmocr`
+**Motivation:** rc.335 deploy on `big` restarted hs-serve-scribe / hs-serve-distill / hs-serve-mcp but left the second scribe unit serving rc.334 until a manual `systemctl restart hs-serve-scribe-olmocr`. Same class as the original "hs upgrade skips server binaries" defect: the restart list is hardcoded instead of derived.
+**Change:** restart every `hs-serve-*` unit (glob the unit names, or register units at install time), not a fixed list.
+**Acceptance:** after `hs upgrade` on a host with both scribe units, `curl :7433/health` and `curl :7435/health` both report the new version with no manual step.
+
+### P1-D2. big_mac deploy blocked: reboot + remount + root-owned mountpoint stub
+**Motivation:** big_mac is wedged on ephemeral-port exhaustion (31k TIME_WAIT leaked by the now-disabled `scribe-autotune` LaunchAgent polling ollama; 86-day uptime) so NFS remount and `hs upgrade` downloads fail with EADDRNOTAVAIL. Additionally `/Volumes/home-still` now exists as a root-owned empty dir (sudo mkdir during recovery), so `hs` panics with `Permission denied` opening its log spool. Host stuck on rc.326.
+**Change:** operator: `sudo reboot`, then `sudo bash /tmp/mount-hs.sh` (remount), then `hs upgrade --pre --yes`. Consider: hs on macOS should not hard-depend on an NFS-backed log spool dir at startup (local spool + shipper).
+**Acceptance:** `ssh big_mac hs --version` → rc.335; no hung `hs` processes; mount healthy.
+
+### P1-D3. `scribe-autotune` still running on mac_air — same socket-leak class that wedged big_mac
+**Motivation:** `launchctl list` on mac_air shows `com.home-still.scribe-autotune` (PID 1781) alive. On big_mac the identical agent leaked ~1000 conn/s to `localhost:11434` until the 16K ephemeral-port range was exhausted, taking down all outbound TCP. mac_air has ollama and the same KeepAlive plist.
+**Change:** either fix the autotune client to reuse one HTTP connection (it builds a fresh connection per poll) or disable the agent on hosts that aren't scribe workers. Decide whether autotune is part of the chain topology at all.
+**Acceptance:** `netstat -an | grep -c TIME_WAIT` on mac_air stays <1k over a day, or the agent is removed.
+
+### P1-D4. Watcher topology: user-unit daemons + manual `hs scribe watch-events` fight over the durable consumer
+**Motivation:** big runs `hs-scribe-watch-events` / `hs-distill-watch-events` as user-scope systemd units (Restart=always). `ensure_consumer` deletes-then-recreates the durable on connect, so any second watcher instance (e.g. an operator running `hs scribe watch-events` by hand) kills the unit's consumer and vice-versa ("consumer deleted" churn), and each recreate RESETS JetStream delivery counts — a max_deliver-exhausted poison message comes back to life. Observed live during the rc.335 deploy (mcconnell resurrected).
+**Change:** detect an existing live consumer with a different instance and refuse to start (fail loudly: "watcher already running"), or make ensure_consumer update-in-place instead of delete-first.
+**Acceptance:** starting a second watcher instance on a host with the unit running exits with a clear error; delivery counts survive watcher restarts.
+
+---
+
 ## P0 — rc.334 scribe-chain follow-ups (2026-06-10)
+
+> **rc.335 note (2026-06-11):** P0-20's *instance* is resolved — the Russian
+> mcconnell PDF was dropped per decision, and the redelivered message TERMed
+> with an honest `conversion_failed: source_missing` stamp under rc.335's
+> single classify table. The *general* defect (max_deliver exhaustion leaves
+> no stamp) remains open below. P0-21 (3600s dispatch cap) also remains open.
 
 ### P0-20. JetStream `max_deliver=5` exhaustion is silent — no catalog stamp, doc vanishes from the pipeline
 **Motivation:** `mcconnell_code_complete_2nd` (889-page test book) burned all 5 deliveries on the `scribe-workers` consumer overnight (last NAK 2026-06-10 06:00:42Z, `backoff_secs=30` logged — then nothing, ever). JetStream stops redelivering after `max_deliver` with no notification to the consumer; the catalog YAML still reads `{}` — no `conversion_failed`, no `attempts_log`. The doc is invisible to every repair direction (`stuck_convert` can't see it because there's no stamp at all). Direct ONE-PATH/fail-loudly violation: the transient-NAK path assumes redelivery is infinite, but the broker caps it.
