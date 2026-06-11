@@ -89,9 +89,16 @@ impl OnnxEmbedder {
 
 fn build_text_embedding() -> Result<TextEmbedding, DistillError> {
     use ort::execution_providers::CUDAExecutionProvider;
+    // error_on_failure: ort's default is to log and silently fall back to
+    // the CPU provider when CUDA registration fails. Distill ships with
+    // no CPU path — a failed registration must be a hard error, not a
+    // 50x-slower session that only the (startup-only) VRAM probe could
+    // have caught.
     let opts = InitOptions::new(EmbeddingModel::BGEM3)
         .with_show_download_progress(true)
-        .with_execution_providers(vec![CUDAExecutionProvider::default().build()]);
+        .with_execution_providers(vec![CUDAExecutionProvider::default()
+            .build()
+            .error_on_failure()]);
     TextEmbedding::try_new(opts)
         .map_err(|e| DistillError::Embedding(format!("Failed to load model: {e}")))
 }
@@ -227,7 +234,12 @@ impl Embedder for OnnxEmbedder {
             // requests are fast.
             if guard.is_none() {
                 tracing::info!("lazy-loading bge-m3 after idle release");
-                let m = build_text_embedding()?;
+                let mut m = build_text_embedding()?;
+                // Same CUDA-residency gate as startup: a driver hiccup or
+                // evicted pyke cache between idle-release and rebuild must
+                // fail loudly here, not degrade every subsequent embed to
+                // CPU until someone notices the throughput graph.
+                verify_cuda_probe(&mut m)?;
                 *guard = Some(m);
             }
             let model_ref = guard
