@@ -49,9 +49,11 @@ pub async fn title_and_category(cfg: &Config, markdown: &str) -> Result<NameResu
         "{}/api/generate",
         cfg.naming.ollama_url.trim_end_matches('/')
     );
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
+    // Canonical workspace client constructor (rc.306 deleted the ad-hoc
+    // builders): sets connect_timeout alongside the overall timeout, so a
+    // host that accepts the SYN but never completes the handshake fails
+    // fast instead of hanging the full 120s.
+    let http = hs_common::http::http_client(std::time::Duration::from_secs(120))
         .map_err(|e| PersonalError::Naming(format!("http client: {e}")))?;
 
     let resp = http
