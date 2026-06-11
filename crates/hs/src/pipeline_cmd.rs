@@ -187,8 +187,9 @@ async fn cmd_events_reset(reporter: &Arc<dyn Reporter>) -> Result<()> {
     nats.reset_streams()
         .await
         .context("reset JetStream streams")?;
-    reporter
-        .finish("Deleted JetStream streams PAPERS and SCRIBE. Next worker connect recreates them.");
+    reporter.finish(
+        "Deleted JetStream streams PAPERS, SCRIBE, and DISTILL. Next worker connect recreates them.",
+    );
     Ok(())
 }
 
