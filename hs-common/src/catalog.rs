@@ -596,6 +596,13 @@ pub async fn update_conversion_catalog_via(
         converted_by,
         attempts_log,
     });
+    // A success supersedes any failure stamped by an earlier backend in
+    // the chain (e.g. glm_ocr's QC reject before olmocr converted the
+    // same document). Leaving both stamps makes every corrupted/failed
+    // reader (`conversion_failed.is_some()`) mislabel a converted paper
+    // as dead. The full attempt history survives in
+    // `conversion.attempts_log`.
+    entry.conversion_failed = None;
 
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
@@ -866,6 +873,50 @@ conversion:
             .expect("read succeeds")
             .expect("row still present");
         assert_eq!(entry2.conversion_failed.unwrap().attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn success_clears_prior_conversion_failed_stamp() {
+        // Chain escalation: backend 1 stamps conversion_failed (QC
+        // reject), backend 2 succeeds. The success stamp must clear the
+        // failure or every corrupted-reader mislabels the converted row.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        update_conversion_failed_via(
+            &storage,
+            "catalog",
+            "escalated",
+            "vlm_repetition_loop",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        update_conversion_catalog_via(
+            &storage,
+            "catalog",
+            "escalated",
+            "scribe-olmocr",
+            12.5,
+            10,
+            vec![],
+            "markdown/es/escalated.md",
+            Some("olmocr".to_string()),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let entry = read_catalog_entry_via(&storage, "catalog", "escalated")
+            .await
+            .expect("read succeeds")
+            .expect("row present");
+        assert!(entry.conversion.is_some(), "success stamp present");
+        assert!(
+            entry.conversion_failed.is_none(),
+            "stale failure stamp must be cleared by the success write"
+        );
     }
 
     #[tokio::test]
