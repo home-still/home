@@ -57,6 +57,15 @@ pub fn classify_failure(msg: &str) -> FailureClass {
         Permanent("html_not_utf8")
     } else if msg.contains("unsupported source type") {
         Permanent("unsupported_extension")
+    } else if msg.contains("source bytes missing") {
+        // storage.get returned NotFound — the object doesn't exist, so
+        // escalating would re-GET the same absent key on every backend
+        // and the exhaustion stamp would clobber the true reason with
+        // the generic token. Stop the chain at the first backend.
+        Permanent("source_missing")
+    } else if msg.contains("has no extension") {
+        // Event key carries no extension; no backend can pick a parser.
+        Permanent("missing_extension")
     } else if msg.contains("VLM repetition loop") {
         // Covers both the server's streaming-abort message ("VLM
         // repetition loop detected") and the client-side QC reject
@@ -114,6 +123,26 @@ mod tests {
         assert_eq!(
             classify_failure("error sending request for url (http://big:7435/scribe)"),
             FailureClass::Transient
+        );
+    }
+
+    #[test]
+    fn source_missing_is_permanent_not_escalate() {
+        // A missing source object must short-circuit the chain — every
+        // backend GETs the same storage, so escalation just re-fails
+        // N-1 more times and the exhaustion stamp replaces the true
+        // reason with the generic token.
+        assert_eq!(
+            classify_failure("source bytes missing for papers/mc/code.pdf"),
+            FailureClass::Permanent("source_missing")
+        );
+    }
+
+    #[test]
+    fn missing_extension_is_permanent() {
+        assert_eq!(
+            classify_failure("key papers/mc/noext has no extension"),
+            FailureClass::Permanent("missing_extension")
         );
     }
 
