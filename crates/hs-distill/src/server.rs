@@ -277,6 +277,7 @@ async fn handle_distill(
         req.catalog.clone(),
         &state.config,
         &collection,
+        crate::pipeline::ContentProfile::for_collection(&collection),
         state.embedder.as_ref(),
         &state.qdrant,
         |_| {}, // no progress for non-streaming
@@ -334,6 +335,7 @@ async fn handle_distill_stream(
             catalog,
             &state.config,
             &collection,
+            crate::pipeline::ContentProfile::for_collection(&collection),
             state.embedder.as_ref(),
             &state.qdrant,
             on_progress,

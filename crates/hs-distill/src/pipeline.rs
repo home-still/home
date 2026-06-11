@@ -12,6 +12,35 @@ use crate::metadata::extract_rule_based;
 use crate::qdrant;
 use crate::types::EmbeddedChunk;
 
+/// What kind of content a collection deliberately carries — decides which
+/// ingress quality gates `index_document` applies. The mapping lives in
+/// exactly one place ([`ContentProfile::for_collection`]); adding a new
+/// deliberately-short collection means adding it THERE, not discovering
+/// scattered name-compares after its content silently drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentProfile {
+    /// Full-body converted documents: gate on the paywall/interstitial
+    /// stub heuristics and drop low-quality chunks.
+    FullDocument,
+    /// Deliberately short, degraded-signal payloads (abstracts,
+    /// title-only stems). The "short page without article structure =
+    /// junk" and 50-char `TooShort` rules would reject exactly the
+    /// content these collections exist to carry, so both gates are off
+    /// — the producing pipeline already made the informed decision to
+    /// index degraded signal.
+    ShortFormCurated,
+}
+
+impl ContentProfile {
+    /// The one registry mapping collection names to profiles.
+    pub fn for_collection(collection_name: &str) -> Self {
+        match collection_name {
+            "paper_abstracts" => Self::ShortFormCurated,
+            _ => Self::FullDocument,
+        }
+    }
+}
+
 /// Index a single markdown document: chunk -> metadata -> embed -> upsert.
 /// If `content` is provided, uses it directly instead of reading from disk.
 /// If `catalog_override` is provided, uses it directly and skips the
@@ -25,6 +54,7 @@ pub async fn index_document(
     catalog_override: Option<hs_common::catalog::CatalogEntry>,
     config: &DistillServerConfig,
     collection_name: &str,
+    profile: ContentProfile,
     embedder: &dyn Embedder,
     qdrant_client: &qdrant_client::Qdrant,
     on_progress: impl Fn(DistillProgress),
@@ -63,12 +93,10 @@ pub async fn index_document(
     // record_embedding_outcome_via → embedding_skip = zero_chunks_or_empty,
     // which the reconciler treats as an intentional terminal skip.
     //
-    // The `paper_abstracts` collection deliberately ships short content
-    // (title-only stems when no abstract was recovered), which trips the
+    // Short-form collections deliberately ship content that trips the
     // "short page without article structure = junk" rule inside
-    // `is_paywall_html`. Skip the check for that collection — every paper
-    // is supposed to make it in, even with degraded signal.
-    if collection_name != "paper_abstracts" && hs_common::html::is_paywall_html(&markdown) {
+    // `is_paywall_html` — see ContentProfile.
+    if profile == ContentProfile::FullDocument && hs_common::html::is_paywall_html(&markdown) {
         tracing::warn!(
             stem,
             len = markdown.len(),
@@ -151,13 +179,11 @@ pub async fn index_document(
     let chunks = chunk_markdown(&markdown, &meta, &page_offsets, &chunker_config);
 
     // Filter out low-quality chunks (repetition loops, garbled text, etc.)
-    // The `paper_abstracts` collection deliberately ships short, single-chunk
-    // payloads (title-only when no abstract was recovered) which fail the
-    // 50-char `TooShort` rule. Bypass the filter for that collection —
-    // callers there have already made an informed decision to index
-    // degraded-signal content, and dropping points behind their back was
-    // causing 2,268 catalog stamps to point at non-existent Qdrant rows.
-    let chunks: Vec<_> = if collection_name == "paper_abstracts" {
+    // Short-form collections bypass the filter — their single-chunk
+    // payloads fail the 50-char `TooShort` rule by design, and dropping
+    // points behind the producer's back was causing 2,268 catalog stamps
+    // to point at non-existent Qdrant rows. See ContentProfile.
+    let chunks: Vec<_> = if profile == ContentProfile::ShortFormCurated {
         chunks
     } else {
         let pre_filter = chunks.len();
