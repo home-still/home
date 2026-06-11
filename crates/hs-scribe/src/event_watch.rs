@@ -188,38 +188,22 @@ pub async fn convert_and_upload(
                 .convert_with_progress(raw_bytes, Some(timeout), Some(stem), |_| {})
                 .await
                 .map_err(|e| {
-                    // Server-side format errors ("Invalid image size",
-                    // "FormatError", PdfiumLibrary) are permanent — the
-                    // PDF itself is broken. HTTP 415 with the
-                    // unsupported_content_type body is permanent too
-                    // (the /scribe gate rejected non-PDF bytes at the
-                    // door).
-                    //
-                    // VLM-content failures (`VLM repetition loop
-                    // detected`, `connection closed before message
-                    // completed` — llama-server closing a slot
-                    // mid-stream after its own repetition guard fires)
-                    // are also permanent: the same PDF will fail
-                    // identically on any scribe in the pool because the
-                    // VLM produces the same output for the same input
-                    // image. Without this, poison-pill papers NAK-and-
+                    // Permanent/Escalate-class failures (broken PDF,
+                    // VLM repetition loop, olmocr rejecting every page)
+                    // must NOT NAK — retrying the same backend produces
+                    // the same result, and poison-pill papers would
                     // redeliver every 30 s on JetStream and hog every
-                    // in-flight slot, starving the rest of the queue.
-                    //
-                    // Everything else is a cluster-state problem and
-                    // should NAK.
+                    // in-flight slot. They surface as
+                    // HandlerError::Permanent so the chain dispatcher
+                    // can consult `classify::classify_failure` for the
+                    // stop-vs-next-backend decision. Only
+                    // `FailureClass::Transient` (cluster-state problems)
+                    // NAKs. One table decides: `classify.rs`.
                     let msg = format!("{e:#}");
-                    let perm = msg.contains("FormatError")
-                        || msg.contains("Invalid image size")
-                        || msg.contains("PdfiumLibrary")
-                        || msg.contains("unsupported_content_type")
-                        || msg.contains("VLM repetition loop detected")
-                        || msg.contains("connection closed before message completed");
                     let ctx = e.context(format!("scribe convert failed for {}", event.key));
-                    if perm {
-                        HandlerError::Permanent(ctx)
-                    } else {
-                        HandlerError::Transient(ctx)
+                    match crate::classify::classify_failure(&msg) {
+                        crate::classify::FailureClass::Transient => HandlerError::Transient(ctx),
+                        _ => HandlerError::Permanent(ctx),
                     }
                 })?;
             let md = conversion.markdown;

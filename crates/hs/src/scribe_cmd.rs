@@ -270,48 +270,22 @@ impl ConvertClassification {
 /// next backend can take a swing.
 pub(crate) fn classify_convert_failure(err: &anyhow::Error) -> ConvertClassification {
     let msg = format!("{err:#}");
-    if msg.contains("unsupported_content_type:html") {
-        ConvertClassification::Permanent("unsupported_content_type:html".to_string())
-    } else if msg.contains("unsupported_content_type:binary") {
-        ConvertClassification::Permanent("unsupported_content_type:binary".to_string())
-    } else if msg.contains("paywall") {
-        ConvertClassification::Permanent("paywall_html".to_string())
-    } else if msg.contains("FormatError")
-        || msg.contains("Invalid image size")
-        || msg.contains("PdfiumLibrary")
-    {
-        ConvertClassification::Permanent("pdf_parse_error".to_string())
-    } else if msg.contains("EPUB parse failed") {
-        ConvertClassification::Permanent("epub_parse_error".to_string())
-    } else if msg.contains("not valid UTF-8") {
-        ConvertClassification::Permanent("html_not_utf8".to_string())
-    } else if msg.contains("unsupported source type") {
-        ConvertClassification::Permanent("unsupported_extension".to_string())
-    } else if msg.contains("VLM repetition loop") {
-        // event_watch.rs's QC stamps `vlm_repetition_loop` directly
-        // before returning the Permanent error. Mirror that reason here
-        // so the outer-handler stamp doesn't clobber the inner one with
-        // a generic label.
-        ConvertClassification::Escalate("vlm_repetition_loop".to_string())
-    } else if msg.contains("connection closed before message completed") {
-        // llama-server's slot eviction mid-stream after its own repetition
-        // guard fires — same VLM-class failure family as the explicit
-        // repetition loop detection. Different VLM may not hit it.
-        ConvertClassification::Escalate("vlm_transport_error".to_string())
-    } else if msg.contains("olmocr reported 0 completed pages") {
-        // Olmocr ran but produced nothing (output validation rejected
-        // every page, or its renderer couldn't open the PDF). Not proof
-        // the PDF is broken — observed on the Russian Code Complete,
-        // which has a clean text layer. Escalate; a genuinely broken
-        // PDF fails fast on the next backend with a real FormatError.
-        ConvertClassification::Escalate("olmocr_zero_pages".to_string())
-    } else {
-        // Unknown VLM-class failure. Escalate by default — the next
-        // backend may succeed where this one failed for a reason we
-        // haven't catalogued yet. The chain naturally terminates if
-        // every backend rejects with the same unknown reason; cost is
-        // one extra backend attempt per unknown failure.
-        ConvertClassification::Escalate("permanent_convert_failure".to_string())
+    match hs_scribe::classify::classify_failure(&msg) {
+        hs_scribe::classify::FailureClass::Permanent(reason) => {
+            ConvertClassification::Permanent(reason.to_string())
+        }
+        hs_scribe::classify::FailureClass::Escalate(reason) => {
+            ConvertClassification::Escalate(reason.to_string())
+        }
+        // This arm only fires for errors that arrived as
+        // HandlerError::Permanent yet match no table entry — the handler
+        // positively identified them as non-retriable, so escalating is
+        // the safe default: the next backend may succeed for a reason we
+        // haven't catalogued yet, and the chain naturally terminates if
+        // every backend rejects.
+        hs_scribe::classify::FailureClass::Transient => {
+            ConvertClassification::Escalate("permanent_convert_failure".to_string())
+        }
     }
 }
 
