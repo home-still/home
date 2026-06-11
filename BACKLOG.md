@@ -251,6 +251,22 @@ Security and documentation stories are intentionally excluded.
 
 ---
 
+## P0 — rc.334 scribe-chain follow-ups (2026-06-10)
+
+### P0-20. JetStream `max_deliver=5` exhaustion is silent — no catalog stamp, doc vanishes from the pipeline
+**Motivation:** `mcconnell_code_complete_2nd` (889-page test book) burned all 5 deliveries on the `scribe-workers` consumer overnight (last NAK 2026-06-10 06:00:42Z, `backoff_secs=30` logged — then nothing, ever). JetStream stops redelivering after `max_deliver` with no notification to the consumer; the catalog YAML still reads `{}` — no `conversion_failed`, no `attempts_log`. The doc is invisible to every repair direction (`stuck_convert` can't see it because there's no stamp at all). Direct ONE-PATH/fail-loudly violation: the transient-NAK path assumes redelivery is infinite, but the broker caps it.
+**Scope:** `crates/hs/src/scribe_cmd.rs` (`cmd_watch_events` transient/NAK branch) + the consumer config site that sets `max_deliver`.
+**Change:** Read `num_delivered` from the message metadata; when `num_delivered == max_deliver` (final delivery) and the chain outcome is Transient, do NOT NAK — stamp `conversion_failed: max_deliveries_exhausted` with the full `attempts_log`, then ACK terminally. The operator sees the failure in the catalog instead of archaeology in jsz.
+**Acceptance:** With all chain backends unreachable and a 1-message stream, after 5 deliveries the catalog carries `conversion_failed: max_deliveries_exhausted` + 5×N attempt entries, and `nats consumer report` shows 0 pending / 0 ack-pending.
+
+### P0-21. Page-scaled dispatch timeout caps at 3600s — book-length GLM converts structurally cannot finish
+**Motivation:** mcconnell's delivery-5 GLM leg on big started 06:00:38Z−3600s, was actively converting pages at 05:54Z (layout-model WARNs in `hs-serve-scribe` journal; watchdog did NOT fire — the 4500s threshold patch held), and was killed at exactly 06:00:38Z by the dispatcher's own `timeout_secs=3600` ceiling (journal: `dispatching pdf to scribe with page-scaled timeout … pages=889 timeout_secs=3600`). At GLM's observed page rate, 889 pages needs multiple hours; the cap guarantees the timeout → `vlm_transport_error` → escalate, wasting a full hour of GPU per delivery and making GLM permanently unable to convert any book-length PDF through the watch-events path.
+**Scope:** the page-scaled timeout computation in `crates/hs/src/scribe_cmd.rs` (the `timeout_secs` clamp).
+**Change:** Raise/remove the 3600s clamp so the per-page scaling actually governs (e.g. `pages × per_page_secs` with a much higher absolute ceiling), and keep the hs-scribe-watchdog stall threshold consistent with it (currently hand-patched to 4500s on big — `~/.local/bin/hs-scribe-watchdog`, NOT in repo; check it in or fold it into `hs`).
+**Acceptance:** An 889-page PDF dispatched through watch-events gets a deadline ≥ its realistic GLM convert time, and the watchdog does not kill the in-flight convert.
+
+---
+
 ## P1 — rc.314 self-test follow-ups (2026-05-02)
 
 ### P0-15. Mass cascade of `papers/.quarantine/*` events floods scribe-watch with permanent failures
