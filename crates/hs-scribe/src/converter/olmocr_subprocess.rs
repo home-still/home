@@ -88,24 +88,26 @@ pub async fn convert(pdf_bytes: &[u8], config: &AppConfig) -> Result<String> {
         ));
     }
 
-    // Read olmocr's reported page-failure stats from stdout so the
-    // classifier upstream can distinguish "PDF unreadable" (all pages
-    // failed) from "convert succeeded" without scanning logs.
+    // olmocr emits its end-of-run "Completed pages: N" / "Failed pages: N"
+    // summary through Python logging: pipeline.py calls `logger.info(...)` on a
+    // bare `logging.StreamHandler()`, which defaults to STDERR — not stdout.
+    // Parse BOTH streams so the count is found wherever olmocr writes it.
+    // Reading only stdout made `completed` parse as 0 on every successful run,
+    // so good olmocr output — notably the code-dense books olmocr exists to
+    // handle — was silently discarded and escalated to the next backend.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let (completed, failed) = parse_page_counts(&stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (completed, failed) = parse_page_counts(&format!("{stdout}\n{stderr}"));
     tracing::info!(completed, failed, "olmocr_subprocess: CLI exited cleanly");
     if completed == 0 {
-        // Olmocr produced nothing — pypdfium2 couldn't open the PDF, or
-        // its output validation rejected every page (observed on the
-        // Russian Code Complete: 45 min of GPU work, then 0/0 counts).
-        // This is an OLMOCR-class failure, not proof the PDF is broken:
+        // Olmocr genuinely produced nothing — pypdfium2 couldn't open the
+        // PDF, or its output validation rejected every page. This is an
+        // OLMOCR-class failure, not proof the PDF is broken:
         // classify_convert_failure treats the unrecognized message as
-        // Escalate, so the next backend gets its shot. A genuinely
-        // broken PDF dies in seconds there with a real FormatError
-        // (Permanent), so the wasted attempt is cheap. Log the CLI's
-        // stderr tail for post-mortem since the workspace tempdir is
-        // about to be dropped.
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Escalate, so the next backend gets its shot. A genuinely broken PDF
+        // dies in seconds there with a real FormatError (Permanent), so the
+        // wasted attempt is cheap. Log the CLI's stderr tail for post-mortem
+        // since the workspace tempdir is about to be dropped.
         let stderr_tail: String = stderr
             .lines()
             .rev()
@@ -172,10 +174,10 @@ fn find_markdown_output(workspace: &std::path::Path) -> Result<PathBuf> {
     ))
 }
 
-/// Parse the `Completed pages: N` / `Failed pages: N` lines olmocr
-/// prints to stdout at the end of a run. Returns `(0, 0)` if the
-/// markers aren't found (treat as "we don't know" — the downstream
-/// empty-markdown check still catches blank output).
+/// Parse the `Completed pages: N` / `Failed pages: N` lines olmocr logs to
+/// stderr at the end of a run (the caller passes stdout+stderr combined).
+/// Returns `(0, 0)` if the markers aren't found (treat as "we don't know" —
+/// the downstream empty-markdown check still catches blank output).
 fn parse_page_counts(stdout: &str) -> (u64, u64) {
     let mut completed = 0u64;
     let mut failed = 0u64;
