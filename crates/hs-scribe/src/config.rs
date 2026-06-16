@@ -230,6 +230,13 @@ impl AppConfig {
 pub struct ScribeServerEntry {
     pub url: String,
     pub backend: String,
+    /// Max conversions the dispatcher runs against THIS backend at once.
+    /// Tuned per-backend because models differ wildly in footprint: olmocr
+    /// (vLLM + a per-conversion CLI subprocess rendering pages) is RAM/VRAM
+    /// heavy and wants a low cap; glm (scans, rarely hit) can run more. The
+    /// dispatcher holds a semaphore of this size per backend, so a heavy
+    /// model can't fan out and exhaust host RAM. Default 4.
+    pub concurrency: usize,
 }
 
 /// Default backend identifier when an entry comes in as a bare URL
@@ -237,6 +244,12 @@ pub struct ScribeServerEntry {
 /// file in the fleet.
 fn default_backend() -> String {
     "glm_ocr".to_string()
+}
+
+/// Default per-backend conversion concurrency when an entry doesn't set one.
+/// Conservative so an unconfigured heavy backend can't blow up RAM/VRAM.
+fn default_concurrency() -> usize {
+    4
 }
 
 /// Serde wire shape for `ScribeServerEntry`. The untagged enum lets YAML
@@ -250,6 +263,8 @@ enum ScribeServerEntryRepr {
         url: String,
         #[serde(default = "default_backend")]
         backend: String,
+        #[serde(default = "default_concurrency")]
+        concurrency: usize,
     },
 }
 
@@ -259,8 +274,17 @@ impl From<ScribeServerEntryRepr> for ScribeServerEntry {
             ScribeServerEntryRepr::Bare(url) => Self {
                 url,
                 backend: default_backend(),
+                concurrency: default_concurrency(),
             },
-            ScribeServerEntryRepr::Struct { url, backend } => Self { url, backend },
+            ScribeServerEntryRepr::Struct {
+                url,
+                backend,
+                concurrency,
+            } => Self {
+                url,
+                backend,
+                concurrency,
+            },
         }
     }
 }
@@ -270,6 +294,7 @@ impl From<ScribeServerEntry> for ScribeServerEntryRepr {
         Self::Struct {
             url: entry.url,
             backend: entry.backend,
+            concurrency: entry.concurrency,
         }
     }
 }
@@ -467,6 +492,7 @@ impl Default for ScribeConfig {
             servers: vec![ScribeServerEntry {
                 url: "http://localhost:7433".into(),
                 backend: default_backend(),
+                concurrency: default_concurrency(),
             }],
             local_server: true,
             inbox_poll_interval_secs: default_inbox_poll_interval_secs(),
@@ -605,6 +631,7 @@ mod tests {
         let entries = vec![ScribeServerEntry {
             url: "http://x:7433".into(),
             backend: "glm_ocr".into(),
+            concurrency: default_concurrency(),
         }];
         let yaml = serde_yaml_ng::to_string(&entries).expect("serialize");
         assert!(yaml.contains("url: http://x:7433"));

@@ -340,6 +340,11 @@ pub(crate) fn classify_convert_failure(err: &anyhow::Error) -> ConvertClassifica
 struct ChainEntry {
     backend: String,
     client: hs_scribe::client::ScribeClient,
+    /// Per-backend conversion concurrency cap. Sized from
+    /// `scribe.servers[].concurrency` so a heavy model (olmocr) is throttled
+    /// independently of a light one (glm). The handler holds a permit across
+    /// each backend's convert attempt.
+    sem: Arc<tokio::sync::Semaphore>,
 }
 
 pub(crate) async fn cmd_watch_events(
@@ -363,6 +368,8 @@ pub(crate) async fn cmd_watch_events(
         Some(url) => vec![ChainEntry {
             backend: "unknown".to_string(),
             client: ScribeClient::new_with_timeout(&url, convert_timeout)?,
+            // Manual single-backend override: one operator convert, modest cap.
+            sem: Arc::new(tokio::sync::Semaphore::new(4)),
         }],
         None if !cfg.servers.is_empty() => cfg
             .servers
@@ -371,12 +378,14 @@ pub(crate) async fn cmd_watch_events(
                 Ok(ChainEntry {
                     backend: e.backend.clone(),
                     client: ScribeClient::new_with_timeout(&e.url, convert_timeout)?,
+                    sem: Arc::new(tokio::sync::Semaphore::new(e.concurrency.max(1))),
                 })
             })
             .collect::<Result<_>>()?,
         None => vec![ChainEntry {
             backend: "glm_ocr".to_string(),
             client: ScribeClient::new_with_timeout(DEFAULT_SERVER, convert_timeout)?,
+            sem: Arc::new(tokio::sync::Semaphore::new(4)),
         }],
     };
     let chain = Arc::new(chain);
@@ -384,7 +393,14 @@ pub(crate) async fn cmd_watch_events(
 
     let chain_summary: Vec<String> = chain
         .iter()
-        .map(|e| format!("{}@{}", e.backend, e.client.url()))
+        .map(|e| {
+            format!(
+                "{}@{} (concurrency={})",
+                e.backend,
+                e.client.url(),
+                e.sem.available_permits()
+            )
+        })
         .collect();
     tracing::info!(
         chain = ?chain_summary,
@@ -443,6 +459,15 @@ pub(crate) async fn cmd_watch_events(
                     chain_pos = attempts_log.len() + 1,
                     "chain attempt"
                 );
+                // Per-backend concurrency cap: hold a permit for THIS backend
+                // across its convert attempt (released on escalation or return).
+                // Sized from `scribe.servers[].concurrency` so a heavy model
+                // (olmocr) is throttled to a few while a light one (glm) runs
+                // more — instead of one global cap fanning out onto olmocr.
+                let _permit = Arc::clone(&entry.sem)
+                    .acquire_owned()
+                    .await
+                    .expect("scribe chain concurrency semaphore is never closed");
                 let result = convert_and_upload(
                     storage.as_ref(),
                     &entry.client,
