@@ -367,6 +367,13 @@ pub struct AutotuneConfig {
     /// Where the tuner persists its rolling history + current state.
     /// Survives across restarts.
     pub state_path: PathBuf,
+    /// RAM floor (MiB). The tuner will not raise `OLLAMA_NUM_PARALLEL` while
+    /// `MemAvailable` is below this — more parallel converts means more
+    /// concurrent rasterization + VLM working set, and the throughput
+    /// hill-climber is otherwise blind to memory. Downward steps and holds are
+    /// always allowed. `0` disables the ceiling. Skipped on hosts where
+    /// `/proc/meminfo` can't be read.
+    pub min_available_mem_mb: u64,
 }
 
 impl Default for AutotuneConfig {
@@ -391,6 +398,11 @@ impl Default for AutotuneConfig {
             converge_after_stable: 5,
             best_rate_decay: 0.95,
             state_path,
+            // ~3 GiB headroom before the tuner stops climbing. With per-page
+            // streaming each concurrent convert is small, so this is a backstop
+            // against the hill-climber stacking concurrency on an already-tight
+            // host, not the primary RAM guard (that's the cgroup slice).
+            min_available_mem_mb: 3072,
         }
     }
 }

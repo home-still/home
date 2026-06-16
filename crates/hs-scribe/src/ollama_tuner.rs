@@ -611,7 +611,31 @@ pub async fn run_forever(cfg: AutotuneConfig) -> Result<()> {
         );
 
         let pre_best = state.best_rate;
-        let action = decide(&cfg, &mut state, per_min);
+        let prev_n = state.current_n;
+        let mut action = decide(&cfg, &mut state, per_min);
+
+        // RAM ceiling: never let the throughput hill-climber RAISE concurrency
+        // while the host is already low on memory. Demote an upward step to a
+        // hold and revert the bookkeeping decide() advanced; the next tick
+        // re-evaluates once pressure clears. Skipped when MemAvailable is
+        // unreadable or the floor is disabled (min_available_mem_mb == 0).
+        if let Action::Apply(n) = action {
+            if n > prev_n && cfg.min_available_mem_mb > 0 {
+                if let Some(avail) = crate::mem::available_memory_mb() {
+                    if avail < cfg.min_available_mem_mb {
+                        tracing::warn!(
+                            target_n = n,
+                            prev_n,
+                            avail_mb = avail,
+                            floor_mb = cfg.min_available_mem_mb,
+                            "host RAM below floor — refusing to raise NUM_PARALLEL; holding"
+                        );
+                        state.current_n = prev_n;
+                        action = Action::Noop;
+                    }
+                }
+            }
+        }
         // rc.295 diagnostic: surface post-decision best_rate so operators
         // can see whether decay actually mutated state.
         tracing::info!(
@@ -664,6 +688,7 @@ mod tests {
             // byte-for-byte; dedicated tests below flip it on.
             best_rate_decay: 1.0,
             state_path: PathBuf::from("/tmp/hs-autotune-test.json"),
+            min_available_mem_mb: 0,
         }
     }
 
