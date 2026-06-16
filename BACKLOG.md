@@ -257,6 +257,7 @@ Security and documentation stories are intentionally excluded.
 **Motivation:** rc.335 deploy on `big` restarted hs-serve-scribe / hs-serve-distill / hs-serve-mcp but left the second scribe unit serving rc.334 until a manual `systemctl restart hs-serve-scribe-olmocr`. Same class as the original "hs upgrade skips server binaries" defect: the restart list is hardcoded instead of derived.
 **Change:** restart every `hs-serve-*` unit (glob the unit names, or register units at install time), not a fixed list.
 **Acceptance:** after `hs upgrade` on a host with both scribe units, `curl :7433/health` and `curl :7435/health` both report the new version with no manual step.
+**Still open (rc.340, 2026-06-16):** confirmed on every rc.338 → rc.340 deploy on `big`. The gap also skips **`hs-serve-olmocr-vllm`** (the vLLM backend), not just `hs-serve-scribe-olmocr` — each deploy required a manual `sudo systemctl start hs-serve-olmocr-vllm hs-serve-scribe-olmocr`. Broaden the derive to cover ALL `hs-serve-*` incl the vLLM unit (`restart_cmd.rs` hardcodes `["scribe","distill","mcp"]`).
 
 ### P1-D2. big_mac deploy blocked: reboot + remount + root-owned mountpoint stub
 **Motivation:** big_mac is wedged on ephemeral-port exhaustion (31k TIME_WAIT leaked by the now-disabled `scribe-autotune` LaunchAgent polling ollama; 86-day uptime) so NFS remount and `hs upgrade` downloads fail with EADDRNOTAVAIL. Additionally `/Volumes/home-still` now exists as a root-owned empty dir (sudo mkdir during recovery), so `hs` panics with `Permission denied` opening its log spool. Host stuck on rc.326.
@@ -272,6 +273,13 @@ Security and documentation stories are intentionally excluded.
 **Motivation:** big runs `hs-scribe-watch-events` / `hs-distill-watch-events` as user-scope systemd units (Restart=always). `ensure_consumer` deletes-then-recreates the durable on connect, so any second watcher instance (e.g. an operator running `hs scribe watch-events` by hand) kills the unit's consumer and vice-versa ("consumer deleted" churn), and each recreate RESETS JetStream delivery counts — a max_deliver-exhausted poison message comes back to life. Observed live during the rc.335 deploy (mcconnell resurrected).
 **Change:** detect an existing live consumer with a different instance and refuse to start (fail loudly: "watcher already running"), or make ensure_consumer update-in-place instead of delete-first.
 **Acceptance:** starting a second watcher instance on a host with the unit running exits with a clear error; delivery counts survive watcher restarts.
+
+## P1 — rc.340 deploy follow-ups (2026-06-16)
+
+### P1-D5. `hs upgrade` on a systemd-native host starts conflicting podman containers
+**Motivation:** `big` runs scribe via the systemd-native `hs-serve-*` units, but `hs upgrade` *also* runs `podman-compose -f ~/.home-still/docker-compose.yml up -d`, starting `home-still_scribe_1` + `home-still_qdrant_1`. The scribe container binds `0.0.0.0:7433` — the exact port systemd `hs-serve-scribe` already holds — so on every rc.338 → rc.340 deploy the container either loses the race (logs `rootlessport ... bind: address already in use`, harmless noise) or wins it: on rc.338 the container squatted 7433 with a **stale `:latest` (rc.335) image** while systemd `hs-serve-scribe` crash-looped on `Address already in use`, serving the OLD binary until an operator ran `podman stop home-still_scribe_1`. The container path is half-wired and fights the native services it's meant to replace. (Qdrant has the same dual-path risk — a container qdrant bound 6333-6334 alongside whatever served before; left untouched during recovery, but unverified.)
+**Change:** `hs upgrade` must not run the compose stack on hosts that run the native systemd units — detect the native units and skip compose, or make the compose step explicitly opt-in per host. On `big`, scribe/distill are native; only the Pis use `ghcr.io/home-still/hs-scribe-server` containers. Closely related to **P1-D1** (both are `hs upgrade` doing the wrong thing per host).
+**Acceptance:** `hs upgrade` on `big` leaves systemd `hs-serve-scribe` holding `:7433` on the new version, starts **no** `home-still_*` podman container, and needs no manual `podman stop` / port-clash recovery.
 
 ---
 
