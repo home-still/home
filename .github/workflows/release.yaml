@@ -39,7 +39,11 @@ jobs:
             archive: tar.gz
             use_zigbuild: true
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            # Pinned: `windows-latest` rolled to the VS2026 image (MSVC 14.51),
+            # which libduckdb-sys cannot compile (broke rc.336). `windows-2025`
+            # is rc.335's known-good VS2022-MSVC image; `windows-2025-vs2026` is
+            # the separate label that broke us.
+            runner: windows-2025
             archive: zip
 
     steps:
