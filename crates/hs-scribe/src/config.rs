@@ -338,98 +338,12 @@ pub struct ScribeConfig {
     /// deadline and neither gives up prematurely.
     #[serde(default)]
     pub timeout_policy: TimeoutPolicy,
-    /// Ollama `OLLAMA_NUM_PARALLEL` auto-tuner knobs. Consumed by
-    /// `hs scribe autotune`, which hill-climbs against observed
-    /// per-host scribe throughput.
-    #[serde(default)]
-    pub autotune: AutotuneConfig,
     /// Storage backend (loaded from top-level `storage:` section, not `scribe.storage`).
     #[serde(skip)]
     pub storage: StorageConfig,
     /// Event bus (loaded from top-level `events:` section).
     #[serde(skip)]
     pub events: EventBusConfig,
-}
-
-/// Per-host knobs for `hs scribe autotune`. All fields have sane
-/// defaults; the autotuner works out of the box.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AutotuneConfig {
-    /// URL of the scribe-server on the same host as Ollama.
-    pub scribe_url: String,
-    /// How long between ticks. Each tick restarts Ollama once, so this
-    /// is also the "per-host disruption budget" — default 30 min.
-    pub tick_interval_secs: u64,
-    /// Wait after each Ollama restart before starting the measurement
-    /// window. Gives the model time to warm up and in-flight converts
-    /// to drain.
-    pub warmup_secs: u64,
-    /// Measurement window: count scribe's `total_conversions` delta
-    /// across this interval. Shorter → noisier; longer → slower to
-    /// converge. Default 24 min (so warmup + measure fits in a 30 min
-    /// tick with headroom).
-    pub measure_secs: u64,
-    /// Candidate values the hill-climber walks. Must be strictly
-    /// increasing and have at least 2 entries.
-    pub values: Vec<u32>,
-    /// Ratio that counts as a real improvement, e.g. 1.05 = needs +5%.
-    pub improvement_threshold: f64,
-    /// Ratio below which we call it a regression and step back, e.g.
-    /// 0.90 = backs off at a -10% drop.
-    pub regression_threshold: f64,
-    /// Number of inconclusive ticks (rate within the two thresholds)
-    /// before the tuner marks itself converged and stops stepping.
-    pub converge_after_stable: u32,
-    /// Multiplicative decay applied to `best_rate` on every plateau tick
-    /// so a stale historical peak doesn't block future stepping when
-    /// workload character shifts (e.g. from small papers to larger ones,
-    /// or after a hardware change). Default `0.95` — half-life ≈ 14
-    /// ticks ≈ 140 min at the 10-min cadence; fast enough to unstick
-    /// within a session, slow enough to ignore sample noise. Set to
-    /// `1.0` to disable.
-    pub best_rate_decay: f64,
-    /// Where the tuner persists its rolling history + current state.
-    /// Survives across restarts.
-    pub state_path: PathBuf,
-    /// RAM floor (MiB). The tuner will not raise `OLLAMA_NUM_PARALLEL` while
-    /// `MemAvailable` is below this — more parallel converts means more
-    /// concurrent rasterization + VLM working set, and the throughput
-    /// hill-climber is otherwise blind to memory. Downward steps and holds are
-    /// always allowed. `0` disables the ceiling. Skipped on hosts where
-    /// `/proc/meminfo` can't be read.
-    pub min_available_mem_mb: u64,
-}
-
-impl Default for AutotuneConfig {
-    fn default() -> Self {
-        let state_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".home-still")
-            .join("autotune-state.json");
-        let values = HardwareProfile::detect().class.autotune_values();
-        Self {
-            scribe_url: "http://127.0.0.1:7433".into(),
-            // Tick 10 min: warmup 60s + measure 480s = 9 min per tick with
-            // ~1 min idle slack. Shorter windows are noisier, so
-            // `converge_after_stable = 5` compensates. Net convergence drops
-            // from ~2 hours at the old 30-min tick to ~45 min.
-            tick_interval_secs: 600,
-            warmup_secs: 60,
-            measure_secs: 480,
-            values,
-            improvement_threshold: 1.05,
-            regression_threshold: 0.90,
-            converge_after_stable: 5,
-            best_rate_decay: 0.95,
-            state_path,
-            // ~3 GiB headroom before the tuner stops climbing. With per-page
-            // streaming each concurrent convert is small, so this is a backstop
-            // against the hill-climber stacking concurrency on an already-tight
-            // host, not the primary RAM guard (that's the cgroup slice).
-            min_available_mem_mb: 3072,
-        }
-    }
 }
 
 fn default_inbox_poll_interval_secs() -> u64 {
@@ -498,7 +412,6 @@ impl Default for ScribeConfig {
             inbox_poll_interval_secs: default_inbox_poll_interval_secs(),
             convert_timeout_secs: default_convert_timeout_secs(),
             timeout_policy: TimeoutPolicy::default(),
-            autotune: AutotuneConfig::default(),
             storage: StorageConfig::default(),
             events: EventBusConfig::default(),
         }

@@ -48,9 +48,6 @@ fn init_logging(
         TopCmd::Distill {
             command: hs_distill::cli::DistillCmd::WatchEvents { .. },
         } => ("hs-distill-watch", true),
-        TopCmd::Scribe {
-            command: scribe_cmd::ScribeCmd::Autotune,
-        } => ("hs-scribe-autotune", true),
         _ => ("hs", false),
     };
 

@@ -101,19 +101,6 @@ impl HostClass {
         }
     }
 
-    /// Ollama NUM_PARALLEL candidate set the autotuner explores. Ordered
-    /// strictly ascending; autotuner bootstraps from the lowest value.
-    pub fn autotune_values(self) -> Vec<u32> {
-        match self {
-            HostClass::Pi => vec![1, 2, 3, 4],
-            HostClass::AppleSiliconLow => vec![2, 4, 6, 8],
-            HostClass::AppleSiliconHigh => vec![4, 6, 8, 12, 16],
-            HostClass::NvidiaMid => vec![4, 8, 12, 16, 24, 32],
-            HostClass::NvidiaHigh => vec![8, 12, 16, 24, 32, 48],
-            HostClass::GenericCpu => vec![2, 4, 6, 8],
-        }
-    }
-
     /// Pool size for the layout/table ONNX detectors. Each detector costs
     /// ~100 MB resident, so sizing matches the host's memory budget.
     pub fn detector_pool_size(self) -> usize {
@@ -300,27 +287,6 @@ mod tests {
             classify(12, 48, GpuInfo::AppleSilicon),
             HostClass::AppleSiliconHigh
         );
-    }
-
-    #[test]
-    fn autotune_values_are_ascending() {
-        for class in [
-            HostClass::Pi,
-            HostClass::AppleSiliconLow,
-            HostClass::AppleSiliconHigh,
-            HostClass::NvidiaMid,
-            HostClass::NvidiaHigh,
-            HostClass::GenericCpu,
-        ] {
-            let values = class.autotune_values();
-            assert!(!values.is_empty(), "{class:?} has no autotune values");
-            for pair in values.windows(2) {
-                assert!(
-                    pair[0] < pair[1],
-                    "{class:?} autotune values must be strictly ascending, got {values:?}"
-                );
-            }
-        }
     }
 
     #[test]

@@ -5,8 +5,6 @@ pub mod diag;
 pub mod epub;
 pub mod event_watch;
 pub mod html;
-pub mod mem;
-pub mod ollama_tuner;
 pub mod pdf_meta;
 pub mod postprocess;
 

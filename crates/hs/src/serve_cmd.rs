@@ -75,18 +75,6 @@ pub enum ServeCmd {
         #[arg(long, conflicts_with = "install")]
         uninstall: bool,
     },
-    /// `OLLAMA_NUM_PARALLEL` auto-tuner daemon. Runs as a root-level
-    /// systemd unit (Linux only; macOS is a stub — see
-    /// `hs_scribe::ollama_tuner`). Needs root so it can rewrite the
-    /// `/etc/systemd/system/ollama.service.d/` drop-in.
-    ScribeAutotune {
-        /// Install as a root system service and start it (requires sudo).
-        #[arg(long, conflicts_with = "uninstall")]
-        install: bool,
-        /// Stop and remove the system service.
-        #[arg(long, conflicts_with = "install")]
-        uninstall: bool,
-    },
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -148,15 +136,8 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
         ServeCmd::DistillWatch {
             uninstall: true, ..
         } => uninstall_user_service("distill-watch-events", reporter).await,
-        ServeCmd::ScribeAutotune { install: true, .. } => install_autotune_service(reporter).await,
-        ServeCmd::ScribeAutotune {
-            uninstall: true, ..
-        } => uninstall_service("scribe-autotune", reporter).await,
         ServeCmd::ScribeWatch { .. } => serve_scribe_watch(reporter).await,
         ServeCmd::DistillWatch { .. } => serve_distill_watch(reporter).await,
-        ServeCmd::ScribeAutotune { .. } => {
-            crate::scribe_cmd::dispatch(crate::scribe_cmd::ScribeCmd::Autotune, reporter).await
-        }
 
         // -- start / stop (background) --
         ServeCmd::Scribe {
@@ -724,172 +705,6 @@ WantedBy=multi-user.target
     } // cfg(any(linux, macos))
 }
 
-/// Install the OLLAMA_NUM_PARALLEL auto-tuner as a root-level systemd
-/// service. Root is required because the tuner rewrites the Ollama
-/// drop-in under `/etc/systemd/system/ollama.service.d/` and calls
-/// `systemctl restart ollama` each tick. macOS is not yet supported —
-/// the inner `apply_num_parallel` returns Err on that platform.
-async fn install_autotune_service(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        return install_autotune_service_macos(reporter).await;
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = reporter;
-        anyhow::bail!("scribe-autotune is only supported on Linux and macOS");
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
-        let hs_path = hs_bin.display();
-        let service_name = "hs-serve-scribe-autotune";
-        let unit_path = format!("/etc/systemd/system/{service_name}.service");
-        let unit = format!(
-            r#"[Unit]
-Description=Home-Still OLLAMA_NUM_PARALLEL auto-tuner
-After=network.target ollama.service hs-serve-scribe.service
-Wants=ollama.service hs-serve-scribe.service
-
-[Service]
-Type=simple
-User=root
-Environment=RUST_LOG=info
-ExecStart={hs_path} scribe autotune
-Restart=always
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-"#
-        );
-        reporter.status("Install", &format!("writing {unit_path}"));
-        let tmp = format!("/tmp/{service_name}.service");
-        std::fs::write(&tmp, &unit).context("Failed to write temp unit file")?;
-        let status = tokio::process::Command::new("sudo")
-            .args(["cp", &tmp, &unit_path])
-            .status()
-            .await
-            .context("sudo cp failed")?;
-        if !status.success() {
-            anyhow::bail!("Failed to install systemd unit (sudo cp)");
-        }
-        let _ = std::fs::remove_file(&tmp);
-        for args in [
-            &["systemctl", "daemon-reload"][..],
-            &["systemctl", "enable", "--now", service_name][..],
-        ] {
-            let status = tokio::process::Command::new("sudo")
-                .args(args)
-                .status()
-                .await
-                .context("sudo systemctl failed")?;
-            if !status.success() {
-                anyhow::bail!("sudo {} failed", args.join(" "));
-            }
-        }
-        reporter.finish(&format!(
-            "Installed and started {service_name}\n\
-             Logs: sudo journalctl -u {service_name} -f\n\
-             State: /root/.home-still/autotune-state.json (root owns it)\n\
-             Remove: sudo hs serve scribe-autotune --uninstall"
-        ));
-        Ok(())
-    }
-}
-
-/// macOS counterpart to [`install_autotune_service`]. Installs a
-/// user-level LaunchAgent — no sudo. All three macOS Ollama control
-/// variants (Homebrew, Desktop app, custom LaunchAgent) restart Ollama
-/// via `launchctl` under the invoking user's GUI domain, so the
-/// autotuner itself must also run as that user.
-#[cfg(target_os = "macos")]
-async fn install_autotune_service_macos(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
-    let hs_path = hs_bin.display().to_string();
-    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
-    let label = "com.home-still.scribe-autotune";
-    let plist_dir = home_dir.join("Library/LaunchAgents");
-    std::fs::create_dir_all(&plist_dir)?;
-    let plist_path = plist_dir.join(format!("{label}.plist"));
-
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://schemas.apple.com/dtds/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{hs_path}</string>
-        <string>scribe</string>
-        <string>autotune</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>RUST_LOG</key>
-        <string>info</string>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    </dict>
-    <key>KeepAlive</key>
-    <true/>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/hs-scribe-autotune.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/hs-scribe-autotune.log</string>
-</dict>
-</plist>
-"#
-    );
-
-    reporter.status("Install", &format!("{}", plist_path.display()));
-    std::fs::write(&plist_path, &plist)?;
-
-    // Bootout+bootstrap: load in the GUI user domain and start.
-    // Use the target name (`gui/<uid>/<label>`) for bootout so a
-    // re-install is idempotent. Ignore bootout exit status — missing
-    // is fine on a fresh install.
-    let uid_out = tokio::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .await
-        .context("id -u")?;
-    let uid = String::from_utf8(uid_out.stdout)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .ok_or_else(|| anyhow::anyhow!("could not read uid from `id -u`"))?;
-    let domain = format!("gui/{uid}");
-    let _ = tokio::process::Command::new("launchctl")
-        .args(["bootout", &format!("{domain}/{label}")])
-        .status()
-        .await;
-    let status = tokio::process::Command::new("launchctl")
-        .args(["bootstrap", &domain, plist_path.to_string_lossy().as_ref()])
-        .status()
-        .await
-        .context("launchctl bootstrap failed")?;
-    if !status.success() {
-        anyhow::bail!(
-            "launchctl bootstrap {domain} {} failed",
-            plist_path.display()
-        );
-    }
-
-    reporter.finish(&format!(
-        "Installed and started {label}\n\
-         Logs: tail -f /tmp/hs-scribe-autotune.log\n\
-         State: ~/.home-still/autotune-state.json\n\
-         Remove: hs serve scribe-autotune --uninstall\n\n\
-         Heads up — the autotuner restarts local Ollama on each step,\n\
-         causing ~30-60s VLM outages during its 10-30 minute cycles."
-    ));
-    Ok(())
-}
-
 async fn uninstall_service(service_type: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -980,10 +795,10 @@ fn check_system_service_conflict(service_type: &str) -> Result<()> {
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // launchctl list format: "PID\tStatus\tLabel". Match the label
-            // column exactly — not as a substring — otherwise
-            // `com.home-still.scribe` false-positives on the separately
-            // managed `com.home-still.scribe-autotune` and the scribe
-            // wrapper refuses to start.
+            // column exactly — not as a substring — so a service label that
+            // is a prefix of another (e.g. `com.home-still.scribe` vs a
+            // longer `com.home-still.scribe-*`) can't false-positive and make
+            // the wrapper refuse to start.
             let my_pid = std::process::id().to_string();
             for line in stdout.lines() {
                 let mut fields = line.split('\t');

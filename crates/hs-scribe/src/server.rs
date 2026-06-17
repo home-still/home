@@ -52,8 +52,8 @@ pub struct ServerState {
     /// Lock-free reads serve `/health` probes without blocking writers.
     pub last_conversion_ms: Arc<AtomicU64>,
     /// Monotonic count of successful conversions since startup. Consumers
-    /// diff this across polls for throughput measurement (see `hs scribe
-    /// autotune`). Lock-free atomic increment on success.
+    /// diff this across polls for throughput measurement. Lock-free atomic
+    /// increment on success.
     pub total_conversions: Arc<AtomicU64>,
 }
 
@@ -109,10 +109,8 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoRespon
 }
 
 async fn handle_readiness(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    // Report the EFFECTIVE capacity, not the configured value — rc.295
-    // clamps vlm_concurrency to live OLLAMA_NUM_PARALLEL when the config
-    // would oversubscribe Ollama. The pool load-balancer relies on this
-    // number being truthful.
+    // Report the EFFECTIVE capacity (the VLM semaphore size). The pool
+    // load-balancer relies on this number being truthful.
     let total = state.processor.effective_vlm_concurrency();
     let available = state.processor.vlm_sem().available_permits();
     let in_flight = state.in_flight.load(Ordering::Relaxed);

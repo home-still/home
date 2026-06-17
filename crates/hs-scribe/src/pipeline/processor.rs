@@ -107,12 +107,7 @@ pub struct Processor {
     /// semaphore as watch/CLI callers; `/readiness` reports its live
     /// permit count via `Processor::vlm_sem()`.
     vlm_sem: Arc<tokio::sync::Semaphore>,
-    /// The actual semaphore capacity. Equals `config.vlm_concurrency`
-    /// unless clamped by live `OLLAMA_NUM_PARALLEL` detection at startup —
-    /// Rust-layer concurrency above Ollama's parallel capacity just
-    /// oversubscribes Ollama's internal queue, inflates per-request
-    /// latency past the convert deadline, and produces cascading
-    /// timeouts. Clamping at startup keeps Rust in lockstep with Ollama.
+    /// The actual semaphore capacity. Equals `config.vlm_concurrency`.
     effective_vlm_concurrency: usize,
     config: AppConfig,
 }
@@ -143,7 +138,7 @@ impl Processor {
                 )
             };
 
-        let effective_vlm_concurrency = resolve_effective_vlm_concurrency(config.vlm_concurrency);
+        let effective_vlm_concurrency = config.vlm_concurrency;
         let vlm_sem = Arc::new(tokio::sync::Semaphore::new(effective_vlm_concurrency));
 
         Ok(Self {
@@ -159,8 +154,7 @@ impl Processor {
     }
 
     /// Effective semaphore capacity — what `/readiness` reports as
-    /// `vlm_slots_total`. Equals `config.vlm_concurrency` except when
-    /// clamped by live `OLLAMA_NUM_PARALLEL`.
+    /// `vlm_slots_total`. Equals `config.vlm_concurrency`.
     pub fn effective_vlm_concurrency(&self) -> usize {
         self.effective_vlm_concurrency
     }
@@ -881,59 +875,6 @@ impl Processor {
                 .map(|(_, md, _, _)| md)
                 .collect::<Vec<_>>(),
         ))
-    }
-}
-
-/// Clamp `requested` (the configured `vlm_concurrency`) to the live
-/// `OLLAMA_NUM_PARALLEL` on this host when both are detectable and the
-/// requested value is larger. This prevents Rust-layer oversubscription
-/// of Ollama's internal parallel queue, which on production showed up as
-/// every in-flight request stalling past the 900s convert deadline and
-/// getting cancelled without counting as success. If `OLLAMA_NUM_PARALLEL`
-/// is not explicitly set, we fall back to the requested value — the
-/// operator has opted out of the guardrail.
-fn resolve_effective_vlm_concurrency(requested: usize) -> usize {
-    let detected = match crate::ollama_tuner::detect_ollama_control() {
-        Ok(ctrl) => ctrl.detect_current(),
-        Err(e) => {
-            tracing::debug!(
-                "No Ollama launcher found for vlm_concurrency guardrail: {e} — \
-                 using configured vlm_concurrency={requested} as-is"
-            );
-            return requested;
-        }
-    };
-    let Some(num_parallel) = detected else {
-        tracing::info!(
-            vlm_concurrency = requested,
-            "OLLAMA_NUM_PARALLEL not explicitly set — using configured \
-             vlm_concurrency as-is. If Ollama's default is smaller than this, \
-             expect queue oversubscription; set OLLAMA_NUM_PARALLEL via the \
-             platform launcher (systemd drop-in or launchctl setenv) or run \
-             `hs scribe autotune`."
-        );
-        return requested;
-    };
-    let num_parallel_usize = num_parallel as usize;
-    if num_parallel_usize < requested {
-        tracing::warn!(
-            requested,
-            ollama_num_parallel = num_parallel,
-            effective = num_parallel_usize,
-            "vlm_concurrency clamped to OLLAMA_NUM_PARALLEL — Rust-layer \
-             concurrency above Ollama's parallel capacity oversubscribes its \
-             internal queue and inflates per-request latency past the convert \
-             deadline. Raise OLLAMA_NUM_PARALLEL (e.g. via `hs scribe autotune`) \
-             to use the full requested concurrency."
-        );
-        num_parallel_usize
-    } else {
-        tracing::info!(
-            vlm_concurrency = requested,
-            ollama_num_parallel = num_parallel,
-            "vlm_concurrency within OLLAMA_NUM_PARALLEL — no clamp"
-        );
-        requested
     }
 }
 

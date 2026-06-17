@@ -126,9 +126,9 @@ pub struct HealthResponse {
     #[serde(default)]
     pub last_conversion_at: Option<String>,
     /// Total successful conversions since server startup. Monotonic
-    /// counter, cheap atomic increment. Consumers (e.g. `hs scribe
-    /// autotune`) diff this across polls to compute throughput without
-    /// needing log parsing. Resets to 0 on every scribe-server restart.
+    /// counter, cheap atomic increment. Consumers diff this across polls
+    /// to compute throughput without needing log parsing. Resets to 0 on
+    /// every scribe-server restart.
     #[serde(default)]
     pub total_conversions: u64,
 }

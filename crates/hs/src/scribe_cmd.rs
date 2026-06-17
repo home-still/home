@@ -85,10 +85,6 @@ pub enum ScribeCmd {
         /// Catalog stem (no extension), e.g. `10.48550_arxiv.2312.10997`.
         stem: String,
     },
-    /// Auto-tune `OLLAMA_NUM_PARALLEL` against the local scribe-server's
-    /// observed throughput. Install as a root systemd service via
-    /// `sudo hs serve scribe-autotune --install`.
-    Autotune,
 }
 
 #[derive(Subcommand, Debug)]
@@ -130,7 +126,6 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         }
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
         ScribeCmd::Reconvert { stem } => cmd_reconvert(&stem, reporter).await,
-        ScribeCmd::Autotune => cmd_autotune(reporter).await,
     }
 }
 
@@ -248,12 +243,6 @@ async fn cmd_reconvert(stem: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
         "Reconvert queued: stem={stem} source_key={source_key}"
     ));
     Ok(())
-}
-
-async fn cmd_autotune(_reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let cfg = hs_scribe::config::ScribeConfig::load()
-        .map_err(|e| anyhow::anyhow!("load ScribeConfig: {e}"))?;
-    hs_scribe::ollama_tuner::run_forever(cfg.autotune).await
 }
 
 /// Strip the path + extension off a NATS `papers.ingested` event key to
@@ -789,21 +778,6 @@ pub async fn cmd_server(action: ServerAction) -> Result<()> {
 
     match action {
         ServerAction::Start => {
-            let has_nvidia = check_command("nvidia-smi", &[]).await;
-            if should_use_native_ollama(has_nvidia) && !check_ollama_running().await {
-                if cfg!(target_os = "linux") {
-                    eprintln!("Starting Ollama systemd service...");
-                    ensure_ollama_systemd().await?;
-                } else {
-                    eprintln!("Starting native Ollama...");
-                    let _ = tokio::process::Command::new("ollama")
-                        .arg("serve")
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
-                    wait_for_ollama_native(30).await?;
-                }
-            }
             compose.run_capture(&["-f", cf, "up", "-d"]).await?;
             eprintln!("Waiting for services...");
             wait_for_health(DEFAULT_SERVER, 300).await?;
@@ -811,11 +785,6 @@ pub async fn cmd_server(action: ServerAction) -> Result<()> {
         }
         ServerAction::Stop => {
             compose.run_capture(&["-f", cf, "down"]).await?;
-            let has_nvidia = check_command("nvidia-smi", &[]).await;
-            if should_use_native_ollama(has_nvidia) {
-                eprintln!("Unloading model from VRAM...");
-                unload_ollama_model("glm-ocr").await;
-            }
             eprintln!("Stopped.");
         }
     }
@@ -868,23 +837,6 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         )
     })?;
 
-    // Ensure Ollama (the VLM backend) is running — same logic as before.
-    let has_nvidia = check_command("nvidia-smi", &[]).await;
-    if should_use_native_ollama(has_nvidia) && !check_ollama_running().await {
-        if cfg!(target_os = "linux") {
-            reporter.status("Ollama", "starting systemd service");
-            ensure_ollama_systemd().await?;
-        } else {
-            reporter.status("Ollama", "starting native");
-            let _ = tokio::process::Command::new("ollama")
-                .arg("serve")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-            wait_for_ollama_native(30).await?;
-        }
-    }
-
     reporter.status(
         "Scribe",
         &format!("running on port {port} (Ctrl+C to stop)"),
@@ -905,10 +857,6 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         anyhow::bail!("hs-scribe-server exited with {status}");
     }
 
-    if should_use_native_ollama(has_nvidia) {
-        unload_ollama_model("glm-ocr").await;
-    }
-
     Ok(())
 }
 
@@ -921,73 +869,7 @@ fn hidden_dir() -> PathBuf {
         .join(hs_common::HIDDEN_DIR)
 }
 
-use hs_common::compose::{check_command, ComposeCmd};
-
-/// Pick the native-Ollama path on Apple Silicon and Linux-with-NVIDIA,
-/// where we drive Ollama directly (no container). Everywhere else we
-/// assume the operator arranged their own Ollama (container, remote, or
-/// none — we don't care, we just POST to the configured URL).
-fn should_use_native_ollama(has_nvidia: bool) -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        || (cfg!(target_os = "linux") && has_nvidia)
-}
-
-/// Ensure systemd-managed Ollama is active. Called on Linux-with-NVIDIA
-/// before the scribe server starts. Best-effort: if systemctl is missing
-/// (container, non-systemd distro) we return Ok and let the operator's
-/// Ollama setup take over.
-async fn ensure_ollama_systemd() -> Result<()> {
-    let status = tokio::process::Command::new("systemctl")
-        .args(["start", "ollama"])
-        .status()
-        .await;
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(_) | Err(_) => {
-            // systemctl not available or failed — trust the operator's
-            // prior setup. `check_ollama_running` is the next gate.
-            Ok(())
-        }
-    }
-}
-
-/// Unload a model from Ollama VRAM by setting keep_alive=0.
-async fn unload_ollama_model(model: &str) {
-    let _ = reqwest::Client::new()
-        .post("http://localhost:11434/api/generate")
-        .json(&serde_json::json!({
-            "model": model,
-            "keep_alive": 0
-        }))
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await;
-}
-
-async fn check_ollama_running() -> bool {
-    reqwest::Client::new()
-        .get("http://localhost:11434/api/tags")
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await
-        .is_ok()
-}
-
-async fn wait_for_ollama_native(timeout_secs: u64) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
-    loop {
-        if tokio::time::Instant::now() > deadline {
-            anyhow::bail!(
-                "Timed out waiting for native Ollama to start.\n\
-                 Try running manually: ollama serve"
-            );
-        }
-        if check_ollama_running().await {
-            return Ok(());
-        }
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    }
-}
+use hs_common::compose::ComposeCmd;
 
 async fn wait_for_health(server_url: &str, timeout_secs: u64) -> Result<()> {
     let url = format!("{server_url}/health");
