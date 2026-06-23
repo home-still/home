@@ -29,7 +29,7 @@ pub struct GatewayConfig {
     pub key_rotation_days: u64,
 
     /// Service routing: path prefix -> backend URL
-    /// e.g., { "scribe": "http://192.168.1.110:7433" }
+    /// e.g., { "scribe": "http://scribe.example.local:7433" }
     #[serde(default)]
     pub routes: HashMap<String, String>,
 }

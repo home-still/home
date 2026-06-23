@@ -99,14 +99,16 @@ pub fn coalesce_abstract(
     catalog_abstract: Option<String>,
     markdown_body: Option<&str>,
 ) -> CoalescedAbstract {
-    if let Some(text) = openalex_abstract.filter(|s| s.trim().len() >= MIN_ABSTRACT_CHARS) {
+    if let Some(text) = openalex_abstract.filter(|s| s.trim().chars().count() >= MIN_ABSTRACT_CHARS)
+    {
         return CoalescedAbstract {
             source: AbstractSource::Openalex,
             abstract_text: Some(text.trim().to_string()),
         };
     }
 
-    if let Some(text) = catalog_abstract.filter(|s| s.trim().len() >= MIN_ABSTRACT_CHARS) {
+    if let Some(text) = catalog_abstract.filter(|s| s.trim().chars().count() >= MIN_ABSTRACT_CHARS)
+    {
         return CoalescedAbstract {
             source: AbstractSource::Catalog,
             abstract_text: Some(text.trim().to_string()),
@@ -115,7 +117,7 @@ pub fn coalesce_abstract(
 
     if let Some(body) = markdown_body {
         if let Some(extracted) =
-            extract_markdown_abstract(body).filter(|s| s.len() >= MIN_ABSTRACT_CHARS)
+            extract_markdown_abstract(body).filter(|s| s.chars().count() >= MIN_ABSTRACT_CHARS)
         {
             return CoalescedAbstract {
                 source: AbstractSource::Markdown,
@@ -323,6 +325,36 @@ mod tests {
         );
         assert_eq!(r.source, AbstractSource::Markdown);
         assert!(r.abstract_text.as_ref().unwrap().starts_with("Markdown"));
+    }
+
+    #[test]
+    fn coalesce_gates_on_chars_not_bytes() {
+        // Equal *character* length must be accepted or rejected identically
+        // regardless of script. A byte gate (the old bug) would accept a CJK
+        // abstract while dropping a Latin one of the same char length.
+        let cjk_100: String = "数".repeat(MIN_ABSTRACT_CHARS); // 100 chars, ~300 bytes
+        let latin_100: String = "a".repeat(MIN_ABSTRACT_CHARS); // 100 chars, 100 bytes
+        assert_eq!(
+            coalesce_abstract(Some(cjk_100), None, None).source,
+            AbstractSource::Openalex
+        );
+        assert_eq!(
+            coalesce_abstract(Some(latin_100), None, None).source,
+            AbstractSource::Openalex
+        );
+
+        // Just under the char floor → rejected for both scripts. The CJK case
+        // (~297 bytes) would have wrongly passed a byte gate.
+        let cjk_99: String = "数".repeat(MIN_ABSTRACT_CHARS - 1);
+        let latin_99: String = "a".repeat(MIN_ABSTRACT_CHARS - 1);
+        assert_eq!(
+            coalesce_abstract(Some(cjk_99), None, None).source,
+            AbstractSource::TitleOnly
+        );
+        assert_eq!(
+            coalesce_abstract(Some(latin_99), None, None).source,
+            AbstractSource::TitleOnly
+        );
     }
 
     #[test]

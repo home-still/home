@@ -213,10 +213,10 @@ impl AppConfig {
 /// ```yaml
 /// scribe:
 ///   servers:
-///     - http://192.168.1.110:7433              # legacy: backend = glm_ocr
-///     - url: http://192.168.1.110:7434         # new chain entry
+///     - http://host-a.example.local:7433       # legacy: backend = glm_ocr
+///     - url: http://host-a.example.local:7434  # new chain entry
 ///       backend: olmocr
-///     - url: http://192.168.1.110:7433
+///     - url: http://host-a.example.local:7433
 ///       backend: glm_ocr
 /// ```
 ///
@@ -481,24 +481,24 @@ mod tests {
     fn bare_url_deserializes_with_default_backend() {
         // Legacy form — every existing config.yaml in the fleet looks
         // like this. Must continue to parse without operator action.
-        let yaml = "- http://192.168.1.110:7433\n";
+        let yaml = "- http://192.0.2.110:7433\n";
         let entries: Vec<ScribeServerEntry> =
             serde_yaml_ng::from_str(yaml).expect("bare URL must parse");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].url, "http://192.168.1.110:7433");
+        assert_eq!(entries[0].url, "http://192.0.2.110:7433");
         assert_eq!(entries[0].backend, "glm_ocr");
     }
 
     #[test]
     fn struct_form_deserializes_with_explicit_backend() {
         let yaml = "\
-- url: http://192.168.1.110:7434
+- url: http://192.0.2.110:7434
   backend: olmocr
 ";
         let entries: Vec<ScribeServerEntry> =
             serde_yaml_ng::from_str(yaml).expect("struct form must parse");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].url, "http://192.168.1.110:7434");
+        assert_eq!(entries[0].url, "http://192.0.2.110:7434");
         assert_eq!(entries[0].backend, "olmocr");
     }
 
@@ -508,7 +508,7 @@ mod tests {
         // the same default the bare form uses rather than fail loudly,
         // since that matches the legacy meaning.
         let yaml = "\
-- url: http://192.168.1.110:7433
+- url: http://192.0.2.110:7433
 ";
         let entries: Vec<ScribeServerEntry> =
             serde_yaml_ng::from_str(yaml).expect("backend-less struct must parse");
@@ -521,10 +521,10 @@ mod tests {
         // The chain semantics in Step 2d rely on this exact ordering —
         // primary backend first, fallbacks after.
         let yaml = "\
-- url: http://192.168.1.110:7434
+- url: http://192.0.2.110:7434
   backend: olmocr
-- http://192.168.1.110:7433
-- url: http://192.168.1.233:7433
+- http://192.0.2.110:7433
+- url: http://192.0.2.233:7433
   backend: glm_ocr
 ";
         let entries: Vec<ScribeServerEntry> =

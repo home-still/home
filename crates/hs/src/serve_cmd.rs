@@ -1014,7 +1014,7 @@ fn local_ip_hint() -> String {
             .output()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // Output: "1.1.1.1 via 192.168.1.1 dev enp6s0 src 192.168.1.110 uid 1000"
+            // Output: "1.1.1.1 via 192.0.2.1 dev enp6s0 src 192.0.2.110 uid 1000"
             if let Some(pos) = stdout.find("src ") {
                 let after_src = &stdout[pos + 4..];
                 if let Some(ip) = after_src.split_whitespace().next() {

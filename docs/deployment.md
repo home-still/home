@@ -887,8 +887,8 @@ On the primary GPU host (§6.3), add the new URL to `~/.home-still/config.yaml`:
 ```yaml
 scribe:
   servers:
-    - http://192.168.1.110:7433   # big   (primary)
-    - http://192.168.1.111:7433   # big_mac (secondary)
+    - http://primary.example.local:7433     # primary GPU host
+    - http://secondary.example.local:7433   # secondary host
 ```
 
 Restart the primary's `hs-scribe-watch-events.service`:

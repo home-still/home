@@ -28,6 +28,14 @@ pub fn parse_work_id_u64(id: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
+/// Upper bound on a word position in `abstract_inverted_index`. Positions come
+/// straight from snapshot JSON as an unbounded `u32`; a single malformed record
+/// near `u32::MAX` would otherwise allocate tens of GB and OOM-kill the whole
+/// partition load. Real abstracts are at most a few thousand tokens, so this
+/// ceiling is far above any legitimate value — over it, we skip the abstract
+/// (the row still ingests) rather than crash the partition.
+const MAX_ABSTRACT_POSITION: usize = 100_000;
+
 pub fn reconstruct_abstract(inverted_index: &HashMap<String, Vec<u32>>) -> Option<String> {
     if inverted_index.is_empty() {
         return None;
@@ -38,6 +46,15 @@ pub fn reconstruct_abstract(inverted_index: &HashMap<String, Vec<u32>>) -> Optio
         .flat_map(|positions| positions.iter())
         .max()
         .copied()? as usize;
+
+    if max_pos > MAX_ABSTRACT_POSITION {
+        tracing::warn!(
+            max_pos,
+            limit = MAX_ABSTRACT_POSITION,
+            "skipping abstract with implausibly large word position (likely malformed record)"
+        );
+        return None;
+    }
 
     let mut words: Vec<&str> = vec![""; max_pos + 1];
 
@@ -90,6 +107,17 @@ mod tests {
         idx.insert("c".to_string(), vec![2]);
         idx.insert("d".to_string(), vec![3]);
         assert_eq!(reconstruct_abstract(&idx).as_deref(), Some("a b c d a"));
+    }
+
+    #[test]
+    fn skips_abstract_with_implausible_position() {
+        // A malformed snapshot record with a position beyond the sane ceiling
+        // must be skipped (returns None) rather than allocating ~the position
+        // count of slots and OOM-killing the partition load.
+        let mut idx = HashMap::new();
+        idx.insert("hello".to_string(), vec![0]);
+        idx.insert("world".to_string(), vec![MAX_ABSTRACT_POSITION as u32 + 1]);
+        assert_eq!(reconstruct_abstract(&idx), None);
     }
 
     #[test]

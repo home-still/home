@@ -24,41 +24,52 @@ impl ScribePool {
     /// Convert one PDF via the best available server.
     /// Caller is responsible for limiting concurrency (e.g. via a semaphore).
     /// Returns `(server_url, ConversionResult)` on success.
+    ///
+    /// The retry loop covers only server *acquisition* — pool saturation is
+    /// transient, so we retry `pick_server` up to 3 times. Once a server is
+    /// acquired the conversion is a single attempt: a backend-side convert
+    /// failure propagates immediately (the chain's own escalation/failover
+    /// handles retrying against other backends, not this pool).
     pub async fn convert_one(
         &self,
         pdf_bytes: Vec<u8>,
         on_progress: impl Fn(ProgressEvent) + Send + Sync + 'static,
     ) -> Result<(String, ConversionResult)> {
+        let mut acquired = None;
         let mut last_err = None;
         for attempt in 0..3 {
             match self.inner.pick_server().await {
-                Ok((client, _pick_guard)) => {
-                    let url = client.url().to_string();
-                    let short = url
-                        .strip_prefix("http://")
-                        .or_else(|| url.strip_prefix("https://"))
-                        .unwrap_or(&url);
-                    on_progress(ProgressEvent {
-                        stage: "server".into(),
-                        page: 0,
-                        total_pages: 0,
-                        message: format!("→ {short}"),
-                    });
-                    let result = client
-                        .convert_with_progress(pdf_bytes, None, None, on_progress)
-                        .await?;
-                    return Ok((url, result));
+                Ok(picked) => {
+                    acquired = Some(picked);
+                    break;
                 }
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < 2 {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        tokio::time::sleep(Duration::from_secs(3)).await;
                     }
                 }
             }
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No servers available")))
+        let (client, _pick_guard) = acquired
+            .ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("No servers available")))?;
+
+        let url = client.url().to_string();
+        let short = url
+            .strip_prefix("http://")
+            .or_else(|| url.strip_prefix("https://"))
+            .unwrap_or(&url);
+        on_progress(ProgressEvent {
+            stage: "server".into(),
+            page: 0,
+            total_pages: 0,
+            message: format!("→ {short}"),
+        });
+        let result = client
+            .convert_with_progress(pdf_bytes, None, None, on_progress)
+            .await?;
+        Ok((url, result))
     }
 
     /// Health check all servers. Returns (url, reachable) pairs.

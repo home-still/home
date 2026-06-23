@@ -563,3 +563,86 @@ rc.341 removed the orphaned `OLLAMA_NUM_PARALLEL` autotuner, the native-ollama s
 1. **`vlm_concurrency` (12) now oversubscribes llama-server `--parallel 8`.** rc.341 deleted `resolve_effective_vlm_concurrency`, which used to clamp the scribe server's page-parallelism semaphore down to a detected `OLLAMA_NUM_PARALLEL`. That clamp only ever applied to the (unused) ollama path, so removing it is correct — BUT the GLM scribe (`:7433`) now sends up to `config.vlm_concurrency=12` concurrent page requests to `llama-server-glm-ocr` which runs `--parallel 8`, so 4 queue. GLM is escalation-only (rare), so low blast radius, but consider setting the GLM scribe's `vlm_concurrency` to match `--parallel` (8) in config, OR raise llama-server `--parallel`. Tuning only — no rebuild.
 2. **Leftover disabled unit file on `big`.** `/etc/systemd/system/hs-serve-scribe-autotune.service` still exists (now `disabled`, inert — rc.341 no longer generates it). Harmless, but `sudo rm` it + `daemon-reload` for cleanliness whenever convenient.
 3. **GLM escalations on repetition-loop papers struggle.** Papers that escalate olmocr→glm_ocr via `reason=vlm_repetition_loop` (e.g. `10.3389_fphys.2021.677581`) also trip GLM's 4-gram-cycle repetition detector; some exhaust the chain (`scribe convert failed`) and stay unconverted. This is the same root theme as **P0-12** (decode-time repetition prevention) — both backends loop on the same pathological PDFs. Track under P0-12, not separately.
+
+---
+
+## Code-review follow-ups (2026-06-23) — `feat/distill-search-include-text` branch
+
+Verified findings from a max-effort multi-agent review of the branch diff (145 changed files) vs `main`. **Coverage is partial:** the review's synthesis pass and several verifiers/the codebase-wide sweep hit a session rate-limit, ~24 findings were kept but the report capped at 15, and `openai_compatible.rs` / `reconcile.rs` / `status.rs` were never verified. **Re-run the review for the full set.** Security (CR-1) and documentation/privacy (CR-8) items are normally excluded from this file per the header, but are included here at operator request — both are CLAUDE.md non-negotiables.
+
+> **RESOLVED 2026-06-23 (CR-1 … CR-8).** All eight major/medium findings fixed on
+> this branch with regression tests; `cargo fmt`/`clippy -D warnings`/`test` all green.
+> - **CR-1** — deleted `is_rfc1918_source` + `lan_zone_claims`; every proxied request now
+>   authenticates via the signed-token path (ONE PATH). **Deploy note:** LAN hosts must
+>   present a valid bearer token — confirm each is enrolled before rollout.
+> - **CR-2** — `citations(sort="citations")` paginates the full citing set (capped at
+>   `MAX_CITATION_SORT_FETCH=10_000`) before ranking; test
+>   `citations_sort_by_citations_ranks_globally_across_pages`.
+> - **CR-3** — `relevance_score` is pure again; title-presence floor moved to
+>   `passes_citation_title_floor`, applied only on the citation-sort filter in `search.rs`;
+>   test `abstract_match_not_demoted_in_default_ranking`.
+> - **CR-4** — `convert_one` retry loop now wraps only server acquisition; convert is
+>   single-attempt (comment matches behavior).
+> - **CR-5** — `reconstruct_abstract` bounds `max_pos` at `MAX_ABSTRACT_POSITION=100_000`,
+>   skips+logs malformed records; test `skips_abstract_with_implausible_position`.
+> - **CR-6** — title length gate counts chars; tests `accepts_long_cjk_title_within_char_limit`,
+>   `rejects_over_long_title_by_char_count`.
+> - **CR-7** — `coalesce_abstract` gates on `chars().count()` across all paths; test
+>   `coalesce_gates_on_chars_not_bytes`.
+> - **CR-8** — real LAN IPs replaced with `example.local` / RFC 5737 `192.0.2.x`
+>   placeholders across docs, rustdoc, and fixtures (incl. `hs-gateway/src/config.rs`,
+>   `hs/src/server_cmd.rs`, repro tests — wider than originally listed).
+> - **CR-9** (P3 cleanups) and the older codebase-wide P1 sweeps remain **open**.
+
+### P0 (security) — CR-1. Gateway auth bypass via trusted RFC1918 source IP
+**Motivation:** `crates/hs-gateway/src/proxy.rs:47` — `is_rfc1918_source` grants wildcard (`*`) scope with synthetic claims and **zero token check** to any connection whose peer IP is in 10/172.16/192.168. Any LAN host (or a container/NAT path presenting a private source IP) reaches every gateway-proxied backend with full scope and no bearer token — a request that previously required a signed token now bypasses auth entirely.
+**Scope:** `crates/hs-gateway/src/proxy.rs:47` (+ the claims-synthesis path it feeds).
+**Change:** Remove source-IP-based authorization. Every proxied request authenticates via the same signed-token path regardless of source network. No "trusted LAN" branch — ONE PATH.
+**Acceptance:** A request from an RFC1918 source with no/invalid bearer token is rejected with 401; a valid token from any source succeeds. (Note: the `proxy.rs` re-verify itself was rate-limited — re-confirm on rerun.)
+
+### P1 (correctness) — CR-2. `paper_citations(sort="citations")` ranks only the first 1000 edges
+**Motivation:** `paper/src/providers/semantic_scholar.rs:376` — the fetch loop breaks once `entries.len() >= effective_limit`, which page 1 (`PAGE_SIZE=1000`) always satisfies for default `limit=100`. So it sorts/truncates only the first 1000 fetched edges (in SS default order), not the global citation ranking. For any paper with >1000 citations the MCP tool returns the most-cited 100 *among an arbitrary first 1000* — wrong "top citing papers."
+**Scope:** `paper/src/providers/semantic_scholar.rs:376` (citations pagination + sort).
+**Change:** When `sort="citations"`, fetch all citing edges (paginate to completion, within a sane cap) before sorting/truncating — don't early-break on `effective_limit` while a sort is requested.
+**Acceptance:** `paper_citations` on a >1000-citation DOI with `sort="citations"` returns the globally most-cited N, stable across repeated calls.
+
+### P1 (correctness) — CR-3. Title-presence floor leaks into relevance-sorted search
+**Motivation:** `paper/src/aggregation/relevance.rs:76` — the new `TITLE_PRESENCE_FLOOR` cap (comment: "only for sort=citations") is applied unconditionally inside `relevance_score`, which also feeds the relevance-sorted ranking (`ranking.rs:48`, `score = 0.4*rrf + 0.35*rel + …`). A normal `paper_search` whose best match has query terms in the abstract but <50% in the title gets hard-capped at 0.299, demoting on-topic results below weaker title-keyword matches.
+**Scope:** `paper/src/aggregation/relevance.rs:76`; caller split in `paper/src/aggregation/ranking.rs:48`.
+**Change:** Apply the cap only on the citation-sort path, not inside the shared `relevance_score` used by the default ranking. Thread the intent through (or compute the cap in the citation-sort filter), so relevance ordering is unchanged.
+**Acceptance:** A relevance search where the top abstract-match lacks title terms ranks it where it ranked pre-branch; citation-sort still applies the floor.
+
+### P1 (correctness) — CR-4. `convert_one` retry loop never retries a failed conversion
+**Motivation:** `crates/hs/src/scribe_pool.rs:33` — the `for attempt in 0..3` loop forwards to `convert_with_progress(...).await?`; `?` returns immediately, and `pdf_bytes`/`on_progress` are moved on the first iteration. So it only ever retries `pick_server()` (pool-saturation) failures, never a failed conversion, despite the loop/comment advertising retry. A transient backend 500 or dropped mid-convert stream fails the whole PDF on attempt 1.
+**Scope:** `crates/hs/src/scribe_pool.rs:33`.
+**Change:** Either retry the convert step on transient errors (clone/Arc the bytes so they survive iterations; classify transient vs permanent) OR delete the misleading `0..3` loop and document single-attempt semantics. Pick one — no half-loop that lies about its behavior.
+**Acceptance:** A simulated transient convert failure is retried up to the advertised count; a permanent failure returns immediately. If retry is dropped instead, the comment and loop are gone.
+
+### P1 (robustness) — CR-5. Unbounded allocation on one corrupt OpenAlex position
+**Motivation:** `crates/openalex-ingest/src/parser.rs:42` — `reconstruct_abstract` does `vec![""; max_pos + 1]` where `max_pos` is an unbounded `u32` straight from snapshot `abstract_inverted_index` JSON. One malformed record (position near `u32::MAX` → ~68 GB) OOM-kills `hs openalex load-works` mid-partition, forcing a from-scratch partition re-run — the length-driven blowup the ingest hardening targets.
+**Scope:** `crates/openalex-ingest/src/parser.rs:42`.
+**Change:** Bound `max_pos` before allocating (reject/skip the abstract when it exceeds a sane token ceiling). Fail the row loudly (skip + log), not the whole partition.
+**Acceptance:** A synthetic record with a giant position is skipped (logged) and ingest continues; valid abstracts reconstruct unchanged.
+
+### P1 (correctness) — CR-6. Over-long-title check uses byte length, rejecting valid CJK titles
+**Motivation:** `personal/src/services/naming.rs:90` — `title.len() > 200` measures bytes, not chars. A ~70-char CJK title (~210 UTF-8 bytes) is rejected with "model returned over-long title" and the document **fails ingest entirely**. The sibling `take_chars` in the same file correctly uses char boundaries.
+**Scope:** `personal/src/services/naming.rs:90`.
+**Change:** Compare `title.chars().count() > 200` (or reuse the char-boundary helper).
+**Acceptance:** A 70-char/210-byte title passes; a genuinely >200-char title is still rejected.
+
+### P2 (data quality) — CR-7. Abstract length gate mixes bytes and chars by script
+**Motivation:** `crates/hs-distill/src/abstracts.rs:120` — `coalesce_abstract` gates OpenAlex/catalog candidates on `s.trim().len()` (bytes) against `MIN_ABSTRACT_CHARS`, while `abstract_chars()` reports chars. A short non-Latin abstract passes as bytes while an equally-short Latin one is dropped to `TitleOnly` — `AbstractSource` provenance becomes script-dependent and inconsistent vs the markdown path.
+**Scope:** `crates/hs-distill/src/abstracts.rs:120`.
+**Change:** Gate on `chars().count()` consistently across all candidate paths.
+**Acceptance:** Latin and CJK abstracts of equal *character* length are accepted/rejected identically; `AbstractSource` stamping is consistent.
+
+### Doc/privacy — CR-8. Real LAN IPs committed in docs and source
+**Motivation:** This branch adds real addresses/hostnames, violating the CLAUDE.md privacy non-negotiable (use `<host>`/`example.local`): `docs/deployment.md:890-891` (`192.168.1.110 # big`, `192.168.1.111 # big_mac`) and `crates/hs-scribe/src/config.rs:216-219` rustdoc + test fixtures (`:484-527`, including bmb `192.168.1.233`). The config.rs ones also render in `cargo doc`. Confirmed newly introduced by this branch (surrounding IPs pre-existing).
+**Scope:** `docs/deployment.md:890`; `crates/hs-scribe/src/config.rs:216`, `:484-527`.
+**Change:** Replace with `http://<host>:7433` / `example.local` placeholders in docs, rustdoc, and fixtures.
+**Acceptance:** `git grep -E '192\.168\.1\.(110|111|233)' -- docs crates` returns nothing newly added by the branch.
+
+### P3 (maintainability / efficiency) — CR-9. Lower-priority cleanups
+- **`crates/hs-scribe/src/pipeline/processor.rs:745`** — the ~120-line per-region pipeline (stream-render → `spawn_blocking` stage1 → `JoinSet` stage2 → sort/join) is duplicated nearly verbatim between `process_pdf_with_progress` and `process_pdf`, differing only in progress callbacks. This is the rc.304→rc.305 "missed sibling call site" trap (the rc.341 OOM-streaming fix had to be applied twice). Extract one shared driver; `process_pdf` calls it with a no-op progress fn.
+- **`crates/hs-scribe/src/event_watch.rs:313`** (and `:463` for HTML) — `(*source.bytes).clone()` copies the full PDF/HTML out of the `Arc` per document. Have `convert_with_progress` accept `Arc<Vec<u8>>`/`Bytes` (reqwest multipart takes `Bytes` without copy).
+- **`personal/src/services/ingest.rs:44`** — `converters::convert(cfg, format, bytes.clone(), …)` holds two full file copies across the convert+LLM-naming window (`bytes` reused at `:60`). Change `converters::convert` to take `&[u8]`.

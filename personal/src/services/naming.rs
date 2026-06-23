@@ -87,10 +87,10 @@ pub async fn title_and_category(cfg: &Config, markdown: &str) -> Result<NameResu
     if title.is_empty() {
         return Err(PersonalError::Naming("model returned empty title".into()));
     }
-    if title.len() > 200 {
+    let title_chars = title.chars().count();
+    if title_chars > 200 {
         return Err(PersonalError::Naming(format!(
-            "model returned over-long title ({} chars)",
-            title.len()
+            "model returned over-long title ({title_chars} chars)"
         )));
     }
 
@@ -208,6 +208,47 @@ mod tests {
         let err = title_and_category(&cfg, "anything").await.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("empty title"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn accepts_long_cjk_title_within_char_limit() {
+        // 70 CJK chars ≈ 210 UTF-8 bytes. The length gate counts chars, so this
+        // must pass; a byte-based check (the old bug) would reject it.
+        let title: String = "研".repeat(70);
+        let inner = serde_json::json!({ "title": title, "category": "medical" }).to_string();
+        let envelope = serde_json::json!({ "response": inner });
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/generate")
+            .with_status(200)
+            .with_body(envelope.to_string())
+            .create_async()
+            .await;
+
+        let cfg = cfg_with_url(&server.url());
+        let r = title_and_category(&cfg, "anything")
+            .await
+            .expect("70-char CJK title should be accepted");
+        assert_eq!(r.title.chars().count(), 70);
+    }
+
+    #[tokio::test]
+    async fn rejects_over_long_title_by_char_count() {
+        let title: String = "a".repeat(201);
+        let inner = serde_json::json!({ "title": title, "category": "medical" }).to_string();
+        let envelope = serde_json::json!({ "response": inner });
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/generate")
+            .with_status(200)
+            .with_body(envelope.to_string())
+            .create_async()
+            .await;
+
+        let cfg = cfg_with_url(&server.url());
+        let err = title_and_category(&cfg, "anything").await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("over-long title"), "got: {msg}");
     }
 
     #[tokio::test]

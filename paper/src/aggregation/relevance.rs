@@ -1,10 +1,11 @@
 use crate::models::Paper;
 
-/// Below this fraction of query terms appearing in the title, the paper's
-/// score is hard-capped just under [`super::ranking::CITATION_SORT_MIN_RELEVANCE`].
-/// Stops off-topic high-citation papers from surfacing in "sort by citations"
-/// searches purely on the strength of an abstract mention. Tuned to keep
-/// papers where ≥half the query is in the title.
+/// Minimum fraction of query terms that must appear in the title for a paper
+/// to clear [`passes_citation_title_floor`]. Stops off-topic high-citation
+/// papers from surfacing in "sort by citations" searches purely on the
+/// strength of an abstract mention. Tuned to keep papers where ≥half the query
+/// is in the title. Applied ONLY on the citation-sort path — never inside the
+/// default relevance ranking.
 const TITLE_PRESENCE_FLOOR: f64 = 0.5;
 
 /// Scores how well a paper matches the query.  Returns 0.0-1.0.
@@ -66,16 +67,26 @@ pub fn relevance_score(query: &str, paper: &Paper) -> f64 {
         meta += 0.25;
     }
 
-    let weighted = 0.4 * term_coverage + 0.3 * phrase_score + 0.2 * title_density + 0.1 * meta;
+    0.4 * term_coverage + 0.3 * phrase_score + 0.2 * title_density + 0.1 * meta
+}
 
-    // Title-presence floor: when the user wanted topical-AND-cited results
-    // (sort=citations), an abstract-only match shouldn't lift a paper above
-    // the citation-sort relevance floor. `min()` so we never *raise* a low
-    // score — we only cap high ones.
-    let title_coverage = title_hits as f64 / query_terms.len() as f64;
-    if title_coverage < TITLE_PRESENCE_FLOOR {
-        return weighted.min(super::ranking::CITATION_SORT_MIN_RELEVANCE - 0.001);
+/// Whether at least [`TITLE_PRESENCE_FLOOR`] of the query terms appear in the
+/// paper's title. Used ONLY on the `sort=citations` path to keep off-topic
+/// high-citation papers (matched on an abstract mention alone) out of the
+/// ranked results. The default relevance ranking does not apply this gate, so
+/// an on-topic abstract match is never demoted in ordinary search.
+pub fn passes_citation_title_floor(query: &str, paper: &Paper) -> bool {
+    let query_lower = query.to_lowercase();
+    let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+    if query_terms.is_empty() {
+        return true;
     }
 
-    weighted
+    let title_lower = paper.title.to_lowercase();
+    let title_hits = query_terms
+        .iter()
+        .filter(|term| title_lower.contains(**term))
+        .count();
+    let title_coverage = title_hits as f64 / query_terms.len() as f64;
+    title_coverage >= TITLE_PRESENCE_FLOOR
 }

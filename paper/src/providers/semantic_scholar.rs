@@ -319,9 +319,11 @@ impl SemanticScholarProvider {
     }
 
     /// Return the list of papers that cite a given DOI (forward chaining).
-    /// Paginates SS's `/citations` endpoint at 1000 per page until `limit`
-    /// reached or upstream exhausted; `year_from` filter and `sort` are
-    /// applied post-fetch (SS does not filter citations reliably by year).
+    /// Paginates SS's `/citations` endpoint at 1000 per page; `year_from`
+    /// filter and `sort` are applied post-fetch (SS does not filter citations
+    /// reliably by year). For `sort="citations"` the full citing set is
+    /// fetched (bounded by `MAX_CITATION_SORT_FETCH`) so the ranking is global;
+    /// for the default year sort, fetch stops once `limit` edges are gathered.
     pub async fn citations(
         &self,
         doi: &str,
@@ -331,6 +333,16 @@ impl SemanticScholarProvider {
         let effective_limit = opts.limit.unwrap_or(100).min(1000) as usize;
 
         const PAGE_SIZE: u32 = 1000;
+        // When sorting by citation count we must rank the global citing set,
+        // not whatever the first `effective_limit` edges happened to be in SS's
+        // default order — so fetch to completion, bounded by a sane cap.
+        const MAX_CITATION_SORT_FETCH: usize = 10_000;
+        let sort_by_citations = opts.sort.as_deref() == Some("citations");
+        let fetch_target = if sort_by_citations {
+            MAX_CITATION_SORT_FETCH
+        } else {
+            effective_limit
+        };
         let mut entries: Vec<CitationGraphEntry> = Vec::new();
         let mut offset: u32 = 0;
         let mut total_available: Option<u32> = None;
@@ -373,7 +385,7 @@ impl SemanticScholarProvider {
                     .map(s2_paper_to_entry),
             );
 
-            if entries.len() >= effective_limit {
+            if entries.len() >= fetch_target {
                 hit_limit = true;
                 break;
             }
@@ -904,6 +916,66 @@ mod tests {
             .await
             .expect_err("404 must surface as Err");
         assert!(matches!(err, PaperError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn citations_sort_by_citations_ranks_globally_across_pages() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Page 1 (offset=0): a full page of low-citation edges. The single
+        // most-cited edge lives on PAGE 2 — so an early-break-on-limit fetch
+        // would never see it and would rank a citationCount=1 edge first.
+        let mut page1_data = String::from("[");
+        for i in 0..1000 {
+            if i > 0 {
+                page1_data.push(',');
+            }
+            page1_data.push_str(&format!(
+                r#"{{"citingPaper":{{"paperId":"low{i}","title":"Low cite {i}","year":2020,"citationCount":1,"externalIds":{{"DOI":"10.1/low{i}"}}}}}}"#
+            ));
+        }
+        page1_data.push(']');
+        let page1 = format!(r#"{{"offset":0,"next":1000,"total":1001,"data":{page1_data}}}"#);
+        let page2 = r#"{"offset":1000,"total":1001,"data":[{"citingPaper":{"paperId":"top","title":"Most cited","year":2021,"citationCount":9999,"externalIds":{"DOI":"10.1/top"}}}]}"#;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/graph/v1/paper/DOI:10.1234/popular/citations"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(page1))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/graph/v1/paper/DOI:10.1234/popular/citations"))
+            .and(query_param("offset", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(page2))
+            .mount(&server)
+            .await;
+
+        let provider = provider_pointing_at(&server.uri());
+        let resp = provider
+            .citations(
+                "10.1234/popular",
+                CitationsOpts {
+                    limit: Some(100),
+                    sort: Some("citations".to_string()),
+                    ..CitationsOpts::default()
+                },
+            )
+            .await
+            .expect("citations must succeed");
+
+        // The globally most-cited edge (page 2) must rank first, proving the
+        // fetch paginated past the first page before sorting.
+        assert_eq!(
+            resp.citations.first().and_then(|c| c.citation_count),
+            Some(9999)
+        );
+        assert_eq!(
+            resp.citations.first().map(|c| c.title.as_str()),
+            Some("Most cited")
+        );
     }
 
     // ── Live integration test ───────────────────────────────────────────
