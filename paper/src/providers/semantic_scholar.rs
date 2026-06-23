@@ -337,6 +337,14 @@ impl SemanticScholarProvider {
         // not whatever the first `effective_limit` edges happened to be in SS's
         // default order — so fetch to completion, bounded by a sane cap.
         const MAX_CITATION_SORT_FETCH: usize = 10_000;
+        // Semantic Scholar's citations endpoint serves at most the first 10,000
+        // edges (`offset + limit <= 10000`); a request past that returns 400.
+        // Because null-`citingPaper` edges are filtered out, `entries` grows
+        // slower than `offset`, so we cannot rely on the entry-count cap alone
+        // to stop in time — guard the offset explicitly. With PAGE_SIZE=1000 the
+        // last requestable offset is 9000. For sort=citations this means we rank
+        // the top-N among the first 10k edges SS will return — its documented max.
+        const SS_CITATIONS_MAX_OFFSET: u32 = 10_000 - PAGE_SIZE;
         let sort_by_citations = opts.sort.as_deref() == Some("citations");
         let fetch_target = if sort_by_citations {
             MAX_CITATION_SORT_FETCH
@@ -349,6 +357,12 @@ impl SemanticScholarProvider {
         let mut hit_limit = false;
 
         loop {
+            if offset > SS_CITATIONS_MAX_OFFSET {
+                // Next page would exceed SS's offset ceiling — stop here rather
+                // than issue a request SS rejects with 400.
+                hit_limit = true;
+                break;
+            }
             let url = format!(
                 "{}/graph/v1/paper/{}/citations?fields=externalIds,title,year,authors,venue,citationCount&limit={}&offset={}",
                 self.base_url, id, PAGE_SIZE, offset
@@ -975,6 +989,68 @@ mod tests {
         assert_eq!(
             resp.citations.first().map(|c| c.title.as_str()),
             Some("Most cited")
+        );
+    }
+
+    #[tokio::test]
+    async fn citations_sort_stops_at_ss_offset_ceiling_without_400() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Pages at offsets 0..=9000. Each returns 1000 edges but only 50 carry a
+        // citingPaper (the rest are null and get filtered), so `entries` lags
+        // `offset` — the real condition that walked the old code past Semantic
+        // Scholar's 10k offset ceiling into a 400. We deliberately do NOT mount
+        // offset=10000: if the loop requests it, the unmatched mock 404s and the
+        // call errors, failing this test.
+        let server = MockServer::start().await;
+        for page in 0..=9u32 {
+            let offset = page * 1000;
+            let mut data = String::from("[");
+            for i in 0..1000u32 {
+                if i > 0 {
+                    data.push(',');
+                }
+                if i < 50 {
+                    let cc = offset + i;
+                    data.push_str(&format!(
+                        r#"{{"citingPaper":{{"paperId":"p{offset}_{i}","title":"cite {offset}_{i}","year":2020,"citationCount":{cc},"externalIds":{{"DOI":"10.1/{offset}_{i}"}}}}}}"#
+                    ));
+                } else {
+                    data.push_str(r#"{"citingPaper":null}"#);
+                }
+            }
+            data.push(']');
+            let next = offset + 1000;
+            let body =
+                format!(r#"{{"offset":{offset},"next":{next},"total":50000,"data":{data}}}"#);
+            Mock::given(method("GET"))
+                .and(path("/graph/v1/paper/DOI:10.1234/huge/citations"))
+                .and(query_param("offset", offset.to_string()))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+        }
+
+        let provider = provider_pointing_at(&server.uri());
+        let resp = provider
+            .citations(
+                "10.1234/huge",
+                CitationsOpts {
+                    limit: Some(10),
+                    sort: Some("citations".to_string()),
+                    ..CitationsOpts::default()
+                },
+            )
+            .await
+            .expect("must stop at SS offset ceiling, not request past it and 400");
+
+        // Got results (didn't error), ranked by citation_count. The highest
+        // planted count is on the last fetched page (offset 9000 + 49).
+        assert_eq!(resp.citations.len(), 10);
+        assert_eq!(
+            resp.citations.first().and_then(|c| c.citation_count),
+            Some(9049)
         );
     }
 

@@ -578,6 +578,11 @@ Verified findings from a max-effort multi-agent review of the branch diff (145 c
 > - **CR-2** — `citations(sort="citations")` paginates the full citing set (capped at
 >   `MAX_CITATION_SORT_FETCH=10_000`) before ranking; test
 >   `citations_sort_by_citations_ranks_globally_across_pages`.
+>   **rc.344 follow-up:** rc.343's deeper pagination 400'd on high-citation papers
+>   (SS serves at most the first 10k edges; filtered null edges let `offset` outrun
+>   `entries`). Added an `SS_CITATIONS_MAX_OFFSET=9000` guard so we stop at SS's
+>   ceiling instead of requesting past it; test
+>   `citations_sort_stops_at_ss_offset_ceiling_without_400`.
 > - **CR-3** — `relevance_score` is pure again; title-presence floor moved to
 >   `passes_citation_title_floor`, applied only on the citation-sort filter in `search.rs`;
 >   test `abstract_match_not_demoted_in_default_ranking`.
