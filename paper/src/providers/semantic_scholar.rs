@@ -337,14 +337,14 @@ impl SemanticScholarProvider {
         // not whatever the first `effective_limit` edges happened to be in SS's
         // default order — so fetch to completion, bounded by a sane cap.
         const MAX_CITATION_SORT_FETCH: usize = 10_000;
-        // Semantic Scholar's citations endpoint serves at most the first 10,000
-        // edges (`offset + limit <= 10000`); a request past that returns 400.
-        // Because null-`citingPaper` edges are filtered out, `entries` grows
-        // slower than `offset`, so we cannot rely on the entry-count cap alone
-        // to stop in time — guard the offset explicitly. With PAGE_SIZE=1000 the
-        // last requestable offset is 9000. For sort=citations this means we rank
-        // the top-N among the first 10k edges SS will return — its documented max.
-        const SS_CITATIONS_MAX_OFFSET: u32 = 10_000 - PAGE_SIZE;
+        // Semantic Scholar's citations endpoint rejects a request once
+        // `offset + limit >= 10000` (verified empirically: offset 8999 + limit
+        // 1000 = 9999 succeeds; offset 9000 = 10000 returns 400). Because
+        // null-`citingPaper` edges are filtered out, `entries` grows slower than
+        // `offset`, so the entry-count cap alone won't stop us in time — guard
+        // the offset explicitly. For sort=citations this means we rank the top-N
+        // among the first ~9000 edges SS will serve — its hard ceiling.
+        const SS_CITATIONS_OFFSET_LIMIT: u32 = 10_000;
         let sort_by_citations = opts.sort.as_deref() == Some("citations");
         let fetch_target = if sort_by_citations {
             MAX_CITATION_SORT_FETCH
@@ -357,9 +357,9 @@ impl SemanticScholarProvider {
         let mut hit_limit = false;
 
         loop {
-            if offset > SS_CITATIONS_MAX_OFFSET {
-                // Next page would exceed SS's offset ceiling — stop here rather
-                // than issue a request SS rejects with 400.
+            if offset + PAGE_SIZE >= SS_CITATIONS_OFFSET_LIMIT {
+                // Next page would hit SS's offset+limit ceiling — stop here
+                // rather than issue a request SS rejects with 400.
                 hit_limit = true;
                 break;
             }
@@ -997,14 +997,15 @@ mod tests {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        // Pages at offsets 0..=9000. Each returns 1000 edges but only 50 carry a
+        // Pages at offsets 0..=8000. Each returns 1000 edges but only 50 carry a
         // citingPaper (the rest are null and get filtered), so `entries` lags
         // `offset` — the real condition that walked the old code past Semantic
-        // Scholar's 10k offset ceiling into a 400. We deliberately do NOT mount
-        // offset=10000: if the loop requests it, the unmatched mock 404s and the
+        // Scholar's `offset+limit < 10000` ceiling into a 400. We deliberately do
+        // NOT mount offset=9000 (the first offset SS rejects): if the guard is
+        // too loose and the loop requests it, the unmatched mock 404s and the
         // call errors, failing this test.
         let server = MockServer::start().await;
-        for page in 0..=9u32 {
+        for page in 0..=8u32 {
             let offset = page * 1000;
             let mut data = String::from("[");
             for i in 0..1000u32 {
@@ -1046,11 +1047,42 @@ mod tests {
             .expect("must stop at SS offset ceiling, not request past it and 400");
 
         // Got results (didn't error), ranked by citation_count. The highest
-        // planted count is on the last fetched page (offset 9000 + 49).
+        // planted count is on the last fetched page (offset 8000 + 49).
         assert_eq!(resp.citations.len(), 10);
         assert_eq!(
             resp.citations.first().and_then(|c| c.citation_count),
-            Some(9049)
+            Some(8049)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live API — run with `cargo test -p paper -- --ignored citations_sort_live`"]
+    async fn citations_sort_live_high_citation_paper_no_400() {
+        // BERT (~80k citations) — exercises the deep-pagination path against the
+        // real SS offset ceiling. Regression guard for rc.343/rc.344: must not
+        // 400 past offset 8999, and results must be citation-count descending.
+        let provider = SemanticScholarProvider::new(&SemanticScholarConfig::default())
+            .expect("default config builds provider");
+        let resp = provider
+            .citations(
+                "10.18653/v1/N19-1423",
+                CitationsOpts {
+                    limit: Some(5),
+                    sort: Some("citations".to_string()),
+                    ..CitationsOpts::default()
+                },
+            )
+            .await
+            .expect("sort=citations on a high-citation paper must not 400");
+        assert!(!resp.citations.is_empty(), "expected citing papers");
+        let counts: Vec<u32> = resp
+            .citations
+            .iter()
+            .map(|c| c.citation_count.unwrap_or(0))
+            .collect();
+        assert!(
+            counts.windows(2).all(|w| w[0] >= w[1]),
+            "citations must be sorted descending by count: {counts:?}"
         );
     }
 
