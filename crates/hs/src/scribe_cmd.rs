@@ -323,23 +323,11 @@ pub(crate) fn classify_convert_failure(err: &anyhow::Error) -> ConvertClassifica
     }
 }
 
-/// One backend's HTTP client plus the operator-visible name from
-/// `ScribeConfig.servers[].backend`. Built once at startup so per-event
-/// dispatch isn't reconstructing reqwest clients.
-struct ChainEntry {
-    backend: String,
-    client: hs_scribe::client::ScribeClient,
-    /// Per-backend conversion concurrency cap. Sized from
-    /// `scribe.servers[].concurrency` so a heavy model (olmocr) is throttled
-    /// independently of a light one (glm). The handler holds a permit across
-    /// each backend's convert attempt.
-    sem: Arc<tokio::sync::Semaphore>,
-}
-
 pub(crate) async fn cmd_watch_events(
     server_override: Option<String>,
     _reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
+    use hs_common::service::pool::ServicePool;
     use hs_scribe::client::ScribeClient;
     use hs_scribe::config::ScribeConfig;
     use hs_scribe::event_watch::{convert_and_upload, run_subscriber};
@@ -349,81 +337,68 @@ pub(crate) async fn cmd_watch_events(
     let bus = cfg.build_event_bus().await?;
 
     let convert_timeout = std::time::Duration::from_secs(cfg.convert_timeout_secs);
-    // Build the chain in operator-specified order. CLI `--server` override
-    // collapses to a singleton chain with an unknown backend label —
-    // catalog will record `converted_by: "unknown"` so an operator can
-    // still tell at a glance that the chain was bypassed.
-    let chain: Vec<ChainEntry> = match server_override {
-        Some(url) => vec![ChainEntry {
-            backend: "unknown".to_string(),
-            client: ScribeClient::new_with_timeout(&url, convert_timeout)?,
-            // Manual single-backend override: one operator convert, modest cap.
-            sem: Arc::new(tokio::sync::Semaphore::new(4)),
-        }],
+    // Resolve the converter pool. CLI `--server` override collapses to a
+    // single-server pool labelled "unknown"; otherwise use the configured
+    // servers (or the local default). The watcher distributes WHOLE papers
+    // across the pool by least-loaded readiness — big and the Apple-Silicon
+    // hosts each convert different papers concurrently (rc.346: restored the
+    // ServicePool dispatch that the strict failover chain had replaced; that
+    // chain serialized every paper onto the first host). Per-host olmocr→glm
+    // escalation now lives inside each scribe server, so the watcher sends one
+    // host per paper and re-picks another only on a recoverable failure.
+    let labelled_servers: Vec<(String, String)> = match &server_override {
+        Some(url) => vec![(url.clone(), "unknown".to_string())],
         None if !cfg.servers.is_empty() => cfg
             .servers
             .iter()
-            .map(|e| {
-                Ok(ChainEntry {
-                    backend: e.backend.clone(),
-                    client: ScribeClient::new_with_timeout(&e.url, convert_timeout)?,
-                    sem: Arc::new(tokio::sync::Semaphore::new(e.concurrency.max(1))),
-                })
-            })
-            .collect::<Result<_>>()?,
-        None => vec![ChainEntry {
-            backend: "glm_ocr".to_string(),
-            client: ScribeClient::new_with_timeout(DEFAULT_SERVER, convert_timeout)?,
-            sem: Arc::new(tokio::sync::Semaphore::new(4)),
-        }],
+            .map(|e| (e.url.clone(), e.backend.clone()))
+            .collect(),
+        None => vec![(DEFAULT_SERVER.to_string(), "glm_ocr".to_string())],
     };
-    let chain = Arc::new(chain);
+    let backend_for_url: Arc<std::collections::HashMap<String, String>> =
+        Arc::new(labelled_servers.iter().cloned().collect());
+    let server_urls: Vec<String> = labelled_servers.iter().map(|(u, _)| u.clone()).collect();
+    let num_servers = server_urls.len();
+
+    let clients: Vec<ScribeClient> = server_urls
+        .iter()
+        .map(|url| ScribeClient::new_with_timeout(url, convert_timeout))
+        .collect::<Result<_>>()?;
+    let pool = Arc::new(ServicePool::new(clients));
     let timeout_policy = Arc::new(cfg.timeout_policy.clone());
 
-    let chain_summary: Vec<String> = chain
-        .iter()
-        .map(|e| {
-            format!(
-                "{}@{} (concurrency={})",
-                e.backend,
-                e.client.url(),
-                e.sem.available_permits()
-            )
-        })
-        .collect();
+    let storage_for_handler = storage.clone();
+    let bus_for_handler = bus.clone();
+    // Size the in-flight cap to the cluster's aggregate VLM-slot ceiling
+    // (sum of each host's advertised slots) so the watcher pipelines as many
+    // concurrent papers as the whole fleet can run — an RTX 3090 host plus
+    // Apple-Silicon hosts add up rather than capping at one host's worth.
+    // Falls back to servers*4 when readiness probes fail.
+    let concurrency = pool.probed_concurrency().await;
     tracing::info!(
-        chain = ?chain_summary,
+        servers = ?server_urls,
+        concurrency,
         convert_timeout_secs = cfg.convert_timeout_secs,
         base_secs = timeout_policy.base_secs,
         per_page_secs = timeout_policy.per_page_secs,
         floor_secs = timeout_policy.floor_secs,
         ceiling_secs = timeout_policy.ceiling_secs,
-        "starting event-bus watcher with {}-backend chain",
-        chain.len()
+        "starting event-bus watcher with least-loaded pool dispatch"
     );
-
-    let storage_for_handler = storage.clone();
-    let bus_for_handler = bus.clone();
-    // Chain processing is sequential per event; concurrency cap stays
-    // modest. The legacy `ServicePool::probed_concurrency` was sized for
-    // pool-wide fan-out which no longer matches the chain model — fall
-    // back to a fixed 8-in-flight cap so the watcher can still pipeline
-    // independent events through long chains without blowing up.
-    let concurrency = 8usize;
-    tracing::info!(concurrency, "scribe-watch consumer in-flight cap");
     run_subscriber(bus.clone(), storage.clone(), concurrency, move |event| {
         let storage = storage_for_handler.clone();
         let bus = bus_for_handler.clone();
-        let chain = chain.clone();
+        let pool = pool.clone();
+        let backend_for_url = backend_for_url.clone();
         let timeout_policy = timeout_policy.clone();
         async move {
-            // Walk the chain in order. On `Escalate` or `Transient`, log
-            // the attempt and continue to the next backend; the next
-            // backend may handle the content this one rejected. On
-            // `Permanent`, short-circuit immediately — the source is
-            // intrinsically unconvertable and no other backend will help.
-            // On success, the backend's own catalog stamp captures the
-            // chain context (converted_by + attempts_log).
+            // Dispatch by least-loaded host (the pool's readiness pick). On
+            // `Escalate` or `Transient`, log the attempt and re-pick another
+            // host — round-robin tie-breaking lands consecutive picks on
+            // different hosts, so this is real failover. On `Permanent`,
+            // short-circuit immediately — the source is intrinsically
+            // unconvertable and no other host will help. On success, the
+            // host's own catalog stamp captures converted_by + attempts_log.
             let mut attempts_log: Vec<hs_common::catalog::AttemptEntry> = Vec::new();
             let mut last_err: Option<hs_scribe::event_watch::HandlerError> = None;
 
@@ -440,31 +415,40 @@ pub(crate) async fn cmd_watch_events(
                     Err(e) => return Err(e),
                 };
 
-            for entry in chain.iter() {
+            for _ in 0..num_servers.max(1) {
+                // Pick the least-loaded ready host. `pick_server` polls if
+                // every host is saturated, so a busy pool parks here rather
+                // than NAKing. The PickGuard holds this host's client-side
+                // reservation for the convert and frees it at loop-end, so
+                // the next pick (this event's failover, or a concurrent
+                // event) sees accurate load.
+                let (client, _pick_guard) = match pool.pick_server().await {
+                    Ok(picked) => picked,
+                    Err(e) => {
+                        last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
+                        break;
+                    }
+                };
+                let url = client.url().to_string();
+                let backend = backend_for_url
+                    .get(&url)
+                    .cloned()
+                    .unwrap_or_else(|| "scribe".to_string());
                 tracing::info!(
-                    server = %entry.client.url(),
-                    backend = %entry.backend,
+                    server = %url,
+                    backend = %backend,
                     key = %event.key,
-                    chain_pos = attempts_log.len() + 1,
-                    "chain attempt"
+                    attempt = attempts_log.len() + 1,
+                    "pool dispatch (least-loaded)"
                 );
-                // Per-backend concurrency cap: hold a permit for THIS backend
-                // across its convert attempt (released on escalation or return).
-                // Sized from `scribe.servers[].concurrency` so a heavy model
-                // (olmocr) is throttled to a few while a light one (glm) runs
-                // more — instead of one global cap fanning out onto olmocr.
-                let _permit = Arc::clone(&entry.sem)
-                    .acquire_owned()
-                    .await
-                    .expect("scribe chain concurrency semaphore is never closed");
                 let result = convert_and_upload(
                     storage.as_ref(),
-                    &entry.client,
+                    client,
                     bus.as_ref(),
                     &event,
                     timeout_policy.as_ref(),
                     &source,
-                    Some(entry.backend.clone()),
+                    Some(backend.clone()),
                     attempts_log.clone(),
                 )
                 .await;
@@ -480,7 +464,7 @@ pub(crate) async fn cmd_watch_events(
                             ConvertClassification::Escalate(_) => "escalate",
                         };
                         attempts_log.push(hs_common::catalog::AttemptEntry {
-                            backend: entry.backend.clone(),
+                            backend: backend.clone(),
                             outcome: outcome.to_string(),
                             reason: Some(reason.clone()),
                             at: now,
@@ -488,10 +472,10 @@ pub(crate) async fn cmd_watch_events(
                         match classification {
                             ConvertClassification::Permanent(_) => {
                                 tracing::warn!(
-                                    backend = %entry.backend,
+                                    backend = %backend,
                                     key = %event.key,
                                     reason = %reason,
-                                    "chain short-circuit: permanent failure"
+                                    "pool dispatch: permanent failure — no host will help"
                                 );
                                 if let Some(stem) = stem_from_event_key(&event.key) {
                                     if let Err(stamp_err) =
@@ -516,43 +500,42 @@ pub(crate) async fn cmd_watch_events(
                             }
                             ConvertClassification::Escalate(_) => {
                                 tracing::info!(
-                                    backend = %entry.backend,
+                                    backend = %backend,
                                     key = %event.key,
                                     reason = %reason,
-                                    "chain escalating to next backend"
+                                    "pool dispatch: host escalated — re-picking another host"
                                 );
                                 last_err = Some(hs_scribe::event_watch::HandlerError::Permanent(e));
                             }
                         }
                     }
                     Err(hs_scribe::event_watch::HandlerError::Transient(e)) => {
-                        // Transient failures on this backend (network
-                        // flake, scribe 5xx) — try the next backend
-                        // before NAKing the event back to JetStream.
-                        // Different backend = different process =
-                        // different network path, so it may not share
-                        // the transient condition.
+                        // Transient failure on this host (network flake,
+                        // scribe 5xx) — re-pick another host before NAKing
+                        // the event back to JetStream. A different host is a
+                        // different process on a different network path, so
+                        // it may not share the transient condition.
                         attempts_log.push(hs_common::catalog::AttemptEntry {
-                            backend: entry.backend.clone(),
+                            backend: backend.clone(),
                             outcome: "transient".to_string(),
                             reason: Some(format!("{e:#}")),
                             at: now,
                         });
                         tracing::warn!(
-                            backend = %entry.backend,
+                            backend = %backend,
                             key = %event.key,
                             error = %e,
-                            "chain transient: trying next backend"
+                            "pool dispatch: transient — re-picking another host"
                         );
                         last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
                     }
                 }
             }
 
-            // Chain exhausted. Whatever the last error was, surface it
-            // — `last_err` is `Some` because the loop ran at least once
-            // (the chain is non-empty by construction). If the last
-            // surviving error was Permanent, stamp it; if it was
+            // Pool exhausted (every host tried). Whatever the last error
+            // was, surface it — `last_err` is `Some` because the loop ran
+            // at least once (the pool is non-empty by construction). If the
+            // last surviving error was Permanent, stamp it; if it was
             // Transient, NAK and let JetStream redeliver.
             match last_err {
                 Some(hs_scribe::event_watch::HandlerError::Permanent(e)) => {
@@ -571,7 +554,7 @@ pub(crate) async fn cmd_watch_events(
                                 stem = %stem,
                                 reason = %reason,
                                 error = %stamp_err,
-                                "failed to stamp chain-exhausted conversion_failed"
+                                "failed to stamp pool-exhausted conversion_failed"
                             );
                         }
                     }
@@ -579,7 +562,7 @@ pub(crate) async fn cmd_watch_events(
                 }
                 Some(e) => Err(e),
                 None => Err(hs_scribe::event_watch::HandlerError::Transient(
-                    anyhow::anyhow!("chain was empty"),
+                    anyhow::anyhow!("scribe pool was empty"),
                 )),
             }
         }
