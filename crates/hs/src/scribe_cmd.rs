@@ -323,6 +323,23 @@ pub(crate) fn classify_convert_failure(err: &anyhow::Error) -> ConvertClassifica
     }
 }
 
+/// Distinct backend names from the configured server list, in config order
+/// of first appearance. This is the escalation chain order: the dispatcher
+/// tries a paper on tier `[0]`'s backend first and falls through to `[1]`,
+/// `[2]`, … on a VLM-class `Escalate`. Duplicates collapse so N same-backend
+/// hosts form ONE tier (least-loaded within it), not N chain steps — the
+/// pre-rc.346 flat chain treated every host as its own step and serialized
+/// papers onto the first one.
+pub(crate) fn backend_tier_order(labelled_servers: &[(String, String)]) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for (_, backend) in labelled_servers {
+        if !order.iter().any(|b| b == backend) {
+            order.push(backend.clone());
+        }
+    }
+    order
+}
+
 pub(crate) async fn cmd_watch_events(
     server_override: Option<String>,
     _reporter: &Arc<dyn Reporter>,
@@ -355,49 +372,71 @@ pub(crate) async fn cmd_watch_events(
             .collect(),
         None => vec![(DEFAULT_SERVER.to_string(), "glm_ocr".to_string())],
     };
-    let backend_for_url: Arc<std::collections::HashMap<String, String>> =
-        Arc::new(labelled_servers.iter().cloned().collect());
-    let server_urls: Vec<String> = labelled_servers.iter().map(|(u, _)| u.clone()).collect();
-    let num_servers = server_urls.len();
-
-    let clients: Vec<ScribeClient> = server_urls
-        .iter()
-        .map(|url| ScribeClient::new_with_timeout(url, convert_timeout))
-        .collect::<Result<_>>()?;
-    let pool = Arc::new(ServicePool::new(clients));
+    // Group servers into backend TIERS, preserving config order of first
+    // appearance (e.g. `[olmocr, glm_ocr]`). Dispatch walks tiers
+    // top-to-bottom: a paper is first tried on the primary backend's tier,
+    // and a VLM-class failure (`Escalate`, e.g. `olmocr_zero_pages`) falls
+    // through to the NEXT tier. WITHIN a tier, `pick_server` distributes
+    // whole papers across that tier's hosts by least-loaded readiness.
+    //
+    // rc.346 collapsed every server into ONE backend-blind pool: that
+    // restored per-paper distribution but LOST the backend chain, because
+    // the pool re-picks purely by free-slot count. With big (olmocr, 12
+    // slots) outnumbering bmb (glm_ocr, 6 slots), every escalation re-picked
+    // big/olmocr again — scans olmocr can't render permanently failed and
+    // the glm-only host (bmb, which cannot run olmocr at all) was never
+    // dispatched to. Tiering keeps rc.346's intra-tier least-loaded while
+    // restoring the config.rs-documented top-to-bottom backend escalation.
+    let tier_order = backend_tier_order(&labelled_servers);
+    let mut built_tiers: Vec<(String, ServicePool<ScribeClient>)> =
+        Vec::with_capacity(tier_order.len());
+    for backend in &tier_order {
+        let clients: Vec<ScribeClient> = labelled_servers
+            .iter()
+            .filter(|(_, b)| b == backend)
+            .map(|(url, _)| ScribeClient::new_with_timeout(url, convert_timeout))
+            .collect::<Result<_>>()?;
+        built_tiers.push((backend.clone(), ServicePool::new(clients)));
+    }
+    let tiers = Arc::new(built_tiers);
     let timeout_policy = Arc::new(cfg.timeout_policy.clone());
 
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
     // Size the in-flight cap to the cluster's aggregate VLM-slot ceiling
-    // (sum of each host's advertised slots) so the watcher pipelines as many
-    // concurrent papers as the whole fleet can run — an RTX 3090 host plus
-    // Apple-Silicon hosts add up rather than capping at one host's worth.
-    // Falls back to servers*4 when readiness probes fail.
-    let concurrency = pool.probed_concurrency().await;
+    // (sum of every tier's hosts' advertised slots) so the watcher pipelines
+    // as many concurrent papers as the whole fleet can run — an RTX 3090
+    // host plus Apple-Silicon hosts add up rather than capping at one host's
+    // worth. Each tier falls back to hosts*4 when its readiness probes fail.
+    let mut concurrency = 0usize;
+    for (_, pool) in tiers.iter() {
+        concurrency += pool.probed_concurrency().await;
+    }
+    let concurrency = concurrency.max(1);
     tracing::info!(
-        servers = ?server_urls,
+        tiers = ?tier_order,
+        servers = ?labelled_servers.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
         concurrency,
         convert_timeout_secs = cfg.convert_timeout_secs,
         base_secs = timeout_policy.base_secs,
         per_page_secs = timeout_policy.per_page_secs,
         floor_secs = timeout_policy.floor_secs,
         ceiling_secs = timeout_policy.ceiling_secs,
-        "starting event-bus watcher with least-loaded pool dispatch"
+        "starting event-bus watcher with tiered least-loaded pool dispatch"
     );
     run_subscriber(bus.clone(), storage.clone(), concurrency, move |event| {
         let storage = storage_for_handler.clone();
         let bus = bus_for_handler.clone();
-        let pool = pool.clone();
-        let backend_for_url = backend_for_url.clone();
+        let tiers = tiers.clone();
         let timeout_policy = timeout_policy.clone();
         async move {
-            // Dispatch by least-loaded host (the pool's readiness pick). On
-            // `Escalate` or `Transient`, log the attempt and re-pick another
-            // host — round-robin tie-breaking lands consecutive picks on
-            // different hosts, so this is real failover. On `Permanent`,
+            // Dispatch through the backend tiers in order. The first tier
+            // (primary backend) gets the paper via its own least-loaded pick.
+            // On `Escalate` or `Transient`, fall through to the NEXT tier —
+            // a genuinely different backend on a different host, so this is
+            // real failover (olmocr scan-fail → glm). On `Permanent`,
             // short-circuit immediately — the source is intrinsically
-            // unconvertable and no other host will help. On success, the
+            // unconvertable and no other backend will help. On success, the
             // host's own catalog stamp captures converted_by + attempts_log.
             let mut attempts_log: Vec<hs_common::catalog::AttemptEntry> = Vec::new();
             let mut last_err: Option<hs_scribe::event_watch::HandlerError> = None;
@@ -415,31 +454,29 @@ pub(crate) async fn cmd_watch_events(
                     Err(e) => return Err(e),
                 };
 
-            for _ in 0..num_servers.max(1) {
-                // Pick the least-loaded ready host. `pick_server` polls if
-                // every host is saturated, so a busy pool parks here rather
-                // than NAKing. The PickGuard holds this host's client-side
-                // reservation for the convert and frees it at loop-end, so
-                // the next pick (this event's failover, or a concurrent
-                // event) sees accurate load.
+            for (backend, pool) in tiers.iter() {
+                // Least-loaded pick WITHIN this backend tier. `pick_server`
+                // polls if the tier is saturated, so a busy tier parks here
+                // rather than NAKing. The PickGuard holds this host's
+                // client-side reservation for the convert and frees it at
+                // loop-end, so the next pick (a concurrent event, or this
+                // event's next tier) sees accurate load. A tier with no ready
+                // host records a transient error and falls through to the
+                // next tier rather than aborting the whole chain.
                 let (client, _pick_guard) = match pool.pick_server().await {
                     Ok(picked) => picked,
                     Err(e) => {
                         last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
-                        break;
+                        continue;
                     }
                 };
                 let url = client.url().to_string();
-                let backend = backend_for_url
-                    .get(&url)
-                    .cloned()
-                    .unwrap_or_else(|| "scribe".to_string());
                 tracing::info!(
                     server = %url,
                     backend = %backend,
                     key = %event.key,
                     attempt = attempts_log.len() + 1,
-                    "pool dispatch (least-loaded)"
+                    "pool dispatch (tiered least-loaded)"
                 );
                 let result = convert_and_upload(
                     storage.as_ref(),
@@ -503,7 +540,7 @@ pub(crate) async fn cmd_watch_events(
                                     backend = %backend,
                                     key = %event.key,
                                     reason = %reason,
-                                    "pool dispatch: host escalated — re-picking another host"
+                                    "pool dispatch: backend escalated — falling through to next tier"
                                 );
                                 last_err = Some(hs_scribe::event_watch::HandlerError::Permanent(e));
                             }
@@ -511,10 +548,12 @@ pub(crate) async fn cmd_watch_events(
                     }
                     Err(hs_scribe::event_watch::HandlerError::Transient(e)) => {
                         // Transient failure on this host (network flake,
-                        // scribe 5xx) — re-pick another host before NAKing
-                        // the event back to JetStream. A different host is a
-                        // different process on a different network path, so
-                        // it may not share the transient condition.
+                        // scribe 5xx) — fall through to the next backend tier
+                        // before NAKing the event back to JetStream. The next
+                        // tier is a different process on a different host and
+                        // network path, so it may not share the transient
+                        // condition; if every tier is exhausted the event is
+                        // NAKed and JetStream redelivers the whole chain.
                         attempts_log.push(hs_common::catalog::AttemptEntry {
                             backend: backend.clone(),
                             outcome: "transient".to_string(),
@@ -525,7 +564,7 @@ pub(crate) async fn cmd_watch_events(
                             backend = %backend,
                             key = %event.key,
                             error = %e,
-                            "pool dispatch: transient — re-picking another host"
+                            "pool dispatch: transient — falling through to next tier"
                         );
                         last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
                     }
@@ -936,6 +975,48 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
 }
 
 // ── Clean junk HTML papers ────────────────────────────────────
+
+#[cfg(test)]
+mod backend_tier_tests {
+    use super::backend_tier_order;
+
+    fn s(url: &str, backend: &str) -> (String, String) {
+        (url.to_string(), backend.to_string())
+    }
+
+    #[test]
+    fn tiers_preserve_config_order_of_first_appearance() {
+        // olmocr listed first → it is tier 0 (primary); glm_ocr tier 1.
+        // This is the escalation direction: olmocr_zero_pages falls through
+        // to glm, never the reverse.
+        let servers = vec![
+            s("http://big:7435", "olmocr"),
+            s("http://bmb:7433", "glm_ocr"),
+        ];
+        assert_eq!(backend_tier_order(&servers), vec!["olmocr", "glm_ocr"]);
+    }
+
+    #[test]
+    fn multiple_hosts_same_backend_collapse_to_one_tier() {
+        // Two olmocr hosts must form ONE tier (least-loaded within it), not
+        // two chain steps — otherwise escalation would "advance" from one
+        // olmocr host to another olmocr host and never reach glm, which is
+        // exactly the rc.346 regression this restores the fix for.
+        let servers = vec![
+            s("http://big:7435", "olmocr"),
+            s("http://big2:7435", "olmocr"),
+            s("http://bmb:7433", "glm_ocr"),
+        ];
+        assert_eq!(backend_tier_order(&servers), vec!["olmocr", "glm_ocr"]);
+    }
+
+    #[test]
+    fn single_server_override_is_one_tier() {
+        // `--server` override collapses to a single "unknown"-backend tier.
+        let servers = vec![s("http://host:7433", "unknown")];
+        assert_eq!(backend_tier_order(&servers), vec!["unknown"]);
+    }
+}
 
 #[cfg(test)]
 mod classify_convert_failure_tests {
