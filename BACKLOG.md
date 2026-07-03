@@ -131,13 +131,6 @@ Security and documentation stories are intentionally excluded.
 
 ## P1 — Reliability (panics and silent failures in hot paths)
 
-### P1-0. Honor per-backend `concurrency` cap in the scribe watcher pool (rc.347 follow-up)
-**Motivation:** `ScribeServerEntry.concurrency` (config `scribe.servers[].concurrency`, `big`'s olmocr set to `2` to "keep big responsive") is **dead config** — the rc.346+ watcher sizes its in-flight semaphore from each host's *advertised VLM slot count* (`probed_concurrency`, big advertises 12), ignoring the config cap. Result: under a burst (e.g. `hs pipeline reconvert-failed`), big runs up to 12 concurrent olmocr subprocesses (vLLM + per-convert CLI page rasterization), thrashes RAM/VRAM, and olmocr emits **false `olmocr_zero_pages` / `workspace/markdown does not exist`** failures. Confirmed rc.347: papers that failed `olmocr_zero_pages` 4× under load (`10.48550_arXiv.2410.15608`) convert **cleanly on olmocr when run alone**. rc.347's backend-tier escalation masks the symptom (thrash-failures now escalate to bmb's glm instead of permanent-failing) but at the cost of routing olmocr-capable papers to a lower-quality backend and burning a bmb slot. ONE PATH: the documented `concurrency` field must actually cap dispatch.
-**Scope:**
-- `crates/hs/src/scribe_cmd.rs` `cmd_watch_events` — tier pools currently use `probed_concurrency()` (advertised slots). Cap each tier's effective in-flight to the **sum of that tier's entries' config `concurrency`**, not the advertised slot count. Likely a per-tier `tokio::sync::Semaphore` acquired before `pick_server`.
-- `hs-common/src/service/pool.rs` — `probed_concurrency` / `concurrency` are the wrong ceiling for a capped backend; decide whether the cap lives in the pool or the caller.
-**Acceptance:** with `big` olmocr `concurrency: 2`, a burst of N papers shows at most 2 concurrent olmocr converts on big (`journalctl` dispatch density / `nvidia-smi` subprocess count), and `olmocr_zero_pages` rate drops to genuine-incompatible papers only.
-
 ### P1-1. Replace mutex-unwrap with error propagation
 **Motivation:** Poisoned-mutex panics cascade in long-running processes.
 **Scope:**

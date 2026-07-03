@@ -330,14 +330,31 @@ pub(crate) fn classify_convert_failure(err: &anyhow::Error) -> ConvertClassifica
 /// hosts form ONE tier (least-loaded within it), not N chain steps — the
 /// pre-rc.346 flat chain treated every host as its own step and serialized
 /// papers onto the first one.
-pub(crate) fn backend_tier_order(labelled_servers: &[(String, String)]) -> Vec<String> {
+pub(crate) fn backend_tier_order(labelled_servers: &[(String, String, usize)]) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
-    for (_, backend) in labelled_servers {
+    for (_, backend, _) in labelled_servers {
         if !order.iter().any(|b| b == backend) {
             order.push(backend.clone());
         }
     }
     order
+}
+
+/// Per-backend concurrency ceiling: the sum of the configured `concurrency`
+/// of every server entry on that backend, floored at 1. This — NOT the hosts'
+/// advertised VLM slot counts — is the tier's dispatch cap, so a heavy model
+/// (olmocr) honors its config `concurrency: 2` instead of fanning out to the
+/// advertised 12 slots and thrashing the host into false `olmocr_zero_pages`.
+pub(crate) fn backend_tier_cap(
+    labelled_servers: &[(String, String, usize)],
+    backend: &str,
+) -> usize {
+    labelled_servers
+        .iter()
+        .filter(|(_, b, _)| b == backend)
+        .map(|(_, _, c)| *c)
+        .sum::<usize>()
+        .max(1)
 }
 
 pub(crate) async fn cmd_watch_events(
@@ -354,30 +371,32 @@ pub(crate) async fn cmd_watch_events(
     let bus = cfg.build_event_bus().await?;
 
     let convert_timeout = std::time::Duration::from_secs(cfg.convert_timeout_secs);
-    // Resolve the converter pool. CLI `--server` override collapses to a
-    // single-server pool labelled "unknown"; otherwise use the configured
-    // servers (or the local default). The watcher distributes WHOLE papers
-    // across the pool by least-loaded readiness — big and the Apple-Silicon
-    // hosts each convert different papers concurrently (rc.346: restored the
-    // ServicePool dispatch that the strict failover chain had replaced; that
-    // chain serialized every paper onto the first host). Per-host olmocr→glm
-    // escalation now lives inside each scribe server, so the watcher sends one
-    // host per paper and re-picks another only on a recoverable failure.
-    let labelled_servers: Vec<(String, String)> = match &server_override {
-        Some(url) => vec![(url.clone(), "unknown".to_string())],
+    // Resolve the converter servers. CLI `--server` override collapses to a
+    // single "unknown"-backend entry; otherwise use the configured servers
+    // (or the local default). Each entry carries its per-backend `concurrency`
+    // cap (config `scribe.servers[].concurrency`); it becomes the tier's
+    // dispatch ceiling below.
+    const DEFAULT_TIER_CONCURRENCY: usize = 4; // matches config.rs default_concurrency()
+    let labelled_servers: Vec<(String, String, usize)> = match &server_override {
+        Some(url) => vec![(url.clone(), "unknown".to_string(), DEFAULT_TIER_CONCURRENCY)],
         None if !cfg.servers.is_empty() => cfg
             .servers
             .iter()
-            .map(|e| (e.url.clone(), e.backend.clone()))
+            .map(|e| (e.url.clone(), e.backend.clone(), e.concurrency))
             .collect(),
-        None => vec![(DEFAULT_SERVER.to_string(), "glm_ocr".to_string())],
+        None => vec![(
+            DEFAULT_SERVER.to_string(),
+            "glm_ocr".to_string(),
+            DEFAULT_TIER_CONCURRENCY,
+        )],
     };
     // Group servers into backend TIERS, preserving config order of first
     // appearance (e.g. `[olmocr, glm_ocr]`). Dispatch walks tiers
     // top-to-bottom: a paper is first tried on the primary backend's tier,
     // and a VLM-class failure (`Escalate`, e.g. `olmocr_zero_pages`) falls
     // through to the NEXT tier. WITHIN a tier, `pick_server` distributes
-    // whole papers across that tier's hosts by least-loaded readiness.
+    // whole papers across that tier's hosts by least-loaded readiness, and a
+    // per-tier semaphore caps how many convert AT ONCE.
     //
     // rc.346 collapsed every server into ONE backend-blind pool: that
     // restored per-paper distribution but LOST the backend chain, because
@@ -388,34 +407,40 @@ pub(crate) async fn cmd_watch_events(
     // dispatched to. Tiering keeps rc.346's intra-tier least-loaded while
     // restoring the config.rs-documented top-to-bottom backend escalation.
     let tier_order = backend_tier_order(&labelled_servers);
-    let mut built_tiers: Vec<(String, ServicePool<ScribeClient>)> =
-        Vec::with_capacity(tier_order.len());
+    let mut built_tiers: Vec<(
+        String,
+        ServicePool<ScribeClient>,
+        Arc<tokio::sync::Semaphore>,
+    )> = Vec::with_capacity(tier_order.len());
+    let mut total_cap = 0usize;
     for backend in &tier_order {
         let clients: Vec<ScribeClient> = labelled_servers
             .iter()
-            .filter(|(_, b)| b == backend)
-            .map(|(url, _)| ScribeClient::new_with_timeout(url, convert_timeout))
+            .filter(|(_, b, _)| b == backend)
+            .map(|(url, _, _)| ScribeClient::new_with_timeout(url, convert_timeout))
             .collect::<Result<_>>()?;
-        built_tiers.push((backend.clone(), ServicePool::new(clients)));
+        let cap = backend_tier_cap(&labelled_servers, backend);
+        total_cap += cap;
+        built_tiers.push((
+            backend.clone(),
+            ServicePool::new(clients),
+            Arc::new(tokio::sync::Semaphore::new(cap)),
+        ));
     }
     let tiers = Arc::new(built_tiers);
     let timeout_policy = Arc::new(cfg.timeout_policy.clone());
 
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
-    // Size the in-flight cap to the cluster's aggregate VLM-slot ceiling
-    // (sum of every tier's hosts' advertised slots) so the watcher pipelines
-    // as many concurrent papers as the whole fleet can run — an RTX 3090
-    // host plus Apple-Silicon hosts add up rather than capping at one host's
-    // worth. Each tier falls back to hosts*4 when its readiness probes fail.
-    let mut concurrency = 0usize;
-    for (_, pool) in tiers.iter() {
-        concurrency += pool.probed_concurrency().await;
-    }
-    let concurrency = concurrency.max(1);
+    // Global admission cap = sum of the per-tier concurrency caps, so the
+    // watcher admits exactly as many concurrent papers as the tiers can
+    // actually run. The per-tier semaphores enforce the per-backend split;
+    // this bounds total in-flight handlers so a large JetStream backlog can't
+    // spawn unbounded tasks all parked on a tier semaphore.
+    let concurrency = total_cap.max(1);
     tracing::info!(
         tiers = ?tier_order,
-        servers = ?labelled_servers.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
+        servers = ?labelled_servers.iter().map(|(u, _, _)| u.clone()).collect::<Vec<_>>(),
         concurrency,
         convert_timeout_secs = cfg.convert_timeout_secs,
         base_secs = timeout_policy.base_secs,
@@ -454,7 +479,25 @@ pub(crate) async fn cmd_watch_events(
                     Err(e) => return Err(e),
                 };
 
-            for (backend, pool) in tiers.iter() {
+            for (backend, pool, tier_sem) in tiers.iter() {
+                // Acquire this backend's concurrency permit BEFORE picking a
+                // host — this caps how many converts the tier runs at once
+                // (config `concurrency`), so a heavy model can't fan out to
+                // the host's full advertised slot count and thrash it. Held
+                // across the convert, released when the permit drops at the
+                // end of this loop iteration (so the next tier / next event
+                // sees a freed slot). The semaphore is never closed, so
+                // `acquire` only errors on a closed semaphore — treat that as
+                // transient and fall through.
+                let _tier_permit = match tier_sem.acquire().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        last_err = Some(hs_scribe::event_watch::HandlerError::Transient(
+                            anyhow::anyhow!("tier semaphore closed: {e}"),
+                        ));
+                        continue;
+                    }
+                };
                 // Least-loaded pick WITHIN this backend tier. `pick_server`
                 // polls if the tier is saturated, so a busy tier parks here
                 // rather than NAKing. The PickGuard holds this host's
@@ -978,10 +1021,10 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
 
 #[cfg(test)]
 mod backend_tier_tests {
-    use super::backend_tier_order;
+    use super::{backend_tier_cap, backend_tier_order};
 
-    fn s(url: &str, backend: &str) -> (String, String) {
-        (url.to_string(), backend.to_string())
+    fn s(url: &str, backend: &str, concurrency: usize) -> (String, String, usize) {
+        (url.to_string(), backend.to_string(), concurrency)
     }
 
     #[test]
@@ -990,8 +1033,8 @@ mod backend_tier_tests {
         // This is the escalation direction: olmocr_zero_pages falls through
         // to glm, never the reverse.
         let servers = vec![
-            s("http://big:7435", "olmocr"),
-            s("http://bmb:7433", "glm_ocr"),
+            s("http://big:7435", "olmocr", 2),
+            s("http://bmb:7433", "glm_ocr", 4),
         ];
         assert_eq!(backend_tier_order(&servers), vec!["olmocr", "glm_ocr"]);
     }
@@ -1001,11 +1044,12 @@ mod backend_tier_tests {
         // Two olmocr hosts must form ONE tier (least-loaded within it), not
         // two chain steps — otherwise escalation would "advance" from one
         // olmocr host to another olmocr host and never reach glm, which is
-        // exactly the rc.346 regression this restores the fix for.
+        // exactly the rc.346 regression this restores the fix for. Their
+        // per-host concurrency caps sum into the one tier's ceiling.
         let servers = vec![
-            s("http://big:7435", "olmocr"),
-            s("http://big2:7435", "olmocr"),
-            s("http://bmb:7433", "glm_ocr"),
+            s("http://big:7435", "olmocr", 2),
+            s("http://big2:7435", "olmocr", 2),
+            s("http://bmb:7433", "glm_ocr", 4),
         ];
         assert_eq!(backend_tier_order(&servers), vec!["olmocr", "glm_ocr"]);
     }
@@ -1013,8 +1057,42 @@ mod backend_tier_tests {
     #[test]
     fn single_server_override_is_one_tier() {
         // `--server` override collapses to a single "unknown"-backend tier.
-        let servers = vec![s("http://host:7433", "unknown")];
+        let servers = vec![s("http://host:7433", "unknown", 4)];
         assert_eq!(backend_tier_order(&servers), vec!["unknown"]);
+    }
+
+    #[test]
+    fn tier_cap_is_config_concurrency_not_advertised_slots() {
+        // big olmocr is capped at 2 even though the host advertises 12 VLM
+        // slots — the config cap is the dispatch ceiling, which is the whole
+        // point of P1-0. glm (bmb) caps at 4.
+        let servers = vec![
+            s("http://big:7435", "olmocr", 2),
+            s("http://bmb:7433", "glm_ocr", 4),
+        ];
+        assert_eq!(backend_tier_cap(&servers, "olmocr"), 2);
+        assert_eq!(backend_tier_cap(&servers, "glm_ocr"), 4);
+    }
+
+    #[test]
+    fn tier_cap_sums_hosts_on_the_same_backend() {
+        // Two olmocr hosts at 2 each → tier ceiling 4 (least-loaded within).
+        let servers = vec![
+            s("http://big:7435", "olmocr", 2),
+            s("http://big2:7435", "olmocr", 2),
+            s("http://bmb:7433", "glm_ocr", 4),
+        ];
+        assert_eq!(backend_tier_cap(&servers, "olmocr"), 4);
+    }
+
+    #[test]
+    fn tier_cap_floors_at_one() {
+        // A zero-concurrency entry (or unknown backend) must never yield a
+        // 0-permit semaphore, which would deadlock every dispatch on that
+        // tier. Floor at 1.
+        let servers = vec![s("http://x:7433", "olmocr", 0)];
+        assert_eq!(backend_tier_cap(&servers, "olmocr"), 1);
+        assert_eq!(backend_tier_cap(&servers, "glm_ocr"), 1);
     }
 }
 
