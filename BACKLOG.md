@@ -131,6 +131,42 @@ Security and documentation stories are intentionally excluded.
 
 ## P1 — Reliability (panics and silent failures in hot paths)
 
+### P1-0. distill server embeds 0 chunks for some glm_ocr docs whose markdown chunks fine locally
+**Motivation:** Discovered 2026-07-05 ingesting Game AI Pro 2. Three chapters
+(`GameAIPro2_Chapter11_Smart_Zones...`, `..._Chapter39_Analytics-Based_AI...`,
+`..._Chapter40_Procedural_Content_Generation...`) are stamped
+`embedding_skip: zero_chunks_or_empty` despite having complete, high-quality
+markdown in storage (Ch39: 61 658 B / 9 051 words, `converted_by: glm_ocr`,
+`markdown_path` correct). `hs distill diagnose <stem>` reads that same storage
+markdown and reports **20/18/9 chunks, all accepted, 0 rejected** — but the
+distill **server** path (`distill_index` / `distill_reindex` MCP, and the
+original event-driven embed) returns `chunks_indexed: 0, old_vectors_purged: 0`
+and re-stamps `zero_chunks_or_empty`. A known-good control (`..._Chapter08...`,
+olmocr) reindexes correctly (purged 10, indexed 10) against the *same* server,
+so the server/embedder is healthy and the bug is **doc-specific**. Common factor
+of the failing set: `converted_by: glm_ocr`. So the CLI-side chunker (diagnose)
+and the server-side chunk/embed path diverge on specific glm_ocr markdown — one
+sees 20 chunks, the other sees 0. This silently drops real documents from search
+and likely accounts for a slice of the corpus-wide `embedding_skipped: 466`.
+**Scope:**
+- `crates/hs-distill/src/pipeline.rs` (server read→chunk→embed path)
+- `crates/hs-distill/src/event_watch.rs` (`zero_chunks_or_empty` stamp site)
+- Whatever markdown-read the server uses on reindex vs. what `hs distill diagnose`
+  uses in `crates/hs/src/distill_cmd.rs::cmd_diagnose` — reconcile the two so they
+  read + chunk identically. Suspect: server reconstructs from catalog `pages`
+  offsets or applies a different pre-chunk normalization than diagnose's raw read.
+**Change:** Make the server reindex path produce exactly what `diagnose` produces
+for the same stem (single source of truth for markdown-read + chunk). Fail loudly
+if a doc that diagnose says yields N>0 chunks embeds 0 — do not silently stamp
+`zero_chunks_or_empty` when the chunker would accept chunks.
+**Acceptance:**
+- `distill_reindex` on the three stems above indexes 20/18/9 chunks (matching
+  `hs distill diagnose`), and they become searchable via `distill_search`.
+- A regression test embeds a known glm_ocr markdown fixture and asserts
+  `chunks_indexed == diagnose chunk count`.
+- Sweep `embedding_skipped` for other docs whose `diagnose` yields >0 chunks and
+  re-embed them.
+
 ### P1-1. Replace mutex-unwrap with error propagation
 **Motivation:** Poisoned-mutex panics cascade in long-running processes.
 **Scope:**
