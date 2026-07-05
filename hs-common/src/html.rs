@@ -13,14 +13,44 @@ pub fn looks_like_html(header: &[u8]) -> bool {
     s.contains("<!doctype html") || s.contains("<html") || s.contains("<head")
 }
 
+/// True if `needle` occurs in `haystack` bounded by a non-alphanumeric char
+/// (or a string edge) on both sides — i.e. as a standalone phrase, not as a
+/// substring of a longer word. Guards short login phrases like "sign in" from
+/// false-matching inside legitimate prose ("rendering system design in pbrt",
+/// "we assign in the loop", "log into" narration).
+fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = start == 0
+            || !haystack[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let after_ok = end >= haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// True when `content` looks like a paywall / error / landing page
 /// rather than real article content.
 pub fn is_paywall_html(content: &str) -> bool {
     let lower = content.to_lowercase();
 
-    // Paywall indicators
-    let has_login = lower.contains("sign in")
-        || lower.contains("log in")
+    // Paywall indicators. "sign in" / "log in" are short enough to appear as
+    // substrings of ordinary words ("de[sign in]g", "cata[log in]g"), so they
+    // require word boundaries; the longer phrases are specific enough as-is.
+    let has_login = contains_word_bounded(&lower, "sign in")
+        || contains_word_bounded(&lower, "log in")
         || lower.contains("access denied")
         || lower.contains("403 forbidden")
         || lower.contains("subscription required")
@@ -240,6 +270,25 @@ mod tests {
     fn detects_login_wall() {
         let html = "<html><body>Please sign in to access this article.</body></html>";
         assert!(is_paywall_html(html));
+    }
+
+    #[test]
+    fn login_phrase_inside_word_is_not_a_paywall() {
+        // "sign in" as a substring of "design in" / "log in" inside
+        // "cataloging in" must NOT trip the login heuristic. Regression for a
+        // legit short book chapter (PBR3 "Retrospective") that was rejected as
+        // `paywall_html` because "rendering system design in pbrt" contains
+        // the substring "sign in".
+        let body: String = std::iter::repeat_n(
+            "pbrt represents one point in the space of rendering system design \
+             in practice, and cataloging in detail how we assign in the loop \
+             lets designers reason about tradeoffs. ",
+            8,
+        )
+        .collect();
+        let html = format!("<html><body><p>{body}</p></body></html>");
+        assert!(html.len() < 100_000 && !html.contains("<article"));
+        assert!(!is_paywall_html(&html));
     }
 
     #[test]
