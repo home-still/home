@@ -479,23 +479,78 @@ rename the markdown object, rewrite the catalog row's stem key, `hs distill purg
 The inventory lists 1 URL-encoded pair. The real duplication is larger and
 systematic.
 
-### 10a. Case-collision pairs — 42 groups, 84 documents, 3.3 MB redundant
+### 10a. Case-collision pairs — FIXED
 
-Stems differing **only in case**, both fully indexed, both returned by search:
+**42 groups / 84 documents / 3.3 MB redundant, plus 734 latent. All resolved.**
+
+Stems differing **only in case**, both fully indexed, both returned by one query:
 
 ```
 10.48550_arxiv.2410.07095   ↔  10.48550_arXiv.2410.07095
-10.48550_arxiv.2212.04356   ↔  10.48550_arXiv.2212.04356
 10.1016_j.paid.2019.06.030  ↔  10.1016_J.PAID.2019.06.030
 10.1109_TRO.2024.3386370    ↔  10.1109_tro.2024.3386370
 10.1037_0033-295X.100.2.204 ↔  10.1037_0033-295x.100.2.204
-…37 more
+…38 more
 ```
 
-Root cause: DOIs are case-insensitive by spec, but the stem derivation does not
-normalize case, so the same paper ingested via two providers lands twice. **This is
-the largest single retrieval-quality defect found** and it is not in the inventory.
-Fix at ingest (lowercase the DOI before deriving the stem), then dedupe.
+**Root cause** — `paper/src/providers/downloader.rs:248` built the storage key from
+the DOI verbatim:
+
+```rust
+let filename = format!("{}.pdf", doi.replace('/', "_"));
+```
+
+DOIs are case-insensitive (ISO 26324), so `10.48550/arXiv.X` and
+`10.48550/arxiv.X` are one paper — but they became two documents, converted twice
+and indexed twice. The arXiv fast path immediately below already matched its prefix
+case-insensitively for *resolution*; the rule was simply never applied to *storage
+identity*. Fixed by lowercasing before derivation.
+
+**Scale was larger than the 42 visible pairs.** A further **734** stems carried
+mixed case with no twin yet — latent collisions that the root-cause fix would have
+*triggered* on the next re-download. Fixing derivation without converging those
+would have made things worse, so both were handled together: **775 stems total.**
+
+**Migration** — added `hs migrate canonicalize-doi-stems` (dry-run default,
+`--limit` for staged runs), following the existing `migrate_cmd` pattern rather
+than inventing a new mechanism. Per stem it moves markdown and source onto the
+canonical key, carries the catalog row across, purges the dropped `doc_id`'s
+vectors, and re-indexes any stem whose canonical markdown changed. Restricted to
+stems starting with `10.` — filename stems (`GameAIPro2_Chapter30_…`,
+`Instant-Field-Aligned-Meshes`, `W2102450255`) carry meaningful case and are never
+touched.
+
+Collisions keep the **larger** markdown, not the lowercase one. The short twin is
+consistently the degraded conversion — one pair is 2,581 B against **22 B**. Two
+large-delta pairs were hand-checked and the rule picked the fuller conversion in
+both directions (uppercase won `10.1016_*.RASD.2010.03.002` at 45,352 B vs 29,067 B;
+lowercase won `10.1017_*S0033291718004038` at 52,014 B vs 33,234 B).
+
+**Result — 13 batches, 775 stems, 0 errors:**
+
+| Metric | Value |
+|---|---:|
+| Stems canonicalized | **775** (41 collisions, 734 renames) |
+| Chunks purged and re-indexed | **22,981** |
+| Errors | **0** |
+| Case-collision groups remaining | **0** *(verified from S3, not from the tool that did the work)* |
+| Non-canonical DOI stems remaining | **0** |
+| Corpus | 8,590 → **8,558** docs (−32 net duplicates), 259,817 points |
+
+Verified end-to-end: `10.1016_J.RASD.2010.03.002` is no longer indexed,
+`10.1016_j.rasd.2010.03.002` is, and the query that used to return both now returns
+one document. The catalog still records the DOI in its registered casing
+(`10.1016/J.RASD.2010.03.002`) — canonical *storage identity*, faithful *metadata*.
+
+**One bug found and fixed mid-run.** The scan snapshot went stale at write time.
+Where two *different* non-canonical spellings share one canonical form
+(`10.1016_B978-…00002-X` and `…00002-x` — the only such pair in the corpus), the
+first was renamed onto the canonical key mid-run and the second still saw
+"canonical absent", overwriting it without comparing sizes and leaving the first
+spelling's catalog row attached to the second's markdown. The surviving content
+happened to be the larger one, but by luck rather than design. Fixed by re-probing
+both sides live before deciding; the affected stem was re-converted so markdown and
+conversion stamp were regenerated together, then re-indexed (13 chunks).
 
 ### 10b. DOI ↔ OpenAlex-ID pairs
 
@@ -553,7 +608,7 @@ duplicates, but it bounds the problem.
 | I | 2 Cambridge-chrome docs | reconverted, but source HTML still carries the chrome | `hs pipeline purge-poisoned-chunks` |
 | — | Year extraction | needs code change | fix `extract_year`; emit none over a guess |
 | — | 13 `sig*` mislabels | stem rename, outside documented verbs | manual |
-| — | 42 case-collision dupes | needs ingest normalization + dedupe | new work |
+| — | ~~42 case-collision dupes~~ | **FIXED** — see §10a | ship `hs migrate canonicalize-doi-stems` in the next rc |
 | — | 70 degenerate page tables | — | see footnote in §12 |
 | — | `10.1007_s10508-005-0998-4` | source is a JS SPA shell; no OA PDF | manual acquisition |
 | — | 1 title backfill | arXiv 429 | retry |
@@ -655,6 +710,13 @@ sentence begins "In the spring of 2001"); 70 degenerate page-offset tables; and
 stub removed 26 chunks rather than 1, taking real (if unreadable) content with it.
 Documented in §5 with everything needed to re-acquire it.
 
-The corpus is materially healthier than it was this morning, and the largest single
-remaining defect — 42 duplicate pairs crowding search results — is one nobody had
-measured before today.
+**Fixed after the first pass:** the case-collision duplicates — the largest
+retrieval-quality defect found, and one nobody had measured before today. Root
+cause was one line deriving storage keys from un-normalized DOIs. 775 stems
+canonicalized across 13 batches with zero errors; independent verification from S3
+shows **0 collisions and 0 non-canonical DOI stems remaining**. The migration verb
+(`hs migrate canonicalize-doi-stems`) and the downloader fix are committed and need
+to ride the next rc so the verb exists fleet-wide — the run itself was performed
+from a local build.
+
+The corpus is materially healthier than it was this morning.
