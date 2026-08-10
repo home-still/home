@@ -1178,6 +1178,25 @@ fn needs_canonicalizing(stem: &str) -> bool {
     stem.starts_with("10.") && stem != stem.to_lowercase()
 }
 
+/// Live size of a single object, or `None` when it does not exist.
+///
+/// The scan-time snapshot cannot be trusted at write time: when two
+/// *different* non-canonical spellings share one canonical form (e.g.
+/// `…00002-X` and `…00002-x`), the first is renamed onto the canonical key
+/// during the run, and the second would still see the snapshot's "canonical
+/// absent" and blindly overwrite it — keeping whichever happened to sort
+/// last rather than the better conversion, and detaching the catalog row
+/// from the markdown. Re-probing here collapses that race.
+async fn object_len(storage: &dyn hs_common::storage::Storage, key: &str) -> Option<u64> {
+    storage
+        .list(key)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|m| m.key == key)
+        .map(|m| m.size)
+}
+
 /// Copy an object to a new key and delete the original. S3 has no rename.
 async fn move_object(
     storage: &dyn hs_common::storage::Storage,
@@ -1306,7 +1325,26 @@ pub async fn run_canonicalize_doi_stems(
     let servers = crate::distill_cmd::resolve_servers(server).await;
     let distill = hs_distill::client::DistillClient::new(&servers[0])?;
 
-    for v in &variants {
+    for snapshot in &variants {
+        // Re-probe both sides rather than trusting the scan snapshot: an
+        // earlier iteration of this same run may have moved an object onto
+        // the canonical key. See `object_len`.
+        let v = CaseVariant {
+            md_len: object_len(
+                &*storage,
+                &hs_common::markdown::markdown_storage_key(&snapshot.stem),
+            )
+            .await,
+            canonical_md_len: object_len(
+                &*storage,
+                &hs_common::markdown::markdown_storage_key(&snapshot.canonical),
+            )
+            .await,
+            stem: snapshot.stem.clone(),
+            canonical: snapshot.canonical.clone(),
+        };
+        let v = &v;
+
         // Log every stem before touching it. A live run rewrites hundreds of
         // storage keys and purges vectors; without a per-stem trail there is
         // no way to tell afterwards what moved where, or where an aborted
