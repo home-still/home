@@ -1116,3 +1116,444 @@ mod drop_local_html_tests {
         assert!(still_there.is_some(), "dry-run must not delete");
     }
 }
+
+// ---------------------------------------------------------------------------
+// canonicalize-doi-stems
+// ---------------------------------------------------------------------------
+
+/// A DOI-derived stem whose case differs from the canonical (lowercase) form.
+#[derive(Debug, Clone)]
+struct CaseVariant {
+    /// The stem as stored, carrying at least one uppercase character.
+    stem: String,
+    /// `stem.to_lowercase()` — the canonical storage key.
+    canonical: String,
+    /// Size of the variant's markdown object, if it has one.
+    md_len: Option<u64>,
+    /// Size of the canonical stem's markdown object, if that stem exists.
+    canonical_md_len: Option<u64>,
+}
+
+impl CaseVariant {
+    /// True when both spellings are present — a live duplicate that is
+    /// currently returning the same paper twice from search.
+    fn is_collision(&self) -> bool {
+        self.canonical_md_len.is_some()
+    }
+
+    /// Which spelling holds the better conversion. Larger markdown wins:
+    /// across the corpus the short twin is consistently the degraded one
+    /// (one real pair is 2,581 B against 22 B). Ties go to the canonical
+    /// form so the migration is a no-op on genuinely identical twins.
+    fn variant_wins(&self) -> bool {
+        match (self.md_len, self.canonical_md_len) {
+            (Some(v), Some(c)) => v > c,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct CanonicalizeStats {
+    scanned: u64,
+    collisions: u64,
+    renames: u64,
+    moved_markdown: u64,
+    moved_paper: u64,
+    rewrote_catalog: u64,
+    deleted_catalog: u64,
+    purged_docs: u64,
+    purged_chunks: u64,
+    errors: Vec<String>,
+}
+
+/// True for stems that came from a DOI and are not already canonical.
+///
+/// Restricted to DOI-shaped stems on purpose. DOIs are case-insensitive by
+/// ISO 26324, so lowercasing one is lossless. Filename-derived stems
+/// (`GameAIPro2_Chapter30_…`, `Instant-Field-Aligned-Meshes`) carry
+/// meaningful case and must never be touched.
+fn needs_canonicalizing(stem: &str) -> bool {
+    stem.starts_with("10.") && stem != stem.to_lowercase()
+}
+
+/// Copy an object to a new key and delete the original. S3 has no rename.
+async fn move_object(
+    storage: &dyn hs_common::storage::Storage,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    let bytes = storage.get(from).await?;
+    storage.put(to, bytes).await?;
+    storage.delete(from).await?;
+    Ok(())
+}
+
+/// Canonicalize DOI-derived stems to lowercase, collapsing case-collision
+/// duplicates onto one storage key.
+///
+/// Two shapes are handled in one pass because they are the same defect at
+/// different stages:
+///
+/// * **Collision** — both spellings exist. The same paper was downloaded
+///   twice under two spellings of its DOI and is indexed twice, so a single
+///   query returns it twice and crowds real hits out of the top-k. The
+///   better conversion is kept at the canonical key; the loser's objects and
+///   vectors are deleted.
+/// * **Rename** — only the non-canonical spelling exists. Harmless today,
+///   but a live hazard the moment the download path starts lowercasing: the
+///   next fetch of that DOI would land on the canonical key and manufacture
+///   a fresh collision. Canonicalizing now closes that door.
+///
+/// Vectors for every dropped `doc_id` are purged from Qdrant, and any stem
+/// whose canonical markdown changed is re-indexed, so storage and the index
+/// stay in agreement. Without the purge the duplicate stays searchable —
+/// which is the whole defect.
+pub async fn run_canonicalize_doi_stems(
+    reporter: &Arc<dyn Reporter>,
+    dry_run: bool,
+    limit: Option<usize>,
+    server: Option<&str>,
+) -> Result<()> {
+    use hs_common::storage::Storage;
+
+    let paper_cfg = paper::config::Config::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage: Arc<dyn Storage> = paper_cfg
+        .build_storage()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    reporter.status("Scan", "listing catalog/ for non-canonical DOI stems...");
+    let stems = hs_common::catalog::list_catalog_stems_via(&*storage, "catalog").await?;
+
+    // Index markdown objects by key so sizes resolve without a per-stem HEAD
+    // round-trip across ~8.6k stems.
+    let md_sizes: std::collections::HashMap<String, u64> = storage
+        .list("markdown/")
+        .await?
+        .into_iter()
+        .map(|m| (m.key.clone(), m.size))
+        .collect();
+
+    let mut variants: Vec<CaseVariant> = Vec::new();
+    for stem in stems.iter().filter(|s| needs_canonicalizing(s)) {
+        let canonical = stem.to_lowercase();
+        variants.push(CaseVariant {
+            md_len: md_sizes
+                .get(&hs_common::markdown::markdown_storage_key(stem))
+                .copied(),
+            canonical_md_len: md_sizes
+                .get(&hs_common::markdown::markdown_storage_key(&canonical))
+                .copied(),
+            stem: stem.clone(),
+            canonical,
+        });
+    }
+    variants.sort_by(|a, b| a.stem.cmp(&b.stem));
+    if let Some(n) = limit {
+        variants.truncate(n);
+    }
+
+    let collisions = variants.iter().filter(|v| v.is_collision()).count();
+    let mut stats = CanonicalizeStats {
+        scanned: variants.len() as u64,
+        collisions: collisions as u64,
+        renames: (variants.len() - collisions) as u64,
+        ..Default::default()
+    };
+
+    if variants.is_empty() {
+        reporter.finish("No non-canonical DOI stems found — nothing to do");
+        return Ok(());
+    }
+
+    reporter.status(
+        "Plan",
+        &format!(
+            "{} non-canonical DOI stem(s): {} collision(s), {} rename(s) ({})",
+            stats.scanned,
+            stats.collisions,
+            stats.renames,
+            if dry_run { "dry-run" } else { "live" }
+        ),
+    );
+
+    if dry_run {
+        for v in variants.iter().filter(|v| v.is_collision()).take(50) {
+            reporter.status(
+                "Collision",
+                &format!(
+                    "{} [{} B] vs {} [{} B] — keep {}",
+                    v.stem,
+                    v.md_len.unwrap_or(0),
+                    v.canonical,
+                    v.canonical_md_len.unwrap_or(0),
+                    if v.variant_wins() {
+                        "variant"
+                    } else {
+                        "canonical"
+                    }
+                ),
+            );
+        }
+        reporter.finish(&format!(
+            "Dry-run: {} stem(s) would be canonicalized ({} collision, {} rename)",
+            stats.scanned, stats.collisions, stats.renames
+        ));
+        return Ok(());
+    }
+
+    let servers = crate::distill_cmd::resolve_servers(server).await;
+    let distill = hs_distill::client::DistillClient::new(&servers[0])?;
+
+    for v in &variants {
+        // Log every stem before touching it. A live run rewrites hundreds of
+        // storage keys and purges vectors; without a per-stem trail there is
+        // no way to tell afterwards what moved where, or where an aborted
+        // run stopped.
+        reporter.status(
+            if v.is_collision() {
+                "Collision"
+            } else {
+                "Rename"
+            },
+            &format!(
+                "{} -> {}{}",
+                v.stem,
+                v.canonical,
+                if v.is_collision() {
+                    if v.variant_wins() {
+                        " (promoting this spelling's content)"
+                    } else {
+                        " (canonical content kept)"
+                    }
+                } else {
+                    ""
+                }
+            ),
+        );
+
+        // Any stem whose canonical markdown ends up different from what is
+        // currently indexed has to be re-indexed, or search keeps serving
+        // the old body under the canonical doc_id.
+        let mut canonical_content_changed = false;
+
+        let from_md = hs_common::markdown::markdown_storage_key(&v.stem);
+        let to_md = hs_common::markdown::markdown_storage_key(&v.canonical);
+
+        if !v.is_collision() || v.variant_wins() {
+            // Promote this spelling's markdown onto the canonical key —
+            // either it is the only copy, or it is the better one.
+            if storage.exists(&from_md).await.unwrap_or(false) {
+                match move_object(&*storage, &from_md, &to_md).await {
+                    Ok(()) => {
+                        stats.moved_markdown += 1;
+                        canonical_content_changed = true;
+                    }
+                    Err(e) => {
+                        stats
+                            .errors
+                            .push(format!("markdown {} -> {}: {e}", v.stem, v.canonical));
+                        continue;
+                    }
+                }
+            }
+        } else if storage.exists(&from_md).await.unwrap_or(false) {
+            // Canonical holds the better conversion — discard this one.
+            if let Err(e) = storage.delete(&from_md).await {
+                stats
+                    .errors
+                    .push(format!("delete markdown {}: {e}", v.stem));
+            }
+        }
+
+        // Source document. Only relocate when the canonical slot is free —
+        // never clobber an existing source with the loser's bytes.
+        for ext in ["pdf", "html", "htm", "epub"] {
+            let from = format!("papers/{}", hs_common::sharded_key(&v.stem, ext));
+            if !storage.exists(&from).await.unwrap_or(false) {
+                continue;
+            }
+            let to = format!("papers/{}", hs_common::sharded_key(&v.canonical, ext));
+            let res = if storage.exists(&to).await.unwrap_or(false) {
+                storage.delete(&from).await
+            } else {
+                move_object(&*storage, &from, &to).await.map(|()| {
+                    stats.moved_paper += 1;
+                })
+            };
+            if let Err(e) = res {
+                stats.errors.push(format!("papers {}.{ext}: {e}", v.stem));
+            }
+        }
+
+        // Catalog row: carry this row's metadata over only when the
+        // canonical row is absent, then drop the variant row either way.
+        match hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", &v.stem).await {
+            Ok(Some(mut entry)) => {
+                let canonical_exists =
+                    hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", &v.canonical)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
+                // Write this row onto the canonical key when the canonical
+                // row is absent, and also when this spelling won a collision
+                // — its markdown was just promoted, so its provenance
+                // (`conversion`, `converted_by`, page offsets) has to travel
+                // with the bytes. Leaving the loser's stamp attached to the
+                // winner's content is exactly the kind of mismatched record
+                // that takes hours to trace later.
+                if !canonical_exists || (v.is_collision() && v.variant_wins()) {
+                    entry.markdown_path = Some(to_md.clone());
+                    if let Some(p) = entry.pdf_path.as_ref() {
+                        let ext = Path::new(p)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("pdf")
+                            .to_string();
+                        entry.pdf_path = Some(format!(
+                            "papers/{}",
+                            hs_common::sharded_key(&v.canonical, &ext)
+                        ));
+                    }
+                    match hs_common::catalog::write_catalog_entry_via(
+                        &*storage,
+                        "catalog",
+                        &v.canonical,
+                        &entry,
+                    )
+                    .await
+                    {
+                        Ok(()) => stats.rewrote_catalog += 1,
+                        Err(e) => stats
+                            .errors
+                            .push(format!("write catalog {}: {e}", v.canonical)),
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => stats.errors.push(format!("read catalog {}: {e}", v.stem)),
+        }
+
+        match hs_common::catalog::delete_catalog_entry_via(&*storage, "catalog", &v.stem).await {
+            Ok(()) => stats.deleted_catalog += 1,
+            Err(e) => stats.errors.push(format!("delete catalog {}: {e}", v.stem)),
+        }
+
+        // Drop the variant's vectors. Until this happens the duplicate is
+        // still returned by search, which is the defect being fixed.
+        match distill.delete_doc(&v.stem).await {
+            Ok(n) => {
+                if n > 0 {
+                    stats.purged_docs += 1;
+                    stats.purged_chunks += n;
+                }
+            }
+            Err(e) => stats.errors.push(format!("purge {}: {e}", v.stem)),
+        }
+
+        if canonical_content_changed {
+            // Re-index from the canonical key so the vectors match the bytes
+            // now sitting there.
+            if let Err(e) = distill.delete_doc(&v.canonical).await {
+                stats
+                    .errors
+                    .push(format!("purge canonical {}: {e}", v.canonical));
+            }
+            let cat =
+                hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", &v.canonical)
+                    .await
+                    .ok()
+                    .flatten();
+            if let Err(e) = distill
+                .index_from_storage_with_catalog(&*storage, &to_md, cat.as_ref())
+                .await
+            {
+                stats.errors.push(format!("reindex {}: {e}", v.canonical));
+            }
+        }
+    }
+
+    for e in stats.errors.iter().take(20) {
+        reporter.warn(e);
+    }
+
+    reporter.finish(&format!(
+        "Canonicalized {} stem(s): {} markdown moved, {} source moved, {} catalog rewritten, \
+         {} catalog rows dropped, {} doc(s) purged ({} chunks); {} error(s)",
+        stats.scanned,
+        stats.moved_markdown,
+        stats.moved_paper,
+        stats.rewrote_catalog,
+        stats.deleted_catalog,
+        stats.purged_docs,
+        stats.purged_chunks,
+        stats.errors.len()
+    ));
+
+    if !stats.errors.is_empty() {
+        anyhow::bail!(
+            "canonicalize-doi-stems finished with {} error(s)",
+            stats.errors.len()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod canonicalize_tests {
+    use super::*;
+
+    #[test]
+    fn targets_only_mixed_case_doi_stems() {
+        assert!(needs_canonicalizing("10.48550_arXiv.2410.07095"));
+        assert!(needs_canonicalizing("10.1016_J.PAID.2019.06.030"));
+        assert!(needs_canonicalizing("10.1109_TRO.2024.3386370"));
+    }
+
+    #[test]
+    fn leaves_canonical_doi_stems_alone() {
+        assert!(!needs_canonicalizing("10.48550_arxiv.2410.07095"));
+        assert!(!needs_canonicalizing("10.1145_566570.566586"));
+    }
+
+    /// Filename-derived stems carry meaningful case and are not DOIs, so
+    /// lowercasing them would be a destructive rename for no benefit.
+    #[test]
+    fn never_touches_non_doi_stems() {
+        assert!(!needs_canonicalizing(
+            "GameAIPro2_Chapter30_Modular_Tactical_Influence_Maps"
+        ));
+        assert!(!needs_canonicalizing("Instant-Field-Aligned-Meshes"));
+        assert!(!needs_canonicalizing("W2102450255"));
+        assert!(!needs_canonicalizing("PBR3_07_Sampling_and_Reconstruction"));
+        assert!(!needs_canonicalizing("forsgren_accelerate"));
+    }
+
+    fn variant(md: Option<u64>, canon: Option<u64>) -> CaseVariant {
+        CaseVariant {
+            stem: "10.1_A".into(),
+            canonical: "10.1_a".into(),
+            md_len: md,
+            canonical_md_len: canon,
+        }
+    }
+
+    #[test]
+    fn collision_is_detected_by_canonical_markdown_presence() {
+        assert!(variant(Some(10), Some(10)).is_collision());
+        assert!(!variant(Some(10), None).is_collision());
+    }
+
+    /// The degraded twin is consistently the shorter one — one real pair is
+    /// 2,581 B against 22 B — so size decides, and ties favour canonical to
+    /// keep the migration a no-op on identical twins.
+    #[test]
+    fn larger_markdown_wins_and_ties_favour_canonical() {
+        assert!(variant(Some(2581), Some(22)).variant_wins());
+        assert!(!variant(Some(22), Some(2581)).variant_wins());
+        assert!(!variant(Some(500), Some(500)).variant_wins());
+        assert!(!variant(None, Some(500)).variant_wins());
+    }
+}
