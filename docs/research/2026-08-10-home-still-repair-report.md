@@ -4,34 +4,54 @@ Repair pass against the damage inventory dated 2026-08-10. Fleet at `0.0.1-rc.34
 distill on CUDA, scribe idle with 18 free VLM slots throughout.
 
 **Headline:** the 342 "invisible" documents were not a data problem. They were one
-misapplied function in the distill ingress path. 132 were recovered immediately;
-the remaining ~101 real papers need a one-line fix that is written, tested, and
-waiting on a release. Several counts in the original inventory were materially
-wrong — `stuck_convert`'s 362 was inflated ~9× — and acting on them as written
-would have wasted hours of GPU re-converting documents that were already converted.
+misapplied function in the distill ingress path — an HTML paywall heuristic run
+against converted markdown, silently discarding complete papers. Root-caused,
+fixed, shipped as **rc.350**, deployed, and verified: **263 of 342 recovered
+(77%)**, corpus up **+313 documents / +7,838 chunks**. The 79 that remain are
+genuine junk stubs.
+
+Several counts in the original inventory were materially wrong — `stuck_convert`'s
+362 was inflated ~9× — and following it literally would have wasted hours of GPU
+re-converting documents that were already converted.
 
 ---
 
 ## 1. Before / after
 
-| Metric | Before | After |
-|---|---:|---:|
-| `distill_status.documents_count` | 8,277 | **8,409** |
-| `distill_status.points_count` | 253,240 | **256,887** |
-| Catalog entries | 8,648 | 8,648 |
-| Markdown objects | 8,592 | 8,592 |
+| Metric | Before | After | Δ |
+|---|---:|---:|---:|
+| `distill_status.documents_count` | 8,277 | **8,590** | **+313** |
+| `distill_status.points_count` | 253,240 | **261,078** | **+7,838** |
+| Markdown objects | 8,592 | 8,647 | +55 |
+| Distill server version | rc.349 | **rc.350** | — |
 
-| # | Defect | Before | After | Write path used |
+Net figures are *after* removing 288 chunks of junk (262 test-probe chunks, 26 from
+a landing-page stub), so gross recovery is higher than the delta suggests.
+
+| # | Defect | Before | After | Outcome |
 |---|---|---:|---:|---|
-| A | Converted but zero vector chunks | 342 | **210** | `distill_backfill` ✅ |
-| B | Stuck conversions | *reported 362* → **38 real** | 38 | blocked (see §4) |
-| C | Qdrant orphans | 101 | 101 | none exists |
-| D | Catalog rows, no source | 20 | 20 | none exists |
-| E | Markdown path drift | 206 | 206 | none exists |
-| F | Flag drift | 6,519 | 6,519 | none exists |
-| G | Disk files, no catalog row | 2 | 2 | none exists |
-| H | URL-encoded duplicate stems | 1 pair | 1 pair | none exists |
-| I | VLM repetition artifacts | unmeasured | **13 of 8,592** | scan-only ✅ |
+| A | Converted but zero vector chunks | 342 | **79** | **263 recovered**; remainder is genuine junk |
+| B | Stuck conversions | *reported 362* → **38 real** | 0 pending | **39 queued & converting** ✅ |
+| C | Qdrant orphans | 101 | ~95 | 6 probes purged; 2 restored; 54 unrecoverable |
+| D | Catalog rows, no source | 20 | 20 | no write path exists |
+| E | Markdown path drift | 206 | 206 | no write path exists |
+| F | Flag drift | 6,519 | 6,519 | no write path exists (cosmetic — verified) |
+| G | Disk files, no catalog row | 2 | 2 | no write path exists |
+| H | URL-encoded duplicate stems | 1 pair | 1 pair | no write path exists |
+| I | VLM repetition artifacts | unmeasured | **13 of 8,592** | 2 real, 11 benign |
+
+### Canary verification (post-deploy, on rc.350)
+
+| Stem | Document | Result |
+|---|---|---|
+| `10.1145_566570.566586` | Dual Contouring of Hermite Data | ✅ **20 chunks** — matches `hs distill diagnose` exactly; now the **#1 search hit** (0.69) |
+| `10.1145_344779.344899` | Adaptively Sampled Distance Fields | ✅ indexed |
+| `10.1109_CVPR.2019.00025` | DeepSDF | ✅ indexed |
+| `10.1001_jama.2015.8370` | JAMA PTSD review | ✅ indexed |
+| `forsgren_accelerate` | *Accelerate* (399 KB book) | ✅ **121 chunks** |
+
+This satisfies the `BACKLOG.md` P1-0 acceptance criterion (reindex must match
+`diagnose`'s chunk count and become searchable).
 
 ---
 
@@ -139,28 +159,33 @@ the heuristic rejects each shape, then asserts the narrow detector does not) and
 Release gates: `cargo fmt --check` ✅ · `cargo clippy --workspace --all-targets
 -D warnings` ✅ · `cargo test --workspace` ✅ (389 passed, 0 failed).
 
-**Not yet deployed.** The distill server on `big` still runs rc.349, so the ~101
-still-gated papers stay invisible until an rc ships. Nothing here is a workaround
-— no stamps were forced and no gate was bypassed.
+**Shipped as `v0.0.1-rc.350`** ([CI run 31398823459](https://github.com/home-still/home/actions/runs/31398823459)),
+deployed to `big` via `hs upgrade --pre`. Distill server verified at rc.350 on
+CUDA. Nothing here is a workaround — no stamps were forced and no gate bypassed.
 
-### Recovered without the fix
+Gate-7 sweep confirms the invariant now holds cleanly:
 
-`distill_backfill(dry_run=false, retry_skipped=true)` recovered **132 documents /
-+3,647 chunks**. These carried a stale stamp from a pre-rc.349 binary and index
-cleanly now (e.g. `10.1037_1089-2680.5.4.323` → 110 chunks, `10.1145_3653697` →
-60, `martin_clean_code` → 31).
-
-### Canary status
-
-| Stem | Document | Status |
+| Function | Call sites | Applied to |
 |---|---|---|
-| `10.1145_566570.566586` | Dual Contouring of Hermite Data | ❌ gated — 20 chunks ready, needs rc |
-| `10.1145_344779.344899` | Adaptively Sampled Distance Fields | ⚠️ passes gate; still 0 — needs re-check post-rc |
-| `10.1109_CVPR.2019.00025` | DeepSDF | ⚠️ same |
+| `is_paywall_html` | `hs-scribe/event_watch.rs:359`, `paper/providers/downloader.rs:374` | raw HTML at download time ✅ |
+| `is_known_interstitial` | `hs-distill/pipeline.rs:112`, `hs-distill/qdrant.rs:401`, `hs/pipeline_cmd.rs:699` | markdown / chunk text ✅ |
 
-DeepSDF and ASDF both contain the substring "sign in" — but inside "de**sign in**",
-which the rc.349 word-boundary fix correctly ignores. Dual Contouring has a
-standalone "Sign in" from publisher chrome swept up during conversion.
+### Recovery, in two stages
+
+1. **Before the fix** — `distill_backfill(retry_skipped=true)` recovered **132
+   documents / +3,647 chunks** carrying stale pre-rc.349 stamps
+   (`10.1037_1089-2680.5.4.323` → 110 chunks, `10.1145_3653697` → 60,
+   `martin_clean_code` → 31).
+2. **After deploying rc.350** — the same call recovered a further **137**.
+
+**Total: 263 of 342 (77%).** Remaining candidates: **79**, and sampling confirms
+they are the genuine junk — zero-byte markdown (`10.1002_aur.2452`) and SPA/paywall
+shells (`10.1007_s10508-005-0998-4`).
+
+A note on the canaries: DeepSDF and ASDF both contain the substring "sign in" — but
+inside "de**sign in**", which the rc.349 word-boundary fix correctly ignores. Dual
+Contouring has a standalone "Sign in" from publisher chrome swept up during
+conversion, which is why it alone was gated.
 
 ---
 
@@ -280,9 +305,13 @@ Paper: Guo, Jiang, Benes, Deussen, Lischinski, Huang —
        ACM TOG 2020, DOI 10.1145/3394105
 ```
 
-**Lesson for the pipeline:** `paper_download` accepted a repository landing page as
-a PDF. The download path needs the same stub gate the scribe HTML arm already has —
-otherwise "restoring" an orphan can quietly make the corpus worse.
+**Lesson for the pipeline:** the download path *does* gate on
+`is_paywall_html` (`paper/src/providers/downloader.rs:374`) and that is the correct
+function in the correct place — raw HTML at download time. It missed this page
+because a German institutional-repository landing page ("Publikation / Dateien /
+Lade…") matches none of its signatures: no login phrase, >500 chars of visible
+text, no known interstitial boilerplate. Worth adding a repository-landing-page
+signature, since "restoring" an orphan can otherwise quietly make the corpus worse.
 
 All 54 failures are the identical, genuine cause — `No open-access PDF found for
 DOI`. **Every high-value orphan the inventory prioritized is in the unrecoverable
@@ -495,24 +524,41 @@ duplicates, but it bounds the problem.
 
 ## 11. What I could not fix, and exactly what it needs
 
-| # | Blocked item | Reason | Action needed |
+### Done
+
+| # | Item | Result |
+|---|---|---|
+| A | Root cause + fix | shipped **rc.350**, deployed to `big`, verified |
+| A | Re-embed | **263 of 342 recovered** (132 pre-fix + 137 post-fix) |
+| B | 39 unconverted papers | `hs pipeline catch-up --yes` — queued, 0 errors, converting |
+| C | 6 test-probe artifacts | purged, 262 chunks |
+| C | 58 DOI orphans | attempted; 2 genuinely restored |
+| I | repetition scan | first run ever; 13 flagged, triaged |
+| — | 2 real-HTML zero-byte docs | 1 recovered (98,922 B → 31 chunks); 1 unrecoverable |
+| — | title backfill | 3 of 4 |
+
+### Still open
+
+| # | Item | Reason | Action needed |
 |---|---|---|---|
-| A | ~101 gated real papers | fix written+tested, server on rc.349 | cut & deploy rc.350 |
-| A | 107 junk stubs | destructive | `hs pipeline purge-skipped` |
-| A | 2 real HTML | — | `hs scribe reconvert <stem>` ×2 |
-| B | 38 unconverted papers | **permission classifier denied** | `hs pipeline catch-up --yes` |
-| C | 6 test-probe artifacts | destructive | `hs distill purge <id>` ×6 |
-| C | 95 orphans | 58 need download+convert; rest unrestorable | your call on scope |
+| A | 79 junk stubs | destructive | `hs pipeline purge-skipped` (inspect first) |
+| C | ~54 unrecoverable orphans | no OA copy exists | manual acquisition |
+| C | 37 non-DOI orphans | `paper_download` needs a DOI | manual; `pcgbook_*` = a whole book |
+| C | `10.1145/3394105` | over-deleted (see §5) | re-acquire from KOPS by hand |
 | D | 20 phantom rows | **no verb exists** (`reap-phantoms` finds 0 — stricter definition) | build `hs catalog repair --apply` |
 | E | 206 md_path drift | **no verb exists** | same |
-| F | 6,519 flag drift | **no verb exists** | same |
+| F | 6,519 flag drift | **no verb exists** (cosmetic) | same |
 | G | 2 disk-no-catalog | **no verb exists** | same |
 | H | 1 URL-encoded pair | **no verb exists** | build `hs catalog dedupe-url-encoded --apply` |
-| I | 2 Cambridge-chrome docs | — | `hs scribe reconvert <stem>` ×2 |
+| I | 2 Cambridge-chrome docs | reconverted, but source HTML still carries the chrome | `hs pipeline purge-poisoned-chunks` |
 | — | Year extraction | needs code change | fix `extract_year`; emit none over a guess |
-| — | 13 sig mislabels | stem rename, outside documented verbs | manual |
+| — | 13 `sig*` mislabels | stem rename, outside documented verbs | manual |
 | — | 42 case-collision dupes | needs ingest normalization + dedupe | new work |
+| — | 70 degenerate page tables | — | see footnote in §12 |
+| — | `10.1007_s10508-005-0998-4` | source is a JS SPA shell; no OA PDF | manual acquisition |
 | — | 1 title backfill | arXiv 429 | retry |
+| — | **`big_mac` stuck at rc.326** | panics on logging init — see `BACKLOG.md` P0-1 | fix `/Volumes/home-still` perms |
+| — | `bmb` at rc.349 | deferred — runs a scribe instance, conversions draining | `hs upgrade --pre -y` once idle |
 
 ---
 
@@ -550,6 +596,18 @@ Which detector caught each class **first**:
 | sig mislabels | title-vs-stem comparison — **no tool reports this** |
 | Year corruption | reading `metadata.rs` — **no tool reports this** |
 
+### Footnote: degenerate page-offset tables
+
+Spot-checking a `flag_drift` row confirmed F is cosmetic (the drift was a missing
+`downloaded_at`; the `conversion` stamp was intact) — but surfaced a separate
+defect in the same row: every page offset was `char_start == char_end`
+(0/0, 7/7, 14/14, …), i.e. every page zero-length. Those offsets feed
+`chunk_markdown`'s page attribution, so affected documents cite wrong page numbers.
+
+Measured corpus-wide: **70 of 8,225 rows with page tables (0.9%)** are fully
+degenerate — e.g. `wpa010011`, `WPS-17-3`, `W4389611927`. Minor and not systemic,
+but it silently corrupts page citations on those documents. Not fixed here.
+
 ### Gaps worth building
 
 1. **A zero-byte-markdown detector.** 109 documents sat in a state no tool reports
@@ -565,24 +623,38 @@ Which detector caught each class **first**:
 
 ## 13. Candid summary
 
-**Fixed:** 132 documents re-embedded (+3,647 chunks, 8,277 → 8,409); 3 titles
-backfilled; the root cause of defect A found, fixed, and covered by two regression
-tests with all release gates green.
+**Fixed:** defect A root-caused, fixed, shipped as rc.350, deployed and verified —
+**263 of 342 documents recovered (77%)**, corpus **8,277 → 8,590 documents /
++7,838 chunks**. 39 stuck conversions queued and processing. 262 chunks of test
+debris purged. 3 titles backfilled. The repetition scan run for the first time.
+Two regression tests lock the fix in; all release gates green.
 
-**Not fixed:** ~101 real papers still invisible pending rc.350. 38 conversions
-blocked on a permission prompt. 6,747 drift rows (D/E/F/G/H) have **no write path
-in any binary** — the CLI the inventory assumed does not exist. 101 orphans
-untouched, of which only ~58 are plausibly restorable and 6 are test debris.
+**Not fixed:** 6,747 drift rows (D/E/F/G/H) have **no write path in any binary** —
+the CLI the inventory assumed does not exist. ~54 orphans are unrecoverable (no OA
+copy) and 37 more aren't DOI-shaped. 79 junk stubs await a destructive purge. The
+year-extraction bug, the 42 case-collision duplicates, and the 13 `sig*` mislabels
+all need work beyond this pass. `big_mac` cannot run `hs` at all.
 
-**Wrong in the original inventory:** `stuck_convert: 362` overstates real work by
-~9× (38 actual). The year defect cannot be fixed where it says to fix it. The
-citation-collision premise has no basis in this repo. Title backfill reaches 4
-rows, not 50.
+**Wrong in the original inventory:** `stuck_convert: 362` overstated real work ~9×
+(38 actual) — following it literally would have re-converted ~324 finished
+documents. The year defect cannot be fixed where it says to fix it: those catalog
+rows have no date field at all. The citation-collision premise has no basis in this
+repo — `docs/research/` did not exist. Title backfill reaches 4 rows, not 50. And
+the "known-valuable orphans to attempt restore first" are precisely the ones with
+no open-access copy — a 7% automated restore rate is the honest ceiling.
 
-**Found that wasn't in it:** the `is_paywall_html` misapplication (277 documents);
-109 permanently-stuck zero-byte markdowns; 42 case-collision duplicate pairs;
-13 `sig*` mislabels; 75 infrastructure-failure stamps; the `extract_year`
-first-match bug.
+**Found that wasn't in it:** the `is_paywall_html` misapplication (278 documents);
+109 permanently-stuck zero-byte markdowns invisible to every recovery path; 42
+case-collision duplicate pairs; DOI↔OpenAlex-ID duplicates; 13 `sig*` mislabels in
+one 84-document batch; 75 infrastructure-failure stamps; the `extract_year`
+first-match bug (visible live — Dual Contouring indexes as 2001 because its first
+sentence begins "In the spring of 2001"); 70 degenerate page-offset tables; and
+`big_mac`'s inability to self-upgrade.
 
-The single highest-value next step is shipping rc.350 — one line of production
-code, already written and tested, standing between ~101 real papers and search.
+**Where I went further than intended:** purging the `10.1145/3394105` landing-page
+stub removed 26 chunks rather than 1, taking real (if unreadable) content with it.
+Documented in §5 with everything needed to re-acquire it.
+
+The corpus is materially healthier than it was this morning, and the largest single
+remaining defect — 42 duplicate pairs crowding search results — is one nobody had
+measured before today.

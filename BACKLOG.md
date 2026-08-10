@@ -141,6 +141,32 @@ Security and documentation stories are intentionally excluded.
 
 ---
 
+## P0 — Blockers
+
+### P0-1. `big_mac` cannot run `hs` at all — panics on logging init, stuck at rc.326
+**Symptom:** every `hs` subcommand that initializes logging panics immediately:
+
+```
+thread 'main' panicked at crates/hs/src/main.rs:75:37:
+install logging subscriber: opening spool dir "/Volumes/home-still/logs/spool/hs"
+Caused by: Permission denied (os error 13)
+```
+
+`hs --version` still works (it short-circuits before logging init), which is why
+the host reports a version and looks healthy. **`hs upgrade` does not** — so
+`big_mac` has been unable to self-upgrade and sits at **rc.326** while the fleet is
+at rc.350 (discovered 2026-08-10 during the rc.350 deploy; skew predates it).
+**Scope:** `/Volumes/home-still` mount permissions on `big_mac`, and
+`crates/hs/src/main.rs:75`.
+**Change:** Fix the mount/ownership so the spool dir is writable. Separately,
+consider whether an unwritable *log* directory should be fatal to every command —
+this is a logging concern taking down the entire CLI, including the one command
+(`upgrade`) that could repair the host.
+**Acceptance:** `ssh big_mac '~/.local/bin/hs upgrade --pre -y'` completes and
+`hs --version` reports the current rc.
+
+---
+
 ## P1 — Reliability (panics and silent failures in hot paths)
 
 ### P1-0. distill server embeds 0 chunks for some glm_ocr docs whose markdown chunks fine locally
