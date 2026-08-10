@@ -14,6 +14,18 @@ Security and documentation stories are intentionally excluded.
 
 ## P0 — Non-negotiable violations (must fix before next rc.*)
 
+### P0-15. `scribe_health` reports `ok` without ever probing its VLM backend (2026-07-29)
+**Motivation:** `big`'s olmocr backend was dead from **2026-07-25T22:31Z to 2026-07-29T12:17Z** — llama-swap could not start vLLM (`--gpu-memory-utilization 0.70` needed 16.49 GiB against 16.06 GiB free once the distill embedder was pinned resident). For those four days `curl :7435/health` returned `{"status":"ok","layout_model":true,"table_model":true,...}` and `hs status` listed the instance as `healthy: true, slots_available: 12`, because the health handler only checks scribe's own in-process layout/table models. It never issues a request to `HS_SCRIBE_OLMOCR_ENDPOINT`. The scribe pool therefore kept dispatching to a backend that could only time out, and the sole outward signal was `pipeline_drift` climbing to 468 against a threshold of 3 — a lagging indicator nobody is paged on. A green health check in front of a dead dependency is a silent-failure path.
+**Scope:**
+- scribe server health handler in `crates/hs-scribe` (the `/health` route backing `scribe_health`)
+- `crates/hs-mcp/src/main.rs` — `scribe_health` tool response shape
+- pool readiness filter in `hs-scribe-watch-events` (the check that already readiness-excludes a sleeping `bmb`)
+**Change:** `/health` must probe the configured VLM backend and report its real state — one cheap upstream call (`GET {endpoint}/models`, or a cached last-success timestamp with a max age). Report the backend verdict as its own field (`backend_reachable`, `backend_model`, `backend_checked_at`) and make the top-level `status` fail when the backend is unreachable. `status: "ok"` must mean "this instance can convert a PDF right now", not "my own models loaded". The pool's readiness filter then excludes a backend-dead instance the same way it excludes a sleeping laptop. No degraded/partial status tier — reachable or fail.
+**Acceptance:**
+- With llama-swap stopped on `big`, `curl :7435/health` returns a non-ok status and `hs status` shows that instance unhealthy within one poll interval.
+- The scribe pool dispatches zero conversions to an instance whose backend probe is failing.
+- `last_conversion_at` going stale while papers are queued is surfaced, not silent.
+
 ### P0-12. Stop VLM repetition collapse from being committed (F1, rc.308 self-test)
 **Motivation:** Self-test rc.308 round-trip on `10.48550_arxiv.2312.10997` (Gao RAG survey) produced page-1 markdown that's `"the retrieval of"` repeated for ~9 KB, then `"valval...val"` for the remainder. Convert stamped `success`, auto-embed indexed 35 chunks; the doc now poisons `academic_papers` Qdrant collection. `event_watch.rs:171-176` documents that the QC repetition-loop reject was disabled by operator decision on 2026-04-23 because rejection produced an infinite retry storm. The retry-storm root cause: rejection didn't close out the catalog row, so the inbox watcher re-detected the source PDF and re-queued it. Same input → same VLM output → same rejection → loop. The current "save what we can" path is a ONE-PATH violation.
 **Scope:**
@@ -132,6 +144,27 @@ Security and documentation stories are intentionally excluded.
 ## P1 — Reliability (panics and silent failures in hot paths)
 
 ### P1-0. distill server embeds 0 chunks for some glm_ocr docs whose markdown chunks fine locally
+**ROOT CAUSE FOUND + FIXED 2026-08-10 (awaiting rc.350 deploy).** Not glm_ocr-specific
+and not a chunker divergence. `pipeline.rs::index_document` gated on
+`hs_common::html::is_paywall_html`, an *HTML* heuristic, applied to *converted
+markdown*. Its first rule — `has_login && content.len() < 100_000` — carries no
+`!has_article` guard, so any sub-100 KB document containing "sign in" / "log in" /
+"access denied" was rejected outright; a second rule rejected anything mentioning
+"clinical trials" / "search results" without a literal `abstract`+`references` pair.
+`hs distill diagnose` never runs this gate, which is exactly why CLI and server
+disagreed. Measured over all 423 `zero_chunks_or_empty` rows: **278 rejected by the
+gate, of which `is_known_interstitial` (the in-tree false-positive-safe detector)
+clears 277** — including the full text of *Accelerate* (399 KB) and a 99 KB
+mathematics-education paper. Fix: gate on `is_known_interstitial` instead; all
+literal interstitial signatures still match, and `hs-scribe` keeps `is_paywall_html`
+on raw HTML where it belongs. Regression tests in `hs-common/src/html.rs`. A further
+132 docs carried stale pre-rc.349 stamps and were recovered by
+`distill_backfill(retry_skipped=true)` with no code change. Full analysis:
+`docs/research/2026-08-10-home-still-repair-report.md`.
+**Follow-up still open:** the silent `Ok(0)` remains — a gate veto is
+indistinguishable from "chunker produced nothing". Give it a distinct
+`embedding_skip.reason` so it fails loudly.
+
 **Motivation:** Discovered 2026-07-05 ingesting Game AI Pro 2. Three chapters
 (`GameAIPro2_Chapter11_Smart_Zones...`, `..._Chapter39_Analytics-Based_AI...`,
 `..._Chapter40_Procedural_Content_Generation...`) are stamped
@@ -166,6 +199,11 @@ if a doc that diagnose says yields N>0 chunks embeds 0 — do not silently stamp
   `chunks_indexed == diagnose chunk count`.
 - Sweep `embedding_skipped` for other docs whose `diagnose` yields >0 chunks and
   re-embed them.
+
+### P1-14. Downloader saves the repository landing page when `download_urls` also holds a direct PDF (2026-07-29)
+**Motivation:** Two abstract-only stubs were ingested, converted by `html-parser` in ~0.005 s / "1 page", embedded, and then had to be deleted by hand: `10.1109_tvcg.2009.113` (UFRGS Lume "Visualizar item" page) and `10.34726_hss.2014.27898` (TU Wien reposiTUm record page). Neither is a paywall or an anti-bot interstitial, so `is_paywall_html` (rc.349) and both `hs pipeline purge-skipped` / `purge-poisoned` signature lists miss them — they are *successfully retrieved wrong documents*. The catalog for the first one lists `download_urls: ["http://hdl.handle.net/10183/27630", "https://lume.ufrgs.br/bitstream/10183/27630/1/000751721.pdf"]`: the direct PDF was known and the handle redirect was chosen anyway. The TU Wien record page likewise advertises a 32.86 MB PDF that was never fetched. These land in Qdrant as 1–4 chunk documents whose text is repository chrome plus an abstract, which is exactly the low-value noise `distill_search` should never return.
+**Change:** when a candidate URL set contains both a landing/handle URL and a direct PDF URL, order direct-PDF candidates first. After fetching HTML, require a positive "this is a full text" signal before accepting it as the paper — reject a document whose extracted body is dominated by repository navigation chrome, or that carries a link to a PDF it did not follow. Fail loudly (no catalog row) rather than storing a landing page as the paper; a stub row is the degraded-substitute pattern the ONE PATH rule forbids.
+**Acceptance:** re-downloading `10.1109/tvcg.2009.113` fetches `.../000751721.pdf`, not the handle page. A landing page with no reachable full text produces no `papers/`, `markdown/`, or `catalog/` object at all. Neither stem reappears via `hs pipeline catch-up`.
 
 ### P1-1. Replace mutex-unwrap with error propagation
 **Motivation:** Poisoned-mutex panics cascade in long-running processes.
@@ -309,6 +347,8 @@ if a doc that diagnose says yields N>0 chunks embeds 0 — do not silently stamp
 **Motivation:** big runs `hs-scribe-watch-events` / `hs-distill-watch-events` as user-scope systemd units (Restart=always). `ensure_consumer` deletes-then-recreates the durable on connect, so any second watcher instance (e.g. an operator running `hs scribe watch-events` by hand) kills the unit's consumer and vice-versa ("consumer deleted" churn), and each recreate RESETS JetStream delivery counts — a max_deliver-exhausted poison message comes back to life. Observed live during the rc.335 deploy (mcconnell resurrected).
 **Change:** detect an existing live consumer with a different instance and refuse to start (fail loudly: "watcher already running"), or make ensure_consumer update-in-place instead of delete-first.
 **Acceptance:** starting a second watcher instance on a host with the unit running exits with a clear error; delivery counts survive watcher restarts.
+**ESCALATE TO P0 (2026-07-29):** this is not an operator-error edge case — it is the steady-state fleet topology, and it has been silently destroying the embed leg. `big` runs `hs-distill-watch-events` (user unit, concurrency=8) and `bmb` runs `com.home-still.distill-watch-events` (LaunchAgent, concurrency=6). Both bind durable `distill-workers` on stream `SCRIBE`; each one's `ensure_consumer` delete-then-recreate evicts the other, which restarts and evicts back. Measured: big's restart counter at **11,920**; bmb loops every ~11 s; the durable's `created` timestamp advances to *now* on every poll. Neither watcher ever consumes a message. `scribe.completed` events are therefore never indexed by the daemon path — the embed backlog (`markdown` 8075 vs `embedded_documents` 7766) is the residue. Both daemons log only `WARN jetstream delivery error error=consumer deleted`, and neither systemd nor `hs status` reports a fault: `hs status` showed `distill_instances[0].healthy: true` throughout.
+**Additional acceptance:** two watcher daemons on different hosts pointed at the same distill server either (a) share the durable as a real queue group with no recreate, or (b) the second one fails loudly at startup. A watcher that cannot bind its consumer must exit non-zero with a distinct message, not spin on `Restart=always` — 11,920 silent restarts must be impossible.
 
 ## P1 — rc.340 deploy follow-ups (2026-06-16)
 
@@ -419,6 +459,23 @@ if a doc that diagnose says yields N>0 chunks embeds 0 — do not silently stamp
 **Scope:** `paper/src/aggregation/relevance.rs` (`relevance_score`).
 **Change:** Add a title-presence floor: if fewer than 50% of query terms appear in the title, cap the score below `CITATION_SORT_MIN_RELEVANCE` regardless of abstract content. Single gate, applied in `relevance_score` itself. Don't add a second sort-time filter.
 **Acceptance:** The cited query returns no off-topic high-citation papers in positions 1–10. Existing `target_paper_survives_citation_floor_even_with_fewer_citations` test still passes.
+
+---
+
+## P1 — 2026-07-15 ops follow-up (event-driven conversion silently halted)
+
+### P1-19. `hs-scribe-watch-events` stays dead after a deploy/`hs restart` stops it — silent conversion halt
+**Motivation:** On 2026-07-15 manual ingestion looked broken — files dropped in `papers/manually_downloaded/` were swept and published to `papers.ingested`, but nothing converted for ~2 days. Root cause: `hs-scribe-watch-events.service` (the NATS `papers.ingested` → scribe-pool consumer) was `inactive (dead)` since 2026-07-13 10:37, killed by SIGTERM — a clean stop, almost certainly a deploy / `hs restart`. The unit sets `Restart=always`, but that only recovers crash exits; a deliberate `systemctl stop` leaves it down permanently. The outage was **silent**: `hs status` showed "Scribe ● running" because that row reflects the scribe *server* (`hs-serve-scribe`), not the event consumer, and no catch-up timer was running (`hs-pipeline-catchup.timer` disabled). A manual `systemctl --user start` restored it and it drained the backlog immediately — so this recurs on every deploy that stops it without restarting.
+**Scope:**
+- The deploy/restart flow that issues the SIGTERM (`hs upgrade` / `hs restart` service management in `crates/hs/src/`).
+- `hs status` health surface (server-liveness vs consumer-liveness conflation).
+**Change:**
+1. The deploy/`hs restart` path must restart every event consumer it stops (`hs-scribe-watch-events`, and any peer) and verify each via `is-active` post-deploy, failing loudly if one didn't come back. No "stopped and forgot".
+2. `hs status` must show the scribe *consumer's* heartbeat as a distinct row (like the inbox watcher's `last_tick_seconds_ago`), not conflate it with the server's "running". A dead consumer must turn the dashboard red.
+3. (Decide, separate) `hs-pipeline-catchup.timer` as a periodic source-scan re-queue is a hidden fallback that masks a dead consumer — a ONE-PATH smell. Either make it the intended one path or delete it; don't leave it as a silent backstop.
+**Acceptance:**
+- After `hs upgrade` / `hs restart` on any host, `hs-scribe-watch-events` is active, and a post-deploy check fails loudly if it isn't.
+- `hs status` shows a scribe-consumer heartbeat that goes red within one tick of the consumer dying (repro: `systemctl --user stop hs-scribe-watch-events` → dashboard red).
 
 ---
 

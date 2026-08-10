@@ -85,18 +85,32 @@ pub async fn index_document(
         return Ok(0);
     }
 
-    // Belt-and-suspenders: refuse markdown that looks like a paywall /
-    // anti-bot interstitial / stub even though the downloader and scribe
-    // already gate at ingress. A new origin-side anti-bot variant or a
-    // pre-rc.315 residual stub would otherwise be embedded as a 1-chunk
+    // Belt-and-suspenders: refuse markdown that matches a *known* anti-bot /
+    // cookie-wall interstitial signature even though the downloader and
+    // scribe already gate at ingress. A new origin-side anti-bot variant or
+    // a pre-rc.315 residual stub would otherwise be embedded as a 1-chunk
     // vector and poison search. Returning Ok(0) routes through
     // record_embedding_outcome_via → embedding_skip = zero_chunks_or_empty,
     // which the reconciler treats as an intentional terminal skip.
     //
-    // Short-form collections deliberately ship content that trips the
-    // "short page without article structure = junk" rule inside
-    // `is_paywall_html` — see ContentProfile.
-    if profile == ContentProfile::FullDocument && hs_common::html::is_paywall_html(&markdown) {
+    // This gate uses `is_known_interstitial`, NOT `is_paywall_html`. The
+    // latter is an *HTML* heuristic — it strips tags, looks for `<article`,
+    // and rejects any page under 100 KB that says "sign in", or any page
+    // mentioning "clinical trials" / "search results" that lacks a literal
+    // "abstract"+"references" pair. Those rules are calibrated for raw HTML
+    // at download time (see hs-scribe's html arm), where a false positive
+    // just costs a re-download. Run against *converted markdown* they are a
+    // category error, and the cost of a false positive is permanent
+    // invisibility: the doc is stamped terminal-skip and never reaches
+    // search. Measured on the corpus 2026-08-10, that gate was silently
+    // discarding 133 complete papers — including the full text of
+    // "Accelerate" (399 KB) and a 99 KB mathematics-education paper —
+    // while its own conservative sibling cleared 277 of the 278 documents
+    // it rejected. `is_known_interstitial` matches only literal, unique
+    // interstitial boilerplate, and is documented as safe where a false
+    // positive would destroy real content.
+    if profile == ContentProfile::FullDocument && hs_common::html::is_known_interstitial(&markdown)
+    {
         tracing::warn!(
             stem,
             len = markdown.len(),

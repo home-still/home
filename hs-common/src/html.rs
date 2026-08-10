@@ -291,6 +291,66 @@ mod tests {
         assert!(!is_paywall_html(&html));
     }
 
+    /// The distill ingress gate runs against *converted markdown*, where a
+    /// false positive stamps a real paper terminal-skip and drops it from
+    /// search permanently. These three shapes are verbatim reductions of
+    /// documents the `is_paywall_html` heuristic was silently discarding
+    /// from the corpus on 2026-08-10; `is_known_interstitial` must clear
+    /// all of them. See `hs-distill::pipeline::index_document`.
+    #[test]
+    fn known_interstitial_clears_real_papers_that_paywall_heuristic_rejects() {
+        // A complete paper under 100 KB whose body says "Sign in" once
+        // (publisher chrome swept up by the converter). Rejected by
+        // `is_paywall_html` via the `has_login && len < 100_000` rule, which
+        // — unlike the rule below it — carries no `!has_article` guard.
+        let with_login = format!(
+            "# Dual Contouring of Hermite Data\n\n## Abstract\n\n{}\n\n## References\n\n\
+             [1] Smith 2020\n\nSign in to ACM Digital Library\n",
+            "This paper describes a new method for contouring a signed grid. ".repeat(200)
+        );
+        assert!(
+            is_paywall_html(&with_login),
+            "precondition: heuristic rejects it"
+        );
+        assert!(!is_known_interstitial(&with_login));
+
+        // A clinical review that mentions "clinical trials" but has no
+        // literal "references" heading — rejected by the `is_landing` rule.
+        let review = format!(
+            "# Psychotherapy for Military-Related PTSD\n\n## Abstract\n\n{}\n",
+            "We reviewed randomized clinical trials of exposure therapy. ".repeat(200)
+        );
+        assert!(
+            is_paywall_html(&review),
+            "precondition: heuristic rejects it"
+        );
+        assert!(!is_known_interstitial(&review));
+
+        // A book-length document containing a "search results" mention.
+        let book = format!(
+            "ACCELERATE\n\nBuilding and Scaling High Performing Technology Organizations\n\n{}\n",
+            "Teams that deploy frequently recover faster; see search results in Appendix B. "
+                .repeat(400)
+        );
+        assert!(is_paywall_html(&book), "precondition: heuristic rejects it");
+        assert!(!is_known_interstitial(&book));
+    }
+
+    /// The narrow detector must still catch the real interstitials — the
+    /// fix above must not open the door that `is_paywall_html` was closing.
+    #[test]
+    fn known_interstitial_still_catches_real_stubs() {
+        assert!(is_known_interstitial(
+            "# digital.library.unt.edu\n\n## Gauging your humanity\n\nJust a moment..."
+        ));
+        assert!(is_known_interstitial(
+            "Preparing to download ... HHS Vulnerability Disclosure"
+        ));
+        assert!(is_known_interstitial(
+            "Cookies are disabled. Wiley Online Library requires cookies for authentication."
+        ));
+    }
+
     #[test]
     fn looks_like_html_accepts_doctype() {
         assert!(looks_like_html(b"<!DOCTYPE html><html>..."));
