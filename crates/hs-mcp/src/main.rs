@@ -3137,20 +3137,33 @@ impl HomeStillMcp {
         )
         .await;
 
-        // Pipeline drift: source documents that haven't produced markdown
-        // yet. Saturating subtraction so stage lag never yields a negative.
-        // Drift = `documents - markdown - in_flight`. By design, catalog
-        // rows stamped `conversion_failed` (surfaced separately as
+        // Pipeline drift: distinct source stems that haven't produced
+        // markdown yet, less whatever is converting right now. Saturating
+        // subtraction so stage lag never yields a negative.
+        //
+        // Counted per *stem*, not per object: a paper stored as both `.pdf`
+        // and `.html` yields one markdown, and markdown whose source was
+        // removed by the DOI-stem lowercasing migration has no source at
+        // all. The old `documents - markdown` object arithmetic charged the
+        // former as backlog and credited the latter against it, holding the
+        // metric at 71 against a threshold of 3 no matter how much the
+        // pipeline converted. See `count_unconverted_stems`.
+        //
+        // By design, catalog rows stamped `conversion_failed` that still
+        // sit in the live papers tree (surfaced separately as
         // `corrupted_pdfs`) are NOT subtracted — drift is meant to surface
         // them too, since failed converts represent stuck pipeline state
         // the operator should see. Values above `pipeline_drift_threshold`
         // indicate either stamped failures or stems that errored without a
         // stamp; check scribe/event-watch logs for the latter.
         let total_in_flight: u64 = scribe_instances.iter().map(|s| s.in_flight).sum();
-        pipeline.pipeline_drift = pipeline
-            .documents
-            .saturating_sub(pipeline.markdown)
-            .saturating_sub(total_in_flight);
+        pipeline.pipeline_drift = hs_common::status::count_unconverted_stems(
+            &*self.storage,
+            &self.papers_prefix,
+            &self.markdown_prefix,
+        )
+        .await
+        .saturating_sub(total_in_flight);
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
         pipeline.corrupted_pdfs = corrupted_pdfs;
         pipeline.inbox_pending = inbox_pending;

@@ -379,8 +379,48 @@ pub async fn convert_and_upload(
     };
     let duration_secs = start.elapsed().as_secs_f64();
 
+    // A conversion that produced nothing embeddable is a failed conversion,
+    // not a successful one. Without this gate the stub was written to
+    // storage, stamped `conversion` success and published as
+    // `scribe.completed`; distill then filtered every chunk under the same
+    // floor and recorded `embedding_skip: zero_chunks_or_empty` — leaving a
+    // catalog row claiming success for a document that never had content.
+    // Observed shape: a Radware 302 anti-bot page that reached the
+    // html-parser as `# 302 Found\n\nrdwr` (17 bytes).
+    if !hs_common::quality::has_indexable_content(&markdown) {
+        if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+            storage,
+            "catalog",
+            stem,
+            "empty_conversion",
+            Vec::new(),
+        )
+        .await
+        {
+            tracing::error!(stem = %stem, error = %e, "stamp conversion_failed failed");
+        }
+        return Err(HandlerError::Permanent(anyhow::anyhow!(
+            "{} converted to {} non-whitespace chars, below the {}-char indexable floor; \
+             refusing to record a conversion",
+            event.key,
+            hs_common::quality::non_whitespace_len(&markdown),
+            hs_common::quality::MIN_INDEXABLE_NON_WS,
+        )));
+    }
+
+    // Two independent page signals: the separator structure the backend
+    // emitted, and the source's own page count parsed at ingest. See
+    // `resolve_page_accounting` for why markdown structure wins when it
+    // exists and why a lone offset over a multi-page source is dropped.
     let page_offsets = hs_common::catalog::compute_page_offsets(&markdown);
-    let total_pages = page_offsets.len() as u64;
+    let accounting =
+        hs_common::catalog::resolve_page_accounting(page_offsets.len() as u64, source.pdf_pages);
+    let total_pages = accounting.total_pages;
+    let page_offsets = if accounting.offsets_trustworthy {
+        page_offsets
+    } else {
+        Vec::new()
+    };
 
     storage
         .put(&md_key, markdown.into_bytes())

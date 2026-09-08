@@ -245,6 +245,46 @@ pub fn compute_page_offsets(markdown: &str) -> Vec<PageOffset> {
     offsets
 }
 
+/// How many pages to record, and whether the markdown's page offsets can be
+/// trusted as citation provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageAccounting {
+    pub total_pages: u64,
+    /// False when the offsets don't describe the source's pages, in which
+    /// case they must be dropped rather than used to attribute a page.
+    pub offsets_trustworthy: bool,
+}
+
+/// Reconcile the two independent page signals a conversion produces.
+///
+/// - `md_pages`: how many `\n\n---\n\n`-delimited pages the backend emitted
+///   (see [`compute_page_offsets`]). Only backends that assemble output via
+///   `join_pages` produce these; the olmocr subprocess returns one flat
+///   blob, so this is 1 for a 52 KB, 14-page paper.
+/// - `source_pages`: the PDF's own page count, parsed by lopdf at ingest to
+///   size the conversion timeout.
+///
+/// Markdown structure wins when it exists, because it is self-consistent
+/// with the offsets and survives the lopdf miscounts documented on
+/// `timeout_policy.floor_secs`. Otherwise the source count is the only real
+/// information available — using `md_pages` there is what made every
+/// olmocr conversion report `1pg`.
+///
+/// Offsets are untrustworthy exactly when the markdown claims one page but
+/// the source has several: a lone offset spanning the whole document makes
+/// `resolve_page` report page 1 for every chunk of it.
+pub fn resolve_page_accounting(md_pages: u64, source_pages: Option<u32>) -> PageAccounting {
+    let total_pages = if md_pages > 1 {
+        md_pages
+    } else {
+        source_pages.map_or(md_pages, u64::from)
+    };
+    PageAccounting {
+        total_pages,
+        offsets_trustworthy: md_pages > 1 || total_pages <= 1,
+    }
+}
+
 /// Read an existing catalog entry, or return None if it doesn't exist.
 pub fn read_catalog_entry(catalog_dir: &Path, stem: &str) -> Option<CatalogEntry> {
     let path = crate::sharded_path(catalog_dir, stem, "yaml");
@@ -1125,6 +1165,61 @@ conversion:
         assert!(
             err.to_string().contains("transient backend failure"),
             "storage error should bubble up verbatim: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod page_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn olmocr_flat_blob_reports_the_source_page_count() {
+        // The rc.350 bug: olmocr returns one blob with no `\n\n---\n\n`
+        // separators, so a 14-page paper recorded `total_pages: 1`. lopdf
+        // already knew the real count.
+        let a = resolve_page_accounting(1, Some(14));
+        assert_eq!(a.total_pages, 14);
+        // A single offset spanning 14 pages would attribute every chunk to
+        // page 1, so it must not be kept.
+        assert!(!a.offsets_trustworthy);
+    }
+
+    #[test]
+    fn structured_markdown_wins_over_a_miscounting_source() {
+        // lopdf is known to undercount (a 282-page book reported as 8, per
+        // `timeout_policy.floor_secs`). When the backend emitted real page
+        // structure, that structure is authoritative and its offsets stay.
+        let a = resolve_page_accounting(282, Some(8));
+        assert_eq!(a.total_pages, 282);
+        assert!(a.offsets_trustworthy);
+    }
+
+    #[test]
+    fn html_and_epub_have_no_source_page_count() {
+        // Non-PDF sources carry `pdf_pages: None`; one page is the truth,
+        // and its offset legitimately covers the whole document.
+        let a = resolve_page_accounting(1, None);
+        assert_eq!(a.total_pages, 1);
+        assert!(a.offsets_trustworthy);
+    }
+
+    #[test]
+    fn genuine_single_page_pdf_keeps_its_offset() {
+        let a = resolve_page_accounting(1, Some(1));
+        assert_eq!(a.total_pages, 1);
+        assert!(a.offsets_trustworthy);
+    }
+
+    #[test]
+    fn page_offsets_track_separators() {
+        // Guards the `md_pages` input: two separators means three pages.
+        let md = "one\n\n---\n\ntwo\n\n---\n\nthree";
+        let offsets = compute_page_offsets(md);
+        assert_eq!(offsets.len(), 3);
+        assert_eq!(
+            resolve_page_accounting(offsets.len() as u64, Some(3)).total_pages,
+            3
         );
     }
 }

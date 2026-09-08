@@ -217,6 +217,13 @@ async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()>
 
     let mut to_republish: Vec<String> = Vec::new();
     for obj in &papers {
+        // `hs migrate quarantine-bad-content` relocates non-PDF/non-HTML
+        // bytes here and stamps `conversion_failed` precisely so nothing
+        // re-publishes them; that sweeper skips its own output for the same
+        // reason. Republishing them would re-queue known-bad bytes forever.
+        if obj.key.contains("/.quarantine/") {
+            continue;
+        }
         let name = match obj.key.rsplit('/').next() {
             Some(n) if !n.starts_with("._") => n,
             _ => continue,
@@ -226,6 +233,11 @@ async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()>
             _ => continue,
         };
         if md_stems.contains(stem) {
+            continue;
+        }
+        // A zero-byte source has no bytes to convert; scribe would fetch it,
+        // fail, and the event would cycle. Reject at the door.
+        if obj.size == 0 {
             continue;
         }
         let _ = ext;
