@@ -45,7 +45,7 @@ pub async fn download_batch(
 ) -> BatchDownloadResult {
     let total = papers.len();
 
-    let results: Vec<Result<DownloadResult, (Paper, String)>> =
+    let results: Vec<Result<DownloadResult, Box<(Paper, String)>>> =
         stream::iter(papers.into_iter().enumerate())
             .map(|(i, paper)| {
                 let service = Arc::clone(&service);
@@ -83,7 +83,8 @@ pub async fn download_batch(
                                 }
                             }
                         }
-                        Err((_, err)) => {
+                        Err(boxed) => {
+                            let err = &boxed.1;
                             if let Some(ref cb) = on_progress {
                                 cb(DownloadEvent::Failed {
                                     index: i,
@@ -110,11 +111,14 @@ pub async fn download_batch(
         match result {
             Ok(dr) if dr.skipped => skipped.push(dr),
             Ok(dr) => succeeded.push(dr),
-            Err((paper, error)) => failed.push(DownloadFailure {
-                paper_id: paper.id,
-                title: paper.title,
-                error,
-            }),
+            Err(boxed) => {
+                let (paper, error) = *boxed;
+                failed.push(DownloadFailure {
+                    paper_id: paper.id,
+                    title: paper.title,
+                    error,
+                })
+            }
         }
     }
 
@@ -127,12 +131,14 @@ pub async fn download_batch(
 }
 
 #[allow(clippy::type_complexity)]
+// `Paper` is large enough that an unboxed `(Paper, String)` error variant
+// bloats every `Result` on the happy path, so the failure payload is boxed.
 async fn download_single(
     service: &dyn DownloadService,
     paper: &Paper,
     on_progress: Option<&OnProgress>,
     index: usize,
-) -> Result<DownloadResult, (Paper, String)> {
+) -> Result<DownloadResult, Box<(Paper, String)>> {
     let filename = format!("{}.pdf", sanitize_filename(&paper.id));
     let title = paper.title.clone();
 
@@ -174,12 +180,12 @@ async fn download_single(
         }
     }
 
-    Err((
+    Err(Box::new((
         paper.clone(),
         last_err
             .map(|e| e.to_string())
             .unwrap_or_else(|| format!("No download URL or DOI for paper {}", paper.id)),
-    ))
+    )))
 }
 
 fn sanitize_filename(id: &str) -> String {
