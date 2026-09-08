@@ -82,7 +82,6 @@ pub fn is_paywall_html(content: &str) -> bool {
 
     // Loading / interstitial pages (PMC download stub, etc.)
     if lower.contains("preparing to download")
-        || lower.contains("hhs vulnerability disclosure")
         || lower.contains("please wait while the document loads")
     {
         return true;
@@ -184,7 +183,6 @@ pub fn is_known_interstitial(content: &str) -> bool {
         || lower.contains("just a moment...")
         || lower.contains("wiley online library requires cookies")
         || lower.contains("preparing to download")
-        || lower.contains("hhs vulnerability disclosure")
         // Anubis / BotStopper Proof-of-Work bot challenges share the same
         // boilerplate prose. The brand-name strings ("Anubis", "BotStopper")
         // sometimes lose their surrounding whitespace through the
@@ -557,5 +555,21 @@ mod tests {
             <h2>References</h2><ol><li>x</li></ol>\
             PMCID: PMC1234 PMID: 5678 Copyright notice</article></body></html>";
         assert!(!is_paywall_html(html));
+    }
+
+    #[test]
+    fn pmc_article_with_hhs_footer_is_not_paywall_or_interstitial() {
+        // The HHS Vulnerability Disclosure phrase is part of the standard
+        // NCBI footer on EVERY genuine PMC full-text page. Treating it as a
+        // paywall/interstitial signature rejects real articles wholesale.
+        let html = "<html><body><article>\
+            <h1>Learning to play: understanding in-game tutorials</h1>\
+            <h2>Abstract</h2><p>This paper reviews in-game tutorial research.</p>\
+            <h2>1. Introduction</h2><p>Tutorials are essential strategies.</p>\
+            <h2>References</h2><ol><li>Cao &amp; Liu</li></ol>\
+            <footer>NCBI: HHS Vulnerability Disclosure</footer>\
+            </article></body></html>";
+        assert!(!is_paywall_html(html));
+        assert!(!is_known_interstitial(html));
     }
 }
