@@ -14,6 +14,38 @@ Security and documentation stories are intentionally excluded.
 
 ## P0 — Non-negotiable violations (must fix before next rc.*)
 
+### P0-16. `big_mac` cannot run any `hs` command — startup panics on the log spool dir (2026-09-08)
+**Motivation:** During the rc.352 fleet upgrade, `big_mac` could not be upgraded and remains stranded on **rc.326** (the rest of the fleet is on rc.352). Every `hs` invocation — including `hs --version` and `hs upgrade` — aborts before doing any work:
+```
+thread 'main' panicked at crates/hs/src/main.rs:75:37:
+install logging subscriber: opening spool dir "/Volumes/home-still/logs/spool/hs"
+Caused by: Permission denied (os error 13)
+```
+Two separate defects: (a) `/Volumes/home-still` on `big_mac` is not writable by the invoking user, so the configured `log_dir` is wrong for that host or the mount lost its permissions; (b) `hs` treats an unwritable log directory as a fatal panic at startup, which makes the binary unusable for *every* command — including the `upgrade` that would replace it. A host that cannot log should still be able to report its version and upgrade itself. This is also why `big_mac` cannot self-recover: the fix cannot be delivered by `hs upgrade` because `hs upgrade` is the thing that panics.
+**Scope:**
+- `crates/hs/src/main.rs:75` — the `.expect()` / panic on logging-subscriber install
+- `hs_common::logging` spool-dir creation
+- `big_mac`'s `~/.home-still/config.yaml` `home.log_dir` / `/Volumes/home-still` mount permissions
+**Change:** Startup must not panic because logging could not be initialised. Failing to open the spool dir is not a failure of the requested command — emit one diagnostic to stderr naming the unwritable path and continue with console-only logging. Keep it loud (a warning on every invocation, not a silent degrade) but non-fatal. Separately, correct `big_mac`'s `log_dir` so the spool lands on a writable path. Do NOT add a silent fallback that hides the misconfiguration.
+**Acceptance:**
+- With `/Volumes/home-still` unwritable, `hs --version` and `hs upgrade --pre` both succeed on `big_mac` and print a warning naming the path.
+- `big_mac` reports `hs 0.0.1-rc.352` or later after a self-upgrade.
+- No code path silently swallows the spool-dir error without surfacing it.
+
+### P0-17. `hs upgrade` claims success for services it failed to restart, and skips others entirely (2026-09-08)
+**Motivation:** Two gaps observed during the rc.352 rollout, both of which leave upgraded binaries running old code with no signal to the operator.
+
+1. On `big`, `hs upgrade` restarted only `hs-serve-distill`, `hs-serve-mcp` and the distill containers. It installed a new `hs-scribe-server` binary but never restarted `hs-serve-scribe-olmocr`, and it does not touch the `systemd --user` daemons `hs-scribe-watch-events` / `hs-distill-watch-events` — which are exactly where the rc.352 conversion-gate and page-count fixes live. Without a manual `systemctl restart`, `hs upgrade` reports "Upgraded to 0.0.1-rc.352" while the changed code is not running.
+2. On `mac_air`, the restart of `com.home-still.scribe` printed `Unload failed: 5: Input/output error` and `Load failed: 5: Input/output error`, then printed `OK: com.home-still.scribe restarted` and counted it in `Restarted 1 service(s)`. A failed `launchctl` round-trip must not be reported as OK.
+**Scope:**
+- `hs upgrade` service-restart logic in `crates/hs` (the restart table and its launchctl/systemd branches)
+- the restart set: must include `hs-serve-scribe-olmocr` and the `--user` scope watcher units
+**Change:** Derive the restart set from which binaries were actually replaced, covering both `systemd --system` and `systemd --user` scopes plus launchd. Propagate each restart's real exit status: a non-zero `launchctl`/`systemctl` result is a failure, must be printed as such, must not increment the restarted count, and must make `hs upgrade` exit non-zero. Per CLAUDE.md, fix `hs upgrade` rather than documenting a manual `systemctl restart` step.
+**Acceptance:**
+- After `hs upgrade` on `big`, every process whose binary changed reports the new version with no manual restart.
+- A forced `launchctl` failure on a Mac host makes `hs upgrade` print the failure and exit non-zero.
+- `hs upgrade` never prints `OK: <svc> restarted` for a restart whose underlying command failed.
+
 ### P0-15. `scribe_health` reports `ok` without ever probing its VLM backend (2026-07-29)
 **Motivation:** `big`'s olmocr backend was dead from **2026-07-25T22:31Z to 2026-07-29T12:17Z** — llama-swap could not start vLLM (`--gpu-memory-utilization 0.70` needed 16.49 GiB against 16.06 GiB free once the distill embedder was pinned resident). For those four days `curl :7435/health` returned `{"status":"ok","layout_model":true,"table_model":true,...}` and `hs status` listed the instance as `healthy: true, slots_available: 12`, because the health handler only checks scribe's own in-process layout/table models. It never issues a request to `HS_SCRIBE_OLMOCR_ENDPOINT`. The scribe pool therefore kept dispatching to a backend that could only time out, and the sole outward signal was `pipeline_drift` climbing to 468 against a threshold of 3 — a lagging indicator nobody is paged on. A green health check in front of a dead dependency is a silent-failure path.
 **Scope:**
