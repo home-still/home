@@ -13,7 +13,7 @@ use crate::services::{distill::PersonalDistill, naming};
 use chrono::Utc;
 use hs_common::catalog::{CatalogEntry, ConversionMeta};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Default, Clone)]
 pub struct IngestOptions {
@@ -49,9 +49,9 @@ pub async fn ingest(cfg: &Config, file: &Path, opts: IngestOptions) -> Result<In
     let (title, category) = resolve_name_and_category(cfg, &markdown, &opts).await?;
 
     let stem = build_stem(&title, &sha);
-    let dest_orig = sharded(cfg.root_dir(), &stem, format.as_str());
-    let dest_md = sharded(cfg.markdown_dir(), &stem, "md");
-    let dest_cat = sharded(cfg.root_dir(), &stem, "catalog.yaml");
+    let dest_orig = hs_common::sharded_path(&cfg.root_dir(), &stem, format.as_str());
+    let dest_md = hs_common::sharded_path(&cfg.markdown_dir(), &stem, "md");
+    let dest_cat = hs_common::sharded_path(&cfg.root_dir(), &stem, "catalog.yaml");
 
     if !opts.force && (dest_orig.exists() || dest_md.exists() || dest_cat.exists()) {
         return Err(PersonalError::DuplicateStem(stem));
@@ -146,11 +146,6 @@ pub(crate) fn build_stem(title: &str, sha: &str) -> String {
     format!("{buf}-{suffix}")
 }
 
-fn sharded(dir: PathBuf, stem: &str, ext: &str) -> PathBuf {
-    let prefix = &stem[..stem.len().min(2)];
-    dir.join(prefix).join(format!("{stem}.{ext}"))
-}
-
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -190,6 +185,8 @@ fn build_catalog(i: &CatalogInput<'_>) -> CatalogEntry {
             total_pages: 0,
             converted_at: now,
             pages: Vec::new(),
+            converted_by: None,
+            attempts_log: Vec::new(),
         }),
         category: Some(i.category.to_string()),
         original_format: Some(i.format.to_string()),

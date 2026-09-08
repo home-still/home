@@ -20,7 +20,7 @@ fn main() {
             errs += 1;
             if errors_shown < 5 {
                 println!("--- line {} error: {} ---", i + 1, e);
-                println!("{}", &line.chars().take(500).collect::<String>());
+                println!("{}", line.chars().take(500).collect::<String>());
                 errors_shown += 1;
             }
         }

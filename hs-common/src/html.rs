@@ -13,14 +13,44 @@ pub fn looks_like_html(header: &[u8]) -> bool {
     s.contains("<!doctype html") || s.contains("<html") || s.contains("<head")
 }
 
+/// True if `needle` occurs in `haystack` bounded by a non-alphanumeric char
+/// (or a string edge) on both sides — i.e. as a standalone phrase, not as a
+/// substring of a longer word. Guards short login phrases like "sign in" from
+/// false-matching inside legitimate prose ("rendering system design in pbrt",
+/// "we assign in the loop", "log into" narration).
+fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = start == 0
+            || !haystack[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let after_ok = end >= haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// True when `content` looks like a paywall / error / landing page
 /// rather than real article content.
 pub fn is_paywall_html(content: &str) -> bool {
     let lower = content.to_lowercase();
 
-    // Paywall indicators
-    let has_login = lower.contains("sign in")
-        || lower.contains("log in")
+    // Paywall indicators. "sign in" / "log in" are short enough to appear as
+    // substrings of ordinary words ("de[sign in]g", "cata[log in]g"), so they
+    // require word boundaries; the longer phrases are specific enough as-is.
+    let has_login = contains_word_bounded(&lower, "sign in")
+        || contains_word_bounded(&lower, "log in")
         || lower.contains("access denied")
         || lower.contains("403 forbidden")
         || lower.contains("subscription required")
@@ -52,7 +82,6 @@ pub fn is_paywall_html(content: &str) -> bool {
 
     // Loading / interstitial pages (PMC download stub, etc.)
     if lower.contains("preparing to download")
-        || lower.contains("hhs vulnerability disclosure")
         || lower.contains("please wait while the document loads")
     {
         return true;
@@ -154,7 +183,6 @@ pub fn is_known_interstitial(content: &str) -> bool {
         || lower.contains("just a moment...")
         || lower.contains("wiley online library requires cookies")
         || lower.contains("preparing to download")
-        || lower.contains("hhs vulnerability disclosure")
         // Anubis / BotStopper Proof-of-Work bot challenges share the same
         // boilerplate prose. The brand-name strings ("Anubis", "BotStopper")
         // sometimes lose their surrounding whitespace through the
@@ -240,6 +268,85 @@ mod tests {
     fn detects_login_wall() {
         let html = "<html><body>Please sign in to access this article.</body></html>";
         assert!(is_paywall_html(html));
+    }
+
+    #[test]
+    fn login_phrase_inside_word_is_not_a_paywall() {
+        // "sign in" as a substring of "design in" / "log in" inside
+        // "cataloging in" must NOT trip the login heuristic. Regression for a
+        // legit short book chapter (PBR3 "Retrospective") that was rejected as
+        // `paywall_html` because "rendering system design in pbrt" contains
+        // the substring "sign in".
+        let body: String = std::iter::repeat_n(
+            "pbrt represents one point in the space of rendering system design \
+             in practice, and cataloging in detail how we assign in the loop \
+             lets designers reason about tradeoffs. ",
+            8,
+        )
+        .collect();
+        let html = format!("<html><body><p>{body}</p></body></html>");
+        assert!(html.len() < 100_000 && !html.contains("<article"));
+        assert!(!is_paywall_html(&html));
+    }
+
+    /// The distill ingress gate runs against *converted markdown*, where a
+    /// false positive stamps a real paper terminal-skip and drops it from
+    /// search permanently. These three shapes are verbatim reductions of
+    /// documents the `is_paywall_html` heuristic was silently discarding
+    /// from the corpus on 2026-08-10; `is_known_interstitial` must clear
+    /// all of them. See `hs-distill::pipeline::index_document`.
+    #[test]
+    fn known_interstitial_clears_real_papers_that_paywall_heuristic_rejects() {
+        // A complete paper under 100 KB whose body says "Sign in" once
+        // (publisher chrome swept up by the converter). Rejected by
+        // `is_paywall_html` via the `has_login && len < 100_000` rule, which
+        // — unlike the rule below it — carries no `!has_article` guard.
+        let with_login = format!(
+            "# Dual Contouring of Hermite Data\n\n## Abstract\n\n{}\n\n## References\n\n\
+             [1] Smith 2020\n\nSign in to ACM Digital Library\n",
+            "This paper describes a new method for contouring a signed grid. ".repeat(200)
+        );
+        assert!(
+            is_paywall_html(&with_login),
+            "precondition: heuristic rejects it"
+        );
+        assert!(!is_known_interstitial(&with_login));
+
+        // A clinical review that mentions "clinical trials" but has no
+        // literal "references" heading — rejected by the `is_landing` rule.
+        let review = format!(
+            "# Psychotherapy for Military-Related PTSD\n\n## Abstract\n\n{}\n",
+            "We reviewed randomized clinical trials of exposure therapy. ".repeat(200)
+        );
+        assert!(
+            is_paywall_html(&review),
+            "precondition: heuristic rejects it"
+        );
+        assert!(!is_known_interstitial(&review));
+
+        // A book-length document containing a "search results" mention.
+        let book = format!(
+            "ACCELERATE\n\nBuilding and Scaling High Performing Technology Organizations\n\n{}\n",
+            "Teams that deploy frequently recover faster; see search results in Appendix B. "
+                .repeat(400)
+        );
+        assert!(is_paywall_html(&book), "precondition: heuristic rejects it");
+        assert!(!is_known_interstitial(&book));
+    }
+
+    /// The narrow detector must still catch the real interstitials — the
+    /// fix above must not open the door that `is_paywall_html` was closing.
+    #[test]
+    fn known_interstitial_still_catches_real_stubs() {
+        assert!(is_known_interstitial(
+            "# digital.library.unt.edu\n\n## Gauging your humanity\n\nJust a moment..."
+        ));
+        assert!(is_known_interstitial(
+            "Preparing to download ... HHS Vulnerability Disclosure"
+        ));
+        assert!(is_known_interstitial(
+            "Cookies are disabled. Wiley Online Library requires cookies for authentication."
+        ));
     }
 
     #[test]
@@ -448,5 +555,21 @@ mod tests {
             <h2>References</h2><ol><li>x</li></ol>\
             PMCID: PMC1234 PMID: 5678 Copyright notice</article></body></html>";
         assert!(!is_paywall_html(html));
+    }
+
+    #[test]
+    fn pmc_article_with_hhs_footer_is_not_paywall_or_interstitial() {
+        // The HHS Vulnerability Disclosure phrase is part of the standard
+        // NCBI footer on EVERY genuine PMC full-text page. Treating it as a
+        // paywall/interstitial signature rejects real articles wholesale.
+        let html = "<html><body><article>\
+            <h1>Learning to play: understanding in-game tutorials</h1>\
+            <h2>Abstract</h2><p>This paper reviews in-game tutorial research.</p>\
+            <h2>1. Introduction</h2><p>Tutorials are essential strategies.</p>\
+            <h2>References</h2><ol><li>Cao &amp; Liu</li></ol>\
+            <footer>NCBI: HHS Vulnerability Disclosure</footer>\
+            </article></body></html>";
+        assert!(!is_paywall_html(html));
+        assert!(!is_known_interstitial(html));
     }
 }

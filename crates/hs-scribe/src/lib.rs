@@ -1,10 +1,10 @@
+pub mod classify;
 pub mod client;
 pub mod config;
 pub mod diag;
 pub mod epub;
 pub mod event_watch;
 pub mod html;
-pub mod ollama_tuner;
 pub mod pdf_meta;
 pub mod postprocess;
 
@@ -12,6 +12,8 @@ pub mod postprocess;
 pub mod cli;
 
 // Server-side modules (heavy deps: ONNX, pdfium, image, etc.)
+#[cfg(feature = "server")]
+pub mod converter;
 #[cfg(feature = "server")]
 pub mod gpu;
 #[cfg(feature = "server")]

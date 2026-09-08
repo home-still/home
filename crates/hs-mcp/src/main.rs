@@ -180,6 +180,49 @@ struct DistillSearchParams {
     limit: Option<u64>,
     #[schemars(description = "Year filter, e.g. '>2020', '2023', '>=2021'")]
     year: Option<String>,
+    #[schemars(
+        description = "When true (default), include the matched chunk_text in each hit. Set false for a metadata-only response — useful when an agent is ranking/deduping large result sets (e.g. building a DOI catalog) and the passages would overflow its context window. Score and ranking are unaffected."
+    )]
+    include_text: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+struct DistillSearchHitOut {
+    doc_id: String,
+    title: Option<String>,
+    authors: Vec<String>,
+    year: Option<u64>,
+    doi: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_text: Option<String>,
+    score: f32,
+    pdf_path: Option<String>,
+    line_start: usize,
+    line_end: usize,
+    page: Option<usize>,
+    category: Option<String>,
+}
+
+fn map_distill_search_hits(
+    hits: Vec<hs_distill::client::SearchHit>,
+    include_text: bool,
+) -> Vec<DistillSearchHitOut> {
+    hits.into_iter()
+        .map(|h| DistillSearchHitOut {
+            doc_id: h.doc_id,
+            title: h.title,
+            authors: h.authors,
+            year: h.year,
+            doi: h.doi,
+            chunk_text: include_text.then_some(h.chunk_text),
+            score: h.score,
+            pdf_path: h.pdf_path,
+            line_start: h.line_start,
+            line_end: h.line_end,
+            page: h.page,
+            category: h.category,
+        })
+        .collect()
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -350,14 +393,6 @@ struct PersonalReindexParams {
     stem: String,
 }
 
-/// Format a `SystemTime` as an RFC3339 UTC string. Used by `catalog_repair`
-/// to stamp per-object timestamps drawn from storage `last_modified` instead
-/// of a shared batch `now()` — which was the root cause of the `catalog_recent`
-/// "all rows on one nanosecond" anomaly.
-fn system_time_to_rfc3339(t: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
-}
-
 // ── OpenAlex DuckDB helpers ─────────────────────────────────────
 
 fn openalex_unavailable_error() -> String {
@@ -395,7 +430,30 @@ fn open_openalex_readonly() -> anyhow::Result<duckdb::Connection> {
     }
     let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
     let conn = duckdb::Connection::open_with_flags(&db_path, cfg)?;
+    // Cap query memory so a single bad FTS call can't OOM-kill the entire
+    // mcp process and trigger a systemd restart loop. `match_bm25` on
+    // multi-term queries with common terms builds an ~11M-row intermediate
+    // CTE; under the default unlimited budget DuckDB tries to materialize
+    // it and the kernel OOM-killer fires. With a cap, DuckDB plans
+    // conservatively and either completes or raises a recoverable
+    // "Out of Memory" that surfaces cleanly to the MCP client.
+    conn.execute_batch("SET memory_limit='4GB';")?;
     Ok(conn)
+}
+
+/// Probe whether the OpenAlex corpus has finished its end-to-end build
+/// (load, indexes, FTS). The signal is a single row in `_corpus_state`
+/// keyed `openalex_works`, written by `OpenAlexDb::build_fts` only after
+/// the FTS index is persisted. Returns `false` if the table doesn't exist
+/// (older DB from before the gate landed) or has no row — both mean
+/// "not ready, don't expose the openalex_* tools yet."
+fn is_openalex_corpus_ready(conn: &duckdb::Connection) -> bool {
+    let result: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM _corpus_state WHERE component = 'openalex_works'",
+        [],
+        |row| row.get(0),
+    );
+    matches!(result, Ok(n) if n > 0)
 }
 
 /// Run an OpenAlex SQL query inside spawn_blocking, return rows serialized as
@@ -439,7 +497,7 @@ fn collect_rows_json(
     let mut rows = stmt.query(params).map_err(|e| format!("query: {e}"))?;
     let cols: Vec<String> = rows
         .as_ref()
-        .map(|s| s.column_names().into_iter().map(String::from).collect())
+        .map(|s| s.column_names().into_iter().collect())
         .unwrap_or_default();
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(|e| format!("next: {e}"))? {
@@ -555,7 +613,11 @@ impl HomeStillMcp {
         // Config is the sole source of server URLs. To route through the
         // gateway, set the gateway URL explicitly in config (e.g.
         // `servers: [https://gateway.example/gateway/scribe]`).
-        let scribe_servers = scribe_cfg.servers.clone();
+        // hs-mcp only needs URLs (health fanout + ScribeClient::new). The
+        // per-server backend metadata in `ScribeServerEntry` is consumed
+        // by the scribe-chain dispatcher in `cmd_watch_events`, not here.
+        let scribe_servers: Vec<String> =
+            scribe_cfg.servers.iter().map(|e| e.url.clone()).collect();
         let distill_servers = distill_cfg.servers.clone();
 
         // Best-effort open of the local OpenAlex DuckDB. Missing config section
@@ -568,6 +630,41 @@ impl HomeStillMcp {
             })
             .ok()
             .map(|conn| Arc::new(std::sync::Mutex::new(conn)));
+
+        // Gate: check the readiness sentinel BEFORE building the tool
+        // router. If the openalex corpus isn't fully loaded + indexed + FTS'd,
+        // strip the 5 `openalex_*` tools from the router so they don't show
+        // up in tools/list — preventing downstream agents from calling them
+        // and getting empty/partial results during a migration window. The
+        // gate evaluates once at server startup; Phase 6 of the migration
+        // restarts hs-serve-mcp, which re-evaluates against the now-set
+        // sentinel and re-exposes the tools.
+        let openalex_corpus_ready = openalex_db
+            .as_ref()
+            .map(|arc| {
+                let conn = arc.lock().unwrap();
+                is_openalex_corpus_ready(&conn)
+            })
+            .unwrap_or(false);
+
+        let mut tool_router = Self::tool_router();
+        if !openalex_corpus_ready {
+            for name in [
+                "openalex_search",
+                "openalex_get",
+                "openalex_references",
+                "openalex_citations",
+                "openalex_authors_by_topic",
+            ] {
+                tool_router.remove_route(name);
+            }
+            tracing::info!(
+                "openalex corpus not ready (no _corpus_state sentinel); 5 openalex_* tools hidden \
+                 from tools/list — restart hs-serve-mcp after `hs openalex build-fts` to expose them"
+            );
+        } else {
+            tracing::info!("openalex corpus ready; openalex_* tools enabled");
+        }
 
         Ok(Self {
             storage,
@@ -582,7 +679,7 @@ impl HomeStillMcp {
             scribe_convert_timeout: std::time::Duration::from_secs(scribe_cfg.convert_timeout_secs),
             distill_servers,
             openalex_db,
-            tool_router: Self::tool_router(),
+            tool_router,
             prompt_router: Self::prompt_router(),
         })
     }
@@ -858,6 +955,7 @@ impl HomeStillMcp {
             conversion_failed: None,
             embedding: None,
             embedding_skip: None,
+            abstract_embed: None,
             repair: None,
             category: None,
             original_format: None,
@@ -929,14 +1027,22 @@ impl HomeStillMcp {
                 let embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
                 let embedding_skipped = cat.embedding_skip.is_some();
                 let repaired = cat.repair.is_some();
+                // `corrupted` mirrors the `corrupted_pdfs` counter in
+                // system_status — the catalog row was stamped
+                // `conversion_failed` because the source bytes are not a
+                // valid PDF (paywall HTML stub, truncated download, etc.).
+                let corrupted = cat.conversion_failed.is_some();
+                let doi = cat.doi.clone().unwrap_or_default();
                 serde_json::json!({
                     "stem": stem,
                     "title": title,
+                    "doi": doi,
                     "downloaded": downloaded,
                     "converted": converted,
                     "embedded": embedded,
                     "embedding_skipped": embedding_skipped,
                     "repaired": repaired,
+                    "corrupted": corrupted,
                 })
             })
             .collect();
@@ -1101,20 +1207,19 @@ impl HomeStillMcp {
     )]
     async fn catalog_repair(
         &self,
-        Parameters(mut p): Parameters<CatalogRepairParams>,
+        Parameters(p): Parameters<CatalogRepairParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        // rc.306 P0-6: MCP is a read-only surface. Any client-supplied
-        // `dry_run=false` is ignored; the apply path lives in the CLI.
+        // rc.306 P0-6: MCP is a read-only surface. This handler is
+        // dry-run ONLY — the apply path lives in the CLI. A client-
+        // supplied `dry_run=false` is acknowledged in the response so
+        // the caller knows no writes happened.
         let client_wanted_apply = !p.dry_run;
-        p.dry_run = true;
-        let _ = client_wanted_apply; // surfaced in the response via hint
-                                     // One shared pass over all three prefixes — 3 concurrent LISTs and
-                                     // bounded-concurrency parallel GETs of every catalog YAML. Replaces
-                                     // the pre-fix "7 serial scans × (1 LIST + N serial GETs)" shape
-                                     // whose cost at 3k+ rows exceeded the MCP 4-minute client budget
-                                     // even under dry_run. Every scan below reads the same snapshot, so
-                                     // dry-run and live-repair walk identical scan code.
+        // One shared pass over all three prefixes — 3 concurrent LISTs and
+        // bounded-concurrency parallel GETs of every catalog YAML. Replaces
+        // the pre-fix "7 serial scans × (1 LIST + N serial GETs)" shape
+        // whose cost at 3k+ rows exceeded the MCP 4-minute client budget
+        // even under dry_run.
         let progress_token = context.meta.get_progress_token();
         let peer = context.peer.clone();
 
@@ -1293,427 +1398,48 @@ impl HomeStillMcp {
             .map(|r| serde_json::json!({ "stem": r.stem, "source_ext": r.source_ext }))
             .collect();
 
-        if p.dry_run {
-            return Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "dry_run": true,
-                "disk_no_catalog": {
-                    "orphans_found": disk_total,
-                    "would_repair": disk_orphans.iter().take(limit).count(),
-                    "samples": disk_samples,
-                },
-                "catalog_no_markdown": {
-                    "orphans_found": md_total,
-                    "would_clear_conversion": md_orphans.iter().take(limit).count(),
-                    "samples": md_samples,
-                },
-                "catalog_no_source": {
-                    "orphans_found": phantom_total,
-                    "would_delete": phantom_orphans.iter().take(limit).count(),
-                    "samples": phantom_samples,
-                },
-                "flag_drift": {
-                    "drift_found": drift_total,
-                    "would_backfill_conversion": drift_conversion_total.min(limit),
-                    "would_backfill_downloaded_at": drift_download_total.min(limit),
-                    "samples": drift_samples,
-                },
-                "flag_drift_resync": {
-                    "candidates_found": resync_total,
-                    "would_resync_downloaded_at": resync_download_total.min(limit),
-                    "would_resync_conversion": resync_conversion_total.min(limit),
-                    "samples": resync_samples,
-                },
-                "md_path_drift": {
-                    "drift_found": md_path_drift_total,
-                    "would_rewrite": md_path_drift_rows.iter().take(limit).count(),
-                    "samples": md_path_drift_samples,
-                },
-                "stuck_convert": {
-                    "stuck_found": stuck_total,
-                    "would_emit": stuck_rows.iter().take(limit).count(),
-                    "pdf_candidates": stuck_pdf,
-                    "html_candidates": stuck_html,
-                    "samples": stuck_samples,
-                },
-            }))
-            .unwrap_or_default());
-        }
-
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut disk_repaired = 0u64;
-        let mut md_cleared = 0u64;
-        let mut phantom_deleted = 0u64;
-        let mut errors: Vec<String> = Vec::new();
-
-        // Forward repair: synthesize catalog rows for disk orphans.
-        for (stem, ext) in disk_orphans.iter().take(limit) {
-            let mut entry = hs_common::catalog::read_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                stem,
-            )
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default();
-            if entry.pdf_path.is_none() {
-                entry.pdf_path = Some(format!(
-                    "{}/{}",
-                    self.papers_prefix,
-                    hs_common::sharded_key(stem, ext)
-                ));
-            }
-            entry.repair = Some(hs_common::catalog::RepairMeta {
-                repaired_at: now.clone(),
-                reason: format!("orphan {ext} on disk with no catalog row"),
-            });
-            match hs_common::catalog::write_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                stem,
-                &entry,
-            )
-            .await
-            {
-                Ok(()) => disk_repaired += 1,
-                Err(e) => errors.push(format!("disk/{stem}: {e}")),
-            }
-        }
-
-        // Reverse repair: clear stale conversion/embedding blocks AND purge
-        // any Qdrant vectors for the doc_id. Clearing the catalog flag
-        // without purging Qdrant is the 2026-04-18 ghost-chunk class of
-        // bug — the catalog says "not converted" while Qdrant still serves
-        // stale chunks from the deleted markdown. We keep downloaded_at /
-        // sha256 / file_size_bytes untouched — that data is still
-        // authoritative and lets the convert queue re-pick the row without
-        // re-downloading.
-        let distill_client_for_purge = self.distill_client().map_err(|e| e.to_string())?;
-        let mut md_qdrant_purged = 0u64;
-        for stem in md_orphans.iter().take(limit) {
-            let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                stem,
-            )
-            .await
-            .map_err(|e| e.to_string())?
-            else {
-                errors.push(format!("md/{stem}: catalog entry vanished mid-repair"));
-                continue;
-            };
-            entry.conversion = None;
-            entry.embedding = None;
-            entry.embedding_skip = None;
-            entry.repair = Some(hs_common::catalog::RepairMeta {
-                repaired_at: now.clone(),
-                reason: "catalog claimed converted but markdown missing — cleared + Qdrant purged"
-                    .into(),
-            });
-            match hs_common::catalog::write_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                stem,
-                &entry,
-            )
-            .await
-            {
-                Ok(()) => md_cleared += 1,
-                Err(e) => {
-                    errors.push(format!("md/{stem}: {e}"));
-                    continue;
-                }
-            }
-            // Best-effort Qdrant purge. A failure here doesn't roll back the
-            // catalog clear — the next distill_reconcile will surface any
-            // ghost chunks that slipped through, and the catalog change is
-            // the load-bearing invariant.
-            if let Some(ref client) = distill_client_for_purge {
-                match client.delete_doc(stem).await {
-                    Ok(n) if n > 0 => {
-                        md_qdrant_purged += n;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("md-orphan qdrant purge {stem} failed: {e}");
-                    }
-                }
-            }
-        }
-
-        // Phantom purge: catalog YAMLs with no backing paper file AND no
-        // markdown. These have nowhere to be reconstructed from, so the
-        // row itself is the orphan — delete it outright.
-        for stem in phantom_orphans.iter().take(limit) {
-            match hs_common::catalog::delete_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                stem,
-            )
-            .await
-            {
-                Ok(()) => phantom_deleted += 1,
-                Err(e) => errors.push(format!("phantom/{stem}: {e}")),
-            }
-        }
-
-        // Flag-drift repair: backfill the missing stage flag using the
-        // storage evidence. We can't recover the real conversion duration /
-        // page count that the original convert would have stamped — we
-        // record that the metadata came from repair so operators can tell
-        // organic stamps from repair stamps, and re-run `distill_reindex`
-        // if they need accurate page offsets.
-        //
-        // Stamp values come from the source object's `last_modified` (S3
-        // LastModified / fs mtime) — NOT a shared batch `now()`. The prior
-        // behavior collapsed every repaired row onto one nanosecond, which
-        // poisoned `catalog_recent` for gap detection. `now` is used only
-        // for `RepairMeta.repaired_at`, which legitimately reflects when
-        // the repair itself ran.
-        let mut drift_conversion_repaired = 0u64;
-        let mut drift_download_repaired = 0u64;
-        for row in drift_rows.iter().take(limit) {
-            let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &row.stem,
-            )
-            .await
-            .map_err(|e| e.to_string())?
-            else {
-                errors.push(format!(
-                    "drift/{}: catalog entry vanished mid-repair",
-                    row.stem
-                ));
-                continue;
-            };
-            let mut changed = false;
-            if row.conversion_missing_with_markdown && entry.conversion.is_none() {
-                let converted_at = row
-                    .markdown_last_modified
-                    .map(system_time_to_rfc3339)
-                    .unwrap_or_else(|| now.clone());
-                entry.conversion = Some(hs_common::catalog::ConversionMeta {
-                    server: "catalog_repair:flag_drift".to_string(),
-                    duration_secs: 0.0,
-                    total_pages: 0,
-                    converted_at,
-                    pages: Vec::new(),
-                });
-                drift_conversion_repaired += 1;
-                changed = true;
-            }
-            if row.download_stamp_missing_with_source && entry.downloaded_at.is_none() {
-                let downloaded_at = row
-                    .source_last_modified
-                    .map(system_time_to_rfc3339)
-                    .unwrap_or_else(|| now.clone());
-                entry.downloaded_at = Some(downloaded_at);
-                drift_download_repaired += 1;
-                changed = true;
-            }
-            if changed {
-                entry.repair = Some(hs_common::catalog::RepairMeta {
-                    repaired_at: now.clone(),
-                    reason: "flag_drift backfill — storage had evidence the catalog flags didn't"
-                        .to_string(),
-                });
-                if let Err(e) = hs_common::catalog::write_catalog_entry_via(
-                    &*self.storage,
-                    &self.catalog_prefix,
-                    &row.stem,
-                    &entry,
-                )
-                .await
-                {
-                    errors.push(format!("drift/{}: {e}", row.stem));
-                }
-            }
-        }
-
-        // Flag-drift-resync: for rows whose timestamps still carry a prior
-        // batch `now()` stamp, rewrite `downloaded_at` / synthetic Convert
-        // `converted_at` to the storage `last_modified`. Leaves `entry.repair`
-        // intact so the audit trail of "this came from a backfill" survives.
-        let mut resync_download_repaired = 0u64;
-        let mut resync_conversion_repaired = 0u64;
-        for row in resync_rows.iter().take(limit) {
-            let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &row.stem,
-            )
-            .await
-            .map_err(|e| e.to_string())?
-            else {
-                errors.push(format!(
-                    "resync/{}: catalog entry vanished mid-repair",
-                    row.stem
-                ));
-                continue;
-            };
-            // Re-verify the fingerprint on the freshly-read entry — guards
-            // against the row being rewritten by another process between scan
-            // and repair.
-            let Some(repair_at) = entry.repair.as_ref().map(|r| r.repaired_at.clone()) else {
-                continue;
-            };
-            let mut changed = false;
-            if let Some(mtime) = row.resync_download {
-                if entry.downloaded_at.as_deref() == Some(repair_at.as_str()) {
-                    entry.downloaded_at = Some(system_time_to_rfc3339(mtime));
-                    resync_download_repaired += 1;
-                    changed = true;
-                }
-            }
-            if let Some(mtime) = row.resync_conversion {
-                if let Some(conv) = entry.conversion.as_mut() {
-                    if conv.server == "catalog_repair:flag_drift" && conv.converted_at == repair_at
-                    {
-                        conv.converted_at = system_time_to_rfc3339(mtime);
-                        resync_conversion_repaired += 1;
-                        changed = true;
-                    }
-                }
-            }
-            if changed {
-                if let Err(e) = hs_common::catalog::write_catalog_entry_via(
-                    &*self.storage,
-                    &self.catalog_prefix,
-                    &row.stem,
-                    &entry,
-                )
-                .await
-                {
-                    errors.push(format!("resync/{}: {e}", row.stem));
-                }
-            }
-        }
-
-        // Md-path-drift repair: rewrite `markdown_path` to the real storage
-        // key. Non-destructive — does not touch markdown objects or Qdrant.
-        // Eliminates the 2026-04 ghost-orphan class where every reconcile
-        // was re-probing a stale path and burning two HEADs per doc_id.
-        let mut md_path_drift_repaired = 0u64;
-        for d in md_path_drift_rows.iter().take(limit) {
-            let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &d.stem,
-            )
-            .await
-            .map_err(|e| e.to_string())?
-            else {
-                errors.push(format!(
-                    "md_path_drift/{}: catalog entry vanished mid-repair",
-                    d.stem
-                ));
-                continue;
-            };
-            entry.markdown_path = Some(d.resolved_path.clone());
-            entry.repair = Some(hs_common::catalog::RepairMeta {
-                repaired_at: now.clone(),
-                reason: format!(
-                    "md_path_drift: rewrote markdown_path '{}' → '{}'",
-                    d.stale_path, d.resolved_path
-                ),
-            });
-            match hs_common::catalog::write_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &d.stem,
-                &entry,
-            )
-            .await
-            {
-                Ok(()) => md_path_drift_repaired += 1,
-                Err(e) => errors.push(format!("md_path_drift/{}: {e}", d.stem)),
-            }
-        }
-
-        // Stuck-convert repair: purge any residual Qdrant vectors for the
-        // doc_id (Type A ghost chunks from a prior cycle whose markdown was
-        // deleted), then publish `papers.ingested`. `hs scribe watch-events`
-        // picks it up, converts, emits `scribe.completed`; `hs distill
-        // watch-events` then indexes. Both daemons must be running on the
-        // GPU host for this to drain — document in deployment.md.
-        let stuck_limit = limit;
-        let mut stuck_emitted = 0u64;
-        let mut stuck_qdrant_purged: u64 = 0;
-        for row in stuck_rows.iter().take(stuck_limit) {
-            if let Some(ref client) = distill_client_for_purge {
-                match client.delete_doc(&row.stem).await {
-                    Ok(n) => stuck_qdrant_purged += n,
-                    Err(e) => {
-                        errors.push(format!("stuck-purge/{}: {e}", row.stem));
-                    }
-                }
-            }
-            let source_key = format!(
-                "{}/{}",
-                self.papers_prefix.trim_end_matches('/'),
-                hs_common::sharded_key(&row.stem, &row.source_ext)
-            );
-            let payload = serde_json::json!({
-                "key": source_key,
-                "source": "catalog_repair:stuck_convert",
-            });
-            match self
-                .events
-                .publish(
-                    "papers.ingested",
-                    serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
-                )
-                .await
-            {
-                Ok(()) => stuck_emitted += 1,
-                Err(e) => errors.push(format!("stuck-emit/{}: {e}", row.stem)),
-            }
-        }
-
         Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "dry_run": false,
+            "dry_run": true,
+            "requested_apply_ignored": client_wanted_apply,
             "disk_no_catalog": {
                 "orphans_found": disk_total,
-                "repaired": disk_repaired,
+                "would_repair": disk_orphans.iter().take(limit).count(),
                 "samples": disk_samples,
             },
             "catalog_no_markdown": {
                 "orphans_found": md_total,
-                "cleared": md_cleared,
-                "qdrant_points_purged": md_qdrant_purged,
+                "would_clear_conversion": md_orphans.iter().take(limit).count(),
                 "samples": md_samples,
             },
             "catalog_no_source": {
                 "orphans_found": phantom_total,
-                "deleted": phantom_deleted,
+                "would_delete": phantom_orphans.iter().take(limit).count(),
                 "samples": phantom_samples,
             },
             "flag_drift": {
                 "drift_found": drift_total,
-                "conversion_backfilled": drift_conversion_repaired,
-                "downloaded_at_backfilled": drift_download_repaired,
+                "would_backfill_conversion": drift_conversion_total.min(limit),
+                "would_backfill_downloaded_at": drift_download_total.min(limit),
                 "samples": drift_samples,
             },
             "flag_drift_resync": {
                 "candidates_found": resync_total,
-                "downloaded_at_resynced": resync_download_repaired,
-                "conversion_resynced": resync_conversion_repaired,
+                "would_resync_downloaded_at": resync_download_total.min(limit),
+                "would_resync_conversion": resync_conversion_total.min(limit),
                 "samples": resync_samples,
             },
             "md_path_drift": {
                 "drift_found": md_path_drift_total,
-                "rewritten": md_path_drift_repaired,
+                "would_rewrite": md_path_drift_rows.iter().take(limit).count(),
                 "samples": md_path_drift_samples,
             },
             "stuck_convert": {
                 "stuck_found": stuck_total,
-                "emitted": stuck_emitted,
-                "qdrant_points_purged": stuck_qdrant_purged,
+                "would_emit": stuck_rows.iter().take(limit).count(),
                 "pdf_candidates": stuck_pdf,
                 "html_candidates": stuck_html,
                 "samples": stuck_samples,
             },
-            "errors": errors,
         }))
         .unwrap_or_default())
     }
@@ -2073,8 +1799,12 @@ impl HomeStillMcp {
         // Dispatch by source type — one path per file extension. No
         // fallback between types; if the named source isn't present, we
         // error loudly instead of silently converting something else.
-        let (md, per_page_region_classes, source_key, server_label) =
+        let (md, per_page_region_classes, source_key, server_label, source_pages) =
             if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await {
+                // Count before the bytes move into the converter; olmocr
+                // returns one flat blob, so this is the only page-count
+                // ground truth this path will get.
+                let source_pages = hs_scribe::pdf_meta::count_pages(&pdf_bytes);
                 let client = self
                     .scribe_client()
                     .map_err(|e| e.to_string())?
@@ -2115,16 +1845,17 @@ impl HomeStillMcp {
                     conversion.per_page_region_classes,
                     pdf_key,
                     "scribe-vlm".to_string(),
+                    source_pages,
                 )
             } else if let Ok(html_bytes) = self.storage.get(&html_key).await {
                 let html = String::from_utf8(html_bytes)
                     .map_err(|e| format!("HTML at {html_key} is not valid UTF-8: {e}"))?;
                 let md = hs_scribe::html::convert_html_to_markdown(&html);
-                (md, Vec::new(), html_key, "html-parser".to_string())
+                (md, Vec::new(), html_key, "html-parser".to_string(), None)
             } else if let Ok(epub_bytes) = self.storage.get(&epub_key).await {
                 let md = hs_scribe::epub::convert_epub_to_markdown(&epub_bytes)
                     .map_err(|e| format!("EPUB parse failed for {epub_key}: {e}"))?;
-                (md, Vec::new(), epub_key, "epub-parser".to_string())
+                (md, Vec::new(), epub_key, "epub-parser".to_string(), None)
             } else {
                 return Err(format!(
                 "No PDF, HTML, or EPUB found for '{}' (tried {pdf_key}, {html_key}, {epub_key})",
@@ -2140,8 +1871,27 @@ impl HomeStillMcp {
             tracing::info!("{}: cleaned {} repetition site(s)", p.stem, truncations);
         }
 
+        // A conversion with no embeddable content is a failed conversion.
+        // Mirrors the daemon gate in hs-scribe's convert_and_upload: no
+        // markdown written, no catalog row, no scribe.completed.
+        if !hs_common::quality::has_indexable_content(&md) {
+            return Err(format!(
+                "{}: converted to {} non-whitespace chars, below the {}-char indexable floor — not persisted",
+                p.stem,
+                hs_common::quality::non_whitespace_len(&md),
+                hs_common::quality::MIN_INDEXABLE_NON_WS,
+            ));
+        }
+
         let page_offsets = hs_common::catalog::compute_page_offsets(&md);
-        let total_pages = page_offsets.len() as u64;
+        let accounting =
+            hs_common::catalog::resolve_page_accounting(page_offsets.len() as u64, source_pages);
+        let total_pages = accounting.total_pages;
+        let page_offsets = if accounting.offsets_trustworthy {
+            page_offsets
+        } else {
+            Vec::new()
+        };
         let per_page_is_bibliography: Vec<bool> = (0..per_page_truncations.len())
             .map(|i| {
                 per_page_region_classes
@@ -2186,6 +1936,8 @@ impl HomeStillMcp {
             total_pages,
             page_offsets,
             &md_key,
+            None,
+            Vec::new(),
         )
         .await
         .map_err(|e| format!("Failed to update catalog for '{}': {e}", p.stem))?;
@@ -2225,7 +1977,7 @@ impl HomeStillMcp {
     // ── Distill Tools ──────────────────────────────────────────
 
     #[tool(
-        description = "Semantic search across indexed academic documents. Returns ranked results with text snippets, metadata, and relevance scores.",
+        description = "Semantic search across indexed academic documents. Returns ranked results with text snippets, metadata, and relevance scores. Pass include_text=false to omit chunk_text from each hit — a metadata-only response that lets an agent rank/dedupe large result sets (e.g. build a DOI catalog) without the passages overflowing its context window. Score and ranking are unaffected.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2252,8 +2004,54 @@ impl HomeStillMcp {
             .search(&p.query, p.limit.unwrap_or(10), filters)
             .await
         {
-            Ok(hits) => Ok(serde_json::to_string_pretty(&hits).unwrap_or_default()),
+            Ok(hits) => {
+                let include_text = p.include_text.unwrap_or(true);
+                let out = map_distill_search_hits(hits, include_text);
+                Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
+            }
             Err(e) => Err(format!("Search failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Semantic search over downloaded papers' abstracts. Targets the `paper_abstracts` Qdrant collection — one point per paper (not per chunk), embedded from `{title}\\n\\n{abstract}` where the abstract is sourced from the local OpenAlex catalog (preferred), the converted markdown's `## Abstract` section (fallback), or the title alone (last resort). Higher-precision than `distill_search` for 'find me the paper that argues X' queries because body-section noise (methods, references, citations) is excluded. Returns ranked hits with score, title, doi, year, and the embedded abstract text.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn abstract_search(
+        &self,
+        Parameters(p): Parameters<DistillSearchParams>,
+    ) -> Result<String, String> {
+        let client = self
+            .distill_client()
+            .map_err(|e| e.to_string())?
+            .ok_or("No distill server configured")?;
+
+        let filters = hs_distill::client::SearchFilters {
+            year: p.year,
+            topic: None,
+            category: None,
+        };
+
+        match client
+            .search_in(
+                &p.query,
+                p.limit.unwrap_or(10),
+                filters,
+                Some("paper_abstracts"),
+            )
+            .await
+        {
+            Ok(hits) => {
+                let include_text = p.include_text.unwrap_or(true);
+                let out = map_distill_search_hits(hits, include_text);
+                Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
+            }
+            Err(e) => Err(format!("abstract_search failed: {e}")),
         }
     }
 
@@ -2930,12 +2728,17 @@ impl HomeStillMcp {
             "year" => "ORDER BY publication_year DESC NULLS LAST, bm25 DESC",
             _ => "ORDER BY bm25 DESC",
         };
+        // `conjunctive := 1` requires every query term to appear in the doc.
+        // Without it (default disjunctive), a multi-term query against a
+        // 56M-row corpus matches millions of docs and DuckDB's BM25
+        // implementation OOMs trying to score them all. Conjunctive matches
+        // are also the semantics users actually want for multi-word search.
         let sql = format!(
             r#"
             WITH ranked AS (
               SELECT
                 openalex_id, doi, title, publication_year, cited_by_count,
-                fts_main_works.match_bm25(openalex_id, ?) AS bm25
+                fts_main_works.match_bm25(openalex_id, ?, conjunctive := 1) AS bm25
               FROM works
             )
             SELECT openalex_id, doi, title, publication_year, cited_by_count, bm25
@@ -3003,7 +2806,7 @@ impl HomeStillMcp {
                     .map_err(|e| format!("query: {e}"))?;
                 let cols: Vec<String> = rows
                     .as_ref()
-                    .map(|s| s.column_names().into_iter().map(String::from).collect())
+                    .map(|s| s.column_names().into_iter().collect())
                     .unwrap_or_default();
                 if let Some(row) = rows.next().map_err(|e| format!("next: {e}"))? {
                     Some(row_to_json(row, &cols)?)
@@ -3358,20 +3161,33 @@ impl HomeStillMcp {
         )
         .await;
 
-        // Pipeline drift: source documents that haven't produced markdown
-        // yet. Saturating subtraction so stage lag never yields a negative.
-        // Drift = `documents - markdown - in_flight`. By design, catalog
-        // rows stamped `conversion_failed` (surfaced separately as
+        // Pipeline drift: distinct source stems that haven't produced
+        // markdown yet, less whatever is converting right now. Saturating
+        // subtraction so stage lag never yields a negative.
+        //
+        // Counted per *stem*, not per object: a paper stored as both `.pdf`
+        // and `.html` yields one markdown, and markdown whose source was
+        // removed by the DOI-stem lowercasing migration has no source at
+        // all. The old `documents - markdown` object arithmetic charged the
+        // former as backlog and credited the latter against it, holding the
+        // metric at 71 against a threshold of 3 no matter how much the
+        // pipeline converted. See `count_unconverted_stems`.
+        //
+        // By design, catalog rows stamped `conversion_failed` that still
+        // sit in the live papers tree (surfaced separately as
         // `corrupted_pdfs`) are NOT subtracted — drift is meant to surface
         // them too, since failed converts represent stuck pipeline state
         // the operator should see. Values above `pipeline_drift_threshold`
         // indicate either stamped failures or stems that errored without a
         // stamp; check scribe/event-watch logs for the latter.
         let total_in_flight: u64 = scribe_instances.iter().map(|s| s.in_flight).sum();
-        pipeline.pipeline_drift = pipeline
-            .documents
-            .saturating_sub(pipeline.markdown)
-            .saturating_sub(total_in_flight);
+        pipeline.pipeline_drift = hs_common::status::count_unconverted_stems(
+            &*self.storage,
+            &self.papers_prefix,
+            &self.markdown_prefix,
+        )
+        .await
+        .saturating_sub(total_in_flight);
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
         pipeline.corrupted_pdfs = corrupted_pdfs;
         pipeline.inbox_pending = inbox_pending;
@@ -3885,5 +3701,61 @@ mod startup_tests {
             msg.contains("storage"),
             "error should mention storage; got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod distill_search_mapping_tests {
+    use super::map_distill_search_hits;
+    use hs_distill::client::SearchHit;
+
+    fn fixture() -> Vec<SearchHit> {
+        vec![SearchHit {
+            doc_id: "10.1234_test".to_string(),
+            title: Some("Test paper".to_string()),
+            authors: vec!["Doe".to_string()],
+            year: Some(2024),
+            doi: Some("10.1234/test".to_string()),
+            chunk_text: "lorem ipsum dolor sit amet".to_string(),
+            score: 0.87,
+            pdf_path: Some("papers/10/10.1234_test.pdf".to_string()),
+            line_start: 12,
+            line_end: 16,
+            page: Some(3),
+            category: None,
+        }]
+    }
+
+    #[test]
+    fn include_text_true_preserves_chunk_text() {
+        let out = map_distill_search_hits(fixture(), true);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"chunk_text\""), "json: {json}");
+        assert!(json.contains("lorem ipsum"), "json: {json}");
+    }
+
+    #[test]
+    fn include_text_false_omits_chunk_text_key() {
+        let out = map_distill_search_hits(fixture(), false);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            !json.contains("\"chunk_text\""),
+            "chunk_text key should be absent; got: {json}"
+        );
+        assert!(
+            !json.contains("lorem ipsum"),
+            "passage text should not leak; got: {json}"
+        );
+        assert!(json.contains("\"doc_id\":\"10.1234_test\""));
+        assert!(json.contains("\"doi\":\"10.1234/test\""));
+        assert!(json.contains("\"score\":0.87"));
+    }
+
+    #[test]
+    fn empty_input_round_trips() {
+        let full = serde_json::to_string(&map_distill_search_hits(vec![], true)).unwrap();
+        let lite = serde_json::to_string(&map_distill_search_hits(vec![], false)).unwrap();
+        assert_eq!(full, "[]");
+        assert_eq!(lite, "[]");
     }
 }

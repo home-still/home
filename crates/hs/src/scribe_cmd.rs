@@ -37,7 +37,7 @@ async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
         return vec![s.to_string()];
     }
     match ScribeConfig::load() {
-        Ok(cfg) if !cfg.servers.is_empty() => cfg.servers,
+        Ok(cfg) if !cfg.servers.is_empty() => cfg.servers.into_iter().map(|e| e.url).collect(),
         _ => vec![DEFAULT_SERVER.to_string()],
     }
 }
@@ -85,10 +85,6 @@ pub enum ScribeCmd {
         /// Catalog stem (no extension), e.g. `10.48550_arxiv.2312.10997`.
         stem: String,
     },
-    /// Auto-tune `OLLAMA_NUM_PARALLEL` against the local scribe-server's
-    /// observed throughput. Install as a root systemd service via
-    /// `sudo hs serve scribe-autotune --install`.
-    Autotune,
 }
 
 #[derive(Subcommand, Debug)]
@@ -130,16 +126,28 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         }
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
         ScribeCmd::Reconvert { stem } => cmd_reconvert(&stem, reporter).await,
-        ScribeCmd::Autotune => cmd_autotune(reporter).await,
     }
 }
 
-/// Clear `conversion` / `conversion_failed` on a single catalog row and
-/// republish `papers.ingested` so the watcher reconverts it. The terminal-
-/// failure stamp is what stops `list_catalog_stuck_convert` from re-queueing
-/// the source on its own — without this command, a row stamped with
-/// `vlm_repetition_loop` (or any other terminal reason) is permanently
-/// stuck. Operator-driven; CLI-only by design.
+/// Reset every derived artifact for a stem and republish `papers.ingested`
+/// so the watcher reconverts it from the source bytes:
+///
+/// 1. purge the stem's chunks from Qdrant (re-indexing upserts by
+///    `(doc_id, chunk_index)`, so a shorter new conversion would leave
+///    orphaned tail chunks from the old one),
+/// 2. delete the stale markdown object (the watcher's idempotency guard
+///    — "markdown already present; skipping" — would otherwise skip the
+///    reconvert entirely),
+/// 3. clear `conversion` / `conversion_failed` / `embedding` /
+///    `embedding_skip` (the stamps gate the source-scan and the distill
+///    reconcile; left in place they pin the old derived state forever).
+///
+/// Remote purge runs first so a failure aborts before any local state is
+/// destroyed. The terminal-failure stamp is what stops
+/// `list_catalog_stuck_convert` from re-queueing the source on its own —
+/// without this command, a row stamped with `vlm_repetition_loop` (or any
+/// other terminal reason) is permanently stuck. Operator-driven; CLI-only
+/// by design.
 async fn cmd_reconvert(stem: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
     const PAPERS_PREFIX: &str = "papers";
     const CATALOG_PREFIX: &str = "catalog";
@@ -183,9 +191,41 @@ async fn cmd_reconvert(stem: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
         )
     })?;
 
+    // Purge old vectors before touching anything else: if the distill
+    // server is unreachable this aborts with nothing mutated, instead of
+    // leaving a half-reset row whose stale chunks keep matching searches.
+    if entry.embedding.is_some() || entry.embedding_skip.is_some() {
+        let servers = crate::distill_cmd::resolve_servers(None).await;
+        let client = crate::distill_cmd::make_distill_client(&servers[0]).await?;
+        let deleted = client.delete_doc(stem).await.with_context(|| {
+            format!(
+                "purge old Qdrant chunks for {stem} via {} — start the distill \
+                 server (or fix the URL in config) and re-run",
+                servers[0]
+            )
+        })?;
+        reporter.status("Purged", &format!("{deleted} stale chunk(s) for {stem}"));
+    }
+
+    // Delete the stale markdown so the watcher actually reconverts.
+    let md_key = hs_common::markdown::markdown_storage_key(stem);
+    if storage
+        .exists(&md_key)
+        .await
+        .with_context(|| format!("storage exists check for {md_key}"))?
+    {
+        storage
+            .delete(&md_key)
+            .await
+            .with_context(|| format!("delete stale markdown {md_key}"))?;
+    }
+
     let mut cleared = entry;
     cleared.conversion = None;
     cleared.conversion_failed = None;
+    cleared.embedding = None;
+    cleared.embedding_skip = None;
+    cleared.markdown_path = None;
     hs_common::catalog::write_catalog_entry_via(&*storage, CATALOG_PREFIX, stem, &cleared)
         .await
         .with_context(|| format!("write cleared catalog row for {stem}"))?;
@@ -205,12 +245,6 @@ async fn cmd_reconvert(stem: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_autotune(_reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let cfg = hs_scribe::config::ScribeConfig::load()
-        .map_err(|e| anyhow::anyhow!("load ScribeConfig: {e}"))?;
-    hs_scribe::ollama_tuner::run_forever(cfg.autotune).await
-}
-
 /// Strip the path + extension off a NATS `papers.ingested` event key to
 /// recover the catalog stem. `"papers/10/10.1007_s001.pdf"` →
 /// `Some("10.1007_s001")`. Used when stamping `conversion_failed` on
@@ -224,42 +258,103 @@ fn stem_from_event_key(key: &str) -> Option<String> {
     Some(stem.to_string())
 }
 
-/// Classify a permanent convert error into a short catalog-friendly reason
-/// token. The scribe HTTP server returns HTTP 415 + body
+/// Classified outcome of a convert failure, consumed by the scribe-chain
+/// dispatcher in `cmd_watch_events`.
+///
+/// `Permanent` means the source content is intrinsically unconvertable —
+/// HTML masquerading as PDF, a structurally broken PDF, a paywall. No
+/// other VLM backend will succeed on the same input, so the chain stops
+/// and `conversion_failed` is stamped immediately.
+///
+/// `Escalate` means a VLM-class failure: the current backend rejected
+/// the content (e.g. GLM-OCR's per-region repetition detector aborted on
+/// code-dense pages) but a different backend may handle it (e.g. olmocr
+/// with text-layer anchoring). The dispatcher should try the next
+/// backend in `ScribeConfig.servers` and only stamp `conversion_failed`
+/// when the chain is fully exhausted.
+///
+/// Both variants carry the catalog-friendly reason token so the stamp
+/// is consistent whether it lands immediately (Permanent) or after the
+/// chain runs dry (Escalate).
+pub(crate) enum ConvertClassification {
+    Permanent(String),
+    Escalate(String),
+}
+
+impl ConvertClassification {
+    /// Catalog-friendly reason token, regardless of variant. Used when
+    /// the caller needs the string but doesn't care about chain semantics
+    /// (e.g. when logging or when the chain has only one backend so
+    /// Escalate degenerates to Permanent).
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Self::Permanent(r) | Self::Escalate(r) => r,
+        }
+    }
+}
+
+/// Classify a convert failure as Permanent (stop chain) or Escalate
+/// (try next backend). The scribe HTTP server returns HTTP 415 + body
 /// `unsupported_content_type:{html,binary}` for content-type mismatches
 /// (see `hs-scribe/src/server.rs::verify_pdf_content`). PDF parse errors
 /// surface as `FormatError` / `Invalid image size` / `PdfiumLibrary` in
 /// the error chain. HTML paywall rejection embeds "paywall" in the
-/// message. Anything else we tag generically so the operator sees the
-/// full chain in the log but the catalog still gets a stamp.
-fn classify_permanent_reason(err: &anyhow::Error) -> String {
+/// message. VLM-class failures (`VLM repetition loop`, mid-stream
+/// `connection closed before message completed`) are Escalate so the
+/// next backend can take a swing.
+pub(crate) fn classify_convert_failure(err: &anyhow::Error) -> ConvertClassification {
     let msg = format!("{err:#}");
-    if msg.contains("unsupported_content_type:html") {
-        "unsupported_content_type:html".to_string()
-    } else if msg.contains("unsupported_content_type:binary") {
-        "unsupported_content_type:binary".to_string()
-    } else if msg.contains("paywall") {
-        "paywall_html".to_string()
-    } else if msg.contains("FormatError")
-        || msg.contains("Invalid image size")
-        || msg.contains("PdfiumLibrary")
-    {
-        "pdf_parse_error".to_string()
-    } else if msg.contains("EPUB parse failed") {
-        "epub_parse_error".to_string()
-    } else if msg.contains("not valid UTF-8") {
-        "html_not_utf8".to_string()
-    } else if msg.contains("unsupported source type") {
-        "unsupported_extension".to_string()
-    } else if msg.contains("VLM repetition loop") {
-        // event_watch.rs's QC stamps `vlm_repetition_loop` directly
-        // before returning the Permanent error. Mirror that reason here
-        // so the outer-handler stamp doesn't clobber the inner one with
-        // a generic label.
-        "vlm_repetition_loop".to_string()
-    } else {
-        "permanent_convert_failure".to_string()
+    match hs_scribe::classify::classify_failure(&msg) {
+        hs_scribe::classify::FailureClass::Permanent(reason) => {
+            ConvertClassification::Permanent(reason.to_string())
+        }
+        hs_scribe::classify::FailureClass::Escalate(reason) => {
+            ConvertClassification::Escalate(reason.to_string())
+        }
+        // This arm only fires for errors that arrived as
+        // HandlerError::Permanent yet match no table entry — the handler
+        // positively identified them as non-retriable, so escalating is
+        // the safe default: the next backend may succeed for a reason we
+        // haven't catalogued yet, and the chain naturally terminates if
+        // every backend rejects.
+        hs_scribe::classify::FailureClass::Transient => {
+            ConvertClassification::Escalate("permanent_convert_failure".to_string())
+        }
     }
+}
+
+/// Distinct backend names from the configured server list, in config order
+/// of first appearance. This is the escalation chain order: the dispatcher
+/// tries a paper on tier `[0]`'s backend first and falls through to `[1]`,
+/// `[2]`, … on a VLM-class `Escalate`. Duplicates collapse so N same-backend
+/// hosts form ONE tier (least-loaded within it), not N chain steps — the
+/// pre-rc.346 flat chain treated every host as its own step and serialized
+/// papers onto the first one.
+pub(crate) fn backend_tier_order(labelled_servers: &[(String, String, usize)]) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for (_, backend, _) in labelled_servers {
+        if !order.iter().any(|b| b == backend) {
+            order.push(backend.clone());
+        }
+    }
+    order
+}
+
+/// Per-backend concurrency ceiling: the sum of the configured `concurrency`
+/// of every server entry on that backend, floored at 1. This — NOT the hosts'
+/// advertised VLM slot counts — is the tier's dispatch cap, so a heavy model
+/// (olmocr) honors its config `concurrency: 2` instead of fanning out to the
+/// advertised 12 slots and thrashing the host into false `olmocr_zero_pages`.
+pub(crate) fn backend_tier_cap(
+    labelled_servers: &[(String, String, usize)],
+    backend: &str,
+) -> usize {
+    labelled_servers
+        .iter()
+        .filter(|(_, b, _)| b == backend)
+        .map(|(_, _, c)| *c)
+        .sum::<usize>()
+        .max(1)
 }
 
 pub(crate) async fn cmd_watch_events(
@@ -275,124 +370,283 @@ pub(crate) async fn cmd_watch_events(
     let storage = cfg.build_storage()?;
     let bus = cfg.build_event_bus().await?;
 
-    let servers: Vec<String> = match server_override {
-        Some(s) => vec![s],
-        None if !cfg.servers.is_empty() => cfg.servers.clone(),
-        None => vec![DEFAULT_SERVER.to_string()],
-    };
     let convert_timeout = std::time::Duration::from_secs(cfg.convert_timeout_secs);
-    let clients: Vec<ScribeClient> = servers
-        .iter()
-        .map(|u| ScribeClient::new_with_timeout(u, convert_timeout))
-        .collect::<Result<_>>()?;
-    let pool = Arc::new(ServicePool::new(clients));
+    // Resolve the converter servers. CLI `--server` override collapses to a
+    // single "unknown"-backend entry; otherwise use the configured servers
+    // (or the local default). Each entry carries its per-backend `concurrency`
+    // cap (config `scribe.servers[].concurrency`); it becomes the tier's
+    // dispatch ceiling below.
+    const DEFAULT_TIER_CONCURRENCY: usize = 4; // matches config.rs default_concurrency()
+    let labelled_servers: Vec<(String, String, usize)> = match &server_override {
+        Some(url) => vec![(url.clone(), "unknown".to_string(), DEFAULT_TIER_CONCURRENCY)],
+        None if !cfg.servers.is_empty() => cfg
+            .servers
+            .iter()
+            .map(|e| (e.url.clone(), e.backend.clone(), e.concurrency))
+            .collect(),
+        None => vec![(
+            DEFAULT_SERVER.to_string(),
+            "glm_ocr".to_string(),
+            DEFAULT_TIER_CONCURRENCY,
+        )],
+    };
+    // Group servers into backend TIERS, preserving config order of first
+    // appearance (e.g. `[olmocr, glm_ocr]`). Dispatch walks tiers
+    // top-to-bottom: a paper is first tried on the primary backend's tier,
+    // and a VLM-class failure (`Escalate`, e.g. `olmocr_zero_pages`) falls
+    // through to the NEXT tier. WITHIN a tier, `pick_server` distributes
+    // whole papers across that tier's hosts by least-loaded readiness, and a
+    // per-tier semaphore caps how many convert AT ONCE.
+    //
+    // rc.346 collapsed every server into ONE backend-blind pool: that
+    // restored per-paper distribution but LOST the backend chain, because
+    // the pool re-picks purely by free-slot count. With big (olmocr, 12
+    // slots) outnumbering bmb (glm_ocr, 6 slots), every escalation re-picked
+    // big/olmocr again — scans olmocr can't render permanently failed and
+    // the glm-only host (bmb, which cannot run olmocr at all) was never
+    // dispatched to. Tiering keeps rc.346's intra-tier least-loaded while
+    // restoring the config.rs-documented top-to-bottom backend escalation.
+    let tier_order = backend_tier_order(&labelled_servers);
+    let mut built_tiers: Vec<(
+        String,
+        ServicePool<ScribeClient>,
+        Arc<tokio::sync::Semaphore>,
+    )> = Vec::with_capacity(tier_order.len());
+    let mut total_cap = 0usize;
+    for backend in &tier_order {
+        let clients: Vec<ScribeClient> = labelled_servers
+            .iter()
+            .filter(|(_, b, _)| b == backend)
+            .map(|(url, _, _)| ScribeClient::new_with_timeout(url, convert_timeout))
+            .collect::<Result<_>>()?;
+        let cap = backend_tier_cap(&labelled_servers, backend);
+        total_cap += cap;
+        built_tiers.push((
+            backend.clone(),
+            ServicePool::new(clients),
+            Arc::new(tokio::sync::Semaphore::new(cap)),
+        ));
+    }
+    let tiers = Arc::new(built_tiers);
     let timeout_policy = Arc::new(cfg.timeout_policy.clone());
 
+    let storage_for_handler = storage.clone();
+    let bus_for_handler = bus.clone();
+    // Global admission cap = sum of the per-tier concurrency caps, so the
+    // watcher admits exactly as many concurrent papers as the tiers can
+    // actually run. The per-tier semaphores enforce the per-backend split;
+    // this bounds total in-flight handlers so a large JetStream backlog can't
+    // spawn unbounded tasks all parked on a tier semaphore.
+    let concurrency = total_cap.max(1);
     tracing::info!(
-        servers = ?servers,
+        tiers = ?tier_order,
+        servers = ?labelled_servers.iter().map(|(u, _, _)| u.clone()).collect::<Vec<_>>(),
+        concurrency,
         convert_timeout_secs = cfg.convert_timeout_secs,
         base_secs = timeout_policy.base_secs,
         per_page_secs = timeout_policy.per_page_secs,
         floor_secs = timeout_policy.floor_secs,
         ceiling_secs = timeout_policy.ceiling_secs,
-        "starting event-bus watcher with {}-server pool",
-        servers.len()
+        "starting event-bus watcher with tiered least-loaded pool dispatch"
     );
-
-    let storage_for_handler = storage.clone();
-    let bus_for_handler = bus.clone();
-    let concurrency = pool.probed_concurrency().await;
-    tracing::info!(concurrency, "scribe-watch consumer in-flight cap");
     run_subscriber(bus.clone(), storage.clone(), concurrency, move |event| {
         let storage = storage_for_handler.clone();
         let bus = bus_for_handler.clone();
-        let pool = pool.clone();
+        let tiers = tiers.clone();
         let timeout_policy = timeout_policy.clone();
         async move {
-            // Dispatch retry: a /convert can fail mid-stream when a
-            // single scribe's link flaps. One fast retry on a different
-            // host is cheap, and convert_and_upload is idempotent via
-            // its head-check on the target markdown key. Permanent
-            // failures (VLM repetition, unsupported type, paywall HTML,
-            // PDF parse errors) short-circuit the retry — redelivery to
-            // a different server would fail identically.
-            let max_dispatch_attempts: u32 = 2;
+            // Dispatch through the backend tiers in order. The first tier
+            // (primary backend) gets the paper via its own least-loaded pick.
+            // On `Escalate` or `Transient`, fall through to the NEXT tier —
+            // a genuinely different backend on a different host, so this is
+            // real failover (olmocr scan-fail → glm). On `Permanent`,
+            // short-circuit immediately — the source is intrinsically
+            // unconvertable and no other backend will help. On success, the
+            // host's own catalog stamp captures converted_by + attempts_log.
+            let mut attempts_log: Vec<hs_common::catalog::AttemptEntry> = Vec::new();
             let mut last_err: Option<hs_scribe::event_watch::HandlerError> = None;
-            for attempt in 1..=max_dispatch_attempts {
-                let (client, _pick_guard) = match pool.pick_server().await {
-                    Ok(t) => t,
+
+            // Fetch + parse the source ONCE per event. Every backend
+            // attempt reuses the same Arc'd bytes and page count —
+            // escalation used to re-download and re-parse the whole
+            // book from storage per backend. prepare_source handles
+            // its own failure stamping (source_missing) and
+            // classification: Permanent → TERM, Transient → NAK.
+            let source =
+                match hs_scribe::event_watch::prepare_source(storage.as_ref(), &event).await {
+                    Ok(hs_scribe::event_watch::SourcePrep::AlreadyConverted(_)) => return Ok(()),
+                    Ok(hs_scribe::event_watch::SourcePrep::Fetched(src)) => src,
+                    Err(e) => return Err(e),
+                };
+
+            for (backend, pool, tier_sem) in tiers.iter() {
+                // Acquire this backend's concurrency permit BEFORE picking a
+                // host — this caps how many converts the tier runs at once
+                // (config `concurrency`), so a heavy model can't fan out to
+                // the host's full advertised slot count and thrash it. Held
+                // across the convert, released when the permit drops at the
+                // end of this loop iteration (so the next tier / next event
+                // sees a freed slot). The semaphore is never closed, so
+                // `acquire` only errors on a closed semaphore — treat that as
+                // transient and fall through.
+                let _tier_permit = match tier_sem.acquire().await {
+                    Ok(permit) => permit,
                     Err(e) => {
-                        return Err(hs_scribe::event_watch::HandlerError::Transient(
-                            e.context("no ready scribe servers"),
+                        last_err = Some(hs_scribe::event_watch::HandlerError::Transient(
+                            anyhow::anyhow!("tier semaphore closed: {e}"),
                         ));
+                        continue;
                     }
                 };
+                // Least-loaded pick WITHIN this backend tier. `pick_server`
+                // polls if the tier is saturated, so a busy tier parks here
+                // rather than NAKing. The PickGuard holds this host's
+                // client-side reservation for the convert and frees it at
+                // loop-end, so the next pick (a concurrent event, or this
+                // event's next tier) sees accurate load. A tier with no ready
+                // host records a transient error and falls through to the
+                // next tier rather than aborting the whole chain.
+                let (client, _pick_guard) = match pool.pick_server().await {
+                    Ok(picked) => picked,
+                    Err(e) => {
+                        last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
+                        continue;
+                    }
+                };
+                let url = client.url().to_string();
                 tracing::info!(
-                    server = %client.url(),
+                    server = %url,
+                    backend = %backend,
                     key = %event.key,
-                    attempt,
-                    "dispatching event"
+                    attempt = attempts_log.len() + 1,
+                    "pool dispatch (tiered least-loaded)"
                 );
-                match convert_and_upload(
+                let result = convert_and_upload(
                     storage.as_ref(),
                     client,
                     bus.as_ref(),
                     &event,
                     timeout_policy.as_ref(),
+                    &source,
+                    Some(backend.clone()),
+                    attempts_log.clone(),
                 )
-                .await
-                {
+                .await;
+
+                let now = chrono::Utc::now().to_rfc3339();
+                match result {
                     Ok(_) => return Ok(()),
                     Err(hs_scribe::event_watch::HandlerError::Permanent(e)) => {
-                        // Terminal: source won't convert regardless of
-                        // retries. Stamp `conversion_failed` on the
-                        // catalog row so catalog_repair's stuck_convert
-                        // direction won't re-publish this stem, and
-                        // `hs status` surfaces it in the Corrupted PDFs
-                        // count. Best-effort — if the stamp itself fails
-                        // we still term the NATS message so the daemon
-                        // doesn't spin.
-                        if let Some(stem) = stem_from_event_key(&event.key) {
-                            let reason = classify_permanent_reason(&e);
-                            if let Err(stamp_err) =
-                                hs_common::catalog::update_conversion_failed_via(
-                                    storage.as_ref(),
-                                    "catalog",
-                                    &stem,
-                                    &reason,
-                                )
-                                .await
-                            {
+                        let classification = classify_convert_failure(&e);
+                        let reason = classification.reason().to_string();
+                        let outcome = match &classification {
+                            ConvertClassification::Permanent(_) => "permanent",
+                            ConvertClassification::Escalate(_) => "escalate",
+                        };
+                        attempts_log.push(hs_common::catalog::AttemptEntry {
+                            backend: backend.clone(),
+                            outcome: outcome.to_string(),
+                            reason: Some(reason.clone()),
+                            at: now,
+                        });
+                        match classification {
+                            ConvertClassification::Permanent(_) => {
                                 tracing::warn!(
-                                    stem = %stem,
-                                    reason,
-                                    error = %stamp_err,
-                                    "failed to stamp conversion_failed; terminating anyway"
+                                    backend = %backend,
+                                    key = %event.key,
+                                    reason = %reason,
+                                    "pool dispatch: permanent failure — no host will help"
                                 );
+                                if let Some(stem) = stem_from_event_key(&event.key) {
+                                    if let Err(stamp_err) =
+                                        hs_common::catalog::update_conversion_failed_via(
+                                            storage.as_ref(),
+                                            "catalog",
+                                            &stem,
+                                            &reason,
+                                            attempts_log.clone(),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            stem = %stem,
+                                            reason = %reason,
+                                            error = %stamp_err,
+                                            "failed to stamp conversion_failed; terminating anyway"
+                                        );
+                                    }
+                                }
+                                return Err(hs_scribe::event_watch::HandlerError::Permanent(e));
+                            }
+                            ConvertClassification::Escalate(_) => {
+                                tracing::info!(
+                                    backend = %backend,
+                                    key = %event.key,
+                                    reason = %reason,
+                                    "pool dispatch: backend escalated — falling through to next tier"
+                                );
+                                last_err = Some(hs_scribe::event_watch::HandlerError::Permanent(e));
                             }
                         }
-                        return Err(hs_scribe::event_watch::HandlerError::Permanent(e));
                     }
-                    Err(hs_scribe::event_watch::HandlerError::Transient(e))
-                        if attempt < max_dispatch_attempts =>
-                    {
+                    Err(hs_scribe::event_watch::HandlerError::Transient(e)) => {
+                        // Transient failure on this host (network flake,
+                        // scribe 5xx) — fall through to the next backend tier
+                        // before NAKing the event back to JetStream. The next
+                        // tier is a different process on a different host and
+                        // network path, so it may not share the transient
+                        // condition; if every tier is exhausted the event is
+                        // NAKed and JetStream redelivers the whole chain.
+                        attempts_log.push(hs_common::catalog::AttemptEntry {
+                            backend: backend.clone(),
+                            outcome: "transient".to_string(),
+                            reason: Some(format!("{e:#}")),
+                            at: now,
+                        });
                         tracing::warn!(
-                            server = %client.url(),
+                            backend = %backend,
                             key = %event.key,
-                            attempt,
                             error = %e,
-                            "convert failed — retrying on a different server"
+                            "pool dispatch: transient — falling through to next tier"
                         );
                         last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
                     }
-                    Err(e) => return Err(e),
                 }
             }
-            Err(last_err.unwrap_or_else(|| {
-                hs_scribe::event_watch::HandlerError::Transient(anyhow::anyhow!(
-                    "dispatch retries exhausted"
-                ))
-            }))
+
+            // Pool exhausted (every host tried). Whatever the last error
+            // was, surface it — `last_err` is `Some` because the loop ran
+            // at least once (the pool is non-empty by construction). If the
+            // last surviving error was Permanent, stamp it; if it was
+            // Transient, NAK and let JetStream redeliver.
+            match last_err {
+                Some(hs_scribe::event_watch::HandlerError::Permanent(e)) => {
+                    let reason = classify_convert_failure(&e).reason().to_string();
+                    if let Some(stem) = stem_from_event_key(&event.key) {
+                        if let Err(stamp_err) = hs_common::catalog::update_conversion_failed_via(
+                            storage.as_ref(),
+                            "catalog",
+                            &stem,
+                            &reason,
+                            attempts_log,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                stem = %stem,
+                                reason = %reason,
+                                error = %stamp_err,
+                                "failed to stamp pool-exhausted conversion_failed"
+                            );
+                        }
+                    }
+                    Err(hs_scribe::event_watch::HandlerError::Permanent(e))
+                }
+                Some(e) => Err(e),
+                None => Err(hs_scribe::event_watch::HandlerError::Transient(
+                    anyhow::anyhow!("scribe pool was empty"),
+                )),
+            }
         }
     })
     .await
@@ -467,6 +721,9 @@ async fn cmd_convert(
 
     let pdf_bytes =
         std::fs::read(&input).with_context(|| format!("Cannot read {}", input.display()))?;
+    // Count before the bytes move into the converter — olmocr returns one
+    // flat blob, so the source PDF is the only page-count ground truth.
+    let source_pages = hs_scribe::pdf_meta::count_pages(&pdf_bytes);
 
     let stage: Arc<Box<dyn hs_common::reporter::StageHandle>> =
         Arc::new(reporter.begin_counted_stage("Converting", None));
@@ -509,8 +766,11 @@ async fn cmd_convert(
         tracing::info!("Cleaned {} repetition site(s)", truncations);
     }
 
-    let page_offsets = hs_common::catalog::compute_page_offsets(&md);
-    let total_pages = page_offsets.len() as u64;
+    let total_pages = hs_common::catalog::resolve_page_accounting(
+        hs_common::catalog::compute_page_offsets(&md).len() as u64,
+        source_pages,
+    )
+    .total_pages;
     let per_page_is_bibliography: Vec<bool> = (0..per_page_truncations.len())
         .map(|i| {
             per_page_region_classes
@@ -589,21 +849,6 @@ pub async fn cmd_server(action: ServerAction) -> Result<()> {
 
     match action {
         ServerAction::Start => {
-            let has_nvidia = check_command("nvidia-smi", &[]).await;
-            if should_use_native_ollama(has_nvidia) && !check_ollama_running().await {
-                if cfg!(target_os = "linux") {
-                    eprintln!("Starting Ollama systemd service...");
-                    ensure_ollama_systemd().await?;
-                } else {
-                    eprintln!("Starting native Ollama...");
-                    let _ = tokio::process::Command::new("ollama")
-                        .arg("serve")
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
-                    wait_for_ollama_native(30).await?;
-                }
-            }
             compose.run_capture(&["-f", cf, "up", "-d"]).await?;
             eprintln!("Waiting for services...");
             wait_for_health(DEFAULT_SERVER, 300).await?;
@@ -611,11 +856,6 @@ pub async fn cmd_server(action: ServerAction) -> Result<()> {
         }
         ServerAction::Stop => {
             compose.run_capture(&["-f", cf, "down"]).await?;
-            let has_nvidia = check_command("nvidia-smi", &[]).await;
-            if should_use_native_ollama(has_nvidia) {
-                eprintln!("Unloading model from VRAM...");
-                unload_ollama_model("glm-ocr").await;
-            }
             eprintln!("Stopped.");
         }
     }
@@ -668,23 +908,6 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         )
     })?;
 
-    // Ensure Ollama (the VLM backend) is running — same logic as before.
-    let has_nvidia = check_command("nvidia-smi", &[]).await;
-    if should_use_native_ollama(has_nvidia) && !check_ollama_running().await {
-        if cfg!(target_os = "linux") {
-            reporter.status("Ollama", "starting systemd service");
-            ensure_ollama_systemd().await?;
-        } else {
-            reporter.status("Ollama", "starting native");
-            let _ = tokio::process::Command::new("ollama")
-                .arg("serve")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-            wait_for_ollama_native(30).await?;
-        }
-    }
-
     reporter.status(
         "Scribe",
         &format!("running on port {port} (Ctrl+C to stop)"),
@@ -705,10 +928,6 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         anyhow::bail!("hs-scribe-server exited with {status}");
     }
 
-    if should_use_native_ollama(has_nvidia) {
-        unload_ollama_model("glm-ocr").await;
-    }
-
     Ok(())
 }
 
@@ -721,80 +940,12 @@ fn hidden_dir() -> PathBuf {
         .join(hs_common::HIDDEN_DIR)
 }
 
-use hs_common::compose::{check_command, ComposeCmd};
-
-/// Pick the native-Ollama path on Apple Silicon and Linux-with-NVIDIA,
-/// where we drive Ollama directly (no container). Everywhere else we
-/// assume the operator arranged their own Ollama (container, remote, or
-/// none — we don't care, we just POST to the configured URL).
-fn should_use_native_ollama(has_nvidia: bool) -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        || (cfg!(target_os = "linux") && has_nvidia)
-}
-
-/// Ensure systemd-managed Ollama is active. Called on Linux-with-NVIDIA
-/// before the scribe server starts. Best-effort: if systemctl is missing
-/// (container, non-systemd distro) we return Ok and let the operator's
-/// Ollama setup take over.
-async fn ensure_ollama_systemd() -> Result<()> {
-    let status = tokio::process::Command::new("systemctl")
-        .args(["start", "ollama"])
-        .status()
-        .await;
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(_) | Err(_) => {
-            // systemctl not available or failed — trust the operator's
-            // prior setup. `check_ollama_running` is the next gate.
-            Ok(())
-        }
-    }
-}
-
-/// Unload a model from Ollama VRAM by setting keep_alive=0.
-async fn unload_ollama_model(model: &str) {
-    let _ = reqwest::Client::new()
-        .post("http://localhost:11434/api/generate")
-        .json(&serde_json::json!({
-            "model": model,
-            "keep_alive": 0
-        }))
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await;
-}
-
-async fn check_ollama_running() -> bool {
-    reqwest::Client::new()
-        .get("http://localhost:11434/api/tags")
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await
-        .is_ok()
-}
-
-async fn wait_for_ollama_native(timeout_secs: u64) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
-    loop {
-        if tokio::time::Instant::now() > deadline {
-            anyhow::bail!(
-                "Timed out waiting for native Ollama to start.\n\
-                 Try running manually: ollama serve"
-            );
-        }
-        if check_ollama_running().await {
-            return Ok(());
-        }
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    }
-}
+use hs_common::compose::ComposeCmd;
 
 async fn wait_for_health(server_url: &str, timeout_secs: u64) -> Result<()> {
     let url = format!("{server_url}/health");
     hs_common::compose::wait_for_url(&url, timeout_secs, "scribe server").await
 }
-
-const PAGE_SEPARATOR: &str = "\n\n---\n\n";
 
 async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let scribe_cfg = ScribeConfig::load().unwrap_or_default();
@@ -832,12 +983,24 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
             .map(|l| l.trim_start_matches('#').trim().to_string())
             .filter(|t| !t.is_empty());
 
-        // Count pages
-        let total_pages = content.split(PAGE_SEPARATOR).count() as u64;
-
         // Look for matching PDF
         let pdf_path = papers_dir.join(format!("{stem}.pdf"));
         let pdf_exists = pdf_path.exists();
+
+        // Prefer the PDF's real page count when the source is still on
+        // disk. Markdown separators only track pages for backends that
+        // emit them, so olmocr-converted markdown would otherwise backfill
+        // as `total_pages: 1` regardless of length.
+        let source_pages = if pdf_exists {
+            std::fs::read(&pdf_path)
+                .ok()
+                .and_then(|b| hs_scribe::pdf_meta::count_pages(&b))
+        } else {
+            None
+        };
+        let page_offsets = hs_common::catalog::compute_page_offsets(&content);
+        let accounting =
+            hs_common::catalog::resolve_page_accounting(page_offsets.len() as u64, source_pages);
 
         let entry = hs_common::catalog::CatalogEntry {
             title,
@@ -850,9 +1013,15 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
             conversion: Some(hs_common::catalog::ConversionMeta {
                 server: "backfill".to_string(),
                 duration_secs: 0.0,
-                total_pages,
+                total_pages: accounting.total_pages,
                 converted_at: chrono::Utc::now().to_rfc3339(),
-                pages: hs_common::catalog::compute_page_offsets(&content),
+                pages: if accounting.offsets_trustworthy {
+                    page_offsets
+                } else {
+                    Vec::new()
+                },
+                converted_by: None,
+                attempts_log: Vec::new(),
             }),
             ..Default::default()
         };
@@ -871,33 +1040,170 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
 // ── Clean junk HTML papers ────────────────────────────────────
 
 #[cfg(test)]
-mod classify_permanent_reason_tests {
-    use super::classify_permanent_reason;
+mod backend_tier_tests {
+    use super::{backend_tier_cap, backend_tier_order};
+
+    fn s(url: &str, backend: &str, concurrency: usize) -> (String, String, usize) {
+        (url.to_string(), backend.to_string(), concurrency)
+    }
 
     #[test]
-    fn vlm_repetition_loop_message_maps_to_specific_reason() {
+    fn tiers_preserve_config_order_of_first_appearance() {
+        // olmocr listed first → it is tier 0 (primary); glm_ocr tier 1.
+        // This is the escalation direction: olmocr_zero_pages falls through
+        // to glm, never the reverse.
+        let servers = vec![
+            s("http://big:7435", "olmocr", 2),
+            s("http://bmb:7433", "glm_ocr", 4),
+        ];
+        assert_eq!(backend_tier_order(&servers), vec!["olmocr", "glm_ocr"]);
+    }
+
+    #[test]
+    fn multiple_hosts_same_backend_collapse_to_one_tier() {
+        // Two olmocr hosts must form ONE tier (least-loaded within it), not
+        // two chain steps — otherwise escalation would "advance" from one
+        // olmocr host to another olmocr host and never reach glm, which is
+        // exactly the rc.346 regression this restores the fix for. Their
+        // per-host concurrency caps sum into the one tier's ceiling.
+        let servers = vec![
+            s("http://big:7435", "olmocr", 2),
+            s("http://big2:7435", "olmocr", 2),
+            s("http://bmb:7433", "glm_ocr", 4),
+        ];
+        assert_eq!(backend_tier_order(&servers), vec!["olmocr", "glm_ocr"]);
+    }
+
+    #[test]
+    fn single_server_override_is_one_tier() {
+        // `--server` override collapses to a single "unknown"-backend tier.
+        let servers = vec![s("http://host:7433", "unknown", 4)];
+        assert_eq!(backend_tier_order(&servers), vec!["unknown"]);
+    }
+
+    #[test]
+    fn tier_cap_is_config_concurrency_not_advertised_slots() {
+        // big olmocr is capped at 2 even though the host advertises 12 VLM
+        // slots — the config cap is the dispatch ceiling, which is the whole
+        // point of P1-0. glm (bmb) caps at 4.
+        let servers = vec![
+            s("http://big:7435", "olmocr", 2),
+            s("http://bmb:7433", "glm_ocr", 4),
+        ];
+        assert_eq!(backend_tier_cap(&servers, "olmocr"), 2);
+        assert_eq!(backend_tier_cap(&servers, "glm_ocr"), 4);
+    }
+
+    #[test]
+    fn tier_cap_sums_hosts_on_the_same_backend() {
+        // Two olmocr hosts at 2 each → tier ceiling 4 (least-loaded within).
+        let servers = vec![
+            s("http://big:7435", "olmocr", 2),
+            s("http://big2:7435", "olmocr", 2),
+            s("http://bmb:7433", "glm_ocr", 4),
+        ];
+        assert_eq!(backend_tier_cap(&servers, "olmocr"), 4);
+    }
+
+    #[test]
+    fn tier_cap_floors_at_one() {
+        // A zero-concurrency entry (or unknown backend) must never yield a
+        // 0-permit semaphore, which would deadlock every dispatch on that
+        // tier. Floor at 1.
+        let servers = vec![s("http://x:7433", "olmocr", 0)];
+        assert_eq!(backend_tier_cap(&servers, "olmocr"), 1);
+        assert_eq!(backend_tier_cap(&servers, "glm_ocr"), 1);
+    }
+}
+
+#[cfg(test)]
+mod classify_convert_failure_tests {
+    use super::{classify_convert_failure, ConvertClassification};
+
+    #[test]
+    fn vlm_repetition_loop_escalates_with_specific_reason() {
         // Verbatim shape of the error event_watch.rs constructs at the
-        // RejectLoop arm. The outer handler must classify this back to
-        // `vlm_repetition_loop` so `update_conversion_failed_via` writes
-        // the same reason both stampers wrote, instead of the generic
-        // `permanent_convert_failure` clobber.
+        // RejectLoop arm. Classification must preserve the specific
+        // reason so the catalog stamp lands as `vlm_repetition_loop`
+        // (not the generic clobber) when the chain runs out of backends.
+        // VLM-class failure → Escalate so a different backend gets a
+        // shot before the chain stamps failure.
         let err = anyhow::anyhow!(
             "VLM repetition loop on papers/10/x.pdf (truncations=23, longest_run=9009B)"
         );
-        assert_eq!(classify_permanent_reason(&err), "vlm_repetition_loop");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Escalate(r) => assert_eq!(r, "vlm_repetition_loop"),
+            other => panic!("expected Escalate, got {:?}", other.reason()),
+        }
     }
 
     #[test]
-    fn unrecognized_message_falls_back_to_generic() {
+    fn vlm_transport_error_escalates() {
+        // llama-server slot eviction mid-stream. Same VLM-class family
+        // as the repetition loop — escalate to next backend.
+        let err = anyhow::anyhow!(
+            "scribe convert failed: client error (SendRequest): connection closed before message completed"
+        );
+        match classify_convert_failure(&err) {
+            ConvertClassification::Escalate(r) => assert_eq!(r, "vlm_transport_error"),
+            other => panic!("expected Escalate, got {:?}", other.reason()),
+        }
+    }
+
+    #[test]
+    fn unrecognized_message_escalates_with_generic_reason() {
+        // Unknown failure → Escalate so the next backend gets a chance.
+        // If every backend rejects with the same unknown reason, the
+        // chain terminates naturally and stamps `permanent_convert_failure`.
         let err = anyhow::anyhow!("scribe convert failed: some novel failure mode");
-        assert_eq!(classify_permanent_reason(&err), "permanent_convert_failure");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Escalate(r) => assert_eq!(r, "permanent_convert_failure"),
+            other => panic!("expected Escalate, got {:?}", other.reason()),
+        }
     }
 
     #[test]
-    fn pdf_parse_error_takes_precedence_over_vlm() {
-        // FormatError is a hard PDF-parse problem; route to pdf_parse_error
-        // even if a downstream layer happens to mention "VLM" in its chain.
+    fn olmocr_zero_pages_escalates() {
+        // The mcconnell shape: olmocr ran 45 min on a Cyrillic book with
+        // a clean text layer, then reported 0 completed pages. Must
+        // Escalate so GLM-OCR gets its shot — the original Permanent
+        // classification short-circuited the chain incorrectly.
+        let err =
+            anyhow::anyhow!("Server error: olmocr reported 0 completed pages (failed=0); content may need a different backend");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Escalate(r) => assert_eq!(r, "olmocr_zero_pages"),
+            other => panic!("expected Escalate, got {:?}", other.reason()),
+        }
+    }
+
+    #[test]
+    fn pdf_parse_error_is_permanent() {
+        // FormatError is a hard PDF-parse problem; no VLM backend will
+        // succeed because the PDF itself is unreadable to scribe's
+        // parser. Stop the chain immediately, don't burn other backends'
+        // compute on a hopeless input.
         let err = anyhow::anyhow!("scribe convert failed: FormatError on page 3");
-        assert_eq!(classify_permanent_reason(&err), "pdf_parse_error");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Permanent(r) => assert_eq!(r, "pdf_parse_error"),
+            other => panic!("expected Permanent, got {:?}", other.reason()),
+        }
+    }
+
+    #[test]
+    fn unsupported_content_type_is_permanent() {
+        let err = anyhow::anyhow!("scribe rejected: unsupported_content_type:html");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Permanent(r) => assert_eq!(r, "unsupported_content_type:html"),
+            other => panic!("expected Permanent, got {:?}", other.reason()),
+        }
+    }
+
+    #[test]
+    fn paywall_is_permanent() {
+        let err = anyhow::anyhow!("paywall HTML detected on download");
+        match classify_convert_failure(&err) {
+            ConvertClassification::Permanent(r) => assert_eq!(r, "paywall_html"),
+            other => panic!("expected Permanent, got {:?}", other.reason()),
+        }
     }
 }

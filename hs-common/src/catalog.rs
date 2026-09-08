@@ -60,6 +60,14 @@ pub struct CatalogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_skip: Option<EmbeddingSkip>,
 
+    /// Recorded by the abstracts pipeline when this paper has been
+    /// embedded into the `paper_abstracts` Qdrant collection. Distinct
+    /// from `embedding` — that one tracks full-body chunks in
+    /// `academic_papers`. Used by `hs distill abstracts reconcile` to
+    /// idempotently re-run only entries that haven't been embedded yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abstract_embed: Option<AbstractEmbedStamp>,
+
     /// Recorded when `catalog_repair` synthesized a row for an orphan file
     /// (PDF/HTML on disk with no prior catalog entry). Distinguishes
     /// repaired rows from rows produced by the normal download path.
@@ -97,6 +105,18 @@ pub struct ConversionMeta {
     pub converted_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<PageOffset>,
+    /// Which backend in the scribe chain produced this markdown. Distinct
+    /// from `server` — `server` is the pipeline class ("scribe-vlm"),
+    /// `converted_by` identifies the specific VLM (`"olmocr"`, `"glm_ocr"`).
+    /// `None` for legacy rows written before the chain feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub converted_by: Option<String>,
+    /// Ordered log of backends tried before this success. Empty when the
+    /// primary backend succeeded on first attempt; populated when the
+    /// chain escalated past failed primaries before reaching the backend
+    /// recorded in `converted_by`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts_log: Vec<AttemptEntry>,
 }
 
 /// Terminal convert failure — written when the source is unconvertable by
@@ -113,10 +133,43 @@ pub struct ConversionFailure {
     pub reason: String,
     /// RFC3339 timestamp of when this failure was recorded.
     pub at: String,
-    /// Attempt counter. Always 1 today (terminal on first detection); the
-    /// field is carried so a future retry policy has a place to increment.
+    /// Attempt counter. Increments by 1 each time the catalog is stamped
+    /// for the same stem — orthogonal to `attempts_log`, which is per-
+    /// chain-walk. `attempts` is the rough redelivery count, useful for
+    /// "this stem failed N times across the whole cluster lifetime";
+    /// `attempts_log` is the audit trail of the most recent chain walk.
     #[serde(default = "default_attempts")]
     pub attempts: u32,
+    /// Ordered log of backends tried during the most recent chain walk
+    /// before all backends were exhausted. Lets operators see WHICH
+    /// backends rejected a doc and with WHAT reasons without grepping
+    /// scribe logs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts_log: Vec<AttemptEntry>,
+}
+
+/// One step in the scribe chain's attempt log, recorded by the orchestrator
+/// after each backend returns. Lives on both `ConversionMeta` (success
+/// case — shows the path through escalating backends) and
+/// `ConversionFailure` (exhaustion case — shows every backend tried).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptEntry {
+    /// Backend identifier from `ScribeConfig.servers[].backend` — e.g.
+    /// `"olmocr"`, `"glm_ocr"`. Matches the value written to
+    /// `ConversionMeta.converted_by` when this attempt was the one that
+    /// succeeded.
+    pub backend: String,
+    /// Classified outcome. Canonical values: `"success"`, `"escalate"`,
+    /// `"permanent"`, `"transient"`. The orchestrator maps each backend's
+    /// returned error class to one of these before logging.
+    pub outcome: String,
+    /// Short machine-readable failure reason when `outcome` is not
+    /// `"success"` — e.g. `"vlm_repetition_loop"`, `"pdf_parse_error"`,
+    /// `"transport_error"`. `None` when the attempt succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// RFC3339 timestamp of when this attempt completed.
+    pub at: String,
 }
 
 fn default_attempts() -> u32 {
@@ -142,6 +195,24 @@ pub struct EmbeddingMeta {
     pub server: String,
     pub chunks_indexed: u32,
     pub compute_device: String,
+    pub embedded_at: String,
+}
+
+/// Stamp recorded when a paper's abstract has been embedded into the
+/// `paper_abstracts` Qdrant collection. Distinct from `EmbeddingMeta` —
+/// that one tracks the full-body chunks in `academic_papers`. The two
+/// pipelines run independently and stamp different fields.
+///
+/// `source` records which input the embed actually used so `abstracts
+/// status` can report coverage without re-running the coalesce.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbstractEmbedStamp {
+    /// `openalex` | `markdown` | `title_only` — see
+    /// `hs_distill::abstracts::AbstractSource`.
+    pub source: String,
+    /// Length of the abstract text that was actually embedded (excluding
+    /// the title prefix). `0` for `title_only`.
+    pub abstract_chars: u32,
     pub embedded_at: String,
 }
 
@@ -174,6 +245,46 @@ pub fn compute_page_offsets(markdown: &str) -> Vec<PageOffset> {
     offsets
 }
 
+/// How many pages to record, and whether the markdown's page offsets can be
+/// trusted as citation provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageAccounting {
+    pub total_pages: u64,
+    /// False when the offsets don't describe the source's pages, in which
+    /// case they must be dropped rather than used to attribute a page.
+    pub offsets_trustworthy: bool,
+}
+
+/// Reconcile the two independent page signals a conversion produces.
+///
+/// - `md_pages`: how many `\n\n---\n\n`-delimited pages the backend emitted
+///   (see [`compute_page_offsets`]). Only backends that assemble output via
+///   `join_pages` produce these; the olmocr subprocess returns one flat
+///   blob, so this is 1 for a 52 KB, 14-page paper.
+/// - `source_pages`: the PDF's own page count, parsed by lopdf at ingest to
+///   size the conversion timeout.
+///
+/// Markdown structure wins when it exists, because it is self-consistent
+/// with the offsets and survives the lopdf miscounts documented on
+/// `timeout_policy.floor_secs`. Otherwise the source count is the only real
+/// information available — using `md_pages` there is what made every
+/// olmocr conversion report `1pg`.
+///
+/// Offsets are untrustworthy exactly when the markdown claims one page but
+/// the source has several: a lone offset spanning the whole document makes
+/// `resolve_page` report page 1 for every chunk of it.
+pub fn resolve_page_accounting(md_pages: u64, source_pages: Option<u32>) -> PageAccounting {
+    let total_pages = if md_pages > 1 {
+        md_pages
+    } else {
+        source_pages.map_or(md_pages, u64::from)
+    };
+    PageAccounting {
+        total_pages,
+        offsets_trustworthy: md_pages > 1 || total_pages <= 1,
+    }
+}
+
 /// Read an existing catalog entry, or return None if it doesn't exist.
 pub fn read_catalog_entry(catalog_dir: &Path, stem: &str) -> Option<CatalogEntry> {
     let path = crate::sharded_path(catalog_dir, stem, "yaml");
@@ -200,6 +311,7 @@ pub fn write_catalog_entry(
 
 /// Update only the conversion section of an existing catalog entry.
 /// If no entry exists, creates a minimal one with just conversion metadata.
+#[allow(clippy::too_many_arguments)]
 pub fn update_conversion_catalog(
     catalog_dir: &Path,
     stem: &str,
@@ -208,6 +320,8 @@ pub fn update_conversion_catalog(
     total_pages: u64,
     pages: Vec<PageOffset>,
     markdown_path: &str,
+    converted_by: Option<String>,
+    attempts_log: Vec<AttemptEntry>,
 ) -> std::io::Result<()> {
     let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
 
@@ -218,6 +332,8 @@ pub fn update_conversion_catalog(
         total_pages,
         converted_at: chrono::Utc::now().to_rfc3339(),
         pages,
+        converted_by,
+        attempts_log,
     });
 
     write_catalog_entry(catalog_dir, stem, &entry)
@@ -243,6 +359,27 @@ pub fn update_embedding_catalog(
         server: server.to_string(),
         chunks_indexed,
         compute_device: compute_device.to_string(),
+        embedded_at: chrono::Utc::now().to_rfc3339(),
+    });
+
+    write_catalog_entry(catalog_dir, stem, &entry)
+}
+
+/// Stamp the `paper_abstracts` embed result onto a catalog entry. Called
+/// by `hs distill abstracts build` after the embed + Qdrant upsert succeed.
+/// `source` is `"openalex"`, `"markdown"`, or `"title_only"` — matches the
+/// `AbstractSource` enum's serialized form in hs-distill.
+pub fn update_abstract_embed_catalog(
+    catalog_dir: &Path,
+    stem: &str,
+    source: &str,
+    abstract_chars: u32,
+) -> std::io::Result<()> {
+    let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
+
+    entry.abstract_embed = Some(AbstractEmbedStamp {
+        source: source.to_string(),
+        abstract_chars,
         embedded_at: chrono::Utc::now().to_rfc3339(),
     });
 
@@ -482,6 +619,8 @@ pub async fn update_conversion_catalog_via(
     total_pages: u64,
     pages: Vec<PageOffset>,
     markdown_path: &str,
+    converted_by: Option<String>,
+    attempts_log: Vec<AttemptEntry>,
 ) -> anyhow::Result<()> {
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
         .await?
@@ -494,7 +633,16 @@ pub async fn update_conversion_catalog_via(
         total_pages,
         converted_at: chrono::Utc::now().to_rfc3339(),
         pages,
+        converted_by,
+        attempts_log,
     });
+    // A success supersedes any failure stamped by an earlier backend in
+    // the chain (e.g. glm_ocr's QC reject before olmocr converted the
+    // same document). Leaving both stamps makes every corrupted/failed
+    // reader (`conversion_failed.is_some()`) mislabel a converted paper
+    // as dead. The full attempt history survives in
+    // `conversion.attempts_log`.
+    entry.conversion_failed = None;
 
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
@@ -511,6 +659,7 @@ pub async fn update_conversion_failed_via(
     prefix: &str,
     stem: &str,
     reason: &str,
+    attempts_log: Vec<AttemptEntry>,
 ) -> anyhow::Result<()> {
     let mut entry = read_catalog_entry_via(storage, prefix, stem)
         .await?
@@ -524,6 +673,7 @@ pub async fn update_conversion_failed_via(
         reason: reason.to_string(),
         at: chrono::Utc::now().to_rfc3339(),
         attempts,
+        attempts_log,
     });
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
@@ -616,6 +766,27 @@ pub async fn update_embedding_catalog_via(
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
 
+/// Storage-backed sibling of [`update_abstract_embed_catalog`].
+pub async fn update_abstract_embed_catalog_via(
+    storage: &dyn crate::storage::Storage,
+    prefix: &str,
+    stem: &str,
+    source: &str,
+    abstract_chars: u32,
+) -> anyhow::Result<()> {
+    let mut entry = read_catalog_entry_via(storage, prefix, stem)
+        .await?
+        .unwrap_or_default();
+
+    entry.abstract_embed = Some(AbstractEmbedStamp {
+        source: source.to_string(),
+        abstract_chars,
+        embedded_at: chrono::Utc::now().to_rfc3339(),
+    });
+
+    write_catalog_entry_via(storage, prefix, stem, &entry).await
+}
+
 #[cfg(all(test, feature = "storage"))]
 mod storage_tests {
     use super::*;
@@ -667,6 +838,8 @@ mod storage_tests {
                 total_pages: 1,
                 converted_at: "2026-04-15T19:50:02Z".into(),
                 pages: vec![],
+                converted_by: None,
+                attempts_log: vec![],
             }),
             ..Default::default()
         };
@@ -714,6 +887,7 @@ conversion:
             "catalog",
             "paywalled",
             "unsupported_content_type:html",
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -730,6 +904,7 @@ conversion:
             "catalog",
             "paywalled",
             "unsupported_content_type:html",
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -738,6 +913,50 @@ conversion:
             .expect("read succeeds")
             .expect("row still present");
         assert_eq!(entry2.conversion_failed.unwrap().attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn success_clears_prior_conversion_failed_stamp() {
+        // Chain escalation: backend 1 stamps conversion_failed (QC
+        // reject), backend 2 succeeds. The success stamp must clear the
+        // failure or every corrupted-reader mislabels the converted row.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        update_conversion_failed_via(
+            &storage,
+            "catalog",
+            "escalated",
+            "vlm_repetition_loop",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        update_conversion_catalog_via(
+            &storage,
+            "catalog",
+            "escalated",
+            "scribe-olmocr",
+            12.5,
+            10,
+            vec![],
+            "markdown/es/escalated.md",
+            Some("olmocr".to_string()),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let entry = read_catalog_entry_via(&storage, "catalog", "escalated")
+            .await
+            .expect("read succeeds")
+            .expect("row present");
+        assert!(entry.conversion.is_some(), "success stamp present");
+        assert!(
+            entry.conversion_failed.is_none(),
+            "stale failure stamp must be cleared by the success write"
+        );
     }
 
     #[tokio::test]
@@ -946,6 +1165,61 @@ conversion:
         assert!(
             err.to_string().contains("transient backend failure"),
             "storage error should bubble up verbatim: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod page_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn olmocr_flat_blob_reports_the_source_page_count() {
+        // The rc.350 bug: olmocr returns one blob with no `\n\n---\n\n`
+        // separators, so a 14-page paper recorded `total_pages: 1`. lopdf
+        // already knew the real count.
+        let a = resolve_page_accounting(1, Some(14));
+        assert_eq!(a.total_pages, 14);
+        // A single offset spanning 14 pages would attribute every chunk to
+        // page 1, so it must not be kept.
+        assert!(!a.offsets_trustworthy);
+    }
+
+    #[test]
+    fn structured_markdown_wins_over_a_miscounting_source() {
+        // lopdf is known to undercount (a 282-page book reported as 8, per
+        // `timeout_policy.floor_secs`). When the backend emitted real page
+        // structure, that structure is authoritative and its offsets stay.
+        let a = resolve_page_accounting(282, Some(8));
+        assert_eq!(a.total_pages, 282);
+        assert!(a.offsets_trustworthy);
+    }
+
+    #[test]
+    fn html_and_epub_have_no_source_page_count() {
+        // Non-PDF sources carry `pdf_pages: None`; one page is the truth,
+        // and its offset legitimately covers the whole document.
+        let a = resolve_page_accounting(1, None);
+        assert_eq!(a.total_pages, 1);
+        assert!(a.offsets_trustworthy);
+    }
+
+    #[test]
+    fn genuine_single_page_pdf_keeps_its_offset() {
+        let a = resolve_page_accounting(1, Some(1));
+        assert_eq!(a.total_pages, 1);
+        assert!(a.offsets_trustworthy);
+    }
+
+    #[test]
+    fn page_offsets_track_separators() {
+        // Guards the `md_pages` input: two separators means three pages.
+        let md = "one\n\n---\n\ntwo\n\n---\n\nthree";
+        let offsets = compute_page_offsets(md);
+        assert_eq!(offsets.len(), 3);
+        assert_eq!(
+            resolve_page_accounting(offsets.len() as u64, Some(3)).total_pages,
+            3
         );
     }
 }

@@ -37,6 +37,7 @@ Academic research engine: 211M+ vector search with OpenAlex + PMC OA + Qdrant.
 - **Bad-PDF folder is `corrupted/`.** Do not invent alternatives like `quarantine/`, `rejected/`, `bad/` — there's exactly one and it's already wired up.
 - **Watcher liveness is heartbeat-based**, not PID-file-based. When diagnosing "is the watcher alive?" check `last_tick_seconds_ago` from status, not `/var/run/*.pid`.
 - **Status counters can have multiple writers.** Multiple daemons may stamp the same status field — if a counter looks like it's "bouncing", check for multi-writer races before chasing a logic bug in any single writer.
+- **OpenAlex works ingest is streaming pre-dedupe**, not merge-on-insert and not load-then-dedupe. The loader walks `updated_date=*` partitions newest-first and gates each row through an in-RAM `HashSet<u64>` of seen integer work-IDs (the `SeenSet` in `crates/openalex-ingest/src/seen_set.rs`); first-sightings flow into PK'd live tables via plain bulk INSERT, duplicates are skipped silently. The set checkpoints to `~/home-still/data/openalex/seen_set.bin` every 10 partitions for crash recovery. Run `hs openalex load-works` then `hs openalex build-indexes` / `build-fts`. Don't reintroduce `ON CONFLICT` and don't drop the PRIMARY KEYs — both are symptoms of fighting the snapshot's natural ordering. The streaming pre-dedupe is the ONE PATH.
 
 ## Build & Test
 

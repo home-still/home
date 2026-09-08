@@ -14,6 +14,28 @@ pub fn strip_doi(doi: &str) -> &str {
     doi.strip_prefix("https://doi.org/").unwrap_or(doi)
 }
 
+/// Parse the integer portion of an OpenAlex work ID as `u64`. Accepts both
+/// the URL form (`"https://openalex.org/W2741809807"`) and the bare form
+/// (`"W2741809807"`). Returns `None` if the prefix is wrong, the prefix
+/// letter isn't `W`, or the trailing digits don't parse.
+///
+/// Used by the streaming-pre-dedupe seen-set: integer IDs collide-free
+/// at corpus scale (vs hashing the string, which has ~3-in-1000 collision
+/// risk at 250M items via xxhash64).
+pub fn parse_work_id_u64(id: &str) -> Option<u64> {
+    let bare = strip_openalex_id(id);
+    let digits = bare.strip_prefix('W')?;
+    digits.parse::<u64>().ok()
+}
+
+/// Upper bound on a word position in `abstract_inverted_index`. Positions come
+/// straight from snapshot JSON as an unbounded `u32`; a single malformed record
+/// near `u32::MAX` would otherwise allocate tens of GB and OOM-kill the whole
+/// partition load. Real abstracts are at most a few thousand tokens, so this
+/// ceiling is far above any legitimate value — over it, we skip the abstract
+/// (the row still ingests) rather than crash the partition.
+const MAX_ABSTRACT_POSITION: usize = 100_000;
+
 pub fn reconstruct_abstract(inverted_index: &HashMap<String, Vec<u32>>) -> Option<String> {
     if inverted_index.is_empty() {
         return None;
@@ -24,6 +46,15 @@ pub fn reconstruct_abstract(inverted_index: &HashMap<String, Vec<u32>>) -> Optio
         .flat_map(|positions| positions.iter())
         .max()
         .copied()? as usize;
+
+    if max_pos > MAX_ABSTRACT_POSITION {
+        tracing::warn!(
+            max_pos,
+            limit = MAX_ABSTRACT_POSITION,
+            "skipping abstract with implausibly large word position (likely malformed record)"
+        );
+        return None;
+    }
 
     let mut words: Vec<&str> = vec![""; max_pos + 1];
 
@@ -79,8 +110,52 @@ mod tests {
     }
 
     #[test]
+    fn skips_abstract_with_implausible_position() {
+        // A malformed snapshot record with a position beyond the sane ceiling
+        // must be skipped (returns None) rather than allocating ~the position
+        // count of slots and OOM-killing the partition load.
+        let mut idx = HashMap::new();
+        idx.insert("hello".to_string(), vec![0]);
+        idx.insert("world".to_string(), vec![MAX_ABSTRACT_POSITION as u32 + 1]);
+        assert_eq!(reconstruct_abstract(&idx), None);
+    }
+
+    #[test]
     fn empty_index_returns_none() {
         let idx: HashMap<String, Vec<u32>> = HashMap::new();
         assert!(reconstruct_abstract(&idx).is_none());
+    }
+
+    #[test]
+    fn parses_work_id_u64_url_form() {
+        assert_eq!(
+            parse_work_id_u64("https://openalex.org/W2741809807"),
+            Some(2_741_809_807)
+        );
+    }
+
+    #[test]
+    fn parses_work_id_u64_bare_form() {
+        assert_eq!(parse_work_id_u64("W2741809807"), Some(2_741_809_807));
+    }
+
+    #[test]
+    fn parses_work_id_u64_short_id() {
+        // Some early-corpus works have short IDs.
+        assert_eq!(parse_work_id_u64("W123"), Some(123));
+    }
+
+    #[test]
+    fn parses_work_id_u64_rejects_non_w_prefix() {
+        // Authors/sources/etc. use A/S/I prefixes; this helper is works-only.
+        assert_eq!(parse_work_id_u64("A123"), None);
+        assert_eq!(parse_work_id_u64("https://openalex.org/A123"), None);
+    }
+
+    #[test]
+    fn parses_work_id_u64_rejects_garbage() {
+        assert_eq!(parse_work_id_u64(""), None);
+        assert_eq!(parse_work_id_u64("W"), None);
+        assert_eq!(parse_work_id_u64("Wabc"), None);
     }
 }

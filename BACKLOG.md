@@ -14,6 +14,50 @@ Security and documentation stories are intentionally excluded.
 
 ## P0 — Non-negotiable violations (must fix before next rc.*)
 
+### P0-16. `big_mac` cannot run any `hs` command — startup panics on the log spool dir (2026-09-08)
+**Motivation:** During the rc.352 fleet upgrade, `big_mac` could not be upgraded and remains stranded on **rc.326** (the rest of the fleet is on rc.352). Every `hs` invocation — including `hs --version` and `hs upgrade` — aborts before doing any work:
+```
+thread 'main' panicked at crates/hs/src/main.rs:75:37:
+install logging subscriber: opening spool dir "/Volumes/home-still/logs/spool/hs"
+Caused by: Permission denied (os error 13)
+```
+Two separate defects: (a) `/Volumes/home-still` on `big_mac` is not writable by the invoking user, so the configured `log_dir` is wrong for that host or the mount lost its permissions; (b) `hs` treats an unwritable log directory as a fatal panic at startup, which makes the binary unusable for *every* command — including the `upgrade` that would replace it. A host that cannot log should still be able to report its version and upgrade itself. This is also why `big_mac` cannot self-recover: the fix cannot be delivered by `hs upgrade` because `hs upgrade` is the thing that panics.
+**Scope:**
+- `crates/hs/src/main.rs:75` — the `.expect()` / panic on logging-subscriber install
+- `hs_common::logging` spool-dir creation
+- `big_mac`'s `~/.home-still/config.yaml` `home.log_dir` / `/Volumes/home-still` mount permissions
+**Change:** Startup must not panic because logging could not be initialised. Failing to open the spool dir is not a failure of the requested command — emit one diagnostic to stderr naming the unwritable path and continue with console-only logging. Keep it loud (a warning on every invocation, not a silent degrade) but non-fatal. Separately, correct `big_mac`'s `log_dir` so the spool lands on a writable path. Do NOT add a silent fallback that hides the misconfiguration.
+**Acceptance:**
+- With `/Volumes/home-still` unwritable, `hs --version` and `hs upgrade --pre` both succeed on `big_mac` and print a warning naming the path.
+- `big_mac` reports `hs 0.0.1-rc.352` or later after a self-upgrade.
+- No code path silently swallows the spool-dir error without surfacing it.
+
+### P0-17. `hs upgrade` claims success for services it failed to restart, and skips others entirely (2026-09-08)
+**Motivation:** Two gaps observed during the rc.352 rollout, both of which leave upgraded binaries running old code with no signal to the operator.
+
+1. On `big`, `hs upgrade` restarted only `hs-serve-distill`, `hs-serve-mcp` and the distill containers. It installed a new `hs-scribe-server` binary but never restarted `hs-serve-scribe-olmocr`, and it does not touch the `systemd --user` daemons `hs-scribe-watch-events` / `hs-distill-watch-events` — which are exactly where the rc.352 conversion-gate and page-count fixes live. Without a manual `systemctl restart`, `hs upgrade` reports "Upgraded to 0.0.1-rc.352" while the changed code is not running.
+2. On `mac_air`, the restart of `com.home-still.scribe` printed `Unload failed: 5: Input/output error` and `Load failed: 5: Input/output error`, then printed `OK: com.home-still.scribe restarted` and counted it in `Restarted 1 service(s)`. A failed `launchctl` round-trip must not be reported as OK.
+**Scope:**
+- `hs upgrade` service-restart logic in `crates/hs` (the restart table and its launchctl/systemd branches)
+- the restart set: must include `hs-serve-scribe-olmocr` and the `--user` scope watcher units
+**Change:** Derive the restart set from which binaries were actually replaced, covering both `systemd --system` and `systemd --user` scopes plus launchd. Propagate each restart's real exit status: a non-zero `launchctl`/`systemctl` result is a failure, must be printed as such, must not increment the restarted count, and must make `hs upgrade` exit non-zero. Per CLAUDE.md, fix `hs upgrade` rather than documenting a manual `systemctl restart` step.
+**Acceptance:**
+- After `hs upgrade` on `big`, every process whose binary changed reports the new version with no manual restart.
+- A forced `launchctl` failure on a Mac host makes `hs upgrade` print the failure and exit non-zero.
+- `hs upgrade` never prints `OK: <svc> restarted` for a restart whose underlying command failed.
+
+### P0-15. `scribe_health` reports `ok` without ever probing its VLM backend (2026-07-29)
+**Motivation:** `big`'s olmocr backend was dead from **2026-07-25T22:31Z to 2026-07-29T12:17Z** — llama-swap could not start vLLM (`--gpu-memory-utilization 0.70` needed 16.49 GiB against 16.06 GiB free once the distill embedder was pinned resident). For those four days `curl :7435/health` returned `{"status":"ok","layout_model":true,"table_model":true,...}` and `hs status` listed the instance as `healthy: true, slots_available: 12`, because the health handler only checks scribe's own in-process layout/table models. It never issues a request to `HS_SCRIBE_OLMOCR_ENDPOINT`. The scribe pool therefore kept dispatching to a backend that could only time out, and the sole outward signal was `pipeline_drift` climbing to 468 against a threshold of 3 — a lagging indicator nobody is paged on. A green health check in front of a dead dependency is a silent-failure path.
+**Scope:**
+- scribe server health handler in `crates/hs-scribe` (the `/health` route backing `scribe_health`)
+- `crates/hs-mcp/src/main.rs` — `scribe_health` tool response shape
+- pool readiness filter in `hs-scribe-watch-events` (the check that already readiness-excludes a sleeping `bmb`)
+**Change:** `/health` must probe the configured VLM backend and report its real state — one cheap upstream call (`GET {endpoint}/models`, or a cached last-success timestamp with a max age). Report the backend verdict as its own field (`backend_reachable`, `backend_model`, `backend_checked_at`) and make the top-level `status` fail when the backend is unreachable. `status: "ok"` must mean "this instance can convert a PDF right now", not "my own models loaded". The pool's readiness filter then excludes a backend-dead instance the same way it excludes a sleeping laptop. No degraded/partial status tier — reachable or fail.
+**Acceptance:**
+- With llama-swap stopped on `big`, `curl :7435/health` returns a non-ok status and `hs status` shows that instance unhealthy within one poll interval.
+- The scribe pool dispatches zero conversions to an instance whose backend probe is failing.
+- `last_conversion_at` going stale while papers are queued is surfaced, not silent.
+
 ### P0-12. Stop VLM repetition collapse from being committed (F1, rc.308 self-test)
 **Motivation:** Self-test rc.308 round-trip on `10.48550_arxiv.2312.10997` (Gao RAG survey) produced page-1 markdown that's `"the retrieval of"` repeated for ~9 KB, then `"valval...val"` for the remainder. Convert stamped `success`, auto-embed indexed 35 chunks; the doc now poisons `academic_papers` Qdrant collection. `event_watch.rs:171-176` documents that the QC repetition-loop reject was disabled by operator decision on 2026-04-23 because rejection produced an infinite retry storm. The retry-storm root cause: rejection didn't close out the catalog row, so the inbox watcher re-detected the source PDF and re-queued it. Same input → same VLM output → same rejection → loop. The current "save what we can" path is a ONE-PATH violation.
 **Scope:**
@@ -129,7 +173,95 @@ Security and documentation stories are intentionally excluded.
 
 ---
 
+## P0 — Blockers
+
+### P0-1. `big_mac` cannot run `hs` at all — panics on logging init, stuck at rc.326
+**Symptom:** every `hs` subcommand that initializes logging panics immediately:
+
+```
+thread 'main' panicked at crates/hs/src/main.rs:75:37:
+install logging subscriber: opening spool dir "/Volumes/home-still/logs/spool/hs"
+Caused by: Permission denied (os error 13)
+```
+
+`hs --version` still works (it short-circuits before logging init), which is why
+the host reports a version and looks healthy. **`hs upgrade` does not** — so
+`big_mac` has been unable to self-upgrade and sits at **rc.326** while the fleet is
+at rc.350 (discovered 2026-08-10 during the rc.350 deploy; skew predates it).
+**Scope:** `/Volumes/home-still` mount permissions on `big_mac`, and
+`crates/hs/src/main.rs:75`.
+**Change:** Fix the mount/ownership so the spool dir is writable. Separately,
+consider whether an unwritable *log* directory should be fatal to every command —
+this is a logging concern taking down the entire CLI, including the one command
+(`upgrade`) that could repair the host.
+**Acceptance:** `ssh big_mac '~/.local/bin/hs upgrade --pre -y'` completes and
+`hs --version` reports the current rc.
+
+---
+
 ## P1 — Reliability (panics and silent failures in hot paths)
+
+### P1-0. distill server embeds 0 chunks for some glm_ocr docs whose markdown chunks fine locally
+**ROOT CAUSE FOUND + FIXED 2026-08-10 (awaiting rc.350 deploy).** Not glm_ocr-specific
+and not a chunker divergence. `pipeline.rs::index_document` gated on
+`hs_common::html::is_paywall_html`, an *HTML* heuristic, applied to *converted
+markdown*. Its first rule — `has_login && content.len() < 100_000` — carries no
+`!has_article` guard, so any sub-100 KB document containing "sign in" / "log in" /
+"access denied" was rejected outright; a second rule rejected anything mentioning
+"clinical trials" / "search results" without a literal `abstract`+`references` pair.
+`hs distill diagnose` never runs this gate, which is exactly why CLI and server
+disagreed. Measured over all 423 `zero_chunks_or_empty` rows: **278 rejected by the
+gate, of which `is_known_interstitial` (the in-tree false-positive-safe detector)
+clears 277** — including the full text of *Accelerate* (399 KB) and a 99 KB
+mathematics-education paper. Fix: gate on `is_known_interstitial` instead; all
+literal interstitial signatures still match, and `hs-scribe` keeps `is_paywall_html`
+on raw HTML where it belongs. Regression tests in `hs-common/src/html.rs`. A further
+132 docs carried stale pre-rc.349 stamps and were recovered by
+`distill_backfill(retry_skipped=true)` with no code change. Full analysis:
+`docs/research/2026-08-10-home-still-repair-report.md`.
+**Follow-up still open:** the silent `Ok(0)` remains — a gate veto is
+indistinguishable from "chunker produced nothing". Give it a distinct
+`embedding_skip.reason` so it fails loudly.
+
+**Motivation:** Discovered 2026-07-05 ingesting Game AI Pro 2. Three chapters
+(`GameAIPro2_Chapter11_Smart_Zones...`, `..._Chapter39_Analytics-Based_AI...`,
+`..._Chapter40_Procedural_Content_Generation...`) are stamped
+`embedding_skip: zero_chunks_or_empty` despite having complete, high-quality
+markdown in storage (Ch39: 61 658 B / 9 051 words, `converted_by: glm_ocr`,
+`markdown_path` correct). `hs distill diagnose <stem>` reads that same storage
+markdown and reports **20/18/9 chunks, all accepted, 0 rejected** — but the
+distill **server** path (`distill_index` / `distill_reindex` MCP, and the
+original event-driven embed) returns `chunks_indexed: 0, old_vectors_purged: 0`
+and re-stamps `zero_chunks_or_empty`. A known-good control (`..._Chapter08...`,
+olmocr) reindexes correctly (purged 10, indexed 10) against the *same* server,
+so the server/embedder is healthy and the bug is **doc-specific**. Common factor
+of the failing set: `converted_by: glm_ocr`. So the CLI-side chunker (diagnose)
+and the server-side chunk/embed path diverge on specific glm_ocr markdown — one
+sees 20 chunks, the other sees 0. This silently drops real documents from search
+and likely accounts for a slice of the corpus-wide `embedding_skipped: 466`.
+**Scope:**
+- `crates/hs-distill/src/pipeline.rs` (server read→chunk→embed path)
+- `crates/hs-distill/src/event_watch.rs` (`zero_chunks_or_empty` stamp site)
+- Whatever markdown-read the server uses on reindex vs. what `hs distill diagnose`
+  uses in `crates/hs/src/distill_cmd.rs::cmd_diagnose` — reconcile the two so they
+  read + chunk identically. Suspect: server reconstructs from catalog `pages`
+  offsets or applies a different pre-chunk normalization than diagnose's raw read.
+**Change:** Make the server reindex path produce exactly what `diagnose` produces
+for the same stem (single source of truth for markdown-read + chunk). Fail loudly
+if a doc that diagnose says yields N>0 chunks embeds 0 — do not silently stamp
+`zero_chunks_or_empty` when the chunker would accept chunks.
+**Acceptance:**
+- `distill_reindex` on the three stems above indexes 20/18/9 chunks (matching
+  `hs distill diagnose`), and they become searchable via `distill_search`.
+- A regression test embeds a known glm_ocr markdown fixture and asserts
+  `chunks_indexed == diagnose chunk count`.
+- Sweep `embedding_skipped` for other docs whose `diagnose` yields >0 chunks and
+  re-embed them.
+
+### P1-14. Downloader saves the repository landing page when `download_urls` also holds a direct PDF (2026-07-29)
+**Motivation:** Two abstract-only stubs were ingested, converted by `html-parser` in ~0.005 s / "1 page", embedded, and then had to be deleted by hand: `10.1109_tvcg.2009.113` (UFRGS Lume "Visualizar item" page) and `10.34726_hss.2014.27898` (TU Wien reposiTUm record page). Neither is a paywall or an anti-bot interstitial, so `is_paywall_html` (rc.349) and both `hs pipeline purge-skipped` / `purge-poisoned` signature lists miss them — they are *successfully retrieved wrong documents*. The catalog for the first one lists `download_urls: ["http://hdl.handle.net/10183/27630", "https://lume.ufrgs.br/bitstream/10183/27630/1/000751721.pdf"]`: the direct PDF was known and the handle redirect was chosen anyway. The TU Wien record page likewise advertises a 32.86 MB PDF that was never fetched. These land in Qdrant as 1–4 chunk documents whose text is repository chrome plus an abstract, which is exactly the low-value noise `distill_search` should never return.
+**Change:** when a candidate URL set contains both a landing/handle URL and a direct PDF URL, order direct-PDF candidates first. After fetching HTML, require a positive "this is a full text" signal before accepting it as the paper — reject a document whose extracted body is dominated by repository navigation chrome, or that carries a link to a PDF it did not follow. Fail loudly (no catalog row) rather than storing a landing page as the paper; a stub row is the degraded-substitute pattern the ONE PATH rule forbids.
+**Acceptance:** re-downloading `10.1109/tvcg.2009.113` fetches `.../000751721.pdf`, not the handle page. A landing page with no reachable full text produces no `papers/`, `markdown/`, or `catalog/` object at all. Neither stem reappears via `hs pipeline catch-up`.
 
 ### P1-1. Replace mutex-unwrap with error propagation
 **Motivation:** Poisoned-mutex panics cascade in long-running processes.
@@ -251,6 +383,62 @@ Security and documentation stories are intentionally excluded.
 
 ---
 
+## P1 — rc.335 deploy follow-ups (2026-06-11)
+
+### P1-D1. `hs upgrade` restart list misses `hs-serve-scribe-olmocr`
+**Motivation:** rc.335 deploy on `big` restarted hs-serve-scribe / hs-serve-distill / hs-serve-mcp but left the second scribe unit serving rc.334 until a manual `systemctl restart hs-serve-scribe-olmocr`. Same class as the original "hs upgrade skips server binaries" defect: the restart list is hardcoded instead of derived.
+**Change:** restart every `hs-serve-*` unit (glob the unit names, or register units at install time), not a fixed list.
+**Acceptance:** after `hs upgrade` on a host with both scribe units, `curl :7433/health` and `curl :7435/health` both report the new version with no manual step.
+**Still open (rc.340, 2026-06-16):** confirmed on every rc.338 → rc.340 deploy on `big`. The gap also skips **`hs-serve-olmocr-vllm`** (the vLLM backend), not just `hs-serve-scribe-olmocr` — each deploy required a manual `sudo systemctl start hs-serve-olmocr-vllm hs-serve-scribe-olmocr`. Broaden the derive to cover ALL `hs-serve-*` incl the vLLM unit (`restart_cmd.rs` hardcodes `["scribe","distill","mcp"]`).
+
+### P1-D2. big_mac deploy blocked: reboot + remount + root-owned mountpoint stub
+**Motivation:** big_mac is wedged on ephemeral-port exhaustion (31k TIME_WAIT leaked by the now-disabled `scribe-autotune` LaunchAgent polling ollama; 86-day uptime) so NFS remount and `hs upgrade` downloads fail with EADDRNOTAVAIL. Additionally `/Volumes/home-still` now exists as a root-owned empty dir (sudo mkdir during recovery), so `hs` panics with `Permission denied` opening its log spool. Host stuck on rc.326.
+**Change:** operator: `sudo reboot`, then `sudo bash /tmp/mount-hs.sh` (remount), then `hs upgrade --pre --yes`. Consider: hs on macOS should not hard-depend on an NFS-backed log spool dir at startup (local spool + shipper).
+**Acceptance:** `ssh big_mac hs --version` → rc.335; no hung `hs` processes; mount healthy.
+
+### P1-D3. `scribe-autotune` still running on mac_air — same socket-leak class that wedged big_mac
+**Motivation:** `launchctl list` on mac_air shows `com.home-still.scribe-autotune` (PID 1781) alive. On big_mac the identical agent leaked ~1000 conn/s to `localhost:11434` until the 16K ephemeral-port range was exhausted, taking down all outbound TCP. mac_air has ollama and the same KeepAlive plist.
+**Change:** either fix the autotune client to reuse one HTTP connection (it builds a fresh connection per poll) or disable the agent on hosts that aren't scribe workers. Decide whether autotune is part of the chain topology at all.
+**Acceptance:** `netstat -an | grep -c TIME_WAIT` on mac_air stays <1k over a day, or the agent is removed.
+
+### P1-D4. Watcher topology: user-unit daemons + manual `hs scribe watch-events` fight over the durable consumer
+**Motivation:** big runs `hs-scribe-watch-events` / `hs-distill-watch-events` as user-scope systemd units (Restart=always). `ensure_consumer` deletes-then-recreates the durable on connect, so any second watcher instance (e.g. an operator running `hs scribe watch-events` by hand) kills the unit's consumer and vice-versa ("consumer deleted" churn), and each recreate RESETS JetStream delivery counts — a max_deliver-exhausted poison message comes back to life. Observed live during the rc.335 deploy (mcconnell resurrected).
+**Change:** detect an existing live consumer with a different instance and refuse to start (fail loudly: "watcher already running"), or make ensure_consumer update-in-place instead of delete-first.
+**Acceptance:** starting a second watcher instance on a host with the unit running exits with a clear error; delivery counts survive watcher restarts.
+**ESCALATE TO P0 (2026-07-29):** this is not an operator-error edge case — it is the steady-state fleet topology, and it has been silently destroying the embed leg. `big` runs `hs-distill-watch-events` (user unit, concurrency=8) and `bmb` runs `com.home-still.distill-watch-events` (LaunchAgent, concurrency=6). Both bind durable `distill-workers` on stream `SCRIBE`; each one's `ensure_consumer` delete-then-recreate evicts the other, which restarts and evicts back. Measured: big's restart counter at **11,920**; bmb loops every ~11 s; the durable's `created` timestamp advances to *now* on every poll. Neither watcher ever consumes a message. `scribe.completed` events are therefore never indexed by the daemon path — the embed backlog (`markdown` 8075 vs `embedded_documents` 7766) is the residue. Both daemons log only `WARN jetstream delivery error error=consumer deleted`, and neither systemd nor `hs status` reports a fault: `hs status` showed `distill_instances[0].healthy: true` throughout.
+**Additional acceptance:** two watcher daemons on different hosts pointed at the same distill server either (a) share the durable as a real queue group with no recreate, or (b) the second one fails loudly at startup. A watcher that cannot bind its consumer must exit non-zero with a distinct message, not spin on `Restart=always` — 11,920 silent restarts must be impossible.
+
+## P1 — rc.340 deploy follow-ups (2026-06-16)
+
+### P1-D5. `hs upgrade` on a systemd-native host starts conflicting podman containers
+**Motivation:** `big` runs scribe via the systemd-native `hs-serve-*` units, but `hs upgrade` *also* runs `podman-compose -f ~/.home-still/docker-compose.yml up -d`, starting `home-still_scribe_1` + `home-still_qdrant_1`. The scribe container binds `0.0.0.0:7433` — the exact port systemd `hs-serve-scribe` already holds — so on every rc.338 → rc.340 deploy the container either loses the race (logs `rootlessport ... bind: address already in use`, harmless noise) or wins it: on rc.338 the container squatted 7433 with a **stale `:latest` (rc.335) image** while systemd `hs-serve-scribe` crash-looped on `Address already in use`, serving the OLD binary until an operator ran `podman stop home-still_scribe_1`. The container path is half-wired and fights the native services it's meant to replace. (Qdrant has the same dual-path risk — a container qdrant bound 6333-6334 alongside whatever served before; left untouched during recovery, but unverified.)
+**Change:** `hs upgrade` must not run the compose stack on hosts that run the native systemd units — detect the native units and skip compose, or make the compose step explicitly opt-in per host. On `big`, scribe/distill are native; only the Pis use `ghcr.io/home-still/hs-scribe-server` containers. Closely related to **P1-D1** (both are `hs upgrade` doing the wrong thing per host).
+**Acceptance:** `hs upgrade` on `big` leaves systemd `hs-serve-scribe` holding `:7433` on the new version, starts **no** `home-still_*` podman container, and needs no manual `podman stop` / port-clash recovery.
+
+---
+
+## P0 — rc.334 scribe-chain follow-ups (2026-06-10)
+
+> **rc.335 note (2026-06-11):** P0-20's *instance* is resolved — the Russian
+> mcconnell PDF was dropped per decision, and the redelivered message TERMed
+> with an honest `conversion_failed: source_missing` stamp under rc.335's
+> single classify table. The *general* defect (max_deliver exhaustion leaves
+> no stamp) remains open below. P0-21 (3600s dispatch cap) also remains open.
+
+### P0-20. JetStream `max_deliver=5` exhaustion is silent — no catalog stamp, doc vanishes from the pipeline
+**Motivation:** `mcconnell_code_complete_2nd` (889-page test book) burned all 5 deliveries on the `scribe-workers` consumer overnight (last NAK 2026-06-10 06:00:42Z, `backoff_secs=30` logged — then nothing, ever). JetStream stops redelivering after `max_deliver` with no notification to the consumer; the catalog YAML still reads `{}` — no `conversion_failed`, no `attempts_log`. The doc is invisible to every repair direction (`stuck_convert` can't see it because there's no stamp at all). Direct ONE-PATH/fail-loudly violation: the transient-NAK path assumes redelivery is infinite, but the broker caps it.
+**Scope:** `crates/hs/src/scribe_cmd.rs` (`cmd_watch_events` transient/NAK branch) + the consumer config site that sets `max_deliver`.
+**Change:** Read `num_delivered` from the message metadata; when `num_delivered == max_deliver` (final delivery) and the chain outcome is Transient, do NOT NAK — stamp `conversion_failed: max_deliveries_exhausted` with the full `attempts_log`, then ACK terminally. The operator sees the failure in the catalog instead of archaeology in jsz.
+**Acceptance:** With all chain backends unreachable and a 1-message stream, after 5 deliveries the catalog carries `conversion_failed: max_deliveries_exhausted` + 5×N attempt entries, and `nats consumer report` shows 0 pending / 0 ack-pending.
+
+### P0-21. Page-scaled dispatch timeout caps at 3600s — book-length GLM converts structurally cannot finish
+**Motivation:** mcconnell's delivery-5 GLM leg on big started 06:00:38Z−3600s, was actively converting pages at 05:54Z (layout-model WARNs in `hs-serve-scribe` journal; watchdog did NOT fire — the 4500s threshold patch held), and was killed at exactly 06:00:38Z by the dispatcher's own `timeout_secs=3600` ceiling (journal: `dispatching pdf to scribe with page-scaled timeout … pages=889 timeout_secs=3600`). At GLM's observed page rate, 889 pages needs multiple hours; the cap guarantees the timeout → `vlm_transport_error` → escalate, wasting a full hour of GPU per delivery and making GLM permanently unable to convert any book-length PDF through the watch-events path.
+**Scope:** the page-scaled timeout computation in `crates/hs/src/scribe_cmd.rs` (the `timeout_secs` clamp).
+**Change:** Raise/remove the 3600s clamp so the per-page scaling actually governs (e.g. `pages × per_page_secs` with a much higher absolute ceiling), and keep the hs-scribe-watchdog stall threshold consistent with it (currently hand-patched to 4500s on big — `~/.local/bin/hs-scribe-watchdog`, NOT in repo; check it in or fold it into `hs`).
+**Acceptance:** An 889-page PDF dispatched through watch-events gets a deadline ≥ its realistic GLM convert time, and the watchdog does not kill the in-flight convert.
+
+---
+
 ## P1 — rc.314 self-test follow-ups (2026-05-02)
 
 ### P0-15. Mass cascade of `papers/.quarantine/*` events floods scribe-watch with permanent failures
@@ -329,6 +517,23 @@ Security and documentation stories are intentionally excluded.
 **Scope:** `paper/src/aggregation/relevance.rs` (`relevance_score`).
 **Change:** Add a title-presence floor: if fewer than 50% of query terms appear in the title, cap the score below `CITATION_SORT_MIN_RELEVANCE` regardless of abstract content. Single gate, applied in `relevance_score` itself. Don't add a second sort-time filter.
 **Acceptance:** The cited query returns no off-topic high-citation papers in positions 1–10. Existing `target_paper_survives_citation_floor_even_with_fewer_citations` test still passes.
+
+---
+
+## P1 — 2026-07-15 ops follow-up (event-driven conversion silently halted)
+
+### P1-19. `hs-scribe-watch-events` stays dead after a deploy/`hs restart` stops it — silent conversion halt
+**Motivation:** On 2026-07-15 manual ingestion looked broken — files dropped in `papers/manually_downloaded/` were swept and published to `papers.ingested`, but nothing converted for ~2 days. Root cause: `hs-scribe-watch-events.service` (the NATS `papers.ingested` → scribe-pool consumer) was `inactive (dead)` since 2026-07-13 10:37, killed by SIGTERM — a clean stop, almost certainly a deploy / `hs restart`. The unit sets `Restart=always`, but that only recovers crash exits; a deliberate `systemctl stop` leaves it down permanently. The outage was **silent**: `hs status` showed "Scribe ● running" because that row reflects the scribe *server* (`hs-serve-scribe`), not the event consumer, and no catch-up timer was running (`hs-pipeline-catchup.timer` disabled). A manual `systemctl --user start` restored it and it drained the backlog immediately — so this recurs on every deploy that stops it without restarting.
+**Scope:**
+- The deploy/restart flow that issues the SIGTERM (`hs upgrade` / `hs restart` service management in `crates/hs/src/`).
+- `hs status` health surface (server-liveness vs consumer-liveness conflation).
+**Change:**
+1. The deploy/`hs restart` path must restart every event consumer it stops (`hs-scribe-watch-events`, and any peer) and verify each via `is-active` post-deploy, failing loudly if one didn't come back. No "stopped and forgot".
+2. `hs status` must show the scribe *consumer's* heartbeat as a distinct row (like the inbox watcher's `last_tick_seconds_ago`), not conflate it with the server's "running". A dead consumer must turn the dashboard red.
+3. (Decide, separate) `hs-pipeline-catchup.timer` as a periodic source-scan re-queue is a hidden fallback that masks a dead consumer — a ONE-PATH smell. Either make it the intended one path or delete it; don't leave it as a silent backstop.
+**Acceptance:**
+- After `hs upgrade` / `hs restart` on any host, `hs-scribe-watch-events` is active, and a post-deploy check fails loudly if it isn't.
+- `hs status` shows a scribe-consumer heartbeat that goes red within one tick of the consumer dying (repro: `systemctl --user stop hs-scribe-watch-events` → dashboard red).
 
 ---
 
@@ -499,3 +704,103 @@ Not actionable as backlog items yet; need an operator answer or a follow-up read
 3. **Qdrant outage root cause: rootless podman dies with user-systemd at logout (2026-05-02 — RESOLVED).** Container `home-still_qdrant_1` was killed twice in this session — both times the trigger was `Stopping User Manager for UID 1000` in the system journal (verified at 2026-05-02 11:29:02 CDT). With `Linger=no` for `ladvien`, `systemd --user` exits at the last SSH logout and takes every rootless container with it. `restart: unless-stopped` and `restart: always` are both no-ops in this scenario because there's no podman daemon left to honor them. **Fixed in-session via `loginctl enable-linger ladvien`** (verified `Linger=yes`). The previous BACKLOG hypothesis ("podman-compose@home-still.service stopped it") was wrong — that unit name was a podman label artifact, not a real systemd unit. **Follow-up TODO:** every other rootless service on `big` has the same exposure; audit `home-still-scribe-inbox.service`, `hs-scribe-watch-events.service`, `hs-distill-watch-events.service`, and the timers — confirm they recover correctly across a logout/login cycle now that linger is on, OR convert them to system-level units if any don't.
 
 4. **`hs status` MCP routing depends on cloud OAuth even on the gateway-host itself (2026-05-02 — PARTIALLY FIXED).** `crates/hs/src/mcp_client.rs:from_default_creds` hardcoded `gateway_url + /mcp` so `hs status` on `big` (which hosts the local MCP at `localhost:7445`) round-trips through `cloud.lolzlab.com` and depends on a 7-day refresh token. Token expiry → 401 → silent-fallback dashboard (P0-16). **Mitigation in-session:** added `HS_MCP_URL` env-var bypass in `mcp_client.rs:from_default_creds`; built and installed as `~/.local/bin/hs.rc314-local-mcp` with `~/.local/bin/hs` symlink updated. Operators on the gateway host should `set -gx HS_MCP_URL http://localhost:7445/mcp` in fish config (or `export HS_MCP_URL=...` in bash). **Real fix still owed:** make this a `mcp.url` field in `~/.home-still/config.yaml` instead of an env var — that's the canonical config-side surface the project uses for everything else (storage, scribe, distill, qdrant). Track jointly with **P0-16**.
+
+---
+
+## rc.341 deploy follow-ups (2026-06-17) — ollama autotuner retired
+
+rc.341 removed the orphaned `OLLAMA_NUM_PARALLEL` autotuner, the native-ollama startup glue, and fixed the vestigial "Ollama URL" startup log (it printed `ollama_url` regardless of backend; now prints the active "Backend URL"). The scribe GLM backend is `HS_SCRIBE_BACKEND=OpenAi` → llama-server `:8080`; ollama `:11434` is unused by home-still. See memory `project_scribe_glm_is_llama_server`.
+
+1. **`vlm_concurrency` (12) now oversubscribes llama-server `--parallel 8`.** rc.341 deleted `resolve_effective_vlm_concurrency`, which used to clamp the scribe server's page-parallelism semaphore down to a detected `OLLAMA_NUM_PARALLEL`. That clamp only ever applied to the (unused) ollama path, so removing it is correct — BUT the GLM scribe (`:7433`) now sends up to `config.vlm_concurrency=12` concurrent page requests to `llama-server-glm-ocr` which runs `--parallel 8`, so 4 queue. GLM is escalation-only (rare), so low blast radius, but consider setting the GLM scribe's `vlm_concurrency` to match `--parallel` (8) in config, OR raise llama-server `--parallel`. Tuning only — no rebuild.
+2. **Leftover disabled unit file on `big`.** `/etc/systemd/system/hs-serve-scribe-autotune.service` still exists (now `disabled`, inert — rc.341 no longer generates it). Harmless, but `sudo rm` it + `daemon-reload` for cleanliness whenever convenient.
+3. **GLM escalations on repetition-loop papers struggle.** Papers that escalate olmocr→glm_ocr via `reason=vlm_repetition_loop` (e.g. `10.3389_fphys.2021.677581`) also trip GLM's 4-gram-cycle repetition detector; some exhaust the chain (`scribe convert failed`) and stay unconverted. This is the same root theme as **P0-12** (decode-time repetition prevention) — both backends loop on the same pathological PDFs. Track under P0-12, not separately.
+
+---
+
+## Code-review follow-ups (2026-06-23) — `feat/distill-search-include-text` branch
+
+Verified findings from a max-effort multi-agent review of the branch diff (145 changed files) vs `main`. **Coverage is partial:** the review's synthesis pass and several verifiers/the codebase-wide sweep hit a session rate-limit, ~24 findings were kept but the report capped at 15, and `openai_compatible.rs` / `reconcile.rs` / `status.rs` were never verified. **Re-run the review for the full set.** Security (CR-1) and documentation/privacy (CR-8) items are normally excluded from this file per the header, but are included here at operator request — both are CLAUDE.md non-negotiables.
+
+> **RESOLVED 2026-06-23 (CR-1 … CR-8).** All eight major/medium findings fixed on
+> this branch with regression tests; `cargo fmt`/`clippy -D warnings`/`test` all green.
+> - **CR-1** — deleted `is_rfc1918_source` + `lan_zone_claims`; every proxied request now
+>   authenticates via the signed-token path (ONE PATH). **Deploy note:** LAN hosts must
+>   present a valid bearer token — confirm each is enrolled before rollout.
+> - **CR-2** — `citations(sort="citations")` paginates the full citing set (capped at
+>   `MAX_CITATION_SORT_FETCH=10_000`) before ranking; test
+>   `citations_sort_by_citations_ranks_globally_across_pages`.
+>   **rc.344/rc.345 follow-up:** rc.343's deeper pagination 400'd on high-citation
+>   papers (SS rejects when `offset + limit >= 10000`; filtered null edges let
+>   `offset` outrun `entries`). rc.344's first guard was off-by-one (permitted the
+>   failing offset=9000); rc.345 corrected it to break when `offset + PAGE_SIZE >=
+>   10000` (verified empirically: offset 8999 ok, 9000 → 400). Tests:
+>   `citations_sort_stops_at_ss_offset_ceiling_without_400` (mock) +
+>   `citations_sort_live_high_citation_paper_no_400` (live, `#[ignore]`).
+> - **CR-3** — `relevance_score` is pure again; title-presence floor moved to
+>   `passes_citation_title_floor`, applied only on the citation-sort filter in `search.rs`;
+>   test `abstract_match_not_demoted_in_default_ranking`.
+> - **CR-4** — `convert_one` retry loop now wraps only server acquisition; convert is
+>   single-attempt (comment matches behavior).
+> - **CR-5** — `reconstruct_abstract` bounds `max_pos` at `MAX_ABSTRACT_POSITION=100_000`,
+>   skips+logs malformed records; test `skips_abstract_with_implausible_position`.
+> - **CR-6** — title length gate counts chars; tests `accepts_long_cjk_title_within_char_limit`,
+>   `rejects_over_long_title_by_char_count`.
+> - **CR-7** — `coalesce_abstract` gates on `chars().count()` across all paths; test
+>   `coalesce_gates_on_chars_not_bytes`.
+> - **CR-8** — real LAN IPs replaced with `example.local` / RFC 5737 `192.0.2.x`
+>   placeholders across docs, rustdoc, and fixtures (incl. `hs-gateway/src/config.rs`,
+>   `hs/src/server_cmd.rs`, repro tests — wider than originally listed).
+> - **CR-9** (P3 cleanups) and the older codebase-wide P1 sweeps remain **open**.
+
+### P0 (security) — CR-1. Gateway auth bypass via trusted RFC1918 source IP
+**Motivation:** `crates/hs-gateway/src/proxy.rs:47` — `is_rfc1918_source` grants wildcard (`*`) scope with synthetic claims and **zero token check** to any connection whose peer IP is in 10/172.16/192.168. Any LAN host (or a container/NAT path presenting a private source IP) reaches every gateway-proxied backend with full scope and no bearer token — a request that previously required a signed token now bypasses auth entirely.
+**Scope:** `crates/hs-gateway/src/proxy.rs:47` (+ the claims-synthesis path it feeds).
+**Change:** Remove source-IP-based authorization. Every proxied request authenticates via the same signed-token path regardless of source network. No "trusted LAN" branch — ONE PATH.
+**Acceptance:** A request from an RFC1918 source with no/invalid bearer token is rejected with 401; a valid token from any source succeeds. (Note: the `proxy.rs` re-verify itself was rate-limited — re-confirm on rerun.)
+
+### P1 (correctness) — CR-2. `paper_citations(sort="citations")` ranks only the first 1000 edges
+**Motivation:** `paper/src/providers/semantic_scholar.rs:376` — the fetch loop breaks once `entries.len() >= effective_limit`, which page 1 (`PAGE_SIZE=1000`) always satisfies for default `limit=100`. So it sorts/truncates only the first 1000 fetched edges (in SS default order), not the global citation ranking. For any paper with >1000 citations the MCP tool returns the most-cited 100 *among an arbitrary first 1000* — wrong "top citing papers."
+**Scope:** `paper/src/providers/semantic_scholar.rs:376` (citations pagination + sort).
+**Change:** When `sort="citations"`, fetch all citing edges (paginate to completion, within a sane cap) before sorting/truncating — don't early-break on `effective_limit` while a sort is requested.
+**Acceptance:** `paper_citations` on a >1000-citation DOI with `sort="citations"` returns the globally most-cited N, stable across repeated calls.
+
+### P1 (correctness) — CR-3. Title-presence floor leaks into relevance-sorted search
+**Motivation:** `paper/src/aggregation/relevance.rs:76` — the new `TITLE_PRESENCE_FLOOR` cap (comment: "only for sort=citations") is applied unconditionally inside `relevance_score`, which also feeds the relevance-sorted ranking (`ranking.rs:48`, `score = 0.4*rrf + 0.35*rel + …`). A normal `paper_search` whose best match has query terms in the abstract but <50% in the title gets hard-capped at 0.299, demoting on-topic results below weaker title-keyword matches.
+**Scope:** `paper/src/aggregation/relevance.rs:76`; caller split in `paper/src/aggregation/ranking.rs:48`.
+**Change:** Apply the cap only on the citation-sort path, not inside the shared `relevance_score` used by the default ranking. Thread the intent through (or compute the cap in the citation-sort filter), so relevance ordering is unchanged.
+**Acceptance:** A relevance search where the top abstract-match lacks title terms ranks it where it ranked pre-branch; citation-sort still applies the floor.
+
+### P1 (correctness) — CR-4. `convert_one` retry loop never retries a failed conversion
+**Motivation:** `crates/hs/src/scribe_pool.rs:33` — the `for attempt in 0..3` loop forwards to `convert_with_progress(...).await?`; `?` returns immediately, and `pdf_bytes`/`on_progress` are moved on the first iteration. So it only ever retries `pick_server()` (pool-saturation) failures, never a failed conversion, despite the loop/comment advertising retry. A transient backend 500 or dropped mid-convert stream fails the whole PDF on attempt 1.
+**Scope:** `crates/hs/src/scribe_pool.rs:33`.
+**Change:** Either retry the convert step on transient errors (clone/Arc the bytes so they survive iterations; classify transient vs permanent) OR delete the misleading `0..3` loop and document single-attempt semantics. Pick one — no half-loop that lies about its behavior.
+**Acceptance:** A simulated transient convert failure is retried up to the advertised count; a permanent failure returns immediately. If retry is dropped instead, the comment and loop are gone.
+
+### P1 (robustness) — CR-5. Unbounded allocation on one corrupt OpenAlex position
+**Motivation:** `crates/openalex-ingest/src/parser.rs:42` — `reconstruct_abstract` does `vec![""; max_pos + 1]` where `max_pos` is an unbounded `u32` straight from snapshot `abstract_inverted_index` JSON. One malformed record (position near `u32::MAX` → ~68 GB) OOM-kills `hs openalex load-works` mid-partition, forcing a from-scratch partition re-run — the length-driven blowup the ingest hardening targets.
+**Scope:** `crates/openalex-ingest/src/parser.rs:42`.
+**Change:** Bound `max_pos` before allocating (reject/skip the abstract when it exceeds a sane token ceiling). Fail the row loudly (skip + log), not the whole partition.
+**Acceptance:** A synthetic record with a giant position is skipped (logged) and ingest continues; valid abstracts reconstruct unchanged.
+
+### P1 (correctness) — CR-6. Over-long-title check uses byte length, rejecting valid CJK titles
+**Motivation:** `personal/src/services/naming.rs:90` — `title.len() > 200` measures bytes, not chars. A ~70-char CJK title (~210 UTF-8 bytes) is rejected with "model returned over-long title" and the document **fails ingest entirely**. The sibling `take_chars` in the same file correctly uses char boundaries.
+**Scope:** `personal/src/services/naming.rs:90`.
+**Change:** Compare `title.chars().count() > 200` (or reuse the char-boundary helper).
+**Acceptance:** A 70-char/210-byte title passes; a genuinely >200-char title is still rejected.
+
+### P2 (data quality) — CR-7. Abstract length gate mixes bytes and chars by script
+**Motivation:** `crates/hs-distill/src/abstracts.rs:120` — `coalesce_abstract` gates OpenAlex/catalog candidates on `s.trim().len()` (bytes) against `MIN_ABSTRACT_CHARS`, while `abstract_chars()` reports chars. A short non-Latin abstract passes as bytes while an equally-short Latin one is dropped to `TitleOnly` — `AbstractSource` provenance becomes script-dependent and inconsistent vs the markdown path.
+**Scope:** `crates/hs-distill/src/abstracts.rs:120`.
+**Change:** Gate on `chars().count()` consistently across all candidate paths.
+**Acceptance:** Latin and CJK abstracts of equal *character* length are accepted/rejected identically; `AbstractSource` stamping is consistent.
+
+### Doc/privacy — CR-8. Real LAN IPs committed in docs and source
+**Motivation:** This branch adds real addresses/hostnames, violating the CLAUDE.md privacy non-negotiable (use `<host>`/`example.local`): `docs/deployment.md:890-891` (`192.168.1.110 # big`, `192.168.1.111 # big_mac`) and `crates/hs-scribe/src/config.rs:216-219` rustdoc + test fixtures (`:484-527`, including bmb `192.168.1.233`). The config.rs ones also render in `cargo doc`. Confirmed newly introduced by this branch (surrounding IPs pre-existing).
+**Scope:** `docs/deployment.md:890`; `crates/hs-scribe/src/config.rs:216`, `:484-527`.
+**Change:** Replace with `http://<host>:7433` / `example.local` placeholders in docs, rustdoc, and fixtures.
+**Acceptance:** `git grep -E '192\.168\.1\.(110|111|233)' -- docs crates` returns nothing newly added by the branch.
+
+### P3 (maintainability / efficiency) — CR-9. Lower-priority cleanups
+- **`crates/hs-scribe/src/pipeline/processor.rs:745`** — the ~120-line per-region pipeline (stream-render → `spawn_blocking` stage1 → `JoinSet` stage2 → sort/join) is duplicated nearly verbatim between `process_pdf_with_progress` and `process_pdf`, differing only in progress callbacks. This is the rc.304→rc.305 "missed sibling call site" trap (the rc.341 OOM-streaming fix had to be applied twice). Extract one shared driver; `process_pdf` calls it with a no-op progress fn.
+- **`crates/hs-scribe/src/event_watch.rs:313`** (and `:463` for HTML) — `(*source.bytes).clone()` copies the full PDF/HTML out of the `Arc` per document. Have `convert_with_progress` accept `Arc<Vec<u8>>`/`Bytes` (reqwest multipart takes `Bytes` without copy).
+- **`personal/src/services/ingest.rs:44`** — `converters::convert(cfg, format, bytes.clone(), …)` holds two full file copies across the convert+LLM-naming window (`bytes` reused at `:60`). Change `converters::convert` to take `&[u8]`.

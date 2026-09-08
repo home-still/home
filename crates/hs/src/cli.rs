@@ -155,6 +155,27 @@ pub enum MigrateAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Canonicalize DOI-derived stems to lowercase, collapsing
+    /// case-collision duplicates onto one storage key. DOIs are
+    /// case-insensitive (ISO 26324), but stems were derived from the DOI
+    /// verbatim, so the same paper fetched as `10.48550/arXiv.X` and
+    /// `10.48550/arxiv.X` landed twice and is returned twice by search.
+    /// Handles both live collisions (both spellings present — keeps the
+    /// larger markdown) and latent ones (only the mixed-case spelling
+    /// present, which would collide on the next re-download). Purges the
+    /// dropped doc_id's vectors and re-indexes any stem whose canonical
+    /// markdown changed. Non-DOI stems are never touched.
+    CanonicalizeDoiStems {
+        /// Preview without moving, deleting, or purging anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Cap on stems processed this run (for staged migration)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Override distill server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

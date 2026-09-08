@@ -114,7 +114,7 @@ pub fn detect_suspect_wide_region(bboxes: &[BBox], page_width: u32) -> Option<us
 }
 
 fn is_suspect_class(class: &str) -> bool {
-    SUSPECT_CLASSES.iter().any(|c| *c == class)
+    SUSPECT_CLASSES.contains(&class)
 }
 
 /// Run the projection-profile verifier on the suspect bbox. Returns the
@@ -125,6 +125,7 @@ fn is_suspect_class(class: &str) -> bool {
 /// each x column, smooths the profile with a small Gaussian, then looks
 /// for a deep sustained minimum in the gutter zone `[0.40·W, 0.60·W]`.
 /// 1-2 ms on a 2200×3000 px page at 200 DPI on this hardware class.
+#[allow(clippy::needless_range_loop)] // explicit index arithmetic on `smoothed`
 pub fn verify_two_column_via_profile(image: &DynamicImage, bbox: &BBox) -> Option<u32> {
     let (img_w, img_h) = image.dimensions();
     if img_w == 0 || img_h == 0 {
@@ -320,13 +321,12 @@ pub fn split_suspect_at_gutter(bboxes: &mut Vec<BBox>, suspect_idx: usize, gutte
 /// the scribe-server unit, restart, and the next conversion uses
 /// active split). Default off — Phase 1 is shadow-only.
 pub fn active_split_enabled() -> bool {
-    match std::env::var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE")
-        .ok()
-        .as_deref()
-    {
-        Some("1") | Some("true") | Some("yes") | Some("TRUE") | Some("YES") => true,
-        _ => false,
-    }
+    matches!(
+        std::env::var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "yes" | "TRUE" | "YES")
+    )
 }
 
 /// Otsu's threshold for an 8-bit luma image. Returns the threshold value
@@ -574,7 +574,7 @@ mod tests {
         let g = g.unwrap();
         // Gutter should land within the central [0.40, 0.60] band.
         assert!(
-            g >= 320 && g <= 480,
+            (320..=480).contains(&g),
             "gutter at {g}, expected 320..480 (mid-page band)"
         );
     }

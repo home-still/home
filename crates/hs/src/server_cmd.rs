@@ -14,7 +14,7 @@ pub enum ServerCmd {
     Add {
         /// Service type (scribe, distill, mcp)
         service_type: String,
-        /// Server URL (e.g. http://192.168.1.110:7433)
+        /// Server URL (e.g. http://scribe.example.local:7433)
         url: String,
     },
     /// Remove a server from the registry

@@ -46,10 +46,15 @@ async fn async_main() -> Result<()> {
         AppConfig::default()
     });
 
+    let backend_url = match config.backend {
+        hs_scribe::config::BackendChoice::OpenAi => &config.openai_url,
+        hs_scribe::config::BackendChoice::Ollama => &config.ollama_url,
+        hs_scribe::config::BackendChoice::Cloud => &config.cloud_url,
+    };
     tracing::info!(
-        "Backend: {:?}, Ollama URL: {}, Model: {}, VLM concurrency: {}",
+        "Backend: {:?}, Backend URL: {}, Model: {}, VLM concurrency: {}",
         config.backend,
-        config.ollama_url,
+        backend_url,
         config.model,
         config.vlm_concurrency
     );

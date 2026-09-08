@@ -1,11 +1,14 @@
 //! `hs openalex …` — local OpenAlex catalog management.
 //!
 //! Commands:
-//!   load       Bulk-load a snapshot entity into DuckDB.
-//!   load-works Bulk-load works partitions (Rust-driven Appender path).
-//!   status     Print row counts per table and recent ingest log entries.
-//!   query      Run an ad-hoc read-only SQL query and print rows as JSON.
-//!   build-fts  Build the BM25 FTS index over works.title + abstract_text.
+//!   load           Bulk-load a snapshot entity into DuckDB.
+//!   load-works     Bulk-load works partitions via streaming pre-dedupe.
+//!                  Walks partitions newest-first; a SeenSet of seen
+//!                  integer work-IDs gates each row so the live tables
+//!                  hold their PRIMARY KEY invariants without ON CONFLICT.
+//!   status         Print row counts per table and recent ingest log entries.
+//!   query          Run an ad-hoc read-only SQL query and print rows as JSON.
+//!   build-fts      Build the BM25 FTS index over works.title + abstract_text.
 //!   build-indexes  Build the post-load secondary indexes.
 
 use std::path::PathBuf;
@@ -23,9 +26,12 @@ pub enum OpenAlexCmd {
         /// sources, institutions, funders, publishers, authors.
         entity: String,
     },
-    /// Load works partitions (parses Rust-side, fans out to 5 appenders).
+    /// Load works partitions via streaming pre-dedupe (parses Rust-side,
+    /// fans out to 5 appenders, gates each row through a SeenSet).
     LoadWorks {
-        /// Optional partition name (e.g. updated_date=2024-01-01) to load just one.
+        /// Optional partition name (e.g. updated_date=2024-01-01) to load
+        /// just one. The SeenSet is bootstrapped from the live `works`
+        /// table so existing rows still dedupe correctly.
         #[arg(long)]
         partition: Option<String>,
     },
@@ -59,41 +65,39 @@ pub async fn dispatch(cmd: OpenAlexCmd) -> Result<()> {
             );
         }
         OpenAlexCmd::LoadWorks { partition } => {
+            let seen_path = seen_set_path(&cfg.db_path);
             let works_dir = cfg.snapshot_dir.join("works");
             if let Some(part_name) = partition {
+                // Single-partition path (testing/debug). Bootstrap the
+                // SeenSet from the live `works` table so we don't re-emit
+                // rows that previous runs already loaded; otherwise PK
+                // violations would surface on the bulk INSERT.
                 let part_path = works_dir.join(&part_name);
                 if !part_path.is_dir() {
                     return Err(anyhow!("partition not found: {}", part_path.display()));
                 }
-                let s = db.load_works_partition(&part_path)?;
+                println!("bootstrapping seen-set from existing works table...");
+                let mut seen =
+                    openalex_ingest::SeenSet::rebuild_from_db(db.raw(), seen_path.clone())?;
+                let s = db.load_works_partition(&part_path, &mut seen)?;
+                seen.force_checkpoint()?;
                 println!(
-                    "works/{}: {} rows inserted (skipped={})",
+                    "works/{}: {} rows inserted (skipped_partition={})",
                     part_name, s.rows_inserted, s.skipped_partitions
                 );
             } else {
+                // Full-corpus walk: load_works walks newest-first and
+                // manages SeenSet rehydrate / checkpoint / final flush
+                // internally.
                 let parts = list_partitions(&works_dir)?;
-                println!("loading {} works partitions...", parts.len());
-                let mut total_rows = 0u64;
-                let mut total_loaded = 0u64;
-                let mut total_skipped = 0u64;
-                for (i, part) in parts.iter().enumerate() {
-                    let s = db.load_works_partition(part)?;
-                    total_rows += s.rows_inserted;
-                    total_loaded += s.partitions_loaded;
-                    total_skipped += s.skipped_partitions;
-                    if (i + 1) % 10 == 0 || i + 1 == parts.len() {
-                        println!(
-                            "  [{}/{}] cumulative: {} rows loaded, {} partitions skipped",
-                            i + 1,
-                            parts.len(),
-                            total_rows,
-                            total_skipped
-                        );
-                    }
-                }
+                println!(
+                    "loading {} works partitions newest-first (streaming pre-dedupe)...",
+                    parts.len()
+                );
+                let s = db.load_works(&cfg.snapshot_dir, seen_path)?;
                 println!(
                     "works: {} partitions loaded, {} skipped, {} rows inserted",
-                    total_loaded, total_skipped, total_rows
+                    s.partitions_loaded, s.skipped_partitions, s.rows_inserted
                 );
             }
         }
@@ -109,7 +113,7 @@ pub async fn dispatch(cmd: OpenAlexCmd) -> Result<()> {
             // duckdb-rs requires .query() before column metadata is valid.
             let col_names: Vec<String> = rows
                 .as_ref()
-                .map(|s| s.column_names().into_iter().map(String::from).collect())
+                .map(|s| s.column_names().into_iter().collect())
                 .unwrap_or_default();
             let mut count = 0u64;
             while let Some(row) = rows.next()? {
@@ -172,6 +176,15 @@ fn expand_tilde(p: &str) -> PathBuf {
         }
     }
     PathBuf::from(p)
+}
+
+/// SeenSet checkpoint path: lives next to the DuckDB file so wiping the
+/// data dir wipes both atomically.
+fn seen_set_path(db_path: &std::path::Path) -> PathBuf {
+    db_path
+        .parent()
+        .map(|p| p.join("seen_set.bin"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/seen_set.bin"))
 }
 
 fn value_to_json(v: duckdb::types::Value) -> serde_json::Value {

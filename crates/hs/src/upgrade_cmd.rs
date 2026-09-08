@@ -86,7 +86,11 @@ pub async fn run(
         reporter.status("Upgraded", &format!("hs → {latest}"));
     }
 
-    // Upgrade companion binaries if they're already installed
+    // Upgrade companion binaries if they're already installed. Each name
+    // must match a release-asset prefix (see `.github/workflows/release.yaml`)
+    // and the binary on disk gets located by `find_companion_binary` — we
+    // only swap binaries that are actually installed on this host, so a
+    // CLI-only client doesn't try to pull GPU server binaries.
     for (name, finder) in [
         (
             "hs-distill-server",
@@ -94,6 +98,10 @@ pub async fn run(
         ),
         ("hs-gateway", find_companion_binary("hs-gateway")),
         ("hs-mcp", find_companion_binary("hs-mcp")),
+        (
+            "hs-scribe-server",
+            find_companion_binary("hs-scribe-server"),
+        ),
     ] {
         if finder.is_some() {
             let installed = download_and_replace_binary(&release, name, target, reporter).await?;

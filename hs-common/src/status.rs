@@ -368,6 +368,70 @@ pub async fn count_ext_via(storage: &dyn Storage, prefix: &str, ext: &str) -> u6
     }
 }
 
+/// Count distinct source stems under `papers_prefix` that have no markdown.
+///
+/// This is the honest basis for `pipeline_drift`. Comparing raw object
+/// counts (`pdfs + htmls + epubs` vs `markdown`) cannot answer "how many
+/// documents still owe us markdown", because the two sides don't share a
+/// key space:
+///
+/// - A paper saved as **both** `.pdf` and `.html` (43 stems on the corpus
+///   as of rc.350) adds 2 to the source side but can only ever yield 1
+///   markdown, so each one contributed a permanent +1 of phantom drift.
+/// - Markdown whose source has since been removed (9 stems, from the
+///   DOI-stem lowercasing migration) subtracted from drift, masking real
+///   backlog.
+///
+/// Those two errors put a floor under the metric that no amount of
+/// conversion could clear, which is why drift sat at 71 against a
+/// threshold of 3. Counting stems makes the number reachable: it goes to
+/// zero exactly when every live source has markdown.
+///
+/// `.quarantine/` is excluded: `hs migrate quarantine-bad-content`
+/// relocates known-bad bytes there and stamps `conversion_failed`
+/// specifically to take them out of the pipeline, and `hs pipeline
+/// catch-up` skips them for the same reason. They surface through the
+/// corrupted count instead. Stamped failures still sitting in the live
+/// papers tree are deliberately *not* excluded — drift is meant to show
+/// those.
+#[cfg(feature = "storage")]
+pub async fn count_unconverted_stems(
+    storage: &dyn Storage,
+    papers_prefix: &str,
+    markdown_prefix: &str,
+) -> u64 {
+    fn stem_of(key: &str, exts: &[&str]) -> Option<String> {
+        let name = key.rsplit('/').next()?;
+        if name.starts_with("._") {
+            return None;
+        }
+        let (stem, ext) = name.rsplit_once('.')?;
+        exts.contains(&ext).then(|| stem.to_string())
+    }
+
+    let (papers, markdown) = match (
+        storage.list(papers_prefix).await,
+        storage.list(markdown_prefix).await,
+    ) {
+        (Ok(p), Ok(m)) => (p, m),
+        _ => return 0,
+    };
+
+    let md_stems: std::collections::HashSet<String> = markdown
+        .iter()
+        .filter_map(|o| stem_of(&o.key, &["md"]))
+        .collect();
+
+    let unconverted: std::collections::HashSet<String> = papers
+        .iter()
+        .filter(|o| !o.key.contains("/.quarantine/"))
+        .filter_map(|o| stem_of(&o.key, &["pdf", "html", "epub"]))
+        .filter(|stem| !md_stems.contains(stem))
+        .collect();
+
+    unconverted.len() as u64
+}
+
 /// A single listing-and-deserialization pass over the three prefixes that
 /// `catalog_repair`'s seven scan directions all probe. Built once per
 /// `catalog_repair` invocation and lent to each scan by reference, so the
@@ -1064,6 +1128,8 @@ mod history_tests {
                 total_pages: 1,
                 converted_at: "2026-04-15T19:50:02Z".into(),
                 pages: vec![],
+                converted_by: None,
+                attempts_log: vec![],
             }),
             embedding_skip: Some(EmbeddingSkip {
                 reason: "zero_chunks_or_empty".into(),
@@ -1080,6 +1146,8 @@ mod history_tests {
                 total_pages: 33,
                 converted_at: "2026-04-15T18:01:00Z".into(),
                 pages: vec![],
+                converted_by: None,
+                attempts_log: vec![],
             }),
             embedding: Some(EmbeddingMeta {
                 server: "distill-1".into(),
@@ -1117,6 +1185,99 @@ mod history_tests {
         let skip = events.iter().find(|e| e.activity == "EmbedSkip").unwrap();
         assert_eq!(skip.reason.as_deref(), Some("zero_chunks_or_empty"));
         assert_eq!(skip.detail, "zero_chunks_or_empty");
+    }
+}
+
+#[cfg(all(test, feature = "storage"))]
+mod unconverted_stem_tests {
+    use super::*;
+    use crate::storage::LocalFsStorage;
+
+    /// Reproduces the three accounting errors that pinned `pipeline_drift`
+    /// at 71 against a threshold of 3 on the rc.350 corpus. The old metric
+    /// was `count(pdf|html|epub objects) - count(md objects)`, which on this
+    /// fixture returns 4 - 2 = 2; only `dual` genuinely owes markdown, so
+    /// the correct answer is 1.
+    #[tokio::test]
+    async fn counts_stems_not_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        // (1) One paper stored as BOTH .pdf and .html. Two source objects,
+        // but a single stem that can only ever yield one markdown. 43 such
+        // stems existed on the corpus, each contributing phantom drift.
+        storage
+            .put("papers/du/dual.pdf", b"pdf".to_vec())
+            .await
+            .unwrap();
+        storage
+            .put("papers/du/dual.html", b"html".to_vec())
+            .await
+            .unwrap();
+
+        // (2) Markdown whose source is gone (DOI-stem lowercasing
+        // migration). Under object arithmetic this *subtracted* from drift,
+        // masking real backlog.
+        storage
+            .put("markdown/or/orphan.md", b"md".to_vec())
+            .await
+            .unwrap();
+
+        // (3) A quarantined source: deliberately removed from the pipeline
+        // by `hs migrate quarantine-bad-content`, surfaced via the
+        // corrupted count, and skipped by `hs pipeline catch-up`.
+        storage
+            .put("papers/.quarantine/ba/bad.pdf", b"junk".to_vec())
+            .await
+            .unwrap();
+
+        // A properly converted paper: must not count.
+        storage
+            .put("papers/ok/done.pdf", b"pdf".to_vec())
+            .await
+            .unwrap();
+        storage
+            .put("markdown/ok/done.md", b"md".to_vec())
+            .await
+            .unwrap();
+
+        let n = count_unconverted_stems(&storage, "papers", "markdown").await;
+        assert_eq!(n, 1, "only `dual` owes markdown");
+    }
+
+    #[tokio::test]
+    async fn reaches_zero_when_every_live_source_is_converted() {
+        // The property the old metric could not satisfy: a fully converted
+        // corpus must read exactly 0, so the threshold is meaningful.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        storage
+            .put("papers/aa/a.pdf", b"pdf".to_vec())
+            .await
+            .unwrap();
+        storage
+            .put("papers/aa/a.html", b"html".to_vec())
+            .await
+            .unwrap();
+        storage
+            .put("markdown/aa/a.md", b"md".to_vec())
+            .await
+            .unwrap();
+        storage
+            .put("papers/.quarantine/bb/b.pdf", b"junk".to_vec())
+            .await
+            .unwrap();
+        // macOS resource forks are not sources.
+        storage
+            .put("papers/cc/._c.pdf", b"junk".to_vec())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_unconverted_stems(&storage, "papers", "markdown").await,
+            0
+        );
     }
 }
 
@@ -1161,6 +1322,8 @@ mod stuck_convert_tests {
                 total_pages: 5,
                 converted_at: "2026-04-15T16:01:00Z".into(),
                 pages: vec![],
+                converted_by: None,
+                attempts_log: vec![],
             }),
             ..Default::default()
         };
@@ -1208,6 +1371,7 @@ mod stuck_convert_tests {
                 reason: "unsupported_content_type:html".into(),
                 at: "2026-04-24T10:01:00Z".into(),
                 attempts: 1,
+                attempts_log: vec![],
             }),
             ..Default::default()
         };
@@ -1637,6 +1801,8 @@ mod flag_drift_tests {
                 total_pages: 0,
                 converted_at: batch_stamp.into(),
                 pages: vec![],
+                converted_by: None,
+                attempts_log: vec![],
             }),
             repair: Some(RepairMeta {
                 repaired_at: batch_stamp.into(),

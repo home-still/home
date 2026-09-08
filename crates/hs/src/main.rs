@@ -48,9 +48,6 @@ fn init_logging(
         TopCmd::Distill {
             command: hs_distill::cli::DistillCmd::WatchEvents { .. },
         } => ("hs-distill-watch", true),
-        TopCmd::Scribe {
-            command: scribe_cmd::ScribeCmd::Autotune,
-        } => ("hs-scribe-autotune", true),
         _ => ("hs", false),
     };
 
@@ -170,6 +167,19 @@ fn main() -> ExitCode {
                     }
                     cli::MigrateAction::DropLocalHtml { dry_run } => {
                         migrate_cmd::run_drop_local_html(&reporter, dry_run).await
+                    }
+                    cli::MigrateAction::CanonicalizeDoiStems {
+                        dry_run,
+                        limit,
+                        server,
+                    } => {
+                        migrate_cmd::run_canonicalize_doi_stems(
+                            &reporter,
+                            dry_run,
+                            limit,
+                            server.as_deref(),
+                        )
+                        .await
                     }
                 },
                 TopCmd::Pipeline { command } => pipeline_cmd::dispatch(command, &reporter).await,

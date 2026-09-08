@@ -54,6 +54,28 @@ pub enum PipelineMode {
     PerRegion,
 }
 
+/// Which converter the scribe server uses for the inbound `/scribe` POST.
+///
+/// `Legacy` is the per-region OcrEngine pipeline (render → layout-detect
+/// → per-region VLM via `BackendChoice`) — what scribe has always done.
+///
+/// `OlmOcr` shells out to the `olmocr` CLI (allenai/olmOCR-2-7B-1025-FP8
+/// via vLLM). Olmocr does its own rendering, anchoring against the PDF's
+/// text layer, and produces flat markdown. The per-region pipeline,
+/// streaming repetition detector, and QC postprocess are all bypassed —
+/// olmocr returns assembled markdown which the server returns as-is.
+///
+/// Selected at server startup via `HS_SCRIBE_CONVERTER=olmocr` so a
+/// single binary serves both backends (different scribe-server processes
+/// on different ports, each with its own env-selected converter).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConverterMode {
+    #[default]
+    Legacy,
+    Olmocr,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub ollama_url: String,
@@ -61,6 +83,11 @@ pub struct AppConfig {
     pub cloud_api_key: Option<String>,
     pub cloud_url: String,
     pub openai_url: String,
+    /// Bearer token for the OpenAI-compatible VLM backend. `None` when the
+    /// backend is unauthenticated (e.g. a bare `llama-server` on big). Set
+    /// via `HS_SCRIBE_OPENAI_API_KEY` when routing through an auth-gated
+    /// proxy such as `llama-swap` on a daily-driver host.
+    pub openai_api_key: Option<String>,
     pub backend: BackendChoice,
     /// Wall-clock deadline (seconds) for a single PDF convert on the server.
     /// The handler wraps `process_pdf_*` in `tokio::time::timeout()` — when
@@ -92,6 +119,21 @@ pub struct AppConfig {
     pub use_cuda: bool,
     pub max_image_dim: u32,
     pub vlm_concurrency: usize,
+    /// Which converter implements `/scribe`. Defaults to `Legacy` so
+    /// existing deployments are unaffected; set `HS_SCRIBE_CONVERTER=olmocr`
+    /// on hosts running the olmocr/vLLM scribe instance.
+    #[serde(default)]
+    pub converter: ConverterMode,
+    /// vLLM endpoint serving olmocr (OpenAI-compatible). Consumed only
+    /// when `converter == Olmocr`. Override via `HS_SCRIBE_OLMOCR_ENDPOINT`.
+    pub olmocr_endpoint: String,
+    /// Model name vLLM advertises for olmocr (matches its
+    /// `--served-model-name`). Override via `HS_SCRIBE_OLMOCR_MODEL`.
+    pub olmocr_model: String,
+    /// Path to the `olmocr` CLI binary. Override via `HS_SCRIBE_OLMOCR_BIN`.
+    /// Default `"olmocr"` lets the OS PATH lookup find it; on big the
+    /// pinned location is `~/.local/share/olmocr-vllm/venv/bin/olmocr`.
+    pub olmocr_bin: String,
 }
 impl Default for AppConfig {
     fn default() -> Self {
@@ -102,6 +144,7 @@ impl Default for AppConfig {
             cloud_api_key: None,
             cloud_url: "https://api.z.ai/api/paas/v4/layout_parsing".into(),
             openai_url: "http://localhost:8080".into(),
+            openai_api_key: None,
             backend: BackendChoice::Ollama,
             convert_deadline_secs: 900,
             dpi: 200,
@@ -114,6 +157,10 @@ impl Default for AppConfig {
             use_cuda: true,
             max_image_dim: 1800,
             vlm_concurrency: class.vlm_concurrency(),
+            converter: ConverterMode::default(),
+            olmocr_endpoint: "http://localhost:8081/v1".into(),
+            olmocr_model: "olmocr".into(),
+            olmocr_bin: "olmocr".into(),
         }
     }
 }
@@ -158,6 +205,100 @@ impl AppConfig {
     }
 }
 
+/// A scribe HTTP server entry. YAML accepts either the legacy bare URL
+/// string (which defaults the backend to `glm_ocr`, matching every
+/// pre-chain deployment) or a struct with explicit per-entry backend
+/// metadata:
+///
+/// ```yaml
+/// scribe:
+///   servers:
+///     - http://host-a.example.local:7433       # legacy: backend = glm_ocr
+///     - url: http://host-a.example.local:7434  # new chain entry
+///       backend: olmocr
+///     - url: http://host-a.example.local:7433
+///       backend: glm_ocr
+/// ```
+///
+/// Chain order is the list order — `cmd_watch_events` walks entries
+/// top-to-bottom, escalating from one backend to the next on
+/// `ConvertClassification::Escalate`. The `backend` field is recorded
+/// in the catalog as `ConversionMeta.converted_by` (success) and each
+/// `AttemptEntry.backend` (chain audit log).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "ScribeServerEntryRepr", into = "ScribeServerEntryRepr")]
+pub struct ScribeServerEntry {
+    pub url: String,
+    pub backend: String,
+    /// Max conversions the dispatcher runs against THIS backend at once.
+    /// Tuned per-backend because models differ wildly in footprint: olmocr
+    /// (vLLM + a per-conversion CLI subprocess rendering pages) is RAM/VRAM
+    /// heavy and wants a low cap; glm (scans, rarely hit) can run more. The
+    /// dispatcher holds a semaphore of this size per backend, so a heavy
+    /// model can't fan out and exhaust host RAM. Default 4.
+    pub concurrency: usize,
+}
+
+/// Default backend identifier when an entry comes in as a bare URL
+/// string — preserves the pre-chain semantics for every existing config
+/// file in the fleet.
+fn default_backend() -> String {
+    "glm_ocr".to_string()
+}
+
+/// Default per-backend conversion concurrency when an entry doesn't set one.
+/// Conservative so an unconfigured heavy backend can't blow up RAM/VRAM.
+fn default_concurrency() -> usize {
+    4
+}
+
+/// Serde wire shape for `ScribeServerEntry`. The untagged enum lets YAML
+/// accept either form transparently; the type-level `from` / `into`
+/// converters above keep `ScribeServerEntry`'s call-site API ergonomic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ScribeServerEntryRepr {
+    Bare(String),
+    Struct {
+        url: String,
+        #[serde(default = "default_backend")]
+        backend: String,
+        #[serde(default = "default_concurrency")]
+        concurrency: usize,
+    },
+}
+
+impl From<ScribeServerEntryRepr> for ScribeServerEntry {
+    fn from(repr: ScribeServerEntryRepr) -> Self {
+        match repr {
+            ScribeServerEntryRepr::Bare(url) => Self {
+                url,
+                backend: default_backend(),
+                concurrency: default_concurrency(),
+            },
+            ScribeServerEntryRepr::Struct {
+                url,
+                backend,
+                concurrency,
+            } => Self {
+                url,
+                backend,
+                concurrency,
+            },
+        }
+    }
+}
+
+impl From<ScribeServerEntry> for ScribeServerEntryRepr {
+    fn from(entry: ScribeServerEntry) -> Self {
+        Self::Struct {
+            url: entry.url,
+            backend: entry.backend,
+            concurrency: entry.concurrency,
+        }
+    }
+}
+
 /// Client-side scribe configuration (server list, directories).
 /// Loaded from ~/.home-still/config.yaml under the "scribe" section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,7 +308,7 @@ pub struct ScribeConfig {
     pub watch_dir: PathBuf,
     pub corrupted_dir: PathBuf,
     pub catalog_dir: PathBuf,
-    pub servers: Vec<String>,
+    pub servers: Vec<ScribeServerEntry>,
     /// When false, skip local scribe server init/start (client-only mode).
     /// Machines that only run the watcher and forward to remote scribe servers
     /// should set this to false.
@@ -197,86 +338,12 @@ pub struct ScribeConfig {
     /// deadline and neither gives up prematurely.
     #[serde(default)]
     pub timeout_policy: TimeoutPolicy,
-    /// Ollama `OLLAMA_NUM_PARALLEL` auto-tuner knobs. Consumed by
-    /// `hs scribe autotune`, which hill-climbs against observed
-    /// per-host scribe throughput.
-    #[serde(default)]
-    pub autotune: AutotuneConfig,
     /// Storage backend (loaded from top-level `storage:` section, not `scribe.storage`).
     #[serde(skip)]
     pub storage: StorageConfig,
     /// Event bus (loaded from top-level `events:` section).
     #[serde(skip)]
     pub events: EventBusConfig,
-}
-
-/// Per-host knobs for `hs scribe autotune`. All fields have sane
-/// defaults; the autotuner works out of the box.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AutotuneConfig {
-    /// URL of the scribe-server on the same host as Ollama.
-    pub scribe_url: String,
-    /// How long between ticks. Each tick restarts Ollama once, so this
-    /// is also the "per-host disruption budget" — default 30 min.
-    pub tick_interval_secs: u64,
-    /// Wait after each Ollama restart before starting the measurement
-    /// window. Gives the model time to warm up and in-flight converts
-    /// to drain.
-    pub warmup_secs: u64,
-    /// Measurement window: count scribe's `total_conversions` delta
-    /// across this interval. Shorter → noisier; longer → slower to
-    /// converge. Default 24 min (so warmup + measure fits in a 30 min
-    /// tick with headroom).
-    pub measure_secs: u64,
-    /// Candidate values the hill-climber walks. Must be strictly
-    /// increasing and have at least 2 entries.
-    pub values: Vec<u32>,
-    /// Ratio that counts as a real improvement, e.g. 1.05 = needs +5%.
-    pub improvement_threshold: f64,
-    /// Ratio below which we call it a regression and step back, e.g.
-    /// 0.90 = backs off at a -10% drop.
-    pub regression_threshold: f64,
-    /// Number of inconclusive ticks (rate within the two thresholds)
-    /// before the tuner marks itself converged and stops stepping.
-    pub converge_after_stable: u32,
-    /// Multiplicative decay applied to `best_rate` on every plateau tick
-    /// so a stale historical peak doesn't block future stepping when
-    /// workload character shifts (e.g. from small papers to larger ones,
-    /// or after a hardware change). Default `0.95` — half-life ≈ 14
-    /// ticks ≈ 140 min at the 10-min cadence; fast enough to unstick
-    /// within a session, slow enough to ignore sample noise. Set to
-    /// `1.0` to disable.
-    pub best_rate_decay: f64,
-    /// Where the tuner persists its rolling history + current state.
-    /// Survives across restarts.
-    pub state_path: PathBuf,
-}
-
-impl Default for AutotuneConfig {
-    fn default() -> Self {
-        let state_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".home-still")
-            .join("autotune-state.json");
-        let values = HardwareProfile::detect().class.autotune_values();
-        Self {
-            scribe_url: "http://127.0.0.1:7433".into(),
-            // Tick 10 min: warmup 60s + measure 480s = 9 min per tick with
-            // ~1 min idle slack. Shorter windows are noisier, so
-            // `converge_after_stable = 5` compensates. Net convergence drops
-            // from ~2 hours at the old 30-min tick to ~45 min.
-            tick_interval_secs: 600,
-            warmup_secs: 60,
-            measure_secs: 480,
-            values,
-            improvement_threshold: 1.05,
-            regression_threshold: 0.90,
-            converge_after_stable: 5,
-            best_rate_decay: 0.95,
-            state_path,
-        }
-    }
 }
 
 fn default_inbox_poll_interval_secs() -> u64 {
@@ -336,12 +403,15 @@ impl Default for ScribeConfig {
             watch_dir: resolve_project_dir().join("papers"),
             corrupted_dir: resolve_project_dir().join("corrupted"),
             catalog_dir: resolve_project_dir().join("catalog"),
-            servers: vec!["http://localhost:7433".into()],
+            servers: vec![ScribeServerEntry {
+                url: "http://localhost:7433".into(),
+                backend: default_backend(),
+                concurrency: default_concurrency(),
+            }],
             local_server: true,
             inbox_poll_interval_secs: default_inbox_poll_interval_secs(),
             convert_timeout_secs: default_convert_timeout_secs(),
             timeout_policy: TimeoutPolicy::default(),
-            autotune: AutotuneConfig::default(),
             storage: StorageConfig::default(),
             events: EventBusConfig::default(),
         }
@@ -400,5 +470,88 @@ impl ScribeConfig {
     /// Build the configured event bus.
     pub async fn build_event_bus(&self) -> anyhow::Result<Arc<dyn EventBus>> {
         self.events.build().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_url_deserializes_with_default_backend() {
+        // Legacy form — every existing config.yaml in the fleet looks
+        // like this. Must continue to parse without operator action.
+        let yaml = "- http://192.0.2.110:7433\n";
+        let entries: Vec<ScribeServerEntry> =
+            serde_yaml_ng::from_str(yaml).expect("bare URL must parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].url, "http://192.0.2.110:7433");
+        assert_eq!(entries[0].backend, "glm_ocr");
+    }
+
+    #[test]
+    fn struct_form_deserializes_with_explicit_backend() {
+        let yaml = "\
+- url: http://192.0.2.110:7434
+  backend: olmocr
+";
+        let entries: Vec<ScribeServerEntry> =
+            serde_yaml_ng::from_str(yaml).expect("struct form must parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].url, "http://192.0.2.110:7434");
+        assert_eq!(entries[0].backend, "olmocr");
+    }
+
+    #[test]
+    fn struct_form_with_missing_backend_defaults_to_glm_ocr() {
+        // Operator wrote `url: ...` but forgot `backend:` — fall back to
+        // the same default the bare form uses rather than fail loudly,
+        // since that matches the legacy meaning.
+        let yaml = "\
+- url: http://192.0.2.110:7433
+";
+        let entries: Vec<ScribeServerEntry> =
+            serde_yaml_ng::from_str(yaml).expect("backend-less struct must parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].backend, "glm_ocr");
+    }
+
+    #[test]
+    fn mixed_list_preserves_order_and_backends() {
+        // The chain semantics in Step 2d rely on this exact ordering —
+        // primary backend first, fallbacks after.
+        let yaml = "\
+- url: http://192.0.2.110:7434
+  backend: olmocr
+- http://192.0.2.110:7433
+- url: http://192.0.2.233:7433
+  backend: glm_ocr
+";
+        let entries: Vec<ScribeServerEntry> =
+            serde_yaml_ng::from_str(yaml).expect("mixed list must parse");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].backend, "olmocr");
+        assert_eq!(entries[1].backend, "glm_ocr"); // bare → default
+        assert_eq!(entries[2].backend, "glm_ocr");
+    }
+
+    #[test]
+    fn roundtrip_serializes_as_struct_form() {
+        // Serializing always emits the explicit form so operators can
+        // see exactly which backend each URL routes to. Round-trip
+        // through Vec because the From/Into pair only fires on Vec
+        // elements, not on the wrapper itself.
+        let entries = vec![ScribeServerEntry {
+            url: "http://x:7433".into(),
+            backend: "glm_ocr".into(),
+            concurrency: default_concurrency(),
+        }];
+        let yaml = serde_yaml_ng::to_string(&entries).expect("serialize");
+        assert!(yaml.contains("url: http://x:7433"));
+        assert!(yaml.contains("backend: glm_ocr"));
+        let parsed: Vec<ScribeServerEntry> = serde_yaml_ng::from_str(&yaml).expect("re-parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].url, "http://x:7433");
+        assert_eq!(parsed[0].backend, "glm_ocr");
     }
 }

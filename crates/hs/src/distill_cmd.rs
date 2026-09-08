@@ -13,7 +13,7 @@ use hs_distill::config::{DistillClientConfig, DistillServerConfig};
 const DEFAULT_SERVER: &str = "http://localhost:7434";
 
 /// Create a DistillClient, with auth headers if the URL is a cloud gateway.
-async fn make_distill_client(url: &str) -> Result<DistillClient> {
+pub(crate) async fn make_distill_client(url: &str) -> Result<DistillClient> {
     if is_cloud_url(url) {
         let auth = hs_common::auth::client::AuthenticatedClient::from_default_path()
             .context("Cloud credentials not found. Run `hs cloud enroll` first.")?;
@@ -26,7 +26,7 @@ async fn make_distill_client(url: &str) -> Result<DistillClient> {
 const QDRANT_REST_PORT: u16 = 6333;
 const QDRANT_GRPC_PORT: u16 = 6334;
 
-async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
+pub(crate) async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
     if let Some(s) = cli_server {
         return vec![s.to_string()];
     }
@@ -164,6 +164,15 @@ pub async fn dispatch(
         DistillCmd::Purge { doc_id, server } => {
             cmd_purge(&doc_id, server.as_deref(), reporter).await
         }
+        DistillCmd::Abstracts(sub) => match sub {
+            hs_distill::cli::AbstractsCmd::Build { force, server } => {
+                cmd_abstracts_build(server.as_deref(), force, reporter).await
+            }
+            hs_distill::cli::AbstractsCmd::Reconcile { server } => {
+                cmd_abstracts_build(server.as_deref(), false, reporter).await
+            }
+            hs_distill::cli::AbstractsCmd::Status => cmd_abstracts_status(reporter).await,
+        },
     }
 }
 
@@ -176,6 +185,226 @@ async fn cmd_purge(doc_id: &str, server: Option<&str>, reporter: &Arc<dyn Report
         .await
         .with_context(|| format!("delete_doc({doc_id})"))?;
     reporter.finish(&format!("Deleted {deleted} chunk(s) for {doc_id}"));
+    Ok(())
+}
+
+/// Open the local OpenAlex DuckDB read-only using the path from
+/// `~/.home-still/config.yaml`. Mirrors `open_openalex_readonly` in hs-mcp;
+/// keeps the same memory cap so a stray query can't OOM the CLI process
+/// the way it used to OOM hs-mcp.
+fn open_openalex_readonly_for_cli() -> Result<duckdb::Connection> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no $HOME"))?;
+    let cfg_path = home.join(".home-still").join("config.yaml");
+    let raw = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("read {}", cfg_path.display()))?;
+    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&raw)?;
+    let oa = v
+        .get("openalex")
+        .ok_or_else(|| anyhow::anyhow!("missing `openalex:` section in config.yaml"))?;
+    let db_path_str = oa
+        .get("db_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("openalex.db_path missing"))?;
+    let db_path = if let Some(rest) = db_path_str.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(db_path_str)
+    };
+    let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
+    let conn = duckdb::Connection::open_with_flags(&db_path, cfg)?;
+    conn.execute_batch("SET memory_limit='4GB';")?;
+    Ok(conn)
+}
+
+/// Build the `paper_abstracts` Qdrant collection from every catalog entry.
+///
+/// Per the abstracts plan: coalesce (OpenAlex DuckDB, then markdown
+/// `## Abstract`, then title-only), embed `title + abstract` via the
+/// existing /distill route targeting `collection_name="paper_abstracts"`,
+/// then stamp the catalog so reconcile runs are idempotent.
+async fn cmd_abstracts_build(
+    server: Option<&str>,
+    force: bool,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    use hs_distill::abstracts::{build_embed_input, coalesce_abstract, AbstractSource};
+    use openalex_ingest::lookup_work_abstract_by_doi;
+
+    const COLLECTION: &str = "paper_abstracts";
+    const CATALOG_PREFIX: &str = "catalog";
+
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage()?;
+    let servers = resolve_servers(server).await;
+    let client = DistillClient::new(&servers[0])?;
+
+    reporter.status("Init", "opening OpenAlex DuckDB (read-only)");
+    let oa_conn = open_openalex_readonly_for_cli()
+        .context("open OpenAlex DuckDB — the abstracts pipeline needs the local OA catalog as the canonical source")?;
+
+    reporter.status("Init", "listing catalog entries");
+    let entries = hs_common::catalog::list_catalog_entries_via(&*storage, CATALOG_PREFIX)
+        .await
+        .context("list catalog entries")?;
+    let total = entries.len();
+    reporter.status("Catalog", &format!("{total} entries"));
+
+    let mut count_openalex = 0u32;
+    let mut count_catalog = 0u32;
+    let mut count_markdown = 0u32;
+    let mut count_title_only = 0u32;
+    let mut count_skipped = 0u32;
+    let mut count_errored = 0u32;
+
+    for (idx, (stem, _meta, entry)) in entries.into_iter().enumerate() {
+        if !force && entry.abstract_embed.is_some() {
+            count_skipped += 1;
+            continue;
+        }
+
+        reporter.status(&format!("[{}/{}]", idx + 1, total), &stem);
+
+        // 1. OpenAlex DOI lookup. The catalog only has metadata that was
+        //    available at download time, which is often nothing — many
+        //    DOIs land in the catalog with `title=None` from a metadata
+        //    provider that gave a bare PDF URL. The local OA catalog is
+        //    the canonical source for both title AND abstract.
+        let oa_row = entry
+            .doi
+            .as_deref()
+            .and_then(|doi| lookup_work_abstract_by_doi(&oa_conn, doi).ok().flatten());
+        let openalex_abstract = oa_row.as_ref().and_then(|w| w.abstract_text.clone());
+        // Title coalesce: catalog > OpenAlex > stem. Falling back to the
+        // stem guarantees the embed_input is never empty, so every paper
+        // makes it into the `paper_abstracts` collection. The stem is a
+        // degraded signal for pure-DOI filenames but a useful one for
+        // author_year_topic personal-corpus naming.
+        let title = entry
+            .title
+            .clone()
+            .or_else(|| oa_row.as_ref().and_then(|w| w.title.clone()))
+            .unwrap_or_else(|| stem.clone());
+
+        // 2. Catalog-stored abstract — captured at `paper_download` time
+        //    from whichever provider produced the hit (often Crossref,
+        //    Semantic Scholar, or arxiv for DOIs not in the OpenAlex
+        //    snapshot). Cheap to read — already on the entry we just
+        //    loaded.
+        let catalog_abstract = entry.abstract_text.clone();
+
+        // 3. Markdown fallback — only fetched if neither structured
+        //    source has an abstract, since every fetch is an S3
+        //    round-trip and many papers' converted markdown also lacks a
+        //    detectable Abstract section.
+        let need_markdown = openalex_abstract.is_none()
+            && catalog_abstract
+                .as_deref()
+                .map(|s| s.trim().chars().count() < hs_distill::abstracts::MIN_ABSTRACT_CHARS)
+                .unwrap_or(true);
+        let markdown_text = if need_markdown {
+            if let Some(md_key) = entry.markdown_path.as_deref() {
+                match storage.get(md_key).await {
+                    Ok(bytes) => String::from_utf8(bytes).ok(),
+                    Err(e) => {
+                        tracing::warn!("read markdown {md_key}: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let coalesced = coalesce_abstract(
+            openalex_abstract,
+            catalog_abstract,
+            markdown_text.as_deref(),
+        );
+        let abstract_chars = coalesced.abstract_chars();
+        let embed_input = build_embed_input(Some(&title), &coalesced);
+
+        // 3. POST to the existing /distill endpoint with a synthetic path
+        //    so the doc_id resolves to the catalog stem.
+        let path_hint = format!("{stem}.md");
+        match client
+            .index_content_in(&path_hint, &embed_input, Some(&entry), Some(COLLECTION))
+            .await
+        {
+            Ok(result) if result.chunks_indexed > 0 => {
+                let source = coalesced.source.as_str();
+                if let Err(e) = hs_common::catalog::update_abstract_embed_catalog_via(
+                    &*storage,
+                    CATALOG_PREFIX,
+                    &stem,
+                    source,
+                    abstract_chars,
+                )
+                .await
+                {
+                    tracing::warn!("stamp catalog for {stem}: {e}");
+                }
+                match coalesced.source {
+                    AbstractSource::Openalex => count_openalex += 1,
+                    AbstractSource::Catalog => count_catalog += 1,
+                    AbstractSource::Markdown => count_markdown += 1,
+                    AbstractSource::TitleOnly => count_title_only += 1,
+                }
+            }
+            Ok(_) => {
+                // Server returned success but produced 0 chunks (the
+                // pipeline's quality filter dropped them, or the chunker
+                // emitted nothing usable). Don't stamp — the catalog must
+                // never lie about Qdrant state.
+                tracing::warn!("{stem}: distill produced 0 chunks — not stamping");
+                count_errored += 1;
+            }
+            Err(e) => {
+                tracing::warn!("embed {stem}: {e}");
+                count_errored += 1;
+            }
+        }
+    }
+
+    reporter.finish(&format!(
+        "abstracts indexed: openalex={count_openalex} catalog={count_catalog} markdown={count_markdown} title_only={count_title_only} skipped={count_skipped} errors={count_errored}"
+    ));
+    Ok(())
+}
+
+/// Report `paper_abstracts` coverage from catalog stamps. Does not touch
+/// Qdrant — pure catalog-walk so it's safe to run while distill is busy.
+async fn cmd_abstracts_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    const CATALOG_PREFIX: &str = "catalog";
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage()?;
+
+    let entries = hs_common::catalog::list_catalog_entries_via(&*storage, CATALOG_PREFIX)
+        .await
+        .context("list catalog entries")?;
+    let total = entries.len();
+
+    let mut count_openalex = 0u32;
+    let mut count_catalog = 0u32;
+    let mut count_markdown = 0u32;
+    let mut count_title_only = 0u32;
+    let mut count_unstamped = 0u32;
+
+    for (_stem, _meta, entry) in entries {
+        match entry.abstract_embed.as_ref().map(|s| s.source.as_str()) {
+            Some("openalex") => count_openalex += 1,
+            Some("catalog") => count_catalog += 1,
+            Some("markdown") => count_markdown += 1,
+            Some("title_only") => count_title_only += 1,
+            _ => count_unstamped += 1,
+        }
+    }
+
+    reporter.finish(&format!(
+        "catalog={total} indexed={} (openalex={count_openalex} catalog={count_catalog} markdown={count_markdown} title_only={count_title_only}) unstamped={count_unstamped}",
+        count_openalex + count_catalog + count_markdown + count_title_only
+    ));
     Ok(())
 }
 

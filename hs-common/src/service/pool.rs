@@ -10,11 +10,18 @@ use super::protocol::{ReadinessInfo, ServiceClient};
 pub struct ServicePool<C: ServiceClient> {
     clients: Vec<C>,
     next: AtomicUsize,
-    /// Serializes `pick_server` calls. Without this, a burst of N
-    /// concurrent handlers all probe readiness in parallel, all read
-    /// the same pre-dispatch snapshot, and dog-pile onto whichever
-    /// server happened to look best.
+    /// Serializes each probe→claim cycle inside `pick_server`. Without
+    /// this, a burst of N concurrent handlers all probe readiness in
+    /// parallel, all read the same pre-dispatch snapshot, and dog-pile
+    /// onto whichever server happened to look best. Scoped to ONE cycle
+    /// — never held across the poll-sleep, or a single parked caller
+    /// would serialize every other picker for up to the full
+    /// [`PICK_READY_TIMEOUT`].
     pick_lock: tokio::sync::Mutex<()>,
+    /// See [`PICK_READY_TIMEOUT`] / [`PICK_POLL_INTERVAL`]. Stored per
+    /// pool so tests can shrink them; production always uses the consts.
+    ready_timeout: Duration,
+    poll_interval: Duration,
     /// Client-side in-flight counter per server. Incremented when
     /// `pick_server` returns that server (and held by a
     /// [`PickGuard`] until the caller drops it after convert).
@@ -61,7 +68,18 @@ impl<C: ServiceClient> ServicePool<C> {
             next: AtomicUsize::new(0),
             pick_lock: tokio::sync::Mutex::new(()),
             reservations: Arc::new(reservations),
+            ready_timeout: PICK_READY_TIMEOUT,
+            poll_interval: PICK_POLL_INTERVAL,
         }
+    }
+
+    /// Shrink the poll-wait timing for tests. Not reachable in
+    /// production builds — the consts are the one configuration.
+    #[cfg(test)]
+    fn with_timing(mut self, ready_timeout: Duration, poll_interval: Duration) -> Self {
+        self.ready_timeout = ready_timeout;
+        self.poll_interval = poll_interval;
+        self
     }
 
     /// Number of concurrent operations to allow (4 per server — matches
@@ -101,33 +119,43 @@ impl<C: ServiceClient> ServicePool<C> {
     /// event-bus deliveries from being dropped the moment the pool
     /// happens to be full — they briefly park here instead.
     pub async fn pick_server(&self) -> Result<(&C, PickGuard)> {
-        let _pick_guard = self.pick_lock.lock().await;
-        let deadline = Instant::now() + PICK_READY_TIMEOUT;
+        let deadline = Instant::now() + self.ready_timeout;
         let mut attempt: u32 = 0;
         loop {
-            if let Some((c, idx)) = self.try_pick_once().await? {
-                self.reservations[idx].fetch_add(1, Ordering::Relaxed);
-                let guard = PickGuard {
-                    reservations: Arc::clone(&self.reservations),
-                    idx,
-                };
-                return Ok((c, guard));
+            // pick_lock scope: exactly one probe→claim cycle. Claiming
+            // must be atomic against concurrent pickers (the dog-pile
+            // race the lock exists for), but holding the guard across
+            // the sleep would park every other handler behind this one
+            // for up to the full timeout — under permanent saturation
+            // the waits compound serially (N callers → N × timeout)
+            // because each queued caller only starts its own deadline
+            // after the previous one gives up.
+            {
+                let _pick_guard = self.pick_lock.lock().await;
+                if let Some((c, idx)) = self.try_pick_once().await? {
+                    self.reservations[idx].fetch_add(1, Ordering::Relaxed);
+                    let guard = PickGuard {
+                        reservations: Arc::clone(&self.reservations),
+                        idx,
+                    };
+                    return Ok((c, guard));
+                }
             }
             if Instant::now() >= deadline {
                 anyhow::bail!(
                     "no ready server after {}s of polling",
-                    PICK_READY_TIMEOUT.as_secs()
+                    self.ready_timeout.as_secs()
                 );
             }
             attempt += 1;
             if attempt == 1 {
                 tracing::debug!(
-                    interval_ms = PICK_POLL_INTERVAL.as_millis() as u64,
-                    timeout_s = PICK_READY_TIMEOUT.as_secs(),
+                    interval_ms = self.poll_interval.as_millis() as u64,
+                    timeout_s = self.ready_timeout.as_secs(),
                     "pool saturated — polling for readiness"
                 );
             }
-            tokio::time::sleep(PICK_POLL_INTERVAL).await;
+            tokio::time::sleep(self.poll_interval).await;
         }
     }
 
@@ -323,5 +351,35 @@ mod tests {
         ]);
         let (client, _guard) = pool.pick_server().await.unwrap();
         assert_eq!(client.url(), "http://cold:7433");
+    }
+
+    #[tokio::test]
+    async fn saturated_pool_times_out_pickers_concurrently_not_serially() {
+        // pick_lock must be scoped to one probe→claim cycle, not held
+        // across the poll-sleep. Held-across-sleep, N concurrent callers
+        // on a permanently saturated pool time out SERIALLY (each only
+        // starts after the previous gives up → N × timeout); correctly
+        // scoped, they all poll in parallel and give up together.
+        let pool = Arc::new(
+            ServicePool::new(vec![mk("http://full:7433", true, 0)])
+                .with_timing(Duration::from_millis(300), Duration::from_millis(50)),
+        );
+
+        let started = Instant::now();
+        let tasks: Vec<_> = (0..4)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                tokio::spawn(async move { pool.pick_server().await.is_err() })
+            })
+            .collect();
+        for t in tasks {
+            assert!(t.await.unwrap(), "saturated pool must time out the pick");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "4 pickers on a 300ms timeout must fail concurrently (~300ms), \
+             not serially (~1200ms); took {elapsed:?}"
+        );
     }
 }
