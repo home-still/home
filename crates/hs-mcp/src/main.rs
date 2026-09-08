@@ -1799,8 +1799,12 @@ impl HomeStillMcp {
         // Dispatch by source type — one path per file extension. No
         // fallback between types; if the named source isn't present, we
         // error loudly instead of silently converting something else.
-        let (md, per_page_region_classes, source_key, server_label) =
+        let (md, per_page_region_classes, source_key, server_label, source_pages) =
             if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await {
+                // Count before the bytes move into the converter; olmocr
+                // returns one flat blob, so this is the only page-count
+                // ground truth this path will get.
+                let source_pages = hs_scribe::pdf_meta::count_pages(&pdf_bytes);
                 let client = self
                     .scribe_client()
                     .map_err(|e| e.to_string())?
@@ -1841,16 +1845,17 @@ impl HomeStillMcp {
                     conversion.per_page_region_classes,
                     pdf_key,
                     "scribe-vlm".to_string(),
+                    source_pages,
                 )
             } else if let Ok(html_bytes) = self.storage.get(&html_key).await {
                 let html = String::from_utf8(html_bytes)
                     .map_err(|e| format!("HTML at {html_key} is not valid UTF-8: {e}"))?;
                 let md = hs_scribe::html::convert_html_to_markdown(&html);
-                (md, Vec::new(), html_key, "html-parser".to_string())
+                (md, Vec::new(), html_key, "html-parser".to_string(), None)
             } else if let Ok(epub_bytes) = self.storage.get(&epub_key).await {
                 let md = hs_scribe::epub::convert_epub_to_markdown(&epub_bytes)
                     .map_err(|e| format!("EPUB parse failed for {epub_key}: {e}"))?;
-                (md, Vec::new(), epub_key, "epub-parser".to_string())
+                (md, Vec::new(), epub_key, "epub-parser".to_string(), None)
             } else {
                 return Err(format!(
                 "No PDF, HTML, or EPUB found for '{}' (tried {pdf_key}, {html_key}, {epub_key})",
@@ -1866,8 +1871,27 @@ impl HomeStillMcp {
             tracing::info!("{}: cleaned {} repetition site(s)", p.stem, truncations);
         }
 
+        // A conversion with no embeddable content is a failed conversion.
+        // Mirrors the daemon gate in hs-scribe's convert_and_upload: no
+        // markdown written, no catalog row, no scribe.completed.
+        if !hs_common::quality::has_indexable_content(&md) {
+            return Err(format!(
+                "{}: converted to {} non-whitespace chars, below the {}-char indexable floor — not persisted",
+                p.stem,
+                hs_common::quality::non_whitespace_len(&md),
+                hs_common::quality::MIN_INDEXABLE_NON_WS,
+            ));
+        }
+
         let page_offsets = hs_common::catalog::compute_page_offsets(&md);
-        let total_pages = page_offsets.len() as u64;
+        let accounting =
+            hs_common::catalog::resolve_page_accounting(page_offsets.len() as u64, source_pages);
+        let total_pages = accounting.total_pages;
+        let page_offsets = if accounting.offsets_trustworthy {
+            page_offsets
+        } else {
+            Vec::new()
+        };
         let per_page_is_bibliography: Vec<bool> = (0..per_page_truncations.len())
             .map(|i| {
                 per_page_region_classes

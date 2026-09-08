@@ -721,6 +721,9 @@ async fn cmd_convert(
 
     let pdf_bytes =
         std::fs::read(&input).with_context(|| format!("Cannot read {}", input.display()))?;
+    // Count before the bytes move into the converter — olmocr returns one
+    // flat blob, so the source PDF is the only page-count ground truth.
+    let source_pages = hs_scribe::pdf_meta::count_pages(&pdf_bytes);
 
     let stage: Arc<Box<dyn hs_common::reporter::StageHandle>> =
         Arc::new(reporter.begin_counted_stage("Converting", None));
@@ -763,8 +766,11 @@ async fn cmd_convert(
         tracing::info!("Cleaned {} repetition site(s)", truncations);
     }
 
-    let page_offsets = hs_common::catalog::compute_page_offsets(&md);
-    let total_pages = page_offsets.len() as u64;
+    let total_pages = hs_common::catalog::resolve_page_accounting(
+        hs_common::catalog::compute_page_offsets(&md).len() as u64,
+        source_pages,
+    )
+    .total_pages;
     let per_page_is_bibliography: Vec<bool> = (0..per_page_truncations.len())
         .map(|i| {
             per_page_region_classes
@@ -941,8 +947,6 @@ async fn wait_for_health(server_url: &str, timeout_secs: u64) -> Result<()> {
     hs_common::compose::wait_for_url(&url, timeout_secs, "scribe server").await
 }
 
-const PAGE_SEPARATOR: &str = "\n\n---\n\n";
-
 async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let scribe_cfg = ScribeConfig::load().unwrap_or_default();
     let markdown_dir = &scribe_cfg.output_dir;
@@ -979,12 +983,24 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
             .map(|l| l.trim_start_matches('#').trim().to_string())
             .filter(|t| !t.is_empty());
 
-        // Count pages
-        let total_pages = content.split(PAGE_SEPARATOR).count() as u64;
-
         // Look for matching PDF
         let pdf_path = papers_dir.join(format!("{stem}.pdf"));
         let pdf_exists = pdf_path.exists();
+
+        // Prefer the PDF's real page count when the source is still on
+        // disk. Markdown separators only track pages for backends that
+        // emit them, so olmocr-converted markdown would otherwise backfill
+        // as `total_pages: 1` regardless of length.
+        let source_pages = if pdf_exists {
+            std::fs::read(&pdf_path)
+                .ok()
+                .and_then(|b| hs_scribe::pdf_meta::count_pages(&b))
+        } else {
+            None
+        };
+        let page_offsets = hs_common::catalog::compute_page_offsets(&content);
+        let accounting =
+            hs_common::catalog::resolve_page_accounting(page_offsets.len() as u64, source_pages);
 
         let entry = hs_common::catalog::CatalogEntry {
             title,
@@ -997,9 +1013,13 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
             conversion: Some(hs_common::catalog::ConversionMeta {
                 server: "backfill".to_string(),
                 duration_secs: 0.0,
-                total_pages,
+                total_pages: accounting.total_pages,
                 converted_at: chrono::Utc::now().to_rfc3339(),
-                pages: hs_common::catalog::compute_page_offsets(&content),
+                pages: if accounting.offsets_trustworthy {
+                    page_offsets
+                } else {
+                    Vec::new()
+                },
                 converted_by: None,
                 attempts_log: Vec::new(),
             }),
