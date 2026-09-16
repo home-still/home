@@ -13,7 +13,6 @@ pub use config::{LoggingConfig, LogsYaml, StderrOutput};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -27,7 +26,9 @@ use crate::storage::{Backend, LocalFsStorage, Storage, StorageConfig};
 use spool::{Spool, SpoolWriter};
 
 pub struct LoggingHandle {
-    spool: Spool,
+    /// `None` when the spool dir could not be opened; the process then logs to
+    /// whatever stderr channel is configured and ships nothing.
+    spool: Option<Spool>,
     rotate_max_bytes: u64,
     rotate_interval: Duration,
     ship_interval: Duration,
@@ -46,49 +47,67 @@ pub struct LoggingHandle {
 
 /// Install the global tracing subscriber and open the spool. Synchronous; may
 /// be called before a tokio runtime exists. Background tasks (rotation +
-/// shipping) are started by [`LoggingHandle::spawn_shipper`] or by
-/// [`init_with_shipper`] which combines both.
-pub fn init(cfg: LoggingConfig) -> anyhow::Result<LoggingHandle> {
-    let spool = Spool::new(cfg.spool_dir.clone())
-        .with_context(|| format!("opening spool dir {:?}", cfg.spool_dir))?;
+/// shipping) are started by [`LoggingHandle::spawn_shipper`].
+///
+/// A spool directory that cannot be opened degrades to stderr-only logging
+/// instead of failing: an unwritable log dir must never brick an invocation,
+/// including the `hs upgrade` that would repair the config.
+pub fn init(cfg: LoggingConfig) -> LoggingHandle {
+    let stderr_filter = cfg.stderr.filter_string();
 
-    let writer = SpoolWriter::new(spool.clone());
-    let (non_blocking_file, file_worker_guard) = tracing_appender::non_blocking(writer);
-    let file_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.file_filter));
-    let file_layer = fmt::layer()
-        .json()
-        .with_current_span(true)
-        .with_span_list(true)
-        .with_writer(non_blocking_file)
-        .with_filter(file_filter);
-
-    let mut worker_guards = vec![file_worker_guard];
-
-    // Install subscriber in one of two shapes depending on whether stderr is
-    // enabled. `try_init` is used so a second call (e.g. in tests) is a no-op.
-    match cfg.stderr.filter_string() {
-        Some(filter) => {
-            let (non_blocking_stderr, stderr_guard) =
-                tracing_appender::non_blocking(std::io::stderr());
-            worker_guards.push(stderr_guard);
-            let stderr_layer = fmt::layer()
-                .with_target(false)
-                .with_writer(non_blocking_stderr)
-                .with_filter(EnvFilter::new(filter));
-            let _ = tracing_subscriber::registry()
-                .with(file_layer)
-                .with(stderr_layer)
-                .try_init();
+    let spool = match Spool::new(cfg.spool_dir.clone()) {
+        Ok(spool) => Some(spool),
+        Err(e) => {
+            if stderr_filter.is_some() {
+                // Printed straight to stderr: `--quiet` would swallow it and
+                // the tracing subscriber is not installed yet.
+                eprintln!(
+                    "{}: log spool unavailable at {}: {e:#}; logging to stderr only",
+                    cfg.service_name,
+                    cfg.spool_dir.display()
+                );
+            }
+            None
         }
-        None => {
-            let _ = tracing_subscriber::registry().with(file_layer).try_init();
-        }
+    };
+
+    let mut worker_guards = Vec::new();
+
+    let file_layer = spool.as_ref().map(|spool| {
+        let writer = SpoolWriter::new(spool.clone());
+        let (non_blocking_file, file_worker_guard) = tracing_appender::non_blocking(writer);
+        worker_guards.push(file_worker_guard);
+        let file_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.file_filter));
+        fmt::layer()
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_writer(non_blocking_file)
+            .with_filter(file_filter)
+    });
+
+    let stderr_layer = stderr_filter.map(|filter| {
+        let (non_blocking_stderr, stderr_guard) = tracing_appender::non_blocking(std::io::stderr());
+        worker_guards.push(stderr_guard);
+        fmt::layer()
+            .with_target(false)
+            .with_writer(non_blocking_stderr)
+            .with_filter(EnvFilter::new(filter))
+    });
+
+    // `try_init` so a second call (e.g. in tests) stays a no-op. With neither
+    // layer there is nothing to install and the global slot is left alone.
+    if file_layer.is_some() || stderr_layer.is_some() {
+        let _ = tracing_subscriber::registry()
+            .with(file_layer)
+            .with(stderr_layer)
+            .try_init();
     }
 
     let (rotate_shutdown, _) = watch::channel(false);
 
-    Ok(LoggingHandle {
+    LoggingHandle {
         spool,
         rotate_max_bytes: cfg.rotate_max_bytes,
         rotate_interval: cfg.rotate_interval,
@@ -100,7 +119,7 @@ pub fn init(cfg: LoggingConfig) -> anyhow::Result<LoggingHandle> {
         shipper_shutdown: None,
         shipper_join: None,
         _worker_guards: worker_guards,
-    })
+    }
 }
 
 impl LoggingHandle {
@@ -108,9 +127,13 @@ impl LoggingHandle {
     /// Idempotent per task — calling twice spawns only the tasks that aren't
     /// already running.
     pub fn spawn_shipper(&mut self, storage: Arc<dyn Storage>) -> anyhow::Result<()> {
+        // No spool ⇒ nothing to rotate or ship.
+        let Some(spool) = self.spool.clone() else {
+            return Ok(());
+        };
         if self.rotate_join.is_none() {
             self.rotate_join = Some(tokio::spawn(spool::run_rotate_controller(
-                self.spool.clone(),
+                spool.clone(),
                 self.rotate_max_bytes,
                 self.rotate_interval,
                 self.rotate_shutdown.subscribe(),
@@ -119,7 +142,7 @@ impl LoggingHandle {
         if self.shipper_join.is_none() {
             let (tx, rx) = watch::channel(false);
             let join = tokio::spawn(shipper::run_shipper(
-                self.spool.dir(),
+                spool.dir(),
                 storage,
                 self.s3_key_prefix.clone(),
                 self.ship_interval,
@@ -132,11 +155,19 @@ impl LoggingHandle {
         Ok(())
     }
 
+    /// Whether a spool dir was opened (`false` = degraded, stderr-only mode).
+    #[cfg(test)]
+    pub(crate) fn has_spool(&self) -> bool {
+        self.spool.is_some()
+    }
+
     /// Flush the current spool file and ask the shipper for a final pass.
     /// Call before the tokio runtime shuts down so pending logs reach storage.
     /// Safe to call even if `spawn_shipper` was never invoked.
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
-        let _ = self.spool.rotate_now();
+        if let Some(spool) = &self.spool {
+            let _ = spool.rotate_now();
+        }
         let _ = self.rotate_shutdown.send(true);
         if let Some(tx) = self.shipper_shutdown.take() {
             let _ = tx.send(true);
@@ -153,7 +184,9 @@ impl LoggingHandle {
 
 impl Drop for LoggingHandle {
     fn drop(&mut self) {
-        let _ = self.spool.rotate_now();
+        if let Some(spool) = &self.spool {
+            let _ = spool.rotate_now();
+        }
         let _ = self.rotate_shutdown.send(true);
         if let Some(tx) = &self.shipper_shutdown {
             let _ = tx.send(true);
@@ -165,17 +198,6 @@ impl Drop for LoggingHandle {
             join.abort();
         }
     }
-}
-
-/// Convenience for `#[tokio::main]` callers: install the subscriber *and*
-/// start background tasks in one await.
-pub async fn init_with_shipper(
-    cfg: LoggingConfig,
-    storage: Arc<dyn Storage>,
-) -> anyhow::Result<LoggingHandle> {
-    let mut handle = init(cfg)?;
-    handle.spawn_shipper(storage)?;
-    Ok(handle)
 }
 
 /// Derive a `Storage` for the logs archive from the primary `StorageConfig`.
@@ -226,4 +248,41 @@ pub fn load_config_sections() -> (Option<StorageConfig>, LogsYaml) {
         .and_then(|v| serde_yaml_ng::from_value::<LogsYaml>(v.clone()).ok())
         .unwrap_or_default();
     (storage, logs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A spool dir that cannot be opened must degrade, not abort: `hs` used to
+    /// panic here, which bricked `hs upgrade` on hosts whose log dir was
+    /// unwritable.
+    #[tokio::test]
+    async fn spool_failure_degrades_to_stderr_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A *file* where the spool dir should be: `create_dir_all` fails with
+        // ENOTDIR, which is also what an unwritable mount gives us.
+        let blocked = tmp.path().join("blocked");
+        std::fs::write(&blocked, b"").expect("write blocker file");
+
+        let cfg =
+            LoggingConfig::for_service("hs-logging-test").with_spool_dir(blocked.join("spool"));
+        let handle = init(cfg);
+
+        assert!(!handle.has_spool());
+        handle.shutdown().await.expect("shutdown is infallible");
+    }
+
+    #[tokio::test]
+    async fn writable_spool_dir_is_opened() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let spool_dir = tmp.path().join("spool");
+        let cfg = LoggingConfig::for_service("hs-logging-test")
+            .with_spool_dir(spool_dir.clone())
+            .with_stderr(StderrOutput::Disabled);
+        let handle = init(cfg);
+        assert!(handle.has_spool());
+        assert!(spool_dir.join(spool::CURRENT_FILE).exists());
+        handle.shutdown().await.expect("shutdown is infallible");
+    }
 }

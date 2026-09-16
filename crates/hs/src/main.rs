@@ -69,7 +69,7 @@ fn init_logging(
     let mut cfg = LoggingConfig::for_service(service).with_stderr(stderr_output);
     logs_yaml.apply_to(&mut cfg);
 
-    let handle = logging::init(cfg).expect("install logging subscriber");
+    let handle = logging::init(cfg);
 
     (handle, primary_storage, logs_yaml.bucket)
 }

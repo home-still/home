@@ -107,9 +107,7 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await;
 
-    if let Some(h) = logging_handle {
-        let _ = h.shutdown().await;
-    }
+    let _ = logging_handle.shutdown().await;
     result?;
     Ok(())
 }
@@ -125,23 +123,17 @@ async fn shutdown_signal() {
     tracing::info!("Shutting down gateway");
 }
 
-async fn install_logging() -> Option<hs_common::logging::LoggingHandle> {
+async fn install_logging() -> hs_common::logging::LoggingHandle {
     use hs_common::logging::{self, LoggingConfig, StderrOutput};
     let (primary_storage, logs_yaml) = logging::load_config_sections();
     let mut cfg = LoggingConfig::for_service("hs-gateway")
         .with_stderr(StderrOutput::EnvFilter("info".into()));
     logs_yaml.apply_to(&mut cfg);
-    let mut handle = match logging::init(cfg) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("hs-gateway: logging init failed: {e:#}");
-            return None;
-        }
-    };
+    let mut handle = logging::init(cfg);
     if let Some(storage_cfg) = primary_storage {
         if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket).await {
             let _ = handle.spawn_shipper(storage);
         }
     }
-    Some(handle)
+    handle
 }

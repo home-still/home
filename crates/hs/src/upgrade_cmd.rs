@@ -82,8 +82,13 @@ pub async fn run(
 
     let hs_installed = download_and_replace_binary(&release, "hs", target, reporter).await?;
 
+    // The binaries this run actually replaced; the restart phase is driven by
+    // this set, not by a fixed list of service names.
+    let mut replaced: Vec<PathBuf> = Vec::new();
+
     if hs_installed {
         reporter.status("Upgraded", &format!("hs → {latest}"));
+        replaced.push(install_path_for("hs")?);
     }
 
     // Upgrade companion binaries if they're already installed. Each name
@@ -107,6 +112,7 @@ pub async fn run(
             let installed = download_and_replace_binary(&release, name, target, reporter).await?;
             if installed {
                 reporter.status("Upgraded", &format!("{name} → {latest}"));
+                replaced.push(install_path_for(name)?);
             } else {
                 reporter.status(
                     "Skipped",
@@ -119,11 +125,14 @@ pub async fn run(
     // Phase 4: update Docker services
     upgrade_docker_services(reporter).await?;
 
-    // Phase 5: restart all running services so they pick up the new binaries
-    reporter.status("Restart", "restarting running services...");
-    if let Err(e) = crate::restart_cmd::run(reporter).await {
-        reporter.warn(&format!("Restart failed: {e:#}"));
-    }
+    // Phase 5: restart the services running the binaries we replaced, and
+    // prove they came back on the new binary. A failure here fails the
+    // upgrade — the new binaries are on disk but not running.
+    reporter.status(
+        "Restart",
+        "restarting services running the replaced binaries...",
+    );
+    crate::restart_cmd::after_upgrade(&replaced, reporter).await?;
 
     // Phase 6: health check
     post_upgrade_health_check(reporter).await;
@@ -348,7 +357,7 @@ fn install_path_for(binary_name: &str) -> Result<PathBuf> {
 }
 
 /// Find a companion binary (hs-distill-server, hs-gateway, hs-mcp) on disk.
-fn find_companion_binary(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_companion_binary(name: &str) -> Option<PathBuf> {
     // Check ~/.local/bin
     if let Some(home) = dirs::home_dir() {
         let path = home.join(".local/bin").join(name);

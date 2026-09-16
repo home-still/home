@@ -3565,9 +3565,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     };
 
-    if let Some(h) = logging_handle {
-        let _ = h.shutdown().await;
-    }
+    let _ = logging_handle.shutdown().await;
     result
 }
 
@@ -3590,7 +3588,7 @@ fn resolve_provider_arg(s: Option<&str>) -> Result<paper::cli::ProviderArg, Stri
     }
 }
 
-async fn install_logging(is_sse: bool) -> Option<hs_common::logging::LoggingHandle> {
+async fn install_logging(is_sse: bool) -> hs_common::logging::LoggingHandle {
     use hs_common::logging::{self, LoggingConfig, StderrOutput};
     let (primary_storage, logs_yaml) = logging::load_config_sections();
     let (service, stderr) = if is_sse {
@@ -3600,21 +3598,13 @@ async fn install_logging(is_sse: bool) -> Option<hs_common::logging::LoggingHand
     };
     let mut cfg = LoggingConfig::for_service(service).with_stderr(stderr);
     logs_yaml.apply_to(&mut cfg);
-    let mut handle = match logging::init(cfg) {
-        Ok(h) => h,
-        Err(e) => {
-            if is_sse {
-                eprintln!("hs-mcp: logging init failed: {e:#}");
-            }
-            return None;
-        }
-    };
+    let mut handle = logging::init(cfg);
     if let Some(storage_cfg) = primary_storage {
         if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket).await {
             let _ = handle.spawn_shipper(storage);
         }
     }
-    Some(handle)
+    handle
 }
 
 #[cfg(test)]
