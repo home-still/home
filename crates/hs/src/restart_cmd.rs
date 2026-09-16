@@ -521,12 +521,30 @@ fn parse_serve_port(argv: &str) -> Option<u16> {
 /// Exact path equality — never a substring, so a dev build in
 /// `target/release/` is not mistaken for the installed binary.
 fn is_replaced(path: &Path, binaries: &[PathBuf]) -> bool {
-    let path = canonical_or(path);
-    binaries.iter().any(|binary| canonical_or(binary) == path)
+    let path = canonical_or(&on_disk_path(path));
+    binaries
+        .iter()
+        .any(|binary| canonical_or(&on_disk_path(binary)) == path)
 }
 
 fn matches_replaced(unit: &ServiceUnit, binaries: &[PathBuf]) -> bool {
     is_replaced(&unit.exec_path, binaries)
+}
+
+/// Drop the `" (deleted)"` marker the kernel appends for a file that was
+/// unlinked while still mapped — which is exactly what `hs upgrade` does to its
+/// own image before it records the binaries it replaced, and what a unit's
+/// `ExecStart` path would read back as in that window. The identity we match on
+/// is the path on disk.
+///
+/// Deliberately *not* applied to `/proc/<pid>/exe` when verifying a restart:
+/// there the marker means the old inode is still running, which is a failure.
+fn on_disk_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    match raw.strip_suffix(" (deleted)") {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path.to_path_buf(),
+    }
 }
 
 fn canonical_or(path: &Path) -> PathBuf {
@@ -966,6 +984,38 @@ mod tests {
             "0::/system.slice/hs-serve-mcp.service\n",
             "hs-serve-mcp"
         ));
+    }
+
+    /// The `hs upgrade` failure that shipped in rc.354: it swaps its own image
+    /// first, so every recorded path read back as `… (deleted)` and no unit
+    /// matched — "No running services found to restart" with units running the
+    /// deleted binary.
+    #[cfg(unix)]
+    #[test]
+    fn deleted_marker_still_identifies_the_binary() {
+        let dir = std::env::temp_dir().join(format!("hs-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let real = dir.join("hs.personal-feature");
+        std::fs::write(&real, b"bin").expect("write image");
+        let link = dir.join("hs");
+        std::os::unix::fs::symlink("hs.personal-feature", &link).expect("symlink");
+
+        let recorded = vec![PathBuf::from(format!("{} (deleted)", real.display()))];
+        assert!(matches_replaced(
+            &unit(
+                UnitScope::System,
+                "hs-serve-mcp.service",
+                link.to_str().expect("utf8")
+            ),
+            &recorded
+        ));
+        assert!(!matches_replaced(
+            &unit(UnitScope::System, "other.service", "/bin/true"),
+            &recorded
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
