@@ -353,10 +353,33 @@ async fn restart_systemd_unit(unit: &ServiceUnit) -> Result<(), String> {
     verify_systemd_unit(unit).await
 }
 
-/// Re-read the unit and require it to be `active` on the binary we are meant
-/// to be running. Without this an upgrade can replace a binary, fail to
-/// re-exec it, and still print OK.
+/// How long a just-restarted unit is given to settle before its verification
+/// is called a failure. `systemctl restart` returns as soon as the new process
+/// is forked, and `/proc/<pid>/exe` is unreadable for a moment inside
+/// `execve` — measured on `big` at ~20 ms.
+const VERIFY_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const VERIFY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Re-read the unit until it is `active` on the binary we are meant to be
+/// running. Without this an upgrade can replace a binary, fail to re-exec it,
+/// and still print OK.
 async fn verify_systemd_unit(unit: &ServiceUnit) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + VERIFY_SETTLE_TIMEOUT;
+    loop {
+        match inspect_systemd_unit(unit).await {
+            Ok(()) => return Ok(()),
+            Err(failure) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(failure);
+                }
+                tokio::time::sleep(VERIFY_POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
+/// One verification attempt. `Err` is why this attempt did not pass.
+async fn inspect_systemd_unit(unit: &ServiceUnit) -> Result<(), String> {
     let mut cmd = tokio::process::Command::new("systemctl");
     if unit.scope == UnitScope::User {
         cmd.arg("--user");
@@ -671,6 +694,14 @@ async fn restart_compose_services(reporter: &Arc<dyn Reporter>) -> Result<u32> {
 
 // ── Helpers ────────────────────────────────────────────────────
 
+/// Whether a process's `/proc/<pid>/cgroup` content puts it inside
+/// `unit_name`, which is the full name (`hs-serve-distill.service`) — the
+/// suffix matters, since the cgroup path carries it too.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_is_under_unit(cgroup: &str, unit_name: &str) -> bool {
+    cgroup.contains(&format!("/{unit_name}/")) || cgroup.contains(&format!("/{unit_name}\n"))
+}
+
 /// Return PID of any process listening on `port` that is NOT in the
 /// systemd cgroup of `unit_name`. Returns None if the port is free OR if
 /// it's held by the legitimate systemd-managed process. Linux-only — uses
@@ -729,9 +760,7 @@ fn port_holder_not_under_unit(unit_name: &str, port: u16) -> Option<u32> {
                 // Found the holding PID. Check if it's under the systemd unit.
                 let cgroup =
                     fs::read_to_string(format!("/proc/{}/cgroup", pid)).unwrap_or_default();
-                let in_unit = cgroup.contains(&format!("/{}.service/", unit_name))
-                    || cgroup.contains(&format!("/{}.service\n", unit_name));
-                if !in_unit {
+                if !cgroup_is_under_unit(&cgroup, unit_name) {
                     return Some(pid);
                 }
                 return None;
@@ -910,6 +939,33 @@ mod tests {
                 (Some(1350), "com.home-still.scribe-watch-events".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn cgroup_match_uses_the_full_unit_name() {
+        // Real cgroup lines from `big`.
+        assert!(cgroup_is_under_unit(
+            "0::/home.slice/home-still.slice/hs-serve-distill.service\n",
+            "hs-serve-distill.service"
+        ));
+        assert!(cgroup_is_under_unit(
+            "0::/system.slice/hs-serve-mcp.service\n",
+            "hs-serve-mcp.service"
+        ));
+        assert!(cgroup_is_under_unit(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/hs-scribe-watch-events.service\n",
+            "hs-scribe-watch-events.service"
+        ));
+
+        // A different unit, and a sibling whose name only shares a prefix.
+        assert!(!cgroup_is_under_unit(
+            "0::/system.slice/hs-serve-mcp.service\n",
+            "hs-serve-distill.service"
+        ));
+        assert!(!cgroup_is_under_unit(
+            "0::/system.slice/hs-serve-mcp.service\n",
+            "hs-serve-mcp"
+        ));
     }
 
     #[test]
