@@ -8,7 +8,7 @@ Security and documentation stories are intentionally excluded.
 - **Greenfield — no backwards compatibility.** When a story says "delete", it means delete the code, not wrap it in a feature flag, not keep a legacy alias, not leave a deprecation stub. Callers get fixed in the same PR.
 - **ONE PATH per feature.** No fallbacks, legacy shims, stub placeholders, "backup" modes, rollover behavior, compatibility branches. When the primary path can't produce a usable result, fail loudly. If a fix needs a "fallback" to work, the fix is wrong — redesign.
 - **No CPU fallback.** Anywhere the audit says "tie to compute_device" or "fail if CUDA missing", the answer is fail — not a CPU path.
-- **Definition of Done:** `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test` all pass before tagging any `rc.*`.
+- **Definition of Done:** the three local gates — `cargo fmt -p hs -p paper -p hs-common -p hs-scribe -p hs-distill --check`, `cargo clippy --workspace --exclude hs-scribe --all-targets -- -D warnings`, `cargo test --workspace --exclude hs-scribe` — **plus the two `hs-scribe` invocations CI runs separately**: `cargo clippy -p hs-scribe --features server --all-targets -- -D warnings` and `cargo test -p hs-scribe --features server`. All five pass before tagging any `rc.*`. The plain `--workspace` forms cover none of the `--features server` code and nothing platform-specific; running only those is how `Check` stayed red from 2026-09-08 to 2026-09-19 (8 consecutive failures) while releases shipped green.
 
 ---
 
@@ -565,6 +565,16 @@ if a doc that diagnose says yields N>0 chunks embeds 0 — do not silently stamp
 **Scope:** `mac_air` host state only — `~/Library/LaunchAgents/com.home-still.scribe.plist`, `com.home-still.scribe-autotune.plist`, `com.home-still.ollama.plist`; `scribe.servers` in `big`'s `~/.home-still/config.yaml:83-91`.
 **Change:** Decide mac_air's role once and make the host match it. If it stays out of the scribe pool, uninstall the three dead agents (`launchctl bootout` where loaded, then remove the plists) so `launchctl list` stops advertising units that cannot run. If it comes back, `launchctl load ~/Library/LaunchAgents/com.home-still.scribe.plist`, re-add `http://<mac_air>:7433` to `scribe.servers`, and fix the autotune agent's exit-2 cause rather than leaving it loaded-and-failing. A plist for a retired server is the same silent-drift pattern the ONE PATH rule bans — do not leave it installed "just in case".
 **Acceptance:** `launchctl list | grep home-still` on mac_air shows only agents that are either running or intentionally on-demand; no label reports a non-zero last exit status on a steady-state host. If restored: `curl http://<mac_air>:7433/health` answers and the pool dispatches conversions to it.
+
+---
+
+## P1 — branch/PR closeout (2026-09-19)
+
+### P1-21. Scribe/distill GPU contention has no coordination path — salvaged question from the retired `feat/title-progress-bar` branch
+**Motivation:** PR #1 (`feat/title-progress-bar`, merged 2026-09-19 as an `ours` merge — its history is recorded on `main`, its tree deliberately discarded because every feature had already landed via the `rc-231` line) carried exactly one file that never reached trunk: `hs-common/src/gpu_priority.rs`, 79 lines that made distill poll scribe's `.scribe-watch-status.json` every 5 s and yield the GPU while scribe had work queued. The file itself is not worth resurrecting — it hand-parsed `config.yaml` by line indentation to find `scribe.output_dir`, and a second arbitration path alongside the scribe autotuner is the ONE PATH violation this file's own rules ban. But the *question* it answered is still open in trunk: nothing coordinates the distill embedder and the scribe VLM for the same GPU. Today the only arbitration is indirect — the `home-still.slice` memory cap and the autotuner's concurrency ceiling — and the failure mode is documented in P0-15's motivation: pinning the distill embedder resident left 16.06 GiB free against vLLM's 16.49 GiB requirement, so olmocr could not start for four days.
+**Scope:** `crates/hs-distill/src/embed/onnx.rs` (CUDA session lifetime), `crates/hs-scribe/src/server.rs` VLM slot accounting, the `home-still.slice` cgroup limits on `big`.
+**Change:** Decide whether GPU arbitration is a real requirement or whether the slice cap is sufficient. If it is required, it belongs in one place with one owner — not a status file polled by the other side. Nothing here is urgent: trunk has run without it since rc.231.
+**Acceptance:** Either a written decision that the slice cap is the one path (close this story), or a single arbitration mechanism with a test that proves distill cannot starve a scribe conversion of VRAM.
 
 ---
 
