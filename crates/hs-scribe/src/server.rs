@@ -133,6 +133,7 @@ async fn handle_info(State(state): State<Arc<ServerState>>) -> impl IntoResponse
 }
 
 /// Extract PDF bytes from a multipart upload.
+#[allow(clippy::result_large_err)]
 async fn extract_pdf(mut multipart: Multipart) -> Result<Vec<u8>, Response> {
     while let Ok(Some(field)) = multipart.next_field().await {
         if field.name() == Some("pdf") {

@@ -116,6 +116,9 @@ mod tests {
         assert!(msg.contains("no such file"), "got: {msg}");
     }
 
+    // `std::os::unix::fs::symlink` is unix-only; Windows needs a privileged
+    // `symlink_file`, so the escape path is exercised on unix alone.
+    #[cfg(unix)]
     #[test]
     fn rejects_symlink_escape() {
         let tmp = tempfile::tempdir().unwrap();
