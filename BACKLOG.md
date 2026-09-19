@@ -32,6 +32,10 @@ Two separate defects: (a) `/Volumes/home-still` on `big_mac` is not writable by 
 - `big_mac` reports `hs 0.0.1-rc.352` or later after a self-upgrade.
 - No code path silently swallows the spool-dir error without surfacing it.
 
+**2026-09-16 — second host, same defect.** `two` (the cloud gateway) was bricked identically and sat on **rc.345** through the rc.352 rollout. Its `~/.home-still/config.yaml` was overwritten on 2026-09-12 08:36 with a byte-identical copy of `big`'s (same md5), which carries `home.project_dir: /mnt/home-still` — a path that exists on `big`, does not exist on `two`, and cannot be created under root-owned `/mnt`. Every `hs` invocation aborted in `hs_common::logging::init` → `Spool::new` (`hs-common/src/logging/mod.rs:52`), `hs --version` and `hs upgrade` included, so the host could not self-recover. Restored on 2026-09-16 by rewriting the host's own config (`project_dir: ~/home-still`) and upgrading to rc.352; the code defect stands. This is not a `big_mac` / `/Volumes` quirk: any config drift that points `log_dir` at an unwritable path takes the entire CLI down on any host, and the blast radius is every command rather than logging.
+
+**FIXED rc.353 (2026-09-16).** `hs_common::logging::init` no longer panics on an unopenable spool dir: it prints one `eprintln!` naming the service and the path (`hs-common/src/logging/mod.rs:55-70`), keeps a `spool: None` handle, and continues stderr-only — covered by the `spool dir that cannot be opened must degrade` test in that module. `big_mac` and `two` both self-upgraded and report `hs 0.0.1-rc.355`.
+
 ### P0-17. `hs upgrade` claims success for services it failed to restart, and skips others entirely (2026-09-08)
 **Motivation:** Two gaps observed during the rc.352 rollout, both of which leave upgraded binaries running old code with no signal to the operator.
 
@@ -45,6 +49,23 @@ Two separate defects: (a) `/Volumes/home-still` on `big_mac` is not writable by 
 - After `hs upgrade` on `big`, every process whose binary changed reports the new version with no manual restart.
 - A forced `launchctl` failure on a Mac host makes `hs upgrade` print the failure and exit non-zero.
 - `hs upgrade` never prints `OK: <svc> restarted` for a restart whose underlying command failed.
+
+**2026-09-16 — third observation, `two`.** `hs -y upgrade --pre --force` replaced `hs`, `hs-gateway` and `hs-mcp`, then printed `No running services found to restart` while `hs-gateway.service` was `active`. `crates/hs/src/restart_cmd.rs:16` iterates a hardcoded `["scribe", "distill", "mcp"]` and builds unit names as `hs-serve-{type}`; `two`'s units are `hs-gateway.service` and `hs-mcp.service`, so neither is ever considered. The gateway went on executing the deleted rc.345 image until a manual `systemctl restart hs-gateway`. `hs-gateway` is missing from the restart set on *every* host, not just `two` — deriving the set from the binaries actually replaced (as this story already requires) fixes both halves.
+
+**FIXED rc.353–355 (2026-09-16).** The hardcoded `["scribe", "distill", "mcp"]` table is gone. `crates/hs/src/restart_cmd.rs` discovers units from `systemctl list-units` (system **and** `--user`) plus `launchctl list`, resolves each unit's `ExecStart` / `ProgramArguments` binary — through the kernel's `" (deleted)"` marker — and restarts exactly those units whose executable was replaced (`select_units` / `matches_replaced`). Every `systemctl`/`launchctl` non-zero exit becomes a named failure string, is excluded from the restarted count, and makes the command exit non-zero; restarts are re-verified with `systemctl show` / `launchctl print` before being reported OK. Verified post-rc.355 on `big` (`hs-serve-mcp`, `hs-serve-scribe-olmocr`), `two` (`hs-gateway.service`, which the old table could never name) and `bmb` (`com.home-still.scribe`).
+
+### P0-18. `hs-gateway` silently falls back to loopback + zero routes when `cloud.gateway` is missing (2026-09-16)
+**Motivation:** `GatewayConfig::load` (`crates/hs-gateway/src/config.rs:85-91`) returns `Self::default()` when the `cloud.gateway` section is absent, which means `listen: 127.0.0.1:7440` and an **empty** `routes` map. On `two` the whole `cloud:` section was gone from 2026-09-12 to 2026-09-16 (see P0-16); the public gateway kept working only because its process had started on 2026-06-23 and still held the old config in memory. Any restart in that window — a reboot, a `Restart=on-failure` bounce, or the rc.352 upgrade — would have bound loopback only and dropped every `https://cloud.lolzlab.com` client, while `/health` kept answering `ok` to a local probe. A missing gateway config is a misconfiguration, not a set of defaults, and "listen somewhere else than configured" is the most expensive default in the fleet.
+**Scope:**
+- `crates/hs-gateway/src/config.rs:75-92` — `GatewayConfig::load` and the `Default` impl it leans on
+- `crates/hs-gateway/src/main.rs` — startup path that consumes the loaded config
+**Change:** `load()` must fail loudly when `cloud.gateway` is absent, naming the config path and the missing key, and the process must exit non-zero instead of starting a gateway that routes nothing. Per-field serde defaults for genuinely optional knobs (`token_ttl_secs`, `refresh_ttl_secs`, `key_rotation_days`, `secret_path`) stay; `listen` and `routes` must come from the file. Do not add a "degraded gateway" mode.
+**Acceptance:**
+- With the `cloud:` section removed, `hs-gateway` exits non-zero and prints the config path plus `cloud.gateway`; it never binds a port.
+- With the section present, startup is unchanged (`Starting gateway on 0.0.0.0:7440`, `Routes: [...]`).
+- No code path substitutes `127.0.0.1` for a configured listen address, and no path starts the gateway with an empty route map.
+
+**FIXED rc.353 (2026-09-16).** `GatewayConfig::from_yaml` — split out of `load()` so the rule is testable without `$HOME` — errors with the config path plus a "missing `cloud.gateway` section" message (`crates/hs-gateway/src/config.rs:86`) and bails on an empty `routes` map (`:92-97`). No `Self::default()` path remains. `two`'s gateway restarted on rc.355 binding its configured listen address with a populated route map.
 
 ### P0-15. `scribe_health` reports `ok` without ever probing its VLM backend (2026-07-29)
 **Motivation:** `big`'s olmocr backend was dead from **2026-07-25T22:31Z to 2026-07-29T12:17Z** — llama-swap could not start vLLM (`--gpu-memory-utilization 0.70` needed 16.49 GiB against 16.06 GiB free once the distill embedder was pinned resident). For those four days `curl :7435/health` returned `{"status":"ok","layout_model":true,"table_model":true,...}` and `hs status` listed the instance as `healthy: true, slots_available: 12`, because the health handler only checks scribe's own in-process layout/table models. It never issues a request to `HS_SCRIBE_OLMOCR_ENDPOINT`. The scribe pool therefore kept dispatching to a backend that could only time out, and the sole outward signal was `pipeline_drift` climbing to 468 against a threshold of 3 — a lagging indicator nobody is paged on. A green health check in front of a dead dependency is a silent-failure path.
@@ -534,6 +555,16 @@ if a doc that diagnose says yields N>0 chunks embeds 0 — do not silently stamp
 **Acceptance:**
 - After `hs upgrade` / `hs restart` on any host, `hs-scribe-watch-events` is active, and a post-deploy check fails loudly if it isn't.
 - `hs status` shows a scribe-consumer heartbeat that goes red within one tick of the consumer dying (repro: `systemctl --user stop hs-scribe-watch-events` → dashboard red).
+
+---
+
+## P1 — rc.353–355 fleet rollout follow-ups (2026-09-16)
+
+### P1-20. `mac_air`'s scribe LaunchAgent is unloaded and its autotune agent exits 2 on every run
+**Motivation:** `com.home-still.scribe` (plist `~/Library/LaunchAgents/com.home-still.scribe.plist`, `ProgramArguments = /Users/ladvien/.local/bin/hs-scribe-server --host 0.0.0.0 --port 7433`) has been **unloaded on mac_air** since the 2026-09-08 rc.352 rollout, when `launchctl` returned `Unload failed: 5: Input/output error` / `Load failed: 5: Input/output error` (see P0-17). The rc.353+ restart logic correctly ignores it — `launchctl list` never lists the label, so there is no loaded unit to kickstart — and the pool is unaffected because `mac_air` was commented out of `scribe.servers` on `big` back on 2026-04-24. So this is residue, not lost capacity: an installed LaunchAgent for a server nobody dispatches to, on a host that is otherwise current (`hs 0.0.1-rc.355`). The second half is noisier: `launchctl list` on mac_air shows `com.home-still.scribe-autotune` with last exit status **2** and `com.home-still.ollama` with last exit status **1**, both loaded and both not running — two agents failing on every launch with no operator signal. Only `io.home-still.scribe-inbox` and `com.user.rclone-nfsmount-home-still` are actually alive there.
+**Scope:** `mac_air` host state only — `~/Library/LaunchAgents/com.home-still.scribe.plist`, `com.home-still.scribe-autotune.plist`, `com.home-still.ollama.plist`; `scribe.servers` in `big`'s `~/.home-still/config.yaml:83-91`.
+**Change:** Decide mac_air's role once and make the host match it. If it stays out of the scribe pool, uninstall the three dead agents (`launchctl bootout` where loaded, then remove the plists) so `launchctl list` stops advertising units that cannot run. If it comes back, `launchctl load ~/Library/LaunchAgents/com.home-still.scribe.plist`, re-add `http://<mac_air>:7433` to `scribe.servers`, and fix the autotune agent's exit-2 cause rather than leaving it loaded-and-failing. A plist for a retired server is the same silent-drift pattern the ONE PATH rule bans — do not leave it installed "just in case".
+**Acceptance:** `launchctl list | grep home-still` on mac_air shows only agents that are either running or intentionally on-demand; no label reports a non-zero last exit status on a steady-state host. If restored: `curl http://<mac_air>:7433/health` answers and the pool dispatches conversions to it.
 
 ---
 
