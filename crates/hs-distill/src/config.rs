@@ -123,6 +123,19 @@ pub struct EmbeddingConfig {
     /// and its CUDA allocations.
     #[serde(default)]
     pub idle_release_secs: Option<u64>,
+    /// Free VRAM required before (re)loading the bge-m3 pool, MB. The
+    /// pool is ~4.4 GB resident on `big`. Loading under a co-tenant that
+    /// has taken the card returns a CUDA OOM that poisons the ort
+    /// session, so refuse loudly — and name the holders — instead.
+    /// Hosts without an NVIDIA GPU have no signal and skip the gate.
+    #[serde(default = "default_vram_floor_mb")]
+    pub vram_floor_mb: u64,
+}
+
+/// bge-m3 needs ~4.4 GB resident; 5000 MB leaves a little slack for the
+/// ort arena without demanding a whole free card.
+fn default_vram_floor_mb() -> u64 {
+    5000
 }
 
 impl Default for EmbeddingConfig {
@@ -136,6 +149,7 @@ impl Default for EmbeddingConfig {
             sparse_enabled: true,
             compute_device: ComputeDevice::Cuda,
             idle_release_secs: None,
+            vram_floor_mb: default_vram_floor_mb(),
         }
     }
 }

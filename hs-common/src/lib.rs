@@ -1,4 +1,5 @@
 pub mod exit_codes;
+pub mod gpu;
 pub mod hardware_profile;
 pub mod html;
 #[cfg(feature = "http")]

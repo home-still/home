@@ -65,6 +65,7 @@ async fn async_main() -> Result<()> {
         in_flight: Arc::new(AtomicUsize::new(0)),
         last_conversion_ms: Arc::new(AtomicU64::new(0)),
         total_conversions: Arc::new(AtomicU64::new(0)),
+        backend_state: Arc::new(tokio::sync::Mutex::new(None)),
     });
 
     let addr = format!("{}:{}", args.host, args.port);

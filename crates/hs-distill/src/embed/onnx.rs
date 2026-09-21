@@ -31,6 +31,10 @@ pub struct OnnxEmbedder {
     /// keeps the model warm for its own duration without the sweeper
     /// racing it to release.
     last_used_ms: Arc<AtomicI64>,
+    /// Free-VRAM floor enforced before every (re)load. Copied from
+    /// config so the lazy-reload path inside `spawn_blocking` can apply
+    /// the same gate as startup.
+    vram_floor_mb: u64,
 }
 
 impl OnnxEmbedder {
@@ -57,9 +61,11 @@ impl OnnxEmbedder {
             "initializing bge-m3 embedder pool"
         );
 
-        // Build the first model and verify GPU residency before allocating
-        // the rest. Probe failure aborts — one path, no silent CPU
-        // substitute.
+        // Refuse the load outright when the card is already spoken for,
+        // then build the first model and verify GPU residency before
+        // allocating the rest. Either failure aborts — one path, no
+        // silent CPU substitute.
+        require_vram(config.vram_floor_mb)?;
         let mut first = build_text_embedding()?;
         verify_cuda_probe(&mut first)?;
 
@@ -83,6 +89,7 @@ impl OnnxEmbedder {
             dimension: config.dimension,
             batch_ctrl: Arc::new(AdaptiveBatchController::new(adaptive_cfg)),
             last_used_ms,
+            vram_floor_mb: config.vram_floor_mb,
         })
     }
 }
@@ -114,34 +121,42 @@ fn verify_cuda_probe(model: &mut TextEmbedding) -> Result<(), DistillError> {
         .map_err(|e| DistillError::Embedding(format!("CUDA probe failed: {e}")))?;
     let probe_ms = start.elapsed().as_millis();
 
-    let gpu_mem_used = check_gpu_memory_mb();
+    let self_mem = hs_common::gpu::self_vram_mb();
     tracing::info!(
         probe_ms = probe_ms,
-        gpu_mem_mb = gpu_mem_used,
+        self_vram_mb = ?self_mem,
         "CUDA probe complete"
     );
 
-    if gpu_mem_used < 200 {
+    // Per-process attribution, not whole-card `memory.used`: on a
+    // contended card the old check read 23 GB of OTHER tenants'
+    // allocations and passed vacuously while this process sat on CPU.
+    if self_mem.is_none_or(|mb| mb < 200) {
         return Err(DistillError::Embedding(format!(
-            "CUDA requested but model is not on GPU (only {gpu_mem_used} MB VRAM used). \
+            "CUDA requested but model is not on GPU (own process VRAM: {self_mem:?} MB). \
              Fix CUDA: check driver, LD_LIBRARY_PATH, libonnxruntime_providers_cuda.so, \
              and the pyke ort cache (~/.cache/ort.pyke.io/dfbin). Distill ships with no CPU path."
         )));
     }
-    tracing::info!("CUDA verified: model loaded on GPU ({gpu_mem_used} MB VRAM)");
+    tracing::info!("CUDA verified: model loaded on GPU ({self_mem:?} MB VRAM, this process)");
     Ok(())
 }
 
-/// Check GPU memory usage via nvidia-smi. Returns MB used, or 0 on failure.
-fn check_gpu_memory_mb() -> u64 {
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
-        .output()
-        .ok();
-    output
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0)
+/// Refuse to load the embedder when the card cannot host it. `None`
+/// free-VRAM means no NVIDIA GPU is visible — no gate to apply — which
+/// keeps this a no-op on non-CUDA hosts while still failing loudly on
+/// `big` when a foreign tenant owns the card.
+fn require_vram(floor_mb: u64) -> Result<(), DistillError> {
+    let Some(free) = hs_common::gpu::free_vram_mb() else {
+        return Ok(());
+    };
+    if free < floor_mb {
+        return Err(DistillError::Embedding(format!(
+            "gpu busy: {free} MB free < {floor_mb} MB required to load bge-m3; holders: {}",
+            hs_common::gpu::compute_apps_summary()
+        )));
+    }
+    Ok(())
 }
 
 fn now_unix_ms() -> i64 {
@@ -220,6 +235,7 @@ impl Embedder for OnnxEmbedder {
         // picks index 0.
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.models.len();
         let model = Arc::clone(&self.models[idx]);
+        let vram_floor_mb = self.vram_floor_mb;
 
         // fastembed's `embed` is synchronous and CPU/GPU-heavy. spawn_blocking
         // keeps it off the tokio worker threads.
@@ -233,6 +249,11 @@ impl Embedder for OnnxEmbedder {
             // request after release pays the ~10 s load cost; subsequent
             // requests are fast.
             if guard.is_none() {
+                // Same free-VRAM gate as startup. Returning the error
+                // here makes `hs distill watch-events` NAK so JetStream
+                // redelivers once the card frees up — a CUDA OOM at this
+                // point poisons the session for every later request.
+                require_vram(vram_floor_mb)?;
                 tracing::info!("lazy-loading bge-m3 after idle release");
                 let mut m = build_text_embedding()?;
                 // Same CUDA-residency gate as startup: a driver hiccup or

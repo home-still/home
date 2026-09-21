@@ -134,6 +134,13 @@ pub struct AppConfig {
     /// Default `"olmocr"` lets the OS PATH lookup find it; on big the
     /// pinned location is `~/.local/share/olmocr-vllm/venv/bin/olmocr`.
     pub olmocr_bin: String,
+    /// Free VRAM required to cold-start the VLM backend, MB. Skipped
+    /// when the model is already resident. vLLM at
+    /// `--gpu-memory-utilization 0.60` on a 24 GiB card needs ~14.7 GiB,
+    /// so dispatching below this only buys a `healthCheckTimeout` stall.
+    /// Hosts without an NVIDIA GPU have no free-VRAM signal and skip the
+    /// gate entirely. Override via `HS_SCRIBE_VRAM_HEADROOM_MB`.
+    pub vram_headroom_mb: u64,
 }
 impl Default for AppConfig {
     fn default() -> Self {
@@ -161,6 +168,7 @@ impl Default for AppConfig {
             olmocr_endpoint: "http://localhost:8081/v1".into(),
             olmocr_model: "olmocr".into(),
             olmocr_bin: "olmocr".into(),
+            vram_headroom_mb: 15000,
         }
     }
 }

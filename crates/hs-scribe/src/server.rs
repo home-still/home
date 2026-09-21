@@ -1,6 +1,8 @@
-use crate::client::{HealthResponse, StreamLine, CONVERT_DEADLINE_HEADER, CONVERT_STEM_HEADER};
-use crate::config::AppConfig;
-use crate::gpu;
+use crate::backend_probe::{self, BackendState};
+use crate::client::{
+    HealthResponse, StreamLine, BACKEND_UNAVAILABLE, CONVERT_DEADLINE_HEADER, CONVERT_STEM_HEADER,
+};
+use crate::config::{AppConfig, ConverterMode};
 use crate::pipeline::processor::Processor;
 use axum::{
     body::Body,
@@ -44,6 +46,11 @@ fn resolve_stem(headers: &HeaderMap) -> &str {
         .unwrap_or("<unknown>")
 }
 
+/// How long a backend verdict stays fresh. `pick_server` polls
+/// `/readiness` every 500 ms per queued handler, so an uncached probe
+/// would shell out to `nvidia-smi` several times a second under load.
+const BACKEND_PROBE_TTL: Duration = Duration::from_secs(5);
+
 pub struct ServerState {
     pub processor: Processor,
     pub config: AppConfig,
@@ -55,6 +62,56 @@ pub struct ServerState {
     /// diff this across polls for throughput measurement. Lock-free atomic
     /// increment on success.
     pub total_conversions: Arc<AtomicU64>,
+    /// Last VLM-backend admission verdict and when it was taken.
+    /// `None` until the first probe.
+    pub backend_state: Arc<tokio::sync::Mutex<Option<(std::time::Instant, BackendState)>>>,
+}
+
+/// Return the cached backend verdict, re-probing when it is missing or
+/// older than [`BACKEND_PROBE_TTL`]. Logs once per verdict *transition*
+/// — a per-probe log would emit twice a second per queued handler.
+///
+/// `None` means "no llama-swap backend to admit against": the legacy
+/// converter drives Ollama / a bare OpenAI-compatible server directly
+/// and has no `/running` endpoint, so there is nothing to probe and
+/// nothing to refuse. Reporting a fabricated `reachable: false` there
+/// would readiness-exclude every Apple Silicon pool member.
+async fn cached_backend_state(state: &ServerState) -> Option<BackendState> {
+    if state.config.converter != ConverterMode::Olmocr {
+        return None;
+    }
+    let mut slot = state.backend_state.lock().await;
+    if let Some((at, cached)) = slot.as_ref() {
+        if at.elapsed() < BACKEND_PROBE_TTL {
+            return Some(cached.clone());
+        }
+    }
+    let fresh = backend_probe::probe(
+        &state.config.olmocr_endpoint,
+        &state.config.olmocr_model,
+        state.config.vram_headroom_mb,
+    )
+    .await;
+    let previous = slot.as_ref().map(|(_, s)| s.admits());
+    if previous != Some(fresh.admits()) {
+        if fresh.admits() {
+            tracing::info!(
+                free_vram_mb = ?fresh.free_vram_mb,
+                model_resident = fresh.model_resident,
+                "vlm backend available again"
+            );
+        } else {
+            tracing::warn!(
+                free_vram_mb = ?fresh.free_vram_mb,
+                reachable = fresh.reachable,
+                headroom_mb = state.config.vram_headroom_mb,
+                holders = %hs_common::gpu::compute_apps_summary(),
+                "vlm backend unavailable — refusing dispatch"
+            );
+        }
+    }
+    *slot = Some((std::time::Instant::now(), fresh.clone()));
+    Some(fresh)
 }
 
 fn record_success(last_slot: &AtomicU64, total: &AtomicU64, md: &str) {
@@ -91,35 +148,65 @@ pub fn app(state: Arc<ServerState>) -> Router {
         .with_state(state)
 }
 
+/// `status` is `"ok"` only when the VLM backend can actually take work.
+/// A refusing gate returns 503 with the same body so an operator sees
+/// the free-VRAM number that caused it — `hs status` and the MCP
+/// fanout key off `status`, and `ScribeClient::health` parses the body
+/// regardless of status code.
 async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let (gpu_name, gpu_utilization_pct, gpu_memory_used_mb) = gpu::query_gpu_info();
-    axum::Json(HealthResponse {
-        status: "ok".into(),
+    let info = hs_common::gpu::query_gpu_info();
+    let backend = cached_backend_state(&state).await;
+    let admits = backend.as_ref().is_none_or(|b| b.admits());
+    let body = HealthResponse {
+        status: if admits { "ok" } else { BACKEND_UNAVAILABLE }.into(),
         layout_model: state.processor.has_layout_detector(),
         table_model: state.processor.has_table_recognizer(),
         layout_model_reason: state.processor.layout_model_reason().map(str::to_string),
         table_model_reason: state.processor.table_model_reason().map(str::to_string),
         version: env!("HS_VERSION").into(),
-        gpu_name,
-        gpu_utilization_pct,
-        gpu_memory_used_mb,
+        gpu_name: info.name,
+        gpu_utilization_pct: info.utilization_pct,
+        gpu_memory_used_mb: info.memory_used_mb,
         last_conversion_at: format_last_conv(&state.last_conversion_ms),
         total_conversions: state.total_conversions.load(Ordering::Relaxed),
-    })
+        backend_reachable: backend.as_ref().map(|b| b.reachable),
+        backend_model_resident: backend.as_ref().map(|b| b.model_resident),
+        backend_vram_free_mb: backend.as_ref().and_then(|b| b.free_vram_mb),
+        backend_checked_at: backend.as_ref().map(|b| b.checked_at.clone()),
+    };
+    if admits {
+        (StatusCode::OK, axum::Json(body))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body))
+    }
 }
 
 async fn handle_readiness(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     // Report the EFFECTIVE capacity (the VLM semaphore size). The pool
     // load-balancer relies on this number being truthful.
     let total = state.processor.effective_vlm_concurrency();
-    let available = state.processor.vlm_sem().available_permits();
+    let admits = cached_backend_state(&state)
+        .await
+        .is_none_or(|b| b.admits());
+    // Zero available slots is what `ServicePool::try_pick_once` already
+    // treats as ineligible, so a closed gate parks the dispatcher
+    // instead of feeding a backend that can only time out.
+    let available = if admits {
+        state.processor.vlm_sem().available_permits()
+    } else {
+        0
+    };
     let in_flight = state.in_flight.load(Ordering::Relaxed);
-    axum::Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "ready": available > 0,
         "vlm_slots_total": total,
         "vlm_slots_available": available,
         "in_flight_conversions": in_flight,
-    }))
+    });
+    if !admits {
+        body["backend_status"] = serde_json::Value::String(BACKEND_UNAVAILABLE.into());
+    }
+    axum::Json(body)
 }
 
 async fn handle_info(State(state): State<Arc<ServerState>>) -> impl IntoResponse {

@@ -132,7 +132,8 @@ impl<C: ServiceClient> ServicePool<C> {
             // after the previous one gives up.
             {
                 let _pick_guard = self.pick_lock.lock().await;
-                if let Some((c, idx)) = self.try_pick_once().await? {
+                let log_failures = attempt == 0 || attempt.is_multiple_of(120);
+                if let Some((c, idx)) = self.try_pick_once(log_failures).await? {
                     self.reservations[idx].fetch_add(1, Ordering::Relaxed);
                     let guard = PickGuard {
                         reservations: Arc::clone(&self.reservations),
@@ -159,7 +160,12 @@ impl<C: ServiceClient> ServicePool<C> {
         }
     }
 
-    async fn try_pick_once(&self) -> Result<Option<(&C, usize)>> {
+    /// `log_failures` throttles the unreachable-server warning. A parked
+    /// handler re-probes every [`PICK_POLL_INTERVAL`]; logging every
+    /// failed probe turned one sleeping laptop into a continuous
+    /// several-lines-per-second journal flood. The caller passes true on
+    /// the first cycle and roughly once per minute after.
+    async fn try_pick_once(&self, log_failures: bool) -> Result<Option<(&C, usize)>> {
         let futures: Vec<_> = self
             .clients
             .iter()
@@ -167,13 +173,15 @@ impl<C: ServiceClient> ServicePool<C> {
             .collect();
         let results = futures::future::join_all(futures).await;
 
-        for (c, r) in &results {
-            if let Err(e) = r {
-                tracing::warn!(
-                    server = %c.url(),
-                    error = %e,
-                    "readiness probe failed; excluding from this dispatch"
-                );
+        if log_failures {
+            for (c, r) in &results {
+                if let Err(e) = r {
+                    tracing::warn!(
+                        server = %c.url(),
+                        error = %e,
+                        "readiness probe failed; excluding from this dispatch"
+                    );
+                }
             }
         }
 
@@ -335,7 +343,7 @@ mod tests {
         ]);
         // Use try_pick_once directly so the test doesn't wait
         // PICK_READY_TIMEOUT seconds for availability.
-        let res = all_full.try_pick_once().await.unwrap();
+        let res = all_full.try_pick_once(true).await.unwrap();
         assert!(res.is_none(), "all-full pool must return None, got {res:?}");
     }
 

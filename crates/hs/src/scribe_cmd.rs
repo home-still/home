@@ -699,6 +699,23 @@ async fn cmd_convert(
         check_stage.set_message(&format!("server at {url}"));
         let client = make_scribe_client(url, convert_timeout).await?;
         match client.health().await {
+            // A 503 from the admission gate still deserializes, so an
+            // `Ok` here is not "usable". Bail with the reason instead of
+            // dispatching a conversion the backend cannot start.
+            Ok(h) if h.status != "ok" => {
+                check_stage.finish_failed("backend unavailable");
+                anyhow::bail!(
+                    "scribe server at {url} reports {}: {} MB VRAM free, backend_reachable={} \
+                     — free GPU memory or wait for the current tenant",
+                    h.status,
+                    h.backend_vram_free_mb
+                        .map(|mb| mb.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    h.backend_reachable
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| "n/a".into()),
+                );
+            }
             Ok(_) => check_stage.finish_and_clear(),
             Err(e) => {
                 check_stage.finish_failed("server not reachable");

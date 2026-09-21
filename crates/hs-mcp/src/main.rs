@@ -3072,7 +3072,12 @@ impl HomeStillMcp {
             let health = client.health().await.ok();
             let readiness = client.readiness().await.ok();
 
-            let healthy = health.is_some();
+            // A scribe whose VLM backend can't take work answers 503
+            // with `status: "backend_unavailable"`. The body still
+            // parses, so "reachable" is not "usable" — key off status.
+            let status = health.as_ref().map(|h| h.status.as_str());
+            let backend_unavailable = status == Some(hs_scribe::client::BACKEND_UNAVAILABLE);
+            let healthy = status == Some("ok");
             let version = health
                 .as_ref()
                 .map(|h| h.version.clone())
@@ -3085,7 +3090,9 @@ impl HomeStillMcp {
                 ),
                 None => (0, None, None),
             };
-            let activity = if !healthy {
+            let activity = if backend_unavailable {
+                "backend unavailable".to_string()
+            } else if !healthy {
                 "unhealthy".to_string()
             } else if in_flight > 0 {
                 format!("{in_flight} converting")

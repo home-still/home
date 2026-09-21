@@ -88,6 +88,13 @@ pub struct ProgressEvent {
     pub message: String,
 }
 
+/// `HealthResponse::status` when the scribe server is alive but its VLM
+/// backend cannot take work (llama-swap unreachable, or the model is
+/// not resident and the card has no room to load it). The server pairs
+/// this with HTTP 503; `hs status`, the MCP fanout, and the CLI
+/// preflight all branch on this exact literal.
+pub const BACKEND_UNAVAILABLE: &str = "backend_unavailable";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
@@ -131,6 +138,22 @@ pub struct HealthResponse {
     /// every scribe-server restart.
     #[serde(default)]
     pub total_conversions: u64,
+    /// Whether llama-swap answered the admission probe. `None` on
+    /// scribe instances with no llama-swap backend (legacy converter),
+    /// where the gate does not apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_reachable: Option<bool>,
+    /// Whether the configured VLM model is already loaded. When true the
+    /// free-VRAM half of the gate is skipped — no cold start is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_model_resident: Option<bool>,
+    /// Free VRAM (MiB) at the last probe. `None` on hosts without a
+    /// working `nvidia-smi`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_vram_free_mb: Option<u64>,
+    /// RFC 3339 timestamp of the last admission probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_checked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +162,10 @@ pub struct ReadinessResponse {
     pub vlm_slots_total: usize,
     pub vlm_slots_available: usize,
     pub in_flight_conversions: usize,
+    /// `"backend_unavailable"` when the zero available slots are the
+    /// admission gate refusing, not real saturation. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_status: Option<String>,
 }
 
 impl ReadinessInfo for ReadinessResponse {
@@ -233,6 +260,7 @@ impl ScribeClient {
                 vlm_slots_total: 0,
                 vlm_slots_available: 1,
                 in_flight_conversions: 0,
+                backend_status: None,
             });
         }
         resp.json().await.context("Invalid readiness response")
