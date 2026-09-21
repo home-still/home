@@ -1,6 +1,8 @@
-use crate::client::{HealthResponse, StreamLine, CONVERT_DEADLINE_HEADER, CONVERT_STEM_HEADER};
-use crate::config::AppConfig;
-use crate::gpu;
+use crate::backend_probe::{self, BackendState};
+use crate::client::{
+    HealthResponse, StreamLine, BACKEND_UNAVAILABLE, CONVERT_DEADLINE_HEADER, CONVERT_STEM_HEADER,
+};
+use crate::config::{AppConfig, ConverterMode};
 use crate::pipeline::processor::Processor;
 use axum::{
     body::Body,
@@ -44,6 +46,11 @@ fn resolve_stem(headers: &HeaderMap) -> &str {
         .unwrap_or("<unknown>")
 }
 
+/// How long a backend verdict stays fresh. `pick_server` polls
+/// `/readiness` every 500 ms per queued handler, so an uncached probe
+/// would shell out to `nvidia-smi` several times a second under load.
+const BACKEND_PROBE_TTL: Duration = Duration::from_secs(5);
+
 pub struct ServerState {
     pub processor: Processor,
     pub config: AppConfig,
@@ -52,9 +59,59 @@ pub struct ServerState {
     /// Lock-free reads serve `/health` probes without blocking writers.
     pub last_conversion_ms: Arc<AtomicU64>,
     /// Monotonic count of successful conversions since startup. Consumers
-    /// diff this across polls for throughput measurement (see `hs scribe
-    /// autotune`). Lock-free atomic increment on success.
+    /// diff this across polls for throughput measurement. Lock-free atomic
+    /// increment on success.
     pub total_conversions: Arc<AtomicU64>,
+    /// Last VLM-backend admission verdict and when it was taken.
+    /// `None` until the first probe.
+    pub backend_state: Arc<tokio::sync::Mutex<Option<(std::time::Instant, BackendState)>>>,
+}
+
+/// Return the cached backend verdict, re-probing when it is missing or
+/// older than [`BACKEND_PROBE_TTL`]. Logs once per verdict *transition*
+/// — a per-probe log would emit twice a second per queued handler.
+///
+/// `None` means "no llama-swap backend to admit against": the legacy
+/// converter drives Ollama / a bare OpenAI-compatible server directly
+/// and has no `/running` endpoint, so there is nothing to probe and
+/// nothing to refuse. Reporting a fabricated `reachable: false` there
+/// would readiness-exclude every Apple Silicon pool member.
+async fn cached_backend_state(state: &ServerState) -> Option<BackendState> {
+    if state.config.converter != ConverterMode::Olmocr {
+        return None;
+    }
+    let mut slot = state.backend_state.lock().await;
+    if let Some((at, cached)) = slot.as_ref() {
+        if at.elapsed() < BACKEND_PROBE_TTL {
+            return Some(cached.clone());
+        }
+    }
+    let fresh = backend_probe::probe(
+        &state.config.olmocr_endpoint,
+        &state.config.olmocr_model,
+        state.config.vram_headroom_mb,
+    )
+    .await;
+    let previous = slot.as_ref().map(|(_, s)| s.admits());
+    if previous != Some(fresh.admits()) {
+        if fresh.admits() {
+            tracing::info!(
+                free_vram_mb = ?fresh.free_vram_mb,
+                model_resident = fresh.model_resident,
+                "vlm backend available again"
+            );
+        } else {
+            tracing::warn!(
+                free_vram_mb = ?fresh.free_vram_mb,
+                reachable = fresh.reachable,
+                headroom_mb = state.config.vram_headroom_mb,
+                holders = %hs_common::gpu::compute_apps_summary(),
+                "vlm backend unavailable — refusing dispatch"
+            );
+        }
+    }
+    *slot = Some((std::time::Instant::now(), fresh.clone()));
+    Some(fresh)
 }
 
 fn record_success(last_slot: &AtomicU64, total: &AtomicU64, md: &str) {
@@ -91,37 +148,65 @@ pub fn app(state: Arc<ServerState>) -> Router {
         .with_state(state)
 }
 
+/// `status` is `"ok"` only when the VLM backend can actually take work.
+/// A refusing gate returns 503 with the same body so an operator sees
+/// the free-VRAM number that caused it — `hs status` and the MCP
+/// fanout key off `status`, and `ScribeClient::health` parses the body
+/// regardless of status code.
 async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let (gpu_name, gpu_utilization_pct, gpu_memory_used_mb) = gpu::query_gpu_info();
-    axum::Json(HealthResponse {
-        status: "ok".into(),
+    let info = hs_common::gpu::query_gpu_info();
+    let backend = cached_backend_state(&state).await;
+    let admits = backend.as_ref().is_none_or(|b| b.admits());
+    let body = HealthResponse {
+        status: if admits { "ok" } else { BACKEND_UNAVAILABLE }.into(),
         layout_model: state.processor.has_layout_detector(),
         table_model: state.processor.has_table_recognizer(),
         layout_model_reason: state.processor.layout_model_reason().map(str::to_string),
         table_model_reason: state.processor.table_model_reason().map(str::to_string),
         version: env!("HS_VERSION").into(),
-        gpu_name,
-        gpu_utilization_pct,
-        gpu_memory_used_mb,
+        gpu_name: info.name,
+        gpu_utilization_pct: info.utilization_pct,
+        gpu_memory_used_mb: info.memory_used_mb,
         last_conversion_at: format_last_conv(&state.last_conversion_ms),
         total_conversions: state.total_conversions.load(Ordering::Relaxed),
-    })
+        backend_reachable: backend.as_ref().map(|b| b.reachable),
+        backend_model_resident: backend.as_ref().map(|b| b.model_resident),
+        backend_vram_free_mb: backend.as_ref().and_then(|b| b.free_vram_mb),
+        backend_checked_at: backend.as_ref().map(|b| b.checked_at.clone()),
+    };
+    if admits {
+        (StatusCode::OK, axum::Json(body))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body))
+    }
 }
 
 async fn handle_readiness(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    // Report the EFFECTIVE capacity, not the configured value — rc.295
-    // clamps vlm_concurrency to live OLLAMA_NUM_PARALLEL when the config
-    // would oversubscribe Ollama. The pool load-balancer relies on this
-    // number being truthful.
+    // Report the EFFECTIVE capacity (the VLM semaphore size). The pool
+    // load-balancer relies on this number being truthful.
     let total = state.processor.effective_vlm_concurrency();
-    let available = state.processor.vlm_sem().available_permits();
+    let admits = cached_backend_state(&state)
+        .await
+        .is_none_or(|b| b.admits());
+    // Zero available slots is what `ServicePool::try_pick_once` already
+    // treats as ineligible, so a closed gate parks the dispatcher
+    // instead of feeding a backend that can only time out.
+    let available = if admits {
+        state.processor.vlm_sem().available_permits()
+    } else {
+        0
+    };
     let in_flight = state.in_flight.load(Ordering::Relaxed);
-    axum::Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "ready": available > 0,
         "vlm_slots_total": total,
         "vlm_slots_available": available,
         "in_flight_conversions": in_flight,
-    }))
+    });
+    if !admits {
+        body["backend_status"] = serde_json::Value::String(BACKEND_UNAVAILABLE.into());
+    }
+    axum::Json(body)
 }
 
 async fn handle_info(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
@@ -135,6 +220,7 @@ async fn handle_info(State(state): State<Arc<ServerState>>) -> impl IntoResponse
 }
 
 /// Extract PDF bytes from a multipart upload.
+#[allow(clippy::result_large_err)]
 async fn extract_pdf(mut multipart: Multipart) -> Result<Vec<u8>, Response> {
     while let Ok(Some(field)) = multipart.next_field().await {
         if field.name() == Some("pdf") {
@@ -245,8 +331,23 @@ async fn handle_scribe(
     let path = tmp.path().to_str().unwrap_or_default();
     let (deadline, from_header) = resolve_deadline(&headers, state.config.convert_deadline_secs);
     let stem = resolve_stem(&headers).to_string();
-    let fut = state.processor.process_pdf(path);
-    match tokio::time::timeout(deadline, fut).await {
+    // Branch on the configured converter. `Legacy` runs the per-region
+    // OcrEngine pipeline (Processor::process_pdf). `Olmocr` shells out
+    // to the olmocr CLI which handles render + anchor + prompt + parse +
+    // assemble end-to-end.
+    let state_for_convert = state.clone();
+    let convert_fut = async move {
+        match state_for_convert.config.converter {
+            crate::config::ConverterMode::Legacy => {
+                state_for_convert.processor.process_pdf(path).await
+            }
+            crate::config::ConverterMode::Olmocr => {
+                crate::converter::olmocr_subprocess::convert(&pdf_bytes, &state_for_convert.config)
+                    .await
+            }
+        }
+    };
+    match tokio::time::timeout(deadline, convert_fut).await {
         Ok(Ok(md)) => {
             record_success(&state.last_conversion_ms, &state.total_conversions, &md);
             (StatusCode::OK, md).into_response()
@@ -313,20 +414,40 @@ async fn handle_scribe_stream(
             }
         };
 
-        let fut = state
-            .processor
-            .process_pdf_with_progress(&path, on_progress);
-        match tokio::time::timeout(deadline, fut).await {
-            Ok(Ok(result)) => {
+        // Branch on the configured converter. Legacy streams per-page
+        // progress events natively; olmocr produces the markdown as one
+        // bundle so the stream emits a single Result line at the end
+        // (with empty per-page metadata — olmocr doesn't surface
+        // per-page region classes or diags).
+        let state_for_convert = state.clone();
+        let convert_fut = async move {
+            match state_for_convert.config.converter {
+                crate::config::ConverterMode::Legacy => state_for_convert
+                    .processor
+                    .process_pdf_with_progress(&path, on_progress)
+                    .await
+                    .map(|r| (r.markdown, r.per_page_region_classes, r.per_page_diags)),
+                crate::config::ConverterMode::Olmocr => {
+                    crate::converter::olmocr_subprocess::convert(
+                        &pdf_bytes,
+                        &state_for_convert.config,
+                    )
+                    .await
+                    .map(|md| (md, Vec::new(), Vec::new()))
+                }
+            }
+        };
+        match tokio::time::timeout(deadline, convert_fut).await {
+            Ok(Ok((markdown, per_page_region_classes, per_page_diags))) => {
                 record_success(
                     &state.last_conversion_ms,
                     &state.total_conversions,
-                    &result.markdown,
+                    &markdown,
                 );
                 let line = StreamLine::Result {
-                    markdown: result.markdown,
-                    per_page_region_classes: result.per_page_region_classes,
-                    per_page_diags: result.per_page_diags,
+                    markdown,
+                    per_page_region_classes,
+                    per_page_diags,
                 };
                 if let Ok(json) = serde_json::to_string(&line) {
                     let _ = tx.send(Ok(format!("{json}\n"))).await;

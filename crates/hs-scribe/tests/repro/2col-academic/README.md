@@ -46,7 +46,7 @@ Current pin:
    ```bash
    HS_SCRIBE_REPRO=1 \
    HS_SCRIBE_TEST_BACKEND=openai-compat \
-   HS_SCRIBE_TEST_SCRIBE_URL=http://192.168.1.110:7433 \
+   HS_SCRIBE_TEST_SCRIBE_URL=http://192.0.2.110:7433 \
    HS_SCRIBE_DIAG_DIR=/tmp/repro-diag \
    cargo test -p hs-scribe --test repro_2col_test -- --ignored --nocapture
    ```

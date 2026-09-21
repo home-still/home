@@ -77,6 +77,25 @@ const QC_LONGEST_RUN_BYTES_MAX: usize = 1024;
 /// `clean_repetitions` (4-gram >3×).
 const LOOP_MIN_REPS: usize = 4;
 
+/// Longest pre-cleanup repeated run, in bytes, below which a document has no
+/// runaway loop at all. A real VLM loop spams a phrase toward max_tokens,
+/// leaving a run far longer than any legitimate repeat; below this floor the
+/// truncation sites are benign short-form repetition (code indentation, table
+/// rules, symbol runs). Gating the count-based reject below this floor stops
+/// long technical books — hundreds of ~1-line truncations whose longest run is
+/// a few dozen bytes — from being rejected on truncation COUNT, which scales
+/// with document length rather than loopiness.
+const QC_LOOP_RUN_FLOOR: usize = 128;
+/// Per-page truncation budget that makes the absolute ceiling length-aware:
+/// the effective ceiling is `max(QC_ABSOLUTE_MAX, pages * this)`, so a flat cap
+/// no longer punishes long documents. A whole-doc average above this (with a
+/// real repeated run present) is the distributed-loop signal.
+const QC_TRUNC_PER_PAGE_BUDGET: usize = 2;
+/// Minimum truncation sites on a page for it to count as "bad" in the spread
+/// gate. A lone scattered site per page is normal in dense technical text and
+/// no longer flags the page.
+const QC_BAD_PAGE_MIN_TRUNCS: usize = 2;
+
 /// PP-DocLayout-V3 region class names that indicate a bibliography page.
 /// These are the canonical strings emitted by `models/layout.rs` (idx 18,
 /// 19 in the 25-class taxonomy). A page with any region of these classes
@@ -94,16 +113,22 @@ pub fn is_bibliography_page(class_names: &[String]) -> bool {
 }
 
 /// Decide whether the markdown that came out of `clean_repetitions_per_page`
-/// is trustworthy. Trips on any of:
-/// - total truncation count > `QC_ABSOLUTE_MAX`
+/// is trustworthy. The definitive runaway-loop signal is `longest_run_bytes`
+/// (computed on the **original** pre-cleanup markdown): a real VLM loop spams a
+/// phrase toward max_tokens, leaving a run far longer than any legitimate
+/// repeat. Below `QC_LOOP_RUN_FLOOR` there is no loop, so the document is
+/// accepted regardless of truncation count — this is what stops long technical
+/// books from being rejected on COUNT, which scales with length not loopiness.
+/// Once a meaningful run exists, it trips on any of:
+/// - total truncation count > `max(QC_ABSOLUTE_MAX, pages × QC_TRUNC_PER_PAGE_BUDGET)`
 /// - any single page with `truncations > QC_PER_PAGE_MAX` (or × the
 ///   bibliography multiplier when that page's region classes flag it)
-/// - more than `QC_BAD_PAGE_RATIO_PCT`% of pages have any truncation activity
+/// - more than `QC_BAD_PAGE_RATIO_PCT`% of pages with `>= QC_BAD_PAGE_MIN_TRUNCS`
+///   truncation sites (a lone scattered site per page is normal)
 /// - longest contiguous repeated-substring run > `QC_LONGEST_RUN_BYTES_MAX`
 ///
 /// `per_page_truncations` and `per_page_is_bibliography` must have the same
-/// length and index alignment. `longest_run_bytes` is computed on the
-/// **original** (pre-cleanup) markdown via [`longest_repeated_run_bytes`].
+/// length and index alignment.
 pub fn qc_verdict(
     per_page_truncations: &[crate::diag::TruncationCounts],
     per_page_is_bibliography: &[bool],
@@ -115,8 +140,22 @@ pub fn qc_verdict(
         "qc_verdict: per_page vec lengths must match"
     );
 
+    // No meaningful repeated run anywhere ⇒ no runaway loop. The truncation
+    // sites are benign short-form repetition (code indentation, table rules);
+    // accept regardless of their count, which otherwise grows with document
+    // length and false-positives long code-dense books.
+    if longest_run_bytes < QC_LOOP_RUN_FLOOR {
+        return QcVerdict::Accept;
+    }
+
+    let total_pages = per_page_truncations.len().max(1);
+
+    // Absolute ceiling, made length-aware: a flat cap punishes long documents,
+    // so scale the budget with page count and keep QC_ABSOLUTE_MAX as a floor.
     let total: usize = per_page_truncations.iter().map(|t| t.total()).sum();
-    if total > QC_ABSOLUTE_MAX {
+    let absolute_ceiling =
+        QC_ABSOLUTE_MAX.max(total_pages.saturating_mul(QC_TRUNC_PER_PAGE_BUDGET));
+    if total > absolute_ceiling {
         return QcVerdict::RejectLoop;
     }
 
@@ -132,10 +171,12 @@ pub fn qc_verdict(
         }
     }
 
-    let total_pages = per_page_truncations.len().max(1);
+    // Spread gate: many pages each carrying real (>= QC_BAD_PAGE_MIN_TRUNCS)
+    // truncation activity. A lone scattered site per page is normal in dense
+    // technical text and no longer counts as a "bad" page.
     let bad_pages = per_page_truncations
         .iter()
-        .filter(|t| t.total() >= 1)
+        .filter(|t| t.total() >= QC_BAD_PAGE_MIN_TRUNCS)
         .count();
     if bad_pages.saturating_mul(100) > total_pages.saturating_mul(QC_BAD_PAGE_RATIO_PCT) {
         return QcVerdict::RejectLoop;
@@ -514,9 +555,11 @@ mod tests {
     fn qc_verdict_rejects_absolute_runaway() {
         // Doc-wide total > 20 = reject. Spread across multiple pages so
         // no single page trips the per-page gate first.
-        let truncs = vec![tc(3); 7]; // total = 21
+        let truncs = vec![tc(3); 7]; // total = 21 > max(20, 7*2)
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
+        // A real run is present (>= floor) AND the total is over the
+        // length-aware ceiling.
+        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::RejectLoop);
     }
 
     #[test]
@@ -524,7 +567,7 @@ mod tests {
         // Single page > 3 truncations → reject (one bad page poisons doc).
         let truncs = vec![tc(0), tc(4), tc(0), tc(0)]; // page 1 has 4 > 3
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
+        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::RejectLoop);
     }
 
     #[test]
@@ -573,7 +616,7 @@ mod tests {
             true, false, false, false, false, false, false, false, false, false,
         ];
         // 8 ≤ 3*3 = 9, so per-page gate passes; bad-page ratio is 10% (not > 10%).
-        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::Accept);
     }
 
     #[test]
@@ -581,31 +624,43 @@ mod tests {
         // A bibliography page with > 9 truncations is still rejected.
         let truncs = vec![tc(10), tc(0), tc(0), tc(0)];
         let bib = vec![true, false, false, false];
-        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
+        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::RejectLoop);
     }
 
     #[test]
     fn qc_verdict_rejects_too_many_loopy_pages() {
-        // 11% of pages with truncation activity → reject even when no
-        // single page exceeds the ceiling and the absolute is fine.
-        // 100 pages × (11 with 1 truncation, 89 with 0) = 11 total, 11%.
+        // 11% of pages each carrying real (>= 2) truncation activity → reject
+        // even when no single page exceeds the per-page ceiling. A meaningful
+        // run is present so the count gates are live.
         let mut truncs = vec![tc(0); 100];
         for t in truncs.iter_mut().take(11) {
-            *t = tc(1);
+            *t = tc(2);
         }
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::RejectLoop);
+        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::RejectLoop);
     }
 
     #[test]
     fn qc_verdict_tolerates_at_threshold_loopy_pages() {
-        // 10% exactly → accept (10 of 100 pages with 1 truncation).
+        // 10% exactly → accept (10 of 100 pages with >= 2 truncations).
         let mut truncs = vec![tc(0); 100];
         for t in truncs.iter_mut().take(10) {
-            *t = tc(1);
+            *t = tc(2);
         }
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::Accept);
+    }
+
+    #[test]
+    fn qc_verdict_accepts_long_code_book_with_tiny_runs() {
+        // feathers regression: a ~456-page code book yields hundreds of tiny,
+        // scattered truncations (benign code/table formatting), but the longest
+        // repeated run is only a few dozen bytes — there is no loop. The old
+        // absolute-count gate rejected this purely for being long; it must now
+        // be accepted because the longest run is below the loop floor.
+        let truncs = vec![tc(2); 456]; // 912 truncation sites
+        let bib = pages_with(&truncs);
+        assert_eq!(qc_verdict(&truncs, &bib, 48), QcVerdict::Accept);
     }
 
     #[test]

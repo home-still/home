@@ -1,5 +1,4 @@
 use hs_common::catalog::CatalogEntry;
-use regex::Regex;
 
 use crate::types::DocumentMeta;
 
@@ -38,23 +37,18 @@ pub fn extract_rule_based(
     // canonical location and is identical across hosts.
     meta.pdf_path = Some(format!("papers/{}", hs_common::sharded_key(stem, "pdf")));
 
-    // Year may be filled from the document if catalog missing it.
-    // DOI is NEVER regex-extracted: the first DOI-shaped string in a paper is
-    // almost always a reference citation, not the paper's own DOI, which
-    // produced mislabeled chunks in rc.<=230.
-    if meta.publication_date.is_none() {
-        let first_lines: String = markdown.lines().take(50).collect::<Vec<_>>().join("\n");
-        if let Some(year) = extract_year(&first_lines) {
-            meta.publication_date = Some(year);
-        }
-    }
+    // Neither DOI nor year is ever regex-extracted from body text. The
+    // first DOI-shaped string in a paper is almost always a reference
+    // citation, not the paper's own DOI, which produced mislabeled chunks
+    // in rc.<=230. The first 4-digit year in the opening lines has the
+    // same problem and was worse, because it silently succeeded: journal
+    // headers, copyright lines and the first citation all match, so a 2021
+    // Frontiers paper was indexed as 2008. A wrong year is more damaging
+    // than a missing one — it survives into search results and citations
+    // with no signal that it was guessed. When the catalog has no
+    // publication_date, the year stays None; backfill the catalog instead.
 
     meta
-}
-
-fn extract_year(text: &str) -> Option<String> {
-    let re = Regex::new(r"\b(19|20)\d{2}\b").ok()?;
-    re.find(text).map(|m| m.as_str().to_string())
 }
 
 /// LLM-powered keyword/topic extraction via Ollama (optional).
@@ -132,10 +126,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_year_from_text() {
-        let text = "Published in 2023 by the authors.";
-        let year = extract_year(text);
-        assert_eq!(year, Some("2023".to_string()));
+    fn year_is_never_guessed_from_body_text() {
+        // Opening lines carry a copyright year and a citation year that are
+        // not the paper's own. With no catalog date, the year must stay
+        // None rather than pick one of them.
+        let markdown = "Frontiers in Psychology\n\nCopyright 2008 the authors\n\n\
+                        See Smith et al. 1998 for background.\n\nAbstract";
+        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        assert_eq!(meta.publication_date, None);
+    }
+
+    #[test]
+    fn year_comes_from_the_catalog_when_present() {
+        let cat = hs_common::catalog::CatalogEntry {
+            publication_date: Some("2021-03-04".into()),
+            ..Default::default()
+        };
+        let meta = extract_rule_based("Copyright 2008", "stem", "path/stem.md", Some(&cat));
+        assert_eq!(meta.publication_date.as_deref(), Some("2021-03-04"));
     }
 
     #[test]

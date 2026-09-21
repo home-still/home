@@ -1,6 +1,6 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
@@ -13,12 +13,28 @@ use crate::types::EmbeddingOutput;
 
 /// ONNX-based embedder using fastembed-rs. Always runs on CUDA — the
 /// distill binary ships with no CPU code path (rc.306 P0-7).
+///
+/// Each pool slot is `Mutex<Option<TextEmbedding>>` rather than
+/// `Mutex<TextEmbedding>` so an idle-sweeper task can `take()` the
+/// loaded model and let it Drop, releasing the CUDA allocations under
+/// it. The next `embed_batch` call lazily rebuilds. This is opt-in via
+/// `EmbeddingConfig::idle_release_secs` — `None` keeps the original
+/// always-resident behavior.
 pub struct OnnxEmbedder {
-    models: Vec<Arc<Mutex<TextEmbedding>>>,
+    models: Vec<Arc<Mutex<Option<TextEmbedding>>>>,
     next: AtomicUsize,
     device: ComputeDevice,
     dimension: usize,
     batch_ctrl: Arc<AdaptiveBatchController>,
+    /// Unix millis of the most recent `embed_batch` entry. Stamped at
+    /// the start of the call, not the end, so a long-running embed
+    /// keeps the model warm for its own duration without the sweeper
+    /// racing it to release.
+    last_used_ms: Arc<AtomicI64>,
+    /// Free-VRAM floor enforced before every (re)load. Copied from
+    /// config so the lazy-reload path inside `spawn_blocking` can apply
+    /// the same gate as startup.
+    vram_floor_mb: u64,
 }
 
 impl OnnxEmbedder {
@@ -41,20 +57,29 @@ impl OnnxEmbedder {
             initial_batch_size,
             adaptive = config.adaptive_batch,
             candidates = ?adaptive_cfg.candidates,
+            idle_release_secs = ?config.idle_release_secs,
             "initializing bge-m3 embedder pool"
         );
 
-        // Build the first model and verify GPU residency before allocating
-        // the rest. Probe failure aborts — one path, no silent CPU
-        // substitute.
+        // Refuse the load outright when the card is already spoken for,
+        // then build the first model and verify GPU residency before
+        // allocating the rest. Either failure aborts — one path, no
+        // silent CPU substitute.
+        require_vram(config.vram_floor_mb)?;
         let mut first = build_text_embedding()?;
         verify_cuda_probe(&mut first)?;
 
-        let mut models: Vec<Arc<Mutex<TextEmbedding>>> = Vec::with_capacity(pool_size);
-        models.push(Arc::new(Mutex::new(first)));
+        let mut models: Vec<Arc<Mutex<Option<TextEmbedding>>>> = Vec::with_capacity(pool_size);
+        models.push(Arc::new(Mutex::new(Some(first))));
         for _ in 1..pool_size {
             let model = build_text_embedding()?;
-            models.push(Arc::new(Mutex::new(model)));
+            models.push(Arc::new(Mutex::new(Some(model))));
+        }
+
+        let last_used_ms = Arc::new(AtomicI64::new(now_unix_ms()));
+
+        if let Some(idle_secs) = config.idle_release_secs {
+            spawn_idle_sweeper(models.clone(), last_used_ms.clone(), idle_secs);
         }
 
         Ok(Self {
@@ -63,15 +88,24 @@ impl OnnxEmbedder {
             device,
             dimension: config.dimension,
             batch_ctrl: Arc::new(AdaptiveBatchController::new(adaptive_cfg)),
+            last_used_ms,
+            vram_floor_mb: config.vram_floor_mb,
         })
     }
 }
 
 fn build_text_embedding() -> Result<TextEmbedding, DistillError> {
     use ort::execution_providers::CUDAExecutionProvider;
+    // error_on_failure: ort's default is to log and silently fall back to
+    // the CPU provider when CUDA registration fails. Distill ships with
+    // no CPU path — a failed registration must be a hard error, not a
+    // 50x-slower session that only the (startup-only) VRAM probe could
+    // have caught.
     let opts = InitOptions::new(EmbeddingModel::BGEM3)
         .with_show_download_progress(true)
-        .with_execution_providers(vec![CUDAExecutionProvider::default().build()]);
+        .with_execution_providers(vec![CUDAExecutionProvider::default()
+            .build()
+            .error_on_failure()]);
     TextEmbedding::try_new(opts)
         .map_err(|e| DistillError::Embedding(format!("Failed to load model: {e}")))
 }
@@ -87,34 +121,97 @@ fn verify_cuda_probe(model: &mut TextEmbedding) -> Result<(), DistillError> {
         .map_err(|e| DistillError::Embedding(format!("CUDA probe failed: {e}")))?;
     let probe_ms = start.elapsed().as_millis();
 
-    let gpu_mem_used = check_gpu_memory_mb();
+    let self_mem = hs_common::gpu::self_vram_mb();
     tracing::info!(
         probe_ms = probe_ms,
-        gpu_mem_mb = gpu_mem_used,
+        self_vram_mb = ?self_mem,
         "CUDA probe complete"
     );
 
-    if gpu_mem_used < 200 {
+    // Per-process attribution, not whole-card `memory.used`: on a
+    // contended card the old check read 23 GB of OTHER tenants'
+    // allocations and passed vacuously while this process sat on CPU.
+    if self_mem.is_none_or(|mb| mb < 200) {
         return Err(DistillError::Embedding(format!(
-            "CUDA requested but model is not on GPU (only {gpu_mem_used} MB VRAM used). \
+            "CUDA requested but model is not on GPU (own process VRAM: {self_mem:?} MB). \
              Fix CUDA: check driver, LD_LIBRARY_PATH, libonnxruntime_providers_cuda.so, \
              and the pyke ort cache (~/.cache/ort.pyke.io/dfbin). Distill ships with no CPU path."
         )));
     }
-    tracing::info!("CUDA verified: model loaded on GPU ({gpu_mem_used} MB VRAM)");
+    tracing::info!("CUDA verified: model loaded on GPU ({self_mem:?} MB VRAM, this process)");
     Ok(())
 }
 
-/// Check GPU memory usage via nvidia-smi. Returns MB used, or 0 on failure.
-fn check_gpu_memory_mb() -> u64 {
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
-        .output()
-        .ok();
-    output
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
+/// Refuse to load the embedder when the card cannot host it. `None`
+/// free-VRAM means no NVIDIA GPU is visible — no gate to apply — which
+/// keeps this a no-op on non-CUDA hosts while still failing loudly on
+/// `big` when a foreign tenant owns the card.
+fn require_vram(floor_mb: u64) -> Result<(), DistillError> {
+    let Some(free) = hs_common::gpu::free_vram_mb() else {
+        return Ok(());
+    };
+    if free < floor_mb {
+        return Err(DistillError::Embedding(format!(
+            "gpu busy: {free} MB free < {floor_mb} MB required to load bge-m3; holders: {}",
+            hs_common::gpu::compute_apps_summary()
+        )));
+    }
+    Ok(())
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Background task that drops each pool slot's `TextEmbedding` after the
+/// configured idle window. Wakes every 30 s; cheap relative to the cost
+/// of holding ~5 GB of VRAM. Logs each release with the observed idle
+/// time so an operator can see whether the timeout is well-tuned.
+fn spawn_idle_sweeper(
+    models: Vec<Arc<Mutex<Option<TextEmbedding>>>>,
+    last_used_ms: Arc<AtomicI64>,
+    idle_secs: u64,
+) {
+    let idle_ms = idle_secs.saturating_mul(1000) as i64;
+    let sweep_interval = Duration::from_secs(30);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(sweep_interval).await;
+            let now = now_unix_ms();
+            let last = last_used_ms.load(Ordering::Relaxed);
+            let idle = now.saturating_sub(last);
+            if idle < idle_ms {
+                continue;
+            }
+            let mut released = 0usize;
+            for slot in &models {
+                let mut guard = match slot.lock() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "idle sweeper: lock poisoned; skipping slot");
+                        continue;
+                    }
+                };
+                if guard.take().is_some() {
+                    released += 1;
+                }
+            }
+            if released > 0 {
+                tracing::info!(
+                    idle_secs = idle / 1000,
+                    released_slots = released,
+                    "released bge-m3 embedder pool after idle window"
+                );
+                // Bump last_used so we don't re-log every 30 s while no
+                // requests are coming in. The next embed_batch will set
+                // its own timestamp before reloading.
+                last_used_ms.store(now, Ordering::Relaxed);
+            }
+        }
+    });
 }
 
 #[async_trait]
@@ -123,6 +220,11 @@ impl Embedder for OnnxEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+
+        // Stamp last_used at the START of the call so a long-running
+        // embed keeps the model warm for its own duration. Stamping at
+        // the end would race the sweeper.
+        self.last_used_ms.store(now_unix_ms(), Ordering::Relaxed);
 
         let texts_len = texts.len();
         let texts: Vec<String> = texts.to_vec();
@@ -133,14 +235,38 @@ impl Embedder for OnnxEmbedder {
         // picks index 0.
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.models.len();
         let model = Arc::clone(&self.models[idx]);
+        let vram_floor_mb = self.vram_floor_mb;
 
         // fastembed's `embed` is synchronous and CPU/GPU-heavy. spawn_blocking
         // keeps it off the tokio worker threads.
         let started = Instant::now();
         let denses = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>, DistillError> {
-            let mut model = model
+            let mut guard = model
                 .lock()
                 .map_err(|e| DistillError::Embedding(format!("Model lock poisoned: {e}")))?;
+
+            // Lazy-load if the idle sweeper dropped the model. First
+            // request after release pays the ~10 s load cost; subsequent
+            // requests are fast.
+            if guard.is_none() {
+                // Same free-VRAM gate as startup. Returning the error
+                // here makes `hs distill watch-events` NAK so JetStream
+                // redelivers once the card frees up — a CUDA OOM at this
+                // point poisons the session for every later request.
+                require_vram(vram_floor_mb)?;
+                tracing::info!("lazy-loading bge-m3 after idle release");
+                let mut m = build_text_embedding()?;
+                // Same CUDA-residency gate as startup: a driver hiccup or
+                // evicted pyke cache between idle-release and rebuild must
+                // fail loudly here, not degrade every subsequent embed to
+                // CPU until someone notices the throughput graph.
+                verify_cuda_probe(&mut m)?;
+                *guard = Some(m);
+            }
+            let model_ref = guard
+                .as_mut()
+                .expect("model loaded above or already present");
+
             let mut out = Vec::with_capacity(texts.len());
             for batch_start in (0..texts.len()).step_by(batch_size) {
                 let batch_end = (batch_start + batch_size).min(texts.len());
@@ -148,7 +274,7 @@ impl Embedder for OnnxEmbedder {
                     .iter()
                     .map(|s| s.as_str())
                     .collect();
-                let embeddings = model
+                let embeddings = model_ref
                     .embed(batch, None)
                     .map_err(|e| DistillError::Embedding(format!("Embedding failed: {e}")))?;
                 out.extend(embeddings);

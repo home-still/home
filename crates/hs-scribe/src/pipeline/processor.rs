@@ -7,9 +7,10 @@ use crate::models::table_structure::{
 use crate::ocr::region::RegionType;
 use crate::ocr::OcrEngine;
 use crate::pipeline::markdown_generator::{assemble_page_markdown, join_pages};
+use crate::pipeline::pdf_parser::PageData;
 use crate::pipeline::PdfParser;
 use crate::utils::deduplication::{deduplicate_boxes, filter_contained_regions};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use hs_common::hardware_profile::HardwareProfile;
 use image::DynamicImage;
@@ -106,12 +107,7 @@ pub struct Processor {
     /// semaphore as watch/CLI callers; `/readiness` reports its live
     /// permit count via `Processor::vlm_sem()`.
     vlm_sem: Arc<tokio::sync::Semaphore>,
-    /// The actual semaphore capacity. Equals `config.vlm_concurrency`
-    /// unless clamped by live `OLLAMA_NUM_PARALLEL` detection at startup —
-    /// Rust-layer concurrency above Ollama's parallel capacity just
-    /// oversubscribes Ollama's internal queue, inflates per-request
-    /// latency past the convert deadline, and produces cascading
-    /// timeouts. Clamping at startup keeps Rust in lockstep with Ollama.
+    /// The actual semaphore capacity. Equals `config.vlm_concurrency`.
     effective_vlm_concurrency: usize,
     config: AppConfig,
 }
@@ -142,7 +138,7 @@ impl Processor {
                 )
             };
 
-        let effective_vlm_concurrency = resolve_effective_vlm_concurrency(config.vlm_concurrency);
+        let effective_vlm_concurrency = config.vlm_concurrency;
         let vlm_sem = Arc::new(tokio::sync::Semaphore::new(effective_vlm_concurrency));
 
         Ok(Self {
@@ -158,8 +154,7 @@ impl Processor {
     }
 
     /// Effective semaphore capacity — what `/readiness` reports as
-    /// `vlm_slots_total`. Equals `config.vlm_concurrency` except when
-    /// clamped by live `OLLAMA_NUM_PARALLEL`.
+    /// `vlm_slots_total`. Equals `config.vlm_concurrency`.
     pub fn effective_vlm_concurrency(&self) -> usize {
         self.effective_vlm_concurrency
     }
@@ -461,11 +456,10 @@ impl Processor {
             message: "Parsing PDF...".into(),
         });
 
-        let pages = {
+        let total = {
             let pdf_parser = PdfParser::new()?;
-            pdf_parser.parse_to_pages(pdf_path, self.config.dpi)?
+            pdf_parser.page_count(pdf_path)? as u64
         };
-        let total = pages.len() as u64;
 
         on_progress(ProgressEvent {
             stage: "parse".into(),
@@ -480,62 +474,94 @@ impl Processor {
             let parallel = self.config.parallel;
             let completed = Arc::new(AtomicU64::new(0));
 
-            let markdowns: Vec<String> = stream::iter(pages.into_iter().enumerate())
-                .map(|(i, page)| {
-                    let ocr = Arc::clone(&ocr);
-                    let on_progress = Arc::clone(&on_progress);
-                    let completed = Arc::clone(&completed);
-                    async move {
-                        on_progress(ProgressEvent {
-                            stage: "vlm".into(),
-                            page: i as u64,
-                            total_pages: total,
-                            message: format!("Starting OCR page {}/{total}", i + 1),
-                        });
-                        let downscaled = maybe_downscale(&page.image, max_dim);
-                        let image_bytes = match encode_jpeg(&downscaled) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    page = i + 1,
-                                    "full-page JPEG encode failed — emitting empty page (paper continues)"
-                                );
-                                return String::new();
-                            }
-                        };
-                        tracing::info!(
-                            "Processing page {}/{} ({}x{}, {} bytes JPEG)",
-                            i + 1,
-                            total,
-                            page.image.width(),
-                            page.image.height(),
-                            image_bytes.len()
-                        );
-                        let text = match ocr.recognize(&image_bytes).await {
-                            Ok(t) => t,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    page = i + 1,
-                                    "full-page VLM failed — emitting empty page (paper continues)"
-                                );
-                                String::new()
-                            }
-                        };
-                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                        on_progress(ProgressEvent {
-                            stage: "vlm".into(),
-                            page: done,
-                            total_pages: total,
-                            message: format!("OCR page {done}/{total}"),
-                        });
-                        text
+            // Stage 1: render pages one at a time on a blocking thread into a
+            // small bounded channel — at most a couple of rendered pages are
+            // resident, so a large book no longer materialises its whole raster
+            // set up front (the all-pages-in-RAM OOM that froze the host).
+            let pdf_path_owned = pdf_path.to_string();
+            let render_dpi = self.config.dpi;
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, PageData)>(2);
+            let render = tokio::task::spawn_blocking(move || {
+                let parser = PdfParser::new()?;
+                let document = parser.open(&pdf_path_owned)?;
+                for idx in 0..total as u16 {
+                    let page = PdfParser::render_page(&document, idx, render_dpi)?;
+                    if tx.blocking_send((idx as usize, page)).is_err() {
+                        break;
                     }
-                })
-                .buffered(parallel)
-                .collect()
-                .await;
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+
+            // Stage 2: full-page OCR, bounded to `parallel` concurrent VLM calls.
+            let page_sem = Arc::new(tokio::sync::Semaphore::new(parallel.max(1)));
+            let mut tasks = tokio::task::JoinSet::new();
+            while let Some((i, page)) = rx.recv().await {
+                let permit = Arc::clone(&page_sem)
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("page semaphore closed mid-paper: {e}"))?;
+                let ocr = Arc::clone(&ocr);
+                let on_progress = Arc::clone(&on_progress);
+                let completed = Arc::clone(&completed);
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    on_progress(ProgressEvent {
+                        stage: "vlm".into(),
+                        page: i as u64,
+                        total_pages: total,
+                        message: format!("Starting OCR page {}/{total}", i + 1),
+                    });
+                    let downscaled = maybe_downscale(&page.image, max_dim);
+                    let text = match encode_jpeg(&downscaled) {
+                        Ok(image_bytes) => {
+                            tracing::info!(
+                                "Processing page {}/{} ({}x{}, {} bytes JPEG)",
+                                i + 1,
+                                total,
+                                page.image.width(),
+                                page.image.height(),
+                                image_bytes.len()
+                            );
+                            match ocr.recognize(&image_bytes).await {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        page = i + 1,
+                                        "full-page VLM failed — emitting empty page (paper continues)"
+                                    );
+                                    String::new()
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                page = i + 1,
+                                "full-page JPEG encode failed — emitting empty page (paper continues)"
+                            );
+                            String::new()
+                        }
+                    };
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    on_progress(ProgressEvent {
+                        stage: "vlm".into(),
+                        page: done,
+                        total_pages: total,
+                        message: format!("OCR page {done}/{total}"),
+                    });
+                    (i, text)
+                });
+            }
+
+            let mut collected: Vec<(usize, String)> = Vec::with_capacity(total as usize);
+            while let Some(res) = tasks.join_next().await {
+                collected.push(res?);
+            }
+            render.await??;
+            collected.sort_by_key(|(i, _)| *i);
+            let markdowns: Vec<String> = collected.into_iter().map(|(_, md)| md).collect();
 
             // FullPage mode bypasses layout detection — no per-page region
             // class info exists. Empty class lists tell QC "not bibliography",
@@ -577,27 +603,36 @@ impl Processor {
         let table = self.table_recognizers.clone();
         let on_progress_s1 = Arc::clone(&on_progress);
 
+        // Stage 1 renders each page just before it detects layout and drops it
+        // right after, so only one page of raster is resident at a time — the
+        // whole-document rasterization that OOM-froze the host is gone.
+        let pdf_path_owned = pdf_path.to_string();
+        let render_dpi = self.config.dpi;
         let stage1 = tokio::task::spawn_blocking(move || {
-            for (idx, page) in pages.into_iter().enumerate() {
+            let parser = PdfParser::new()?;
+            let document = parser.open(&pdf_path_owned)?;
+            for idx in 0..total as u16 {
+                let page_no = idx as usize;
                 on_progress_s1(ProgressEvent {
                     stage: "layout".into(),
                     page: idx as u64,
                     total_pages: total,
-                    message: format!("Detecting layout page {}/{total}", idx + 1),
+                    message: format!("Detecting layout page {}/{total}", page_no + 1),
                 });
+                let page = PdfParser::render_page(&document, idx, render_dpi)?;
                 tracing::info!(
                     "Preparing page {}/{} ({}x{}, per-region)",
-                    idx + 1,
+                    page_no + 1,
                     total,
                     page.image.width(),
                     page.image.height(),
                 );
-                let prepared = prepare_page(idx, &page.image, &layout, &table)?;
+                let prepared = prepare_page(page_no, &page.image, &layout, &table)?;
                 on_progress_s1(ProgressEvent {
                     stage: "layout".into(),
-                    page: (idx + 1) as u64,
+                    page: (page_no + 1) as u64,
                     total_pages: total,
-                    message: format!("Layout done page {}/{total}", idx + 1),
+                    message: format!("Layout done page {}/{total}", page_no + 1),
                 });
                 if tx.blocking_send(prepared).is_err() {
                     break;
@@ -689,57 +724,86 @@ impl Processor {
     }
 
     pub async fn process_pdf(&self, pdf_path: &str) -> Result<String> {
-        let pages = {
+        let total = {
             let pdf_parser = PdfParser::new()?;
-            pdf_parser.parse_to_pages(pdf_path, self.config.dpi)?
+            pdf_parser.page_count(pdf_path)?
         };
-        let total = pages.len();
 
         if !self.is_per_region() {
             // Full-page mode: pages can be processed in parallel with downscaling
             let ocr = Arc::clone(&self.ocr);
             let max_dim = self.config.max_image_dim;
             let parallel = self.config.parallel;
-            let markdowns: Vec<String> = stream::iter(pages.into_iter().enumerate())
-                .map(|(i, page)| {
-                    let ocr = Arc::clone(&ocr);
-                    async move {
-                        let downscaled = maybe_downscale(&page.image, max_dim);
-                        let image_bytes = match encode_jpeg(&downscaled) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    page = i + 1,
-                                    "full-page JPEG encode failed — emitting empty page (paper continues)"
-                                );
-                                return String::new();
-                            }
-                        };
-                        tracing::info!(
-                            "Processing page {}/{} ({}x{}, {} bytes JPEG)",
-                            i + 1,
-                            total,
-                            page.image.width(),
-                            page.image.height(),
-                            image_bytes.len()
-                        );
-                        match ocr.recognize(&image_bytes).await {
-                            Ok(t) => t,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    page = i + 1,
-                                    "full-page VLM failed — emitting empty page (paper continues)"
-                                );
-                                String::new()
+            // Stream-render pages through a small bounded channel (one page of
+            // raster resident at a time) and OCR them bounded to `parallel`.
+            let pdf_path_owned = pdf_path.to_string();
+            let render_dpi = self.config.dpi;
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, PageData)>(2);
+            let render = tokio::task::spawn_blocking(move || {
+                let parser = PdfParser::new()?;
+                let document = parser.open(&pdf_path_owned)?;
+                for idx in 0..total as u16 {
+                    let page = PdfParser::render_page(&document, idx, render_dpi)?;
+                    if tx.blocking_send((idx as usize, page)).is_err() {
+                        break;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+
+            let page_sem = Arc::new(tokio::sync::Semaphore::new(parallel.max(1)));
+            let mut tasks = tokio::task::JoinSet::new();
+            while let Some((i, page)) = rx.recv().await {
+                let permit = Arc::clone(&page_sem)
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("page semaphore closed mid-paper: {e}"))?;
+                let ocr = Arc::clone(&ocr);
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let downscaled = maybe_downscale(&page.image, max_dim);
+                    let text = match encode_jpeg(&downscaled) {
+                        Ok(image_bytes) => {
+                            tracing::info!(
+                                "Processing page {}/{} ({}x{}, {} bytes JPEG)",
+                                i + 1,
+                                total,
+                                page.image.width(),
+                                page.image.height(),
+                                image_bytes.len()
+                            );
+                            match ocr.recognize(&image_bytes).await {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        page = i + 1,
+                                        "full-page VLM failed — emitting empty page (paper continues)"
+                                    );
+                                    String::new()
+                                }
                             }
                         }
-                    }
-                })
-                .buffered(parallel)
-                .collect()
-                .await;
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                page = i + 1,
+                                "full-page JPEG encode failed — emitting empty page (paper continues)"
+                            );
+                            String::new()
+                        }
+                    };
+                    (i, text)
+                });
+            }
+
+            let mut collected: Vec<(usize, String)> = Vec::with_capacity(total);
+            while let Some(res) = tasks.join_next().await {
+                collected.push(res?);
+            }
+            render.await??;
+            collected.sort_by_key(|(i, _)| *i);
+            let markdowns: Vec<String> = collected.into_iter().map(|(_, md)| md).collect();
 
             return Ok(join_pages(&markdowns));
         }
@@ -754,16 +818,22 @@ impl Processor {
         let layout = self.layout_detectors.clone();
         let table = self.table_recognizers.clone();
 
+        let pdf_path_owned = pdf_path.to_string();
+        let render_dpi = self.config.dpi;
         let stage1 = tokio::task::spawn_blocking(move || {
-            for (idx, page) in pages.into_iter().enumerate() {
+            let parser = PdfParser::new()?;
+            let document = parser.open(&pdf_path_owned)?;
+            for idx in 0..total as u16 {
+                let page_no = idx as usize;
+                let page = PdfParser::render_page(&document, idx, render_dpi)?;
                 tracing::info!(
                     "Preparing page {}/{} ({}x{}, per-region)",
-                    idx + 1,
+                    page_no + 1,
                     total,
                     page.image.width(),
                     page.image.height(),
                 );
-                let prepared = prepare_page(idx, &page.image, &layout, &table)?;
+                let prepared = prepare_page(page_no, &page.image, &layout, &table)?;
                 if tx.blocking_send(prepared).is_err() {
                     break;
                 }
@@ -805,59 +875,6 @@ impl Processor {
                 .map(|(_, md, _, _)| md)
                 .collect::<Vec<_>>(),
         ))
-    }
-}
-
-/// Clamp `requested` (the configured `vlm_concurrency`) to the live
-/// `OLLAMA_NUM_PARALLEL` on this host when both are detectable and the
-/// requested value is larger. This prevents Rust-layer oversubscription
-/// of Ollama's internal parallel queue, which on production showed up as
-/// every in-flight request stalling past the 900s convert deadline and
-/// getting cancelled without counting as success. If `OLLAMA_NUM_PARALLEL`
-/// is not explicitly set, we fall back to the requested value — the
-/// operator has opted out of the guardrail.
-fn resolve_effective_vlm_concurrency(requested: usize) -> usize {
-    let detected = match crate::ollama_tuner::detect_ollama_control() {
-        Ok(ctrl) => ctrl.detect_current(),
-        Err(e) => {
-            tracing::debug!(
-                "No Ollama launcher found for vlm_concurrency guardrail: {e} — \
-                 using configured vlm_concurrency={requested} as-is"
-            );
-            return requested;
-        }
-    };
-    let Some(num_parallel) = detected else {
-        tracing::info!(
-            vlm_concurrency = requested,
-            "OLLAMA_NUM_PARALLEL not explicitly set — using configured \
-             vlm_concurrency as-is. If Ollama's default is smaller than this, \
-             expect queue oversubscription; set OLLAMA_NUM_PARALLEL via the \
-             platform launcher (systemd drop-in or launchctl setenv) or run \
-             `hs scribe autotune`."
-        );
-        return requested;
-    };
-    let num_parallel_usize = num_parallel as usize;
-    if num_parallel_usize < requested {
-        tracing::warn!(
-            requested,
-            ollama_num_parallel = num_parallel,
-            effective = num_parallel_usize,
-            "vlm_concurrency clamped to OLLAMA_NUM_PARALLEL — Rust-layer \
-             concurrency above Ollama's parallel capacity oversubscribes its \
-             internal queue and inflates per-request latency past the convert \
-             deadline. Raise OLLAMA_NUM_PARALLEL (e.g. via `hs scribe autotune`) \
-             to use the full requested concurrency."
-        );
-        num_parallel_usize
-    } else {
-        tracing::info!(
-            vlm_concurrency = requested,
-            ollama_num_parallel = num_parallel,
-            "vlm_concurrency within OLLAMA_NUM_PARALLEL — no clamp"
-        );
-        requested
     }
 }
 
@@ -1171,6 +1188,7 @@ fn prepare_page(
 /// through from `prepare_page` — used by the document-level QC gate to
 /// apply the bibliography multiplier. `diag` is the per-page record
 /// surfaced to the optional `<output_dir>/<stem>.diag.jsonl`.
+#[allow(clippy::too_many_arguments)]
 async fn execute_vlm_for_page(
     prepared: PreparedPage,
     ocr: Arc<OcrEngine>,
@@ -1312,10 +1330,21 @@ async fn execute_vlm_for_page(
             ),
         });
 
-        // Same fail-loud rule as text regions above: a cell whose VLM
-        // call errors fails the whole conversion, not just the cell.
-        // Empty-jpeg cells stay as intentional placeholders (prepare_page
-        // emitted the warn) because they're not VLM failures.
+        // Text-region VLM failures abort the whole paper (fail-loud, ONE
+        // PATH). Table cells are different: each cell is a single-image
+        // VLM call whose output (often "0.5", "<.001", "Mean (SD)") is
+        // pathologically prone to tripping the streaming repetition
+        // detector. The detector firing on a 4-gram cycle ≥3 times is
+        // easy on tabular numerics — and aborting an entire 30-page
+        // paper because one cell on one page emitted "0.5 0.5 0.5 0.5"
+        // is a worse outcome than emitting an empty cell.
+        //
+        // So: a single cell's `RepetitionLoopError` degrades to an empty
+        // cell, the rest of the table is preserved, and the paper
+        // continues. This is NOT a generic "swallow VLM errors" path —
+        // only the repetition-loop class downgrades; transport errors
+        // and other failures still fail the conversion. The text-region
+        // path remains strict.
         let cell_texts: Vec<String> = stream::iter(table.cell_jpegs)
             .map(|jpeg| {
                 let ocr = Arc::clone(&ocr);
@@ -1331,10 +1360,26 @@ async fn execute_vlm_for_page(
                         .acquire()
                         .await
                         .map_err(|e| anyhow::anyhow!("VLM semaphore closed mid-table: {e}"))?;
-                    let text = ocr
+                    let text = match ocr
                         .recognize_region(&jpeg, RegionType::Text)
                         .await
-                        .with_context(|| format!("table cell VLM failed on page {page_num}"))?;
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            if e.downcast_ref::<crate::ocr::RepetitionLoopError>().is_some() {
+                                tracing::warn!(
+                                    page = page_num,
+                                    error = %e,
+                                    "table cell VLM repetition loop — emitting empty cell (table and paper continue)"
+                                );
+                                cell_done.fetch_add(1, Ordering::Relaxed);
+                                return Ok(String::new());
+                            }
+                            return Err(e.context(format!(
+                                "table cell VLM failed on page {page_num}"
+                            )));
+                        }
+                    };
                     drop(permit);
                     let done = cell_done.fetch_add(1, Ordering::Relaxed) + 1;
                     on_progress(ProgressEvent {

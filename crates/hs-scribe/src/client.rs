@@ -88,6 +88,13 @@ pub struct ProgressEvent {
     pub message: String,
 }
 
+/// `HealthResponse::status` when the scribe server is alive but its VLM
+/// backend cannot take work (llama-swap unreachable, or the model is
+/// not resident and the card has no room to load it). The server pairs
+/// this with HTTP 503; `hs status`, the MCP fanout, and the CLI
+/// preflight all branch on this exact literal.
+pub const BACKEND_UNAVAILABLE: &str = "backend_unavailable";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
@@ -126,11 +133,27 @@ pub struct HealthResponse {
     #[serde(default)]
     pub last_conversion_at: Option<String>,
     /// Total successful conversions since server startup. Monotonic
-    /// counter, cheap atomic increment. Consumers (e.g. `hs scribe
-    /// autotune`) diff this across polls to compute throughput without
-    /// needing log parsing. Resets to 0 on every scribe-server restart.
+    /// counter, cheap atomic increment. Consumers diff this across polls
+    /// to compute throughput without needing log parsing. Resets to 0 on
+    /// every scribe-server restart.
     #[serde(default)]
     pub total_conversions: u64,
+    /// Whether llama-swap answered the admission probe. `None` on
+    /// scribe instances with no llama-swap backend (legacy converter),
+    /// where the gate does not apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_reachable: Option<bool>,
+    /// Whether the configured VLM model is already loaded. When true the
+    /// free-VRAM half of the gate is skipped — no cold start is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_model_resident: Option<bool>,
+    /// Free VRAM (MiB) at the last probe. `None` on hosts without a
+    /// working `nvidia-smi`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_vram_free_mb: Option<u64>,
+    /// RFC 3339 timestamp of the last admission probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_checked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +162,10 @@ pub struct ReadinessResponse {
     pub vlm_slots_total: usize,
     pub vlm_slots_available: usize,
     pub in_flight_conversions: usize,
+    /// `"backend_unavailable"` when the zero available slots are the
+    /// admission gate refusing, not real saturation. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_status: Option<String>,
 }
 
 impl ReadinessInfo for ReadinessResponse {
@@ -233,6 +260,7 @@ impl ScribeClient {
                 vlm_slots_total: 0,
                 vlm_slots_available: 1,
                 in_flight_conversions: 0,
+                backend_status: None,
             });
         }
         resp.json().await.context("Invalid readiness response")
@@ -258,56 +286,17 @@ impl ServiceClient for ScribeClient {
 }
 
 impl ScribeClient {
-    /// Convert a PDF. When `timeout` is `Some`, applies it as the
-    /// reqwest per-request timeout and sends the same value in the
-    /// `X-Convert-Deadline-Secs` header so the server's
-    /// `tokio::time::timeout` wrapper matches. `None` uses the client's
-    /// construction-time baseline.
-    pub async fn convert(
-        &self,
-        pdf_bytes: Vec<u8>,
-        timeout: Option<Duration>,
-        stem: Option<&str>,
-    ) -> Result<ConversionResult> {
-        let url = format!("{}/scribe", self.server_url);
-        let part = reqwest::multipart::Part::bytes(pdf_bytes).file_name("input.pdf");
-        let form = reqwest::multipart::Form::new().part("pdf", part);
-
-        let mut req = self.http.post(&url).multipart(form);
-        if let Some(d) = timeout {
-            req = req
-                .timeout(d)
-                .header(CONVERT_DEADLINE_HEADER, d.as_secs().to_string());
-        }
-        if let Some(s) = stem {
-            req = req.header(CONVERT_STEM_HEADER, s);
-        }
-        let resp = req.send().await.context("Failed to send PDF")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Server error {status}: {body}");
-        }
-
-        // The non-streaming endpoint returns just markdown bytes — there's
-        // no place in the response to carry `per_page_region_classes`.
-        // Callers needing region-class info (event_watch's per-page QC)
-        // must use convert_with_progress instead. Return an empty class
-        // vec here; downstream QC treats it as "not bibliography" and
-        // applies the strict default ceiling everywhere — safe.
-        let markdown = resp.text().await.context("Failed to read response")?;
-        Ok(ConversionResult {
-            markdown,
-            per_page_region_classes: Vec::new(),
-            per_page_diags: Vec::new(),
-        })
-    }
-
-    /// Convert a PDF with streaming progress updates via NDJSON.
-    /// Falls back to the plain `/scribe` endpoint if the server doesn't
-    /// support streaming (404). `timeout` semantics match
-    /// [`ScribeClient::convert`].
+    /// Convert a PDF with streaming progress updates via NDJSON. When
+    /// `timeout` is `Some`, applies it as the reqwest per-request timeout
+    /// and sends the same value in the `X-Convert-Deadline-Secs` header
+    /// so the server's `tokio::time::timeout` wrapper matches. `None`
+    /// uses the client's construction-time baseline.
+    ///
+    /// `/scribe/stream` is the ONE convert path. A 404 means the server
+    /// predates streaming — that's a deploy-discipline error (`hs
+    /// upgrade` the host), not something to paper over with a degraded
+    /// non-streaming request whose empty region-class list silently
+    /// weakens QC.
     pub async fn convert_with_progress(
         &self,
         pdf_bytes: Vec<u8>,
@@ -316,7 +305,7 @@ impl ScribeClient {
         on_progress: impl Fn(ProgressEvent),
     ) -> Result<ConversionResult> {
         let url = format!("{}/scribe/stream", self.server_url);
-        let part = reqwest::multipart::Part::bytes(pdf_bytes.clone()).file_name("input.pdf");
+        let part = reqwest::multipart::Part::bytes(pdf_bytes).file_name("input.pdf");
         let form = reqwest::multipart::Form::new().part("pdf", part);
 
         let mut req = self.http.post(&url).multipart(form);
@@ -330,20 +319,12 @@ impl ScribeClient {
         }
         let mut resp = req.send().await.context("Failed to send PDF")?;
 
-        // Server doesn't support streaming — fall back to plain endpoint.
-        // The fallback path's ConversionResult has empty
-        // per_page_region_classes; QC treats it as no-bibliography (strict
-        // default ceiling everywhere). Old servers can't supply layout
-        // metadata; bumping them is the only way to get bibliography-aware
-        // thresholds.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            on_progress(ProgressEvent {
-                stage: "info".into(),
-                page: 0,
-                total_pages: 0,
-                message: "server does not support progress (update server image)".into(),
-            });
-            return self.convert(pdf_bytes, timeout, stem).await;
+            anyhow::bail!(
+                "scribe server {} has no /scribe/stream endpoint — binary predates \
+                 streaming; run `hs upgrade` on that host",
+                self.server_url
+            );
         }
 
         if !resp.status().is_success() {

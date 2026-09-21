@@ -39,7 +39,13 @@ jobs:
             archive: tar.gz
             use_zigbuild: true
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            # Pinned to windows-2022 (VS2022 MSVC). GitHub repointed BOTH
+            # `windows-latest` AND `windows-2025` to the VS2026 image
+            # (`windows-2025-vs2026`), whose MSVC removed
+            # `stdext::checked_array_iterator` — which DuckDB's vendored `fmt`
+            # still uses, so libduckdb-sys won't compile (broke rc.336 + rc.337).
+            # windows-2022 is a distinct OS image that still ships VS2022.
+            runner: windows-2022
             archive: zip
 
     steps:

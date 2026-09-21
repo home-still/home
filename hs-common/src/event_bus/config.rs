@@ -28,8 +28,9 @@ pub struct EventBusConfig {
 pub struct NatsYaml {
     pub url: String,
     /// Per-message processing deadline in seconds. Translates to the
-    /// JetStream consumer's `ack_wait`. Default 1800 (30 min) matches
-    /// the worst-case scribe convert + slack.
+    /// JetStream consumer's `ack_wait`. Default 7200 (2× the scribe
+    /// timeout ceiling of 3600s) so a legitimately slow book-length
+    /// convert isn't reclaimed by the broker mid-flight.
     pub ack_wait_secs: u64,
     /// After this many redeliveries, JetStream drops the message.
     /// Prevents a NAK storm on a poison message from stalling the queue.

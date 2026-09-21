@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::aggregation::{dedup, merge, quality, ranking};
+use crate::aggregation::{dedup, merge, quality, ranking, relevance};
 use crate::error::PaperError;
 use crate::models::{Paper, SearchQuery, SearchResult, SearchType};
 use crate::ports::provider::PaperProvider;
@@ -119,11 +119,17 @@ impl PaperProvider for AggregateProvider {
 
         // When the caller sorts by citations, drop low-relevance papers so the
         // 25% citation weight in the ranking formula doesn't amplify
-        // high-citation off-topic hits above the target paper.
+        // high-citation off-topic hits above the target paper. The title-presence
+        // floor is applied HERE (citation-sort only), not inside relevance_score,
+        // so the default relevance ranking never demotes an on-topic abstract
+        // match that lacks the query terms in its title.
         let ranked: Vec<_> = if matches!(query.sort_by, crate::models::SortBy::Citations) {
             ranked
                 .into_iter()
-                .filter(|rp| rp.relevance >= ranking::CITATION_SORT_MIN_RELEVANCE)
+                .filter(|rp| {
+                    rp.relevance >= ranking::CITATION_SORT_MIN_RELEVANCE
+                        && relevance::passes_citation_title_floor(&query.query, &rp.paper)
+                })
                 .collect()
         } else {
             ranked

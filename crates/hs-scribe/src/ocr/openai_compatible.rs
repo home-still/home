@@ -3,19 +3,37 @@ use super::repetition_detector::{RepetitionDetector, RepetitionLoopError};
 use super::sse_buffer::SseBuffer;
 use anyhow::Result;
 use futures_util::StreamExt;
+use std::error::Error as _;
+use std::time::Duration;
+
+/// Backoff schedule for retriable VLM transport errors. The total worst-case
+/// added latency per region is ~4.2 s, which fits under the per-page scribe
+/// budget. Three attempts catches transient `--parallel` slot overflows on
+/// llama-server (which manifest as TCP RST / `ConnectionReset`) without
+/// queuing forever when the backend is actually down.
+const RETRY_BACKOFFS: &[Duration] = &[
+    Duration::from_millis(200),
+    Duration::from_millis(800),
+    Duration::from_millis(3200),
+];
 
 pub struct OpenAiBackend {
     client: reqwest::Client,
     url: String,
     model: String,
+    /// Bearer token for auth-gated backends (e.g. `llama-swap`). `None`
+    /// for a bare `llama-server` that serves without auth — in which case
+    /// no `Authorization` header is sent at all.
+    api_key: Option<String>,
 }
 
 impl OpenAiBackend {
-    pub fn new(url: &str, model: &str) -> Self {
+    pub fn new(url: &str, model: &str, api_key: Option<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
             url: url.trim_end_matches('/').to_string(),
             model: model.strip_suffix(":latest").unwrap_or(model).to_string(),
+            api_key: api_key.filter(|k| !k.is_empty()),
         }
     }
 
@@ -41,13 +59,7 @@ impl OpenAiBackend {
         let image_url = format!("data:image/jpeg;base64,{}", b64);
         let body = build_request_body(&self.model, region_type, &image_url);
 
-        let resp = self
-            .client
-            .post(format!("{}/v1/chat/completions", self.url))
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let resp = self.send_with_retry(&body).await?;
 
         let mut stream = resp.bytes_stream();
         let mut sse = SseBuffer::new();
@@ -90,6 +102,105 @@ impl OpenAiBackend {
         // quality if it's actually broken.
         Ok(output)
     }
+
+    /// POST the chat-completions request with bounded exponential backoff
+    /// on retriable transport-class failures. Retries kick in when the
+    /// VLM backend's listen backlog is full (TCP RST), the service is
+    /// briefly down (refused/closed), or it returns a transient 5xx —
+    /// states that resolve within seconds once an in-flight slot frees up.
+    /// 4xx, successful streams, and the mid-stream repetition detector
+    /// remain paper-fatal: those signal real problems with the request
+    /// or content, not transient backend pressure.
+    async fn send_with_retry(&self, body: &serde_json::Value) -> Result<reqwest::Response> {
+        let endpoint = format!("{}/v1/chat/completions", self.url);
+        let mut attempt = 0usize;
+        loop {
+            let mut req = self.client.post(&endpoint).json(body);
+            if let Some(key) = &self.api_key {
+                req = req.bearer_auth(key);
+            }
+            let send_res = req.send().await;
+            match send_res {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return Ok(resp);
+                    }
+                    let retriable_5xx = matches!(status.as_u16(), 502..=504);
+                    if retriable_5xx && attempt < RETRY_BACKOFFS.len() {
+                        let delay = jittered(RETRY_BACKOFFS[attempt]);
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max = RETRY_BACKOFFS.len(),
+                            status = %status,
+                            delay_ms = delay.as_millis() as u64,
+                            "VLM transient 5xx; retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Ok(resp.error_for_status()?);
+                }
+                Err(err) => {
+                    if is_retriable_transport(&err) && attempt < RETRY_BACKOFFS.len() {
+                        let delay = jittered(RETRY_BACKOFFS[attempt]);
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max = RETRY_BACKOFFS.len(),
+                            error = %err,
+                            delay_ms = delay.as_millis() as u64,
+                            "VLM transport error; retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+            }
+        }
+    }
+}
+
+/// Inspect a `reqwest::Error` chain for io-layer kinds that indicate the
+/// VLM backend is momentarily unable to accept the request, not that the
+/// request itself is malformed. Connect, request-builder I/O (TCP RST
+/// during write), timeout, and broken-pipe all qualify.
+fn is_retriable_transport(err: &reqwest::Error) -> bool {
+    if err.is_connect() || err.is_timeout() {
+        return true;
+    }
+    let mut src: Option<&(dyn std::error::Error + 'static)> = err.source();
+    while let Some(e) = src {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::*;
+            return matches!(
+                io.kind(),
+                ConnectionReset
+                    | ConnectionAborted
+                    | ConnectionRefused
+                    | BrokenPipe
+                    | TimedOut
+                    | UnexpectedEof
+            );
+        }
+        src = e.source();
+    }
+    false
+}
+
+/// Add up to 50 ms of pseudo-jitter to a backoff delay. Avoids
+/// synchronised retries from a fan-out of region calls all hitting the
+/// same TCP RST at the same instant — a real failure mode at parallel=8
+/// when a multi-page burst lands together. Cheap clock-based nondeterminism
+/// is enough; no `rand` dep needed.
+fn jittered(base: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    base + Duration::from_millis(nanos % 50)
 }
 
 /// Extract `choices[0].delta.content` from a streamed event payload.
@@ -119,6 +230,7 @@ fn parse_delta_content(event_json: &str) -> Option<String> {
 ///     legitimate citation entries, small enough to catch loops.
 ///     vLLM-specific; non-vLLM OpenAI-compat servers ignore unknown
 ///     keys harmlessly.
+///
 /// Ollama's OpenAI-compat shim (if used) silently drops the penalty
 /// params per ollama#14493 — same caveat as the dedicated Ollama backend.
 fn build_request_body(model: &str, region_type: RegionType, image_url: &str) -> serde_json::Value {
@@ -214,6 +326,38 @@ mod tests {
     fn parse_delta_content_returns_none_for_malformed_json() {
         let event = "not json";
         assert_eq!(parse_delta_content(event), None);
+    }
+
+    #[test]
+    fn retry_budget_fits_under_per_page_scribe_budget() {
+        // The per-page scribe budget is ~10 s (worst case Metal at 1800 px,
+        // see `crates/hs-scribe/src/config.rs:303`). Three retries with the
+        // current schedule add at most ~4.25 s of pure wait time per region
+        // (200 + 800 + 3200 ms + up to 3 × 50 ms jitter). Anyone bumping the
+        // schedule needs to keep the per-page budget intact; this guard
+        // makes the constraint visible at edit time.
+        let total: u64 = RETRY_BACKOFFS.iter().map(|d| d.as_millis() as u64).sum();
+        let jitter_ceiling = (RETRY_BACKOFFS.len() as u64) * 50;
+        assert!(
+            total + jitter_ceiling <= 5_000,
+            "retry budget {} ms + jitter {} ms blows the per-page scribe budget",
+            total,
+            jitter_ceiling
+        );
+    }
+
+    #[test]
+    fn jitter_stays_within_50_ms() {
+        let base = Duration::from_millis(200);
+        for _ in 0..32 {
+            let j = jittered(base);
+            let added = j.checked_sub(base).expect("jitter must not shrink base");
+            assert!(
+                added <= Duration::from_millis(50),
+                "jitter exceeded 50 ms: {:?}",
+                added
+            );
+        }
     }
 
     #[test]

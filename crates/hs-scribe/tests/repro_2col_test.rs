@@ -7,7 +7,7 @@
 //! ```bash
 //! HS_SCRIBE_REPRO=1 \
 //! HS_SCRIBE_TEST_BACKEND=openai-compat \
-//! HS_SCRIBE_TEST_SCRIBE_URL=http://192.168.1.110:7433 \
+//! HS_SCRIBE_TEST_SCRIBE_URL=http://192.0.2.110:7433 \
 //! cargo test -p hs-scribe --test repro_2col_test -- --ignored --nocapture
 //! ```
 //!
@@ -100,7 +100,7 @@ async fn repro_2col_e2e() {
     }
 
     let scribe_url = std::env::var("HS_SCRIBE_TEST_SCRIBE_URL")
-        .expect("HS_SCRIBE_TEST_SCRIBE_URL required (e.g. http://192.168.1.110:7433)");
+        .expect("HS_SCRIBE_TEST_SCRIBE_URL required (e.g. http://192.0.2.110:7433)");
 
     let dir = fixture_dir();
     let fixtures = discover_fixtures(&dir);

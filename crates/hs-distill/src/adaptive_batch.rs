@@ -1,15 +1,9 @@
 //! In-process adaptive batch-size controller for the ONNX embedder.
 //!
-//! Unlike Ollama — where NUM_PARALLEL changes require a process restart and
-//! the tuning loop has to tolerate minutes of restart cost — fastembed's
-//! batch_size is an in-process knob that can change between calls for free.
-//! So this controller is NOT the restart-heavy daemon pattern of
-//! `hs_scribe::ollama_tuner`; it's a lightweight EWMA-driven hill-climber
-//! that reads throughput per-batch and adjusts on the fly.
-//!
-//! Algorithm matches `ollama_tuner::decide`'s shape (improvement threshold,
-//! regression threshold, plateau-until-converged) because it's already
-//! proven stable under real workload noise.
+//! fastembed's batch_size is an in-process knob that can change between
+//! calls for free, so this controller is a lightweight EWMA-driven
+//! hill-climber that reads throughput per-batch and adjusts on the fly:
+//! improvement threshold, regression threshold, plateau-until-converged.
 
 use std::sync::Mutex;
 

@@ -11,8 +11,11 @@ pub async fn convert(cfg: &Config, bytes: Vec<u8>, stem_hint: &str) -> Result<St
             source: e,
         }
     })?;
+    // Same streaming endpoint the paper pipeline uses (the non-streaming
+    // /scribe path was deleted — one convert path). Progress events are
+    // dropped; personal ingest has no UI to drive.
     let result = client
-        .convert(bytes, None, Some(stem_hint))
+        .convert_with_progress(bytes, None, Some(stem_hint), |_| {})
         .await
         .map_err(|e| PersonalError::Converter {
             format: "pdf",

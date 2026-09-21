@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::error::{PersonalError, Result};
 use crate::services::distill::PersonalDistill;
 use hs_common::catalog::CatalogEntry;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct ListEntry {
@@ -42,7 +42,7 @@ pub fn list_entries(cfg: &Config, category: Option<&str>, limit: usize) -> Resul
 }
 
 pub fn read_markdown(cfg: &Config, stem: &str) -> Result<String> {
-    let path = sharded(cfg.markdown_dir(), stem, "md");
+    let path = hs_common::sharded_path(&cfg.markdown_dir(), stem, "md");
     if !path.exists() {
         return Err(PersonalError::Other(anyhow::anyhow!(
             "no markdown found for stem '{stem}'"
@@ -56,13 +56,13 @@ pub async fn delete(cfg: &Config, stem: &str) -> Result<u64> {
     let removed = distill.delete(stem).await?;
 
     let candidates = [
-        sharded(cfg.root_dir(), stem, "pdf"),
-        sharded(cfg.root_dir(), stem, "epub"),
-        sharded(cfg.root_dir(), stem, "docx"),
-        sharded(cfg.root_dir(), stem, "md"),
-        sharded(cfg.root_dir(), stem, "txt"),
-        sharded(cfg.root_dir(), stem, "catalog.yaml"),
-        sharded(cfg.markdown_dir(), stem, "md"),
+        hs_common::sharded_path(&cfg.root_dir(), stem, "pdf"),
+        hs_common::sharded_path(&cfg.root_dir(), stem, "epub"),
+        hs_common::sharded_path(&cfg.root_dir(), stem, "docx"),
+        hs_common::sharded_path(&cfg.root_dir(), stem, "md"),
+        hs_common::sharded_path(&cfg.root_dir(), stem, "txt"),
+        hs_common::sharded_path(&cfg.root_dir(), stem, "catalog.yaml"),
+        hs_common::sharded_path(&cfg.markdown_dir(), stem, "md"),
     ];
     for p in &candidates {
         if p.exists() {
@@ -73,7 +73,7 @@ pub async fn delete(cfg: &Config, stem: &str) -> Result<u64> {
 }
 
 pub async fn reindex(cfg: &Config, stem: &str) -> Result<u32> {
-    let entry_path = sharded(cfg.root_dir(), stem, "catalog.yaml");
+    let entry_path = hs_common::sharded_path(&cfg.root_dir(), stem, "catalog.yaml");
     let entry = read_sidecar(&entry_path)?;
     let md = read_markdown(cfg, stem)?;
     let distill = PersonalDistill::new(cfg)?;
@@ -125,9 +125,4 @@ fn walk_sidecars(root: &Path, f: &mut dyn FnMut(&Path) -> Result<()>) -> Result<
         }
     }
     Ok(())
-}
-
-fn sharded(dir: PathBuf, stem: &str, ext: &str) -> PathBuf {
-    let prefix = &stem[..stem.len().min(2)];
-    dir.join(prefix).join(format!("{stem}.{ext}"))
 }

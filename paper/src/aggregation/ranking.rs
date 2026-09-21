@@ -147,6 +147,39 @@ mod tests {
     }
 
     #[test]
+    fn abstract_match_not_demoted_in_default_ranking() {
+        // A paper whose title lacks the query terms but whose abstract matches
+        // strongly must keep its high relevance under the DEFAULT ranking — the
+        // title-presence floor is a citation-sort-only concern and must not cap
+        // ordinary relevance scoring.
+        let paper = Paper {
+            id: "abs".to_string(),
+            title: "A Study of Urban Transit Systems".to_string(),
+            authors: Vec::new(),
+            abstract_text: Some(
+                "retrieval augmented generation improves large language models".to_string(),
+            ),
+            publication_date: None,
+            doi: None,
+            download_urls: Vec::new(),
+            cited_by_count: Some(10),
+            source: "openalex".to_string(),
+        };
+        let groups = vec![group_of(SourcedPaper {
+            paper: paper.clone(),
+            rank: 0,
+            source: "openalex".to_string(),
+        })];
+        let ranked = rank_papers(&groups, vec![paper], "retrieval augmented generation");
+        assert_eq!(ranked.len(), 1);
+        assert!(
+            ranked[0].relevance > CITATION_SORT_MIN_RELEVANCE,
+            "strong abstract match must not be capped in default ranking, got {}",
+            ranked[0].relevance
+        );
+    }
+
+    #[test]
     fn target_paper_survives_citation_floor_even_with_fewer_citations() {
         // The Gao et al. RAG survey (low-citation in this fixture) has
         // perfect relevance; the off-topic high-cite paper does not.

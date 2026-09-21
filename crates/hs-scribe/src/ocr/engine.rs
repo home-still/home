@@ -22,9 +22,11 @@ impl OcrEngine {
                 &config.cloud_url,
                 config.cloud_api_key.clone(),
             )),
-            BackendChoice::OpenAi => {
-                OcrEngine::OpenAi(OpenAiBackend::new(&config.openai_url, &config.model))
-            }
+            BackendChoice::OpenAi => OcrEngine::OpenAi(OpenAiBackend::new(
+                &config.openai_url,
+                &config.model,
+                config.openai_api_key.clone(),
+            )),
         })
     }
 

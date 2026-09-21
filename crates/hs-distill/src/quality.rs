@@ -57,8 +57,10 @@ pub fn is_low_quality(text: &str) -> bool {
 pub fn explain(text: &str) -> Option<RejectReason> {
     let trimmed = text.trim();
 
-    let non_ws: usize = trimmed.chars().filter(|c| !c.is_whitespace()).count();
-    if non_ws < 50 {
+    // Floor shared with hs-scribe's post-conversion gate via hs-common so
+    // the producer and consumer can't disagree about what is indexable.
+    let non_ws = hs_common::quality::non_whitespace_len(trimmed);
+    if non_ws < hs_common::quality::MIN_INDEXABLE_NON_WS {
         return Some(RejectReason::TooShort { non_ws });
     }
 

@@ -64,38 +64,41 @@ pub struct IngestedEvent {
     pub source: Option<String>,
 }
 
-/// Given an ingested paper key, fetch bytes from `storage`, dispatch to the
-/// converter for its file type (PDF → scribe VLM, HTML → parser, EPUB →
-/// parser), and put the markdown back under `markdown/{shard}/{stem}.md`.
-/// Publishes `scribe.completed` with the markdown key on success. Skips
-/// (returns Ok) if the markdown already exists — idempotent on retry.
-///
-/// Error classification:
-///
-/// - `Permanent` — content is unconvertable no matter how many times we
-///   retry: unsupported extension, HTML not UTF-8, paywall/loading HTML,
-///   EPUB parse failure, and scribe-side PDF parse errors
-///   (`FormatError`, `Invalid image size`, `PdfiumLibrary`). The
-///   `/scribe` endpoint also returns HTTP 415 with a
-///   `unsupported_content_type:{html,binary}` body for bytes that fail
-///   the `%PDF` magic-byte gate; those bubble up as Permanent too.
-/// - `Transient` — cluster state that will recover: storage GET/PUT
-///   failure, scribe 5xx / connection reset / dispatch timeout, no ready
-///   scribe servers. The caller NAKs with backoff.
-pub async fn convert_and_upload(
+/// Once-per-event source preparation: parse the key, check whether the
+/// markdown already exists (idempotent retry), fetch the source bytes,
+/// and — for PDFs — count pages for the page-scaled timeout. Split out
+/// of [`convert_and_upload`] so the chain dispatcher fetches and parses
+/// ONCE and every backend attempt reuses the same bytes; escalation used
+/// to re-download and re-parse the whole book from storage per backend.
+pub enum SourcePrep {
+    /// Markdown already present under this key — nothing to convert.
+    AlreadyConverted(String),
+    Fetched(SourceObject),
+}
+
+/// The fetched source plus everything derivable from it that the chain
+/// needs per attempt. Bytes are shared (`Arc`) so per-backend dispatch
+/// clones a refcount, not the file.
+pub struct SourceObject {
+    pub bytes: std::sync::Arc<Vec<u8>>,
+    pub stem: String,
+    pub ext: String,
+    /// PDF page count for the page-scaled timeout. `None` for non-PDF
+    /// sources or when lopdf can't parse a count.
+    pub pdf_pages: Option<u32>,
+}
+
+pub async fn prepare_source(
     storage: &dyn Storage,
-    scribe: &ScribeClient,
-    bus: &dyn EventBus,
     event: &IngestedEvent,
-    timeout_policy: &TimeoutPolicy,
-) -> Result<String, HandlerError> {
+) -> Result<SourcePrep, HandlerError> {
     let filename = event
         .key
         .rsplit_once('/')
         .map(|(_, f)| f)
         .unwrap_or(&event.key);
     let (stem, ext) = match filename.rsplit_once('.') {
-        Some((s, e)) => (s, e.to_ascii_lowercase()),
+        Some((s, e)) => (s.to_string(), e.to_ascii_lowercase()),
         None => {
             return Err(HandlerError::Permanent(anyhow::anyhow!(
                 "key {} has no extension",
@@ -103,7 +106,7 @@ pub async fn convert_and_upload(
             )));
         }
     };
-    let md_key = hs_common::markdown::markdown_storage_key(stem);
+    let md_key = hs_common::markdown::markdown_storage_key(&stem);
 
     let exists = storage
         .exists(&md_key)
@@ -111,7 +114,7 @@ pub async fn convert_and_upload(
         .map_err(|e| HandlerError::Transient(e.context(format!("head({md_key}) failed"))))?;
     if exists {
         tracing::info!(md_key = %md_key, "markdown already present; skipping");
-        return Ok(md_key);
+        return Ok(SourcePrep::AlreadyConverted(md_key));
     }
 
     let raw_bytes = match storage.get(&event.key).await {
@@ -127,8 +130,9 @@ pub async fn convert_and_upload(
                 if let Err(stamp_err) = hs_common::catalog::update_conversion_failed_via(
                     storage,
                     "catalog",
-                    stem,
+                    &stem,
                     "source_missing",
+                    Vec::new(),
                 )
                 .await
                 {
@@ -147,19 +151,71 @@ pub async fn convert_and_upload(
             ));
         }
     };
+    let bytes = std::sync::Arc::new(raw_bytes);
+
+    let pdf_pages = if ext == "pdf" {
+        // Parsing lopdf is CPU-bound; run it on the blocking pool so a
+        // 500-page book doesn't stall the subscriber event loop. Arc
+        // clone — no byte copy.
+        let bytes_for_meta = std::sync::Arc::clone(&bytes);
+        tokio::task::spawn_blocking(move || crate::pdf_meta::count_pages(&bytes_for_meta))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    Ok(SourcePrep::Fetched(SourceObject {
+        bytes,
+        stem,
+        ext,
+        pdf_pages,
+    }))
+}
+
+/// Given a prepared source, dispatch to the converter for its file type
+/// (PDF → scribe VLM, HTML → parser, EPUB → parser), and put the
+/// markdown back under `markdown/{shard}/{stem}.md`. Publishes
+/// `scribe.completed` with the markdown key on success.
+///
+/// Error classification:
+///
+/// - `Permanent` — content is unconvertable no matter how many times we
+///   retry: unsupported extension, HTML not UTF-8, paywall/loading HTML,
+///   EPUB parse failure, and scribe-side PDF parse errors
+///   (`FormatError`, `Invalid image size`, `PdfiumLibrary`). The
+///   `/scribe` endpoint also returns HTTP 415 with a
+///   `unsupported_content_type:{html,binary}` body for bytes that fail
+///   the `%PDF` magic-byte gate; those bubble up as Permanent too.
+/// - `Transient` — cluster state that will recover: storage GET/PUT
+///   failure, scribe 5xx / connection reset / dispatch timeout, no ready
+///   scribe servers. The caller NAKs with backoff.
+#[allow(clippy::too_many_arguments)]
+pub async fn convert_and_upload(
+    storage: &dyn Storage,
+    scribe: &ScribeClient,
+    bus: &dyn EventBus,
+    event: &IngestedEvent,
+    timeout_policy: &TimeoutPolicy,
+    source: &SourceObject,
+    // Step 2d chain context. `converted_by` identifies which backend in
+    // `ScribeConfig.servers` ran this call so the catalog can record it;
+    // `attempts_log` is the audit trail of any earlier backends that
+    // escalated to this one. Both flow straight through to the success-
+    // path catalog stamp; ignored on failure.
+    converted_by: Option<String>,
+    attempts_log: Vec<hs_common::catalog::AttemptEntry>,
+) -> Result<String, HandlerError> {
+    let stem = source.stem.as_str();
+    let md_key = hs_common::markdown::markdown_storage_key(stem);
 
     let start = std::time::Instant::now();
-    let (markdown, server) = match ext.as_str() {
+    let (markdown, server) = match source.ext.as_str() {
         "pdf" => {
-            // Size the per-request timeout by PDF page count. Parsing
-            // lopdf is CPU-bound; run it on the blocking pool so a 500-
-            // page book doesn't stall the subscriber event loop.
-            let bytes_for_meta = raw_bytes.clone();
-            let pages =
-                tokio::task::spawn_blocking(move || crate::pdf_meta::count_pages(&bytes_for_meta))
-                    .await
-                    .ok()
-                    .flatten();
+            // Size the per-request timeout by the page count prepared
+            // once per event in `prepare_source`.
+            let pages = source.pdf_pages;
             let timeout = compute_convert_timeout(pages, timeout_policy);
             tracing::info!(
                 key = %event.key,
@@ -170,32 +226,29 @@ pub async fn convert_and_upload(
             // Use the streaming endpoint so we get per-page PP-DocLayout-V3
             // region class names alongside the markdown — required for QC's
             // bibliography multiplier. Pass a no-op progress callback; this
-            // handler has no UI to drive. If the server doesn't support
-            // streaming (older binary), the client falls back to plain
-            // /scribe and the per-page class list comes back empty, which
-            // QC treats as "not bibliography" → strict default ceiling
-            // everywhere.
+            // handler has no UI to drive. The olmocr backend returns an
+            // empty class vec; QC treats it as "not bibliography" → strict
+            // default ceiling everywhere.
             let conversion = scribe
-                .convert_with_progress(raw_bytes, Some(timeout), Some(stem), |_| {})
+                .convert_with_progress((*source.bytes).clone(), Some(timeout), Some(stem), |_| {})
                 .await
                 .map_err(|e| {
-                    // Server-side format errors ("Invalid image size",
-                    // "FormatError", PdfiumLibrary) are permanent — the
-                    // PDF itself is broken. HTTP 415 with the
-                    // unsupported_content_type body is permanent too
-                    // (the /scribe gate rejected non-PDF bytes at the
-                    // door). Everything else is a cluster-state problem
-                    // and should NAK.
+                    // Permanent/Escalate-class failures (broken PDF,
+                    // VLM repetition loop, olmocr rejecting every page)
+                    // must NOT NAK — retrying the same backend produces
+                    // the same result, and poison-pill papers would
+                    // redeliver every 30 s on JetStream and hog every
+                    // in-flight slot. They surface as
+                    // HandlerError::Permanent so the chain dispatcher
+                    // can consult `classify::classify_failure` for the
+                    // stop-vs-next-backend decision. Only
+                    // `FailureClass::Transient` (cluster-state problems)
+                    // NAKs. One table decides: `classify.rs`.
                     let msg = format!("{e:#}");
-                    let perm = msg.contains("FormatError")
-                        || msg.contains("Invalid image size")
-                        || msg.contains("PdfiumLibrary")
-                        || msg.contains("unsupported_content_type");
                     let ctx = e.context(format!("scribe convert failed for {}", event.key));
-                    if perm {
-                        HandlerError::Permanent(ctx)
-                    } else {
-                        HandlerError::Transient(ctx)
+                    match crate::classify::classify_failure(&msg) {
+                        crate::classify::FailureClass::Transient => HandlerError::Transient(ctx),
+                        _ => HandlerError::Permanent(ctx),
                     }
                 })?;
             let md = conversion.markdown;
@@ -218,9 +271,9 @@ pub async fn convert_and_upload(
             let truncations: usize = per_page_truncations.iter().map(|t| t.total()).sum();
             let longest_run = crate::postprocess::longest_repeated_run_bytes(&original_md);
             // Align the bibliography flags with per_page_truncations.len().
-            // The wire-protocol fallback (old server) supplies an empty
-            // class vec; pad with empty class lists so qc_verdict sees the
-            // same length on both sides, all flagged as non-bibliography.
+            // The olmocr backend supplies an empty class vec; pad with
+            // empty class lists so qc_verdict sees the same length on
+            // both sides, all flagged as non-bibliography.
             let total_pages = per_page_truncations.len();
             let per_page_is_bibliography: Vec<bool> = (0..total_pages)
                 .map(|i| {
@@ -260,6 +313,7 @@ pub async fn convert_and_upload(
                         "catalog",
                         stem,
                         "vlm_repetition_loop",
+                        Vec::new(),
                     )
                     .await
                     {
@@ -290,7 +344,7 @@ pub async fn convert_and_upload(
             (md_clean, "scribe-vlm")
         }
         "html" | "htm" => {
-            let html = String::from_utf8(raw_bytes).map_err(|e| {
+            let html = String::from_utf8((*source.bytes).clone()).map_err(|e| {
                 HandlerError::Permanent(anyhow::anyhow!(
                     "HTML at {} is not valid UTF-8: {e}",
                     event.key
@@ -311,7 +365,7 @@ pub async fn convert_and_upload(
             (crate::html::convert_html_to_markdown(&html), "html-parser")
         }
         "epub" => {
-            let md = crate::epub::convert_epub_to_markdown(&raw_bytes).map_err(|e| {
+            let md = crate::epub::convert_epub_to_markdown(&source.bytes).map_err(|e| {
                 HandlerError::Permanent(anyhow::anyhow!("EPUB parse failed for {}: {e}", event.key))
             })?;
             (md, "epub-parser")
@@ -325,8 +379,48 @@ pub async fn convert_and_upload(
     };
     let duration_secs = start.elapsed().as_secs_f64();
 
+    // A conversion that produced nothing embeddable is a failed conversion,
+    // not a successful one. Without this gate the stub was written to
+    // storage, stamped `conversion` success and published as
+    // `scribe.completed`; distill then filtered every chunk under the same
+    // floor and recorded `embedding_skip: zero_chunks_or_empty` — leaving a
+    // catalog row claiming success for a document that never had content.
+    // Observed shape: a Radware 302 anti-bot page that reached the
+    // html-parser as `# 302 Found\n\nrdwr` (17 bytes).
+    if !hs_common::quality::has_indexable_content(&markdown) {
+        if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+            storage,
+            "catalog",
+            stem,
+            "empty_conversion",
+            Vec::new(),
+        )
+        .await
+        {
+            tracing::error!(stem = %stem, error = %e, "stamp conversion_failed failed");
+        }
+        return Err(HandlerError::Permanent(anyhow::anyhow!(
+            "{} converted to {} non-whitespace chars, below the {}-char indexable floor; \
+             refusing to record a conversion",
+            event.key,
+            hs_common::quality::non_whitespace_len(&markdown),
+            hs_common::quality::MIN_INDEXABLE_NON_WS,
+        )));
+    }
+
+    // Two independent page signals: the separator structure the backend
+    // emitted, and the source's own page count parsed at ingest. See
+    // `resolve_page_accounting` for why markdown structure wins when it
+    // exists and why a lone offset over a multi-page source is dropped.
     let page_offsets = hs_common::catalog::compute_page_offsets(&markdown);
-    let total_pages = page_offsets.len() as u64;
+    let accounting =
+        hs_common::catalog::resolve_page_accounting(page_offsets.len() as u64, source.pdf_pages);
+    let total_pages = accounting.total_pages;
+    let page_offsets = if accounting.offsets_trustworthy {
+        page_offsets
+    } else {
+        Vec::new()
+    };
 
     storage
         .put(&md_key, markdown.into_bytes())
@@ -347,6 +441,8 @@ pub async fn convert_and_upload(
         total_pages,
         page_offsets,
         &md_key,
+        converted_by,
+        attempts_log,
     )
     .await
     {

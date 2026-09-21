@@ -245,7 +245,17 @@ impl PaperDownloader {
 #[async_trait]
 impl DownloadService for PaperDownloader {
     async fn download_by_doi(&self, doi: &str) -> Result<DownloadResult, PaperError> {
-        let filename = format!("{}.pdf", doi.replace('/', "_"));
+        // Lowercase before deriving the storage key. DOIs are case-insensitive
+        // (ISO 26324), so `10.48550/arXiv.2410.07095` and
+        // `10.48550/arxiv.2410.07095` are the same paper — but deriving the
+        // stem from the DOI verbatim stored them as two documents, indexed
+        // twice, returned twice by one query. 42 such pairs had accumulated by
+        // 2026-08-10. The arXiv fast path below already matches its prefix
+        // case-insensitively for *resolution*; this extends the same rule to
+        // *storage identity*, which is where the duplicates came from.
+        // Existing mixed-case stems are canonicalized by
+        // `hs migrate canonicalize-doi-stems`.
+        let filename = format!("{}.pdf", doi.to_lowercase().replace('/', "_"));
 
         // 1. arXiv fast path — match the arXiv DOI prefix case-insensitively
         // (DataCite registration is `arXiv`, but consumers paste both

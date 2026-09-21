@@ -32,9 +32,14 @@ pub struct NatsConfig {
 
 impl Default for NatsConfig {
     fn default() -> Self {
+        // Mirror NatsYaml::default() in config.rs — the YAML path is what
+        // every live consumer goes through, and two divergent defaults
+        // for the same coupled constant (ack_wait must stay ≥ the scribe
+        // timeout ceiling of 3600s) is how a slow book gets reclaimed
+        // mid-convert by whichever code path picked the stale one.
         Self {
             url: "nats://localhost:4222".into(),
-            ack_wait: Duration::from_secs(1800),
+            ack_wait: Duration::from_secs(7200),
             max_deliver: 5,
             max_age: Duration::from_secs(7 * 24 * 3600),
             max_ack_pending: 32,
@@ -135,13 +140,16 @@ impl NatsBus {
             .map_err(|e| anyhow::anyhow!("create consumer {}: {e}", spec.durable_name))
     }
 
-    /// Delete the two pipeline streams (PAPERS, SCRIBE). All queued and
-    /// in-flight messages are discarded. Operators use this to recover
-    /// from config drift (e.g. a consumer stuck with the wrong ack_wait)
-    /// — after wiping, the next [`connect`] recreates everything from
-    /// the current [`NatsConfig`].
+    /// Delete every pipeline stream (PAPERS, SCRIBE, DISTILL). All
+    /// queued and in-flight messages are discarded. Operators use this
+    /// to recover from config drift (e.g. a consumer stuck with the
+    /// wrong ack_wait) — after wiping, the next [`connect`] recreates
+    /// everything from the current [`NatsConfig`]. The list must match
+    /// what [`connect`] provisions: resetting a subset leaves the
+    /// omitted stream carrying exactly the drifted config the operator
+    /// is trying to clear.
     pub async fn reset_streams(&self) -> anyhow::Result<()> {
-        for stream in [PAPERS_STREAM, SCRIBE_STREAM] {
+        for stream in [PAPERS_STREAM, SCRIBE_STREAM, DISTILL_STREAM] {
             match self.jetstream.delete_stream(stream).await {
                 Ok(_) => tracing::info!(stream, "deleted jetstream stream"),
                 Err(e) => {

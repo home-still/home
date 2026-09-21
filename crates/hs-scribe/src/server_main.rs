@@ -46,10 +46,15 @@ async fn async_main() -> Result<()> {
         AppConfig::default()
     });
 
+    let backend_url = match config.backend {
+        hs_scribe::config::BackendChoice::OpenAi => &config.openai_url,
+        hs_scribe::config::BackendChoice::Ollama => &config.ollama_url,
+        hs_scribe::config::BackendChoice::Cloud => &config.cloud_url,
+    };
     tracing::info!(
-        "Backend: {:?}, Ollama URL: {}, Model: {}, VLM concurrency: {}",
+        "Backend: {:?}, Backend URL: {}, Model: {}, VLM concurrency: {}",
         config.backend,
-        config.ollama_url,
+        backend_url,
         config.model,
         config.vlm_concurrency
     );
@@ -60,6 +65,7 @@ async fn async_main() -> Result<()> {
         in_flight: Arc::new(AtomicUsize::new(0)),
         last_conversion_ms: Arc::new(AtomicU64::new(0)),
         total_conversions: Arc::new(AtomicU64::new(0)),
+        backend_state: Arc::new(tokio::sync::Mutex::new(None)),
     });
 
     let addr = format!("{}:{}", args.host, args.port);
@@ -68,30 +74,22 @@ async fn async_main() -> Result<()> {
     let serve = axum::serve(listener, app(state));
     let result = serve.await;
 
-    if let Some(h) = logging_handle {
-        let _ = h.shutdown().await;
-    }
+    let _ = logging_handle.shutdown().await;
     result?;
     Ok(())
 }
 
-async fn install_logging() -> Option<hs_common::logging::LoggingHandle> {
+async fn install_logging() -> hs_common::logging::LoggingHandle {
     use hs_common::logging::{self, LoggingConfig, StderrOutput};
     let (primary_storage, logs_yaml) = logging::load_config_sections();
     let mut cfg = LoggingConfig::for_service("hs-scribe-server")
         .with_stderr(StderrOutput::EnvFilter("info".into()));
     logs_yaml.apply_to(&mut cfg);
-    let mut handle = match logging::init(cfg) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("hs-scribe-server: logging init failed: {e:#}");
-            return None;
-        }
-    };
+    let mut handle = logging::init(cfg);
     if let Some(storage_cfg) = primary_storage {
         if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket).await {
             let _ = handle.spawn_shipper(storage);
         }
     }
-    Some(handle)
+    handle
 }

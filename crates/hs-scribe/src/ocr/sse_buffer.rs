@@ -50,10 +50,7 @@ impl SseBuffer {
         self.buf.extend_from_slice(chunk);
 
         let mut out = Vec::new();
-        loop {
-            let Some((event_end, sep_len)) = find_event_boundary(&self.buf) else {
-                break;
-            };
+        while let Some((event_end, sep_len)) = find_event_boundary(&self.buf) {
             // Drain the event from the buffer: bytes [0..event_end) are
             // the event body; [event_end..event_end+sep_len) is the
             // blank-line separator we discard.

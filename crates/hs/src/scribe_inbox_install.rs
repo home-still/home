@@ -186,7 +186,7 @@ fn status_macos(reporter: &Arc<dyn Reporter>) -> Result<()> {
 // libc, so gate the real impl to unix and leave a panicking stub for
 // Windows — unreachable at runtime, but keeps the call sites compiling.
 #[cfg(unix)]
-fn users_uid() -> u32 {
+pub(crate) fn users_uid() -> u32 {
     // SAFETY: `geteuid` is a trivial read-only syscall with no out-params.
     unsafe { libc::geteuid() }
 }
