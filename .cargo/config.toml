@@ -1,0 +1,11 @@
+# DuckDB's bundled build (`duckdb = { features = ["bundled"] }`, workspace
+# Cargo.toml) calls the Windows Restart Manager from
+# `duckdb::AdditionalLockInfo` — RmStartSession / RmEndSession /
+# RmRegisterResources / RmGetList — but `libduckdb-sys` never emits a
+# `cargo:rustc-link-lib=rstrtmgr` for it. Binaries that happen to pull
+# rstrtmgr.lib through another dependency link anyway (this is why the
+# release workflow's `-p hs` build is green); the openalex-ingest and
+# paper test binaries do not, and fail with LNK2019 / LNK1120.
+# Link it once for the whole workspace on MSVC rather than per-target.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=rstrtmgr.lib"]
