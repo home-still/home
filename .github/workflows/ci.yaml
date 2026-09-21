@@ -16,7 +16,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # windows-2022 (VS2022), NOT windows-latest: GitHub repointed
+        # `windows-latest` and `windows-2025` to the VS2026 image, whose
+        # MSVC dropped `stdext::checked_array_iterator` — DuckDB's
+        # vendored `fmt` still uses it, so the bundled `libduckdb-sys`
+        # build dies in cc-rs (`cl.exe` exit 2). Every crate but
+        # hs-scribe pulls duckdb, so the whole leg failed. release.yaml
+        # pinned the same runner for the same reason (rc.336/rc.337).
+        os: [ubuntu-latest, macos-latest, windows-2022]
     steps:
       - uses: actions/checkout@v4
       
