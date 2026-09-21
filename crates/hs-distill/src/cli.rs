@@ -24,10 +24,6 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
 
-        /// Don't yield GPU to scribe when it has work queued
-        #[arg(long)]
-        no_yield: bool,
-
         /// Internal: run as daemon child process
         #[arg(long, hide = true)]
         daemon_child: bool,
@@ -88,6 +84,16 @@ pub enum DistillCmd {
         /// Re-index markdown that never reached Qdrant
         #[arg(long)]
         reembed: bool,
+        /// Override server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Delete every Qdrant chunk for a doc_id. CLI-only (no MCP) because
+    /// this is a destructive write — use to clear orphaned vectors after
+    /// markdown has been removed, or to force a clean re-index.
+    Purge {
+        /// doc_id whose chunks should be deleted from Qdrant
+        doc_id: String,
         /// Override server URL
         #[arg(long)]
         server: Option<String>,

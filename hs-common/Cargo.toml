@@ -13,12 +13,17 @@ cli = [
     "dep:terminal_size",
     "dep:unicode-width",
 ]
-service = [
+# Internal feature: pulled in by every other feature that uses reqwest so the
+# single `http::http_client` helper is available wherever reqwest is.
+http = [
     "dep:reqwest",
+    "dep:anyhow",
+]
+service = [
+    "http",
     "dep:serde",
     "dep:serde_json",
     "dep:async-trait",
-    "dep:anyhow",
     "dep:futures",
     "dep:tracing",
 ]
@@ -28,19 +33,17 @@ catalog = [
     "dep:chrono",
 ]
 compose = [
+    "http",
     "dep:tokio",
-    "dep:anyhow",
-    "dep:reqwest",
 ]
 auth = [
+    "http",
     "dep:hmac",
     "dep:sha2",
     "dep:base64",
     "dep:rand",
     "dep:serde",
     "dep:serde_json",
-    "dep:anyhow",
-    "dep:reqwest",
     "dep:tokio",
 ]
 storage = [
@@ -49,15 +52,18 @@ storage = [
     "dep:tokio",
     "dep:serde",
     "dep:serde_yaml_ng",
+    "dep:futures",
+    "dep:chrono",
+    "dep:gethostname",
     "tokio/fs",
 ]
 storage-s3 = [
     "storage",
+    "http",
     "dep:object_store",
     "dep:bytes",
     "dep:futures",
     "dep:url",
-    "dep:reqwest",
     "dep:hmac",
     "dep:sha2",
     "dep:chrono",

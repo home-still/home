@@ -1,0 +1,16 @@
+[package]
+name = "openalex-ingest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+flate2 = { workspace = true }
+duckdb = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

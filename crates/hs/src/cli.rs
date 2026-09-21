@@ -33,6 +33,17 @@ pub enum TopCmd {
         #[command(subcommand)]
         command: paper::cli::PaperCmd,
     },
+    /// Personal documents: ingest medical/financial/etc records into a private store
+    #[command(after_help = "\
+  Examples:
+    hs personal add ~/Downloads/lab-results.pdf
+    hs personal add tax-2024.docx --category tax
+    hs personal search \"blood pressure\"
+    hs personal list --category medical")]
+    Personal {
+        #[command(subcommand)]
+        command: personal::cli::PersonalCmd,
+    },
     /// Distill markdown into vector embeddings for semantic search
     Distill {
         #[command(subcommand)]
@@ -86,12 +97,64 @@ pub enum TopCmd {
         #[command(subcommand)]
         command: MigrateAction,
     },
+    /// Cross-service pipeline operations (rebuild from papers, etc.)
+    Pipeline {
+        #[command(subcommand)]
+        command: super::pipeline_cmd::PipelineCmd,
+    },
+    /// Local OpenAlex catalog (DuckDB) — bulk-load entities, query, build FTS
+    #[command(after_help = "\
+  Examples:
+    hs openalex load concepts
+    hs openalex load-works --partition updated_date=2024-01-01
+    hs openalex status
+    hs openalex query \"SELECT COUNT(*) FROM works\"
+    hs openalex build-fts")]
+    Openalex {
+        #[command(subcommand)]
+        command: super::openalex_cmd::OpenAlexCmd,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum MigrateAction {
     /// Move flat files into 2-char prefix subdirectories (papers/, markdown/, catalog/)
     Sharding,
+    /// Relocate sharded files written to the bucket root back under
+    /// `papers/` (rc.297 pre-fix artifacts from `paper_download`). Invisible
+    /// to `hs status` until moved because `collect_pipeline_counts` only
+    /// walks the `papers/` prefix.
+    MoveRootOrphans {
+        /// Preview moves without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Cap on files to move in this run (for staged migration)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Scan `papers/XX/*.pdf` for content-type mismatches (paywall HTML
+    /// renamed `.pdf`, truncated downloads). HTML is renamed in place to
+    /// `.html` so the existing html-parser path picks it up; other
+    /// non-PDF bytes are relocated to `papers/.quarantine/XX/` and the
+    /// catalog row stamped `conversion_failed` so scribe-watch-events
+    /// stops republishing them. Drains pre-rc.300 junk from the queue.
+    QuarantineBadContent {
+        /// Preview without moving or stamping anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Cap on files inspected this run
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Delete catalog rows whose conversion.server == "local-html" (the
+    /// legacy dual-converter path removed in rc.306). Also deletes the
+    /// associated markdown + source HTML so the pipeline treats those
+    /// stems as new if they are re-downloaded.
+    DropLocalHtml {
+        /// Preview without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

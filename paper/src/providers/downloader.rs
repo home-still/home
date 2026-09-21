@@ -64,6 +64,12 @@ pub struct PaperDownloader {
     storage: Arc<dyn Storage>,
     events: Arc<dyn EventBus>,
     unpaywall_email: Option<String>,
+    /// Storage prefix all downloads land under (e.g. `"papers"`). The key
+    /// for a downloaded artifact is `{papers_prefix}/{sharded_key(stem, ext)}`.
+    /// Pre-rc.298 the prefix was silently omitted, scattering files across
+    /// bucket-root shards — this field exists so writes and pipeline counts
+    /// can't drift apart again.
+    papers_prefix: String,
     resolvers: Vec<Box<dyn PaperProvider>>,
 }
 
@@ -109,8 +115,20 @@ impl PaperDownloader {
             storage,
             events,
             unpaywall_email: config.unpaywall_email.clone(),
+            papers_prefix: config.papers_prefix.clone(),
             resolvers,
         })
+    }
+
+    /// Build the canonical storage key for a downloaded artifact:
+    /// `{papers_prefix}/{XX}/{stem}.{ext}`. Centralised so the download
+    /// path and tests share one definition and can't drift.
+    fn build_key(&self, stem: &str, ext: &str) -> String {
+        format!(
+            "{}/{}",
+            self.papers_prefix.trim_end_matches('/'),
+            hs_common::sharded_key(stem, ext),
+        )
     }
 
     async fn resolve_unpaywall(&self, doi: &str) -> Option<String> {
@@ -293,7 +311,7 @@ impl DownloadService for PaperDownloader {
             .map(|(s, _)| s)
             .unwrap_or(filename);
         let ext = filename.rsplit_once('.').map(|(_, e)| e).unwrap_or("pdf");
-        let key = hs_common::sharded_key(stem, ext);
+        let key = self.build_key(stem, ext);
 
         // Skip if already downloaded
         if let Some(meta) = self
@@ -334,21 +352,41 @@ impl DownloadService for PaperDownloader {
         let size_bytes = buf.len() as u64;
         let sha256 = format!("{:x}", hasher.finalize());
 
+        // Reject sub-`MIN_PDF_BYTES` bodies before they pollute the catalog.
+        // The smallest valid PDF is ~70 bytes (`%PDF-1.x` + xref + trailer);
+        // 100 is well below that. Catches 0-byte stubs (servers that returned
+        // 200 with empty body) and HTML error pages that came through as
+        // empty after gzip-strip. Without this gate, a 0-byte stub would be
+        // stamped `downloaded: true` with sha256 of the empty string.
+        const MIN_PDF_BYTES: u64 = 100;
+        if size_bytes < MIN_PDF_BYTES {
+            return Err(PaperError::NotFound(format!(
+                "Server returned {size_bytes} bytes (< {MIN_PDF_BYTES}); rejecting as stub for {url}"
+            )));
+        }
+
         // Validate and decide final key
         let head = &buf[..buf.len().min(4096)];
         let (final_key, final_bytes) = if head.starts_with(b"%PDF") {
             (key, buf)
-        } else if looks_like_html(head) {
+        } else if hs_common::html::looks_like_html(head) {
             let content = String::from_utf8_lossy(&buf).to_string();
-            if is_paywall_html(&content) {
+            if hs_common::html::is_paywall_html(&content) {
                 return Err(PaperError::NotFound(format!(
                     "Server returned a paywall/login page instead of PDF for {url}"
                 )));
             }
-            (hs_common::sharded_key(stem, "html"), buf)
+            (self.build_key(stem, "html"), buf)
         } else {
-            // Unknown format — keep it as-is (might be a valid binary format)
-            (key, buf)
+            // Anything that's not %PDF and not HTML is garbage by the time
+            // it reaches a paper-download response (graphical-abstract JPEG,
+            // gzipped landing page, login binary blob). Storing under the
+            // expected PDF key inflates `documents` and triggers convert
+            // dispatch that fails 415 every time. Reject at the door —
+            // catalog isn't stamped, file isn't written.
+            return Err(PaperError::NotFound(format!(
+                "downloaded body is neither PDF nor HTML ({size_bytes} bytes); rejecting for {url}"
+            )));
         };
 
         self.storage
@@ -395,89 +433,6 @@ impl DownloadService for PaperDownloader {
             skipped: false,
         })
     }
-}
-
-fn looks_like_html(header: &[u8]) -> bool {
-    let s = String::from_utf8_lossy(&header[..header.len().min(512)]).to_lowercase();
-    s.contains("<!doctype html") || s.contains("<html") || s.contains("<head")
-}
-
-fn is_paywall_html(content: &str) -> bool {
-    let lower = content.to_lowercase();
-
-    // Paywall indicators
-    let has_login = lower.contains("sign in")
-        || lower.contains("log in")
-        || lower.contains("access denied")
-        || lower.contains("403 forbidden")
-        || lower.contains("subscription required")
-        || lower.contains("purchase this article")
-        || lower.contains("institutional access");
-
-    // Paper indicators — meaningful article structure
-    let has_article =
-        lower.contains("<article") || (lower.contains("abstract") && lower.contains("references"));
-
-    // Short pages with login prompts are almost certainly paywalls
-    if has_login && content.len() < 100_000 {
-        return true;
-    }
-
-    // If it has login indicators but no article structure, it's a paywall
-    if has_login && !has_article {
-        return true;
-    }
-
-    // Strip HTML tags and measure actual visible text
-    let text_only = strip_html_tags(&lower);
-    let text_len = text_only.trim().len();
-
-    // Very short pages without article structure are junk (landing pages, error pages)
-    if text_len < 500 && !has_article {
-        return true;
-    }
-
-    // Loading / interstitial pages (PMC download stub, etc.)
-    if lower.contains("preparing to download")
-        || lower.contains("hhs vulnerability disclosure")
-        || lower.contains("please wait while the document loads")
-    {
-        return true;
-    }
-
-    // Journal metadata pages (impact factor, citescore) with no paper body
-    let is_journal_meta = lower.contains("impact factor")
-        || lower.contains("citescore")
-        || lower.contains("aims and scope");
-    if is_journal_meta && !has_article {
-        return true;
-    }
-
-    // Institutional/repository landing pages with navigation but no paper
-    let is_landing = lower.contains("clinical trials")
-        || lower.contains("browse collections")
-        || lower.contains("search results")
-        || lower.contains("cookie policy");
-    if is_landing && !has_article {
-        return true;
-    }
-
-    false
-}
-
-/// Strip HTML tags to get visible text content.
-fn strip_html_tags(html: &str) -> String {
-    let mut result = String::with_capacity(html.len() / 2);
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => result.push(ch),
-            _ => {}
-        }
-    }
-    result
 }
 
 /// Check that a `head()` result confirms the just-written object exists at the
@@ -540,6 +495,50 @@ mod verify_put_tests {
     fn err_when_head_call_itself_fails() {
         let err = verify_put(Err(anyhow::anyhow!("network")), "k", 1).unwrap_err();
         assert!(format!("{err}").contains("verify failed"));
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use hs_common::event_bus::NoOpBus;
+    use hs_common::storage::LocalFsStorage;
+
+    fn mk(papers_prefix: &str) -> PaperDownloader {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(tmp.path()));
+        let events: Arc<dyn EventBus> = Arc::new(NoOpBus);
+        let cfg = crate::config::DownloadConfig {
+            papers_prefix: papers_prefix.to_string(),
+            ..Default::default()
+        };
+        PaperDownloader::with_event_bus(storage, events, &cfg, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn keys_sit_under_default_papers_prefix() {
+        // rc.298 guard: the pre-fix downloader wrote to bare `XX/stem.ext`
+        // at bucket root, invisible to `hs status`. Every new download
+        // must now land under `papers/`.
+        let d = mk("papers");
+        assert_eq!(d.build_key("abcdef", "pdf"), "papers/ab/abcdef.pdf");
+        assert_eq!(
+            d.build_key("10.1007_s001", "html"),
+            "papers/10/10.1007_s001.html"
+        );
+    }
+
+    #[test]
+    fn custom_papers_prefix_threads_through() {
+        let d = mk("bulk-ingest");
+        assert_eq!(d.build_key("xyz9", "pdf"), "bulk-ingest/xy/xyz9.pdf");
+    }
+
+    #[test]
+    fn trailing_slash_on_prefix_is_trimmed() {
+        // Operator typos in config shouldn't double-slash the key.
+        let d = mk("papers/");
+        assert_eq!(d.build_key("ab12", "pdf"), "papers/ab/ab12.pdf");
     }
 }
 

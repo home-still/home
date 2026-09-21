@@ -28,6 +28,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
             archive: tar.gz
+            build_scribe: true
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             archive: tar.gz

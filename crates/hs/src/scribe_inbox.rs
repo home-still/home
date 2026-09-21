@@ -200,8 +200,8 @@ pub async fn sweep_inbox_once(
     Ok(report)
 }
 
-/// Canonical papers prefix used by all downstream tools. Matches
-/// `cmd_watch`'s `papers_prefix` and the server-side MCP / distill.
+/// Canonical papers prefix used by all downstream tools — server-side
+/// scribe watch-events, MCP, distill all read from the same prefix.
 const PAPERS_PREFIX: &str = "papers";
 
 /// Dispatch for `hs scribe inbox ...`.
@@ -253,9 +253,34 @@ async fn cmd_run(reporter: &Arc<dyn Reporter>, _daemon_child: bool) -> Result<()
         ),
     );
 
-    // Boot-time sweep drains any existing backlog before starting the tick.
+    let sweep_interval_secs = poll_interval.as_secs();
+
+    // Boot-time heartbeat + sweep — drains any existing backlog before
+    // starting the tick cycle. The heartbeat also signals to any `hs status`
+    // client that the daemon is alive within one tick of starting, not
+    // after the first poll-interval.
+    //
+    // `last_sweep` carries the most recent completed sweep's counts across
+    // ticks. The pre-sweep stamp re-uses the PREVIOUS value (so the
+    // Watcher row keeps showing `swept N / M` during a long sweep instead
+    // of flickering to nothing); the post-sweep stamp updates it.
+    let mut last_sweep: Option<(u64, u64, u64)> = None;
+    if let Err(e) =
+        hs_common::status::write_inbox_heartbeat(&*storage, sweep_interval_secs, last_sweep).await
+    {
+        tracing::warn!(error = %e, "initial heartbeat write failed");
+    }
     match sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX).await {
-        Ok(r) => log_report(reporter, &r),
+        Ok(r) => {
+            log_report(reporter, &r);
+            last_sweep = Some((r.found as u64, r.relocated, r.errors.len() as u64));
+            if let Err(e) =
+                hs_common::status::write_inbox_heartbeat(&*storage, sweep_interval_secs, last_sweep)
+                    .await
+            {
+                tracing::warn!(error = %e, "post-sweep heartbeat write failed");
+            }
+        }
         Err(e) => tracing::warn!(error = %e, "initial sweep failed"),
     }
 
@@ -272,9 +297,39 @@ async fn cmd_run(reporter: &Arc<dyn Reporter>, _daemon_child: bool) -> Result<()
             return Ok(());
         }
         tokio::time::sleep(poll_interval).await;
+        // Pre-sweep heartbeat keeps the Watcher row "running" even when
+        // a sweep stalls. `last_sweep` carries the previous completed
+        // sweep's counts forward so the `swept N / M` display doesn't
+        // flicker to null every 30s — `hs status` ages out the
+        // heartbeat at 2× poll_interval + 5s grace for the liveness
+        // signal; the numbers alongside are the most recent known
+        // counts, always.
+        if let Err(e) =
+            hs_common::status::write_inbox_heartbeat(&*storage, sweep_interval_secs, last_sweep)
+                .await
+        {
+            tracing::warn!(error = %e, "heartbeat write failed; sweep will still run");
+        }
         match sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX).await {
-            Ok(r) if r.relocated > 0 || !r.errors.is_empty() => log_report(reporter, &r),
-            Ok(_) => tracing::debug!("sweep: nothing to do"),
+            Ok(r) => {
+                if r.relocated > 0 || !r.errors.is_empty() {
+                    log_report(reporter, &r);
+                } else {
+                    tracing::debug!("sweep: nothing to do");
+                }
+                last_sweep = Some((r.found as u64, r.relocated, r.errors.len() as u64));
+                // Post-sweep stamp: refresh the Watcher row with the
+                // fresh counts.
+                if let Err(e) = hs_common::status::write_inbox_heartbeat(
+                    &*storage,
+                    sweep_interval_secs,
+                    last_sweep,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "post-sweep heartbeat write failed");
+                }
+            }
             Err(e) => tracing::warn!(error = %e, "sweep failed; will retry next tick"),
         }
     }

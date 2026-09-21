@@ -204,7 +204,7 @@ async fn cmd_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     // Try to refresh token to check connectivity
-    let auth_client = hs_common::auth::client::AuthenticatedClient::new(creds);
+    let auth_client = hs_common::auth::client::AuthenticatedClient::new(creds)?;
     match auth_client.get_access_token().await {
         Ok(_) => reporter.status("Connection", "OK (token refreshed)"),
         Err(e) => reporter.warn(&format!("Connection failed: {e}")),
@@ -222,7 +222,7 @@ async fn cmd_token(reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     let creds = CloudCredentials::load(&cred_path)?;
-    let auth_client = hs_common::auth::client::AuthenticatedClient::new(creds);
+    let auth_client = hs_common::auth::client::AuthenticatedClient::new(creds)?;
     let access_token = auth_client
         .get_access_token()
         .await

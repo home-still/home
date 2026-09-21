@@ -57,6 +57,78 @@ struct PaperGetParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PaperReferencesParams {
+    #[schemars(description = "DOI of the paper whose reference list to return")]
+    doi: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PaperCitationsParams {
+    #[schemars(description = "DOI of the paper to find citing works for")]
+    doi: String,
+    #[schemars(description = "Maximum citations to return (default 100, max 1000)")]
+    limit: Option<u32>,
+    #[schemars(description = "Optional minimum publication year filter (post-fetch)")]
+    year_from: Option<u16>,
+    #[schemars(description = "Sort order: 'year' (default) or 'citations'")]
+    sort: Option<String>,
+}
+
+// ── OpenAlex (local DuckDB) parameter types ─────────────────────
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OpenAlexSearchParams {
+    #[schemars(description = "Free-text search over works title + abstract (BM25)")]
+    query: String,
+    #[schemars(description = "Maximum results (default 10, max 200)")]
+    max_results: Option<u16>,
+    #[schemars(description = "Minimum publication year filter")]
+    year_from: Option<u16>,
+    #[schemars(description = "Maximum publication year filter")]
+    year_to: Option<u16>,
+    #[schemars(description = "Minimum cited_by_count filter")]
+    min_citations: Option<u32>,
+    #[schemars(description = "Sort: 'relevance' (default), 'citations', 'year'")]
+    sort: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OpenAlexGetParams {
+    #[schemars(description = "OpenAlex work ID (e.g. W2741809807) or DOI (e.g. 10.1234/x)")]
+    id_or_doi: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OpenAlexReferencesParams {
+    #[schemars(description = "OpenAlex work ID whose outbound references to list")]
+    openalex_id: String,
+    #[schemars(description = "Maximum results (default 100, max 1000)")]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OpenAlexCitationsParams {
+    #[schemars(description = "OpenAlex work ID to find citing works for")]
+    openalex_id: String,
+    #[schemars(description = "Maximum results (default 100, max 1000)")]
+    limit: Option<u32>,
+    #[schemars(description = "Optional minimum publication year filter")]
+    year_from: Option<u16>,
+    #[schemars(description = "Sort: 'citations' (default) or 'year'")]
+    sort: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OpenAlexAuthorsByTopicParams {
+    #[schemars(
+        description = "OpenAlex topic ID (e.g. T13975) — get from `openalex_search` or `topics` table"
+    )]
+    topic_id: String,
+    #[schemars(description = "Maximum authors (default 25, max 200)")]
+    limit: Option<u16>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct CatalogReadParams {
     #[schemars(description = "Paper stem name (filename without extension)")]
     stem: String,
@@ -72,6 +144,24 @@ struct ListParams {
         description = "catalog_list only: filter by embedded-in-Qdrant state. true=only embedded, false=only not-yet-embedded, omit=all."
     )]
     embedded: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CatalogRecentParams {
+    #[schemars(description = "Maximum items to return (default: 30)")]
+    limit: Option<usize>,
+    #[schemars(
+        description = "When false (default), suppress rows whose timestamp came from a catalog_repair backfill (`downloaded_at == repair.repaired_at`, or synthetic Convert whose `converted_at == repair.repaired_at`). Set true for forensic mode — repair rows reappear with `\"repair\": true`."
+    )]
+    include_repaired: Option<bool>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct SystemStatusParams {
+    #[schemars(
+        description = "When false (default), the `history` pane mirrors `catalog_recent` and suppresses `catalog_repair` backfill rows. Set true for forensic mode — repair rows reappear with `\"repair\": true`."
+    )]
+    include_repaired: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -121,12 +211,6 @@ struct DistillIndexParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DistillPurgeParams {
-    #[schemars(description = "doc_id whose chunks should be deleted from Qdrant")]
-    doc_id: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DistillReconcileParams {
     #[schemars(description = "If true, report orphans without deleting. Default: true.")]
     #[serde(default = "default_true")]
@@ -170,10 +254,13 @@ struct CatalogRepairParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DedupeUrlEncodedParams {
+    // rc.306 P0-6: field accepted for schema compatibility but ignored
+    // server-side; MCP always runs in dry-run. The apply path is CLI-only.
     #[schemars(
-        description = "If true, report what would be deleted without writing. Default: true."
+        description = "Ignored by MCP (always dry-run). Use `hs catalog dedupe-url-encoded --apply` for the write path."
     )]
     #[serde(default = "default_true")]
+    #[allow(dead_code)]
     dry_run: bool,
 }
 
@@ -212,6 +299,191 @@ fn default_true() -> bool {
     true
 }
 
+// ── Personal Tools params ─────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PersonalSearchParams {
+    #[schemars(description = "Search query for the personal-documents collection")]
+    query: String,
+    #[schemars(description = "Maximum results (default 10)")]
+    limit: Option<usize>,
+    #[schemars(
+        description = "Restrict to a single category (medical, financial, education, legal, employment, tax, insurance, correspondence, other). Omit to search across all categories."
+    )]
+    category: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PersonalListParams {
+    #[schemars(description = "Maximum entries to return (default 50)")]
+    limit: Option<usize>,
+    #[schemars(description = "Restrict to a single category. Omit to list all categories.")]
+    category: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PersonalReadParams {
+    #[schemars(description = "Document stem (filename without extension)")]
+    stem: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PersonalAddParams {
+    #[schemars(
+        description = "Filename inside the personal-store inbox (no path separators, no leading dot, no absolute paths). Drop the file under cfg.inbox_dir() yourself before calling."
+    )]
+    filename: String,
+    #[schemars(
+        description = "Override the LLM-picked category. Must be one of the configured categories."
+    )]
+    category: Option<String>,
+    #[schemars(description = "Override the LLM-picked title.")]
+    title: Option<String>,
+    #[schemars(description = "If true, replace an existing document with the same stem.")]
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PersonalReindexParams {
+    #[schemars(description = "Document stem to re-chunk and re-embed.")]
+    stem: String,
+}
+
+/// Format a `SystemTime` as an RFC3339 UTC string. Used by `catalog_repair`
+/// to stamp per-object timestamps drawn from storage `last_modified` instead
+/// of a shared batch `now()` — which was the root cause of the `catalog_recent`
+/// "all rows on one nanosecond" anomaly.
+fn system_time_to_rfc3339(t: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+}
+
+// ── OpenAlex DuckDB helpers ─────────────────────────────────────
+
+fn openalex_unavailable_error() -> String {
+    "OpenAlex DB not configured. Add an `openalex:` section to ~/.home-still/config.yaml \
+     with `db_path` and `snapshot_dir`, then run `hs openalex load <entity>`."
+        .to_string()
+}
+
+/// Open the local OpenAlex DuckDB read-only. Reads `~/.home-still/config.yaml`
+/// for the `openalex.db_path` setting. Errors if the section or file is
+/// missing — caller decides whether to log+continue.
+fn open_openalex_readonly() -> anyhow::Result<duckdb::Connection> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no $HOME"))?;
+    let cfg_path = home.join(".home-still").join("config.yaml");
+    let raw = std::fs::read_to_string(&cfg_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", cfg_path.display()))?;
+    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&raw)?;
+    let oa = v
+        .get("openalex")
+        .ok_or_else(|| anyhow::anyhow!("missing 'openalex:' section in {}", cfg_path.display()))?;
+    let db_path_str = oa
+        .get("db_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("openalex.db_path missing"))?;
+    let db_path = if let Some(rest) = db_path_str.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        std::path::PathBuf::from(db_path_str)
+    };
+    if !db_path.exists() {
+        anyhow::bail!(
+            "openalex db not found at {} — run `hs openalex load <entity>` first",
+            db_path.display()
+        );
+    }
+    let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
+    let conn = duckdb::Connection::open_with_flags(&db_path, cfg)?;
+    Ok(conn)
+}
+
+/// Run an OpenAlex SQL query inside spawn_blocking, return rows serialized as
+/// a JSON array (pretty-printed). Single entry point for all 4 simple
+/// SELECT-driven openalex_* tools.
+async fn run_openalex_query_json(
+    server: &HomeStillMcp,
+    sql: &str,
+    params: Vec<duckdb::types::Value>,
+) -> Result<String, String> {
+    let conn_arc = server
+        .openalex_db
+        .as_ref()
+        .ok_or_else(openalex_unavailable_error)?
+        .clone();
+    let sql = sql.to_string();
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let conn = conn_arc
+            .lock()
+            .map_err(|_| "openalex DB mutex poisoned".to_string())?;
+        let rows_json = collect_rows_json(&conn, &sql, duckdb::params_from_iter(params.iter()))?;
+        Ok(serde_json::to_string_pretty(&rows_json).unwrap_or_default())
+    })
+    .await
+    .map_err(|e| format!("join: {e}"))?
+}
+
+/// Build a `duckdb::types::Value` from a typed Option, mapping None → Null.
+/// Used by tool handlers to construct the params Vec inline.
+fn opt_value<T: Into<duckdb::types::Value>>(v: Option<T>) -> duckdb::types::Value {
+    v.map(Into::into).unwrap_or(duckdb::types::Value::Null)
+}
+
+/// Run a query and return the result rows as a Vec<serde_json::Value>.
+fn collect_rows_json(
+    conn: &duckdb::Connection,
+    sql: &str,
+    params: impl duckdb::Params,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
+    let mut rows = stmt.query(params).map_err(|e| format!("query: {e}"))?;
+    let cols: Vec<String> = rows
+        .as_ref()
+        .map(|s| s.column_names().into_iter().map(String::from).collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| format!("next: {e}"))? {
+        out.push(row_to_json(row, &cols)?);
+    }
+    Ok(out)
+}
+
+fn row_to_json(row: &duckdb::Row, cols: &[String]) -> Result<serde_json::Value, String> {
+    let mut m = serde_json::Map::with_capacity(cols.len());
+    for (i, name) in cols.iter().enumerate() {
+        let v: duckdb::types::Value = row.get(i).map_err(|e| format!("col {i}: {e}"))?;
+        m.insert(name.clone(), duckdb_value_to_json(v));
+    }
+    Ok(serde_json::Value::Object(m))
+}
+
+fn duckdb_value_to_json(v: duckdb::types::Value) -> serde_json::Value {
+    use duckdb::types::Value as V;
+    use serde_json::Value as J;
+    match v {
+        V::Null => J::Null,
+        V::Boolean(b) => J::Bool(b),
+        V::TinyInt(n) => J::from(n),
+        V::SmallInt(n) => J::from(n),
+        V::Int(n) => J::from(n),
+        V::BigInt(n) => J::from(n),
+        V::HugeInt(n) => J::from(n.to_string()),
+        V::UTinyInt(n) => J::from(n),
+        V::USmallInt(n) => J::from(n),
+        V::UInt(n) => J::from(n),
+        V::UBigInt(n) => J::from(n),
+        V::Float(f) => serde_json::Number::from_f64(f as f64)
+            .map(J::Number)
+            .unwrap_or(J::Null),
+        V::Double(f) => serde_json::Number::from_f64(f)
+            .map(J::Number)
+            .unwrap_or(J::Null),
+        V::Text(s) => J::String(s),
+        V::Blob(b) => J::String(format!("<{} bytes>", b.len())),
+        other => J::String(format!("{:?}", other)),
+    }
+}
+
 // ── MCP Server ──────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -236,36 +508,38 @@ struct HomeStillMcp {
     scribe_servers: Vec<String>,
     scribe_convert_timeout: std::time::Duration,
     distill_servers: Vec<String>,
+    /// Read-only handle to the local OpenAlex DuckDB (when `openalex:` section
+    /// is present in config and the file exists). `None` when the section is
+    /// absent — `openalex_*` tools then return a configuration error.
+    openalex_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
 
 impl HomeStillMcp {
-    async fn new() -> Self {
+    async fn new() -> anyhow::Result<Self> {
         let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
         let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
 
-        // TODO: We don't want fallbacks, this leads to magical behavior.
-        // Storage backend: honor the `storage:` section in ~/.home-still/config.yaml
-        // (`backend: local` or `backend: s3`). If no storage section is present,
-        // fall back to LocalFsStorage rooted at the configured project_dir — that
-        // matches the legacy behavior of reading {project_dir}/{catalog,markdown,papers}.
-        let storage: Arc<dyn Storage> = match hs_common::logging::load_config_sections().0 {
-            Some(cfg) => cfg.build().unwrap_or_else(|e| {
-                tracing::warn!(
-                    "storage config invalid ({e}); falling back to LocalFsStorage at project_dir"
-                );
-                Arc::new(hs_common::storage::LocalFsStorage::new(
-                    hs_common::resolve_project_dir(),
-                ))
-            }),
-            None => Arc::new(hs_common::storage::LocalFsStorage::new(
-                hs_common::resolve_project_dir(),
-            )),
-        };
-        if let Err(e) = storage.ensure_ready().await {
-            tracing::warn!("storage ensure_ready failed: {e:#}");
-        }
+        // Storage backend: honor the `storage:` section in
+        // ~/.home-still/config.yaml. Missing or malformed config is fatal —
+        // we do not fall back to LocalFsStorage at project_dir because that
+        // masks typos and serves unrelated data silently (ONE PATH).
+        let storage_cfg = hs_common::logging::load_config_sections()
+            .0
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "hs-mcp requires a `storage:` section in ~/.home-still/config.yaml \
+                     (backend: local|s3)"
+                )
+            })?;
+        let storage: Arc<dyn Storage> = storage_cfg
+            .build()
+            .map_err(|e| anyhow::anyhow!("storage config invalid: {e:#}"))?;
+        storage
+            .ensure_ready()
+            .await
+            .map_err(|e| anyhow::anyhow!("storage ensure_ready failed: {e:#}"))?;
 
         // Event bus: reuse the events section already parsed into ScribeConfig.
         // Any failure (missing config, broker down, feature not compiled)
@@ -278,19 +552,24 @@ impl HomeStillMcp {
             }
         };
 
-        // Discover servers from gateway registry, falling back to config
-        let scribe_servers = hs_common::service::registry::discover_or_fallback(
-            "scribe",
-            scribe_cfg.servers.clone(),
-        )
-        .await;
-        let distill_servers = hs_common::service::registry::discover_or_fallback(
-            "distill",
-            distill_cfg.servers.clone(),
-        )
-        .await;
+        // Config is the sole source of server URLs. To route through the
+        // gateway, set the gateway URL explicitly in config (e.g.
+        // `servers: [https://gateway.example/gateway/scribe]`).
+        let scribe_servers = scribe_cfg.servers.clone();
+        let distill_servers = distill_cfg.servers.clone();
 
-        Self {
+        // Best-effort open of the local OpenAlex DuckDB. Missing config section
+        // = `None`, tools return a clear error. Missing file = `None` (don't
+        // create here — let `hs openalex` own DB lifecycle).
+        let openalex_db = open_openalex_readonly()
+            .map_err(|e| {
+                tracing::warn!("openalex DB unavailable: {e:#}");
+                e
+            })
+            .ok()
+            .map(|conn| Arc::new(std::sync::Mutex::new(conn)));
+
+        Ok(Self {
             storage,
             events,
             catalog_prefix: "catalog".to_string(),
@@ -302,21 +581,27 @@ impl HomeStillMcp {
             scribe_servers,
             scribe_convert_timeout: std::time::Duration::from_secs(scribe_cfg.convert_timeout_secs),
             distill_servers,
+            openalex_db,
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
-        }
-    }
-
-    fn scribe_client(&self) -> Option<hs_scribe::client::ScribeClient> {
-        self.scribe_servers.first().map(|url| {
-            hs_scribe::client::ScribeClient::new_with_timeout(url, self.scribe_convert_timeout)
         })
     }
 
-    fn distill_client(&self) -> Option<hs_distill::client::DistillClient> {
-        self.distill_servers
-            .first()
-            .map(|url| hs_distill::client::DistillClient::new(url))
+    fn scribe_client(&self) -> anyhow::Result<Option<hs_scribe::client::ScribeClient>> {
+        match self.scribe_servers.first() {
+            Some(url) => Ok(Some(hs_scribe::client::ScribeClient::new_with_timeout(
+                url,
+                self.scribe_convert_timeout,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    fn distill_client(&self) -> anyhow::Result<Option<hs_distill::client::DistillClient>> {
+        match self.distill_servers.first() {
+            Some(url) => Ok(Some(hs_distill::client::DistillClient::new(url)?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -399,6 +684,62 @@ impl HomeStillMcp {
             Ok(Some(paper)) => Ok(serde_json::to_string_pretty(&paper).unwrap_or_default()),
             Ok(None) => Err(format!("No paper found for DOI: {}", p.doi)),
             Err(e) => Err(format!("Lookup failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Return the structured reference list of a paper by DOI. Returns JSON with each reference's DOI, title, year, authors, venue, and citation count. Source: Semantic Scholar Graph API.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn paper_references(
+        &self,
+        Parameters(p): Parameters<PaperReferencesParams>,
+    ) -> Result<String, String> {
+        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
+        let provider = paper::providers::semantic_scholar::SemanticScholarProvider::new(
+            &config.providers.semantic_scholar,
+        )
+        .map_err(|e| format!("Provider error: {e}"))?;
+
+        match provider.references(&p.doi).await {
+            Ok(resp) => Ok(serde_json::to_string_pretty(&resp).unwrap_or_default()),
+            Err(e) => Err(format!("References lookup failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Return the list of papers that cite a given paper by DOI (forward citation chaining). Supports limit (default 100, max 1000) and optional year_from / sort filters. Returns JSON with each citing paper's DOI, title, year, authors, venue, and citation count. Source: Semantic Scholar Graph API.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn paper_citations(
+        &self,
+        Parameters(p): Parameters<PaperCitationsParams>,
+    ) -> Result<String, String> {
+        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
+        let provider = paper::providers::semantic_scholar::SemanticScholarProvider::new(
+            &config.providers.semantic_scholar,
+        )
+        .map_err(|e| format!("Provider error: {e}"))?;
+
+        let opts = paper::providers::semantic_scholar::CitationsOpts {
+            limit: p.limit,
+            year_from: p.year_from,
+            sort: p.sort,
+        };
+
+        match provider.citations(&p.doi, opts).await {
+            Ok(resp) => Ok(serde_json::to_string_pretty(&resp).unwrap_or_default()),
+            Err(e) => Err(format!("Citations lookup failed: {e}")),
         }
     }
 
@@ -514,9 +855,12 @@ impl HomeStillMcp {
             file_size_bytes: Some(result.size_bytes),
             sha256: Some(result.sha256.clone()),
             conversion: None,
+            conversion_failed: None,
             embedding: None,
             embedding_skip: None,
             repair: None,
+            category: None,
+            original_format: None,
         };
         if let Err(e) = hs_common::catalog::write_catalog_entry_via(
             &*self.storage,
@@ -541,7 +885,7 @@ impl HomeStillMcp {
     // ── Catalog Tools ──────────────────────────────────────────
 
     #[tool(
-        description = "List all papers in the catalog with titles, conversion status, and embedded-in-Qdrant status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed.",
+        description = "List all papers in the catalog with titles, conversion status, and embedded-in-Qdrant status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed. Flag semantics: `converted` is true iff markdown exists (converters don't write failure rows — errors propagate and leave no catalog record). `embedded` is true only when Qdrant actually received chunks (`chunks_indexed > 0`).",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -578,8 +922,10 @@ impl HomeStillMcp {
             .map(|(stem, _meta, cat)| {
                 let title = cat.title.unwrap_or_default();
                 let downloaded = cat.downloaded_at.is_some();
+                // `converted` means markdown exists. Converters don't stamp
+                // failure rows — errors propagate and no catalog record is
+                // written, so `conversion.is_some()` is always truthful.
                 let converted = cat.conversion.is_some();
-                let conversion_failed = cat.conversion.as_ref().is_some_and(|c| c.failed);
                 let embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
                 let embedding_skipped = cat.embedding_skip.is_some();
                 let repaired = cat.repair.is_some();
@@ -588,7 +934,6 @@ impl HomeStillMcp {
                     "title": title,
                     "downloaded": downloaded,
                     "converted": converted,
-                    "conversion_failed": conversion_failed,
                     "embedded": embedded,
                     "embedding_skipped": embedding_skipped,
                     "repaired": repaired,
@@ -600,7 +945,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Most recent catalog activity across all papers (download/convert/embed events). One row per event, sorted newest first. Used by the status dashboard's History pane.",
+        description = "Most recent catalog activity (download/convert/embed/embed-skip events). One row per event, sorted newest-first by event timestamp; ties broken by stem so output is deterministic. By default excludes rows whose timestamp is a `catalog_repair` backfill stamp (fingerprint: `downloaded_at == repair.repaired_at`, or synthetic Convert whose `converted_at == repair.repaired_at`) so the feed reflects organic activity. Pass `include_repaired=true` for forensic inspection — repair rows reappear annotated `\"repair\": true`. Used by the status dashboard's History pane.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -610,41 +955,72 @@ impl HomeStillMcp {
     )]
     async fn catalog_recent(
         &self,
-        Parameters(p): Parameters<ListParams>,
+        Parameters(p): Parameters<CatalogRecentParams>,
     ) -> Result<String, String> {
         let triples =
             hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
                 .await
                 .map_err(|e| format!("catalog list failed: {e}"))?;
 
+        let include_repaired = p.include_repaired.unwrap_or(false);
+
         let mut events: Vec<serde_json::Value> = Vec::new();
         for (stem, _meta, entry) in triples {
             let name = entry.title.clone().unwrap_or_else(|| stem.clone());
+            let repair_at: Option<&str> = entry.repair.as_ref().map(|r| r.repaired_at.as_str());
+
             if let Some(ref dl_at) = entry.downloaded_at {
-                let size = entry
-                    .file_size_bytes
-                    .map(|b| b.to_string())
-                    .unwrap_or_default();
-                events.push(serde_json::json!({
-                    "activity": "Download",
-                    "stem": stem,
-                    "name": name,
-                    "detail_bytes": entry.file_size_bytes,
-                    "detail": size,
-                    "at": dl_at,
-                }));
+                // Fingerprint: this `downloaded_at` was stamped by a prior
+                // catalog_repair flag_drift pass. Skip by default so the feed
+                // shows organic activity instead of hundreds of batch-stamped
+                // rows collapsed onto one nanosecond.
+                let is_repair = repair_at == Some(dl_at.as_str());
+                if is_repair && !include_repaired {
+                    // skip
+                } else {
+                    let size = entry
+                        .file_size_bytes
+                        .map(|b| b.to_string())
+                        .unwrap_or_default();
+                    let mut row = serde_json::json!({
+                        "activity": "Download",
+                        "stem": stem,
+                        "name": name,
+                        "detail_bytes": entry.file_size_bytes,
+                        "detail": size,
+                        "at": dl_at,
+                    });
+                    if is_repair {
+                        row["repair"] = serde_json::Value::Bool(true);
+                    }
+                    events.push(row);
+                }
             }
             if let Some(ref conv) = entry.conversion {
-                events.push(serde_json::json!({
-                    "activity": "Convert",
-                    "stem": stem,
-                    "name": name,
-                    "pages": conv.total_pages,
-                    "duration_secs": conv.duration_secs,
-                    "failed": conv.failed,
-                    "reason": conv.reason,
-                    "at": conv.converted_at,
-                }));
+                // Synthetic Convert fingerprint: the flag_drift backfill
+                // stamps `server = "catalog_repair:flag_drift"` and shares the
+                // batch `now()` with `repair.repaired_at`. Matching on both
+                // guards against a real conversion that happened to finish at
+                // the same moment as an unrelated repair on another row.
+                let is_repair = conv.server == "catalog_repair:flag_drift"
+                    && repair_at == Some(conv.converted_at.as_str());
+                if is_repair && !include_repaired {
+                    // skip
+                } else {
+                    let mut row = serde_json::json!({
+                        "activity": "Convert",
+                        "stem": stem,
+                        "name": name,
+                        "pages": conv.total_pages,
+                        "duration_secs": conv.duration_secs,
+                        "server": conv.server,
+                        "at": conv.converted_at,
+                    });
+                    if is_repair {
+                        row["repair"] = serde_json::Value::Bool(true);
+                    }
+                    events.push(row);
+                }
             }
             if let Some(ref emb) = entry.embedding {
                 // TODO: Legacy, deal with it.
@@ -672,10 +1048,15 @@ impl HomeStillMcp {
             }
         }
 
+        // Primary sort: RFC3339 lexicographic DESC. Secondary: stem ASC so
+        // ties (common after batch backfills) produce a stable, readable
+        // order instead of whatever the storage `list` happened to return.
         events.sort_by(|a, b| {
             let a_at = a.get("at").and_then(|v| v.as_str()).unwrap_or("");
             let b_at = b.get("at").and_then(|v| v.as_str()).unwrap_or("");
-            b_at.cmp(a_at)
+            let a_stem = a.get("stem").and_then(|v| v.as_str()).unwrap_or("");
+            let b_stem = b.get("stem").and_then(|v| v.as_str()).unwrap_or("");
+            b_at.cmp(a_at).then_with(|| a_stem.cmp(b_stem))
         });
         let limit = p.limit.unwrap_or(30);
         events.truncate(limit);
@@ -702,6 +1083,7 @@ impl HomeStillMcp {
             &p.stem,
         )
         .await
+        .map_err(|e| e.to_string())?
         {
             Some(entry) => Ok(serde_json::to_string_pretty(&entry).unwrap_or_default()),
             None => Err(format!("No catalog entry found for '{}'", p.stem)),
@@ -709,60 +1091,125 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Reconcile catalog ↔ storage in six directions. Forward: document files (PDFs/HTML) on disk with no catalog row → synthesize minimal catalog entries (carry a `repair` block). Reverse (catalog_no_markdown): catalog rows that claim a successful conversion but whose markdown object is missing → clear the stale `conversion` / `embedding` / `embedding_skip` blocks and purge any stranded Qdrant points so the row re-enters the convert queue (original `downloaded_at` / `sha256` / etc preserved). Phantom (catalog_no_source): catalog rows with neither a paper file nor a markdown in storage → delete the row outright (the YAML is the last trace; with no source to re-derive from, it's unreachable). Flag-drift: rows whose stage flags disagree with storage evidence → backfill the missing stamp without deleting. Md-path-drift: rows whose `markdown_path` points to a stale key (pre-`bc2b6fb` unsharded layout) or is absent while the file exists under a different key → rewrite `markdown_path` to the real storage location (non-destructive). Stuck-convert: rows with a paper file but no conversion stamp → purge any ghost Qdrant points and re-publish `papers.ingested` so the event-watch daemon converts + embeds. Use `dry_run=true` first to see counts in all six directions.",
+        description = "Reports catalog ↔ storage reconciliation in seven directions (forward disk orphans, catalog_no_markdown, catalog_no_source phantoms, flag-drift, flag-drift-resync, md-path-drift, stuck-convert). DRY-RUN ONLY from MCP: the apply path was removed in rc.306 — use `hs distill reconcile --fix-stamps --reembed` or the planned `hs catalog repair --apply` CLI for the write path. Any `dry_run=false` argument is ignored with a notice in the response.",
         annotations(
-            read_only_hint = false,
-            destructive_hint = true,
+            read_only_hint = true,
+            destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
         )
     )]
     async fn catalog_repair(
         &self,
-        Parameters(p): Parameters<CatalogRepairParams>,
+        Parameters(mut p): Parameters<CatalogRepairParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        // Forward direction: files on disk with no catalog row.
-        let disk_orphans = hs_common::status::list_orphan_document_stems(
+        // rc.306 P0-6: MCP is a read-only surface. Any client-supplied
+        // `dry_run=false` is ignored; the apply path lives in the CLI.
+        let client_wanted_apply = !p.dry_run;
+        p.dry_run = true;
+        let _ = client_wanted_apply; // surfaced in the response via hint
+                                     // One shared pass over all three prefixes — 3 concurrent LISTs and
+                                     // bounded-concurrency parallel GETs of every catalog YAML. Replaces
+                                     // the pre-fix "7 serial scans × (1 LIST + N serial GETs)" shape
+                                     // whose cost at 3k+ rows exceeded the MCP 4-minute client budget
+                                     // even under dry_run. Every scan below reads the same snapshot, so
+                                     // dry-run and live-repair walk identical scan code.
+        let progress_token = context.meta.get_progress_token();
+        let peer = context.peer.clone();
+
+        let progress_token_for_fetch = progress_token.clone();
+        let peer_for_fetch = peer.clone();
+        let on_fetch_progress = move |done: usize, total: usize| {
+            let Some(token) = progress_token_for_fetch.clone() else {
+                return;
+            };
+            let peer = peer_for_fetch.clone();
+            tokio::spawn(async move {
+                let params = ProgressNotificationParam::new(token, done as f64)
+                    .with_message(format!("catalog snapshot: {done}/{total}"))
+                    .with_total(total as f64);
+                if let Err(e) = peer.notify_progress(params).await {
+                    tracing::warn!(error = %e, "catalog_repair snapshot notify_progress failed");
+                }
+            });
+        };
+
+        let snapshot = hs_common::status::build_repair_snapshot(
             &*self.storage,
             &self.papers_prefix,
             &self.catalog_prefix,
+            &self.markdown_prefix,
+            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
+            on_fetch_progress,
         )
         .await
-        .map_err(|e| format!("disk-orphan scan failed: {e}"))?;
+        .map_err(|e| format!("snapshot build failed: {e}"))?;
+
+        // Per-phase progress ping so the client timer resets between scans
+        // and the operator can see which phase is running. The scans
+        // themselves are pure in-memory filters over the snapshot — this
+        // is heartbeat + visibility, not pacing.
+        let emit_scan_phase = |phase: u64, name: &str| {
+            let Some(token) = progress_token.clone() else {
+                return;
+            };
+            let peer = peer.clone();
+            let name = name.to_string();
+            tokio::spawn(async move {
+                let params = ProgressNotificationParam::new(token, phase as f64)
+                    .with_message(format!("scan {phase}/7: {name}"))
+                    .with_total(7.0);
+                if let Err(e) = peer.notify_progress(params).await {
+                    tracing::warn!(error = %e, "catalog_repair scan-phase notify_progress failed");
+                }
+            });
+        };
+
+        // Forward direction: files on disk with no catalog row.
+        emit_scan_phase(1, "disk orphans");
+        let disk_orphans =
+            hs_common::status::list_orphan_document_stems(&snapshot.papers, &snapshot.catalog);
 
         // Reverse direction: catalog claims converted but markdown is gone.
+        emit_scan_phase(2, "catalog rows without markdown");
         let md_orphans = hs_common::status::list_catalog_rows_without_markdown(
-            &*self.storage,
-            &self.catalog_prefix,
-            &self.markdown_prefix,
-        )
-        .await
-        .map_err(|e| format!("markdown-orphan scan failed: {e}"))?;
+            &snapshot.catalog,
+            &snapshot.markdown,
+        );
 
         // Phantom direction: catalog row with neither a paper file nor a
         // markdown file. These inflate `catalog_entries` above `documents`
         // in the pipeline rollup and have no reachable payload anywhere —
         // safe to delete once confirmed via dry-run.
+        emit_scan_phase(3, "phantom orphans");
         let phantom_orphans = hs_common::status::list_catalog_rows_without_source(
-            &*self.storage,
-            &self.papers_prefix,
-            &self.catalog_prefix,
-            &self.markdown_prefix,
-        )
-        .await
-        .map_err(|e| format!("phantom-orphan scan failed: {e}"))?;
+            &snapshot.papers,
+            &snapshot.catalog,
+            &snapshot.markdown,
+        );
 
         // Flag-drift direction: catalog row where a stage flag is missing but
         // the storage evidence for that stage exists. Backfills without
         // deleting — unlike the three directions above, which clear or synth.
+        emit_scan_phase(4, "flag drift");
         let drift_rows = hs_common::status::list_catalog_flag_drift(
-            &*self.storage,
-            &self.papers_prefix,
-            &self.catalog_prefix,
-            &self.markdown_prefix,
-        )
-        .await
-        .map_err(|e| format!("flag-drift scan failed: {e}"))?;
+            &snapshot.papers,
+            &snapshot.catalog,
+            &snapshot.markdown,
+        );
+
+        // Flag-drift-resync direction: rows still wearing the fingerprint of a
+        // prior flag_drift batch stamp (`downloaded_at == repair.repaired_at` or
+        // synthetic Convert whose `converted_at == repair.repaired_at`). Rewrite
+        // to the storage object's `last_modified` so the activity feed stops
+        // showing hundreds of rows collapsed onto one nanosecond.
+        emit_scan_phase(5, "flag drift resync");
+        let resync_rows = hs_common::status::list_catalog_flag_drift_resync_candidates(
+            &snapshot.papers,
+            &snapshot.catalog,
+            &snapshot.markdown,
+        );
 
         // Md-path-drift direction: catalog `markdown_path` disagrees with
         // where the markdown actually lives. Post-`bc2b6fb` the physical
@@ -771,13 +1218,11 @@ impl HomeStillMcp {
         // resolver that trusts `markdown_path` probes a stale key and
         // reports a ghost orphan. Rewrites the catalog field to the real
         // storage key (non-destructive; does not touch markdown or Qdrant).
+        emit_scan_phase(6, "md_path drift");
         let md_path_drift_rows = hs_common::status::list_catalog_rows_with_md_path_drift(
-            &*self.storage,
-            &self.catalog_prefix,
-            &self.markdown_prefix,
-        )
-        .await
-        .map_err(|e| format!("md-path-drift scan failed: {e}"))?;
+            &snapshot.catalog,
+            &snapshot.markdown,
+        );
 
         // Stuck-convert direction: catalog has a PDF/HTML source on disk but
         // no `conversion` stamp. Re-queues via the event bus rather than an
@@ -787,13 +1232,9 @@ impl HomeStillMcp {
         // prior cycle whose markdown was later deleted) also get purged
         // here so the re-index writes fresh points instead of mixing with
         // stale ones.
-        let stuck_rows = hs_common::status::list_catalog_stuck_convert(
-            &*self.storage,
-            &self.papers_prefix,
-            &self.catalog_prefix,
-        )
-        .await
-        .map_err(|e| format!("stuck-convert scan failed: {e}"))?;
+        emit_scan_phase(7, "stuck convert");
+        let stuck_rows =
+            hs_common::status::list_catalog_stuck_convert(&snapshot.papers, &snapshot.catalog);
 
         let disk_total = disk_orphans.len();
         let md_total = md_orphans.len();
@@ -811,6 +1252,15 @@ impl HomeStillMcp {
             .iter()
             .filter(|r| r.download_stamp_missing_with_source)
             .count();
+        let resync_total = resync_rows.len();
+        let resync_download_total = resync_rows
+            .iter()
+            .filter(|r| r.resync_download.is_some())
+            .count();
+        let resync_conversion_total = resync_rows
+            .iter()
+            .filter(|r| r.resync_conversion.is_some())
+            .count();
         let limit = p.limit.unwrap_or(usize::MAX);
         let disk_samples: Vec<String> = disk_orphans
             .iter()
@@ -821,6 +1271,11 @@ impl HomeStillMcp {
         let phantom_samples: Vec<String> = phantom_orphans.iter().take(10).cloned().collect();
         let drift_samples: Vec<String> =
             drift_rows.iter().take(10).map(|r| r.stem.clone()).collect();
+        let resync_samples: Vec<String> = resync_rows
+            .iter()
+            .take(10)
+            .map(|r| r.stem.clone())
+            .collect();
         let md_path_drift_samples: Vec<serde_json::Value> = md_path_drift_rows
             .iter()
             .take(10)
@@ -862,6 +1317,12 @@ impl HomeStillMcp {
                     "would_backfill_downloaded_at": drift_download_total.min(limit),
                     "samples": drift_samples,
                 },
+                "flag_drift_resync": {
+                    "candidates_found": resync_total,
+                    "would_resync_downloaded_at": resync_download_total.min(limit),
+                    "would_resync_conversion": resync_conversion_total.min(limit),
+                    "samples": resync_samples,
+                },
                 "md_path_drift": {
                     "drift_found": md_path_drift_total,
                     "would_rewrite": md_path_drift_rows.iter().take(limit).count(),
@@ -892,6 +1353,7 @@ impl HomeStillMcp {
                 stem,
             )
             .await
+            .map_err(|e| e.to_string())?
             .unwrap_or_default();
             if entry.pdf_path.is_none() {
                 entry.pdf_path = Some(format!(
@@ -925,7 +1387,7 @@ impl HomeStillMcp {
         // sha256 / file_size_bytes untouched — that data is still
         // authoritative and lets the convert queue re-pick the row without
         // re-downloading.
-        let distill_client_for_purge = self.distill_client();
+        let distill_client_for_purge = self.distill_client().map_err(|e| e.to_string())?;
         let mut md_qdrant_purged = 0u64;
         for stem in md_orphans.iter().take(limit) {
             let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
@@ -934,6 +1396,7 @@ impl HomeStillMcp {
                 stem,
             )
             .await
+            .map_err(|e| e.to_string())?
             else {
                 errors.push(format!("md/{stem}: catalog entry vanished mid-repair"));
                 continue;
@@ -999,6 +1462,13 @@ impl HomeStillMcp {
         // record that the metadata came from repair so operators can tell
         // organic stamps from repair stamps, and re-run `distill_reindex`
         // if they need accurate page offsets.
+        //
+        // Stamp values come from the source object's `last_modified` (S3
+        // LastModified / fs mtime) — NOT a shared batch `now()`. The prior
+        // behavior collapsed every repaired row onto one nanosecond, which
+        // poisoned `catalog_recent` for gap detection. `now` is used only
+        // for `RepairMeta.repaired_at`, which legitimately reflects when
+        // the repair itself ran.
         let mut drift_conversion_repaired = 0u64;
         let mut drift_download_repaired = 0u64;
         for row in drift_rows.iter().take(limit) {
@@ -1008,6 +1478,7 @@ impl HomeStillMcp {
                 &row.stem,
             )
             .await
+            .map_err(|e| e.to_string())?
             else {
                 errors.push(format!(
                     "drift/{}: catalog entry vanished mid-repair",
@@ -1017,23 +1488,26 @@ impl HomeStillMcp {
             };
             let mut changed = false;
             if row.conversion_missing_with_markdown && entry.conversion.is_none() {
+                let converted_at = row
+                    .markdown_last_modified
+                    .map(system_time_to_rfc3339)
+                    .unwrap_or_else(|| now.clone());
                 entry.conversion = Some(hs_common::catalog::ConversionMeta {
                     server: "catalog_repair:flag_drift".to_string(),
                     duration_secs: 0.0,
                     total_pages: 0,
-                    converted_at: now.clone(),
+                    converted_at,
                     pages: Vec::new(),
-                    failed: false,
-                    reason: Some(
-                        "backfilled by flag_drift repair; markdown existed without conversion stamp"
-                            .to_string(),
-                    ),
                 });
                 drift_conversion_repaired += 1;
                 changed = true;
             }
             if row.download_stamp_missing_with_source && entry.downloaded_at.is_none() {
-                entry.downloaded_at = Some(now.clone());
+                let downloaded_at = row
+                    .source_last_modified
+                    .map(system_time_to_rfc3339)
+                    .unwrap_or_else(|| now.clone());
+                entry.downloaded_at = Some(downloaded_at);
                 drift_download_repaired += 1;
                 changed = true;
             }
@@ -1056,6 +1530,65 @@ impl HomeStillMcp {
             }
         }
 
+        // Flag-drift-resync: for rows whose timestamps still carry a prior
+        // batch `now()` stamp, rewrite `downloaded_at` / synthetic Convert
+        // `converted_at` to the storage `last_modified`. Leaves `entry.repair`
+        // intact so the audit trail of "this came from a backfill" survives.
+        let mut resync_download_repaired = 0u64;
+        let mut resync_conversion_repaired = 0u64;
+        for row in resync_rows.iter().take(limit) {
+            let Some(mut entry) = hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &row.stem,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            else {
+                errors.push(format!(
+                    "resync/{}: catalog entry vanished mid-repair",
+                    row.stem
+                ));
+                continue;
+            };
+            // Re-verify the fingerprint on the freshly-read entry — guards
+            // against the row being rewritten by another process between scan
+            // and repair.
+            let Some(repair_at) = entry.repair.as_ref().map(|r| r.repaired_at.clone()) else {
+                continue;
+            };
+            let mut changed = false;
+            if let Some(mtime) = row.resync_download {
+                if entry.downloaded_at.as_deref() == Some(repair_at.as_str()) {
+                    entry.downloaded_at = Some(system_time_to_rfc3339(mtime));
+                    resync_download_repaired += 1;
+                    changed = true;
+                }
+            }
+            if let Some(mtime) = row.resync_conversion {
+                if let Some(conv) = entry.conversion.as_mut() {
+                    if conv.server == "catalog_repair:flag_drift" && conv.converted_at == repair_at
+                    {
+                        conv.converted_at = system_time_to_rfc3339(mtime);
+                        resync_conversion_repaired += 1;
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                if let Err(e) = hs_common::catalog::write_catalog_entry_via(
+                    &*self.storage,
+                    &self.catalog_prefix,
+                    &row.stem,
+                    &entry,
+                )
+                .await
+                {
+                    errors.push(format!("resync/{}: {e}", row.stem));
+                }
+            }
+        }
+
         // Md-path-drift repair: rewrite `markdown_path` to the real storage
         // key. Non-destructive — does not touch markdown objects or Qdrant.
         // Eliminates the 2026-04 ghost-orphan class where every reconcile
@@ -1068,6 +1601,7 @@ impl HomeStillMcp {
                 &d.stem,
             )
             .await
+            .map_err(|e| e.to_string())?
             else {
                 errors.push(format!(
                     "md_path_drift/{}: catalog entry vanished mid-repair",
@@ -1160,6 +1694,12 @@ impl HomeStillMcp {
                 "downloaded_at_backfilled": drift_download_repaired,
                 "samples": drift_samples,
             },
+            "flag_drift_resync": {
+                "candidates_found": resync_total,
+                "downloaded_at_resynced": resync_download_repaired,
+                "conversion_resynced": resync_conversion_repaired,
+                "samples": resync_samples,
+            },
             "md_path_drift": {
                 "drift_found": md_path_drift_total,
                 "rewritten": md_path_drift_repaired,
@@ -1179,18 +1719,23 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Find and remove URL-encoded duplicate stems. When a PDF is ingested twice — once with the original filename containing unicode or unsafe chars, once with the URL-encoded form (e.g., `Anna%E2%80%99s Archive` + `Anna's Archive`) — both markdown objects get written and the decoded-form is usually the one that embeds. The encoded-form is a ghost: it may have a catalog row with only `embedding_skip`, a markdown in storage, and no Qdrant points. This tool finds pairs where both an encoded stem and its decoded twin exist as markdown, confirms the decoded twin is the one that was indexed, and deletes the encoded-form catalog row, markdown object, and any stray Qdrant points. Default is dry-run.",
+        description = "Reports URL-encoded duplicate stems (encoded-form + decoded-form pairs where the decoded twin is the one actually indexed). DRY-RUN ONLY from MCP: the apply path was removed in rc.306 — use the planned `hs catalog dedupe-url-encoded --apply` CLI for the write path. Any `dry_run=false` argument is ignored with a notice in the response.",
         annotations(
-            read_only_hint = false,
-            destructive_hint = true,
+            read_only_hint = true,
+            destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
         )
     )]
     async fn dedupe_url_encoded(
         &self,
-        Parameters(p): Parameters<DedupeUrlEncodedParams>,
+        Parameters(_p): Parameters<DedupeUrlEncodedParams>,
     ) -> Result<String, String> {
+        // rc.306 P0-6: MCP is a read-only surface. The caller's dry_run
+        // argument is intentionally ignored — this handler always reports
+        // without writing; the apply path lives in the (CLI-only) future
+        // `hs catalog dedupe-url-encoded --apply`.
+        let dry_run_forced = true;
         // Enumerate all markdown stems.
         let markdown = self
             .storage
@@ -1235,75 +1780,15 @@ impl HomeStillMcp {
             .map(|(e, d)| serde_json::json!({"encoded": e, "decoded": d}))
             .collect();
 
-        if p.dry_run {
-            return Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "dry_run": true,
-                "pairs_found": total,
-                "would_delete_encoded_rows": total,
-                "samples": samples,
-            }))
-            .unwrap_or_default());
-        }
-
-        let mut md_deleted = 0u64;
-        let mut md_missing = 0u64;
-        let mut cat_deleted = 0u64;
-        let mut errors: Vec<String> = Vec::new();
-
-        for (encoded, _decoded) in &pairs {
-            // 1. Delete the markdown storage object. Object-store's S3 bulk
-            // DeleteObjects path re-URL-encodes keys that already contain
-            // percent-sequences, producing a 404 — tolerate that, since the
-            // objective is to break the Embed/EmbedSkip loop, which the
-            // catalog-row delete alone accomplishes.
-            let md_key = format!(
-                "{}/{}",
-                self.markdown_prefix.trim_end_matches('/'),
-                hs_common::sharded_key(encoded, "md")
-            );
-            match self.storage.delete(&md_key).await {
-                Ok(()) => md_deleted += 1,
-                Err(e) => {
-                    let msg = format!("{e}");
-                    if msg.contains("NoSuchKey") || msg.contains("404") {
-                        md_missing += 1;
-                    } else {
-                        errors.push(format!("md/{encoded}: {msg}"));
-                    }
-                }
-            }
-
-            // 2. Delete the catalog YAML row. This is the load-bearing
-            // operation — with no row, the reconciler won't try to re-embed
-            // the encoded stem, and the Embed/EmbedSkip loop breaks.
-            match hs_common::catalog::delete_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                encoded,
-            )
-            .await
-            {
-                Ok(()) => cat_deleted += 1,
-                Err(e) => errors.push(format!("cat/{encoded}: {e}")),
-            }
-
-            // Deliberately NOT calling distill.delete_doc here: the reqwest
-            // client URL-encodes the path segment, axum URL-decodes it twice
-            // in the server router, and the encoded stem's doc_id round-
-            // trips to the decoded twin's doc_id — deleting the wrong (good)
-            // embeddings. Since the reconciler has already confirmed the
-            // encoded form is embed_missing, there's nothing to clean up in
-            // Qdrant anyway.
-        }
-
+        // rc.306 P0-6: apply path is CLI-only. MCP emits the report and stops.
+        let _ = dry_run_forced;
         Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "dry_run": false,
+            "dry_run": true,
+            "mcp_forced_dry_run": true,
+            "apply_hint": "use `hs catalog dedupe-url-encoded --apply` (CLI-only) for the write path",
             "pairs_found": total,
-            "markdown_deleted": md_deleted,
-            "markdown_already_missing": md_missing,
-            "catalog_rows_deleted": cat_deleted,
+            "would_delete_encoded_rows": total,
             "samples": samples,
-            "errors": errors,
         }))
         .unwrap_or_default())
     }
@@ -1340,6 +1825,7 @@ impl HomeStillMcp {
                 &stem,
             )
             .await
+            .map_err(|e| e.to_string())?
             .and_then(|c| c.conversion)
             .map(|cv| cv.total_pages)
             .unwrap_or(0);
@@ -1538,7 +2024,10 @@ impl HomeStillMcp {
         )
     )]
     async fn scribe_health(&self) -> Result<String, String> {
-        let client = self.scribe_client().ok_or("No scribe server configured")?;
+        let client = self
+            .scribe_client()
+            .map_err(|e| e.to_string())?
+            .ok_or("No scribe server configured")?;
 
         let health = client.health().await.ok();
         let readiness = client.readiness().await.ok();
@@ -1564,117 +2053,115 @@ impl HomeStillMcp {
         Parameters(p): Parameters<ScribeConvertParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        let pdf_key = hs_common::sharded_key(&p.stem, "pdf");
-        let html_key = hs_common::sharded_key(&p.stem, "html");
+        let pdf_key = format!(
+            "{}/{}",
+            self.papers_prefix.trim_end_matches('/'),
+            hs_common::sharded_key(&p.stem, "pdf"),
+        );
+        let html_key = format!(
+            "{}/{}",
+            self.papers_prefix.trim_end_matches('/'),
+            hs_common::sharded_key(&p.stem, "html"),
+        );
+        let epub_key = format!(
+            "{}/{}",
+            self.papers_prefix.trim_end_matches('/'),
+            hs_common::sharded_key(&p.stem, "epub"),
+        );
 
         let start = std::time::Instant::now();
-        let (md, source_key, server_label) = if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await
-        {
-            let client = self.scribe_client().ok_or("No scribe server configured")?;
-            // Stream scribe's per-page progress through the MCP peer as
-            // notifications/progress events. Each event resets Claude
-            // Desktop's 4-min tool-call timeout, so multi-page PDFs that
-            // take longer than 240s end-to-end can complete.
-            let progress_token = context.meta.get_progress_token();
-            let peer = context.peer.clone();
-            let stem_for_progress = p.stem.clone();
-            let on_progress = move |event: hs_scribe::client::ProgressEvent| {
-                let Some(token) = progress_token.clone() else {
-                    return;
+        // Dispatch by source type — one path per file extension. No
+        // fallback between types; if the named source isn't present, we
+        // error loudly instead of silently converting something else.
+        let (md, per_page_region_classes, source_key, server_label) =
+            if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await {
+                let client = self
+                    .scribe_client()
+                    .map_err(|e| e.to_string())?
+                    .ok_or("No scribe server configured")?;
+                // Stream scribe's per-page progress through the MCP peer as
+                // notifications/progress events. Each event resets Claude
+                // Desktop's 4-min tool-call timeout, so multi-page PDFs that
+                // take longer than 240s end-to-end can complete.
+                let progress_token = context.meta.get_progress_token();
+                let peer = context.peer.clone();
+                let stem_for_progress = p.stem.clone();
+                let on_progress = move |event: hs_scribe::client::ProgressEvent| {
+                    let Some(token) = progress_token.clone() else {
+                        return;
+                    };
+                    let peer = peer.clone();
+                    let stem = stem_for_progress.clone();
+                    tokio::spawn(async move {
+                        let mut params = ProgressNotificationParam::new(token, event.page as f64)
+                            .with_message(format!(
+                                "{stem}: {} {}/{}",
+                                event.stage, event.page, event.total_pages
+                            ));
+                        if event.total_pages > 0 {
+                            params = params.with_total(event.total_pages as f64);
+                        }
+                        if let Err(e) = peer.notify_progress(params).await {
+                            tracing::warn!(stem = %stem, error = %e, "notify_progress failed");
+                        }
+                    });
                 };
-                let peer = peer.clone();
-                let stem = stem_for_progress.clone();
-                tokio::spawn(async move {
-                    let mut params = ProgressNotificationParam::new(token, event.page as f64)
-                        .with_message(format!(
-                            "{stem}: {} {}/{}",
-                            event.stage, event.page, event.total_pages
-                        ));
-                    if event.total_pages > 0 {
-                        params = params.with_total(event.total_pages as f64);
-                    }
-                    if let Err(e) = peer.notify_progress(params).await {
-                        tracing::warn!(stem = %stem, error = %e, "notify_progress failed");
-                    }
-                });
-            };
-            let md = client
-                .convert_with_progress(pdf_bytes, on_progress)
-                .await
-                .map_err(|e| format!("Conversion failed: {e}"))?;
-            let server_url = self
-                .scribe_servers
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            let short = server_url
-                .strip_prefix("http://")
-                .or_else(|| server_url.strip_prefix("https://"))
-                .unwrap_or(server_url);
-            (md, pdf_key, short.to_string())
-        } else if let Ok(html_bytes) = self.storage.get(&html_key).await {
-            let html = String::from_utf8(html_bytes)
-                .map_err(|e| format!("HTML at {html_key} is not valid UTF-8: {e}"))?;
-            let md = hs_scribe::html::convert_html_to_markdown(&html);
-            (md, html_key, "local-html".to_string())
-        } else {
-            return Err(format!(
-                "No PDF or HTML found for '{}' (tried {pdf_key} and {html_key})",
+                let conversion = client
+                    .convert_with_progress(pdf_bytes, None, Some(p.stem.as_str()), on_progress)
+                    .await
+                    .map_err(|e| format!("Conversion failed: {e}"))?;
+                (
+                    conversion.markdown,
+                    conversion.per_page_region_classes,
+                    pdf_key,
+                    "scribe-vlm".to_string(),
+                )
+            } else if let Ok(html_bytes) = self.storage.get(&html_key).await {
+                let html = String::from_utf8(html_bytes)
+                    .map_err(|e| format!("HTML at {html_key} is not valid UTF-8: {e}"))?;
+                let md = hs_scribe::html::convert_html_to_markdown(&html);
+                (md, Vec::new(), html_key, "html-parser".to_string())
+            } else if let Ok(epub_bytes) = self.storage.get(&epub_key).await {
+                let md = hs_scribe::epub::convert_epub_to_markdown(&epub_bytes)
+                    .map_err(|e| format!("EPUB parse failed for {epub_key}: {e}"))?;
+                (md, Vec::new(), epub_key, "epub-parser".to_string())
+            } else {
+                return Err(format!(
+                "No PDF, HTML, or EPUB found for '{}' (tried {pdf_key}, {html_key}, {epub_key})",
                 p.stem
             ));
-        };
+            };
         let duration_secs = start.elapsed().as_secs_f64();
 
-        let (md, truncations) = hs_scribe::postprocess::clean_repetitions(&md);
+        let longest_run = hs_scribe::postprocess::longest_repeated_run_bytes(&md);
+        let (md, per_page_truncations) = hs_scribe::postprocess::clean_repetitions_per_page(&md);
+        let truncations: usize = per_page_truncations.iter().map(|t| t.total()).sum();
         if truncations > 0 {
             tracing::info!("{}: cleaned {} repetition site(s)", p.stem, truncations);
         }
 
         let page_offsets = hs_common::catalog::compute_page_offsets(&md);
         let total_pages = page_offsets.len() as u64;
+        let per_page_is_bibliography: Vec<bool> = (0..per_page_truncations.len())
+            .map(|i| {
+                per_page_region_classes
+                    .get(i)
+                    .map(|classes| hs_scribe::postprocess::is_bibliography_page(classes))
+                    .unwrap_or(false)
+            })
+            .collect();
 
-        if hs_scribe::postprocess::qc_verdict(truncations, total_pages)
-            == hs_scribe::postprocess::QcVerdict::RejectLoop
+        // VLM repetition-loop check: propagate as a hard error. No catalog
+        // row is written — operator sees it in MCP error response + logs.
+        if hs_scribe::postprocess::qc_verdict(
+            &per_page_truncations,
+            &per_page_is_bibliography,
+            longest_run,
+        ) == hs_scribe::postprocess::QcVerdict::RejectLoop
         {
-            if let Err(e) = hs_common::catalog::update_conversion_failed_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &p.stem,
-                &server_label,
-                duration_secs,
-                total_pages,
-                "repetition_loop",
-            )
-            .await
-            {
-                tracing::warn!("failed-conversion catalog stamp failed for {}: {e}", p.stem);
-            }
             return Err(format!(
-                "{}: VLM repetition loop ({} truncation site(s) across {} page(s)) — not persisted",
-                p.stem, truncations, total_pages
-            ));
-        }
-
-        if hs_scribe::postprocess::is_stub_pdf(total_pages, &md, duration_secs) {
-            // Record the failure on the catalog so the doc isn't silently
-            // retried by every backfill pass, and so it's visible in
-            // `catalog_list` via the `conversion_failed` flag.
-            if let Err(e) = hs_common::catalog::update_conversion_failed_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &p.stem,
-                &server_label,
-                duration_secs,
-                total_pages,
-                "stub_document",
-            )
-            .await
-            {
-                tracing::warn!("failed-conversion catalog stamp failed for {}: {e}", p.stem);
-            }
-            return Err(format!(
-                "{}: stub document (≤1 page, <500 non-whitespace chars or sub-second convert) — not persisted",
-                p.stem
+                "{}: VLM repetition loop ({} truncation site(s), longest_run={}B across {} page(s)) — not persisted",
+                p.stem, truncations, longest_run, total_pages
             ));
         }
 
@@ -1752,11 +2239,13 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         let filters = hs_distill::client::SearchFilters {
             year: p.year,
             topic: None,
+            category: None,
         };
 
         match client
@@ -1780,6 +2269,7 @@ impl HomeStillMcp {
     async fn distill_status(&self) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         let health = client.health().await.ok();
@@ -1807,6 +2297,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         match client.doc_exists(&p.doc_id).await {
@@ -1834,6 +2325,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         // Load the catalog entry first so we can prefer the exact key scribe
@@ -1846,7 +2338,8 @@ impl HomeStillMcp {
             &self.catalog_prefix,
             &p.stem,
         )
-        .await;
+        .await
+        .map_err(|e| e.to_string())?;
 
         let key = hs_common::markdown::resolve_markdown_key_verified(
             &*self.storage,
@@ -1898,37 +2391,15 @@ impl HomeStillMcp {
         }
     }
 
-    #[tool(
-        description = "Delete every Qdrant chunk for a given doc_id. Use to clear orphaned vectors after markdown has been removed, or to force a clean re-index.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn distill_purge(
-        &self,
-        Parameters(p): Parameters<DistillPurgeParams>,
-    ) -> Result<String, String> {
-        let client = self
-            .distill_client()
-            .ok_or("No distill server configured")?;
-        match client.delete_doc(&p.doc_id).await {
-            Ok(deleted) => Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "doc_id": p.doc_id,
-                "deleted": deleted,
-            }))
-            .unwrap_or_default()),
-            Err(e) => Err(format!("Purge failed: {e}")),
-        }
-    }
+    // distill_purge: removed in rc.306. Bulk-delete is CLI-only via
+    // `hs distill purge <doc_id>`. Agents can no longer reach the
+    // write path through MCP.
 
     #[tool(
-        description = "Reconcile Qdrant against markdown storage: find doc_ids whose markdown object is missing and optionally delete them. Defaults to dry_run=true — pass dry_run=false to actually delete.",
+        description = "Reports Qdrant doc_ids whose markdown object is missing. DRY-RUN ONLY from MCP: the delete path was removed in rc.306 — use `hs distill reconcile --reembed` or `hs distill purge <doc_id>` for the write path. Any `dry_run=false` argument is ignored with a notice in the response.",
         annotations(
-            read_only_hint = false,
-            destructive_hint = true,
+            read_only_hint = true,
+            destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
         )
@@ -1937,8 +2408,13 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<DistillReconcileParams>,
     ) -> Result<String, String> {
+        // rc.306 P0-6: MCP is read-only. The caller's dry_run argument
+        // is ignored; the delete path lives in `hs distill reconcile`
+        // (existing CLI) and `hs distill purge <doc_id>`.
+        let _ = p.dry_run;
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
         let limit = p.limit.unwrap_or(100_000);
         let doc_ids = client
@@ -1948,15 +2424,13 @@ impl HomeStillMcp {
 
         let mut orphans: Vec<String> = Vec::new();
         for doc_id in &doc_ids {
-            // Consult the catalog for an authoritative markdown_path first.
-            // Pre-rc.241 rows can have an unsharded path; without this lookup
-            // we'd flag them as ghost orphans even though the object exists.
             let catalog_entry = hs_common::catalog::read_catalog_entry_via(
                 &*self.storage,
                 &self.catalog_prefix,
                 doc_id,
             )
-            .await;
+            .await
+            .map_err(|e| e.to_string())?;
             let key = hs_common::markdown::resolve_markdown_key_verified(
                 &*self.storage,
                 &self.markdown_prefix,
@@ -1971,22 +2445,14 @@ impl HomeStillMcp {
             }
         }
 
-        let mut deleted_total: u64 = 0;
-        if !p.dry_run {
-            for doc_id in &orphans {
-                match client.delete_doc(doc_id).await {
-                    Ok(n) => deleted_total += n,
-                    Err(e) => tracing::warn!("purge {doc_id} failed: {e}"),
-                }
-            }
-        }
-
         Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "dry_run": p.dry_run,
+            "dry_run": true,
+            "mcp_forced_dry_run": true,
+            "apply_hint": "use `hs distill reconcile --reembed` or `hs distill purge <doc_id>` (CLI-only) for the delete path",
             "scanned_doc_ids": doc_ids.len(),
             "orphan_count": orphans.len(),
             "orphans": orphans,
-            "points_deleted": deleted_total,
+            "points_deleted": 0,
         }))
         .unwrap_or_default())
     }
@@ -2036,7 +2502,8 @@ impl HomeStillMcp {
                     continue;
                 }
             };
-            let (cleaned, truncations) = hs_scribe::postprocess::clean_repetitions(&original);
+            let (cleaned, breakdown) = hs_scribe::postprocess::clean_repetitions(&original);
+            let truncations = breakdown.total();
             if truncations <= threshold {
                 continue;
             }
@@ -2053,6 +2520,7 @@ impl HomeStillMcp {
                 "stem": stem,
                 "key": obj.key,
                 "truncations": truncations,
+                "truncations_by_pass": breakdown,
                 "offending_snippet": snippet,
             }));
         }
@@ -2081,6 +2549,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         let deleted = client
@@ -2095,7 +2564,8 @@ impl HomeStillMcp {
             &self.catalog_prefix,
             &p.stem,
         )
-        .await;
+        .await
+        .map_err(|e| e.to_string())?;
 
         let key = hs_common::markdown::resolve_markdown_key_verified(
             &*self.storage,
@@ -2164,7 +2634,7 @@ impl HomeStillMcp {
         let candidates: Vec<String> = triples
             .into_iter()
             .filter_map(|(stem, _meta, cat)| {
-                let converted = cat.conversion.as_ref().is_some_and(|c| !c.failed);
+                let converted = cat.conversion.is_some();
                 let already_embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
                 let was_skipped = cat.embedding_skip.is_some();
                 if !converted || already_embedded {
@@ -2194,6 +2664,7 @@ impl HomeStillMcp {
 
         let client = self
             .distill_client()
+            .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
         let mut indexed = 0u64;
@@ -2206,7 +2677,8 @@ impl HomeStillMcp {
                 &self.catalog_prefix,
                 stem,
             )
-            .await;
+            .await
+            .map_err(|e| e.to_string())?;
             let key = hs_common::markdown::resolve_markdown_key_verified(
                 &*self.storage,
                 &self.markdown_prefix,
@@ -2261,10 +2733,17 @@ impl HomeStillMcp {
         .unwrap_or_default())
     }
 
-    // ── System Tools ───────────────────────────────────────────
+    // ── Personal Tools ─────────────────────────────────────────
+    //
+    // Read tools (search/list/read) are unconstrained. Write tools
+    // (add/reindex) are scoped: `personal_add` accepts a filename and
+    // resolves it under the configured inbox (cfg.inbox_dir()), refusing
+    // any path separator, leading dot, or symlink-escape — see
+    // `personal::services::inbox::resolve_inbox_path` for the constraints.
+    // Delete is intentionally still CLI-only (`hs personal delete <stem>`).
 
     #[tool(
-        description = "Full pipeline status: PDF count, markdown count, catalog count, embedded document count, server health for all services.",
+        description = "Semantic search over the personal-documents collection. Use category to scope to medical, financial, etc. Read-only — for ingest, run `hs personal add` from the CLI.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2272,9 +2751,414 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    async fn system_status(&self) -> Result<String, String> {
-        let snap = self.build_status_snapshot(20).await;
+    async fn personal_search(
+        &self,
+        Parameters(p): Parameters<PersonalSearchParams>,
+    ) -> Result<String, String> {
+        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let hits = personal::services::search::search(
+            &cfg,
+            &p.query,
+            p.category.as_deref(),
+            p.limit.unwrap_or(10),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let json: Vec<serde_json::Value> = hits
+            .into_iter()
+            .map(|h| {
+                serde_json::json!({
+                    "stem": h.stem,
+                    "title": h.title,
+                    "category": h.category,
+                    "snippet": h.snippet,
+                    "score": h.score,
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string_pretty(&json).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "List ingested personal documents (most recent first), optionally filtered by category. Read-only — for ingest, run `hs personal add` from the CLI.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn personal_list(
+        &self,
+        Parameters(p): Parameters<PersonalListParams>,
+    ) -> Result<String, String> {
+        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let entries = personal::services::catalog::list_entries(
+            &cfg,
+            p.category.as_deref(),
+            p.limit.unwrap_or(50),
+        )
+        .map_err(|e| e.to_string())?;
+        let json: Vec<serde_json::Value> = entries
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "stem": e.stem,
+                    "title": e.title,
+                    "category": e.category,
+                    "original_format": e.original_format,
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string_pretty(&json).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Read the converted markdown of a single personal document by stem. Read-only.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn personal_read(
+        &self,
+        Parameters(p): Parameters<PersonalReadParams>,
+    ) -> Result<String, String> {
+        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        personal::services::catalog::read_markdown(&cfg, &p.stem).map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        description = "Ingest a file already staged in the personal inbox. Provide just the FILENAME (e.g. 'medical-record.pdf') — absolute paths and path separators are rejected. The user drops the file under the configured inbox directory; this tool resolves the name, runs the same ingest pipeline as `hs personal add`, and reports the assigned stem/title/category. PDF conversion of long documents can take many minutes; the tool blocks until indexing finishes.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn personal_add(
+        &self,
+        Parameters(p): Parameters<PersonalAddParams>,
+    ) -> Result<String, String> {
+        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let path = personal::services::inbox::resolve_inbox_path(&cfg, &p.filename)
+            .map_err(|e| e.to_string())?;
+        let opts = personal::services::ingest::IngestOptions {
+            category_override: p.category,
+            title_override: p.title,
+            force: p.force,
+        };
+        let outcome = personal::services::ingest::ingest(&cfg, &path, opts)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "stem": outcome.stem,
+            "title": outcome.title,
+            "category": outcome.category,
+            "chunks_indexed": outcome.chunk_count,
+            "source_file": p.filename,
+        }))
+        .unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Re-chunk and re-embed an already-ingested personal document by stem. Useful after chunker/embedder changes. Deletes the existing Qdrant points for the stem and re-creates them from the stored markdown.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn personal_reindex(
+        &self,
+        Parameters(p): Parameters<PersonalReindexParams>,
+    ) -> Result<String, String> {
+        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let chunks = personal::services::catalog::reindex(&cfg, &p.stem)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "stem": p.stem,
+            "chunks_indexed": chunks,
+        }))
+        .unwrap_or_default())
+    }
+
+    // ── System Tools ───────────────────────────────────────────
+
+    #[tool(
+        description = "Full pipeline status: PDF count, markdown count, catalog count, embedded document count, server health for all services. The `history` pane matches `catalog_recent`'s defaults — rows stamped by a `catalog_repair` backfill (`downloaded_at == repair.repaired_at`, or synthetic Convert whose `converted_at == repair.repaired_at`) are suppressed. Pass `include_repaired=true` for forensic mode; repair rows reappear annotated `\"repair\": true`.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn system_status(
+        &self,
+        Parameters(p): Parameters<SystemStatusParams>,
+    ) -> Result<String, String> {
+        let include_repaired = p.include_repaired.unwrap_or(false);
+        let snap = self.build_status_snapshot(20, include_repaired).await;
         Ok(serde_json::to_string_pretty(&snap).unwrap_or_default())
+    }
+
+    // ── OpenAlex (local DuckDB) Tools ────────────────────────────
+
+    #[tool(
+        description = "Search the local OpenAlex catalog by free text (BM25 over title+abstract). Returns JSON array of works with openalex_id, doi, title, year, citations, and bm25 score. Local DB — no external API calls. Requires `hs openalex build-fts` to have been run.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn openalex_search(
+        &self,
+        Parameters(p): Parameters<OpenAlexSearchParams>,
+    ) -> Result<String, String> {
+        let limit = p.max_results.unwrap_or(10).min(200) as i64;
+        let sort = p.sort.as_deref().unwrap_or("relevance");
+        let order_by = match sort {
+            "citations" => "ORDER BY cited_by_count DESC NULLS LAST, bm25 DESC",
+            "year" => "ORDER BY publication_year DESC NULLS LAST, bm25 DESC",
+            _ => "ORDER BY bm25 DESC",
+        };
+        let sql = format!(
+            r#"
+            WITH ranked AS (
+              SELECT
+                openalex_id, doi, title, publication_year, cited_by_count,
+                fts_main_works.match_bm25(openalex_id, ?) AS bm25
+              FROM works
+            )
+            SELECT openalex_id, doi, title, publication_year, cited_by_count, bm25
+            FROM ranked
+            WHERE bm25 IS NOT NULL
+              AND publication_year >= COALESCE(?, 0)
+              AND publication_year <= COALESCE(?, 9999)
+              AND cited_by_count >= COALESCE(?, 0)
+            {order_by}
+            LIMIT ?;
+            "#
+        );
+        run_openalex_query_json(
+            self,
+            &sql,
+            vec![
+                duckdb::types::Value::Text(p.query),
+                opt_value(p.year_from.map(i64::from)),
+                opt_value(p.year_to.map(i64::from)),
+                opt_value(p.min_citations.map(i64::from)),
+                duckdb::types::Value::BigInt(limit),
+            ],
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Look up a single work in the local OpenAlex catalog by OpenAlex ID (e.g. W2741809807) or DOI (e.g. 10.1234/x). Returns JSON with the work + its denormalized authors and topics.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn openalex_get(
+        &self,
+        Parameters(p): Parameters<OpenAlexGetParams>,
+    ) -> Result<String, String> {
+        let conn_arc = self
+            .openalex_db
+            .as_ref()
+            .ok_or_else(openalex_unavailable_error)?
+            .clone();
+        let id = p.id_or_doi.clone();
+        let result: Result<serde_json::Value, String> = tokio::task::spawn_blocking(move || {
+            let conn = conn_arc
+                .lock()
+                .map_err(|_| "openalex DB mutex poisoned".to_string())?;
+
+            // Work row
+            let work = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT openalex_id, doi, title, abstract_text, publication_year,
+                                publication_date, language, type, cited_by_count, is_retracted,
+                                is_oa, oa_url, primary_source_id
+                         FROM works
+                         WHERE openalex_id = ? OR doi = ?
+                         LIMIT 1",
+                    )
+                    .map_err(|e| format!("prepare: {e}"))?;
+                let mut rows = stmt
+                    .query(duckdb::params![id, id])
+                    .map_err(|e| format!("query: {e}"))?;
+                let cols: Vec<String> = rows
+                    .as_ref()
+                    .map(|s| s.column_names().into_iter().map(String::from).collect())
+                    .unwrap_or_default();
+                if let Some(row) = rows.next().map_err(|e| format!("next: {e}"))? {
+                    Some(row_to_json(row, &cols)?)
+                } else {
+                    None
+                }
+            };
+            let work = match work {
+                Some(w) => w,
+                None => {
+                    return Ok(serde_json::json!({"error": "not_found", "id_or_doi": id}));
+                }
+            };
+            let work_id = work
+                .get("openalex_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let authors = collect_rows_json(
+                &conn,
+                "SELECT a.openalex_id, a.display_name, wa.author_position,
+                        wa.raw_affiliation_string, wa.institution_id
+                 FROM work_authorships wa
+                 LEFT JOIN authors a ON a.openalex_id = wa.author_id
+                 WHERE wa.work_id = ?
+                 ORDER BY wa.author_position",
+                duckdb::params![work_id],
+            )?;
+            let topics = collect_rows_json(
+                &conn,
+                "SELECT t.openalex_id, t.display_name, wt.score
+                 FROM work_topics wt
+                 LEFT JOIN topics t ON t.openalex_id = wt.topic_id
+                 WHERE wt.work_id = ?
+                 ORDER BY wt.score DESC NULLS LAST",
+                duckdb::params![work_id],
+            )?;
+
+            let mut out = work;
+            if let serde_json::Value::Object(ref mut m) = out {
+                m.insert("authors".into(), serde_json::Value::Array(authors));
+                m.insert("topics".into(), serde_json::Value::Array(topics));
+            }
+            Ok::<serde_json::Value, String>(out)
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))?;
+
+        let v = result?;
+        Ok(serde_json::to_string_pretty(&v).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "List works that the given OpenAlex work cites (outbound references). Returns JSON array of cited works with openalex_id, doi, title, year, cited_by_count.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn openalex_references(
+        &self,
+        Parameters(p): Parameters<OpenAlexReferencesParams>,
+    ) -> Result<String, String> {
+        let limit = p.limit.unwrap_or(100).min(1000) as i64;
+        let sql = "SELECT w.openalex_id, w.doi, w.title, w.publication_year, w.cited_by_count
+                   FROM work_references wr
+                   LEFT JOIN works w ON w.openalex_id = wr.referenced_work_id
+                   WHERE wr.work_id = ?
+                   ORDER BY w.cited_by_count DESC NULLS LAST
+                   LIMIT ?";
+        run_openalex_query_json(
+            self,
+            sql,
+            vec![
+                duckdb::types::Value::Text(p.openalex_id),
+                duckdb::types::Value::BigInt(limit),
+            ],
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List works that cite the given OpenAlex work (forward citation chaining). Returns JSON array of citing works.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn openalex_citations(
+        &self,
+        Parameters(p): Parameters<OpenAlexCitationsParams>,
+    ) -> Result<String, String> {
+        let limit = p.limit.unwrap_or(100).min(1000) as i64;
+        let order_by = match p.sort.as_deref() {
+            Some("year") => "ORDER BY w.publication_year DESC NULLS LAST",
+            _ => "ORDER BY w.cited_by_count DESC NULLS LAST",
+        };
+        let sql = format!(
+            "SELECT w.openalex_id, w.doi, w.title, w.publication_year, w.cited_by_count
+             FROM work_references wr
+             LEFT JOIN works w ON w.openalex_id = wr.work_id
+             WHERE wr.referenced_work_id = ?
+               AND w.publication_year >= COALESCE(?, 0)
+             {order_by}
+             LIMIT ?"
+        );
+        run_openalex_query_json(
+            self,
+            &sql,
+            vec![
+                duckdb::types::Value::Text(p.openalex_id),
+                opt_value(p.year_from.map(i64::from)),
+                duckdb::types::Value::BigInt(limit),
+            ],
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Top authors for an OpenAlex topic, ranked by total cited_by_count. Joins work_topics → work_authorships → authors. Returns JSON array of (openalex_id, display_name, cited_by_count, papers_in_topic).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn openalex_authors_by_topic(
+        &self,
+        Parameters(p): Parameters<OpenAlexAuthorsByTopicParams>,
+    ) -> Result<String, String> {
+        let limit = p.limit.unwrap_or(25).min(200) as i64;
+        let sql = "SELECT a.openalex_id, a.display_name, a.cited_by_count,
+                          COUNT(*) AS papers_in_topic
+                   FROM work_topics wt
+                   JOIN work_authorships wa ON wa.work_id = wt.work_id
+                   JOIN authors a ON a.openalex_id = wa.author_id
+                   WHERE wt.topic_id = ?
+                   GROUP BY a.openalex_id, a.display_name, a.cited_by_count
+                   ORDER BY a.cited_by_count DESC NULLS LAST
+                   LIMIT ?";
+        run_openalex_query_json(
+            self,
+            sql,
+            vec![
+                duckdb::types::Value::Text(p.topic_id),
+                duckdb::types::Value::BigInt(limit),
+            ],
+        )
+        .await
     }
 }
 
@@ -2284,6 +3168,7 @@ impl HomeStillMcp {
     pub(crate) async fn build_status_snapshot(
         &self,
         history_limit: usize,
+        include_repaired: bool,
     ) -> hs_common::status::StatusSnapshot {
         use hs_common::status::{
             build_history, collect_pipeline_counts, QdrantInfo, ServiceInstance, StatusSnapshot,
@@ -2295,7 +3180,13 @@ impl HomeStillMcp {
         let mut embedded_chunks: Option<u64> = None;
         let mut qdrant: Option<QdrantInfo> = None;
         for url in &self.distill_servers {
-            let client = hs_distill::client::DistillClient::new(url);
+            let client = match hs_distill::client::DistillClient::new(url) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("distill client build for {url} failed: {e}");
+                    continue;
+                }
+            };
             let health = client.health().await.ok();
             let readiness = client.readiness().await.ok();
             let status = client.status().await.ok();
@@ -2368,7 +3259,13 @@ impl HomeStillMcp {
         // Per-scribe health fanout.
         let mut scribe_instances: Vec<ServiceInstance> = Vec::new();
         for url in &self.scribe_servers {
-            let client = hs_scribe::client::ScribeClient::new(url);
+            let client = match hs_scribe::client::ScribeClient::new(url) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("scribe client build for {url} failed: {e}");
+                    continue;
+                }
+            };
             let health = client.health().await.ok();
             let readiness = client.readiness().await.ok();
 
@@ -2414,15 +3311,41 @@ impl HomeStillMcp {
                 .await
                 .ok();
 
-        let conversion_failed = catalog_triples
-            .as_ref()
-            .map(|triples| {
-                triples
-                    .iter()
-                    .filter(|(_, _, e)| e.conversion.as_ref().is_some_and(|c| c.failed))
-                    .count() as u64
-            })
-            .unwrap_or(0);
+        // Count entries stamped `embedding_skip` so progress percentages
+        // can exclude intentionally-skipped docs from the denominator.
+        let embedding_skipped: Option<u64> = catalog_triples.as_ref().map(|triples| {
+            triples
+                .iter()
+                .filter(|(_, _, entry)| entry.embedding_skip.is_some())
+                .count() as u64
+        });
+
+        // Same pass — catalog rows stamped `conversion_failed` surface as
+        // the Corrupted PDFs count in `hs status`.
+        let corrupted_pdfs: Option<u64> = catalog_triples.as_ref().map(|triples| {
+            triples
+                .iter()
+                .filter(|(_, _, entry)| entry.conversion_failed.is_some())
+                .count() as u64
+        });
+
+        // Inbox queue — files waiting in `papers/manually_downloaded/` for
+        // the next sweep tick. Filtered by the same whitelist the sweeper
+        // applies, so the dashboard number tracks what the daemon will
+        // actually relocate. `.ok()` swallows storage blips — we'd rather
+        // show `Inbox ···` than fail the whole `system_status`.
+        let inbox_prefix = format!(
+            "{}/manually_downloaded/",
+            self.papers_prefix.trim_end_matches('/')
+        );
+        let inbox_pending: Option<u64> = self.storage.list(&inbox_prefix).await.ok().map(|objs| {
+            objs.iter()
+                .filter(|o| {
+                    let fn_ = o.key.rsplit('/').next().unwrap_or("");
+                    hs_common::inbox::is_inbox_candidate_filename(fn_)
+                })
+                .count() as u64
+        });
 
         let mut pipeline = collect_pipeline_counts(
             &*self.storage,
@@ -2431,31 +3354,44 @@ impl HomeStillMcp {
             &self.catalog_prefix,
             embedded_documents,
             embedded_chunks,
+            embedding_skipped,
         )
         .await;
-        pipeline.conversion_failed = conversion_failed;
 
-        // Pipeline drift: rows in `documents` that the next-stage counts don't
-        // claim. Saturating subtraction so under-counting a stage never yields
-        // a negative (i.e. drift can only be >= 0). Testers assert the value
-        // stays at or below PIPELINE_DRIFT_THRESHOLD.
+        // Pipeline drift: source documents that haven't produced markdown
+        // yet. Saturating subtraction so stage lag never yields a negative.
+        // Drift = `documents - markdown - in_flight`. By design, catalog
+        // rows stamped `conversion_failed` (surfaced separately as
+        // `corrupted_pdfs`) are NOT subtracted — drift is meant to surface
+        // them too, since failed converts represent stuck pipeline state
+        // the operator should see. Values above `pipeline_drift_threshold`
+        // indicate either stamped failures or stems that errored without a
+        // stamp; check scribe/event-watch logs for the latter.
         let total_in_flight: u64 = scribe_instances.iter().map(|s| s.in_flight).sum();
         pipeline.pipeline_drift = pipeline
             .documents
             .saturating_sub(pipeline.markdown)
-            .saturating_sub(pipeline.conversion_failed)
             .saturating_sub(total_in_flight);
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
+        pipeline.corrupted_pdfs = corrupted_pdfs;
+        pipeline.inbox_pending = inbox_pending;
+        pipeline.in_flight_conversions = Some(total_in_flight);
 
-        // History from the catalog (same source as `catalog_recent`).
+        // History from the catalog — same source and same default filter as
+        // `catalog_recent` so the two activity feeds can never disagree.
         let history = match catalog_triples {
             Some(triples) => {
                 let pairs: Vec<(String, hs_common::catalog::CatalogEntry)> =
                     triples.into_iter().map(|(s, _m, e)| (s, e)).collect();
-                build_history(&pairs, history_limit)
+                build_history(&pairs, history_limit, include_repaired)
             }
             None => Vec::new(),
         };
+
+        // Inbox-sweeper heartbeat. Populated server-side so every client
+        // (mac_air, big, laptop) renders the same verdict. `None` = no
+        // heartbeat key in storage; `Some(.running=false)` = stale.
+        let inbox_heartbeat = hs_common::status::read_inbox_heartbeat(&*self.storage).await;
 
         StatusSnapshot {
             pipeline,
@@ -2463,6 +3399,7 @@ impl HomeStillMcp {
             distill_instances,
             qdrant,
             history,
+            inbox_heartbeat,
             generated_at: Some(chrono::Utc::now().to_rfc3339()),
         }
     }
@@ -2571,6 +3508,12 @@ impl ServerHandler for HomeStillMcp {
              6. SEARCH: distill_search (semantic search across all indexed papers)\n\
              7. MONITOR: system_status, scribe_health, distill_status\n\n\
              To add a new paper to the pipeline: paper_search → paper_download → scribe_convert → distill_index\n\n\
+             Personal documents: personal_search, personal_list, personal_read are read-only \
+             over the user's private medical/financial/school records. Writes are scoped: \
+             personal_add takes a FILENAME (not a path) and resolves it under the configured \
+             inbox directory (default ~/home-still/personal/inbox/); the user drops the file \
+             there, the tool ingests it. personal_reindex re-chunks an existing stem. Delete \
+             is intentionally CLI-only — run `hs personal delete <stem>`.\n\n\
              Prompts: research_paper, summarize_document, compare_papers",
         )
     }
@@ -2687,6 +3630,7 @@ impl ServerHandler for HomeStillMcp {
                 stem,
             )
             .await
+            .map_err(|e| ErrorData::internal_error(format!("catalog read: {e}"), None))?
             .ok_or_else(|| ErrorData::resource_not_found("catalog entry not found", None))?;
             let yaml = serde_json::to_string_pretty(&entry)
                 .map_err(|e| ErrorData::internal_error(format!("serialize error: {e}"), None))?;
@@ -2766,7 +3710,7 @@ async fn main() -> anyhow::Result<()> {
     // bucket like every other service.
     let logging_handle = install_logging(args.serve.is_some()).await;
 
-    let server = HomeStillMcp::new().await;
+    let server = HomeStillMcp::new().await?;
 
     let result: anyhow::Result<()> = if let Some(addr) = args.serve {
         tracing::info!("Starting MCP SSE server on {addr}");
@@ -2907,5 +3851,39 @@ mod provider_arg_tests {
             "error should name the bad value: {err}"
         );
         assert!(err.contains("pmc"), "error should hint at pmc alias: {err}");
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::HomeStillMcp;
+
+    /// Regression for P0-4: when `~/.home-still/config.yaml` has no
+    /// `storage:` section, the MCP server must refuse to start instead
+    /// of silently falling back to LocalFsStorage rooted at project_dir.
+    #[tokio::test]
+    async fn refuses_to_start_without_storage_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: #[tokio::test] default runtime is single-threaded; this
+        // block brackets the HOME mutation to a single await region.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let result = HomeStillMcp::new().await;
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let err = result
+            .err()
+            .expect("new() must fail without storage config");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("storage"),
+            "error should mention storage; got: {msg}"
+        );
     }
 }

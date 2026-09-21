@@ -249,6 +249,13 @@ pub struct DownloadConfig {
     pub timeout_secs: u64,
     /// Unpaywall email address
     pub unpaywall_email: Option<String>,
+    /// Storage prefix PDFs / HTML / EPUBs are written under. Must match the
+    /// prefix `hs status`, `catalog_repair`, and `scribe_convert` read from —
+    /// otherwise downloads land out of view of the pipeline. Default
+    /// `"papers"`. The pre-rc.298 downloader omitted this prefix entirely
+    /// and scattered files across bucket-root shards (`00/`, `W2/`, …);
+    /// `hs repair move-root-orphans` relocates them.
+    pub papers_prefix: String,
 }
 
 impl Default for DownloadConfig {
@@ -257,6 +264,7 @@ impl Default for DownloadConfig {
             max_concurrent: 4,
             timeout_secs: 120,
             unpaywall_email: None,
+            papers_prefix: "papers".to_string(),
         }
     }
 }

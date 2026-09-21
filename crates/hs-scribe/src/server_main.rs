@@ -16,10 +16,29 @@ struct Args {
     port: u16,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Must run before ANY dlopen or tokio init — re-execs self with the
+    // platform's dynamic-lib search path augmented so ort's CUDA provider
+    // (Linux) and pdfium (macOS) load from our bundled directories
+    // instead of the system default.
+    hs_common::service::lib_bootstrap::ensure_lib_paths_or_reexec();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let _ = hs_common::secrets::load_default_secrets();
     let logging_handle = install_logging().await;
+    // libonnxruntime defaults to "warning" verbosity, which floods the log with
+    // shape-inference noise (logical_and_0.tmp_0.0, fill_constant_27.tmp_0.0)
+    // for every page. The only API in ort 2.0.0-rc.11 to silence this on the
+    // global env is `Environment::set_log_level`; `get_environment()` lazily
+    // commits if needed, so this also serves as the single ort init point.
+    if let Ok(env) = ort::environment::get_environment() {
+        env.set_log_level(ort::logging::LogLevel::Error);
+    }
     let args = Args::parse();
 
     let config = AppConfig::load().unwrap_or_else(|e| {
@@ -34,14 +53,13 @@ async fn main() -> Result<()> {
         config.model,
         config.vlm_concurrency
     );
-    let vlm_sem = Arc::new(tokio::sync::Semaphore::new(config.vlm_concurrency));
     let processor = Processor::new(config.clone())?;
     let state = Arc::new(ServerState {
         processor,
         config,
-        vlm_sem,
         in_flight: Arc::new(AtomicUsize::new(0)),
         last_conversion_ms: Arc::new(AtomicU64::new(0)),
+        total_conversions: Arc::new(AtomicU64::new(0)),
     });
 
     let addr = format!("{}:{}", args.host, args.port);

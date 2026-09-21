@@ -69,21 +69,18 @@ pub struct AuthenticatedClient {
 
 impl AuthenticatedClient {
     /// Create a new authenticated client from stored credentials.
-    pub fn new(credentials: CloudCredentials) -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+    pub fn new(credentials: CloudCredentials) -> anyhow::Result<Self> {
+        Ok(Self {
+            http: crate::http::http_client(std::time::Duration::from_secs(10))?,
             credentials,
             access_token: Mutex::new(None),
-        }
+        })
     }
 
     /// Load credentials from the default path and create a client.
     pub fn from_default_path() -> anyhow::Result<Self> {
         let creds = CloudCredentials::load(&CloudCredentials::default_path())?;
-        Ok(Self::new(creds))
+        Self::new(creds)
     }
 
     /// Get the gateway URL.

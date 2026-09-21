@@ -1,0 +1,31 @@
+[package]
+name = "personal"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "personal"
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+figment = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+hs-common = { workspace = true, features = ["cli", "catalog", "storage-s3", "events-nats", "logging"] }
+hs-scribe = { path = "../crates/hs-scribe" }
+hs-distill = { path = "../crates/hs-distill" }
+sha2 = "0.10"
+docx-rs = "0.4"
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"
+mockito = "1"

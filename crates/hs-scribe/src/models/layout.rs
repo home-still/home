@@ -218,11 +218,38 @@ impl LayoutDetector {
                 format!("unknown_{}", class_id)
             };
 
+            // Keep the pre-clamp values for diagnostic logging if the
+            // post-clamp bbox turns out degenerate.
+            let (x1_raw, y1_raw, x2_raw, y2_raw) = (x1, y1, x2, y2);
+
             // Clamp to image bounds (coords are already in original space)
             let x1 = x1.max(0.0).min(orig_w as f32);
             let y1 = y1.max(0.0).min(orig_h as f32);
             let x2 = x2.max(0.0).min(orig_w as f32);
             let y2 = y2.max(0.0).min(orig_h as f32);
+
+            // Skip zero-width / zero-height regions before they hit the
+            // downstream image crop + JPEG encode. A raw output like
+            // `x1 ≈ 2005, x2 ≈ 2010` on a 1900-pixel image both clamp
+            // to 1900 and produce a degenerate box that the `image`
+            // crate rejects with "Invalid image size (0 x N)". This
+            // was the dominant source of permanent convert failures
+            // pre-rc.304 — the layout model emits these occasionally
+            // on pages where detected regions run past the page edge.
+            if x2 <= x1 || y2 <= y1 {
+                tracing::debug!(
+                    class_id,
+                    score,
+                    x1_raw,
+                    y1_raw,
+                    x2_raw,
+                    y2_raw,
+                    orig_w,
+                    orig_h,
+                    "layout: skipping degenerate bbox (0-dim after clamp)"
+                );
+                continue;
+            }
 
             bboxes.push(BBox {
                 x1,

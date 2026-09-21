@@ -104,6 +104,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_regions_assembles_to_empty_string() {
+        // Phase A invariant: a page with zero layout regions flows through
+        // execute_vlm_for_page with empty text_regions/table_regions and
+        // produces empty markdown. assemble_page_markdown is the chokepoint
+        // — if it ever non-trivially formats &[] the empty-page path breaks.
+        let md = assemble_page_markdown(&[]);
+        assert_eq!(md, "");
+    }
+
+    #[test]
     fn test_paragraph_title_becomes_h2() {
         let regions = vec![(bbox("paragraph_title"), "Section".to_string())];
         let md = assemble_page_markdown(&regions);
