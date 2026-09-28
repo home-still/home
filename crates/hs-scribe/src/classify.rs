@@ -66,6 +66,15 @@ pub fn classify_failure(msg: &str) -> FailureClass {
     } else if msg.contains("has no extension") {
         // Event key carries no extension; no backend can pick a parser.
         Permanent("missing_extension")
+    } else if msg.contains("indexable floor")
+        && (msg.contains("converted by html-parser") || msg.contains("converted by epub-parser"))
+    {
+        // HTML/EPUB run through the same local parser on every tier, so an
+        // empty parse (redirect / anti-bot stub) is content-intrinsic.
+        // Escalating parked the event on the next tier's readiness poll
+        // for nothing. VLM output under the floor is deliberately NOT
+        // matched: a different VLM may read a scan the first could not.
+        Permanent("empty_conversion")
     } else if msg.contains("VLM repetition loop") {
         // Covers both the server's streaming-abort message ("VLM
         // repetition loop detected") and the client-side QC reject
@@ -152,5 +161,31 @@ mod tests {
             classify_failure("FormatError: cross-reference table is broken"),
             FailureClass::Permanent("pdf_parse_error")
         );
+    }
+
+    #[test]
+    fn parser_output_below_floor_is_permanent() {
+        // Shape event_watch::convert_and_upload returns for an HTML
+        // redirect stub. Every tier runs the same parser, so escalation
+        // can never help.
+        for converter in ["html-parser", "epub-parser"] {
+            let msg = format!(
+                "papers/10/x.html converted by {converter} to 12 non-whitespace chars, \
+                 below the 200-char indexable floor; refusing to record a conversion"
+            );
+            assert_eq!(
+                classify_failure(&msg),
+                FailureClass::Permanent("empty_conversion")
+            );
+        }
+    }
+
+    #[test]
+    fn vlm_output_below_floor_does_not_stop_the_chain() {
+        // A near-empty VLM read of a scan must still reach the next
+        // backend; only parser output is content-intrinsic.
+        let msg = "papers/10/x.pdf converted by scribe-vlm to 12 non-whitespace chars, \
+                   below the 200-char indexable floor; refusing to record a conversion";
+        assert!(!matches!(classify_failure(msg), FailureClass::Permanent(_)));
     }
 }

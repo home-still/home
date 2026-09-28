@@ -582,6 +582,18 @@ if a doc that diagnose says yields N>0 chunks embeds 0 — do not silently stamp
 
 ---
 
+## P1 — 2026-09-28 catch-up drain wedge
+
+### P1-23. An escalation into a tier with no admitting host parks the handler for 65 min and wedges the consumer
+**Motivation:** A one-shot `hs pipeline catch-up` on 2026-09-28 republished 60 events; `hs-scribe-watch-events` handled 8 and then made no progress for 20+ minutes with the process idle. Tier order is `[glm_ocr (bmb, cap 4), olmocr (big, cap 2)]`, global admission cap 6. Of 68 sources without markdown, 35 are ≤10 KB Elsevier `/retrieve/articleSelectPrefsTemp` meta-refresh stubs saved as `.html`. Each failed the indexable floor in the html-parser, and that message was unrecognised by `classify::classify_failure`, so the chain escalated it to the olmocr tier. big's scribe was refusing dispatch (`backend_unavailable`, VRAM gate), so `ServicePool::pick_server` polled it every 500 ms for `PICK_READY_TIMEOUT` = 3900 s while holding an olmocr permit. The rest queued on the tier semaphore, and all 6 global slots sat parked. After the deadline the events NAK and redeliver into the same trap (catalog rows show `attempts: 17`).
+**Fixed in rc.357 (trigger only):** the floor error now names its converter, and parser output under the floor classifies `Permanent("empty_conversion")`. VLM output under the floor still escalates.
+**Still open:** any legitimate `Escalate` (e.g. `vlm_repetition_loop` on bmb) still parks for 65 min whenever the olmocr tier's only host is VRAM-gated.
+**Scope:** `hs-common/src/service/pool.rs` (`pick_server`, `PICK_READY_TIMEOUT`), `crates/hs/src/scribe_cmd.rs` (`cmd_watch_events` tier loop).
+**Change:** Distinguish "tier saturated" (hosts admit but slots are full: poll) from "no host in the tier admits at all" (gate closed or unreachable: fail the tier at once as Transient so the event NAKs with backoff and frees its permit). One readiness signal decides; no second timeout path.
+**Acceptance:** With big's scribe reporting `backend_unavailable`, an event that escalates off bmb releases its olmocr permit within one probe interval, and a 60-event catch-up keeps draining on bmb.
+
+---
+
 ## P1 — branch/PR closeout (2026-09-19)
 
 ### P1-21. Scribe/distill GPU contention has no coordination path — salvaged question from the retired `feat/title-progress-bar` branch

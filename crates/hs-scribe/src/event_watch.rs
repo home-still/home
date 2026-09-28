@@ -400,9 +400,10 @@ pub async fn convert_and_upload(
             tracing::error!(stem = %stem, error = %e, "stamp conversion_failed failed");
         }
         return Err(HandlerError::Permanent(anyhow::anyhow!(
-            "{} converted to {} non-whitespace chars, below the {}-char indexable floor; \
+            "{} converted by {} to {} non-whitespace chars, below the {}-char indexable floor; \
              refusing to record a conversion",
             event.key,
+            server,
             hs_common::quality::non_whitespace_len(&markdown),
             hs_common::quality::MIN_INDEXABLE_NON_WS,
         )));
