@@ -47,6 +47,35 @@ impl Drop for PickGuard {
     }
 }
 
+/// `pick_server` error when every host in the pool answered its readiness
+/// probe and refused work at its admission gate (scribe's
+/// `backend_unavailable` VRAM gate). The gate opens when another GPU
+/// tenant leaves, not within a dispatch, so the pick fails at once instead
+/// of parking for [`PICK_READY_TIMEOUT`] while holding the caller's
+/// permits. Callers `downcast_ref` it to tell a closed tier from a
+/// timed-out one.
+#[derive(Debug)]
+pub struct NoAdmittingHost;
+
+impl std::fmt::Display for NoAdmittingHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("every host in the pool is refusing work at its admission gate")
+    }
+}
+
+impl std::error::Error for NoAdmittingHost {}
+
+/// Outcome of one probe→claim cycle in [`ServicePool::pick_server`].
+#[derive(Debug)]
+enum Probe<'a, C> {
+    Picked(&'a C, usize),
+    /// A host may take work once a slot frees or it wakes up (busy, or
+    /// unreachable — a sleeping laptop). Keep polling.
+    Wait,
+    /// Every host answered and every one refused at its admission gate.
+    Gated,
+}
+
 /// How long `pick_server` polls for a ready server before giving up.
 /// Handlers PARK here when every VLM slot is held by an in-progress
 /// convert. With a timeout too short for a book-sized convert (e.g.
@@ -117,7 +146,9 @@ impl<C: ServiceClient> ServicePool<C> {
     /// [`PICK_POLL_INTERVAL`] until a slot frees up or
     /// [`PICK_READY_TIMEOUT`] elapses. The poll-wait keeps bursty
     /// event-bus deliveries from being dropped the moment the pool
-    /// happens to be full — they briefly park here instead.
+    /// happens to be full — they briefly park here instead. When every
+    /// server refuses at its admission gate, fail at once with
+    /// [`NoAdmittingHost`] instead.
     pub async fn pick_server(&self) -> Result<(&C, PickGuard)> {
         let deadline = Instant::now() + self.ready_timeout;
         let mut attempt: u32 = 0;
@@ -133,13 +164,17 @@ impl<C: ServiceClient> ServicePool<C> {
             {
                 let _pick_guard = self.pick_lock.lock().await;
                 let log_failures = attempt == 0 || attempt.is_multiple_of(120);
-                if let Some((c, idx)) = self.try_pick_once(log_failures).await? {
-                    self.reservations[idx].fetch_add(1, Ordering::Relaxed);
-                    let guard = PickGuard {
-                        reservations: Arc::clone(&self.reservations),
-                        idx,
-                    };
-                    return Ok((c, guard));
+                match self.try_pick_once(log_failures).await? {
+                    Probe::Picked(c, idx) => {
+                        self.reservations[idx].fetch_add(1, Ordering::Relaxed);
+                        let guard = PickGuard {
+                            reservations: Arc::clone(&self.reservations),
+                            idx,
+                        };
+                        return Ok((c, guard));
+                    }
+                    Probe::Gated => return Err(NoAdmittingHost.into()),
+                    Probe::Wait => {}
                 }
             }
             if Instant::now() >= deadline {
@@ -165,13 +200,24 @@ impl<C: ServiceClient> ServicePool<C> {
     /// failed probe turned one sleeping laptop into a continuous
     /// several-lines-per-second journal flood. The caller passes true on
     /// the first cycle and roughly once per minute after.
-    async fn try_pick_once(&self, log_failures: bool) -> Result<Option<(&C, usize)>> {
+    async fn try_pick_once(&self, log_failures: bool) -> Result<Probe<'_, C>> {
         let futures: Vec<_> = self
             .clients
             .iter()
             .map(|c| async move { (c, c.readiness().await) })
             .collect();
         let results = futures::future::join_all(futures).await;
+
+        // Only a positive refusal from EVERY host closes the pool. An
+        // unreachable host is not proof of anything (it may be a laptop
+        // that wakes up), so any Err keeps the caller polling.
+        if !results.is_empty()
+            && results
+                .iter()
+                .all(|(_, r)| matches!(r, Ok(info) if !info.admits_work()))
+        {
+            return Ok(Probe::Gated);
+        }
 
         if log_failures {
             for (c, r) in &results {
@@ -221,7 +267,7 @@ impl<C: ServiceClient> ServicePool<C> {
             .max();
 
         let Some(max_avail) = max_avail else {
-            return Ok(None);
+            return Ok(Probe::Wait);
         };
 
         let candidates: Vec<usize> = effective
@@ -233,12 +279,12 @@ impl<C: ServiceClient> ServicePool<C> {
             .collect();
 
         if candidates.is_empty() {
-            return Ok(None);
+            return Ok(Probe::Wait);
         }
 
         let rr = self.next.fetch_add(1, Ordering::Relaxed) % candidates.len();
         let idx = candidates[rr];
-        Ok(Some((&self.clients[idx], idx)))
+        Ok(Probe::Picked(&self.clients[idx], idx))
     }
 
     /// Health check all servers. Returns (url, reachable) pairs.
@@ -273,6 +319,7 @@ mod tests {
     struct Readiness {
         ready: bool,
         avail: usize,
+        admits: bool,
     }
 
     impl ReadinessInfo for Readiness {
@@ -282,6 +329,9 @@ mod tests {
         fn available_slots(&self) -> usize {
             self.avail
         }
+        fn admits_work(&self) -> bool {
+            self.admits
+        }
     }
 
     #[derive(Debug)]
@@ -289,6 +339,10 @@ mod tests {
         url: String,
         ready: Arc<AtomicBool>,
         avail: Arc<AtomicUsize>,
+        /// Answers readiness but refuses at its admission gate.
+        gated: Arc<AtomicBool>,
+        /// Readiness probe fails (host asleep / unreachable).
+        down: Arc<AtomicBool>,
     }
 
     #[async_trait]
@@ -303,9 +357,13 @@ mod tests {
             Ok(Health { _ok: Some(true) })
         }
         async fn readiness(&self) -> Result<Readiness> {
+            if self.down.load(AtomicOrdering::Relaxed) {
+                anyhow::bail!("connection refused");
+            }
             Ok(Readiness {
                 ready: self.ready.load(AtomicOrdering::Relaxed),
                 avail: self.avail.load(AtomicOrdering::Relaxed),
+                admits: !self.gated.load(AtomicOrdering::Relaxed),
             })
         }
     }
@@ -315,7 +373,21 @@ mod tests {
             url: url.into(),
             ready: Arc::new(AtomicBool::new(ready)),
             avail: Arc::new(AtomicUsize::new(avail)),
+            gated: Arc::new(AtomicBool::new(false)),
+            down: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn gated(url: &str) -> MockClient {
+        let c = mk(url, false, 0);
+        c.gated.store(true, AtomicOrdering::Relaxed);
+        c
+    }
+
+    fn down(url: &str) -> MockClient {
+        let c = mk(url, false, 0);
+        c.down.store(true, AtomicOrdering::Relaxed);
+        c
     }
 
     #[tokio::test]
@@ -344,7 +416,10 @@ mod tests {
         // Use try_pick_once directly so the test doesn't wait
         // PICK_READY_TIMEOUT seconds for availability.
         let res = all_full.try_pick_once(true).await.unwrap();
-        assert!(res.is_none(), "all-full pool must return None, got {res:?}");
+        assert!(
+            matches!(res, Probe::Wait),
+            "all-full pool must keep waiting, got {res:?}"
+        );
     }
 
     #[tokio::test]
@@ -389,5 +464,50 @@ mod tests {
             "4 pickers on a 300ms timeout must fail concurrently (~300ms), \
              not serially (~1200ms); took {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn gated_pool_fails_the_pick_at_once() {
+        // big's scribe answers `backend_unavailable` while another GPU
+        // tenant holds the card. Parking for the full ready timeout held
+        // the tier permit and wedged every watch-events slot.
+        let pool = ServicePool::new(vec![gated("http://big:7435")])
+            .with_timing(Duration::from_secs(60), Duration::from_millis(50));
+        let started = Instant::now();
+        let err = pool
+            .pick_server()
+            .await
+            .err()
+            .expect("gated pool must fail");
+        assert!(err.is::<NoAdmittingHost>(), "wrong error: {err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn one_gated_host_does_not_close_the_pool() {
+        // Only a refusal from EVERY host closes the pool; a gated host
+        // beside a busy-but-admitting one means wait for the busy one.
+        let pool = ServicePool::new(vec![
+            gated("http://big:7435"),
+            mk("http://bmb:7433", true, 0),
+        ]);
+        let res = pool.try_pick_once(false).await.unwrap();
+        assert!(matches!(res, Probe::Wait), "got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn unreachable_host_is_polled_not_failed_fast() {
+        // A sleeping laptop is not a closed gate: the pick keeps polling
+        // for the full timeout so the event is not NAKed through its
+        // JetStream delivery budget in minutes.
+        let pool = ServicePool::new(vec![down("http://bmb:7433"), gated("http://big:7435")])
+            .with_timing(Duration::from_millis(300), Duration::from_millis(50));
+        let started = Instant::now();
+        let err = pool.pick_server().await.err().expect("must time out");
+        assert!(
+            !err.is::<NoAdmittingHost>(),
+            "unreachable host closed the pool"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300));
     }
 }

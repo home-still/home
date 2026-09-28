@@ -361,7 +361,7 @@ pub(crate) async fn cmd_watch_events(
     server_override: Option<String>,
     _reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    use hs_common::service::pool::ServicePool;
+    use hs_common::service::pool::{NoAdmittingHost, ServicePool};
     use hs_scribe::client::ScribeClient;
     use hs_scribe::config::ScribeConfig;
     use hs_scribe::event_watch::{convert_and_upload, run_subscriber};
@@ -499,16 +499,27 @@ pub(crate) async fn cmd_watch_events(
                     }
                 };
                 // Least-loaded pick WITHIN this backend tier. `pick_server`
-                // polls if the tier is saturated, so a busy tier parks here
-                // rather than NAKing. The PickGuard holds this host's
-                // client-side reservation for the convert and frees it at
-                // loop-end, so the next pick (a concurrent event, or this
+                // polls if the tier is saturated or unreachable, so a busy
+                // tier parks here rather than NAKing. The PickGuard holds this
+                // host's client-side reservation for the convert and frees it
+                // at loop-end, so the next pick (a concurrent event, or this
                 // event's next tier) sees accurate load. A tier with no ready
                 // host records a transient error and falls through to the
-                // next tier rather than aborting the whole chain.
+                // next tier rather than aborting the whole chain. A tier whose
+                // every host refuses at its admission gate fails the pick at
+                // once; an earlier tier's outcome then stands, since it says
+                // more about this paper than "nobody can take it right now".
                 let (client, _pick_guard) = match pool.pick_server().await {
                     Ok(picked) => picked,
                     Err(e) => {
+                        if e.is::<NoAdmittingHost>() && last_err.is_some() {
+                            tracing::info!(
+                                backend = %backend,
+                                key = %event.key,
+                                "tier skipped: every host refusing at its admission gate"
+                            );
+                            continue;
+                        }
                         last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
                         continue;
                     }

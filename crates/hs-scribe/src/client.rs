@@ -183,6 +183,9 @@ impl ReadinessInfo for ReadinessResponse {
     fn total_slots(&self) -> usize {
         self.vlm_slots_total
     }
+    fn admits_work(&self) -> bool {
+        self.backend_status.as_deref() != Some(BACKEND_UNAVAILABLE)
+    }
 }
 
 pub struct ScribeClient {

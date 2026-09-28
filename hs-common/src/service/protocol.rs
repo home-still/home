@@ -22,6 +22,12 @@ pub trait ReadinessInfo {
     fn total_slots(&self) -> usize {
         self.available_slots()
     }
+    /// False when the host answered but refuses all work at an admission
+    /// gate, as opposed to being busy. Zero available slots alone cannot
+    /// tell the two apart. Defaults to true for services without a gate.
+    fn admits_work(&self) -> bool {
+        true
+    }
 }
 
 /// Common service client interface for health/readiness checks.
