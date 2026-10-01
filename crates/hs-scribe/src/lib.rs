@@ -9,9 +9,6 @@ pub mod html;
 pub mod pdf_meta;
 pub mod postprocess;
 
-// Client-side modules (always available)
-pub mod cli;
-
 // Server-side modules (heavy deps: ONNX, pdfium, image, etc.)
 #[cfg(feature = "server")]
 pub mod converter;
@@ -25,8 +22,6 @@ pub mod pipeline;
 pub mod server;
 #[cfg(feature = "server")]
 pub mod utils;
-#[cfg(feature = "server")]
-pub mod watch;
 
 #[cfg(feature = "eval")]
 pub mod eval;

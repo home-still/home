@@ -46,6 +46,10 @@ pub enum QcVerdict {
     /// Caller should stamp `conversion.failed` with `reason="repetition_loop"`
     /// and NOT write the markdown object.
     RejectLoop,
+    /// The server left regions out of the markdown because it could not
+    /// process them, so the document has holes. Caller must not record it
+    /// as a successful conversion; a different backend may do better.
+    RejectGapped,
 }
 
 /// Absolute truncation ceiling: more than this across the whole doc is a
@@ -127,12 +131,17 @@ pub fn is_bibliography_page(class_names: &[String]) -> bool {
 ///   truncation sites (a lone scattered site per page is normal)
 /// - longest contiguous repeated-substring run > `QC_LONGEST_RUN_BYTES_MAX`
 ///
+/// Independently of all of that, any `skipped_regions` (regions the pipeline
+/// could not process and dropped from the markdown) is `RejectGapped`: a
+/// loop-free document with a hole in it is still not a conversion.
+///
 /// `per_page_truncations` and `per_page_is_bibliography` must have the same
 /// length and index alignment.
 pub fn qc_verdict(
     per_page_truncations: &[crate::diag::TruncationCounts],
     per_page_is_bibliography: &[bool],
     longest_run_bytes: usize,
+    skipped_regions: usize,
 ) -> QcVerdict {
     debug_assert_eq!(
         per_page_truncations.len(),
@@ -140,6 +149,9 @@ pub fn qc_verdict(
         "qc_verdict: per_page vec lengths must match"
     );
 
+    if skipped_regions > 0 {
+        return QcVerdict::RejectGapped;
+    }
     // No meaningful repeated run anywhere ⇒ no runaway loop. The truncation
     // sites are benign short-form repetition (code indentation, table rules);
     // accept regardless of their count, which otherwise grows with document
@@ -542,13 +554,13 @@ mod tests {
     fn qc_verdict_accepts_clean_doc() {
         let truncs = vec![tc(0); 10];
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 0, 0), QcVerdict::Accept);
         // 1 truncation on a single page in a 100-page doc — within the
         // 10% bad-page ratio gate.
         let mut truncs = vec![tc(0); 100];
         truncs[0] = tc(1);
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 0, 0), QcVerdict::Accept);
     }
 
     #[test]
@@ -559,7 +571,7 @@ mod tests {
         let bib = pages_with(&truncs);
         // A real run is present (>= floor) AND the total is over the
         // length-aware ceiling.
-        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::RejectLoop);
+        assert_eq!(qc_verdict(&truncs, &bib, 200, 0), QcVerdict::RejectLoop);
     }
 
     #[test]
@@ -567,7 +579,7 @@ mod tests {
         // Single page > 3 truncations → reject (one bad page poisons doc).
         let truncs = vec![tc(0), tc(4), tc(0), tc(0)]; // page 1 has 4 > 3
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::RejectLoop);
+        assert_eq!(qc_verdict(&truncs, &bib, 200, 0), QcVerdict::RejectLoop);
     }
 
     #[test]
@@ -575,7 +587,7 @@ mod tests {
         // 30-page survey with 0 truncations on every page.
         let truncs = vec![tc(0); 30];
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 0, 0), QcVerdict::Accept);
     }
 
     #[test]
@@ -585,7 +597,7 @@ mod tests {
         // (passes) but longest-run gate trips.
         let truncs = vec![tc(1), tc(0), tc(0)];
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 9400), QcVerdict::RejectLoop);
+        assert_eq!(qc_verdict(&truncs, &bib, 9400, 0), QcVerdict::RejectLoop);
     }
 
     #[test]
@@ -593,7 +605,7 @@ mod tests {
         // Citation boilerplate / table separators stay below 1 KB.
         let truncs = vec![tc(0); 10];
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 800), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 800, 0), QcVerdict::Accept);
     }
 
     #[test]
@@ -616,7 +628,7 @@ mod tests {
             true, false, false, false, false, false, false, false, false, false,
         ];
         // 8 ≤ 3*3 = 9, so per-page gate passes; bad-page ratio is 10% (not > 10%).
-        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 200, 0), QcVerdict::Accept);
     }
 
     #[test]
@@ -624,7 +636,7 @@ mod tests {
         // A bibliography page with > 9 truncations is still rejected.
         let truncs = vec![tc(10), tc(0), tc(0), tc(0)];
         let bib = vec![true, false, false, false];
-        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::RejectLoop);
+        assert_eq!(qc_verdict(&truncs, &bib, 200, 0), QcVerdict::RejectLoop);
     }
 
     #[test]
@@ -637,7 +649,7 @@ mod tests {
             *t = tc(2);
         }
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::RejectLoop);
+        assert_eq!(qc_verdict(&truncs, &bib, 200, 0), QcVerdict::RejectLoop);
     }
 
     #[test]
@@ -648,7 +660,7 @@ mod tests {
             *t = tc(2);
         }
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 200), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 200, 0), QcVerdict::Accept);
     }
 
     #[test]
@@ -660,7 +672,7 @@ mod tests {
         // be accepted because the longest run is below the loop floor.
         let truncs = vec![tc(2); 456]; // 912 truncation sites
         let bib = pages_with(&truncs);
-        assert_eq!(qc_verdict(&truncs, &bib, 48), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 48, 0), QcVerdict::Accept);
     }
 
     #[test]
@@ -732,8 +744,20 @@ mod tests {
         // dominant — used to assert 0-page input doesn't panic.
         let truncs: Vec<TruncationCounts> = vec![];
         let bib: Vec<bool> = vec![];
-        assert_eq!(qc_verdict(&truncs, &bib, 0), QcVerdict::Accept);
-        assert_eq!(qc_verdict(&truncs, &bib, 9999), QcVerdict::RejectLoop);
+        assert_eq!(qc_verdict(&truncs, &bib, 0, 0), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 9999, 0), QcVerdict::RejectLoop);
+    }
+
+    #[test]
+    fn qc_verdict_rejects_a_document_with_holes_even_when_it_has_no_loops() {
+        // Skipped regions are lost content, whatever else is clean: a clean
+        // loop-free doc, a doc with no pages at all, and a bibliography-heavy
+        // doc are all refused.
+        let truncs = vec![crate::diag::TruncationCounts::default(); 5];
+        let bib = vec![false; 5];
+        assert_eq!(qc_verdict(&truncs, &bib, 0, 0), QcVerdict::Accept);
+        assert_eq!(qc_verdict(&truncs, &bib, 0, 1), QcVerdict::RejectGapped);
+        assert_eq!(qc_verdict(&[], &[], 0, 3), QcVerdict::RejectGapped);
     }
 
     #[test]

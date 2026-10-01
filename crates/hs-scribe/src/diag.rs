@@ -71,6 +71,13 @@ pub struct PageDiagRecord {
     /// region completed cleanly.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub repetition_aborted_regions: u32,
+    /// Regions the pipeline had to leave out of this page's markdown
+    /// because they could not be processed (0-dim crop after clamping,
+    /// JPEG encode failure) — as opposed to `repetition_aborted_regions`,
+    /// which the repetition detector dropped on purpose. Any non-zero
+    /// value makes the QC gate refuse the conversion.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub skipped_regions: u32,
 }
 
 fn is_zero_u32(v: &u32) -> bool {

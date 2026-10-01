@@ -1,14 +1,82 @@
-use anyhow::{Context, Result};
+use crate::classify::{ConvertFailure, FailureCode};
+use anyhow::Result;
 use pdfium_render::prelude::*;
+
+/// Largest page side a PDF may declare, in points. 14 400 pt (200 in) is
+/// the limit the PDF format itself documents; a box beyond it, or one that
+/// is not a finite positive number, is not a page.
+pub const MAX_PAGE_POINTS: f32 = 14_400.0;
+
+/// Pixel dimensions a page will be rendered at, after the pixel cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Where a page is rasterized: `box_pts` at `dpi`, scaled down uniformly
+/// until it fits `max_pixels`. Pure arithmetic, evaluated *before* any
+/// bitmap exists — `max_image_dim` downscaling happens after rendering and
+/// cannot protect memory.
+///
+/// A box that is not finite, not positive, wider than [`MAX_PAGE_POINTS`],
+/// or so thin that the cap leaves it under one pixel is refused as a
+/// permanent PDF fault: no backend can render it.
+pub fn plan_render(
+    width_pts: f32,
+    height_pts: f32,
+    dpi: u16,
+    max_pixels: u64,
+) -> Result<RenderSize, ConvertFailure> {
+    let bad = |why: String| ConvertFailure::new(FailureCode::PdfParseError, why);
+    for (side, name) in [(width_pts, "width"), (height_pts, "height")] {
+        if !side.is_finite() || side <= 0.0 || side > MAX_PAGE_POINTS {
+            return Err(bad(format!(
+                "page {name} of {side} pt is not a renderable size (0 < side <= {MAX_PAGE_POINTS} pt)"
+            )));
+        }
+    }
+    let scale = f64::from(dpi) / 72.0;
+    let (w, h) = (f64::from(width_pts) * scale, f64::from(height_pts) * scale);
+    let pixels = w * h;
+    let fit = if pixels > max_pixels as f64 {
+        (max_pixels as f64 / pixels).sqrt()
+    } else {
+        1.0
+    };
+    let (width, height) = ((w * fit).floor(), (h * fit).floor());
+    if width < 1.0 || height < 1.0 {
+        return Err(bad(format!(
+            "a {width_pts}x{height_pts} pt page renders to {width}x{height} px at {dpi} dpi under \
+             the {max_pixels}-pixel limit"
+        )));
+    }
+    Ok(RenderSize {
+        width: width as u32,
+        height: height as u32,
+    })
+}
 
 pub struct PdfParser {
     pdfium: Pdfium,
 }
 
 impl PdfParser {
+    /// Bind to libpdfium the way `Pdfium::default()` does (a copy beside
+    /// the working directory first, then the system search path, which
+    /// `lib_bootstrap` points at the bundled copy) but report a missing
+    /// library as an error instead of panicking the request.
     pub fn new() -> Result<Self> {
-        let pdfium = Pdfium::default();
-        Ok(Self { pdfium })
+        let bindings =
+            match Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./")) {
+                Ok(bindings) => bindings,
+                Err(PdfiumError::LoadLibraryError(_)) => Pdfium::bind_to_system_library()
+                    .map_err(|e| anyhow::anyhow!("libpdfium could not be loaded: {e:?}"))?,
+                Err(e) => anyhow::bail!("libpdfium could not be bound: {e:?}"),
+            };
+        Ok(Self {
+            pdfium: Pdfium::new(bindings),
+        })
     }
 
     /// Open a document, borrowing this parser. The returned document must not
@@ -17,7 +85,7 @@ impl PdfParser {
     pub fn open<'a>(&'a self, path: &str) -> Result<PdfDocument<'a>> {
         self.pdfium
             .load_pdf_from_file(path, None)
-            .with_context(|| format!("opening PDF {path}"))
+            .map_err(|e| document_error(e, path))
     }
 
     /// Page count without rasterizing anything — a cheap metadata read. Used to
@@ -26,23 +94,27 @@ impl PdfParser {
         Ok(self.open(path)?.pages().len() as usize)
     }
 
-    /// Render a single page to a raster image at `dpi`. Streaming callers render
-    /// one page, consume it, and drop it before rendering the next — so peak
-    /// raster memory is a single page, not the whole document. This is the
-    /// safeguard against the all-pages-in-RAM OOM that froze the host: a
-    /// 900-page book is bounded to one page of raster at a time instead of ~14 GB.
-    pub fn render_page(document: &PdfDocument, idx: u16, dpi: u16) -> Result<PageData> {
-        let page = document
-            .pages()
-            .get(idx)
-            .with_context(|| format!("loading page {idx}"))?;
+    /// Render a single page to a raster image at `dpi`, never larger than
+    /// `max_pixels` (see [`plan_render`]). Streaming callers render one page,
+    /// consume it, and drop it before rendering the next — so peak raster
+    /// memory is a single page, not the whole document. This is the safeguard
+    /// against the all-pages-in-RAM OOM that froze the host: a 900-page book
+    /// is bounded to one page of raster at a time instead of ~14 GB.
+    pub fn render_page(
+        document: &PdfDocument,
+        idx: u16,
+        dpi: u16,
+        max_pixels: u64,
+    ) -> Result<PageData> {
+        let page = document.pages().get(idx).map_err(|e| page_error(e, idx))?;
 
-        let width = (page.width().value * dpi as f32 / 72.0) as i32;
-        let height = (page.height().value * dpi as f32 / 72.0) as i32;
+        let (width_pts, height_pts) = (page.width().value, page.height().value);
+        let size = plan_render(width_pts, height_pts, dpi, max_pixels)
+            .map_err(|e| anyhow::Error::new(e).context(format!("page {idx}")))?;
 
         let config = PdfRenderConfig::new()
-            .set_target_width(width)
-            .set_target_height(height);
+            .set_target_width(size.width as i32)
+            .set_target_height(size.height as i32);
 
         let bitmap = page.render_with_config(&config)?;
         let image = bitmap.as_image();
@@ -50,10 +122,46 @@ impl PdfParser {
         Ok(PageData {
             page_idx: idx as usize,
             image,
-            width: page.width().value,
-            height: page.height().value,
+            width: width_pts,
+            height: height_pts,
             text: None,
         })
+    }
+}
+
+/// `true` when pdfium is saying "this document is broken / locked", as
+/// opposed to "I could not open the file" (a server fault).
+fn is_document_fault(e: &PdfiumError) -> bool {
+    matches!(
+        e,
+        PdfiumError::PdfiumLibraryInternalError(
+            PdfiumInternalError::FormatError
+                | PdfiumInternalError::PasswordError
+                | PdfiumInternalError::SecurityError
+                | PdfiumInternalError::PageError
+        )
+    )
+}
+
+fn document_error(e: PdfiumError, path: &str) -> anyhow::Error {
+    if is_document_fault(&e) {
+        ConvertFailure::err(
+            FailureCode::PdfParseError,
+            format!("PDF cannot be opened: {e:?}"),
+        )
+    } else {
+        anyhow::anyhow!("opening PDF {path}: {e:?}")
+    }
+}
+
+fn page_error(e: PdfiumError, idx: u16) -> anyhow::Error {
+    if is_document_fault(&e) {
+        ConvertFailure::err(
+            FailureCode::PdfParseError,
+            format!("page {idx} cannot be loaded: {e:?}"),
+        )
+    } else {
+        anyhow::anyhow!("loading page {idx}: {e:?}")
     }
 }
 
@@ -64,4 +172,89 @@ pub struct PageData {
     pub width: f32,
     pub height: f32,
     pub text: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DEFAULT_MAX_RENDER_PIXELS;
+
+    const LETTER: (f32, f32) = (612.0, 792.0);
+
+    #[test]
+    fn a_normal_page_renders_at_exactly_the_requested_dpi() {
+        let s = plan_render(LETTER.0, LETTER.1, 200, DEFAULT_MAX_RENDER_PIXELS).unwrap();
+        assert_eq!((s.width, s.height), (1700, 2200));
+    }
+
+    #[test]
+    fn a_page_over_the_pixel_cap_is_scaled_to_fit_and_keeps_its_aspect() {
+        // 14400 pt square at 200 dpi is 40 000 x 40 000 = 1.6 Gpx (~6 GB).
+        let s = plan_render(14_400.0, 14_400.0, 200, DEFAULT_MAX_RENDER_PIXELS).unwrap();
+        assert!(
+            u64::from(s.width) * u64::from(s.height) <= DEFAULT_MAX_RENDER_PIXELS,
+            "{s:?}"
+        );
+        assert_eq!(s.width, s.height);
+        assert!(s.width >= 5_900, "should use most of the budget: {s:?}");
+
+        let wide = plan_render(14_400.0, 7_200.0, 300, 1_000_000).unwrap();
+        assert!(u64::from(wide.width) * u64::from(wide.height) <= 1_000_000);
+        let ratio = wide.width as f64 / wide.height as f64;
+        assert!((ratio - 2.0).abs() < 0.01, "{wide:?}");
+    }
+
+    #[test]
+    fn the_pixel_cap_is_never_exceeded_for_any_box_that_is_accepted() {
+        for &(w, h) in &[
+            (1.0, 1.0),
+            (612.0, 792.0),
+            (2384.0, 3370.0),
+            (14_400.0, 14_400.0),
+            (14_400.0, 30.0),
+        ] {
+            for dpi in [1u16, 72, 200, 600, u16::MAX] {
+                for cap in [10_000u64, 1_000_000, DEFAULT_MAX_RENDER_PIXELS] {
+                    if let Ok(s) = plan_render(w, h, dpi, cap) {
+                        assert!(s.width >= 1 && s.height >= 1);
+                        assert!(
+                            u64::from(s.width) * u64::from(s.height) <= cap,
+                            "{w}x{h} @ {dpi} cap {cap} -> {s:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absurd_page_boxes_are_permanent_pdf_errors() {
+        for (w, h) in [
+            (f32::NAN, 792.0),
+            (612.0, f32::NAN),
+            (f32::INFINITY, 792.0),
+            (612.0, f32::NEG_INFINITY),
+            (0.0, 792.0),
+            (612.0, 0.0),
+            (-612.0, 792.0),
+            (14_400.5, 792.0),
+            (612.0, 1.0e9),
+            (f32::MAX, f32::MAX),
+        ] {
+            let e = plan_render(w, h, 200, DEFAULT_MAX_RENDER_PIXELS).unwrap_err();
+            assert_eq!(e.code(), FailureCode::PdfParseError, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn a_sliver_that_the_cap_would_squash_below_one_pixel_is_refused() {
+        // 14400 x 0.01 pt: any dpi leaves a zero-height bitmap.
+        let e = plan_render(14_400.0, 0.01, 200, DEFAULT_MAX_RENDER_PIXELS).unwrap_err();
+        assert_eq!(e.code(), FailureCode::PdfParseError);
+    }
+
+    #[test]
+    fn a_cap_too_small_for_one_pixel_per_side_is_refused() {
+        assert!(plan_render(612.0, 792.0, 200, 0).is_err());
+    }
 }

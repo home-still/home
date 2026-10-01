@@ -17,9 +17,6 @@ server = [
     "dep:ollama-rs",
     "dep:base64",
     "dep:futures",
-    "dep:notify",
-    "dep:notify-debouncer-full",
-    "dep:ctrlc",
     "dep:tracing-subscriber",
     "dep:tokio-stream",
 ]
@@ -47,6 +44,10 @@ scraper = "0.22"
 chrono = { workspace = true }
 epub = "2"
 lopdf = { version = "0.33", default-features = false, features = ["pom_parser"] }
+bytes = "1"
+# The EPUB reader's own zip version (epub 2.x pins 3.x, deflate only): used to
+# measure an archive's real expanded size before any chapter is decompressed.
+zip = { version = "3.0.0", default-features = false, features = ["deflate"] }
 
 # Server Only
 axum = { version = "0.8", optional = true, features = ["multipart"] }
@@ -61,9 +62,6 @@ ndarray = { version = "0.17", optional = true }
 ollama-rs = { version = "0.3", features = ["stream"], optional = true }
 base64 = { version = "0.22", optional = true }
 futures = { version = "0.3", optional = true }
-notify = { version = "8", optional = true }
-notify-debouncer-full = { version = "0.4", optional = true }
-ctrlc = { version = "3", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 edit-distance = { version = "2.1", optional = true }
 openssl = { version = "0.10", features = ["vendored"], optional = true }

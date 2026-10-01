@@ -9,6 +9,14 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Default ceiling on the pixels of one rendered PDF page
+/// (`AppConfig::max_render_pixels`). A US-letter page at the default
+/// 200 dpi is 3.7 Mpx; 36 Mpx is ~6000x6000, so an A0 poster still
+/// renders (at a reduced dpi) while a page that asks for gigapixels never
+/// gets its bitmap allocated. At 4 bytes per pixel the bitmap is 144 MB,
+/// plus the image copy made from it.
+pub const DEFAULT_MAX_RENDER_PIXELS: u64 = 36_000_000;
+
 /// Resolve project_dir from ~/.home-still/config.yaml or default to ~/home-still.
 fn resolve_project_dir() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_default();
@@ -100,7 +108,21 @@ pub struct AppConfig {
     /// `ScribeConfig::convert_timeout_secs` default (900s); tune via
     /// `HS_SCRIBE_CONVERT_DEADLINE_SECS`.
     pub convert_deadline_secs: u64,
+    /// Ceiling (seconds) on the per-request `X-Convert-Deadline-Secs` a
+    /// caller may ask for. A larger request is clamped to this, so one
+    /// client cannot pin a converter slot (and its temp file) for longer
+    /// than the operator allows. Must be at least `convert_deadline_secs`
+    /// and should match the event consumer's `ack_wait` (default 7200 s):
+    /// a conversion that outlives it is redelivered anyway. Override via
+    /// `HS_SCRIBE_MAX_CONVERT_DEADLINE_SECS`.
+    pub max_convert_deadline_secs: u64,
     pub dpi: u16,
+    /// Ceiling on the pixels of one rendered PDF page. A page whose
+    /// `MediaBox x dpi` exceeds it is rendered at a proportionally lower
+    /// dpi, and a box that is not a plausible page is refused. Applied
+    /// before the bitmap is allocated. Override via
+    /// `HS_SCRIBE_MAX_RENDER_PIXELS`.
+    pub max_render_pixels: u64,
     pub parallel: usize,
     pub pipeline_mode: PipelineMode,
     pub layout_model_path: String,
@@ -118,7 +140,19 @@ pub struct AppConfig {
     pub page_parallel: usize,
     pub use_cuda: bool,
     pub max_image_dim: u32,
+    /// Converter capacity. In `Legacy` mode: concurrent VLM calls across
+    /// all conversions (the shared VLM semaphore). In `Olmocr` mode:
+    /// concurrent `olmocr` CLI runs on this host. It is also the most
+    /// conversions the server admits at once (further uploads are refused
+    /// with 503), and the slot total `/readiness` advertises.
     pub vlm_concurrency: usize,
+    /// Longest silence tolerated on a VLM backend connection, in seconds:
+    /// the wait for the first byte (cold model load, prompt-cache rebuild)
+    /// and the gap between reads of a streaming answer. A backend that goes
+    /// quiet for longer fails the region (and so the conversion) instead of
+    /// holding a VLM permit until the whole-convert deadline. Override via
+    /// `HS_SCRIBE_VLM_IDLE_TIMEOUT_SECS`.
+    pub vlm_idle_timeout_secs: u64,
     /// Which converter implements `/scribe`. Defaults to `Legacy` so
     /// existing deployments are unaffected; set `HS_SCRIBE_CONVERTER=olmocr`
     /// on hosts running the olmocr/vLLM scribe instance.
@@ -154,6 +188,8 @@ impl Default for AppConfig {
             openai_api_key: None,
             backend: BackendChoice::Ollama,
             convert_deadline_secs: 900,
+            max_convert_deadline_secs: 7200,
+            max_render_pixels: DEFAULT_MAX_RENDER_PIXELS,
             dpi: 200,
             parallel: 1,
             pipeline_mode: PipelineMode::PerRegion,
@@ -164,6 +200,7 @@ impl Default for AppConfig {
             use_cuda: true,
             max_image_dim: 1800,
             vlm_concurrency: class.vlm_concurrency(),
+            vlm_idle_timeout_secs: 300,
             converter: ConverterMode::default(),
             olmocr_endpoint: "http://localhost:8081/v1".into(),
             olmocr_model: "olmocr".into(),
@@ -184,6 +221,48 @@ impl AppConfig {
             .merge(Env::prefixed("HS_SCRIBE_"))
             .extract()
             .map_err(Box::new)
+    }
+
+    /// Reject settings that would hang or panic the server: a zero
+    /// semaphore size or `buffered(0)` never makes progress, a zero
+    /// dpi/pixel budget renders nothing. Called by the server binary on the
+    /// effective config before anything is started.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("vlm_concurrency", self.vlm_concurrency as u64),
+            ("vlm_idle_timeout_secs", self.vlm_idle_timeout_secs),
+            ("page_parallel", self.page_parallel as u64),
+            ("region_parallel", self.region_parallel as u64),
+            ("parallel", self.parallel as u64),
+            ("dpi", u64::from(self.dpi)),
+            ("max_image_dim", u64::from(self.max_image_dim)),
+            ("max_render_pixels", self.max_render_pixels),
+            ("convert_deadline_secs", self.convert_deadline_secs),
+        ] {
+            if value == 0 {
+                anyhow::bail!(
+                    "scribe config: `{name}` must be at least 1 (0 would hang or render nothing)"
+                );
+            }
+        }
+        if self.max_convert_deadline_secs < self.convert_deadline_secs {
+            anyhow::bail!(
+                "scribe config: `max_convert_deadline_secs` ({}) is below `convert_deadline_secs` ({})",
+                self.max_convert_deadline_secs,
+                self.convert_deadline_secs
+            );
+        }
+        if self.converter == ConverterMode::Olmocr {
+            if self.olmocr_bin.trim().is_empty() {
+                anyhow::bail!("scribe config: `olmocr_bin` is empty but converter is olmocr");
+            }
+            if self.olmocr_endpoint.trim().is_empty() || self.olmocr_model.trim().is_empty() {
+                anyhow::bail!(
+                    "scribe config: `olmocr_endpoint` and `olmocr_model` are required when converter is olmocr"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Resolve a model filename to an absolute path.
@@ -337,6 +416,11 @@ pub struct ScribeConfig {
     /// via `HS_SCRIBE_CONVERT_TIMEOUT_SECS` for outlier workloads.
     #[serde(default = "default_convert_timeout_secs")]
     pub convert_timeout_secs: u64,
+    /// Caps on what an EPUB archive may expand to before it is converted
+    /// (`scribe.epub.max_entries`, `max_entry_bytes`, `max_total_bytes`).
+    /// An archive over any cap is refused, not truncated.
+    #[serde(default)]
+    pub epub: crate::epub::EpubLimits,
     /// Page-count-aware timeout policy for PDF conversion. Each
     /// dispatch reads the PDF page count (lopdf), feeds it into the
     /// policy formula (`clamp(base + pages × per_page, floor, ceiling)`),
@@ -365,9 +449,9 @@ fn default_convert_timeout_secs() -> u64 {
 /// Page-count-aware timeout formula for PDF conversion. The subscriber
 /// reads the page count from the raw PDF before dispatching and sizes
 /// the per-request deadline as
-/// `clamp(base + pages × per_page, floor, ceiling)`. When page count
-/// can't be determined (corrupt PDF, non-PDF bytes), the subscriber
-/// falls back to `fallback_secs`.
+/// `clamp(base + pages × per_page, floor, ceiling)`. A PDF whose page
+/// count cannot be read is refused before dispatch, so there is no
+/// "unknown size" deadline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TimeoutPolicy {
@@ -386,10 +470,24 @@ pub struct TimeoutPolicy {
     /// book so a poison input can't hold a delivery slot for hours.
     /// JetStream `ack_wait` must be ≥ this value.
     pub ceiling_secs: u64,
-    /// Used when `pdf_meta::count_pages` returns `None` — we don't know
-    /// how big the PDF is, so we use a reasonable default that won't
-    /// time out on typical papers.
-    pub fallback_secs: u64,
+}
+
+impl TimeoutPolicy {
+    /// `clamp(floor, ceiling)` panics when `floor > ceiling`, and a zero
+    /// floor lets a deadline of zero seconds through.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.floor_secs == 0 {
+            anyhow::bail!("scribe.timeout_policy.floor_secs must be at least 1");
+        }
+        if self.floor_secs > self.ceiling_secs {
+            anyhow::bail!(
+                "scribe.timeout_policy.floor_secs ({}) is above ceiling_secs ({})",
+                self.floor_secs,
+                self.ceiling_secs
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for TimeoutPolicy {
@@ -399,7 +497,6 @@ impl Default for TimeoutPolicy {
             per_page_secs: 15,
             floor_secs: 300,
             ceiling_secs: 3600,
-            fallback_secs: 900,
         }
     }
 }
@@ -420,6 +517,7 @@ impl Default for ScribeConfig {
             inbox_poll_interval_secs: default_inbox_poll_interval_secs(),
             convert_timeout_secs: default_convert_timeout_secs(),
             timeout_policy: TimeoutPolicy::default(),
+            epub: crate::epub::EpubLimits::default(),
             storage: StorageConfig::default(),
             events: EventBusConfig::default(),
         }
@@ -467,7 +565,32 @@ impl ScribeConfig {
             .unwrap_or_default();
         cfg.storage = storage;
         cfg.events = events;
+        cfg.validate()
+            .map_err(|e| Box::new(figment::Error::from(format!("{e:#}"))))?;
         Ok(cfg)
+    }
+
+    /// Reject values that would panic or hang the dispatcher: a deadline
+    /// floor above its ceiling, a backend tier of zero concurrency (its
+    /// semaphore never grants a permit), zero timeouts or poll intervals.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.timeout_policy.validate()?;
+        self.epub.validate()?;
+        if self.convert_timeout_secs == 0 {
+            anyhow::bail!("scribe.convert_timeout_secs must be at least 1");
+        }
+        if self.inbox_poll_interval_secs == 0 {
+            anyhow::bail!("scribe.inbox_poll_interval_secs must be at least 1");
+        }
+        for entry in &self.servers {
+            if entry.concurrency == 0 {
+                anyhow::bail!(
+                    "scribe.servers entry {} has concurrency 0: nothing would ever be dispatched to it",
+                    entry.url
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Build the configured storage backend.
@@ -561,5 +684,86 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].url, "http://x:7433");
         assert_eq!(parsed[0].backend, "glm_ocr");
+    }
+
+    #[test]
+    fn the_default_configs_are_valid() {
+        AppConfig::default().validate().unwrap();
+        ScribeConfig::default().validate().unwrap();
+        TimeoutPolicy::default().validate().unwrap();
+    }
+
+    #[test]
+    fn zero_concurrency_and_budgets_are_errors_not_hangs() {
+        // Semaphore(0) never grants a permit and buffered(0) never polls.
+        type Break = fn(&mut AppConfig);
+        let cases: [(&str, Break); 8] = [
+            ("vlm_concurrency", |c| c.vlm_concurrency = 0),
+            ("page_parallel", |c| c.page_parallel = 0),
+            ("region_parallel", |c| c.region_parallel = 0),
+            ("parallel", |c| c.parallel = 0),
+            ("dpi", |c| c.dpi = 0),
+            ("max_render_pixels", |c| c.max_render_pixels = 0),
+            ("vlm_idle_timeout_secs", |c| c.vlm_idle_timeout_secs = 0),
+            ("convert_deadline_secs", |c| c.convert_deadline_secs = 0),
+        ];
+        for (key, break_it) in cases {
+            let mut c = AppConfig::default();
+            break_it(&mut c);
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains(key), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_server_deadline_ceiling_cannot_be_below_the_default_deadline() {
+        let c = AppConfig {
+            convert_deadline_secs: 900,
+            max_convert_deadline_secs: 600,
+            ..AppConfig::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn a_timeout_floor_above_its_ceiling_is_an_error_at_load_not_a_dispatch_panic() {
+        let mut c = ScribeConfig::default();
+        c.timeout_policy.floor_secs = 4000;
+        c.timeout_policy.ceiling_secs = 3600;
+        assert!(c.validate().unwrap_err().to_string().contains("floor_secs"));
+        c.timeout_policy.floor_secs = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn a_backend_tier_with_zero_concurrency_is_refused() {
+        let mut c = ScribeConfig::default();
+        c.servers[0].concurrency = 0;
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("concurrency 0"));
+        let c = ScribeConfig {
+            convert_timeout_secs: 0,
+            ..ScribeConfig::default()
+        };
+        assert!(c.validate().is_err());
+        let c = ScribeConfig {
+            inbox_poll_interval_secs: 0,
+            ..ScribeConfig::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn olmocr_mode_requires_its_binary_and_endpoint() {
+        let mut c = AppConfig {
+            converter: ConverterMode::Olmocr,
+            ..AppConfig::default()
+        };
+        c.validate().unwrap();
+        c.olmocr_bin = "  ".into();
+        assert!(c.validate().is_err());
     }
 }

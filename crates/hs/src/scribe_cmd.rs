@@ -21,7 +21,11 @@ async fn make_scribe_client(
         let auth = hs_common::auth::client::AuthenticatedClient::from_default_path()
             .context("Cloud credentials not found. Run `hs cloud enroll` first.")?;
         let http = hs_common::auth::client::AuthedHttp::with_auth(auth, convert_timeout)?;
-        Ok(hs_scribe::client::ScribeClient::new_with_client(url, http))
+        Ok(hs_scribe::client::ScribeClient::new_with_client(
+            url,
+            http,
+            convert_timeout,
+        ))
     } else {
         hs_scribe::client::ScribeClient::new_with_timeout(url, convert_timeout)
     }
@@ -295,15 +299,11 @@ impl ConvertClassification {
 /// Classify a convert failure as Permanent (stop chain) or Escalate
 /// (try next backend). The scribe HTTP server returns HTTP 415 + body
 /// `unsupported_content_type:{html,binary}` for content-type mismatches
-/// (see `hs-scribe/src/server.rs::verify_pdf_content`). PDF parse errors
-/// surface as `FormatError` / `Invalid image size` / `PdfiumLibrary` in
-/// the error chain. HTML paywall rejection embeds "paywall" in the
-/// message. VLM-class failures (`VLM repetition loop`, mid-stream
-/// `connection closed before message completed`) are Escalate so the
-/// next backend can take a swing.
+/// and types its in-stream failures with a `FailureCode`; the verdict is
+/// read from that code (`hs_scribe::classify::classify`), never from the
+/// error text, which carries event keys and stems.
 pub(crate) fn classify_convert_failure(err: &anyhow::Error) -> ConvertClassification {
-    let msg = format!("{err:#}");
-    match hs_scribe::classify::classify_failure(&msg) {
+    match hs_scribe::classify::classify(err) {
         hs_scribe::classify::FailureClass::Permanent(reason) => {
             ConvertClassification::Permanent(reason.to_string())
         }
@@ -428,6 +428,7 @@ pub(crate) async fn cmd_watch_events(
     }
     let tiers = Arc::new(built_tiers);
     let timeout_policy = Arc::new(cfg.timeout_policy.clone());
+    let epub_limits = Arc::new(cfg.epub.clone());
 
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
@@ -453,6 +454,7 @@ pub(crate) async fn cmd_watch_events(
         let bus = bus_for_handler.clone();
         let tiers = tiers.clone();
         let timeout_policy = timeout_policy.clone();
+        let epub_limits = epub_limits.clone();
         async move {
             // Dispatch through the backend tiers in order. The first tier
             // (primary backend) gets the paper via its own least-loaded pick.
@@ -473,7 +475,16 @@ pub(crate) async fn cmd_watch_events(
             // classification: Permanent → TERM, Transient → NAK.
             let source =
                 match hs_scribe::event_watch::prepare_source(storage.as_ref(), &event).await {
-                    Ok(hs_scribe::event_watch::SourcePrep::AlreadyConverted(_)) => return Ok(()),
+                    Ok(hs_scribe::event_watch::SourcePrep::AlreadyConverted(md_key)) => {
+                        // An earlier attempt wrote the markdown; it may have
+                        // died before telling distill. Say it again.
+                        return hs_scribe::event_watch::announce_completed(
+                            bus.as_ref(),
+                            &md_key,
+                            &event.key,
+                        )
+                        .await;
+                    }
                     Ok(hs_scribe::event_watch::SourcePrep::Fetched(src)) => src,
                     Err(e) => return Err(e),
                 };
@@ -537,6 +548,7 @@ pub(crate) async fn cmd_watch_events(
                     bus.as_ref(),
                     &event,
                     timeout_policy.as_ref(),
+                    epub_limits.as_ref(),
                     &source,
                     Some(backend.clone()),
                     attempts_log.clone(),
@@ -670,6 +682,9 @@ pub(crate) async fn cmd_watch_events(
 /// — the scribe VLM pipeline is PDF-only.
 pub fn epub_bytes_to_html(bytes: Vec<u8>) -> Result<String> {
     use std::io::Cursor;
+    // The same entry-count / expanded-size caps the converter applies: an
+    // inbox drop is untrusted zip bytes too.
+    hs_scribe::epub::check_archive(&bytes, &hs_scribe::epub::EpubLimits::default())?;
     let mut doc = epub::doc::EpubDoc::from_reader(Cursor::new(bytes))
         .context("failed to open EPUB archive")?;
     let mut out = String::new();
@@ -750,7 +765,8 @@ async fn cmd_convert(
         std::fs::read(&input).with_context(|| format!("Cannot read {}", input.display()))?;
     // Count before the bytes move into the converter — olmocr returns one
     // flat blob, so the source PDF is the only page-count ground truth.
-    let source_pages = hs_scribe::pdf_meta::count_pages(&pdf_bytes);
+    let source_pages = hs_scribe::pdf_meta::count_pages(&pdf_bytes)
+        .with_context(|| format!("{} cannot be converted", input.display()))?;
 
     let stage: Arc<Box<dyn hs_common::reporter::StageHandle>> =
         Arc::new(reporter.begin_counted_stage("Converting", None));
@@ -782,6 +798,7 @@ async fn cmd_convert(
     }
 
     let (_server, conversion) = result?;
+    let skipped_regions = conversion.skipped_regions();
     let raw_md = conversion.markdown;
     let per_page_region_classes = conversion.per_page_region_classes;
     let per_page_diags = conversion.per_page_diags;
@@ -795,7 +812,7 @@ async fn cmd_convert(
 
     let total_pages = hs_common::catalog::resolve_page_accounting(
         hs_common::catalog::compute_page_offsets(&md).len() as u64,
-        source_pages,
+        Some(source_pages),
     )
     .total_pages;
     let per_page_is_bibliography: Vec<bool> = (0..per_page_truncations.len())
@@ -810,6 +827,7 @@ async fn cmd_convert(
         &per_page_truncations,
         &per_page_is_bibliography,
         longest_run,
+        skipped_regions,
     );
     // Optional --diag JSONL: opt-in via HS_SCRIBE_DIAG_DIR env var. Same
     // semantics as the watch-events daemon path — one JSONL per stem.
@@ -831,11 +849,17 @@ async fn cmd_convert(
         qc_verdict: format!("{verdict:?}"),
         wall_clock_ms: qc_started.elapsed().as_millis() as u64,
     });
-    if verdict == hs_scribe::postprocess::QcVerdict::RejectLoop {
-        anyhow::bail!(
+    match verdict {
+        hs_scribe::postprocess::QcVerdict::Accept => {}
+        hs_scribe::postprocess::QcVerdict::RejectLoop => anyhow::bail!(
             "VLM repetition loop: {truncations} truncation site(s), longest_run={longest_run}B \
              across {total_pages} page(s). Output not persisted; re-run or investigate the source PDF.",
-        );
+        ),
+        hs_scribe::postprocess::QcVerdict::RejectGapped => anyhow::bail!(
+            "{skipped_regions} region(s) of {} could not be processed by the server, so the \
+             markdown has holes. Output not persisted; re-run or investigate the source PDF.",
+            input.display(),
+        ),
     }
 
     // Resolve output: CLI flag > config output_dir > stdout
@@ -1026,7 +1050,7 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
         let source_pages = if pdf_exists {
             std::fs::read(&pdf_path)
                 .ok()
-                .and_then(|b| hs_scribe::pdf_meta::count_pages(&b))
+                .and_then(|b| hs_scribe::pdf_meta::count_pages(&b).ok())
         } else {
             None
         };

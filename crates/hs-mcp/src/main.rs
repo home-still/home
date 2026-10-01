@@ -1800,12 +1800,13 @@ impl HomeStillMcp {
         // Dispatch by source type — one path per file extension. No
         // fallback between types; if the named source isn't present, we
         // error loudly instead of silently converting something else.
-        let (md, per_page_region_classes, source_key, server_label, source_pages) =
+        let (md, per_page_region_classes, source_key, server_label, source_pages, skipped_regions) =
             if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await {
                 // Count before the bytes move into the converter; olmocr
                 // returns one flat blob, so this is the only page-count
                 // ground truth this path will get.
-                let source_pages = hs_scribe::pdf_meta::count_pages(&pdf_bytes);
+                let source_pages = hs_scribe::pdf_meta::count_pages(&pdf_bytes)
+                    .map_err(|e| format!("{pdf_key} cannot be converted: {e}"))?;
                 let client = self
                     .scribe_client()
                     .map_err(|e| e.to_string())?
@@ -1841,22 +1842,24 @@ impl HomeStillMcp {
                     .convert_with_progress(pdf_bytes, None, Some(p.stem.as_str()), on_progress)
                     .await
                     .map_err(|e| format!("Conversion failed: {e}"))?;
+                let skipped_regions = conversion.skipped_regions();
                 (
                     conversion.markdown,
                     conversion.per_page_region_classes,
                     pdf_key,
                     "scribe-vlm".to_string(),
-                    source_pages,
+                    Some(source_pages),
+                    skipped_regions,
                 )
             } else if let Ok(html_bytes) = self.storage.get(&html_key).await {
                 let html = String::from_utf8(html_bytes)
                     .map_err(|e| format!("HTML at {html_key} is not valid UTF-8: {e}"))?;
                 let md = hs_scribe::html::convert_html_to_markdown(&html);
-                (md, Vec::new(), html_key, "html-parser".to_string(), None)
+                (md, Vec::new(), html_key, "html-parser".to_string(), None, 0)
             } else if let Ok(epub_bytes) = self.storage.get(&epub_key).await {
                 let md = hs_scribe::epub::convert_epub_to_markdown(&epub_bytes)
                     .map_err(|e| format!("EPUB parse failed for {epub_key}: {e}"))?;
-                (md, Vec::new(), epub_key, "epub-parser".to_string(), None)
+                (md, Vec::new(), epub_key, "epub-parser".to_string(), None, 0)
             } else {
                 return Err(format!(
                 "No PDF, HTML, or EPUB found for '{}' (tried {pdf_key}, {html_key}, {epub_key})",
@@ -1904,16 +1907,25 @@ impl HomeStillMcp {
 
         // VLM repetition-loop check: propagate as a hard error. No catalog
         // row is written — operator sees it in MCP error response + logs.
-        if hs_scribe::postprocess::qc_verdict(
+        match hs_scribe::postprocess::qc_verdict(
             &per_page_truncations,
             &per_page_is_bibliography,
             longest_run,
-        ) == hs_scribe::postprocess::QcVerdict::RejectLoop
-        {
-            return Err(format!(
-                "{}: VLM repetition loop ({} truncation site(s), longest_run={}B across {} page(s)) — not persisted",
-                p.stem, truncations, longest_run, total_pages
-            ));
+            skipped_regions,
+        ) {
+            hs_scribe::postprocess::QcVerdict::Accept => {}
+            hs_scribe::postprocess::QcVerdict::RejectLoop => {
+                return Err(format!(
+                    "{}: VLM repetition loop ({} truncation site(s), longest_run={}B across {} page(s)) — not persisted",
+                    p.stem, truncations, longest_run, total_pages
+                ));
+            }
+            hs_scribe::postprocess::QcVerdict::RejectGapped => {
+                return Err(format!(
+                    "{}: {} region(s) could not be processed by the server, so the markdown has holes — not persisted",
+                    p.stem, skipped_regions
+                ));
+            }
         }
 
         let md_key = format!(

@@ -9,11 +9,17 @@
 //!    chain stop and stamp (`Permanent`), or hand the document to the
 //!    next backend (`Escalate`)?
 //!
-//! These used to be two independent substring tables that had to agree
-//! and didn't: "olmocr reported 0 completed pages" was Escalate in one
-//! and (by omission) Transient in the other, so the Escalate arm was
-//! dead at runtime and poison PDFs NAK-redelivered through the full
-//! `max_deliver` budget. Both layers now consult this one table.
+//! Both layers ask [`classify`], which reads a typed [`ConvertFailure`]
+//! out of the error chain. A failure is typed where it is *produced* —
+//! the scribe server names it with a [`FailureCode`] on the wire, the
+//! client turns that code back into a `ConvertFailure`, and the event
+//! handler constructs one for its own verdicts. Nothing is classified by
+//! searching message text: event keys and stems end up in messages
+//! (`scribe convert failed for {key}`), so a document whose stem
+//! contains "paywall" used to be permanently failed by a substring match.
+//! An error with no `ConvertFailure` in its chain is `Transient`: it is
+//! cluster state (network, backend down), not a statement about the
+//! document.
 
 /// Three-way verdict for a convert failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,161 +37,302 @@ pub enum FailureClass {
     Transient,
 }
 
-/// Classify a convert-failure message. Matches on substrings because the
-/// error crosses an HTTP boundary as formatted text (`{e:#}`) — the
-/// scribe server's typed error is gone by the time the client sees it.
-pub fn classify_failure(msg: &str) -> FailureClass {
-    use FailureClass::*;
-    if msg.contains("unsupported_content_type:html") {
-        // HTTP 415 from the /scribe gate (server.rs::verify_pdf_content):
-        // the object is HTML, no VLM will change that.
-        Permanent("unsupported_content_type:html")
-    } else if msg.contains("unsupported_content_type:binary") {
-        Permanent("unsupported_content_type:binary")
-    } else if msg.contains("paywall") {
-        Permanent("paywall_html")
-    } else if msg.contains("FormatError")
-        || msg.contains("Invalid image size")
-        || msg.contains("PdfiumLibrary")
-    {
-        // The PDF itself is structurally broken; every renderer-backed
-        // backend fails identically.
-        Permanent("pdf_parse_error")
-    } else if msg.contains("EPUB parse failed") {
-        Permanent("epub_parse_error")
-    } else if msg.contains("not valid UTF-8") {
-        Permanent("html_not_utf8")
-    } else if msg.contains("unsupported source type") {
-        Permanent("unsupported_extension")
-    } else if msg.contains("source bytes missing") {
-        // storage.get returned NotFound — the object doesn't exist, so
-        // escalating would re-GET the same absent key on every backend
-        // and the exhaustion stamp would clobber the true reason with
-        // the generic token. Stop the chain at the first backend.
-        Permanent("source_missing")
-    } else if msg.contains("has no extension") {
-        // Event key carries no extension; no backend can pick a parser.
-        Permanent("missing_extension")
-    } else if msg.contains("indexable floor")
-        && (msg.contains("converted by html-parser") || msg.contains("converted by epub-parser"))
-    {
-        // HTML/EPUB run through the same local parser on every tier, so an
-        // empty parse (redirect / anti-bot stub) is content-intrinsic.
-        // Escalating parked the event on the next tier's readiness poll
-        // for nothing. VLM output under the floor is deliberately NOT
-        // matched: a different VLM may read a scan the first could not.
-        Permanent("empty_conversion")
-    } else if msg.contains("VLM repetition loop") {
-        // Covers both the server's streaming-abort message ("VLM
-        // repetition loop detected") and the client-side QC reject
-        // ("VLM repetition loop on <stem> ..."). A different VLM
-        // produces different output for the same page, so escalate.
-        Escalate("vlm_repetition_loop")
-    } else if msg.contains("connection closed before message completed") {
-        // llama-server evicting a slot mid-stream after its own
-        // repetition guard fires — same VLM-class failure family.
-        Escalate("vlm_transport_error")
-    } else if msg.contains("olmocr reported 0 completed pages") {
-        // olmocr ran but produced nothing (output validation rejected
-        // every page, or its renderer couldn't open the PDF). Not proof
-        // the PDF is broken — observed on a clean-text-layer book. A
-        // genuinely broken PDF fails fast on the next backend with a
-        // real FormatError.
-        Escalate("olmocr_zero_pages")
-    } else {
-        Transient
+/// Machine-readable reason for a convert failure. The [`wire`](Self::wire)
+/// token is the stable name used on the HTTP boundary between scribe
+/// server and client and as the `conversion_failed` reason stamped in the
+/// catalog, so renaming one is a wire and data change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FailureCode {
+    /// HTTP 415 from the `%PDF` magic-byte gate: the object is HTML.
+    UnsupportedContentTypeHtml,
+    /// HTTP 415 from the `%PDF` magic-byte gate: the object is not a PDF.
+    UnsupportedContentTypeBinary,
+    /// HTML that is a paywall / loading stub.
+    PaywallHtml,
+    /// The PDF is structurally broken, encrypted, or has a page box or
+    /// page count the renderer refuses; every renderer fails identically.
+    PdfParseError,
+    /// The EPUB archive cannot be opened, or exceeds the size caps.
+    EpubParseError,
+    HtmlNotUtf8,
+    UnsupportedExtension,
+    /// The source object does not exist in storage.
+    SourceMissing,
+    /// The event key carries no extension; no parser can be picked.
+    MissingExtension,
+    /// The event key cannot name a document (escapes the storage root,
+    /// empty or dot-segment stem).
+    InvalidKey,
+    /// A parser (HTML / EPUB) produced output below the indexable floor.
+    /// Every tier runs the same parser, so this is content-intrinsic.
+    EmptyConversion,
+    /// A VLM produced output below the indexable floor. A different VLM
+    /// may read a scan the first could not.
+    EmptyVlmConversion,
+    /// A VLM looped and the output was rejected by QC (or the streaming
+    /// detector). A different VLM produces different output.
+    VlmRepetitionLoop,
+    /// The VLM stream died mid-response (evicted slot, reset, stall,
+    /// premature EOF, backend-reported error event).
+    VlmTransportError,
+    /// The VLM stopped at its token limit instead of finishing.
+    VlmOutputTruncated,
+    /// olmocr ran but reported no completed page.
+    OlmocrZeroPages,
+    /// olmocr reported failed pages, or fewer completed pages than the
+    /// source has.
+    OlmocrIncompletePages,
+    /// Part of the document could not be processed (regions the pipeline
+    /// had to skip), so the markdown has holes.
+    GappedConversion,
+}
+
+impl FailureCode {
+    /// The stable wire / catalog token.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::UnsupportedContentTypeHtml => "unsupported_content_type:html",
+            Self::UnsupportedContentTypeBinary => "unsupported_content_type:binary",
+            Self::PaywallHtml => "paywall_html",
+            Self::PdfParseError => "pdf_parse_error",
+            Self::EpubParseError => "epub_parse_error",
+            Self::HtmlNotUtf8 => "html_not_utf8",
+            Self::UnsupportedExtension => "unsupported_extension",
+            Self::SourceMissing => "source_missing",
+            Self::MissingExtension => "missing_extension",
+            Self::InvalidKey => "invalid_key",
+            Self::EmptyConversion => "empty_conversion",
+            Self::EmptyVlmConversion => "empty_vlm_conversion",
+            Self::VlmRepetitionLoop => "vlm_repetition_loop",
+            Self::VlmTransportError => "vlm_transport_error",
+            Self::VlmOutputTruncated => "vlm_output_truncated",
+            Self::OlmocrZeroPages => "olmocr_zero_pages",
+            Self::OlmocrIncompletePages => "olmocr_incomplete_pages",
+            Self::GappedConversion => "gapped_conversion",
+        }
     }
+
+    const ALL: [FailureCode; 18] = [
+        Self::UnsupportedContentTypeHtml,
+        Self::UnsupportedContentTypeBinary,
+        Self::PaywallHtml,
+        Self::PdfParseError,
+        Self::EpubParseError,
+        Self::HtmlNotUtf8,
+        Self::UnsupportedExtension,
+        Self::SourceMissing,
+        Self::MissingExtension,
+        Self::InvalidKey,
+        Self::EmptyConversion,
+        Self::EmptyVlmConversion,
+        Self::VlmRepetitionLoop,
+        Self::VlmTransportError,
+        Self::VlmOutputTruncated,
+        Self::OlmocrZeroPages,
+        Self::OlmocrIncompletePages,
+        Self::GappedConversion,
+    ];
+
+    /// Parse a wire token. Exact match only: an unknown token is not a
+    /// known failure, and the caller treats it as unclassified.
+    pub fn from_wire(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.wire() == token)
+    }
+
+    /// What the chain should do with a document that failed this way.
+    pub fn class(self) -> FailureClass {
+        let token = self.wire();
+        match self {
+            Self::UnsupportedContentTypeHtml
+            | Self::UnsupportedContentTypeBinary
+            | Self::PaywallHtml
+            | Self::PdfParseError
+            | Self::EpubParseError
+            | Self::HtmlNotUtf8
+            | Self::UnsupportedExtension
+            | Self::SourceMissing
+            | Self::MissingExtension
+            | Self::InvalidKey
+            | Self::EmptyConversion => FailureClass::Permanent(token),
+            Self::EmptyVlmConversion
+            | Self::VlmRepetitionLoop
+            | Self::VlmTransportError
+            | Self::VlmOutputTruncated
+            | Self::OlmocrZeroPages
+            | Self::OlmocrIncompletePages
+            | Self::GappedConversion => FailureClass::Escalate(token),
+        }
+    }
+}
+
+/// A convert failure that carries its [`FailureCode`]. Put it at the root
+/// of an `anyhow::Error` (`anyhow::Error::new(ConvertFailure::new(..))`);
+/// `.context(..)` layers added later keep it reachable for [`classify`].
+#[derive(Debug)]
+pub struct ConvertFailure {
+    code: FailureCode,
+    message: String,
+}
+
+impl ConvertFailure {
+    pub fn new(code: FailureCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// `anyhow::Error` rooted at a failure with this code.
+    pub fn err(code: FailureCode, message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self::new(code, message))
+    }
+
+    pub fn code(&self) -> FailureCode {
+        self.code
+    }
+}
+
+impl std::fmt::Display for ConvertFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConvertFailure {}
+
+/// The [`FailureCode`] an error was typed with, if any.
+pub fn failure_code(err: &anyhow::Error) -> Option<FailureCode> {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<ConvertFailure>())
+        .map(ConvertFailure::code)
+}
+
+/// Classify a convert failure from its typed code. No code in the chain
+/// means the error says nothing about the document: `Transient`.
+pub fn classify(err: &anyhow::Error) -> FailureClass {
+    failure_code(err).map_or(FailureClass::Transient, FailureCode::class)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_failure, FailureClass};
+    use super::*;
+    use anyhow::Context;
 
     #[test]
-    fn olmocr_zero_pages_escalates() {
-        // The exact string olmocr_subprocess returns, wrapped the way the
-        // server/client round-trip presents it.
-        let msg = "Server error: olmocr reported 0 completed pages (failed=0); \
-                   content may need a different backend";
-        assert_eq!(
-            classify_failure(msg),
-            FailureClass::Escalate("olmocr_zero_pages")
-        );
+    fn every_code_round_trips_through_its_wire_token_and_tokens_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for code in FailureCode::ALL {
+            assert_eq!(FailureCode::from_wire(code.wire()), Some(code));
+            assert!(seen.insert(code.wire()), "duplicate token {}", code.wire());
+        }
     }
 
     #[test]
-    fn repetition_loop_escalates_for_both_message_shapes() {
-        // Server streaming-abort shape.
+    fn wire_tokens_match_exactly_and_nothing_else() {
         assert_eq!(
-            classify_failure("VLM repetition loop detected on page 41"),
-            FailureClass::Escalate("vlm_repetition_loop")
+            FailureCode::from_wire("paywall_html"),
+            Some(FailureCode::PaywallHtml)
         );
-        // Client QC reject shape.
-        assert_eq!(
-            classify_failure("VLM repetition loop on beck_tdd (truncations=40)"),
-            FailureClass::Escalate("vlm_repetition_loop")
-        );
+        for not_a_code in [
+            "",
+            "paywall",
+            "Paywall_html",
+            "paywall_html ",
+            "scribe convert failed for paywall_html",
+            "unsupported_content_type",
+        ] {
+            assert_eq!(FailureCode::from_wire(not_a_code), None, "{not_a_code:?}");
+        }
     }
 
     #[test]
-    fn unknown_errors_are_transient() {
-        assert_eq!(
-            classify_failure("error sending request for url (http://big:7435/scribe)"),
-            FailureClass::Transient
-        );
-    }
-
-    #[test]
-    fn source_missing_is_permanent_not_escalate() {
-        // A missing source object must short-circuit the chain — every
-        // backend GETs the same storage, so escalation just re-fails
-        // N-1 more times and the exhaustion stamp replaces the true
-        // reason with the generic token.
-        assert_eq!(
-            classify_failure("source bytes missing for papers/mc/code.pdf"),
-            FailureClass::Permanent("source_missing")
-        );
-    }
-
-    #[test]
-    fn missing_extension_is_permanent() {
-        assert_eq!(
-            classify_failure("key papers/mc/noext has no extension"),
-            FailureClass::Permanent("missing_extension")
-        );
-    }
-
-    #[test]
-    fn broken_pdf_is_permanent() {
-        assert_eq!(
-            classify_failure("FormatError: cross-reference table is broken"),
-            FailureClass::Permanent("pdf_parse_error")
-        );
-    }
-
-    #[test]
-    fn parser_output_below_floor_is_permanent() {
-        // Shape event_watch::convert_and_upload returns for an HTML
-        // redirect stub. Every tier runs the same parser, so escalation
-        // can never help.
-        for converter in ["html-parser", "epub-parser"] {
-            let msg = format!(
-                "papers/10/x.html converted by {converter} to 12 non-whitespace chars, \
-                 below the 200-char indexable floor; refusing to record a conversion"
-            );
+    fn permanent_codes_stop_the_chain_and_name_the_catalog_reason() {
+        for (code, token) in [
+            (
+                FailureCode::UnsupportedContentTypeHtml,
+                "unsupported_content_type:html",
+            ),
+            (
+                FailureCode::UnsupportedContentTypeBinary,
+                "unsupported_content_type:binary",
+            ),
+            (FailureCode::PaywallHtml, "paywall_html"),
+            (FailureCode::PdfParseError, "pdf_parse_error"),
+            (FailureCode::EpubParseError, "epub_parse_error"),
+            (FailureCode::HtmlNotUtf8, "html_not_utf8"),
+            (FailureCode::UnsupportedExtension, "unsupported_extension"),
+            (FailureCode::SourceMissing, "source_missing"),
+            (FailureCode::MissingExtension, "missing_extension"),
+            (FailureCode::InvalidKey, "invalid_key"),
+            (FailureCode::EmptyConversion, "empty_conversion"),
+        ] {
             assert_eq!(
-                classify_failure(&msg),
-                FailureClass::Permanent("empty_conversion")
+                classify(&ConvertFailure::err(code, "x")),
+                FailureClass::Permanent(token)
             );
         }
     }
 
     #[test]
-    fn vlm_output_below_floor_does_not_stop_the_chain() {
-        // A near-empty VLM read of a scan must still reach the next
-        // backend; only parser output is content-intrinsic.
-        let msg = "papers/10/x.pdf converted by scribe-vlm to 12 non-whitespace chars, \
-                   below the 200-char indexable floor; refusing to record a conversion";
-        assert!(!matches!(classify_failure(msg), FailureClass::Permanent(_)));
+    fn backend_class_failures_escalate_to_the_next_backend() {
+        for code in [
+            FailureCode::EmptyVlmConversion,
+            FailureCode::VlmRepetitionLoop,
+            FailureCode::VlmTransportError,
+            FailureCode::VlmOutputTruncated,
+            FailureCode::OlmocrZeroPages,
+            FailureCode::OlmocrIncompletePages,
+            FailureCode::GappedConversion,
+        ] {
+            assert_eq!(
+                classify(&ConvertFailure::err(code, "x")),
+                FailureClass::Escalate(code.wire()),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_untyped_error_is_transient_even_when_its_text_names_a_verdict() {
+        // The old substring table permanently failed any document whose
+        // stem or key happened to contain one of its words.
+        for text in [
+            "scribe convert failed for papers/pa/paywall-economics.pdf",
+            "error sending request for url (http://host-a:7435/scribe/stream): FormatError",
+            "VLM repetition loop on beck_tdd",
+            "source bytes missing for papers/mc/code.pdf",
+            "key papers/mc/noext has no extension",
+            "converted by html-parser to 12 non-whitespace chars, below the indexable floor",
+        ] {
+            assert_eq!(
+                classify(&anyhow::anyhow!(text.to_string())),
+                FailureClass::Transient,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stem_that_names_a_verdict_does_not_change_the_typed_one() {
+        let err = ConvertFailure::err(FailureCode::VlmTransportError, "stream died")
+            .context("scribe convert failed for papers/pa/paywall-FormatError.pdf");
+        assert_eq!(
+            classify(&err),
+            FailureClass::Escalate("vlm_transport_error")
+        );
+    }
+
+    #[test]
+    fn context_layers_added_after_the_fact_keep_the_code_reachable() {
+        let err: anyhow::Result<()> = Err(ConvertFailure::err(
+            FailureCode::PdfParseError,
+            "broken xref",
+        ));
+        let err = err
+            .context("opening upload")
+            .context("scribe convert failed")
+            .unwrap_err();
+        assert_eq!(failure_code(&err), Some(FailureCode::PdfParseError));
+        assert_eq!(classify(&err), FailureClass::Permanent("pdf_parse_error"));
     }
 }
