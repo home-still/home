@@ -78,6 +78,10 @@ In your cloudflared config (e.g., `~/.cloudflared/config.yml`):
 
 Then `cloudflared tunnel route dns <tunnel-name> cloud.example.com` and restart cloudflared.
 
+### 3b. Provision the backend token
+
+The gateway attaches `Authorization: Bearer $HS_BACKEND_TOKEN` to every proxied backend request and **replaces** the caller's `Authorization` header (a user's gateway token is never forwarded). Startup fails if the variable is unset or shorter than 32 bytes. Generate one value with `openssl rand -hex 32` and add `HS_BACKEND_TOKEN=<64-hex-chars>` to `~/.home-still/secrets.env` (mode 0600) on the gateway host **and** on every backend host — the same value everywhere, set before upgrading the gateway.
+
 ### 4. Start the gateway
 
 As a systemd service:

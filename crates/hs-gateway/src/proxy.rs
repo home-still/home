@@ -230,10 +230,14 @@ async fn forward_request(
     // bodies carry neither Content-Length nor Transfer-Encoding.
     let has_body = !body.is_end_stream();
 
+    // The caller's Authorization (a gateway-signed token) is dropped by
+    // `is_client_only`; the backend gets the shared backend secret instead.
+    // `bearer_auth` marks the value sensitive so it is redacted from Debug.
     let mut backend_req = state
         .http
         .request(parts.method, &backend_url)
-        .headers(filtered_headers(&parts.headers, is_client_only));
+        .headers(filtered_headers(&parts.headers, is_client_only))
+        .bearer_auth(state.backend_token.expose_secret());
 
     let too_large = Arc::new(AtomicBool::new(false));
     if has_body {
@@ -538,10 +542,12 @@ mod tests {
             "keep-alive",
             "te",
             "upgrade",
-            "authorization",
         ] {
             assert!(!headers.contains_key(gone), "{gone} leaked: {headers:?}");
         }
+        // The only credential a backend sees is the shared backend token,
+        // never the caller's gateway token.
+        assert_eq!(headers["authorization"], expected_auth().as_str());
         assert_eq!(headers["x-app-header"], "kept");
     }
 
@@ -836,5 +842,103 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(crate::testutil::body_string(resp).await, "live");
         }
+    }
+
+    async fn authorizations(resp: Response) -> Vec<String> {
+        let text = crate::testutil::body_string(resp).await;
+        text.split('|')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn recording_backend() -> Router {
+        async fn record(req: Request<Body>) -> String {
+            let seen: Vec<String> = req
+                .headers()
+                .get_all(header::AUTHORIZATION)
+                .iter()
+                .map(|v| v.to_str().unwrap_or("<bin>").to_string())
+                .collect();
+            let _ = axum::body::to_bytes(req.into_body(), usize::MAX).await;
+            seen.join("|")
+        }
+        Router::new().fallback(any(record))
+    }
+
+    fn expected_auth() -> String {
+        format!("Bearer {}", crate::testutil::BACKEND_TOKEN)
+    }
+
+    #[tokio::test]
+    async fn backends_get_exactly_one_authorization_header_the_backend_token() {
+        let a = spawn_backend(recording_backend()).await;
+        let b = spawn_backend(recording_backend()).await;
+        let state = test_state(&[("scribe", &a), ("scribe", &b)]).await;
+        let user_token = access(&state, &["scribe"]);
+
+        // GET, and round-robin across both list instances.
+        for _ in 0..4 {
+            let resp = call(
+                &state,
+                bearer_req(Method::GET, "/scribe/x", &user_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(authorizations(resp).await, [expected_auth()]);
+        }
+
+        // Streamed (chunked) POST.
+        let stream = futures_util::stream::iter(
+            (0..8).map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![1u8; 4096]))),
+        );
+        let resp = call(
+            &state,
+            bearer_req(Method::POST, "/scribe/stream", &user_token)
+                .body(Body::from_stream(stream))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(authorizations(resp).await, [expected_auth()]);
+    }
+
+    #[tokio::test]
+    async fn the_users_gateway_token_is_never_forwarded_even_when_sent_twice() {
+        let backend = spawn_backend(recording_backend()).await;
+        let state = test_state(&[("mcp", &backend)]).await;
+        let user_token = access(&state, &["mcp"]);
+
+        let resp = call(
+            &state,
+            bearer_req(Method::GET, "/mcp/x", &user_token)
+                .header("authorization", "Bearer client-supplied-extra")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let seen = authorizations(resp).await;
+        assert_eq!(seen, [expected_auth()]);
+        assert!(!seen.iter().any(|v| v.contains(&user_token)));
+    }
+
+    #[tokio::test]
+    async fn the_backend_token_never_reaches_the_client() {
+        // A refused/failed upstream must not echo the secret in error bodies.
+        let dead = unused_local_url().await;
+        let state = test_state(&[("mcp", &dead)]).await;
+        let user_token = access(&state, &["mcp"]);
+        let resp = call(
+            &state,
+            bearer_req(Method::GET, "/mcp/x", &user_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let body = crate::testutil::body_string(resp).await;
+        assert!(!body.contains(crate::testutil::BACKEND_TOKEN));
+        assert!(!format!("{:?}", state.backend_token).contains(crate::testutil::BACKEND_TOKEN));
     }
 }

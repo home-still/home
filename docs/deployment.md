@@ -193,6 +193,17 @@ cloud:
 
 The gateway's public URL is **not** read from this file — it is the required `--gateway-url https://…` flag below. Startup fails if it is missing or not `https://`. `hs cloud invite` / `hs cloud revoke` only work on this host: they authenticate with `cloud-admin.key`.
 
+**Provision the backend token (required; do this on every host BEFORE upgrading the gateway)**
+
+The gateway sends `Authorization: Bearer $HS_BACKEND_TOKEN` on every request it forwards, replacing the caller's token, and backends (hs-mcp, and every other server that adopts it) answer 401 without it. The gateway refuses to start if the variable is unset or shorter than 32 bytes. Generate one value and put the **same** value in `~/.home-still/secrets.env` on the gateway host and on every backend host:
+
+```bash
+openssl rand -hex 32          # run once; copy the output
+# on the gateway host AND each backend host (scribe, distill, mcp):
+echo 'HS_BACKEND_TOKEN=<64-hex-chars>' >> ~/.home-still/secrets.env
+chmod 600 ~/.home-still/secrets.env
+```
+
 **Run as systemd services**
 
 Run as: `sudo bash`

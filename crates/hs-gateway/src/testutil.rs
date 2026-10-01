@@ -12,6 +12,9 @@ use axum::response::Response;
 use axum::Router;
 use tower::ServiceExt;
 
+/// The backend token every test gateway forwards (obviously fake).
+pub const BACKEND_TOKEN: &str = "test-backend-token-0123456789abcdef-not-a-secret";
+
 use crate::app::build_router;
 use crate::auth::SigningKeys;
 use crate::config::GatewayConfig;
@@ -77,6 +80,7 @@ pub async fn test_state_with(routes: &[(&str, &str)], extra: &str) -> TestState 
         admin_key,
         revocations,
         "https://gateway.example.com".into(),
+        hs_common::auth::backend::BackendToken::new(BACKEND_TOKEN).unwrap(),
     )
     .unwrap();
 

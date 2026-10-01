@@ -56,6 +56,9 @@ async fn main() -> anyhow::Result<()> {
     let keys = SigningKeys::load(&config)?;
     let admin_key = hs_common::auth::token::load_or_create_admin_key(&config.admin_key_path())?;
     let revocations = Revocations::load(config.revocation_path())?;
+    // Required: backends reject requests without it, so there is no
+    // "send nothing" mode. Secrets were loaded into the environment above.
+    let backend_token = hs_common::auth::backend::BackendToken::from_env()?;
 
     let listen = args.listen.unwrap_or_else(|| config.listen.clone());
 
@@ -68,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         admin_key,
         revocations,
         gateway_url,
+        backend_token,
     )?);
     let app = app::build_router(state);
 
@@ -148,4 +152,39 @@ async fn install_logging() -> hs_common::logging::LoggingHandle {
         .start_shipping(primary_storage.as_ref(), &logs_yaml.bucket)
         .await;
     handle
+}
+
+#[cfg(test)]
+mod tests {
+    use hs_common::auth::backend::{BackendToken, ENV_VAR};
+
+    fn lookup(value: Option<&'static str>) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+        move |name| {
+            assert_eq!(name, ENV_VAR);
+            value
+                .map(str::to_string)
+                .ok_or(std::env::VarError::NotPresent)
+        }
+    }
+
+    /// The gateway starts with `BackendToken::from_env()`; an unset or short
+    /// value must be an error naming the variable, never a "send nothing" mode.
+    #[test]
+    fn startup_refuses_without_a_usable_backend_token() {
+        for value in [
+            None,
+            Some("short"),
+            Some("has a space in it 0123456789abcdefghij"),
+        ] {
+            let err = BackendToken::from_lookup(lookup(value)).expect_err("must refuse");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(ENV_VAR), "{msg}");
+            if let Some(v) = value {
+                assert!(!msg.contains(v), "secret leaked into the error: {msg}");
+            }
+        }
+        assert!(
+            BackendToken::from_lookup(lookup(Some("0123456789abcdef0123456789abcdef"))).is_ok()
+        );
+    }
 }

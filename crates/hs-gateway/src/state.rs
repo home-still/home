@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use hs_common::auth::backend::BackendToken;
 use tokio::sync::Semaphore;
 
 use crate::auth::SigningKeys;
@@ -24,6 +25,9 @@ pub struct GatewayState {
     pub enrollments: EnrollmentStore,
     /// Public https origin of the gateway (OAuth issuer / metadata)
     pub gateway_url: String,
+    /// Shared secret every proxied backend request carries (`HS_BACKEND_TOKEN`).
+    /// Its `Debug` is redacted.
+    pub backend_token: BackendToken,
     /// OAuth authorization codes pending exchange
     pub auth_codes: AuthCodeStore,
     /// Dynamically registered OAuth clients
@@ -44,6 +48,7 @@ impl GatewayState {
         admin_key: String,
         revocations: Revocations,
         gateway_url: String,
+        backend_token: BackendToken,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(config.backend_connect_timeout_secs))
@@ -70,6 +75,7 @@ impl GatewayState {
             revocations,
             http,
             gateway_url,
+            backend_token,
         })
     }
 }
