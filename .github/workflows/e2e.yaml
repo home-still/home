@@ -18,18 +18,25 @@ env:
   SCRIBE_IMAGE: ghcr.io/home-still/hs-scribe-server
   LAYOUT_MODEL_URL: https://github.com/home-still/home/releases/download/v0.0.1-rc.39/pp-doclayoutv3.onnx
   TABLE_MODEL_URL: https://github.com/home-still/home/releases/download/v0.0.1-rc.39/slanet-plus.onnx
+  # sha256 of the two assets above, as computed by GitHub for the release.
+  # A model that changes (re-uploaded asset) fails the run instead of being
+  # fed to the scribe image.
+  LAYOUT_MODEL_SHA256: d24809294b2f9f1a9a2767043a64df2714b66e5be056887be2233d1117d784f6
+  TABLE_MODEL_SHA256: d57a942af6a2f57d6a4a0372573c696a2379bf5857c45e2ac69993f3b334514b
 
 jobs:
   e2e:
     name: Scribe end-to-end
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -40,6 +47,8 @@ jobs:
           mkdir -p /tmp/models
           curl -fSL -o /tmp/models/pp-doclayoutv3.onnx "$LAYOUT_MODEL_URL"
           curl -fSL -o /tmp/models/slanet-plus.onnx    "$TABLE_MODEL_URL"
+          echo "$LAYOUT_MODEL_SHA256  /tmp/models/pp-doclayoutv3.onnx" | sha256sum -c -
+          echo "$TABLE_MODEL_SHA256  /tmp/models/slanet-plus.onnx" | sha256sum -c -
           ls -lh /tmp/models/
 
       - name: Create test PDF
@@ -67,9 +76,16 @@ jobs:
           ls -lh /tmp/test.pdf
 
       - name: Start services
+        env:
+          # Untrusted workflow_dispatch input: reaches the shell only through
+          # the environment, and only after it matches the docker tag grammar.
+          IMAGE_TAG: ${{ inputs.image_tag || 'latest' }}
         run: |
-          TAG="${{ inputs.image_tag || 'latest' }}"
-          export SCRIBE_TAG="$TAG"
+          if ! [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "FAIL: image_tag is not a valid docker tag" >&2
+            exit 1
+          fi
+          export SCRIBE_TAG="$IMAGE_TAG"
           export MODELS_DIR=/tmp/models
           docker compose \
             -f crates/hs-scribe/docker/docker-compose.e2e.yml \
@@ -81,11 +97,13 @@ jobs:
           for i in $(seq 1 30); do
             if docker exec ollama-e2e ollama list >/dev/null 2>&1; then
               echo "Ollama is up"
-              break
+              exit 0
             fi
             echo "  attempt $i/30..."
             sleep 5
           done
+          echo "FAIL: Ollama did not come up within 150s" >&2
+          exit 1
 
       - name: Pull VLM model
         run: |
@@ -152,7 +170,7 @@ jobs:
 
       - name: Upload result
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: scribe-e2e-output
           path: /tmp/result.md
