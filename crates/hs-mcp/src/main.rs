@@ -569,6 +569,11 @@ struct HomeStillMcp {
     scribe_convert_timeout: std::time::Duration,
     scribe_timeout_policy: hs_scribe::config::TimeoutPolicy,
     epub_limits: hs_scribe::epub::EpubLimits,
+    /// Every paper provider, with its rate limiters and circuit breakers,
+    /// built once so all requests share them.
+    providers: Arc<paper::providers::set::ProviderSet>,
+    /// The downloader over the shared providers, storage and event bus.
+    downloader: Arc<paper::providers::downloader::PaperDownloader>,
     distill_servers: Vec<String>,
     /// Read-only handle to the local OpenAlex DuckDB (when `openalex:` section
     /// is present in config and the file exists). `None` when the section is
@@ -587,6 +592,7 @@ struct Deps {
     scribe_convert_timeout: std::time::Duration,
     scribe_timeout_policy: hs_scribe::config::TimeoutPolicy,
     epub_limits: hs_scribe::epub::EpubLimits,
+    paper_config: paper::config::Config,
     distill_servers: Vec<String>,
     openalex_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
 }
@@ -701,7 +707,10 @@ impl HomeStillMcp {
             .ok()
             .map(|conn| Arc::new(std::sync::Mutex::new(conn)));
 
-        Ok(Self::from_deps(Deps {
+        let paper_config = paper::config::Config::load()
+            .map_err(|e| anyhow::anyhow!("paper config invalid: {e:#}"))?;
+
+        Self::from_deps(Deps {
             storage,
             events,
             scribe_servers,
@@ -710,10 +719,11 @@ impl HomeStillMcp {
             epub_limits: scribe_cfg.epub.clone(),
             distill_servers,
             openalex_db,
-        }))
+            paper_config,
+        })
     }
 
-    fn from_deps(deps: Deps) -> Self {
+    fn from_deps(deps: Deps) -> anyhow::Result<Self> {
         let Deps {
             storage,
             events,
@@ -721,9 +731,27 @@ impl HomeStillMcp {
             scribe_convert_timeout,
             scribe_timeout_policy,
             epub_limits,
+            paper_config,
             distill_servers,
             openalex_db,
         } = deps;
+
+        // One provider set for the life of the process: every request goes
+        // through the same rate limiters and circuit breakers, and a bad
+        // paper config stops the server here instead of failing each call.
+        let providers = Arc::new(
+            paper::providers::set::ProviderSet::new(&paper_config)
+                .map_err(|e| anyhow::anyhow!("paper providers: {e:#}"))?,
+        );
+        let downloader = Arc::new(
+            paper::providers::downloader::PaperDownloader::with_event_bus(
+                storage.clone(),
+                events.clone(),
+                &paper_config.download,
+                providers.download_resolvers(),
+            )
+            .map_err(|e| anyhow::anyhow!("paper downloader: {e:#}"))?,
+        );
 
         // Gate: check the readiness sentinel BEFORE building the tool
         // router. If the openalex corpus isn't fully loaded + indexed + FTS'd,
@@ -760,7 +788,7 @@ impl HomeStillMcp {
             tracing::info!("openalex corpus ready; openalex_* tools enabled");
         }
 
-        Self {
+        Ok(Self {
             storage,
             events,
             catalog_prefix: "catalog".to_string(),
@@ -770,11 +798,13 @@ impl HomeStillMcp {
             scribe_convert_timeout,
             scribe_timeout_policy,
             epub_limits,
+            providers,
+            downloader,
             distill_servers,
             openalex_db,
             tool_router,
             prompt_router: Self::prompt_router(),
-        }
+        })
     }
 
     fn scribe_client(&self) -> anyhow::Result<Option<hs_scribe::client::ScribeClient>> {
@@ -984,7 +1014,7 @@ impl HomeStillMcp {
     // ── Paper Tools ────────────────────────────────────────────
 
     #[tool(
-        description = "Search academic papers across 6 providers (arXiv, OpenAlex, Semantic Scholar, Europe PMC, CrossRef, CORE). Returns JSON array of papers with title, authors, abstract, DOI, citations.",
+        description = "Search academic papers across 6 providers (arXiv, OpenAlex, Semantic Scholar, Europe PMC, CrossRef, CORE). Returns a JSON object {\"papers\": [...], \"provider_failures\": [...]}: papers with title, authors, abstract, DOI, citations; provider_failures names each provider that failed (empty when all answered). If every provider fails the call is an error.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -996,13 +1026,8 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<PaperSearchParams>,
     ) -> Result<String, String> {
-        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
-
         let provider_arg = resolve_provider_arg(p.provider.as_deref())?;
-
-        let provider = paper::providers::set::ProviderSet::new(&config)
-            .map_err(|e| format!("Provider error: {e}"))?
-            .provider(&provider_arg);
+        let provider = self.providers.provider(&provider_arg);
 
         let search_type = match p.search_type.as_deref() {
             Some("title") => paper::models::SearchType::Title,
@@ -1012,10 +1037,16 @@ impl HomeStillMcp {
             _ => paper::models::SearchType::Keywords,
         };
 
+        // A date filter that does not parse is an error: dropping it would
+        // answer a different question than the one asked.
         let date_filter = p
             .date
             .as_deref()
-            .and_then(|d| paper::models::DateFilter::parse(d).ok());
+            .map(|d| {
+                paper::models::DateFilter::parse(d)
+                    .map_err(|e| format!("invalid date filter {d:?}: {e}"))
+            })
+            .transpose()?;
 
         let sort_by = match p.sort.as_deref() {
             Some("citations") => paper::models::SortBy::Citations,
@@ -1033,19 +1064,18 @@ impl HomeStillMcp {
             min_citations: p.min_citations.map(u64::from),
         };
 
-        match provider.search_by_query(&query).await {
-            // A bare array when every provider answered; an object naming the
-            // failed providers when some did not (never a silent partial).
-            Ok(result) if result.provider_failures.is_empty() => {
-                Ok(serde_json::to_string_pretty(&result.papers).unwrap_or_default())
-            }
-            Ok(result) => Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "papers": result.papers,
-                "provider_failures": result.provider_failures,
-            }))
-            .unwrap_or_default()),
-            Err(e) => Err(format!("Search failed: {e}")),
-        }
+        // One shape, always: `papers` plus the providers that failed (empty
+        // when every provider answered). A search where every provider
+        // failed is an error, so a partial result is never mistaken for a
+        // complete one.
+        let result = provider
+            .search_by_query(&query)
+            .await
+            .map_err(|e| format!("Search failed: {e}"))?;
+        to_json(&serde_json::json!({
+            "papers": result.papers,
+            "provider_failures": result.provider_failures,
+        }))
     }
 
     #[tool(
@@ -1058,17 +1088,14 @@ impl HomeStillMcp {
         )
     )]
     async fn paper_get(&self, Parameters(p): Parameters<PaperGetParams>) -> Result<String, String> {
-        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
-
-        let provider = paper::providers::set::ProviderSet::new(&config)
-            .map_err(|e| format!("Provider error: {e}"))?
-            .provider(&paper::cli::ProviderArg::All);
-
-        match provider.get_by_doi(&p.doi).await {
-            Ok(Some(paper)) => Ok(serde_json::to_string_pretty(&paper).unwrap_or_default()),
-            Ok(None) => Err(format!("No paper found for DOI: {}", p.doi)),
-            Err(e) => Err(format!("Lookup failed: {e}")),
-        }
+        let paper = self
+            .providers
+            .provider(&paper::cli::ProviderArg::All)
+            .get_by_doi(&p.doi)
+            .await
+            .map_err(|e| format!("Lookup failed: {e}"))?
+            .ok_or_else(|| format!("No paper found for DOI: {}", p.doi))?;
+        to_json(&paper)
     }
 
     #[tool(
@@ -1084,16 +1111,12 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<PaperReferencesParams>,
     ) -> Result<String, String> {
-        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
-        let provider = paper::providers::semantic_scholar::SemanticScholarProvider::new(
-            &config.providers.semantic_scholar,
-        )
-        .map_err(|e| format!("Provider error: {e}"))?;
-
-        match provider.references(&p.doi).await {
-            Ok(resp) => Ok(serde_json::to_string_pretty(&resp).unwrap_or_default()),
-            Err(e) => Err(format!("References lookup failed: {e}")),
-        }
+        let resp = self
+            .providers
+            .references(&p.doi)
+            .await
+            .map_err(|e| format!("References lookup failed: {e}"))?;
+        to_json(&resp)
     }
 
     #[tool(
@@ -1109,26 +1132,22 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<PaperCitationsParams>,
     ) -> Result<String, String> {
-        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
-        let provider = paper::providers::semantic_scholar::SemanticScholarProvider::new(
-            &config.providers.semantic_scholar,
-        )
-        .map_err(|e| format!("Provider error: {e}"))?;
-
         let opts = paper::providers::semantic_scholar::CitationsOpts {
             limit: p.limit,
             year_from: p.year_from,
             sort: p.sort,
         };
 
-        match provider.citations(&p.doi, opts).await {
-            Ok(resp) => Ok(serde_json::to_string_pretty(&resp).unwrap_or_default()),
-            Err(e) => Err(format!("Citations lookup failed: {e}")),
-        }
+        let resp = self
+            .providers
+            .citations(&p.doi, opts)
+            .await
+            .map_err(|e| format!("Citations lookup failed: {e}"))?;
+        to_json(&resp)
     }
 
     #[tool(
-        description = "Download a paper PDF by DOI into the papers directory. Tries arXiv, Unpaywall, and provider resolvers. Creates a catalog entry with metadata. Returns JSON with file path, size, and sha256.",
+        description = "Download a paper PDF by DOI into the papers directory. Tries arXiv, MDPI and the shared provider resolvers (Semantic Scholar, Europe PMC, CORE with a key, OpenAlex, CrossRef). Creates a catalog entry with metadata; fails if the provider lookup or the catalog write fails (the PDF stays stored and a retry repairs the row). Returns JSON with file path, size, and sha256.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1140,60 +1159,53 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<PaperDownloadParams>,
     ) -> Result<String, String> {
-        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
-
-        // Providers (and their rate limiters / circuit breakers) are built by
-        // `ProviderSet`; the download resolvers are its shared instances.
-        let providers = paper::providers::set::ProviderSet::new(&config)
-            .map_err(|e| format!("Provider error: {e}"))?;
-
-        let storage = config
-            .build_storage()
-            .map_err(|e| format!("Storage init failed: {e}"))?;
-        let events = config
-            .build_event_bus()
-            .await
-            .map_err(|e| format!("Event bus init failed: {e}"))?;
-        let downloader = paper::providers::downloader::PaperDownloader::with_event_bus(
-            storage,
-            events,
-            &config.download,
-            providers.download_resolvers(),
-        )
-        .map_err(|e| format!("Downloader init failed: {e}"))?;
-
-        // Download by DOI
         use paper::ports::download_service::DownloadService;
-        let result = downloader
-            .download_by_doi(&p.doi)
+
+        let doi = paper::stem::normalize_doi(&p.doi).map_err(|e| format!("invalid DOI: {e}"))?;
+        let stem = paper::stem::doi_stem(&doi).map_err(|e| format!("invalid DOI: {e}"))?;
+
+        let result = self
+            .downloader
+            .download_by_doi(&doi)
             .await
             .map_err(|e| format!("Download failed: {e}"))?;
 
+        // A PDF that was already stored is only "done" when its catalog row
+        // exists too: a retry after a failed catalog write must repair the
+        // row, not report success over a missing one.
         if result.skipped {
-            return Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "doi": p.doi,
-                "skipped": true,
-                "path": result.file_path.display().to_string(),
-                "message": "File already exists",
-            }))
-            .unwrap_or_default());
+            let has_row = hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &stem,
+            )
+            .await
+            .map_err(|e| format!("reading the catalog row for '{stem}' failed: {e:#}"))?
+            .is_some();
+            if has_row {
+                return to_json(&serde_json::json!({
+                    "doi": doi,
+                    "skipped": true,
+                    "path": result.file_path.display().to_string(),
+                    "message": "File already exists",
+                }));
+            }
         }
 
-        // Look up paper metadata to populate catalog entry
-        let paper_meta = providers
+        // A provider that errors is an error, not "no metadata": the PDF is
+        // stored, but the row must not be written as if nothing was known.
+        let paper_meta = self
+            .providers
             .provider(&paper::cli::ProviderArg::All)
-            .get_by_doi(&p.doi)
+            .get_by_doi(&doi)
             .await
-            .ok()
-            .flatten();
-
-        // Write catalog entry
-        let stem = result
-            .file_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+            .map_err(|e| {
+                format!(
+                    "{doi} is stored at {} but looking up its metadata failed, so no catalog \
+                     row was written (run paper_download again once providers answer): {e}",
+                    result.file_path.display()
+                )
+            })?;
 
         let entry = hs_common::catalog::CatalogEntry {
             title: paper_meta.as_ref().map(|p| p.title.clone()),
@@ -1208,7 +1220,7 @@ impl HomeStillMcp {
                         .collect()
                 })
                 .unwrap_or_default(),
-            doi: Some(p.doi.clone()),
+            doi: Some(doi.clone()),
             publication_date: paper_meta
                 .as_ref()
                 .and_then(|p| p.publication_date.map(|d| d.to_string())),
@@ -1233,24 +1245,27 @@ impl HomeStillMcp {
             category: None,
             original_format: None,
         };
-        if let Err(e) = hs_common::catalog::write_catalog_entry_via(
+        hs_common::catalog::write_catalog_entry_via(
             &*self.storage,
             &self.catalog_prefix,
             &stem,
             &entry,
         )
         .await
-        {
-            tracing::warn!("catalog write failed for {stem}: {e}");
-        }
+        .map_err(|e| {
+            format!(
+                "{doi} is stored at {} but writing its catalog row failed (run paper_download \
+                 again to retry): {e:#}",
+                result.file_path.display()
+            )
+        })?;
 
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "doi": p.doi,
+        to_json(&serde_json::json!({
+            "doi": doi,
             "path": result.file_path.display().to_string(),
             "size_bytes": result.size_bytes,
             "sha256": result.sha256,
         }))
-        .unwrap_or_default())
     }
 
     // ── Catalog Tools ──────────────────────────────────────────
@@ -1930,12 +1945,8 @@ impl HomeStillMcp {
             .unwrap_or_default());
         }
 
-        // Provider aggregate for metadata fan-in. Same `ProviderSet` factory
-        // `paper_download` uses, so behavior is consistent.
-        let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
-        let provider = paper::providers::set::ProviderSet::new(&config)
-            .map_err(|e| format!("Provider init failed: {e}"))?
-            .provider(&paper::cli::ProviderArg::All);
+        // Metadata fan-in through the same shared providers every tool uses.
+        let provider = self.providers.provider(&paper::cli::ProviderArg::All);
 
         let now = chrono::Utc::now().to_rfc3339();
         let mut backfilled = 0u64;

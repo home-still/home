@@ -157,19 +157,35 @@ impl FakeDistill {
     }
 }
 
-/// A server over `storage` with the given distill backend and nothing else
-/// configured.
-pub fn server(storage: Arc<dyn Storage>, distill: Option<&FakeDistill>) -> HomeStillMcp {
-    HomeStillMcp::from_deps(Deps {
+fn deps(
+    storage: Arc<dyn Storage>,
+    events: Arc<dyn hs_common::event_bus::EventBus>,
+    scribe_servers: Vec<String>,
+    distill_servers: Vec<String>,
+) -> Deps {
+    Deps {
         storage,
-        events: Arc::new(NoOpBus),
-        scribe_servers: Vec::new(),
-        distill_servers: distill.map(|d| d.url.clone()).into_iter().collect(),
-        openalex_db: None,
+        events,
+        scribe_servers,
         scribe_convert_timeout: std::time::Duration::from_secs(5),
         scribe_timeout_policy: hs_scribe::config::TimeoutPolicy::default(),
         epub_limits: hs_scribe::epub::EpubLimits::default(),
-    })
+        paper_config: paper::config::Config::default(),
+        distill_servers,
+        openalex_db: None,
+    }
+}
+
+/// A server over `storage` with the given distill backend and nothing else
+/// configured.
+pub fn server(storage: Arc<dyn Storage>, distill: Option<&FakeDistill>) -> HomeStillMcp {
+    HomeStillMcp::from_deps(deps(
+        storage,
+        Arc::new(NoOpBus),
+        Vec::new(),
+        distill.map(|d| d.url.clone()).into_iter().collect(),
+    ))
+    .unwrap()
 }
 
 /// An event bus that remembers what was published.
@@ -200,16 +216,13 @@ impl hs_common::event_bus::EventBus for RecordingBus {
 /// on: enough for the sources that never reach the scribe (HTML, EPUB) and
 /// for proving that a source is refused before any request is made.
 pub fn server_with_bus(storage: Arc<dyn Storage>, bus: Arc<RecordingBus>) -> HomeStillMcp {
-    HomeStillMcp::from_deps(Deps {
+    HomeStillMcp::from_deps(deps(
         storage,
-        events: bus,
-        scribe_servers: vec!["http://127.0.0.1:9".to_string()],
-        distill_servers: Vec::new(),
-        openalex_db: None,
-        scribe_convert_timeout: std::time::Duration::from_secs(5),
-        scribe_timeout_policy: hs_scribe::config::TimeoutPolicy::default(),
-        epub_limits: hs_scribe::epub::EpubLimits::default(),
-    })
+        bus,
+        vec!["http://127.0.0.1:9".to_string()],
+        Vec::new(),
+    ))
+    .unwrap()
 }
 
 /// Put a markdown document (and optionally a catalog row) into `storage`.
