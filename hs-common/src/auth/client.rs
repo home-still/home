@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use super::backend::BackendToken;
 use super::token::TokenClaims;
 
 /// Stored credentials for a cloud-enrolled device.
@@ -223,17 +224,52 @@ pub const DEFAULT_AUTHED_TIMEOUT: std::time::Duration = std::time::Duration::fro
 
 /// HTTP client that authorizes each request at send time. Mirrors the
 /// `reqwest::Client` request surface the service clients use. `plain` wraps
-/// an unauthenticated client (LAN servers) behind the same type.
+/// an unauthenticated client (LAN servers) behind the same type; it sends the
+/// shared [`BackendToken`] when `HS_BACKEND_TOKEN` is set.
 #[derive(Clone)]
 pub struct AuthedHttp {
     http: reqwest::Client,
     auth: Option<std::sync::Arc<AuthenticatedClient>>,
+    backend: BackendCreds,
+}
+
+/// What a LAN-backend client sends in `Authorization`.
+#[derive(Clone)]
+enum BackendCreds {
+    /// Nothing: a cloud client (its own token) or no shared secret configured.
+    None,
+    Token(BackendToken),
+    /// `HS_BACKEND_TOKEN` is set but unusable. Reported on the first request
+    /// rather than silently sending nothing.
+    Invalid(std::sync::Arc<str>),
 }
 
 impl AuthedHttp {
-    /// No authentication: requests go out exactly as built.
+    /// LAN-backend client: requests go out as built plus
+    /// `Authorization: Bearer <HS_BACKEND_TOKEN>` when that variable is set
+    /// (see [`BackendToken`]). A set-but-unusable value makes every `send`
+    /// fail with an error naming the variable.
     pub fn plain(http: reqwest::Client) -> Self {
-        Self { http, auth: None }
+        let backend = match BackendToken::from_env_optional() {
+            Ok(Some(token)) => BackendCreds::Token(token),
+            Ok(None) => BackendCreds::None,
+            Err(e) => BackendCreds::Invalid(format!("{e:#}").into()),
+        };
+        Self {
+            http,
+            auth: None,
+            backend,
+        }
+    }
+
+    /// [`Self::plain`] with the shared secret given explicitly instead of
+    /// read from the environment.
+    pub fn plain_with_backend_token(http: reqwest::Client, token: Option<BackendToken>) -> Self {
+        Self {
+            http,
+            auth: None,
+            backend: token.map_or(BackendCreds::None, BackendCreds::Token),
+        }
     }
 
     /// Cloud client: every request gets a fresh token. `timeout` is the
@@ -251,6 +287,7 @@ impl AuthedHttp {
         Ok(Self {
             http,
             auth: Some(std::sync::Arc::new(auth)),
+            backend: BackendCreds::None,
         })
     }
 
@@ -258,6 +295,7 @@ impl AuthedHttp {
         AuthedRequest {
             builder: b,
             auth: self.auth.clone(),
+            backend: self.backend.clone(),
         }
     }
 
@@ -278,6 +316,7 @@ impl AuthedHttp {
 pub struct AuthedRequest {
     builder: reqwest::RequestBuilder,
     auth: Option<std::sync::Arc<AuthenticatedClient>>,
+    backend: BackendCreds,
 }
 
 impl AuthedRequest {
@@ -304,9 +343,11 @@ impl AuthedRequest {
     /// Authorize (when the client is authenticated) and send. A token
     /// failure is returned as the error, never retried.
     pub async fn send(self) -> anyhow::Result<reqwest::Response> {
-        let builder = match &self.auth {
-            Some(auth) => auth.authorize(self.builder).await?,
-            None => self.builder,
+        let builder = match (&self.auth, &self.backend) {
+            (Some(auth), _) => auth.authorize(self.builder).await?,
+            (None, BackendCreds::Token(token)) => self.builder.bearer_auth(token.expose_secret()),
+            (None, BackendCreds::Invalid(reason)) => anyhow::bail!("{reason}"),
+            (None, BackendCreds::None) => self.builder,
         };
         Ok(builder.send().await?)
     }
@@ -497,12 +538,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_client_sends_no_authorization() {
+    async fn plain_client_without_a_backend_token_sends_no_authorization() {
         let (gw, seen) = gateway(vec![]).await;
-        let http = AuthedHttp::plain(reqwest::Client::new());
+        let http = AuthedHttp::plain_with_backend_token(reqwest::Client::new(), None);
         http.get(format!("{gw}/x")).send().await.unwrap();
         let g = seen.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(g.refreshes, 0);
         assert_eq!(g.auth_headers, vec![String::new()]);
+    }
+
+    /// RA-24: a client of a LAN backend sends the shared secret on every
+    /// request method it offers.
+    #[tokio::test]
+    async fn plain_client_with_a_backend_token_sends_it_as_a_bearer() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        let (gw, seen) = gateway(vec![]).await;
+        let http = AuthedHttp::plain_with_backend_token(
+            reqwest::Client::new(),
+            Some(BackendToken::new(secret).unwrap()),
+        );
+        http.get(format!("{gw}/a")).send().await.unwrap();
+        http.post(format!("{gw}/b")).send().await.unwrap();
+        http.delete(format!("{gw}/c")).send().await.unwrap();
+        let g = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(g.refreshes, 0, "the shared secret is not a cloud token");
+        let expected = format!("authorization: Bearer {secret}");
+        assert_eq!(g.auth_headers, vec![expected; 3]);
+    }
+
+    /// The cloud client authenticates with the gateway token only; the LAN
+    /// secret must not be sent to the gateway.
+    #[tokio::test]
+    async fn cloud_client_never_sends_the_backend_token() {
+        let (gw, seen) = gateway(vec![(
+            200,
+            format!(r#"{{"access_token":"{}"}}"#, token(3600)),
+        )])
+        .await;
+        authed(&gw).get(format!("{gw}/x")).send().await.unwrap();
+        let g = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !g.auth_headers[0].contains("0123456789abcdef"),
+            "{:?}",
+            g.auth_headers
+        );
+    }
+
+    /// A set-but-unusable secret is reported by the first request; nothing
+    /// goes out unauthenticated by accident.
+    #[tokio::test]
+    async fn an_unusable_backend_token_fails_the_request_and_sends_nothing() {
+        let (gw, seen) = gateway(vec![]).await;
+        let http = AuthedHttp {
+            http: reqwest::Client::new(),
+            auth: None,
+            backend: BackendCreds::Invalid("HS_BACKEND_TOKEN is 3 bytes long".into()),
+        };
+        let err = http.get(format!("{gw}/x")).send().await.unwrap_err();
+        assert!(err.to_string().contains("HS_BACKEND_TOKEN"), "{err:#}");
+        assert!(seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .auth_headers
+            .is_empty());
     }
 }

@@ -54,6 +54,8 @@ auth = [
     "dep:serde",
     "dep:serde_json",
     "dep:tokio",
+    "dep:http",
+    "dep:subtle",
 ]
 storage = [
     "dep:anyhow",
@@ -140,6 +142,8 @@ hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 rand = { version = "0.9", optional = true }
+http = { version = "1", optional = true }
+subtle = { version = "2", optional = true }
 
 # storage-s3 feature deps
 object_store = { version = "0.13", features = ["aws"], optional = true }
