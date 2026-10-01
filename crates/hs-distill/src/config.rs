@@ -10,6 +10,7 @@ use hs_common::hardware_profile::HardwareProfile;
 use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
 
+use crate::chunker::ChunkerConfig;
 use crate::error::DistillError;
 
 /// Compute device for embedding inference. rc.306 P0-7: CUDA is the
@@ -33,21 +34,43 @@ impl std::fmt::Display for ComputeDevice {
 
 // ── Server Config ──────────────────────────────────────────────
 
+/// Collections requests may name besides `collection_name`, unless the
+/// config says otherwise. `paper_abstracts` is written by
+/// `hs distill abstracts` and read by the MCP `abstract_search` tool;
+/// `personal_docs` is the `hs personal` store (`personal.collection_name`).
+const DEFAULT_EXTRA_COLLECTIONS: [&str; 2] = ["paper_abstracts", "personal_docs"];
+
+/// Config keys that no longer exist. They deserialize into nothing, so
+/// [`DistillServerConfig::load`] names any that are still set instead of
+/// letting an operator believe they have an effect.
+const REMOVED_KEYS: [&str; 2] = ["embedding.model", "embedding.sparse_enabled"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DistillServerConfig {
+    /// Bind address of `hs-distill-server` (CLI `--host` wins).
     pub host: String,
+    /// Listen port of `hs-distill-server` (CLI `--port` wins; `hs serve
+    /// distill --port` passes it as `HS_DISTILL_PORT`).
     pub port: u16,
     pub qdrant_url: String,
     pub qdrant_data_dir: PathBuf,
+    /// The default collection: requests that name none use it.
     pub collection_name: String,
+    /// Further collections requests may name. Every configured collection
+    /// is created/verified at startup; a request naming any other
+    /// collection is rejected (HTTP 400), so a caller can never create or
+    /// reset a collection by naming it.
+    pub collections: Vec<String>,
     pub embedding: EmbeddingConfig,
+    /// HNSW parameters for new collections and the search-time `ef`.
+    pub hnsw: HnswConfig,
     pub chunk_max_tokens: usize,
     pub chunk_overlap: usize,
     /// Number of chunks per Qdrant upsert request. Each chunk carries a
-    /// 1024-dim f32 dense vector plus sparse + payload (~3–5 KB), so the
-    /// default 1000 sits well within Qdrant's 4 MB gRPC frame limit
-    /// while amortizing per-request overhead.
+    /// 1024-dim f32 dense vector plus payload (~3–5 KB), so the default
+    /// 1000 sits well within Qdrant's 4 MB gRPC frame limit while
+    /// amortizing per-request overhead.
     pub qdrant_upsert_batch: usize,
     /// How many Qdrant upsert requests to fire in parallel per document.
     /// Qdrant handles many concurrent writes to one collection cheaply,
@@ -73,7 +96,12 @@ impl Default for DistillServerConfig {
             qdrant_url: "http://localhost:6334".into(),
             qdrant_data_dir: project.join("data").join("qdrant"),
             collection_name: "academic_papers".into(),
+            collections: DEFAULT_EXTRA_COLLECTIONS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             embedding: EmbeddingConfig::default(),
+            hnsw: HnswConfig::default(),
             chunk_max_tokens: 1000,
             chunk_overlap: 100,
             qdrant_upsert_batch: 1000,
@@ -91,18 +119,62 @@ impl DistillServerConfig {
         let home = dirs::home_dir().unwrap_or_default();
         let config_path = home.join(hs_common::CONFIG_REL_PATH);
 
-        Figment::from(Serialized::defaults(Self::default()))
+        let figment = Figment::from(Serialized::defaults(Self::default()))
             .merge(Yaml::file(&config_path).nested())
             .merge(Env::prefixed("HS_DISTILL_"))
-            .select("distill_server")
-            .extract()
-            .map_err(Box::new)
+            .select("distill_server");
+        for key in removed_keys_present(&figment) {
+            tracing::warn!(
+                key = %format!("distill_server.{key}"),
+                "config key no longer exists and is ignored; remove it"
+            );
+        }
+        figment.extract().map_err(Box::new)
     }
 
     /// Reject configurations the server cannot run correctly. Call after
     /// [`Self::load`] (or after building a config in code); the server
     /// refuses to start on an `Err`.
     pub fn validate(&self) -> Result<(), DistillError> {
+        if self.host.trim().is_empty() {
+            return Err(DistillError::Config("host must not be empty".into()));
+        }
+        if self.port == 0 {
+            return Err(DistillError::Config("port must not be 0".into()));
+        }
+
+        validate_collection_name(&self.collection_name)?;
+        let mut seen = vec![self.collection_name.as_str()];
+        for name in &self.collections {
+            validate_collection_name(name)?;
+            if seen.contains(&name.as_str()) {
+                return Err(DistillError::Config(format!(
+                    "collection {name:?} is listed twice (collection_name + collections)"
+                )));
+            }
+            seen.push(name);
+        }
+
+        ChunkerConfig {
+            max_tokens: self.chunk_max_tokens,
+            overlap_tokens: self.chunk_overlap,
+            ..ChunkerConfig::default()
+        }
+        .validate()?;
+        self.embedding.validate(self.chunk_max_tokens)?;
+        self.hnsw.validate()?;
+
+        if self.qdrant_upsert_batch == 0 {
+            return Err(DistillError::Config(
+                "qdrant_upsert_batch must be at least 1".into(),
+            ));
+        }
+        if self.qdrant_upsert_parallelism == 0 {
+            return Err(DistillError::Config(
+                "qdrant_upsert_parallelism must be at least 1".into(),
+            ));
+        }
+
         if self.llm_metadata {
             crate::metadata::parse_ollama_url(&self.ollama_url)?;
             if self.metadata_model.trim().is_empty() {
@@ -118,13 +190,129 @@ impl DistillServerConfig {
         }
         Ok(())
     }
+
+    /// Every collection the server serves: the default first, then
+    /// `collections`.
+    pub fn served_collections(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.collection_name.as_str())
+            .chain(self.collections.iter().map(String::as_str))
+    }
+}
+
+/// A Qdrant collection name this server will accept: 1–64 chars of
+/// `[A-Za-z0-9_-]`, starting with a letter or digit.
+pub fn validate_collection_name(name: &str) -> Result<(), DistillError> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err(DistillError::Config(format!(
+            "collection name {name:?} must be 1-64 chars of [A-Za-z0-9_-] starting with a letter or digit"
+        )))
+    }
+}
+
+fn removed_keys_present(figment: &Figment) -> Vec<&'static str> {
+    REMOVED_KEYS
+        .iter()
+        .copied()
+        .filter(|key| figment.contains(key))
+        .collect()
+}
+
+/// HNSW graph parameters. Applied when a collection is created; existing
+/// collections keep whatever they were built with (see
+/// `qdrant::ensure_collection`, which reports a collection whose HNSW is
+/// disabled). `search_ef` applies to every query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HnswConfig {
+    /// Edges per node. 0 would disable the index (what every collection
+    /// created before RA-41 has); the minimum accepted is 4.
+    pub m: u64,
+    /// Candidates considered while building the graph.
+    pub ef_construct: u64,
+    /// Candidates considered per query.
+    pub search_ef: u64,
+}
+
+impl Default for HnswConfig {
+    fn default() -> Self {
+        // Qdrant's own defaults for m / ef_construct; search_ef is the
+        // value the search path has always requested.
+        Self {
+            m: 16,
+            ef_construct: 100,
+            search_ef: 128,
+        }
+    }
+}
+
+impl HnswConfig {
+    pub fn validate(&self) -> Result<(), DistillError> {
+        if !(4..=128).contains(&self.m) {
+            return Err(DistillError::Config(format!(
+                "hnsw.m must be 4..=128 (got {}); 0 would disable the index",
+                self.m
+            )));
+        }
+        if !(self.m..=1024).contains(&self.ef_construct) {
+            return Err(DistillError::Config(format!(
+                "hnsw.ef_construct must be between hnsw.m ({}) and 1024 (got {})",
+                self.m, self.ef_construct
+            )));
+        }
+        if !(1..=4096).contains(&self.search_ef) {
+            return Err(DistillError::Config(format!(
+                "hnsw.search_ef must be 1..=4096 (got {})",
+                self.search_ef
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// bge-m3's context window; the tokenizer cannot be asked for more.
+pub const MODEL_MAX_LENGTH: usize = 8192;
+
+/// Tokens reserved for the contextual header the chunker prepends to every
+/// chunk (`"{title} > chunk {n}\n\n"`) and the model's special tokens.
+pub const CHUNK_HEADER_RESERVE_TOKENS: usize = 48;
+
+/// Largest batch (rows per forward pass) that keeps the worst-case
+/// self-attention scratch at or below what the embedder has always allowed:
+/// 128 rows x 512 tokens. That scratch grows with `rows x length^2`, so a
+/// longer `max_length` shrinks the batch quadratically. The card is shared
+/// with the scribe VLM and ollama, and a CUDA OOM poisons the ort session.
+pub fn max_batch_rows(max_length: usize) -> usize {
+    const HISTORICAL_ROWS_X_LEN_SQ: usize = 128 * 512 * 512;
+    (HISTORICAL_ROWS_X_LEN_SQ / (max_length.max(1) * max_length.max(1))).max(1)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbeddingConfig {
-    pub model: String,
+    /// Expected embedding width. The model fixes it (bge-m3: 1024); the
+    /// server compares this value with what the model actually returns at
+    /// startup and refuses to run on a mismatch, so a collection can never
+    /// be created with the wrong vector size.
     pub dimension: usize,
+    /// Tokens the model sees per text; longer input is truncated by the
+    /// tokenizer. Must cover a whole chunk: `chunk_max_tokens + 48` must
+    /// not exceed it. The default (1280) holds the default 1000-token chunk
+    /// plus its header with ~25% slack for the chars/4 token estimate.
+    /// Raising it costs VRAM per batch — see [`max_batch_rows`], which caps
+    /// `batch_size` accordingly. Vectors written before this key existed
+    /// were truncated at 512 tokens and need a re-embed to include the
+    /// tail of each chunk.
+    pub max_length: usize,
+    /// Rows per forward pass (starting point when `adaptive_batch`).
+    /// At most [`max_batch_rows`]`(max_length)`.
     pub batch_size: Option<usize>,
     /// Model pool size. Each model is ~600 MB resident; pool lets parallel
     /// `embed_batch` callers avoid contending on one Mutex. Defaults to 1
@@ -135,7 +323,6 @@ pub struct EmbeddingConfig {
     /// using an EWMA controller. `batch_size` becomes the starting point
     /// rather than a fixed value. Disable to pin batch_size exactly.
     pub adaptive_batch: bool,
-    pub sparse_enabled: bool,
     /// Compute device for the embedder. rc.306 P0-7: must be `cuda`.
     /// Present in config for operator visibility and to ensure any
     /// attempt to write a non-CUDA value fails loudly at deserialization.
@@ -169,16 +356,82 @@ fn default_vram_floor_mb() -> u64 {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            model: "bge-m3".into(),
             dimension: 1024,
+            max_length: 1280,
             batch_size: None,
             pool_size: None,
             adaptive_batch: true,
-            sparse_enabled: true,
             compute_device: ComputeDevice::Cuda,
             idle_release_secs: None,
             vram_floor_mb: default_vram_floor_mb(),
         }
+    }
+}
+
+impl EmbeddingConfig {
+    /// Checks that depend only on the embedding settings.
+    pub fn validate_self(&self) -> Result<(), DistillError> {
+        if self.dimension == 0 {
+            return Err(DistillError::Config(
+                "embedding.dimension must be > 0".into(),
+            ));
+        }
+        if !(1..=MODEL_MAX_LENGTH).contains(&self.max_length) {
+            return Err(DistillError::Config(format!(
+                "embedding.max_length must be 1..={MODEL_MAX_LENGTH} (got {})",
+                self.max_length
+            )));
+        }
+        let cap = max_batch_rows(self.max_length);
+        if let Some(batch) = self.batch_size {
+            if batch == 0 {
+                return Err(DistillError::Config(
+                    "embedding.batch_size must be at least 1".into(),
+                ));
+            }
+            if batch > cap {
+                return Err(DistillError::Config(format!(
+                    "embedding.batch_size {batch} exceeds {cap}, the most rows that fit the GPU \
+                     budget at embedding.max_length {}",
+                    self.max_length
+                )));
+            }
+        }
+        if self.pool_size == Some(0) {
+            return Err(DistillError::Config(
+                "embedding.pool_size must be at least 1".into(),
+            ));
+        }
+        if self.idle_release_secs == Some(0) {
+            return Err(DistillError::Config(
+                "embedding.idle_release_secs must be at least 1 (omit it to never release)".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`Self::validate_self`] plus the relation to the chunker:
+    /// `chunk_max_tokens` is the chunker's size, and the embedder must be
+    /// able to see all of it.
+    pub fn validate(&self, chunk_max_tokens: usize) -> Result<(), DistillError> {
+        self.validate_self()?;
+        if chunk_max_tokens + CHUNK_HEADER_RESERVE_TOKENS > self.max_length {
+            return Err(DistillError::Config(format!(
+                "chunk_max_tokens ({chunk_max_tokens}) + {CHUNK_HEADER_RESERVE_TOKENS} header tokens \
+                 exceeds embedding.max_length ({}): the tail of every chunk would be \
+                 truncated out of its vector. Raise embedding.max_length or lower chunk_max_tokens",
+                self.max_length
+            )));
+        }
+        Ok(())
+    }
+
+    /// Rows per forward pass to start from: the configured `batch_size`,
+    /// else 32, never above the [`max_batch_rows`] cap.
+    pub fn initial_batch(&self) -> usize {
+        self.batch_size
+            .unwrap_or(32)
+            .min(max_batch_rows(self.max_length))
     }
 }
 
@@ -302,5 +555,206 @@ mod tests {
         let err = serde_yaml_ng::from_str::<EmbeddingConfig>(yaml)
             .expect_err("unknown compute_device must reject");
         let _ = err.to_string();
+    }
+
+    // ── Server config validation ───────────────────────────────────────
+
+    fn cfg() -> DistillServerConfig {
+        DistillServerConfig::default()
+    }
+
+    fn config_error(c: &DistillServerConfig) -> String {
+        match c.validate() {
+            Err(DistillError::Config(msg)) => msg,
+            other => panic!("expected a config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_server_config_is_valid() {
+        cfg().validate().expect("defaults must validate");
+    }
+
+    #[test]
+    fn chunk_larger_than_the_embedder_window_is_rejected() {
+        // RA-40: 1000-token chunks against a 512-token window silently lost
+        // the back half of every chunk.
+        let mut c = cfg();
+        c.embedding.max_length = 512;
+        let msg = config_error(&c);
+        assert!(msg.contains("1000") && msg.contains("512"), "{msg}");
+    }
+
+    #[test]
+    fn chunk_plus_header_must_fit_the_embedder_window() {
+        let mut c = cfg();
+        c.embedding.max_length = c.chunk_max_tokens + CHUNK_HEADER_RESERVE_TOKENS;
+        c.validate().expect("exactly fitting is allowed");
+        c.embedding.max_length -= 1;
+        config_error(&c);
+    }
+
+    #[test]
+    fn embedder_window_cannot_exceed_the_model() {
+        let mut c = cfg();
+        c.embedding.max_length = MODEL_MAX_LENGTH + 1;
+        config_error(&c);
+        c.embedding.max_length = 0;
+        config_error(&c);
+    }
+
+    #[test]
+    fn zero_batch_size_is_rejected_at_load() {
+        // RA-45d: `step_by(0)` panics inside the embed thread.
+        let mut c = cfg();
+        c.embedding.batch_size = Some(0);
+        assert!(config_error(&c).contains("batch_size"));
+    }
+
+    #[test]
+    fn batch_size_is_capped_by_the_vram_budget_for_the_window() {
+        assert_eq!(max_batch_rows(512), 128, "the historical ceiling");
+        assert_eq!(max_batch_rows(1024), 32);
+        assert!(max_batch_rows(1280) < max_batch_rows(1024));
+        assert_eq!(max_batch_rows(MODEL_MAX_LENGTH), 1, "never below one row");
+
+        let mut c = cfg();
+        let cap = max_batch_rows(c.embedding.max_length);
+        c.embedding.batch_size = Some(cap);
+        c.validate().unwrap();
+        c.embedding.batch_size = Some(cap + 1);
+        assert!(config_error(&c).contains("batch_size"));
+    }
+
+    #[test]
+    fn default_initial_batch_respects_the_cap() {
+        let mut e = EmbeddingConfig::default();
+        assert!(e.initial_batch() <= max_batch_rows(e.max_length));
+        assert!(e.initial_batch() >= 1);
+        e.max_length = 4096;
+        assert_eq!(e.initial_batch(), max_batch_rows(4096));
+    }
+
+    #[test]
+    fn zero_pool_or_idle_window_is_rejected() {
+        let mut c = cfg();
+        c.embedding.pool_size = Some(0);
+        config_error(&c);
+        let mut c = cfg();
+        c.embedding.idle_release_secs = Some(0);
+        config_error(&c);
+    }
+
+    #[test]
+    fn chunker_sizes_are_validated_with_the_server_config() {
+        let mut c = cfg();
+        c.chunk_max_tokens = 0;
+        config_error(&c);
+        let mut c = cfg();
+        c.chunk_overlap = c.chunk_max_tokens;
+        config_error(&c);
+    }
+
+    #[test]
+    fn hnsw_cannot_be_disabled_or_nonsensical() {
+        for bad in [
+            HnswConfig {
+                m: 0,
+                ..HnswConfig::default()
+            },
+            HnswConfig {
+                m: 3,
+                ..HnswConfig::default()
+            },
+            HnswConfig {
+                m: 16,
+                ef_construct: 8,
+                search_ef: 128,
+            },
+            HnswConfig {
+                search_ef: 0,
+                ..HnswConfig::default()
+            },
+        ] {
+            let mut c = cfg();
+            c.hnsw = bad.clone();
+            config_error(&c);
+        }
+    }
+
+    #[test]
+    fn collection_names_are_restricted() {
+        for bad in ["", "../x", "a b", "-lead", "ünï", &"a".repeat(65), "a/b"] {
+            assert!(
+                validate_collection_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        for good in ["academic_papers", "paper_abstracts", "p-1", "A9"] {
+            validate_collection_name(good).unwrap();
+        }
+    }
+
+    #[test]
+    fn configured_collections_must_be_valid_and_unique() {
+        let mut c = cfg();
+        c.collections = vec!["bad name".into()];
+        config_error(&c);
+
+        let mut c = cfg();
+        c.collections = vec![c.collection_name.clone()];
+        assert!(config_error(&c).contains("twice"));
+
+        let mut c = cfg();
+        c.collections = vec!["x".into(), "x".into()];
+        config_error(&c);
+    }
+
+    #[test]
+    fn default_collections_serve_the_workspace_callers() {
+        let c = cfg();
+        let served: Vec<_> = c.served_collections().collect();
+        assert_eq!(
+            served,
+            ["academic_papers", "paper_abstracts", "personal_docs"]
+        );
+    }
+
+    #[test]
+    fn upsert_sizes_of_zero_are_rejected_not_clamped() {
+        let mut c = cfg();
+        c.qdrant_upsert_batch = 0;
+        config_error(&c);
+        let mut c = cfg();
+        c.qdrant_upsert_parallelism = 0;
+        config_error(&c);
+    }
+
+    #[test]
+    fn llm_settings_are_checked_only_when_enabled() {
+        let mut c = cfg();
+        c.ollama_url = "http://localhost:notaport".into();
+        c.validate().expect("unused while llm_metadata is false");
+        c.llm_metadata = true;
+        config_error(&c);
+    }
+
+    #[test]
+    fn removed_keys_are_reported_not_silently_accepted() {
+        let yaml = "distill_server:\n  embedding:\n    model: bge-m3\n    sparse_enabled: true\n    dimension: 1024\n";
+        let fig = Figment::from(Serialized::defaults(DistillServerConfig::default()))
+            .merge(Yaml::string(yaml).nested())
+            .select("distill_server");
+        assert_eq!(
+            removed_keys_present(&fig),
+            ["embedding.model", "embedding.sparse_enabled"]
+        );
+        // Still loads: the keys were already inert.
+        let loaded: DistillServerConfig = fig.extract().unwrap();
+        assert_eq!(loaded.embedding.dimension, 1024);
+
+        let clean = Figment::from(Serialized::defaults(DistillServerConfig::default()))
+            .select("distill_server");
+        assert!(removed_keys_present(&clean).is_empty());
     }
 }

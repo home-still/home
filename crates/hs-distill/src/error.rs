@@ -20,6 +20,11 @@ pub enum DistillError {
     #[error("Config error: {0}")]
     Config(String),
 
+    /// The caller's request is malformed (HTTP 400), as opposed to a server
+    /// or dependency failure.
+    #[error("Invalid request: {0}")]
+    InvalidInput(String),
+
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 }

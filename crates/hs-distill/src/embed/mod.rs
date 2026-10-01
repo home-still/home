@@ -1,3 +1,6 @@
+pub mod pool;
+
+#[cfg(feature = "server")]
 pub mod onnx;
 
 use async_trait::async_trait;
@@ -10,51 +13,100 @@ use crate::types::EmbeddingOutput;
 // is referenced by `EmbeddingConfig::compute_device`.
 pub use crate::config::ComputeDevice;
 
+/// The one embedding model this server runs (fastembed's `BGEM3`). It is a
+/// constant, not configuration: nothing could change it without changing
+/// the code that loads it.
+pub const MODEL_NAME: &str = "bge-m3";
+
+/// Whether an embedder can still serve requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbedderHealth {
+    Healthy,
+    /// Permanently unusable until the process restarts.
+    Failed(String),
+}
+
 /// Trait for embedding backends.
 #[async_trait]
 pub trait Embedder: Send + Sync {
-    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<EmbeddingOutput>, DistillError>;
+    /// Embed `texts`, one vector per text, in order. Takes ownership so the
+    /// backend can move the strings into its worker thread without copying.
+    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<EmbeddingOutput>, DistillError>;
+    /// Width of the vectors this embedder returns, as measured from the
+    /// model's own output.
     fn dimension(&self) -> usize;
-    fn supports_sparse(&self) -> bool;
     fn device(&self) -> &ComputeDevice;
+    fn health(&self) -> EmbedderHealth;
+    /// How many `embed_batch` calls can run at once (model pool size).
+    fn slots(&self) -> usize;
 }
 
-/// Wraps the selected embedder. The name `FallbackEmbedder` is historical;
-/// there is no fallback path — if CUDA fails, startup fails.
-pub struct FallbackEmbedder {
-    primary: Box<dyn Embedder>,
+/// Run `embed` over `texts` in groups of `batch_size` rows and concatenate
+/// the results in order. Fails — rather than panics or silently drops
+/// rows — on a zero batch size or an `embed` that returns the wrong number
+/// of vectors.
+pub fn embed_in_batches(
+    texts: &[String],
+    batch_size: usize,
+    mut embed: impl FnMut(Vec<&str>) -> Result<Vec<Vec<f32>>, DistillError>,
+) -> Result<Vec<Vec<f32>>, DistillError> {
+    if batch_size == 0 {
+        return Err(DistillError::Config(
+            "embedding batch size must be at least 1".into(),
+        ));
+    }
+    let mut out = Vec::with_capacity(texts.len());
+    for batch in texts.chunks(batch_size) {
+        let rows: Vec<&str> = batch.iter().map(String::as_str).collect();
+        let vectors = embed(rows)?;
+        if vectors.len() != batch.len() {
+            return Err(DistillError::Embedding(format!(
+                "embedder returned {} vectors for {} texts",
+                vectors.len(),
+                batch.len()
+            )));
+        }
+        out.extend(vectors);
+    }
+    Ok(out)
 }
 
-impl FallbackEmbedder {
-    pub fn new(primary: Box<dyn Embedder>, _fallback: Option<Box<dyn Embedder>>) -> Self {
-        Self { primary }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn texts(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("t{i}")).collect()
     }
 
-    /// Build the embedder strictly according to the configured device.
-    /// `OnnxEmbedder::new` verifies the CUDA probe succeeds; failure is
-    /// propagated — no silent CPU fallback (ONE PATH).
-    pub fn build(config: &crate::config::EmbeddingConfig) -> Result<Self, DistillError> {
-        tracing::info!("Using configured compute device: {}", config.compute_device);
-        let primary = onnx::OnnxEmbedder::new(config, config.compute_device.clone())?;
-        Ok(Self::new(Box::new(primary), None))
-    }
-}
-
-#[async_trait]
-impl Embedder for FallbackEmbedder {
-    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<EmbeddingOutput>, DistillError> {
-        self.primary.embed_batch(texts).await
+    #[test]
+    fn batches_cover_every_text_in_order() {
+        let mut seen_sizes = Vec::new();
+        let out = embed_in_batches(&texts(7), 3, |rows| {
+            seen_sizes.push(rows.len());
+            Ok(rows.iter().map(|r| vec![r.len() as f32]).collect())
+        })
+        .unwrap();
+        assert_eq!(seen_sizes, [3, 3, 1]);
+        assert_eq!(out.len(), 7);
     }
 
-    fn dimension(&self) -> usize {
-        self.primary.dimension()
+    #[test]
+    fn zero_batch_size_is_an_error_not_a_panic() {
+        // `(0..n).step_by(0)` panics; this is the shape the embed thread had.
+        let err = embed_in_batches(&texts(2), 0, |_| Ok(vec![])).unwrap_err();
+        assert!(matches!(err, DistillError::Config(_)), "{err}");
     }
 
-    fn supports_sparse(&self) -> bool {
-        self.primary.supports_sparse()
+    #[test]
+    fn short_batch_output_is_an_error_not_a_dropped_chunk() {
+        let err = embed_in_batches(&texts(4), 4, |_| Ok(vec![vec![0.0]; 3])).unwrap_err();
+        assert!(matches!(err, DistillError::Embedding(_)), "{err}");
     }
 
-    fn device(&self) -> &ComputeDevice {
-        self.primary.device()
+    #[test]
+    fn empty_input_embeds_nothing() {
+        let out = embed_in_batches(&[], 8, |_| unreachable!("no batch to run")).unwrap();
+        assert!(out.is_empty());
     }
 }

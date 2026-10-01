@@ -55,18 +55,10 @@ pub struct Chunk {
     pub meta: DocumentMeta,
 }
 
-/// Dense + optional sparse embedding output.
+/// Dense embedding of one text.
 #[derive(Debug, Clone)]
 pub struct EmbeddingOutput {
     pub dense: Vec<f32>,
-    pub sparse: Option<SparseVec>,
-}
-
-/// Sparse vector (index-value pairs).
-#[derive(Debug, Clone)]
-pub struct SparseVec {
-    pub indices: Vec<u32>,
-    pub values: Vec<f32>,
 }
 
 /// A chunk with its computed embedding, ready for Qdrant upsert.

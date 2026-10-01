@@ -8,22 +8,27 @@ compile_error!(
      cargo build --release -p hs-distill --features server,cuda --bin hs-distill-server"
 );
 
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
+use hs_distill::api::DistillServerState;
+use hs_distill::collection::CollectionSpec;
 use hs_distill::config::DistillServerConfig;
-use hs_distill::embed::{Embedder, FallbackEmbedder};
-use hs_distill::server::{self, DistillServerState};
+use hs_distill::embed::onnx::OnnxEmbedder;
+use hs_distill::embed::Embedder;
+use hs_distill::qdrant::{ensure_collection, QdrantStore};
+use hs_distill::server;
 
 #[derive(Parser, Debug)]
 #[command(name = "hs-distill-server", about = "Distill embedding server")]
 struct Args {
-    #[arg(long, default_value = "0.0.0.0")]
-    host: String,
-    #[arg(long, default_value = "7434")]
-    port: u16,
+    /// Bind address (default: `distill_server.host` from the config, else 0.0.0.0)
+    #[arg(long)]
+    host: Option<String>,
+    /// Listen port (default: `distill_server.port` from the config, else 7434)
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 fn main() -> Result<()> {
@@ -50,8 +55,10 @@ async fn async_main() -> Result<()> {
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid distill_server config: {e}"))?;
 
-    // Build embedder with GPU→CPU fallback
-    let embedder = FallbackEmbedder::build(&config.embedding)
+    // Build the embedder on the configured device. There is no fallback:
+    // if CUDA is unavailable or the model does not land on the GPU,
+    // startup fails.
+    let embedder = OnnxEmbedder::new(&config.embedding, config.embedding.compute_device.clone())
         .map_err(|e| anyhow::anyhow!("Failed to initialize embedder: {e}"))?;
 
     tracing::info!("Embedder device: {}", embedder.device());
@@ -62,26 +69,32 @@ async fn async_main() -> Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to connect to Qdrant: {e}"))?;
 
-    // Ensure collection exists
-    hs_distill::qdrant::ensure_collection(
-        &qdrant,
-        &config.collection_name,
-        config.embedding.dimension,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to ensure collection: {e}"))?;
+    // Create or verify every collection the server will serve. Requests can
+    // only name these; none is ever created on demand.
+    let spec = CollectionSpec::new(embedder.dimension(), &config.hnsw);
+    for name in config.served_collections() {
+        let outcome = ensure_collection(&qdrant, name, &spec)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to ensure collection '{name}': {e}"))?;
+        tracing::info!(
+            collection = name,
+            created = outcome.created,
+            indexes_created = ?outcome.indexes_created,
+            hnsw_disabled = outcome.hnsw_disabled,
+            "collection ready"
+        );
+    }
 
-    let mut known = std::collections::HashSet::new();
-    known.insert(config.collection_name.clone());
-    let state = Arc::new(DistillServerState {
-        embedder: Arc::new(embedder),
-        qdrant: Arc::new(qdrant),
+    let host = args.host.unwrap_or_else(|| config.host.clone());
+    let port = args.port.unwrap_or(config.port);
+    let store = QdrantStore::new(qdrant, config.hnsw.search_ef);
+    let state = Arc::new(DistillServerState::new(
+        Arc::new(embedder),
+        Arc::new(store),
         config,
-        in_flight: Arc::new(AtomicUsize::new(0)),
-        known_collections: Arc::new(tokio::sync::Mutex::new(known)),
-    });
+    ));
 
-    let addr = format!("{}:{}", args.host, args.port);
+    let addr = format!("{host}:{port}");
     tracing::info!("Listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -5,7 +5,7 @@
 //! hill-climber that reads throughput per-batch and adjusts on the fly:
 //! improvement threshold, regression threshold, plateau-until-converged.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use super::embed::ComputeDevice;
 
@@ -32,10 +32,25 @@ pub struct AdaptiveConfig {
 impl AdaptiveConfig {
     /// Device-default candidate set centered around a reasonable starting
     /// batch size. CUDA is the only shipped device (rc.306 P0-7).
-    pub fn default_for_device(device: &ComputeDevice, initial: usize) -> Self {
-        let candidates: Vec<usize> = match device {
-            ComputeDevice::Cuda => vec![16, 32, 48, 64, 96, 128],
+    ///
+    /// `max_rows` is the most rows a forward pass may carry at the
+    /// configured window (`config::max_batch_rows`): candidates above it are
+    /// dropped, and when the cap falls between two standard candidates it
+    /// becomes one itself, so the controller can never climb into a batch
+    /// whose attention scratch the shared GPU cannot hold.
+    pub fn default_for_device(device: &ComputeDevice, initial: usize, max_rows: usize) -> Self {
+        let max_rows = max_rows.max(1);
+        let standard: &[usize] = match device {
+            ComputeDevice::Cuda => &[16, 32, 48, 64, 96, 128],
         };
+        let mut candidates: Vec<usize> = standard
+            .iter()
+            .copied()
+            .filter(|&c| c <= max_rows)
+            .collect();
+        if standard.iter().any(|&c| c > max_rows) && candidates.last() != Some(&max_rows) {
+            candidates.push(max_rows);
+        }
         // Snap `initial` to the closest candidate at or above it.
         let initial_idx = candidates
             .iter()
@@ -117,7 +132,7 @@ impl AdaptiveBatchController {
 
     /// Current batch size callers should use.
     pub fn current(&self) -> usize {
-        let s = self.state.lock().expect("AdaptiveBatchController poisoned");
+        let s = self.state.lock();
         self.cfg.candidates[s.current_idx]
     }
 
@@ -130,7 +145,7 @@ impl AdaptiveBatchController {
         }
         let rate = batch_len as f64 / elapsed_secs;
 
-        let mut s = self.state.lock().expect("AdaptiveBatchController poisoned");
+        let mut s = self.state.lock();
 
         s.ewma_rate = Some(match s.ewma_rate {
             None => rate,
@@ -225,10 +240,7 @@ impl AdaptiveBatchController {
 
     #[cfg(test)]
     pub fn snapshot_rate(&self) -> Option<f64> {
-        self.state
-            .lock()
-            .expect("AdaptiveBatchController poisoned")
-            .ewma_rate
+        self.state.lock().ewma_rate
     }
 }
 
@@ -337,16 +349,16 @@ mod tests {
     fn default_for_device_snaps_initial() {
         // Cuda candidates: [16, 32, 48, 64, 96, 128].
         // CPU was removed in rc.306 P0-7 (no CPU code path ships).
-        let exact = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 32);
+        let exact = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 32, 128);
         assert_eq!(exact.candidates[exact.initial_idx], 32);
         // Out-of-range initial snaps to next candidate up.
-        let oddball = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 20);
+        let oddball = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 20, 128);
         assert_eq!(oddball.candidates[oddball.initial_idx], 32);
         // Bottom of the range — snaps to the smallest candidate ≥ initial.
-        let bottom = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 1);
+        let bottom = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 1, 128);
         assert_eq!(bottom.candidates[bottom.initial_idx], 16);
         // Above max → top candidate.
-        let above = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 999);
+        let above = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 999, 128);
         assert_eq!(above.candidates[above.initial_idx], 128);
     }
 
@@ -362,5 +374,37 @@ mod tests {
         ctrl.observe(20, 1.0);
         ctrl.observe(20, 1.0); // improvement with direction=-1 → step to 16
         assert_eq!(ctrl.current(), 16);
+    }
+
+    #[test]
+    fn candidates_never_exceed_the_row_cap() {
+        let standard = |cap| AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 32, cap);
+        // Cap between standard sizes becomes the top candidate.
+        assert_eq!(standard(20).candidates, [16, 20]);
+        // Cap on a standard size just truncates.
+        assert_eq!(standard(32).candidates, [16, 32]);
+        // Cap below the smallest standard size leaves only the cap.
+        assert_eq!(standard(1).candidates, [1]);
+        assert_eq!(standard(8).candidates, [8]);
+        // Cap above the standard ceiling changes nothing.
+        assert_eq!(standard(512).candidates, [16, 32, 48, 64, 96, 128]);
+        // The starting point is never above the cap either.
+        for cap in [1, 8, 16, 20, 31, 32, 100, 128, 500] {
+            let c = standard(cap);
+            assert!(c.candidates[c.initial_idx] <= cap, "cap {cap}");
+            assert!(c.candidates.iter().all(|&x| x <= cap), "cap {cap}");
+            assert!(c.candidates.windows(2).all(|w| w[0] < w[1]), "cap {cap}");
+        }
+    }
+
+    #[test]
+    fn a_capped_controller_cannot_step_past_the_cap() {
+        let c = AdaptiveConfig::default_for_device(&ComputeDevice::Cuda, 16, 20);
+        let ctrl = AdaptiveBatchController::new(c);
+        // Strictly improving throughput keeps pushing upward.
+        for i in 0..500 {
+            ctrl.observe(100, 1.0 / (1.0 + i as f64));
+            assert!(ctrl.current() <= 20);
+        }
     }
 }

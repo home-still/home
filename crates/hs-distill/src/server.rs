@@ -1,66 +1,28 @@
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+//! axum adapter over [`crate::api`]: routing, JSON, status codes, NDJSON
+//! streaming. No request logic lives here.
+//!
+//! RA-26 (deferred): `/collection/reset`, `DELETE /doc/{doc_id}` and
+//! `/scrub-interstitials` are destructive and, like every other route, carry
+//! no authentication; the server binds all interfaces. The bearer mechanism
+//! for backend services is being designed separately — these three routes
+//! are the ones that must adopt it first.
+
 use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use hs_common::service::inflight::InFlightGuard;
 use serde::Deserialize;
-use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::client::{
-    DistillProgress, DistillStreamLine, HealthResponse, IndexResult, ReadinessResponse,
-    SearchFilters, SearchHit, StatusResponse,
-};
-use crate::config::DistillServerConfig;
-use crate::embed::{Embedder, FallbackEmbedder};
-use crate::error::DistillError;
-
-pub struct DistillServerState {
-    pub embedder: Arc<FallbackEmbedder>,
-    pub qdrant: Arc<qdrant_client::Qdrant>,
-    pub config: DistillServerConfig,
-    pub in_flight: Arc<AtomicUsize>,
-    /// Collections we've already verified/created since process start. The
-    /// configured default is seeded at startup; non-default names supplied
-    /// via per-request `collection` are lazily ensured on first use, then
-    /// recorded here so subsequent requests skip the round-trip.
-    pub known_collections: Arc<Mutex<HashSet<String>>>,
-}
-
-impl DistillServerState {
-    /// Pick the collection for this request and ensure the Qdrant collection
-    /// exists. Missing `requested` means "use the configured default" — that
-    /// path was vetted at startup, so it short-circuits the lazy-create
-    /// machinery.
-    pub async fn resolve_collection(
-        &self,
-        requested: Option<&str>,
-    ) -> Result<String, DistillError> {
-        let name = requested
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.config.collection_name.clone());
-
-        if name == self.config.collection_name {
-            return Ok(name);
-        }
-
-        let mut known = self.known_collections.lock().await;
-        if !known.contains(&name) {
-            crate::qdrant::ensure_collection(&self.qdrant, &name, self.embedder.dimension())
-                .await?;
-            known.insert(name.clone());
-        }
-        Ok(name)
-    }
-}
+pub use crate::api::DistillServerState;
+use crate::api::{ApiError, ErrorKind, IndexRequest, SearchRequest};
+use crate::client::{DistillProgress, DistillStreamLine};
 
 pub fn app(state: Arc<DistillServerState>) -> Router {
     Router::new()
@@ -79,115 +41,19 @@ pub fn app(state: Arc<DistillServerState>) -> Router {
         .with_state(state)
 }
 
-async fn handle_health(State(state): State<Arc<DistillServerState>>) -> impl IntoResponse {
-    let qdrant_version = match state.qdrant.health_check().await {
-        Ok(r) => r.version,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("qdrant unreachable: {e}"),
-            )
-                .into_response();
-        }
+fn error_response(e: ApiError) -> Response {
+    let status = match e.kind {
+        ErrorKind::BadRequest => StatusCode::BAD_REQUEST,
+        ErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     };
-
-    Json(HealthResponse {
-        status: "ok".into(),
-        compute_device: state.embedder.device().to_string(),
-        collection: state.config.collection_name.clone(),
-        version: env!("HS_VERSION").to_string(),
-        qdrant_version,
-        embed_model: state.config.embedding.model.clone(),
-        qdrant_url: state.config.qdrant_url.clone(),
-    })
-    .into_response()
+    (status, e.message).into_response()
 }
 
-async fn handle_readiness(State(state): State<Arc<DistillServerState>>) -> impl IntoResponse {
-    let in_flight = state.in_flight.load(Ordering::Relaxed);
-    Json(ReadinessResponse {
-        ready: true,
-        in_flight,
-    })
-}
-
-async fn handle_status(
-    State(state): State<Arc<DistillServerState>>,
-    axum::extract::Query(q): axum::extract::Query<CollectionQuery>,
-) -> impl IntoResponse {
-    let collection = match state.resolve_collection(q.collection.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    };
-    let points_count = match crate::qdrant::collection_info(&state.qdrant, &collection).await {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    };
-    let documents_count = match crate::qdrant::distinct_doc_count(&state.qdrant, &collection).await
-    {
-        Ok(d) => d,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response();
-        }
-    };
-    Json(StatusResponse {
-        collection,
-        points_count,
-        documents_count,
-        compute_device: state.embedder.device().to_string(),
-        embed_model: state.config.embedding.model.clone(),
-    })
-    .into_response()
-}
-
-async fn handle_delete_doc(
-    State(state): State<Arc<DistillServerState>>,
-    axum::extract::Path(doc_id): axum::extract::Path<String>,
-    axum::extract::Query(q): axum::extract::Query<CollectionQuery>,
-) -> impl IntoResponse {
-    let collection = match state.resolve_collection(q.collection.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    };
-    match crate::qdrant::delete_by_doc_id(&state.qdrant, &collection, &doc_id).await {
-        Ok(deleted) => {
-            Json(serde_json::json!({"doc_id": doc_id, "deleted": deleted})).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
-}
-
-async fn handle_list_docs(
-    State(state): State<Arc<DistillServerState>>,
-    axum::extract::Query(q): axum::extract::Query<ListDocsQuery>,
-) -> impl IntoResponse {
-    let limit = q.limit.unwrap_or(100_000);
-    let collection = match state.resolve_collection(q.collection.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    };
-    match crate::qdrant::list_doc_ids(&state.qdrant, &collection, limit).await {
-        Ok(ids) => Json(serde_json::json!({"doc_ids": ids})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
-}
-
-async fn handle_reset_collection(
-    State(state): State<Arc<DistillServerState>>,
-    axum::extract::Query(q): axum::extract::Query<CollectionQuery>,
-) -> impl IntoResponse {
-    let dimension = state.embedder.dimension();
-    let collection = match state.resolve_collection(q.collection.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    };
-    match crate::qdrant::reset_collection(&state.qdrant, &collection, dimension).await {
-        Ok(deleted) => Json(serde_json::json!({
-            "collection": collection,
-            "deleted_points": deleted,
-        }))
-        .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+fn reply<T: serde::Serialize>(result: Result<T, ApiError>) -> Response {
+    match result {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => error_response(e),
     }
 }
 
@@ -204,123 +70,123 @@ struct ScrubQuery {
     collection: Option<String>,
 }
 
-async fn handle_scrub_interstitials(
-    State(state): State<Arc<DistillServerState>>,
-    axum::extract::Query(q): axum::extract::Query<ScrubQuery>,
-) -> impl IntoResponse {
-    let collection = match state.resolve_collection(q.collection.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    };
-    match crate::qdrant::scrub_interstitial_chunks(&state.qdrant, &collection, q.dry_run).await {
-        Ok(report) => Json(report).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
-}
-
 #[derive(Deserialize)]
 struct ListDocsQuery {
     limit: Option<u64>,
     collection: Option<String>,
 }
 
-async fn handle_exists(
-    State(state): State<Arc<DistillServerState>>,
-    axum::extract::Path(doc_id): axum::extract::Path<String>,
-    axum::extract::Query(q): axum::extract::Query<CollectionQuery>,
-) -> impl IntoResponse {
-    let collection = match state.resolve_collection(q.collection.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    };
-    match crate::qdrant::doc_exists(&state.qdrant, &collection, &doc_id).await {
-        Ok((exists, chunks)) => {
-            Json(serde_json::json!({"exists": exists, "chunks": chunks})).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+async fn handle_health(State(state): State<Arc<DistillServerState>>) -> Response {
+    reply(state.health().await)
 }
 
-#[derive(Deserialize)]
-struct IndexRequest {
-    /// Filename (stem used as doc_id)
-    path: String,
-    /// If provided, use this content instead of reading from disk
-    content: Option<String>,
-    /// Optional catalog entry — when callers have already loaded it via
-    /// Storage, pass it in so the server doesn't need its own filesystem
-    /// copy of the catalog.
-    catalog: Option<hs_common::catalog::CatalogEntry>,
-    /// Override the target collection. Missing means use the configured
-    /// default (`academic_papers`). Non-default names are lazily created on
-    /// first use; once created they share the same vector schema and field
-    /// indexes as the default.
-    #[serde(default)]
-    collection: Option<String>,
+/// 200 with `ready: true`, or 503 with the same JSON body and a `reason`.
+async fn handle_readiness(State(state): State<Arc<DistillServerState>>) -> Response {
+    let readiness = state.readiness().await;
+    let status = if readiness.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(readiness)).into_response()
+}
+
+async fn handle_status(
+    State(state): State<Arc<DistillServerState>>,
+    Query(q): Query<CollectionQuery>,
+) -> Response {
+    reply(state.status(q.collection.as_deref()).await)
+}
+
+async fn handle_delete_doc(
+    State(state): State<Arc<DistillServerState>>,
+    Path(doc_id): Path<String>,
+    Query(q): Query<CollectionQuery>,
+) -> Response {
+    reply(
+        state
+            .delete_doc(&doc_id, q.collection.as_deref())
+            .await
+            .map(|deleted| serde_json::json!({"doc_id": doc_id, "deleted": deleted})),
+    )
+}
+
+async fn handle_list_docs(
+    State(state): State<Arc<DistillServerState>>,
+    Query(q): Query<ListDocsQuery>,
+) -> Response {
+    reply(
+        state
+            .list_docs(q.limit, q.collection.as_deref())
+            .await
+            .map(|docs| serde_json::json!({"doc_ids": docs.doc_ids, "truncated": docs.truncated})),
+    )
+}
+
+async fn handle_reset_collection(
+    State(state): State<Arc<DistillServerState>>,
+    Query(q): Query<CollectionQuery>,
+) -> Response {
+    reply(
+        state
+            .reset_collection(q.collection.as_deref())
+            .await
+            .map(|(collection, deleted)| {
+                serde_json::json!({"collection": collection, "deleted_points": deleted})
+            }),
+    )
+}
+
+async fn handle_scrub_interstitials(
+    State(state): State<Arc<DistillServerState>>,
+    Query(q): Query<ScrubQuery>,
+) -> Response {
+    reply(
+        state
+            .scrub_interstitials(q.dry_run, q.collection.as_deref())
+            .await,
+    )
+}
+
+async fn handle_exists(
+    State(state): State<Arc<DistillServerState>>,
+    Path(doc_id): Path<String>,
+    Query(q): Query<CollectionQuery>,
+) -> Response {
+    reply(
+        state
+            .doc_exists(&doc_id, q.collection.as_deref())
+            .await
+            .map(|(exists, chunks)| serde_json::json!({"exists": exists, "chunks": chunks})),
+    )
 }
 
 async fn handle_distill(
     State(state): State<Arc<DistillServerState>>,
     Json(req): Json<IndexRequest>,
 ) -> Response {
-    let _guard = InFlightGuard::new(&state.in_flight);
-
-    let collection = match state.resolve_collection(req.collection.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    let job = match state.prepare_index(req) {
+        Ok(job) => job,
+        Err(e) => return error_response(e),
     };
-
-    let path = std::path::Path::new(&req.path);
-    match crate::pipeline::index_document(
-        path,
-        req.content.as_deref(),
-        req.catalog.clone(),
-        &state.config,
-        &collection,
-        crate::pipeline::ContentProfile::for_collection(&collection),
-        state.embedder.as_ref(),
-        &state.qdrant,
-        |_| {}, // no progress for non-streaming
-    )
-    .await
-    {
-        Ok(chunks) => Json(IndexResult {
-            doc_id: path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            chunks_indexed: chunks,
-            embedding_device: state.embedder.device().to_string(),
-        })
-        .into_response(),
-        Err(e) => {
-            tracing::error!("Indexing failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response()
-        }
-    }
+    reply(state.run_index(job, |_| {}).await)
 }
 
 async fn handle_distill_stream(
     State(state): State<Arc<DistillServerState>>,
     Json(req): Json<IndexRequest>,
 ) -> Response {
-    let guard = InFlightGuard::new(&state.in_flight);
-
-    let collection = match state.resolve_collection(req.collection.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    // A request that is wrong on its face is a 400 before any streaming
+    // starts, not a 200 whose only line is an error.
+    let job = match state.prepare_index(req) {
+        Ok(job) => job,
+        Err(e) => return error_response(e),
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
-    let path = req.path.clone();
-    let content = req.content.clone();
-    let catalog = req.catalog.clone();
 
     tokio::spawn(async move {
-        let _guard = guard;
         let tx_progress = tx.clone();
-
         let on_progress = move |event: DistillProgress| {
             let line: DistillStreamLine = hs_common::service::protocol::StreamLine::Progress(event);
             if let Ok(json) = serde_json::to_string(&line) {
@@ -328,44 +194,12 @@ async fn handle_distill_stream(
             }
         };
 
-        let doc_path = std::path::Path::new(&path);
-        match crate::pipeline::index_document(
-            doc_path,
-            content.as_deref(),
-            catalog,
-            &state.config,
-            &collection,
-            crate::pipeline::ContentProfile::for_collection(&collection),
-            state.embedder.as_ref(),
-            &state.qdrant,
-            on_progress,
-        )
-        .await
-        {
-            Ok(chunks) => {
-                let result = IndexResult {
-                    doc_id: doc_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    chunks_indexed: chunks,
-                    embedding_device: state.embedder.device().to_string(),
-                };
-                let line: DistillStreamLine =
-                    hs_common::service::protocol::StreamLine::Result(result);
-                if let Ok(json) = serde_json::to_string(&line) {
-                    let _ = tx.send(Ok(format!("{json}\n"))).await;
-                }
-            }
-            Err(e) => {
-                tracing::error!("Indexing failed: {e}");
-                let line: DistillStreamLine =
-                    hs_common::service::protocol::StreamLine::Error(format!("{e}"));
-                if let Ok(json) = serde_json::to_string(&line) {
-                    let _ = tx.send(Ok(format!("{json}\n"))).await;
-                }
-            }
+        let line: DistillStreamLine = match state.run_index(job, on_progress).await {
+            Ok(result) => hs_common::service::protocol::StreamLine::Result(result),
+            Err(e) => hs_common::service::protocol::StreamLine::Error(e.message),
+        };
+        if let Ok(json) = serde_json::to_string(&line) {
+            let _ = tx.send(Ok(format!("{json}\n"))).await;
         }
     });
 
@@ -378,121 +212,375 @@ async fn handle_distill_stream(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-#[derive(Deserialize)]
-struct SearchRequest {
-    query: String,
-    limit: Option<u64>,
-    filters: Option<SearchFilters>,
-    /// Override the target collection. Missing means use the configured
-    /// default. See [`IndexRequest::collection`] for routing semantics.
-    #[serde(default)]
-    collection: Option<String>,
-}
-
 async fn handle_search(
     State(state): State<Arc<DistillServerState>>,
     Json(req): Json<SearchRequest>,
 ) -> Response {
-    if req.query.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "Search query cannot be empty").into_response();
+    reply(state.search(req).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{DistillStreamLine, ReadinessResponse};
+    use crate::embed::EmbedderHealth;
+    use crate::testutil::{prose, small_chunk_config, FakeEmbedder, FakeStore};
+    use hs_common::service::protocol::StreamLine;
+
+    /// A real axum server on an ephemeral loopback port, over fakes.
+    struct Harness {
+        base: String,
+        http: reqwest::Client,
+        embedder: Arc<FakeEmbedder>,
+        store: Arc<FakeStore>,
     }
 
-    let collection = match state.resolve_collection(req.collection.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    };
+    async fn start() -> Harness {
+        let embedder = Arc::new(FakeEmbedder::new());
+        let store = Arc::new(FakeStore::default());
+        let state = Arc::new(DistillServerState::new(
+            embedder.clone(),
+            store.clone(),
+            small_chunk_config(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        Harness {
+            base: format!("http://{addr}"),
+            http: reqwest::Client::new(),
+            embedder,
+            store,
+        }
+    }
 
-    // Embed the query
-    let query_texts = vec![req.query.clone()];
-    let embeddings = match state.embedder.embed_batch(&query_texts).await {
-        Ok(e) => e,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Embedding failed: {e}"),
+    impl Harness {
+        fn url(&self, path: &str) -> String {
+            format!("{}{path}", self.base)
+        }
+
+        async fn post(&self, path: &str, body: serde_json::Value) -> reqwest::Response {
+            self.http
+                .post(self.url(path))
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn distill_without_content_is_400_and_reads_nothing() {
+        // RA-3 over the wire: the path names a readable file; it must not be
+        // indexed, embedded, or searchable afterwards.
+        let h = start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hostname.md");
+        std::fs::write(&file, "UNIQUE-SECRET-TEXT ".repeat(40)).unwrap();
+
+        for route in ["/distill", "/distill/stream"] {
+            for body in [
+                serde_json::json!({ "path": file }),
+                serde_json::json!({ "path": file, "content": null }),
+            ] {
+                let resp = h.post(route, body).await;
+                assert_eq!(resp.status(), 400, "{route}");
+                let text = resp.text().await.unwrap();
+                assert!(text.contains("content"), "{route}: {text}");
+                assert!(!text.contains("UNIQUE-SECRET"), "{route}: {text}");
+            }
+        }
+        assert_eq!(h.embedder.calls(), 0);
+        assert_eq!(h.store.ops(), []);
+        assert!(h.store.state.lock().upserted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn distill_with_content_indexes_it() {
+        let h = start().await;
+        let resp = h
+            .post(
+                "/distill",
+                serde_json::json!({ "path": "markdown/ab/doc.md", "content": prose(6) }),
             )
-                .into_response()
+            .await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["doc_id"], "doc");
+        assert!(body["chunks_indexed"].as_u64().unwrap() > 0);
+        assert!(!h.store.stored("academic_papers", "doc").is_empty());
+    }
+
+    #[tokio::test]
+    async fn distill_stream_emits_progress_then_a_result_line() {
+        let h = start().await;
+        let text = h
+            .post(
+                "/distill/stream",
+                serde_json::json!({ "path": "doc.md", "content": prose(6) }),
+            )
+            .await
+            .text()
+            .await
+            .unwrap();
+        let lines: Vec<DistillStreamLine> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(lines.len() >= 2, "{text}");
+        assert!(matches!(lines[0], StreamLine::Progress(_)));
+        match lines.last().unwrap() {
+            StreamLine::Result(r) => assert_eq!(r.doc_id, "doc"),
+            other => panic!("last line should be the result: {other:?}"),
         }
-    };
+    }
 
-    let query_vector = match embeddings.into_iter().next() {
-        Some(e) => e.dense,
-        None => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "No embedding produced").into_response()
+    #[tokio::test]
+    async fn a_failure_after_streaming_started_is_an_error_line() {
+        let h = start().await;
+        h.store.state.lock().fail_upsert_from_call = Some(0);
+        let text = h
+            .post(
+                "/distill/stream",
+                serde_json::json!({ "path": "doc.md", "content": prose(6) }),
+            )
+            .await
+            .text()
+            .await
+            .unwrap();
+        let last: DistillStreamLine = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert!(matches!(last, StreamLine::Error(_)), "{text}");
+    }
+
+    #[tokio::test]
+    async fn unknown_collection_is_400_on_every_route_and_creates_nothing() {
+        let h = start().await;
+        let q = "collection=made_up";
+        let responses = vec![
+            h.post(
+                "/distill",
+                serde_json::json!({"path":"a.md","content":"x","collection":"made_up"}),
+            )
+            .await,
+            h.post(
+                "/distill/stream",
+                serde_json::json!({"path":"a.md","content":"x","collection":"made_up"}),
+            )
+            .await,
+            h.post(
+                "/search",
+                serde_json::json!({"query":"q","collection":"made_up"}),
+            )
+            .await,
+            h.http
+                .get(h.url(&format!("/status?{q}")))
+                .send()
+                .await
+                .unwrap(),
+            h.http
+                .get(h.url(&format!("/exists/d?{q}")))
+                .send()
+                .await
+                .unwrap(),
+            h.http
+                .get(h.url(&format!("/docs?{q}")))
+                .send()
+                .await
+                .unwrap(),
+            h.http
+                .delete(h.url(&format!("/doc/d?{q}")))
+                .send()
+                .await
+                .unwrap(),
+            h.http
+                .post(h.url(&format!("/collection/reset?{q}")))
+                .send()
+                .await
+                .unwrap(),
+            h.http
+                .post(h.url(&format!("/scrub-interstitials?{q}")))
+                .send()
+                .await
+                .unwrap(),
+        ];
+        for resp in responses {
+            let url = resp.url().path().to_string();
+            assert_eq!(resp.status(), 400, "{url}");
         }
-    };
+        assert_eq!(h.store.ops(), []);
+        assert_eq!(h.embedder.calls(), 0);
+    }
 
-    let limit = req.limit.unwrap_or(10);
+    #[tokio::test]
+    async fn configured_extra_collection_is_served() {
+        let h = start().await;
+        let resp = h
+            .post(
+                "/distill",
+                serde_json::json!({"path":"a.md","content":prose(4),"collection":"personal_docs"}),
+            )
+            .await;
+        assert_eq!(resp.status(), 200);
+        assert!(!h.store.stored("personal_docs", "a").is_empty());
+        assert!(h.store.stored("academic_papers", "a").is_empty());
+    }
 
-    let filter = req.filters.as_ref().and_then(|f| {
-        crate::qdrant::build_filter(f.year.as_deref(), f.topic.as_deref(), f.category.as_deref())
-    });
+    #[tokio::test]
+    async fn bad_input_is_4xx_and_dependency_failures_are_5xx() {
+        let h = start().await;
+        // 400s
+        assert_eq!(
+            h.post("/search", serde_json::json!({"query":"  "}))
+                .await
+                .status(),
+            400
+        );
+        assert_eq!(
+            h.post(
+                "/search",
+                serde_json::json!({"query":"q","filters":{"year":"abc"}})
+            )
+            .await
+            .status(),
+            400
+        );
+        assert_eq!(
+            h.post("/distill", serde_json::json!({"path":"..","content":"x"}))
+                .await
+                .status(),
+            400
+        );
+        assert_eq!(
+            h.http
+                .get(h.url("/docs?limit=99999999"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        // 500: the store fails while indexing
+        h.store.state.lock().fail_upsert_from_call = Some(0);
+        assert_eq!(
+            h.post(
+                "/distill",
+                serde_json::json!({"path":"a.md","content":prose(6)})
+            )
+            .await
+            .status(),
+            500
+        );
+    }
 
-    match crate::qdrant::search(&state.qdrant, &collection, query_vector, limit, filter).await {
-        Ok(results) => {
-            let hits: Vec<SearchHit> = results
-                .into_iter()
-                .filter_map(|point| {
-                    let payload = point.payload;
-                    Some(SearchHit {
-                        doc_id: payload
-                            .get("doc_id")?
-                            .as_str()
-                            .map(|s| s.to_string())
-                            .unwrap_or_default(),
-                        title: payload
-                            .get("title")
-                            .and_then(|v| v.as_str().map(|s| s.to_string())),
-                        authors: payload
-                            .get("authors")
-                            .and_then(|v| v.as_list())
-                            .map(|list| {
-                                list.iter()
-                                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        year: payload
-                            .get("year")
-                            .and_then(|v| v.as_integer())
-                            .map(|v| v as u64),
-                        doi: payload
-                            .get("doi")
-                            .and_then(|v| v.as_str().map(|s| s.to_string())),
-                        chunk_text: payload
-                            .get("chunk_text")?
-                            .as_str()
-                            .map(|s| s.to_string())
-                            .unwrap_or_default(),
-                        score: point.score,
-                        pdf_path: payload
-                            .get("pdf_path")
-                            .and_then(|v| v.as_str().map(|s| s.to_string())),
-                        line_start: payload
-                            .get("line_start")
-                            .and_then(|v| v.as_integer())
-                            .unwrap_or(0) as usize,
-                        line_end: payload
-                            .get("line_end")
-                            .and_then(|v| v.as_integer())
-                            .unwrap_or(0) as usize,
-                        page: payload
-                            .get("page")
-                            .and_then(|v| v.as_integer())
-                            .map(|v| v as usize),
-                        category: payload
-                            .get("category")
-                            .and_then(|v| v.as_str().map(|s| s.to_string())),
-                    })
-                })
-                .collect();
-
-            Json(hits).into_response()
+    #[tokio::test]
+    async fn docs_lists_ids_with_a_truncation_flag() {
+        let h = start().await;
+        for d in ["a", "b", "c"] {
+            h.store.seed("academic_papers", d, 1);
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Search failed: {e}"),
-        )
-            .into_response(),
+        let all: serde_json::Value = h
+            .http
+            .get(h.url("/docs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(all["doc_ids"].as_array().unwrap().len(), 3);
+        assert_eq!(all["truncated"], false);
+        let some: serde_json::Value = h
+            .http
+            .get(h.url("/docs?limit=2"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(some["doc_ids"].as_array().unwrap().len(), 2);
+        assert_eq!(some["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn readiness_and_health_follow_the_embedder_and_qdrant() {
+        let h = start().await;
+        let ready = h.http.get(h.url("/readiness")).send().await.unwrap();
+        assert_eq!(ready.status(), 200);
+        let body: ReadinessResponse = ready.json().await.unwrap();
+        assert!(body.ready);
+        assert_eq!(body.capacity, 2);
+        assert_eq!(
+            h.http.get(h.url("/health")).send().await.unwrap().status(),
+            200
+        );
+
+        *h.embedder.health.lock() = EmbedderHealth::Failed("slot 0 poisoned".into());
+        let resp = h.http.get(h.url("/readiness")).send().await.unwrap();
+        assert_eq!(resp.status(), 503);
+        let body: ReadinessResponse = resp.json().await.unwrap();
+        assert!(!body.ready);
+        assert!(body.reason.unwrap().contains("poisoned"));
+        assert_eq!(
+            h.http.get(h.url("/health")).send().await.unwrap().status(),
+            503
+        );
+
+        *h.embedder.health.lock() = EmbedderHealth::Healthy;
+        h.store.state.lock().down = true;
+        assert_eq!(
+            h.http
+                .get(h.url("/readiness"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            503
+        );
+        assert_eq!(
+            h.http.get(h.url("/health")).send().await.unwrap().status(),
+            503
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_and_exists_round_trip() {
+        let h = start().await;
+        h.store.seed("academic_papers", "d", 3);
+        let exists: serde_json::Value = h
+            .http
+            .get(h.url("/exists/d"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            (exists["exists"].clone(), exists["chunks"].clone()),
+            (true.into(), 3.into())
+        );
+        let deleted: serde_json::Value = h
+            .http
+            .delete(h.url("/doc/d"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(deleted["deleted"], 3);
+        let exists: serde_json::Value = h
+            .http
+            .get(h.url("/exists/d"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(exists["exists"], false);
     }
 }

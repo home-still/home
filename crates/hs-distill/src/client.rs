@@ -19,6 +19,13 @@ pub struct DistillProgress {
     pub message: String,
 }
 
+/// Most hits one search request may ask for; larger `limit`s are clamped.
+pub const MAX_SEARCH_LIMIT: u64 = 200;
+
+/// Most document ids `/docs` returns; a larger `limit` is rejected (HTTP
+/// 400). Also the cap on the distinct-document count in `/status`.
+pub const MAX_DOC_LIST_LIMIT: u64 = 1_000_000;
+
 /// Result of indexing a single document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexResult {
@@ -83,8 +90,19 @@ pub struct HealthResponse {
 /// Readiness response from the distill server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadinessResponse {
+    /// The embedder is healthy and Qdrant answers.
     pub ready: bool,
     pub in_flight: usize,
+    /// Concurrent `embed` calls the server can run (its model pool size).
+    #[serde(default = "default_capacity")]
+    pub capacity: usize,
+    /// Why `ready` is false.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+fn default_capacity() -> usize {
+    1
 }
 
 impl ReadinessInfo for ReadinessResponse {
@@ -93,7 +111,7 @@ impl ReadinessInfo for ReadinessResponse {
     }
     fn available_slots(&self) -> usize {
         if self.ready {
-            1
+            self.capacity.saturating_sub(self.in_flight)
         } else {
             0
         }
@@ -107,6 +125,9 @@ pub struct StatusResponse {
     pub points_count: u64,
     #[serde(default)]
     pub documents_count: u64,
+    /// `documents_count` stopped at [`MAX_DOC_LIST_LIMIT`]; more exist.
+    #[serde(default)]
+    pub documents_count_truncated: bool,
     pub compute_device: String,
     #[serde(default)]
     pub embed_model: String,
