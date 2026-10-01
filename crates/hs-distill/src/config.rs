@@ -767,6 +767,22 @@ mod tests {
     }
 
     #[test]
+    fn yaml_collections_replace_the_default_list_and_host_port_are_read() {
+        let yaml = "distill_server:\n  host: 127.0.0.1\n  port: 7444\n  collections: [only_this]\n";
+        let loaded: DistillServerConfig =
+            Figment::from(Serialized::defaults(DistillServerConfig::default()))
+                .merge(Yaml::string(yaml).nested())
+                .select("distill_server")
+                .extract()
+                .unwrap();
+        assert_eq!(loaded.collections, ["only_this"]);
+        assert_eq!((loaded.host.as_str(), loaded.port), ("127.0.0.1", 7444));
+        loaded.validate().unwrap();
+        let served: Vec<_> = loaded.served_collections().collect();
+        assert_eq!(served, ["academic_papers", "only_this"]);
+    }
+
+    #[test]
     fn upsert_sizes_of_zero_are_rejected_not_clamped() {
         let mut c = cfg();
         c.qdrant_upsert_batch = 0;
