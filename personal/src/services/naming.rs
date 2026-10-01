@@ -133,7 +133,7 @@ mod tests {
         let s = "aé日b";
         for max in 0..=s.len() + 2 {
             let out = take_chars(s, max);
-            assert!(out.len() <= max.max(0), "max={max} out={out:?}");
+            assert!(out.len() <= max, "max={max} out={out:?}");
             assert!(s.starts_with(&out), "max={max} out={out:?}");
         }
         assert_eq!(take_chars(s, 1), "a");
