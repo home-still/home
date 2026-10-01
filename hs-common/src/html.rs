@@ -41,6 +41,10 @@ fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// Visible-text bytes below which a login prompt on an article-shaped page
+/// marks it as a paywall stub (abstract + "Sign in to read the full text").
+const MIN_TEXT_WITH_LOGIN_PROMPT: usize = 2_000;
+
 /// True when `content` looks like a paywall / error / landing page
 /// rather than real article content.
 pub fn is_paywall_html(content: &str) -> bool {
@@ -61,19 +65,18 @@ pub fn is_paywall_html(content: &str) -> bool {
     let has_article =
         lower.contains("<article") || (lower.contains("abstract") && lower.contains("references"));
 
-    // Short pages with login prompts are almost certainly paywalls
-    if has_login && content.len() < 100_000 {
-        return true;
-    }
-
-    // If it has login indicators but no article structure, it's a paywall
-    if has_login && !has_article {
-        return true;
-    }
-
     // Strip HTML tags and measure actual visible text
     let text_only = strip_html_tags(&lower);
     let text_len = text_only.trim().len();
+
+    // A login prompt condemns a page that has no article structure, or one
+    // that is article-shaped but carries little more than the prompt (an
+    // abstract-only paywall stub). A real article — even a short one —
+    // routinely has a "Sign in" link in its site navigation, so page size
+    // alone must not decide it.
+    if has_login && (!has_article || text_len < MIN_TEXT_WITH_LOGIN_PROMPT) {
+        return true;
+    }
 
     // Very short pages without article structure are junk (landing pages, error pages)
     if text_len < 500 && !has_article {
@@ -171,59 +174,98 @@ pub fn is_paywall_html(content: &str) -> bool {
     false
 }
 
-/// True when `content` matches a *known* anti-bot interstitial / cookie-wall
-/// stub signature. Narrower than [`is_paywall_html`] — does not include the
-/// heuristic short-page / no-article-structure rules, which can false-positive
-/// on a legitimately short editorial. Safe to use as a destructive-purge gate
-/// where false positives would delete real papers.
+/// Largest document or chunk (bytes) [`is_known_interstitial`] will classify.
+///
+/// Real interstitial stubs are tiny (a 131-byte reCAPTCHA stub, a 366-byte
+/// Wiley cookie wall, a few KB at most); a per-chunk scrub sees at most one
+/// chunk (~4 000 characters by default). Anything larger is a real document
+/// that merely mentions a phrase, so it is never a stub: the book
+/// "Accelerate" (399 KB) was once skipped for containing one sentence.
+pub const MAX_INTERSTITIAL_BYTES: usize = 5_000;
+
+/// Largest input (bytes) in which the *generic* signatures below count.
+/// Those phrases occur in ordinary prose and UI narration ("Preparing to
+/// download the dataset", dialogue saying "Just a moment..."), so they only
+/// identify a stub when they are most of the text.
+const MAX_GENERIC_INTERSTITIAL_BYTES: usize = 1_500;
+
+/// Signatures that occur in ordinary prose; see [`MAX_GENERIC_INTERSTITIAL_BYTES`].
+const GENERIC_INTERSTITIAL_SIGNATURES: &[&str] = &["preparing to download", "just a moment..."];
+
+/// Boilerplate sentences unique to one anti-bot / cookie-wall page. Matched
+/// against lowercased text.
+const UNIQUE_INTERSTITIAL_SIGNATURES: &[&str] = &[
+    "www.google.com/recaptcha/challengepage",
+    "checking your browser before accessing",
+    "wiley online library requires cookies",
+    // Anubis / BotStopper Proof-of-Work bot challenges share the same
+    // boilerplate prose. The brand-name strings ("Anubis", "BotStopper")
+    // sometimes lose their surrounding whitespace through the
+    // HTML→markdown round-trip ("set upBotStopperto"), so anchor on a
+    // shared sentence fragment instead. The full phrase is unique to
+    // this anti-scraper page and won't appear in academic body text.
+    "ai companies aggressively scraping",
+    // Generic "verifying connection" stub seen on at least one DOI
+    // (10.24124_*). The full sentence is specific enough to avoid
+    // false-positives on body text that happens to mention "verify".
+    "one moment while we verify your network connection",
+    // Elsevier / ScienceDirect Portuguese cookie banner — surfaces when
+    // the request lands on the PT-BR locale and gets the consent page
+    // instead of the article. The phrase below is from the consent body.
+    "as páginas que você visitou e os links em que clicou",
+    // Akamai-style CAPTCHA / bot-block (Optica Publishing Group, others).
+    // Distinctive boilerplate; the "Incident ID" line is also unique but
+    // varies per request, so anchor on the static sentence.
+    "made us think that you are a bot",
+    // Generic "Request Rejected" / "Preserving Human Intellect" anti-bot
+    // page (seen on bjas.journals.ekb.eg etc.). Either substring alone is
+    // unique to this block-page boilerplate.
+    "to protect our site from automated bots",
+    // Generic "site requires cookies to be enabled" stub (seen on
+    // 10.1097_chi.* and similar).
+    "this site requires cookies to be enabled to function",
+    // Optica-style "Verification required ... text/data mining" challenge.
+    // The TDM-specific carve-out is the unique anchor; real papers don't
+    // tell readers to "contact Customer Service" if they're text-mining.
+    "if you are trying to perform text/data mining",
+    // Cambridge / CABI / Informa "Traffic control and bot detection"
+    // page. Specific enough that real article body text won't match.
+    "traffic control and bot detection",
+    // Polish / EU GDPR cookie consent banner that some publishers
+    // (versita.com, sciendo) prepend or append to the article body.
+    // Catches both the full-stub case and the contamination case.
+    "data, including cookies, are used to provide services",
+    // Brazilian gov.br / Capes cookie banner appended to articles
+    // accessed through the Capes federation. Same pattern as above.
+    "nós usamos cookies para melhorar sua experiência",
+];
+
+/// True when `content` — a whole converted document or a single chunk — is a
+/// *known* anti-bot interstitial / cookie-wall stub. Narrower than
+/// [`is_paywall_html`]: it has none of the heuristic short-page /
+/// no-article-structure rules, which can false-positive on a legitimately
+/// short editorial. Safe to use as a destructive-purge gate where false
+/// positives would delete real papers.
+///
+/// Only short inputs qualify: more than [`MAX_INTERSTITIAL_BYTES`] is never a
+/// stub, and the generic phrases (`preparing to download`, `just a
+/// moment...`) only count in inputs of at most 1 500 bytes. A long book that
+/// happens to contain one of the phrases is real content.
 pub fn is_known_interstitial(content: &str) -> bool {
+    if content.len() > MAX_INTERSTITIAL_BYTES {
+        return false;
+    }
     let lower = content.to_lowercase();
-    lower.contains("www.google.com/recaptcha/challengepage")
-        || lower.contains("checking your browser before accessing")
-        || lower.contains("just a moment...")
-        || lower.contains("wiley online library requires cookies")
-        || lower.contains("preparing to download")
-        // Anubis / BotStopper Proof-of-Work bot challenges share the same
-        // boilerplate prose. The brand-name strings ("Anubis", "BotStopper")
-        // sometimes lose their surrounding whitespace through the
-        // HTML→markdown round-trip ("set upBotStopperto"), so anchor on a
-        // shared sentence fragment instead. The full phrase is unique to
-        // this anti-scraper page and won't appear in academic body text.
-        || lower.contains("ai companies aggressively scraping")
-        // Generic "verifying connection" stub seen on at least one DOI
-        // (10.24124_*). The full sentence is specific enough to avoid
-        // false-positives on body text that happens to mention "verify".
-        || lower.contains("one moment while we verify your network connection")
-        // Elsevier / ScienceDirect Portuguese cookie banner — surfaces when
-        // the request lands on the PT-BR locale and gets the consent page
-        // instead of the article. The phrase below is from the consent body.
-        || lower.contains("as páginas que você visitou e os links em que clicou")
-        // Akamai-style CAPTCHA / bot-block (Optica Publishing Group, others).
-        // Distinctive boilerplate; the "Incident ID" line is also unique but
-        // varies per request, so anchor on the static sentence.
-        || lower.contains("made us think that you are a bot")
-        // Generic "Request Rejected" / "Preserving Human Intellect" anti-bot
-        // page (seen on bjas.journals.ekb.eg etc.). Either substring alone is
-        // unique to this block-page boilerplate.
-        || lower.contains("to protect our site from automated bots")
-        // Generic "site requires cookies to be enabled" stub (seen on
-        // 10.1097_chi.* and similar). Stronger than the Wiley variant —
-        // unconditional on any markdown that says it.
-        || lower.contains("this site requires cookies to be enabled to function")
-        // Optica-style "Verification required ... text/data mining" challenge.
-        // The TDM-specific carve-out is the unique anchor; real papers don't
-        // tell readers to "contact Customer Service" if they're text-mining.
-        || lower.contains("if you are trying to perform text/data mining")
-        // Cambridge / CABI / Informa "Traffic control and bot detection"
-        // page. Specific enough that real article body text won't match.
-        || lower.contains("traffic control and bot detection")
-        // Polish / EU GDPR cookie consent banner that some publishers
-        // (versita.com, sciendo) prepend or append to the article body.
-        // Catches both the full-stub case and the contamination case.
-        || lower.contains("data, including cookies, are used to provide services")
-        // Brazilian gov.br / Capes cookie banner appended to articles
-        // accessed through the Capes federation. Same pattern as above.
-        || lower.contains("nós usamos cookies para melhorar sua experiência")
+    if UNIQUE_INTERSTITIAL_SIGNATURES
+        .iter()
+        .any(|sig| lower.contains(sig))
+    {
+        return true;
+    }
+    content.len() <= MAX_GENERIC_INTERSTITIAL_BYTES
+        && GENERIC_INTERSTITIAL_SIGNATURES
+            .iter()
+            .any(|sig| lower.contains(sig))
 }
 
 /// Strip HTML tags to get visible text content.
@@ -297,19 +339,15 @@ mod tests {
     /// all of them. See `hs-distill::pipeline::index_document`.
     #[test]
     fn known_interstitial_clears_real_papers_that_paywall_heuristic_rejects() {
-        // A complete paper under 100 KB whose body says "Sign in" once
-        // (publisher chrome swept up by the converter). Rejected by
-        // `is_paywall_html` via the `has_login && len < 100_000` rule, which
-        // — unlike the rule below it — carries no `!has_article` guard.
+        // A complete paper whose body says "Sign in" once (publisher chrome
+        // swept up by the converter). `is_paywall_html` used to reject it via
+        // a `has_login && len < 100_000` rule (RA-84); neither gate may now.
         let with_login = format!(
             "# Dual Contouring of Hermite Data\n\n## Abstract\n\n{}\n\n## References\n\n\
              [1] Smith 2020\n\nSign in to ACM Digital Library\n",
             "This paper describes a new method for contouring a signed grid. ".repeat(200)
         );
-        assert!(
-            is_paywall_html(&with_login),
-            "precondition: heuristic rejects it"
-        );
+        assert!(!is_paywall_html(&with_login));
         assert!(!is_known_interstitial(&with_login));
 
         // A clinical review that mentions "clinical trials" but has no
@@ -346,6 +384,80 @@ mod tests {
         ));
         assert!(is_known_interstitial(
             "Cookies are disabled. Wiley Online Library requires cookies for authentication."
+        ));
+    }
+
+    /// RA-43: a phrase inside a long real document is not a stub. Each
+    /// signature is exercised twice — alone (a stub) and buried in book-sized
+    /// prose (real content).
+    #[test]
+    fn known_interstitial_ignores_signatures_inside_long_documents() {
+        let filler = "The deployment pipeline runs the integration suite before every release. ";
+        let book = |phrase: &str| {
+            format!(
+                "{}\n\n{phrase}\n\n{}",
+                filler.repeat(400),
+                filler.repeat(400)
+            )
+        };
+        for phrase in [
+            "Preparing to download the dataset",
+            "\"Just a moment...\" she said.",
+            "Data, including cookies, are used to provide services.",
+            "Wiley Online Library requires cookies",
+            "This site requires cookies to be enabled to function.",
+        ] {
+            assert!(
+                is_known_interstitial(phrase),
+                "stub form must match: {phrase}"
+            );
+            let long = book(phrase);
+            assert!(long.len() > MAX_INTERSTITIAL_BYTES);
+            assert!(!is_known_interstitial(&long), "long doc with: {phrase}");
+        }
+    }
+
+    /// A chunk-sized slice of a real document that says "Just a moment..." or
+    /// "Preparing to download" is prose, not a stub; the same chunk carrying a
+    /// unique cookie-wall sentence (the contamination case) still matches.
+    #[test]
+    fn known_interstitial_generic_phrases_need_a_stub_sized_input() {
+        let prose = "We then verify each transfer against the manifest. ".repeat(25);
+        assert!(prose.len() * 2 > 1_500 && prose.len() * 2 < MAX_INTERSTITIAL_BYTES);
+
+        let generic = format!("{prose}Preparing to download the dataset...\n{prose}");
+        assert!(generic.len() <= MAX_INTERSTITIAL_BYTES);
+        assert!(!is_known_interstitial(&generic));
+
+        let banner =
+            format!("{prose}{prose}Data, including cookies, are used to provide services.\n");
+        assert!(banner.len() > 1_500 && banner.len() <= MAX_INTERSTITIAL_BYTES);
+        assert!(is_known_interstitial(&banner));
+    }
+
+    /// RA-84: a real article carries a "Sign in" link in its site chrome.
+    #[test]
+    fn short_real_article_with_sign_in_link_is_not_a_paywall() {
+        let body = "We measured the response of the sensor across twelve trials. ".repeat(60);
+        let html = format!(
+            "<html><body><nav><a href=\"/login\">Sign in</a></nav><article>\
+             <h1>A short report</h1><h2>Abstract</h2><p>{body}</p>\
+             <h2>References</h2><ol><li>Smith 2020</li></ol></article></body></html>"
+        );
+        assert!(html.len() < 100_000);
+        assert!(!is_paywall_html(&html));
+    }
+
+    /// An article-shaped page that is just an abstract and a login prompt is
+    /// still a paywall stub, as is a bare login wall.
+    #[test]
+    fn abstract_only_login_page_is_still_a_paywall() {
+        let html = "<html><body><article><h1>Paper</h1><h2>Abstract</h2>\
+            <p>We study X.</p><h2>References</h2>\
+            <p>Sign in to read the full text.</p></article></body></html>";
+        assert!(is_paywall_html(html));
+        assert!(is_paywall_html(
+            "<html><body>Please log in to continue.</body></html>"
         ));
     }
 
