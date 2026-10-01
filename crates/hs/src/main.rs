@@ -22,6 +22,8 @@ mod scribe_inbox_install;
 mod scribe_pool;
 mod serve_cmd;
 mod shutdown;
+#[cfg(test)]
+mod test_http;
 mod status_cmd;
 mod upgrade_cmd;
 

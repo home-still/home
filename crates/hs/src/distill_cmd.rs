@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -219,31 +219,167 @@ fn open_openalex_readonly_for_cli() -> Result<duckdb::Connection> {
     Ok(conn)
 }
 
+/// Shared read-only OpenAlex handle. DuckDB is blocking and `!Sync`, so every
+/// query goes through `spawn_blocking` behind this lock.
+type OpenAlexConn = Arc<std::sync::Mutex<duckdb::Connection>>;
+
+/// Look `doi` up in the local OpenAlex catalog off the async threads. `None`
+/// means the work is not in the snapshot; a query failure is an `Err` — it is
+/// not "not found", and treating it as such silently embeds a worse abstract.
+async fn lookup_openalex(
+    conn: &OpenAlexConn,
+    doi: &str,
+) -> Result<Option<openalex_ingest::WorkAbstract>> {
+    let conn = Arc::clone(conn);
+    let doi = doi.to_string();
+    tokio::task::spawn_blocking(move || {
+        let guard = conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("OpenAlex connection lock poisoned"))?;
+        openalex_ingest::lookup_work_abstract_by_doi(&guard, &doi)
+            .map_err(|e| anyhow::anyhow!("OpenAlex lookup for {doi}: {e:#}"))
+    })
+    .await
+    .context("OpenAlex lookup task")?
+}
+
+/// How one catalog row ended.
+enum AbstractRow {
+    /// No source had a usable abstract: not embedded.
+    NoAbstract,
+    Indexed(hs_distill::abstracts::AbstractSource),
+}
+
+/// Coalesce, embed and stamp the abstract of one catalog row. Every failure
+/// (OpenAlex query, markdown read, distill, catalog stamp) is an `Err` for
+/// THIS row; the caller counts it and fails the command at the end.
+async fn build_abstract_row(
+    stem: &str,
+    entry: &hs_common::catalog::CatalogEntry,
+    oa_conn: &OpenAlexConn,
+    storage: &dyn hs_common::storage::Storage,
+    client: &DistillClient,
+) -> Result<AbstractRow> {
+    use hs_distill::abstracts::{build_embed_input, coalesce_abstract};
+
+    const COLLECTION: &str = "paper_abstracts";
+    const CATALOG_PREFIX: &str = "catalog";
+
+    // 1. OpenAlex DOI lookup. The catalog only has metadata that was
+    //    available at download time, which is often nothing — many
+    //    DOIs land in the catalog with `title=None` from a metadata
+    //    provider that gave a bare PDF URL. The local OA catalog is
+    //    the canonical source for both title AND abstract.
+    let oa_row = match entry.doi.as_deref() {
+        Some(doi) => lookup_openalex(oa_conn, doi).await?,
+        None => None,
+    };
+    let openalex_abstract = oa_row.as_ref().and_then(|w| w.abstract_text.clone());
+    // Title coalesce: catalog > OpenAlex > stem. The stem is a degraded
+    // signal for pure-DOI filenames but a useful one for
+    // author_year_topic personal-corpus naming.
+    let title = entry
+        .title
+        .clone()
+        .or_else(|| oa_row.as_ref().and_then(|w| w.title.clone()))
+        .unwrap_or_else(|| stem.to_string());
+
+    // 2. Catalog-stored abstract — captured at `paper_download` time
+    //    from whichever provider produced the hit (often Crossref,
+    //    Semantic Scholar, or arxiv for DOIs not in the OpenAlex
+    //    snapshot). Cheap to read — already on the entry we just
+    //    loaded.
+    let catalog_abstract = entry.abstract_text.clone();
+
+    // 3. Markdown fallback — only fetched if neither structured
+    //    source has an abstract, since every fetch is an S3
+    //    round-trip and many papers' converted markdown also lacks a
+    //    detectable Abstract section. A markdown object that is absent is
+    //    "no markdown"; one that cannot be read is this row's error.
+    let need_markdown = openalex_abstract.is_none()
+        && catalog_abstract
+            .as_deref()
+            .map(|s| s.trim().chars().count() < hs_distill::abstracts::MIN_ABSTRACT_CHARS)
+            .unwrap_or(true);
+    let markdown_text = match entry.markdown_path.as_deref().filter(|_| need_markdown) {
+        Some(md_key) => match storage.get(md_key).await {
+            Ok(bytes) => Some(
+                String::from_utf8(bytes)
+                    .with_context(|| format!("markdown {md_key} is not valid UTF-8"))?,
+            ),
+            Err(e) if hs_common::storage::is_not_found(&e) => None,
+            Err(e) => return Err(e.context(format!("read markdown {md_key}"))),
+        },
+        None => None,
+    };
+
+    // No usable abstract from any source: skip the paper. A title-only
+    // vector would be a degraded stand-in indistinguishable from a real
+    // abstract hit in search results.
+    let Some(coalesced) = coalesce_abstract(
+        openalex_abstract,
+        catalog_abstract,
+        markdown_text.as_deref(),
+    ) else {
+        tracing::debug!("{stem}: no usable abstract — not embedded");
+        return Ok(AbstractRow::NoAbstract);
+    };
+    let abstract_chars = coalesced.abstract_chars();
+    let embed_input = build_embed_input(Some(&title), &coalesced);
+
+    // 4. POST to the existing /distill endpoint with a synthetic path
+    //    so the doc_id resolves to the catalog stem.
+    let path_hint = format!("{stem}.md");
+    let result = client
+        .index_content_in(&path_hint, &embed_input, Some(entry), Some(COLLECTION))
+        .await
+        .context("embed abstract")?;
+    if result.chunks_indexed == 0 {
+        // Server returned success but produced 0 chunks (the pipeline's
+        // quality filter dropped them, or the chunker emitted nothing
+        // usable). Don't stamp — the catalog must never lie about Qdrant
+        // state.
+        anyhow::bail!("distill produced 0 chunks — not stamping");
+    }
+    hs_common::catalog::update_abstract_embed_catalog_via(
+        storage,
+        CATALOG_PREFIX,
+        stem,
+        coalesced.source.as_str(),
+        abstract_chars,
+    )
+    .await
+    .context("stamp catalog after embedding")?;
+    Ok(AbstractRow::Indexed(coalesced.source))
+}
+
 /// Build the `paper_abstracts` Qdrant collection from every catalog entry.
 ///
 /// Per the abstracts plan: coalesce (OpenAlex DuckDB, then the catalog's
 /// provider abstract, then markdown `## Abstract`), embed `title + abstract` via the
 /// existing /distill route targeting `collection_name="paper_abstracts"`,
-/// then stamp the catalog so reconcile runs are idempotent.
+/// then stamp the catalog so reconcile runs are idempotent. Rows that fail
+/// are counted and listed, the run continues, and the command exits non-zero.
 async fn cmd_abstracts_build(
     server: Option<&str>,
     force: bool,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    use hs_distill::abstracts::{build_embed_input, coalesce_abstract, AbstractSource};
-    use openalex_ingest::lookup_work_abstract_by_doi;
+    use hs_distill::abstracts::AbstractSource;
 
-    const COLLECTION: &str = "paper_abstracts";
     const CATALOG_PREFIX: &str = "catalog";
 
+    let stop = crate::shutdown::cooperative();
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage()?;
     let servers = resolve_servers(server).await;
     let client = DistillClient::new(&servers[0])?;
 
     reporter.status("Init", "opening OpenAlex DuckDB (read-only)");
-    let oa_conn = open_openalex_readonly_for_cli()
-        .context("open OpenAlex DuckDB — the abstracts pipeline needs the local OA catalog as the canonical source")?;
+    let oa_conn: OpenAlexConn = Arc::new(std::sync::Mutex::new(
+        open_openalex_readonly_for_cli()
+            .context("open OpenAlex DuckDB — the abstracts pipeline needs the local OA catalog as the canonical source")?,
+    ));
 
     reporter.status("Init", "listing catalog entries");
     let entries = hs_common::catalog::list_catalog_entries_via(&*storage, CATALOG_PREFIX)
@@ -257,9 +393,14 @@ async fn cmd_abstracts_build(
     let mut count_markdown = 0u32;
     let mut count_no_abstract = 0u32;
     let mut count_skipped = 0u32;
-    let mut count_errored = 0u32;
+    let mut errors: Vec<String> = Vec::new();
+    let mut interrupted = false;
 
     for (idx, (stem, _meta, entry)) in entries.into_iter().enumerate() {
+        if stop.requested() {
+            interrupted = true;
+            break;
+        }
         if !force && entry.abstract_embed.is_some() {
             count_skipped += 1;
             continue;
@@ -267,116 +408,34 @@ async fn cmd_abstracts_build(
 
         reporter.status(&format!("[{}/{}]", idx + 1, total), &stem);
 
-        // 1. OpenAlex DOI lookup. The catalog only has metadata that was
-        //    available at download time, which is often nothing — many
-        //    DOIs land in the catalog with `title=None` from a metadata
-        //    provider that gave a bare PDF URL. The local OA catalog is
-        //    the canonical source for both title AND abstract.
-        let oa_row = entry
-            .doi
-            .as_deref()
-            .and_then(|doi| lookup_work_abstract_by_doi(&oa_conn, doi).ok().flatten());
-        let openalex_abstract = oa_row.as_ref().and_then(|w| w.abstract_text.clone());
-        // Title coalesce: catalog > OpenAlex > stem. The stem is a degraded
-        // signal for pure-DOI filenames but a useful one for
-        // author_year_topic personal-corpus naming.
-        let title = entry
-            .title
-            .clone()
-            .or_else(|| oa_row.as_ref().and_then(|w| w.title.clone()))
-            .unwrap_or_else(|| stem.clone());
-
-        // 2. Catalog-stored abstract — captured at `paper_download` time
-        //    from whichever provider produced the hit (often Crossref,
-        //    Semantic Scholar, or arxiv for DOIs not in the OpenAlex
-        //    snapshot). Cheap to read — already on the entry we just
-        //    loaded.
-        let catalog_abstract = entry.abstract_text.clone();
-
-        // 3. Markdown fallback — only fetched if neither structured
-        //    source has an abstract, since every fetch is an S3
-        //    round-trip and many papers' converted markdown also lacks a
-        //    detectable Abstract section.
-        let need_markdown = openalex_abstract.is_none()
-            && catalog_abstract
-                .as_deref()
-                .map(|s| s.trim().chars().count() < hs_distill::abstracts::MIN_ABSTRACT_CHARS)
-                .unwrap_or(true);
-        let markdown_text = if need_markdown {
-            if let Some(md_key) = entry.markdown_path.as_deref() {
-                match storage.get(md_key).await {
-                    Ok(bytes) => String::from_utf8(bytes).ok(),
-                    Err(e) => {
-                        tracing::warn!("read markdown {md_key}: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // No usable abstract from any source: skip the paper. A title-only
-        // vector would be a degraded stand-in indistinguishable from a real
-        // abstract hit in search results.
-        let Some(coalesced) = coalesce_abstract(
-            openalex_abstract,
-            catalog_abstract,
-            markdown_text.as_deref(),
-        ) else {
-            tracing::debug!("{stem}: no usable abstract — not embedded");
-            count_no_abstract += 1;
-            continue;
-        };
-        let abstract_chars = coalesced.abstract_chars();
-        let embed_input = build_embed_input(Some(&title), &coalesced);
-
-        // 3. POST to the existing /distill endpoint with a synthetic path
-        //    so the doc_id resolves to the catalog stem.
-        let path_hint = format!("{stem}.md");
-        match client
-            .index_content_in(&path_hint, &embed_input, Some(&entry), Some(COLLECTION))
-            .await
-        {
-            Ok(result) if result.chunks_indexed > 0 => {
-                let source = coalesced.source.as_str();
-                if let Err(e) = hs_common::catalog::update_abstract_embed_catalog_via(
-                    &*storage,
-                    CATALOG_PREFIX,
-                    &stem,
-                    source,
-                    abstract_chars,
-                )
-                .await
-                {
-                    tracing::warn!("stamp catalog for {stem}: {e}");
-                }
-                match coalesced.source {
-                    AbstractSource::Openalex => count_openalex += 1,
-                    AbstractSource::Catalog => count_catalog += 1,
-                    AbstractSource::Markdown => count_markdown += 1,
-                }
-            }
-            Ok(_) => {
-                // Server returned success but produced 0 chunks (the
-                // pipeline's quality filter dropped them, or the chunker
-                // emitted nothing usable). Don't stamp — the catalog must
-                // never lie about Qdrant state.
-                tracing::warn!("{stem}: distill produced 0 chunks — not stamping");
-                count_errored += 1;
-            }
+        match build_abstract_row(&stem, &entry, &oa_conn, &*storage, &client).await {
+            Ok(AbstractRow::NoAbstract) => count_no_abstract += 1,
+            Ok(AbstractRow::Indexed(AbstractSource::Openalex)) => count_openalex += 1,
+            Ok(AbstractRow::Indexed(AbstractSource::Catalog)) => count_catalog += 1,
+            Ok(AbstractRow::Indexed(AbstractSource::Markdown)) => count_markdown += 1,
             Err(e) => {
-                tracing::warn!("embed {stem}: {e}");
-                count_errored += 1;
+                tracing::warn!("{stem}: {e:#}");
+                errors.push(format!("{stem}: {e:#}"));
             }
         }
     }
 
     reporter.finish(&format!(
-        "abstracts indexed: openalex={count_openalex} catalog={count_catalog} markdown={count_markdown} no_abstract={count_no_abstract} skipped={count_skipped} errors={count_errored}"
+        "abstracts indexed: openalex={count_openalex} catalog={count_catalog} markdown={count_markdown} no_abstract={count_no_abstract} skipped={count_skipped} errors={}",
+        errors.len()
     ));
+    for e in errors.iter().take(10) {
+        reporter.warn(e);
+    }
+    if interrupted {
+        anyhow::bail!(
+            "abstracts build interrupted with {} error(s); re-run to continue (stamped rows are skipped)",
+            errors.len()
+        );
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("abstracts build: {} row(s) failed", errors.len());
+    }
     Ok(())
 }
 
@@ -1006,10 +1065,28 @@ pub fn read_index_status() -> Option<IndexStatus> {
     serde_json::from_str(&contents).ok()
 }
 
+/// Write the status file. It is advisory (a dashboard reads it), so a failed
+/// write is logged and must not kill the indexing run — but it is logged.
 fn write_index_status(status: &IndexStatus) {
-    if let Ok(json) = serde_json::to_string(status) {
-        let _ = std::fs::write(index_status_path(), json);
+    if let Err(e) = write_index_status_to(&index_status_path(), status) {
+        tracing::warn!(error = %e, "could not write the distill index status file");
     }
+}
+
+/// Replace `path` with the JSON of `status` atomically: the daemon, the
+/// foreground indexer and `hs status` all touch this file, and a plain
+/// `fs::write` truncates in place, so a reader (or a second writer) saw it
+/// empty or half-written. Write a temp file in the same directory, then
+/// rename it over the target.
+fn write_index_status_to(path: &Path, status: &IndexStatus) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let json = serde_json::to_vec(status)?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(&json)?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 /// Spawn the index daemon as a background process.
@@ -1721,4 +1798,254 @@ async fn cmd_reconcile(
         counts.ok, stamp_done, embed_done, stamp_failed, embed_failed
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_http::{FakeServer, Response};
+    use async_trait::async_trait;
+    use hs_common::catalog::CatalogEntry;
+    use hs_common::storage::{LocalFsStorage, ObjectMeta, Storage};
+
+    fn long_abstract() -> String {
+        "A sufficiently long abstract about vector search. ".repeat(4)
+    }
+
+    fn in_memory_openalex() -> OpenAlexConn {
+        Arc::new(std::sync::Mutex::new(
+            duckdb::Connection::open_in_memory().unwrap(),
+        ))
+    }
+
+    async fn distill_indexing(chunks: u32) -> FakeServer {
+        FakeServer::start(move |req| match (req.method.as_str(), req.path.as_str()) {
+            ("POST", "/distill") => Response::json(
+                200,
+                &serde_json::json!({
+                    "doc_id": "10.1_abc", "chunks_indexed": chunks, "embedding_device": "cuda"
+                }),
+            ),
+            _ => Response::json(404, &serde_json::json!({})),
+        })
+        .await
+    }
+
+    async fn catalog_row(storage: &LocalFsStorage, stem: &str, entry: &CatalogEntry) {
+        hs_common::catalog::write_catalog_entry_via(storage, "catalog", stem, entry)
+            .await
+            .unwrap();
+    }
+
+    /// RA-110: `lookup_work_abstract_by_doi(..).ok().flatten()` turned a
+    /// broken OpenAlex database into "work not found", and the row was
+    /// embedded from a worse source without a word.
+    #[tokio::test]
+    async fn an_openalex_query_failure_fails_the_row_instead_of_reading_as_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let server = distill_indexing(1).await;
+        let client = DistillClient::new(&server.base).unwrap();
+        let entry = CatalogEntry {
+            doi: Some("10.1/abc".into()),
+            abstract_text: Some(long_abstract()),
+            ..Default::default()
+        };
+        catalog_row(&storage, "10.1_abc", &entry).await;
+
+        // An in-memory database has no `works` table: the query itself fails.
+        let err = build_abstract_row("10.1_abc", &entry, &in_memory_openalex(), &storage, &client)
+            .await
+            .err()
+            .expect("a failing OpenAlex query must fail the row");
+
+        assert!(format!("{err:#}").contains("OpenAlex"), "{err:#}");
+        assert!(
+            server.requests().is_empty(),
+            "nothing was embedded from a fallback source"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_catalog_abstract_is_embedded_and_stamped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let server = distill_indexing(1).await;
+        let client = DistillClient::new(&server.base).unwrap();
+        let entry = CatalogEntry {
+            abstract_text: Some(long_abstract()),
+            ..Default::default()
+        };
+        catalog_row(&storage, "10.1_abc", &entry).await;
+
+        let row = build_abstract_row("10.1_abc", &entry, &in_memory_openalex(), &storage, &client)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            row,
+            AbstractRow::Indexed(hs_distill::abstracts::AbstractSource::Catalog)
+        ));
+        let stamped = hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "10.1_abc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stamped.abstract_embed.unwrap().source, "catalog");
+    }
+
+    #[tokio::test]
+    async fn zero_chunks_is_a_row_failure_and_is_not_stamped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let server = distill_indexing(0).await;
+        let client = DistillClient::new(&server.base).unwrap();
+        let entry = CatalogEntry {
+            abstract_text: Some(long_abstract()),
+            ..Default::default()
+        };
+        catalog_row(&storage, "10.1_abc", &entry).await;
+
+        let err = build_abstract_row("10.1_abc", &entry, &in_memory_openalex(), &storage, &client)
+            .await
+            .err()
+            .expect("0 chunks is a failure");
+
+        assert!(format!("{err:#}").contains("0 chunks"), "{err:#}");
+        let row = hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "10.1_abc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.abstract_embed.is_none(), "the catalog must not lie");
+    }
+
+    #[tokio::test]
+    async fn a_row_without_any_abstract_is_skipped_not_embedded_from_its_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let server = distill_indexing(1).await;
+        let client = DistillClient::new(&server.base).unwrap();
+        let entry = CatalogEntry {
+            title: Some("Only A Title".into()),
+            ..Default::default()
+        };
+
+        let row = build_abstract_row("10.1_abc", &entry, &in_memory_openalex(), &storage, &client)
+            .await
+            .unwrap();
+
+        assert!(matches!(row, AbstractRow::NoAbstract));
+        assert!(server.requests().is_empty());
+    }
+
+    /// `get` fails with a transport error for one key; every other call works.
+    struct FailingGet(LocalFsStorage, &'static str);
+
+    #[async_trait]
+    impl Storage for FailingGet {
+        async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+            if key == self.1 {
+                anyhow::bail!("503 Slow Down");
+            }
+            self.0.get(key).await
+        }
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+            self.0.put(key, bytes).await
+        }
+        async fn head(&self, key: &str) -> anyhow::Result<Option<ObjectMeta>> {
+            self.0.head(key).await
+        }
+        async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+            self.0.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_markdown_fails_the_row_but_a_missing_one_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FailingGet(LocalFsStorage::new(tmp.path()), "markdown/10/10.1_abc.md");
+        let server = distill_indexing(1).await;
+        let client = DistillClient::new(&server.base).unwrap();
+        let broken = CatalogEntry {
+            markdown_path: Some("markdown/10/10.1_abc.md".into()),
+            ..Default::default()
+        };
+        let err = build_abstract_row("10.1_abc", &broken, &in_memory_openalex(), &storage, &client)
+            .await
+            .err()
+            .expect("a storage error is a row failure");
+        assert!(format!("{err:#}").contains("503"), "{err:#}");
+
+        let missing = CatalogEntry {
+            markdown_path: Some("markdown/10/never-written.md".into()),
+            ..Default::default()
+        };
+        let row = build_abstract_row("10.1_xyz", &missing, &in_memory_openalex(), &storage, &client)
+            .await
+            .unwrap();
+        assert!(matches!(row, AbstractRow::NoAbstract));
+    }
+
+    fn sample_status(i: usize) -> IndexStatus {
+        IndexStatus {
+            pid: 1000 + i as u32,
+            total_files: 1000,
+            indexed: i,
+            failed: 0,
+            total_chunks: 5,
+            // Large enough that a non-atomic write is observable mid-way.
+            current_file: format!("file-{i}-{}", "x".repeat(64 * 1024)),
+            done: false,
+        }
+    }
+
+    /// RA-86: the daemon and the foreground indexer both write this file and
+    /// `hs status` reads it; `fs::write` truncates in place, so a reader saw
+    /// an empty or partial document (and read it as "no indexer").
+    #[test]
+    fn the_index_status_file_is_never_observable_half_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("distill-index-status.json");
+        write_index_status_to(&path, &sample_status(0)).unwrap();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..3)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..150 {
+                        write_index_status_to(&path, &sample_status(w * 1000 + i)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let reader = {
+            let path = path.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut reads = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let text = std::fs::read_to_string(&path).expect("the file always exists");
+                    serde_json::from_str::<IndexStatus>(&text)
+                        .unwrap_or_else(|e| panic!("observed a torn status file: {e}"));
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0);
+
+        // No temp files are left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+    }
 }

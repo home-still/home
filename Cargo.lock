@@ -2175,6 +2175,7 @@ dependencies = [
  "openalex-ingest",
  "owo-colors",
  "paper",
+ "parking_lot",
  "personal",
  "ratatui",
  "reqwest",

@@ -9,10 +9,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use dialoguer::Confirm;
+use hs_common::event_bus::EventBus;
 use hs_common::reporter::Reporter;
 use hs_common::storage::Storage;
 use hs_distill::client::DistillClient;
 use hs_distill::config::DistillClientConfig;
+
+use crate::shutdown::Shutdown;
 
 const CONFIRM_TOKEN: &str = "rebuild-from-papers";
 const DEFAULT_DISTILL_URL: &str = "http://localhost:7434";
@@ -193,10 +196,17 @@ async fn cmd_events_reset(reporter: &Arc<dyn Reporter>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let storage = cfg.build_storage().context("building storage backend")?;
+/// What `catch-up` would republish.
+struct CatchUpPlan {
+    papers_total: usize,
+    markdown_stems: usize,
+    to_republish: Vec<String>,
+}
 
+/// Source keys under `papers/` that have no markdown yet. A listing error is
+/// an error: planning from a partial listing would republish (or skip) the
+/// wrong papers.
+async fn plan_catch_up(storage: &dyn Storage) -> Result<CatchUpPlan> {
     let papers = storage.list("papers").await.context("list papers prefix")?;
     let markdown = storage
         .list("markdown")
@@ -228,8 +238,8 @@ async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()>
             Some(n) if !n.starts_with("._") => n,
             _ => continue,
         };
-        let (stem, ext) = match name.rsplit_once('.') {
-            Some((s, e)) if e == "pdf" || e == "html" => (s, e),
+        let stem = match name.rsplit_once('.') {
+            Some((s, e)) if e == "pdf" || e == "html" => s,
             _ => continue,
         };
         if md_stems.contains(stem) {
@@ -240,17 +250,95 @@ async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()>
         if obj.size == 0 {
             continue;
         }
-        let _ = ext;
         to_republish.push(obj.key.clone());
     }
 
+    Ok(CatchUpPlan {
+        papers_total: papers.len(),
+        markdown_stems: md_stems.len(),
+        to_republish,
+    })
+}
+
+/// How a republish loop ended.
+struct PublishOutcome {
+    published: u64,
+    errors: Vec<String>,
+    interrupted: bool,
+}
+
+/// Publish `papers.ingested` for every key. Individual failures are
+/// collected, never swallowed: the caller turns them into a failed command.
+async fn publish_papers_ingested(
+    bus: &dyn EventBus,
+    keys: &[String],
+    source: &str,
+    stop: &Shutdown,
+    reporter: &Arc<dyn Reporter>,
+) -> PublishOutcome {
+    let mut outcome = PublishOutcome {
+        published: 0,
+        errors: Vec::new(),
+        interrupted: false,
+    };
+    for (i, key) in keys.iter().enumerate() {
+        if stop.requested() {
+            outcome.interrupted = true;
+            break;
+        }
+        let payload = serde_json::json!({ "key": key, "source": source });
+        let sent = match serde_json::to_vec(&payload) {
+            Ok(bytes) => bus.publish("papers.ingested", &bytes).await,
+            Err(e) => Err(anyhow::Error::from(e)),
+        };
+        match sent {
+            Ok(()) => outcome.published += 1,
+            Err(e) => outcome.errors.push(format!("publish/{key}: {e}")),
+        }
+        if (i + 1) % 500 == 0 {
+            reporter.status(
+                "Republish",
+                &format!("published {}/{}", outcome.published, keys.len()),
+            );
+        }
+    }
+    outcome
+}
+
+/// Print the first errors, then turn any error (or an interruption) into a
+/// failed command. A pipeline command that lost work must not exit 0.
+fn fail_if_errors(command: &str, errors: &[String], interrupted: bool) -> Result<()> {
+    for e in errors.iter().take(10) {
+        eprintln!("  error: {e}");
+    }
+    if errors.len() > 10 {
+        eprintln!("  ... and {} more", errors.len() - 10);
+    }
+    if interrupted {
+        anyhow::bail!(
+            "{command} interrupted before it finished ({} error(s) so far); re-run to continue",
+            errors.len()
+        );
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("{command} finished with {} error(s)", errors.len());
+    }
+    Ok(())
+}
+
+async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let stop = crate::shutdown::cooperative();
+    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+
+    let plan = plan_catch_up(&*storage).await?;
     reporter.status(
         "Papers",
         &format!(
             "{} total, {} have markdown, {} pending republish",
-            papers.len(),
-            md_stems.len(),
-            to_republish.len()
+            plan.papers_total,
+            plan.markdown_stems,
+            plan.to_republish.len()
         ),
     );
 
@@ -258,7 +346,7 @@ async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()>
         reporter.finish("Dry-run complete — no events published.");
         return Ok(());
     }
-    if to_republish.is_empty() {
+    if plan.to_republish.is_empty() {
         reporter.finish("Nothing to do — every paper already has markdown.");
         return Ok(());
     }
@@ -268,42 +356,21 @@ async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()>
         .await
         .context("building event bus for papers.ingested publish")?;
 
-    let mut published = 0u64;
-    let mut errors: Vec<String> = Vec::new();
-    for (i, key) in to_republish.iter().enumerate() {
-        let payload = serde_json::json!({
-            "key": key,
-            "source": "hs pipeline catch-up",
-        });
-        match bus
-            .publish(
-                "papers.ingested",
-                serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
-            )
-            .await
-        {
-            Ok(()) => published += 1,
-            Err(e) => errors.push(format!("publish/{key}: {e}")),
-        }
-        if (i + 1) % 500 == 0 {
-            reporter.status(
-                "Republish",
-                &format!("published {published}/{}", to_republish.len()),
-            );
-        }
-    }
+    let outcome = publish_papers_ingested(
+        &*bus,
+        &plan.to_republish,
+        "hs pipeline catch-up",
+        &stop,
+        reporter,
+    )
+    .await;
 
     reporter.finish(&format!(
-        "Catch-up queued — papers_republished={published} errors={}",
-        errors.len()
+        "Catch-up queued — papers_republished={} errors={}",
+        outcome.published,
+        outcome.errors.len()
     ));
-    for e in errors.iter().take(10) {
-        eprintln!("  error: {e}");
-    }
-    if errors.len() > 10 {
-        eprintln!("  ... and {} more", errors.len() - 10);
-    }
-    Ok(())
+    fail_if_errors("pipeline catch-up", &outcome.errors, outcome.interrupted)
 }
 
 async fn cmd_rebuild(
@@ -312,6 +379,7 @@ async fn cmd_rebuild(
     confirm: Option<String>,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
+    let stop = crate::shutdown::cooperative();
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage().context("building storage backend")?;
     let server_url = cfg
@@ -322,8 +390,11 @@ async fn cmd_rebuild(
     let client = DistillClient::new(&server_url)?;
 
     // Inventory: used for both dry-run report and live-run "before" snapshot.
+    // It fails if distill or storage cannot be read: a rebuild planned from
+    // a partial picture would destroy state it cannot account for.
     let inv = inventory(&storage, &client).await?;
     print_summary(&inv, reporter);
+    check_rebuild_inputs(&*storage, &inv).await?;
 
     if dry_run {
         reporter.finish("Dry-run complete — no state changed.");
@@ -381,21 +452,86 @@ async fn cmd_rebuild(
     let started_at = chrono::Utc::now().to_rfc3339();
     reporter.status("Pipeline rebuild", &format!("started at {started_at}"));
 
-    // 1. Drop + recreate Qdrant collection.
-    reporter.status("Qdrant", "drop + recreate collection");
-    let qdrant_deleted = client
-        .reset_collection()
-        .await
-        .context("distill reset_collection")?;
+    let summary = execute_rebuild(&*storage, &client, &*bus, &inv, &stop, reporter).await?;
 
-    // 2. Delete every markdown object.
+    reporter.finish(&format!(
+        "Pipeline rebuild queued — markdown_deleted={} \
+         catalog_deleted={} qdrant_deleted={} \
+         papers_republished={} errors={} \
+         (watch `hs status` for scribe + distill catch-up)",
+        summary.markdown_deleted,
+        summary.catalog_deleted,
+        summary.qdrant_deleted,
+        summary.publish.published,
+        summary.publish.errors.len()
+    ));
+    fail_if_errors(
+        "pipeline rebuild (run `hs pipeline catch-up` to queue the papers that were not published)",
+        &summary.publish.errors,
+        summary.publish.interrupted,
+    )
+}
+
+/// Refuse a rebuild that could not finish, BEFORE anything is deleted: with
+/// no source papers there is nothing to regenerate from, and an unreadable
+/// source store means the republish would fail after the derived state is gone.
+async fn check_rebuild_inputs(storage: &dyn Storage, inv: &Inventory) -> Result<()> {
+    let Some(first) = inv.paper_keys.first() else {
+        anyhow::bail!(
+            "refusing to rebuild: no PDF/HTML sources found under papers/, so nothing could \
+             regenerate the markdown, catalog and vectors a rebuild deletes"
+        );
+    };
+    storage
+        .head(first)
+        .await
+        .with_context(|| format!("probe source {first}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("source {first} was listed but cannot be read; refusing to rebuild")
+        })?;
+    Ok(())
+}
+
+struct RebuildSummary {
+    markdown_deleted: u64,
+    catalog_deleted: u64,
+    qdrant_deleted: u64,
+    publish: PublishOutcome,
+}
+
+/// The destructive part of `rebuild`, in an order where every step only
+/// removes what later steps can regenerate from `papers/`, and a failure
+/// STOPS the run before the next, harder-to-undo step:
+///
+/// 1. delete markdown, 2. delete catalog rows (derived state; vectors still
+///    searchable), 3. drop + recreate the Qdrant collection, 4. republish
+///    `papers.ingested` for every source paper.
+///
+/// A failure in 1-3 returns `Err` without republishing; `hs pipeline
+/// catch-up` (or re-running the rebuild) recovers from every stopping point.
+async fn execute_rebuild(
+    storage: &dyn Storage,
+    client: &DistillClient,
+    bus: &dyn EventBus,
+    inv: &Inventory,
+    stop: &Shutdown,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<RebuildSummary> {
     let mut markdown_deleted = 0u64;
-    let mut errors: Vec<String> = Vec::new();
     for (i, obj) in inv.markdown_objs.iter().enumerate() {
-        match storage.delete(&obj.key).await {
-            Ok(()) => markdown_deleted += 1,
-            Err(e) => errors.push(format!("markdown-delete/{}: {e}", obj.key)),
+        if stop.requested() {
+            anyhow::bail!(
+                "interrupted after deleting {markdown_deleted} markdown object(s); the Qdrant \
+                 collection is untouched. Re-run `hs pipeline rebuild` or `hs pipeline catch-up`"
+            );
         }
+        storage.delete(&obj.key).await.with_context(|| {
+            format!(
+                "delete markdown {} (deleted {markdown_deleted} so far; Qdrant untouched)",
+                obj.key
+            )
+        })?;
+        markdown_deleted += 1;
         if (i + 1) % 500 == 0 {
             reporter.status(
                 "Markdown",
@@ -404,13 +540,23 @@ async fn cmd_rebuild(
         }
     }
 
-    // 3. Delete every catalog YAML.
     let mut catalog_deleted = 0u64;
     for (i, obj) in inv.catalog_objs.iter().enumerate() {
-        match storage.delete(&obj.key).await {
-            Ok(()) => catalog_deleted += 1,
-            Err(e) => errors.push(format!("catalog-delete/{}: {e}", obj.key)),
+        if stop.requested() {
+            anyhow::bail!(
+                "interrupted after deleting {markdown_deleted} markdown object(s) and \
+                 {catalog_deleted} catalog row(s); the Qdrant collection is untouched. \
+                 Re-run `hs pipeline rebuild` or `hs pipeline catch-up`"
+            );
         }
+        storage.delete(&obj.key).await.with_context(|| {
+            format!(
+                "delete catalog {} (markdown already deleted; deleted {catalog_deleted} catalog \
+                 row(s) so far; Qdrant untouched)",
+                obj.key
+            )
+        })?;
+        catalog_deleted += 1;
         if (i + 1) % 500 == 0 {
             reporter.status(
                 "Catalog",
@@ -419,48 +565,27 @@ async fn cmd_rebuild(
         }
     }
 
-    // 4. Republish papers.ingested for every paper.
-    let mut papers_republished = 0u64;
-    for (i, key) in inv.paper_keys.iter().enumerate() {
-        let payload = serde_json::json!({
-            "key": key,
-            "source": "hs pipeline rebuild",
-        });
-        match bus
-            .publish(
-                "papers.ingested",
-                serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
-            )
-            .await
-        {
-            Ok(()) => papers_republished += 1,
-            Err(e) => errors.push(format!("publish/{key}: {e}")),
-        }
-        if (i + 1) % 500 == 0 {
-            reporter.status(
-                "Republish",
-                &format!("published {papers_republished}/{}", inv.paper_keys.len()),
-            );
-        }
-    }
+    reporter.status("Qdrant", "drop + recreate collection");
+    let qdrant_deleted = client.reset_collection().await.context(
+        "distill reset_collection (markdown and catalog are already deleted: fix distill, then \
+         run `hs pipeline catch-up`)",
+    )?;
 
-    reporter.finish(&format!(
-        "Pipeline rebuild queued — markdown_deleted={markdown_deleted} \
-         catalog_deleted={catalog_deleted} qdrant_deleted={qdrant_deleted} \
-         papers_republished={papers_republished} errors={} \
-         (watch `hs status` for scribe + distill catch-up)",
-        errors.len()
-    ));
+    let publish = publish_papers_ingested(
+        bus,
+        &inv.paper_keys,
+        "hs pipeline rebuild",
+        stop,
+        reporter,
+    )
+    .await;
 
-    if !errors.is_empty() {
-        for e in errors.iter().take(10) {
-            eprintln!("  error: {e}");
-        }
-        if errors.len() > 10 {
-            eprintln!("  ... and {} more", errors.len() - 10);
-        }
-    }
-    Ok(())
+    Ok(RebuildSummary {
+        markdown_deleted,
+        catalog_deleted,
+        qdrant_deleted,
+        publish,
+    })
 }
 
 struct Inventory {
@@ -503,9 +628,19 @@ async fn inventory(storage: &Arc<dyn Storage>, client: &DistillClient) -> Result
         .context("list catalog prefix")?;
     let catalog_count = catalog_objs.len() as u64;
 
-    let qdrant_ids = client.list_docs(u64::MAX).await.unwrap_or_default();
+    // A distill server that does not answer is an error here, not "0 docs":
+    // the inventory is what the operator confirms against, and `rebuild`
+    // cannot reset the collection without distill anyway.
+    let qdrant_ids = client
+        .list_docs(u64::MAX)
+        .await
+        .context("list indexed documents via the distill server")?;
     let qdrant_docs = qdrant_ids.len() as u64;
-    let qdrant_points = client.status().await.map(|s| s.points_count).unwrap_or(0);
+    let qdrant_points = client
+        .status()
+        .await
+        .context("read the distill server status")?
+        .points_count;
 
     Ok(Inventory {
         paper_keys,
@@ -602,9 +737,15 @@ async fn cmd_purge_skipped(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter
     let mut md_deleted = 0u64;
     let mut cat_deleted = 0u64;
     let mut src_deleted = 0u64;
+    let stop = crate::shutdown::cooperative();
+    let mut interrupted = false;
     let mut errors: Vec<String> = Vec::new();
 
     for (i, v) in victims.iter().enumerate() {
+        if stop.requested() {
+            interrupted = true;
+            break;
+        }
         // Catalog yaml — we already have the exact key from the listing.
         match storage.delete(&v.catalog_key).await {
             Ok(()) => cat_deleted += 1,
@@ -623,14 +764,16 @@ async fn cmd_purge_skipped(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter
         let mut src_hit = false;
         for ext in ["html", "htm"] {
             let key = format!("papers/{}", hs_common::sharded_key(&v.stem, ext));
-            if storage.exists(&key).await.unwrap_or(false) {
-                match storage.delete(&key).await {
+            match storage.exists(&key).await {
+                Ok(false) => continue,
+                Ok(true) => match storage.delete(&key).await {
                     Ok(()) => {
                         src_hit = true;
                         break;
                     }
                     Err(e) => errors.push(format!("papers/{}.{ext}: {e}", v.stem)),
-                }
+                },
+                Err(e) => errors.push(format!("papers/{}.{ext}: probe: {e}", v.stem)),
             }
         }
         if src_hit {
@@ -646,20 +789,14 @@ async fn cmd_purge_skipped(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter
         "Purged HTML stubs — catalog={cat_deleted} markdown={md_deleted} source={src_deleted} errors={}",
         errors.len()
     ));
-    for e in errors.iter().take(10) {
-        eprintln!("  error: {e}");
-    }
-    if errors.len() > 10 {
-        eprintln!("  ... and {} more", errors.len() - 10);
-    }
-    Ok(())
+    fail_if_errors("pipeline purge-skipped", &errors, interrupted)
 }
 
 async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
     // Real research papers convert to >5 KB of markdown; nothing legitimate
     // lives under this floor. Skipping anything larger keeps the GET cost
     // bounded to a few hundred objects rather than the full 4k+ corpus.
-    const MAX_STUB_BYTES: u64 = 5_000;
+    const MAX_STUB_BYTES: u64 = hs_common::html::MAX_INTERSTITIAL_BYTES as u64;
 
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage().context("building storage backend")?;
@@ -692,12 +829,13 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
     }
 
     let mut victims: Vec<Victim> = Vec::new();
-    let mut read_errors = 0u64;
+    let mut errors: Vec<String> = Vec::new();
     for (i, obj) in small.iter().enumerate() {
         let bytes = match storage.get(&obj.key).await {
             Ok(b) => b,
-            Err(_) => {
-                read_errors += 1;
+            Err(e) => {
+                // An unreadable candidate means the scan is incomplete.
+                errors.push(format!("read {}: {e}", obj.key));
                 continue;
             }
         };
@@ -727,12 +865,12 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
         &format!(
             "{} interstitial markdowns identified (read errors: {})",
             victims.len(),
-            read_errors
+            errors.len()
         ),
     );
     if victims.is_empty() {
         reporter.finish("Nothing to purge — no known-interstitial markdowns found.");
-        return Ok(());
+        return fail_if_errors("pipeline purge-poisoned", &errors, false);
     }
 
     for v in victims.iter().take(5) {
@@ -765,16 +903,26 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
     let mut md_deleted = 0u64;
     let mut cat_deleted = 0u64;
     let mut src_deleted = 0u64;
-    let mut errors: Vec<String> = Vec::new();
+    let stop = crate::shutdown::cooperative();
+    let mut interrupted = false;
 
     for (i, v) in victims.iter().enumerate() {
+        if stop.requested() {
+            interrupted = true;
+            break;
+        }
         // Qdrant first — if this fails, leaving the markdown/source/catalog
         // in place lets a retry hit the same victim again. The reverse
         // (delete files first, fail Qdrant) leaves a phantom 1-chunk doc
         // that the reconciler can never reach.
         match client.delete_doc(&v.stem).await {
             Ok(_) => qdrant_deleted += 1,
-            Err(e) => errors.push(format!("qdrant/{}: {e}", v.stem)),
+            Err(e) => {
+                // Leave this victim's markdown/source/catalog in place so a
+                // retry finds it again (see above).
+                errors.push(format!("qdrant/{}: {e}", v.stem));
+                continue;
+            }
         }
 
         // Markdown
@@ -799,13 +947,15 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
         let mut src_hit = false;
         for ext in ["html", "htm", "pdf"] {
             let key = format!("papers/{}", hs_common::sharded_key(&v.stem, ext));
-            if storage.exists(&key).await.unwrap_or(false) {
-                match storage.delete(&key).await {
+            match storage.exists(&key).await {
+                Ok(false) => {}
+                Ok(true) => match storage.delete(&key).await {
                     Ok(()) => {
                         src_hit = true;
                     }
                     Err(e) => errors.push(format!("papers/{}.{ext}: {e}", v.stem)),
-                }
+                },
+                Err(e) => errors.push(format!("papers/{}.{ext}: probe: {e}", v.stem)),
             }
         }
         if src_hit {
@@ -821,13 +971,7 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
         "Purged interstitials — qdrant={qdrant_deleted} markdown={md_deleted} catalog={cat_deleted} source={src_deleted} errors={}",
         errors.len()
     ));
-    for e in errors.iter().take(10) {
-        eprintln!("  error: {e}");
-    }
-    if errors.len() > 10 {
-        eprintln!("  ... and {} more", errors.len() - 10);
-    }
-    Ok(())
+    fail_if_errors("pipeline purge-poisoned", &errors, interrupted)
 }
 
 async fn cmd_reap_phantoms(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -903,8 +1047,14 @@ async fn cmd_reap_phantoms(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter
     }
 
     let mut deleted = 0u64;
+    let stop = crate::shutdown::cooperative();
+    let mut interrupted = false;
     let mut errors: Vec<String> = Vec::new();
     for (i, p) in phantoms.iter().enumerate() {
+        if stop.requested() {
+            interrupted = true;
+            break;
+        }
         match storage.delete(&p.catalog_key).await {
             Ok(()) => deleted += 1,
             Err(e) => errors.push(format!("catalog/{}: {e}", p.stem)),
@@ -918,13 +1068,7 @@ async fn cmd_reap_phantoms(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter
         "Reaped phantoms — catalog={deleted} errors={}",
         errors.len()
     ));
-    for e in errors.iter().take(10) {
-        eprintln!("  error: {e}");
-    }
-    if errors.len() > 10 {
-        eprintln!("  ... and {} more", errors.len() - 10);
-    }
-    Ok(())
+    fail_if_errors("pipeline reap-phantoms", &errors, interrupted)
 }
 
 async fn cmd_purge_poisoned_chunks(
@@ -1088,8 +1232,14 @@ async fn cmd_reconvert_failed(
         .context("building event bus for papers.ingested publish")?;
 
     let mut succeeded = 0u64;
+    let stop = crate::shutdown::cooperative();
+    let mut interrupted = false;
     let mut errors: Vec<String> = Vec::new();
     for (i, (stem, _reason)) in victims.iter().enumerate() {
+        if stop.requested() {
+            interrupted = true;
+            break;
+        }
         match reconvert_one(
             &*storage,
             bus.as_ref(),
@@ -1112,13 +1262,7 @@ async fn cmd_reconvert_failed(
         "Reconvert queued: succeeded={succeeded} errors={}",
         errors.len()
     ));
-    for e in errors.iter().take(10) {
-        eprintln!("  error: {e}");
-    }
-    if errors.len() > 10 {
-        eprintln!("  ... and {} more", errors.len() - 10);
-    }
-    Ok(())
+    fail_if_errors("pipeline reconvert-failed", &errors, interrupted)
 }
 
 /// Per-stem reconvert: clear stamps, locate source, republish event.
@@ -1159,4 +1303,353 @@ async fn reconvert_one(
     let bytes = serde_json::to_vec(&payload)?;
     bus.publish("papers.ingested", &bytes).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_http::{closed_port_url, FakeServer, Response};
+    use async_trait::async_trait;
+    use hs_common::event_bus::{ConsumerSpec, EventStream};
+    use hs_common::reporter::SilentReporter;
+    use hs_common::storage::{LocalFsStorage, ObjectMeta};
+    use parking_lot::Mutex;
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// LocalFs storage that logs deletes (in the same log as the distill
+    /// fixture and the bus, so cross-system ORDER is observable) and can fail
+    /// the delete of one key.
+    struct LogStorage {
+        inner: LocalFsStorage,
+        log: Log,
+        fail_delete_of: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl Storage for LogStorage {
+        async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+            self.inner.put(key, bytes).await
+        }
+        async fn head(&self, key: &str) -> anyhow::Result<Option<ObjectMeta>> {
+            self.inner.head(key).await
+        }
+        async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.log.lock().push(format!("delete:{key}"));
+            if self.fail_delete_of == Some(key) {
+                anyhow::bail!("503 Slow Down");
+            }
+            self.inner.delete(key).await
+        }
+    }
+
+    struct LogBus {
+        log: Log,
+        fail_publish_of: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl EventBus for LogBus {
+        async fn publish(&self, subject: &str, payload: &[u8]) -> anyhow::Result<()> {
+            assert_eq!(subject, "papers.ingested");
+            let value: serde_json::Value = serde_json::from_slice(payload)?;
+            let key = value["key"].as_str().expect("key").to_string();
+            if self.fail_publish_of == Some(key.as_str()) {
+                anyhow::bail!("broker unavailable");
+            }
+            self.log.lock().push(format!("publish:{key}"));
+            Ok(())
+        }
+        async fn consume(&self, _spec: &ConsumerSpec) -> anyhow::Result<EventStream> {
+            unimplemented!("never consumed here")
+        }
+    }
+
+    fn reporter() -> Arc<dyn Reporter> {
+        Arc::new(SilentReporter)
+    }
+
+    /// A distill server that answers the inventory calls and logs `reset`.
+    async fn distill(log: &Log, reset_status: u16) -> FakeServer {
+        let log = Arc::clone(log);
+        FakeServer::start(move |req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", p) if p.starts_with("/docs") => Response::json(
+                200,
+                &serde_json::json!({"doc_ids": ["10.1_a", "10.1_b"], "truncated": false}),
+            ),
+            ("GET", "/status") => Response::json(
+                200,
+                &serde_json::json!({
+                    "collection": "academic_papers", "points_count": 42,
+                    "documents_count": 2, "compute_device": "cuda"
+                }),
+            ),
+            ("POST", "/collection/reset") => {
+                log.lock().push("reset".into());
+                if reset_status == 200 {
+                    Response::json(200, &serde_json::json!({"deleted_points": 42}))
+                } else {
+                    Response::json(reset_status, &serde_json::json!({"error": "boom"}))
+                }
+            }
+            _ => Response::json(404, &serde_json::json!({})),
+        })
+        .await
+    }
+
+    async fn seed(root: &std::path::Path, with_papers: bool) {
+        let s = LocalFsStorage::new(root);
+        if with_papers {
+            s.put("papers/ab/abcdef.pdf", b"%PDF-1".to_vec()).await.unwrap();
+            s.put("papers/cd/cdefgh.html", b"<html>x</html>".to_vec()).await.unwrap();
+        }
+        s.put("markdown/ab/abcdef.md", b"# a".to_vec()).await.unwrap();
+        s.put("catalog/ab/abcdef.yaml", b"a: 1".to_vec()).await.unwrap();
+        s.put("catalog/cd/cdefgh.yaml", b"b: 1".to_vec()).await.unwrap();
+    }
+
+    fn storage_with(
+        root: &std::path::Path,
+        log: &Log,
+        fail_delete_of: Option<&'static str>,
+    ) -> Arc<dyn Storage> {
+        Arc::new(LogStorage {
+            inner: LocalFsStorage::new(root),
+            log: Arc::clone(log),
+            fail_delete_of,
+        })
+    }
+
+    fn index_of(log: &[String], entry: &str) -> usize {
+        log.iter()
+            .position(|e| e == entry)
+            .unwrap_or_else(|| panic!("{entry} not in {log:?}"))
+    }
+
+    #[tokio::test]
+    async fn rebuild_deletes_derived_state_then_drops_qdrant_then_republishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), true).await;
+        let log = Log::default();
+        let server = distill(&log, 200).await;
+        let client = DistillClient::new(&server.base).unwrap();
+        let storage = storage_with(tmp.path(), &log, None);
+        let bus = LogBus { log: Arc::clone(&log), fail_publish_of: None };
+
+        let inv = inventory(&storage, &client).await.unwrap();
+        check_rebuild_inputs(&*storage, &inv).await.unwrap();
+        assert!(log.lock().is_empty(), "inventory and preflight delete nothing");
+        let summary = execute_rebuild(&*storage, &client, &bus, &inv, &Shutdown::new(), &reporter())
+            .await
+            .unwrap();
+
+        let events = log.lock().clone();
+        let md = index_of(&events, "delete:markdown/ab/abcdef.md");
+        let cat_first = index_of(&events, "delete:catalog/ab/abcdef.yaml")
+            .min(index_of(&events, "delete:catalog/cd/cdefgh.yaml"));
+        let cat_last = index_of(&events, "delete:catalog/ab/abcdef.yaml")
+            .max(index_of(&events, "delete:catalog/cd/cdefgh.yaml"));
+        let reset = index_of(&events, "reset");
+        let first_publish = events.iter().position(|e| e.starts_with("publish:")).unwrap();
+        assert!(md < cat_first, "markdown before catalog: {events:?}");
+        assert!(cat_last < reset, "catalog before the Qdrant drop: {events:?}");
+        assert!(reset < first_publish, "drop before republish: {events:?}");
+        assert_eq!(summary.markdown_deleted, 1);
+        assert_eq!(summary.catalog_deleted, 2);
+        assert_eq!(summary.qdrant_deleted, 42);
+        assert_eq!(summary.publish.published, 2);
+        assert!(summary.publish.errors.is_empty());
+    }
+
+    /// The old order dropped the Qdrant collection FIRST, so a failing
+    /// markdown/catalog delete left vectors gone and files in place.
+    #[tokio::test]
+    async fn a_failed_delete_stops_the_rebuild_before_qdrant_is_touched() {
+        for failing in ["markdown/ab/abcdef.md", "catalog/cd/cdefgh.yaml"] {
+            let tmp = tempfile::tempdir().unwrap();
+            seed(tmp.path(), true).await;
+            let log = Log::default();
+            let server = distill(&log, 200).await;
+            let client = DistillClient::new(&server.base).unwrap();
+            let storage = storage_with(tmp.path(), &log, Some(failing));
+            let bus = LogBus { log: Arc::clone(&log), fail_publish_of: None };
+            let inv = inventory(&storage, &client).await.unwrap();
+
+            let err = execute_rebuild(&*storage, &client, &bus, &inv, &Shutdown::new(), &reporter())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{failing}: a failed delete must fail the rebuild"));
+
+            let events = log.lock().clone();
+            assert!(!events.contains(&"reset".to_string()), "{failing}: {events:?}");
+            assert!(
+                !events.iter().any(|e| e.starts_with("publish:")),
+                "{failing}: {events:?}"
+            );
+            assert!(format!("{err:#}").contains("503"), "{failing}: {err:#}");
+            assert!(
+                server.requests().iter().all(|r| r.path != "/collection/reset"),
+                "{failing}: the collection must not have been reset"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_qdrant_reset_fails_the_rebuild_and_publishes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), true).await;
+        let log = Log::default();
+        let server = distill(&log, 500).await;
+        let client = DistillClient::new(&server.base).unwrap();
+        let storage = storage_with(tmp.path(), &log, None);
+        let bus = LogBus { log: Arc::clone(&log), fail_publish_of: None };
+        let inv = inventory(&storage, &client).await.unwrap();
+
+        let err = execute_rebuild(&*storage, &client, &bus, &inv, &Shutdown::new(), &reporter())
+            .await
+            .err()
+            .expect("reset failure must fail the rebuild");
+
+        assert!(format!("{err:#}").contains("catch-up"), "{err:#}");
+        assert!(!log.lock().iter().any(|e| e.starts_with("publish:")));
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_with_no_source_papers_is_refused_before_anything_is_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), false).await;
+        let log = Log::default();
+        let server = distill(&log, 200).await;
+        let client = DistillClient::new(&server.base).unwrap();
+        let storage = storage_with(tmp.path(), &log, None);
+
+        let inv = inventory(&storage, &client).await.unwrap();
+        let err = check_rebuild_inputs(&*storage, &inv)
+            .await
+            .expect_err("nothing to rebuild from");
+
+        assert!(format!("{err:#}").contains("no PDF/HTML sources"), "{err:#}");
+        assert!(log.lock().is_empty(), "no delete and no reset");
+    }
+
+    /// `list_docs(..).unwrap_or_default()` showed 0 docs / 0 points while
+    /// distill was down, and the operator confirmed against that.
+    #[tokio::test]
+    async fn inventory_fails_loudly_when_distill_is_unreachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), true).await;
+        let log = Log::default();
+        let storage = storage_with(tmp.path(), &log, None);
+        let client = DistillClient::new(&closed_port_url().await).unwrap();
+
+        let err = inventory(&storage, &client)
+            .await
+            .err()
+            .expect("an unreachable distill server must fail the inventory");
+
+        assert!(format!("{err:#}").contains("distill"), "{err:#}");
+    }
+
+    /// Publish failures used to be printed and the command exited 0.
+    #[tokio::test]
+    async fn publish_failures_are_collected_and_turn_into_a_failed_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), true).await;
+        let log = Log::default();
+        let server = distill(&log, 200).await;
+        let client = DistillClient::new(&server.base).unwrap();
+        let storage = storage_with(tmp.path(), &log, None);
+        let bus = LogBus {
+            log: Arc::clone(&log),
+            fail_publish_of: Some("papers/cd/cdefgh.html"),
+        };
+        let inv = inventory(&storage, &client).await.unwrap();
+
+        let summary = execute_rebuild(&*storage, &client, &bus, &inv, &Shutdown::new(), &reporter())
+            .await
+            .unwrap();
+
+        assert_eq!(summary.publish.published, 1);
+        assert_eq!(summary.publish.errors.len(), 1, "{:?}", summary.publish.errors);
+        assert!(fail_if_errors("pipeline rebuild", &summary.publish.errors, false).is_err());
+        assert!(fail_if_errors("pipeline rebuild", &[], false).is_ok());
+        assert!(
+            fail_if_errors("pipeline rebuild", &[], true).is_err(),
+            "an interrupted run is not a success"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_stops_the_rebuild_before_any_destructive_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), true).await;
+        let log = Log::default();
+        let server = distill(&log, 200).await;
+        let client = DistillClient::new(&server.base).unwrap();
+        let storage = storage_with(tmp.path(), &log, None);
+        let bus = LogBus { log: Arc::clone(&log), fail_publish_of: None };
+        let inv = inventory(&storage, &client).await.unwrap();
+        let stop = Shutdown::new();
+        stop.request();
+
+        let err = execute_rebuild(&*storage, &client, &bus, &inv, &stop, &reporter())
+            .await
+            .err()
+            .expect("interrupted");
+
+        assert!(format!("{err:#}").contains("interrupted"), "{err:#}");
+        assert!(log.lock().is_empty(), "nothing deleted, reset or published");
+    }
+
+    #[tokio::test]
+    async fn catch_up_plans_only_convertible_sources_without_markdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = LocalFsStorage::new(tmp.path());
+        // converted already
+        s.put("papers/ab/abcdef.pdf", b"%PDF".to_vec()).await.unwrap();
+        s.put("markdown/ab/abcdef.md", b"# done".to_vec()).await.unwrap();
+        // pending
+        s.put("papers/cd/cdefgh.pdf", b"%PDF".to_vec()).await.unwrap();
+        s.put("papers/ef/efghij.html", b"<html/>".to_vec()).await.unwrap();
+        // never republished: empty source, quarantined, resource fork, unsupported ext
+        s.put("papers/gh/ghijkl.pdf", Vec::new()).await.unwrap();
+        s.put("papers/.quarantine/ij/ijklmn.pdf", b"junk".to_vec()).await.unwrap();
+        s.put("papers/ab/._abcdef.pdf", b"fork".to_vec()).await.unwrap();
+        s.put("papers/kl/klmnop.epub", b"epub".to_vec()).await.unwrap();
+
+        let plan = plan_catch_up(&s).await.unwrap();
+
+        let mut pending = plan.to_republish.clone();
+        pending.sort();
+        assert_eq!(pending, vec!["papers/cd/cdefgh.pdf", "papers/ef/efghij.html"]);
+    }
+
+    #[tokio::test]
+    async fn republish_collects_failures_and_stops_on_request() {
+        let log = Log::default();
+        let bus = LogBus {
+            log: Arc::clone(&log),
+            fail_publish_of: Some("papers/b.pdf"),
+        };
+        let keys: Vec<String> = ["papers/a.pdf", "papers/b.pdf", "papers/c.pdf"]
+            .map(String::from)
+            .to_vec();
+
+        let out = publish_papers_ingested(&bus, &keys, "test", &Shutdown::new(), &reporter()).await;
+        assert_eq!(out.published, 2);
+        assert_eq!(out.errors.len(), 1);
+        assert!(!out.interrupted);
+
+        let stop = Shutdown::new();
+        stop.request();
+        let out = publish_papers_ingested(&bus, &keys, "test", &stop, &reporter()).await;
+        assert_eq!(out.published, 0);
+        assert!(out.interrupted);
+    }
 }

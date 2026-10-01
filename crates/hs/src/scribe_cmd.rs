@@ -863,27 +863,95 @@ async fn cmd_convert(
     }
 
     // Resolve output: CLI flag > config output_dir > stdout
-    let out = out_file.or_else(|| {
-        ScribeConfig::load().ok().and_then(|cfg| {
-            let dir = &cfg.output_dir;
-            if dir.as_os_str().is_empty() || dir == std::path::Path::new(".") {
-                None
-            } else {
-                let stem = input.file_stem()?;
-                let path = hs_common::sharded_path(dir, &stem.to_string_lossy(), "md");
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).ok()?;
-                }
-                Some(path)
-            }
-        })
-    });
+    let out = match out_file {
+        Some(path) => Some(path),
+        None => default_markdown_path(&input)?,
+    };
 
     match out {
         Some(path) => std::fs::write(&path, &md)?,
         None => print!("{md}"),
     }
     Ok(())
+}
+
+/// `<output_dir>/<shard>/<stem>.md` for `input`, or `None` (print to stdout)
+/// when no output directory is configured.
+fn default_markdown_path(input: &std::path::Path) -> Result<Option<PathBuf>> {
+    let Ok(cfg) = ScribeConfig::load() else {
+        return Ok(None);
+    };
+    let dir = &cfg.output_dir;
+    if dir.as_os_str().is_empty() || dir == std::path::Path::new(".") {
+        return Ok(None);
+    }
+    markdown_path_in(dir, input).map(Some)
+}
+
+/// The sharded markdown path for `input` under `dir`, creating its shard
+/// directory. The stem comes from a file name the operator typed; it must be
+/// a plain name (`..` would walk out of `dir`) and a directory that cannot be
+/// created is an error, not a silent switch to stdout.
+fn markdown_path_in(dir: &std::path::Path, input: &std::path::Path) -> Result<PathBuf> {
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("{} has no usable file stem", input.display()))?;
+    hs_common::validate_stem(stem)
+        .map_err(|e| anyhow::anyhow!("cannot name the output after {}: {e}", input.display()))?;
+    let path = hs_common::sharded_path(dir, stem, "md");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create output directory {}", parent.display()))?;
+    }
+    Ok(path)
+}
+
+#[cfg(test)]
+mod markdown_path_tests {
+    use super::*;
+
+    #[test]
+    fn non_ascii_stems_get_a_shard_directory_and_never_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["Müller.pdf", "Año.pdf", "Cómo.pdf"] {
+            let path = markdown_path_in(dir.path(), std::path::Path::new(name)).unwrap();
+            assert!(path.starts_with(dir.path()));
+            assert!(path.parent().unwrap().is_dir(), "{path:?}");
+            assert_eq!(
+                path.file_name().unwrap().to_str().unwrap(),
+                format!("{}.md", name.trim_end_matches(".pdf"))
+            );
+        }
+    }
+
+    /// `...pdf` has the stem `..`: the output would land OUTSIDE `dir`.
+    #[test]
+    fn a_stem_that_could_leave_the_output_directory_is_refused() {
+        let outer = tempfile::tempdir().unwrap();
+        let dir = outer.path().join("markdown");
+        std::fs::create_dir(&dir).unwrap();
+
+        for name in ["...pdf"] {
+            let err = markdown_path_in(&dir, std::path::Path::new(name))
+                .expect_err("not a usable stem");
+            assert!(format!("{err:#}").contains("cannot name the output"), "{err:#}");
+        }
+        // Nothing was created beside or above `dir`.
+        assert_eq!(std::fs::read_dir(outer.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_uncreatable_output_directory_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_in_the_way = tmp.path().join("markdown");
+        std::fs::write(&file_in_the_way, "not a directory").unwrap();
+
+        let err = markdown_path_in(&file_in_the_way, std::path::Path::new("paper.pdf"))
+            .expect_err("a file cannot hold shard directories");
+        assert!(format!("{err:#}").contains("create output directory"), "{err:#}");
+    }
 }
 
 // ── Server ──────────────────────────────────────────────────────

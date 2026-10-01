@@ -53,6 +53,34 @@ struct DashboardData {
     counts_error: Option<String>,
 }
 
+impl DashboardData {
+    /// Nothing known yet: `loading` before the first collection, or the
+    /// "could not collect" frame (`counts_error` says why).
+    fn blank(loading: bool, counts_error: Option<String>) -> Self {
+        Self {
+            doc_counts: None,
+            markdown_counts: None,
+            catalog_count: None,
+            corrupted_count: None,
+            embedded_docs: 0,
+            embedded_chunks: 0,
+            embedding_skipped: 0,
+            inbox_pending: None,
+            in_flight_conversions: None,
+            scribe_servers: vec![],
+            distill_servers: vec![],
+            qdrant_healthy: false,
+            qdrant_url: String::new(),
+            qdrant_version: String::new(),
+            watcher: WatcherInfo::Stopped,
+            indexer: IndexerInfo::Stopped,
+            history: vec![],
+            loading,
+            counts_error,
+        }
+    }
+}
+
 /// Status of the inbox-sweeper daemon (`hs scribe inbox` cmd_run). Derived
 /// from a heartbeat the daemon writes each sweep tick to
 /// `hs_common::status::INBOX_HEARTBEAT_KEY`; the MCP server classifies
@@ -123,30 +151,15 @@ struct HistoryEvent {
 async fn collect_data() -> DashboardData {
     // Single source of truth: the MCP gateway's `system_status` tool, whose
     // counts come from the Storage trait and therefore work for both LocalFs
-    // and S3/Garage backends. On MCP failure we return a blank dashboard —
-    // zeros are accurate ("we don't know yet") rather than confidently wrong.
+    // and S3/Garage backends. On MCP failure the TUI shows a blank dashboard
+    // that SAYS why (the counts-unavailable banner) — zeros are accurate
+    // ("we don't know yet") rather than confidently wrong, and the cause is
+    // never discarded.
     match collect_data_via_mcp().await {
         Ok(data) => data,
-        Err(_) => DashboardData {
-            doc_counts: None,
-            markdown_counts: None,
-            catalog_count: None,
-            corrupted_count: None,
-            embedded_docs: 0,
-            embedded_chunks: 0,
-            embedding_skipped: 0,
-            inbox_pending: None,
-            in_flight_conversions: None,
-            scribe_servers: Vec::new(),
-            distill_servers: Vec::new(),
-            qdrant_healthy: false,
-            qdrant_url: String::new(),
-            qdrant_version: String::new(),
-            watcher: WatcherInfo::Stopped,
+        Err(e) => DashboardData {
             indexer: read_indexer_status(),
-            history: Vec::new(),
-            loading: false,
-            counts_error: None,
+            ..DashboardData::blank(false, Some(format!("status unavailable: {e:#}")))
         },
     }
 }
@@ -159,10 +172,12 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
     use serde_json::Value;
 
     let client = crate::mcp_client::McpClient::from_default_creds().await?;
-    let status_json = client
+    let called = client
         .call_tool("system_status", Value::Object(Default::default()))
-        .await?;
-    let snap: hs_common::status::StatusSnapshot = serde_json::from_value(status_json)?;
+        .await;
+    // End the session whether or not the call worked.
+    client.close_logged().await;
+    let snap: hs_common::status::StatusSnapshot = serde_json::from_value(called?)?;
 
     let mut data = snapshot_to_dashboard(snap);
     data.indexer = read_indexer_status();
@@ -601,11 +616,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                 } else {
                     0
                 };
-                let file_short = if current_file.len() > 30 {
-                    format!("{}...", &current_file[..27])
-                } else {
-                    current_file.clone()
-                };
+                let file_short = ellipsize(current_file, 30);
                 let fail_str = if *failed > 0 {
                     format!(" · {failed} failed")
                 } else {
@@ -822,15 +833,18 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
 async fn run_oneshot_json() -> Result<()> {
     use serde_json::Value;
     let client = crate::mcp_client::McpClient::from_default_creds().await?;
-    let snapshot = client
+    let called = client
         .call_tool("system_status", Value::Object(Default::default()))
-        .await?;
-    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        .await;
+    client.close_logged().await;
+    println!("{}", serde_json::to_string_pretty(&called?)?);
     Ok(())
 }
 
 async fn run_oneshot_text() -> Result<()> {
-    let data = collect_data().await;
+    // A status command that cannot get the status fails (non-zero exit); only
+    // the interactive dashboard keeps going with a "status unavailable" banner.
+    let data = collect_data_via_mcp().await?;
 
     // Pipeline counts
     println!("Pipeline:");
@@ -923,23 +937,12 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
         original_hook(info);
     }));
 
-    // Install a raw SIGINT handler so Ctrl+C exits even when NFS hangs.
-    // crossterm's raw mode masks SIGINT, but we override that here so the
-    // process can be killed regardless of NFS/tokio state.
-    #[cfg(unix)]
-    unsafe {
-        extern "C" fn sigint_handler(_sig: libc::c_int) {
-            // These are not strictly async-signal-safe, but we're about to
-            // exit anyway and this is far better than an unkillable process.
-            let _ = disable_raw_mode();
-            let _ = io::stdout().execute(LeaveAlternateScreen);
-            std::process::exit(130);
-        }
-        libc::signal(
-            libc::SIGINT,
-            sigint_handler as *const () as libc::sighandler_t,
-        );
-    }
+    // Ctrl+C / SIGTERM request a graceful stop (`shutdown`): the loop below
+    // notices within one poll interval, restores the terminal and returns.
+    // No signal handler of our own, and the process still exits promptly if
+    // a collection task is wedged on a hung mount (`main` abandons workers
+    // after a short grace period).
+    let stop = crate::shutdown::cooperative();
 
     // Setup terminal
     enable_raw_mode()?;
@@ -947,31 +950,14 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut last_collect = Instant::now() - Duration::from_secs(10); // force immediate collect
-    let mut data = DashboardData {
-        doc_counts: None,
-        markdown_counts: None,
-        catalog_count: None,
-        corrupted_count: None,
-        embedded_docs: 0,
-        embedded_chunks: 0,
-        embedding_skipped: 0,
-        inbox_pending: None,
-        in_flight_conversions: None,
-        scribe_servers: vec![],
-        distill_servers: vec![],
-        qdrant_healthy: false,
-        qdrant_url: String::new(),
-        qdrant_version: String::new(),
-        watcher: WatcherInfo::Stopped,
-        indexer: IndexerInfo::Stopped,
-        history: vec![],
-        loading: true,
-        counts_error: None,
-    };
+    let mut data = DashboardData::blank(true, None);
 
     let mut collect_task: Option<tokio::task::JoinHandle<DashboardData>> = None;
 
     loop {
+        if stop.requested() {
+            break;
+        }
         // Kick off data collection in background (non-blocking)
         if last_collect.elapsed() >= Duration::from_secs(3) && collect_task.is_none() {
             collect_task = Some(tokio::spawn(collect_data()));
@@ -1004,6 +990,7 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
                         data.watcher = new_data.watcher;
                         data.indexer = new_data.indexer;
                         data.history = new_data.history;
+                        data.counts_error = new_data.counts_error;
                         data.loading = false;
                     }
                 }
@@ -1042,4 +1029,68 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     Ok(())
+}
+
+/// Shorten `s` to at most `max` characters, ending in `...` when it was cut.
+/// Counts characters, not bytes: a byte slice through a multi-byte character
+/// in a file name panicked the whole dashboard.
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max.saturating_sub(3)).collect();
+    format!("{kept}...")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn ellipsize_counts_characters_and_leaves_short_names_alone() {
+        assert_eq!(ellipsize("short.md", 30), "short.md");
+        let ascii = "a".repeat(40);
+        assert_eq!(ellipsize(&ascii, 30), format!("{}...", "a".repeat(27)));
+        // 30 two-byte characters are 60 bytes but exactly 30 characters.
+        let thirty_e_acute = "é".repeat(30);
+        assert_eq!(ellipsize(&thirty_e_acute, 30), thirty_e_acute);
+        let long = "日本語".repeat(20);
+        let cut = ellipsize(&long, 30);
+        assert_eq!(cut.chars().count(), 30);
+        assert!(cut.ends_with("..."));
+    }
+
+    /// The indexer row sliced `current_file` at byte 27: a multi-byte
+    /// character straddling it panicked the render (and, in release builds,
+    /// aborted the process with the terminal in raw mode). The row is built
+    /// eagerly even when the panel clips it, so a completed draw is the proof.
+    #[test]
+    fn the_dashboard_renders_a_non_ascii_file_name_longer_than_the_column() {
+        for name in [
+            format!("{}é{}", "a".repeat(26), "b".repeat(20)),
+            format!("{}日本語{}", "a".repeat(25), "b".repeat(20)),
+        ] {
+            let mut data = DashboardData::blank(false, None);
+            data.indexer = IndexerInfo::Running {
+                indexed: 1,
+                total: 2,
+                failed: 0,
+                chunks: 3,
+                current_file: name,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+
+            terminal.draw(|frame| render(frame, &data)).unwrap();
+
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(screen.contains("Pipeline"), "the dashboard drew");
+        }
+    }
 }
