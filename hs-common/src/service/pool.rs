@@ -10,13 +10,14 @@ use super::protocol::{ReadinessInfo, ServiceClient};
 pub struct ServicePool<C: ServiceClient> {
     clients: Vec<C>,
     next: AtomicUsize,
-    /// Serializes each probe→claim cycle inside `pick_server`. Without
-    /// this, a burst of N concurrent handlers all probe readiness in
-    /// parallel, all read the same pre-dispatch snapshot, and dog-pile
-    /// onto whichever server happened to look best. Scoped to ONE cycle
-    /// — never held across the poll-sleep, or a single parked caller
-    /// would serialize every other picker for up to the full
-    /// [`PICK_READY_TIMEOUT`].
+    /// Serializes the SELECT→CLAIM step inside `try_pick_once`. Without
+    /// it, a burst of N concurrent handlers that probed the same snapshot
+    /// would all read the same reservation count and dog-pile onto
+    /// whichever server looked best. Held only across that CPU-only step
+    /// — never across a readiness probe (one stalled host would serialize
+    /// every picker behind its timeout) and never across the poll-sleep (a
+    /// single parked caller would serialize every other picker for up to
+    /// the full [`PICK_READY_TIMEOUT`]).
     pick_lock: tokio::sync::Mutex<()>,
     /// See [`PICK_READY_TIMEOUT`] / [`PICK_POLL_INTERVAL`]. Stored per
     /// pool so tests can shrink them; production always uses the consts.
@@ -153,29 +154,17 @@ impl<C: ServiceClient> ServicePool<C> {
         let deadline = Instant::now() + self.ready_timeout;
         let mut attempt: u32 = 0;
         loop {
-            // pick_lock scope: exactly one probe→claim cycle. Claiming
-            // must be atomic against concurrent pickers (the dog-pile
-            // race the lock exists for), but holding the guard across
-            // the sleep would park every other handler behind this one
-            // for up to the full timeout — under permanent saturation
-            // the waits compound serially (N callers → N × timeout)
-            // because each queued caller only starts its own deadline
-            // after the previous one gives up.
-            {
-                let _pick_guard = self.pick_lock.lock().await;
-                let log_failures = attempt == 0 || attempt.is_multiple_of(120);
-                match self.try_pick_once(log_failures).await? {
-                    Probe::Picked(c, idx) => {
-                        self.reservations[idx].fetch_add(1, Ordering::Relaxed);
-                        let guard = PickGuard {
-                            reservations: Arc::clone(&self.reservations),
-                            idx,
-                        };
-                        return Ok((c, guard));
-                    }
-                    Probe::Gated => return Err(NoAdmittingHost.into()),
-                    Probe::Wait => {}
+            let log_failures = attempt == 0 || attempt.is_multiple_of(120);
+            match self.try_pick_once(log_failures).await? {
+                Probe::Picked(c, idx) => {
+                    let guard = PickGuard {
+                        reservations: Arc::clone(&self.reservations),
+                        idx,
+                    };
+                    return Ok((c, guard));
                 }
+                Probe::Gated => return Err(NoAdmittingHost.into()),
+                Probe::Wait => {}
             }
             if Instant::now() >= deadline {
                 anyhow::bail!(
@@ -195,6 +184,19 @@ impl<C: ServiceClient> ServicePool<C> {
         }
     }
 
+    /// One probe→claim cycle.
+    ///
+    /// The `/readiness` probes run with no lock held, so a host that takes
+    /// seconds to time out (a sleeping laptop) delays only the pickers that
+    /// are themselves probing it, never the claim of a ready host by another
+    /// picker. `pick_lock` guards only the selection and the reservation
+    /// that claims the slot, which is pure CPU: claiming against the live
+    /// `reservations` is what keeps a burst of pickers that probed the same
+    /// snapshot from dog-piling onto whichever server looked best.
+    ///
+    /// `Picked` means the reservation is already taken; the caller owns
+    /// releasing it (via [`PickGuard`]).
+    ///
     /// `log_failures` throttles the unreachable-server warning. A parked
     /// handler re-probes every [`PICK_POLL_INTERVAL`]; logging every
     /// failed probe turned one sleeping laptop into a continuous
@@ -230,6 +232,8 @@ impl<C: ServiceClient> ServicePool<C> {
                 }
             }
         }
+
+        let _claim = self.pick_lock.lock().await;
 
         // Effective available slots = server-reported available minus our
         // outstanding reservations. This handles the case where several
@@ -284,6 +288,7 @@ impl<C: ServiceClient> ServicePool<C> {
 
         let rr = self.next.fetch_add(1, Ordering::Relaxed) % candidates.len();
         let idx = candidates[rr];
+        self.reservations[idx].fetch_add(1, Ordering::Relaxed);
         Ok(Probe::Picked(&self.clients[idx], idx))
     }
 
@@ -343,6 +348,8 @@ mod tests {
         gated: Arc<AtomicBool>,
         /// Readiness probe fails (host asleep / unreachable).
         down: Arc<AtomicBool>,
+        /// Readiness probe takes this long to answer (host half-asleep).
+        stall: Duration,
     }
 
     #[async_trait]
@@ -357,6 +364,9 @@ mod tests {
             Ok(Health { _ok: Some(true) })
         }
         async fn readiness(&self) -> Result<Readiness> {
+            if !self.stall.is_zero() {
+                tokio::time::sleep(self.stall).await;
+            }
             if self.down.load(AtomicOrdering::Relaxed) {
                 anyhow::bail!("connection refused");
             }
@@ -375,6 +385,7 @@ mod tests {
             avail: Arc::new(AtomicUsize::new(avail)),
             gated: Arc::new(AtomicBool::new(false)),
             down: Arc::new(AtomicBool::new(false)),
+            stall: Duration::ZERO,
         }
     }
 
@@ -388,6 +399,82 @@ mod tests {
         let c = mk(url, false, 0);
         c.down.store(true, AtomicOrdering::Relaxed);
         c
+    }
+
+    fn stalled(url: &str, avail: usize, stall: Duration) -> MockClient {
+        let mut c = mk(url, true, avail);
+        c.stall = stall;
+        c
+    }
+
+    /// RA-59: `/readiness` probes run outside `pick_lock`. With the lock
+    /// held across them, N pickers each waited out the stalled host's probe
+    /// one after another (N × stall); now they probe, and wait, together.
+    #[tokio::test]
+    async fn pickers_do_not_serialize_behind_a_stalled_host() {
+        let stall = Duration::from_millis(400);
+        let pool = Arc::new(ServicePool::new(vec![
+            stalled("http://asleep:7433", 4, stall),
+            mk("http://ok:7433", true, 8),
+        ]));
+
+        let started = Instant::now();
+        let tasks: Vec<_> = (0..6)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                tokio::spawn(async move {
+                    let (client, guard) = pool.pick_server().await.unwrap();
+                    let url = client.url().to_string();
+                    (url, guard)
+                })
+            })
+            .collect();
+        let mut guards = Vec::new();
+        for t in tasks {
+            guards.push(t.await.unwrap());
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(guards.len(), 6);
+        assert!(
+            elapsed < stall * 3,
+            "6 pickers behind one {stall:?} probe must overlap (~{stall:?}), \
+             not serialize (~{:?}); took {elapsed:?}",
+            stall * 6
+        );
+    }
+
+    /// Moving the probes out of the lock must not reopen the dog-pile: the
+    /// claim is still atomic against live reservations, so a burst that all
+    /// probed `avail = 2` claims exactly 2 slots.
+    #[tokio::test]
+    async fn concurrent_pickers_never_claim_more_than_the_free_slots() {
+        let pool = Arc::new(
+            ServicePool::new(vec![mk("http://one:7433", true, 2)])
+                .with_timing(Duration::from_millis(200), Duration::from_millis(20)),
+        );
+        let tasks: Vec<_> = (0..6)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                tokio::spawn(async move {
+                    match pool.pick_server().await {
+                        Ok((_, guard)) => {
+                            // Hold the slot past every other picker's deadline.
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            drop(guard);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                })
+            })
+            .collect();
+        let mut claimed = 0;
+        for t in tasks {
+            if t.await.unwrap() {
+                claimed += 1;
+            }
+        }
+        assert_eq!(claimed, 2, "only the 2 advertised slots may be claimed");
     }
 
     #[tokio::test]
