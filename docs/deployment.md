@@ -518,11 +518,11 @@ Only one event-watch pair runs cluster-wide — on the host that owns S3/catalog
 
 ```bash
 # Linux GPU host: scribe + distill need the cuda feature
-GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs-scribe --features cuda
-GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs-distill --features cuda
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs-scribe --features cuda
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs-distill --features cuda
 
 # Always build hs + hs-mcp for the CLI and MCP stdio surface
-GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs -p hs-mcp
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs -p hs-mcp
 
 install -m755 target/release/{hs,hs-mcp,hs-scribe-server,hs-distill-server} ~/.local/bin/
 ```
@@ -873,7 +873,7 @@ This pattern keeps big_mac a pure Ollama-VLM worker — no shared-storage auth, 
 ```bash
 # Sync source from your build host, then native cargo build (no cuda feature on macOS):
 cd ~/home-still
-GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs-scribe --features server -p hs
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs-scribe --features server -p hs
 install -m755 target/release/{hs,hs-scribe-server} ~/.local/bin/
 
 # Install as LaunchAgent (or systemd if Linux):
@@ -1157,11 +1157,13 @@ scribe:
 
 ### `HS_VERSION` baked wrong on a local rc deploy
 
-`build.rs` defaults to `git describe --tags --always`, which picks up the *prior* tag if you haven't tagged yet. For local rc builds, set the version explicitly:
+A `--release` build refuses to start unless `HS_RELEASE_TAG` names the tag it ships as (`build-support/version.rs`); there is no `git describe` or `Cargo.toml` stand-in for a release binary. Set it explicitly:
 
 ```bash
-GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs
 ```
+
+Development (non-`--release`) builds report `git describe --tags --always` of the checkout, refreshed on every commit/checkout/tag.
 
 ### Docker / podman noise drowning the real signal
 
@@ -1186,9 +1188,9 @@ All three must pass. Then tag, build per-host, and roll out in the order above (
 For a local-only rc build (no GitHub release):
 
 ```bash
-GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs --features ...
-GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs-distill --features server,cuda
-GITHUB_REF_NAME=v0.0.1-rc.NNN cargo build --release -p hs-gateway
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs --features ...
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs-distill --features server,cuda
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs-gateway
 ```
 
 Distribute the binaries out of `target/release/` to the right hosts (scp to `~/.local/bin/`), restart services.

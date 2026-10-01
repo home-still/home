@@ -73,7 +73,8 @@ src/
 ## Build
 
 ```sh
-cargo build --release -p hs
+cargo build -p hs                                             # development: version from `git describe`
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs      # release: version is the tag
 ```
 
-The `build.rs` bakes the full version (including RC tags) into the binary via `env!("HS_VERSION")`.
+The `build.rs` bakes the version (including RC tags) into the binary via `env!("HS_VERSION")`; the rules live in `build-support/version.rs`. A `--release` build without a valid `HS_RELEASE_TAG` fails.

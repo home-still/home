@@ -80,9 +80,14 @@ pub fn select_version(
 /// `v0.0.1-rc.360` -> `0.0.1-rc.360`; rejects anything that is not a release tag.
 pub fn version_from_tag(tag: &str) -> Result<String, String> {
     let bad = || {
+        let empty = if tag.is_empty() {
+            format!(" It is set but empty (docker needs `--build-arg {RELEASE_TAG_ENV}=vMAJOR.MINOR.PATCH…`).")
+        } else {
+            String::new()
+        };
         format!(
             "{RELEASE_TAG_ENV}={tag:?} is not a release tag; expected \
-             vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE (for example v0.0.1-rc.360)"
+             vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE (for example v0.0.1-rc.360).{empty}"
         )
     };
     let version = tag.strip_prefix('v').ok_or_else(bad)?;
