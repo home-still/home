@@ -101,11 +101,12 @@ async fn cached_backend_state(state: &ServerState) -> Option<BackendState> {
                 "vlm backend available again"
             );
         } else {
+            let holders = hs_common::gpu::compute_apps_summary_async().await;
             tracing::warn!(
                 free_vram_mb = ?fresh.free_vram_mb,
                 reachable = fresh.reachable,
                 headroom_mb = state.config.vram_headroom_mb,
-                holders = %hs_common::gpu::compute_apps_summary(),
+                holders = %holders,
                 "vlm backend unavailable — refusing dispatch"
             );
         }
@@ -154,7 +155,7 @@ pub fn app(state: Arc<ServerState>) -> Router {
 /// fanout key off `status`, and `ScribeClient::health` parses the body
 /// regardless of status code.
 async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let info = hs_common::gpu::query_gpu_info();
+    let info = hs_common::gpu::query_gpu_info_async().await;
     let backend = cached_backend_state(&state).await;
     let admits = backend.as_ref().is_none_or(|b| b.admits());
     let body = HealthResponse {

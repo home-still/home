@@ -19,8 +19,17 @@ http = [
     "dep:reqwest",
     "dep:anyhow",
 ]
+# Async, TTL-cached `gpu::*_async` accessors for request handlers.
+gpu-async = [
+    "dep:tokio",
+    "dep:tracing",
+    "tokio/rt",
+    "tokio/sync",
+    "tokio/time",
+]
 service = [
     "http",
+    "gpu-async",
     "dep:serde",
     "dep:serde_json",
     "dep:async-trait",

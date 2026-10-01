@@ -89,7 +89,7 @@ fn running_contains(body: &serde_json::Value, model: &str) -> bool {
 /// backend is a verdict (`reachable: false`), not a failure of the
 /// health handler.
 pub async fn probe(endpoint: &str, model: &str, headroom_mb: u64) -> BackendState {
-    let free_vram_mb = hs_common::gpu::free_vram_mb();
+    let free_vram_mb = hs_common::gpu::free_vram_mb_async().await;
     let url = format!("{}/running", swap_base(endpoint));
 
     let client = match hs_common::http::client_builder()
