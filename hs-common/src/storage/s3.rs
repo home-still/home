@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use object_store::{aws::AmazonS3Builder, ObjectStore, ObjectStoreExt, PutPayload};
 use sha2::{Digest, Sha256};
 
-use super::{ObjectMeta, Storage};
+use super::{validate_key, validate_prefix, ObjectMeta, Storage};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -180,17 +180,20 @@ fn path(key: &str) -> object_store::path::Path {
 #[async_trait]
 impl Storage for S3Storage {
     async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+        validate_key(key)?;
         let res = self.inner.get(&path(key)).await?;
         Ok(res.bytes().await?.to_vec())
     }
 
     async fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+        validate_key(key)?;
         let payload = PutPayload::from(Bytes::from(bytes));
         self.inner.put(&path(key), payload).await?;
         Ok(())
     }
 
     async fn head(&self, key: &str) -> anyhow::Result<Option<ObjectMeta>> {
+        validate_key(key)?;
         match self.inner.head(&path(key)).await {
             Ok(m) => Ok(Some(ObjectMeta {
                 key: m.location.to_string(),
@@ -204,6 +207,7 @@ impl Storage for S3Storage {
     }
 
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+        validate_prefix(prefix)?;
         let prefix_path = if prefix.is_empty() {
             None
         } else {
@@ -224,6 +228,7 @@ impl Storage for S3Storage {
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        validate_key(key)?;
         match self.inner.delete(&path(key)).await {
             Ok(()) => Ok(()),
             Err(object_store::Error::NotFound { .. }) => Ok(()),
@@ -315,5 +320,35 @@ mod tests {
         let key = "catalog/ab/some_stem-123.yaml";
         let p = path(key);
         assert_eq!(p.to_string(), key);
+    }
+
+    /// Key validation runs before any request is built, so an escaping key
+    /// fails with `InvalidKey` even against an unreachable endpoint.
+    #[tokio::test]
+    async fn escaping_keys_are_rejected_before_any_request() {
+        let s = S3Storage::new(S3Config {
+            endpoint: "http://127.0.0.1:1".into(),
+            bucket: "b".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            region: "garage".into(),
+            allow_http: true,
+        })
+        .unwrap();
+        for key in ["", "..", "a/../b", "/abs", "a\\b", "a\0b"] {
+            assert!(super::super::is_invalid_key(&s.get(key).await.unwrap_err()));
+            assert!(super::super::is_invalid_key(
+                &s.put(key, vec![1]).await.unwrap_err()
+            ));
+            assert!(super::super::is_invalid_key(
+                &s.head(key).await.unwrap_err()
+            ));
+            assert!(super::super::is_invalid_key(
+                &s.delete(key).await.unwrap_err()
+            ));
+        }
+        assert!(super::super::is_invalid_key(
+            &s.list("../x").await.unwrap_err()
+        ));
     }
 }
