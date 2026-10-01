@@ -49,6 +49,11 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Manage HNSW indexing of the Qdrant collections
+    Hnsw {
+        #[command(subcommand)]
+        action: HnswCmd,
+    },
     /// Show distill system status (Qdrant, server, collection)
     Status {
         /// Override server URL
@@ -133,4 +138,21 @@ pub enum AbstractsCmd {
     /// Report coverage: total catalog entries vs. abstract_embed stamps
     /// broken down by source (openalex / catalog / markdown).
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HnswCmd {
+    /// Enable HNSW on a configured collection. Starts a background
+    /// whole-collection index build on the Qdrant host: requires --yes.
+    Enable {
+        /// Collection name (the server accepts only configured collections)
+        #[arg(long)]
+        collection: String,
+        /// Confirm starting the background index build
+        #[arg(long)]
+        yes: bool,
+        /// Override server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
 }

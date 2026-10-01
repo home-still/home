@@ -157,6 +157,14 @@ pub async fn dispatch(
             server,
         } => cmd_search(&query, limit, year, topic, server.as_deref(), global).await,
         DistillCmd::Status { server } => cmd_status(server.as_deref(), reporter).await,
+        DistillCmd::Hnsw {
+            action:
+                hs_distill::cli::HnswCmd::Enable {
+                    collection,
+                    yes,
+                    server,
+                },
+        } => cmd_hnsw_enable(&collection, yes, server.as_deref(), reporter).await,
         DistillCmd::WatchEvents { server } => cmd_watch_events(server, reporter).await,
         DistillCmd::Diagnose { stem, verbose } => cmd_diagnose(&stem, verbose, reporter).await,
         DistillCmd::Reconcile {
@@ -1563,7 +1571,68 @@ async fn cmd_diagnose(stem: &str, verbose: bool, reporter: &Arc<dyn Reporter>) -
     Ok(())
 }
 
-// ── Reconcile ───────────────────────────────────────────────────
+// ── HNSW ────────────────────────────────────────────────────────
+
+/// `hs distill hnsw enable`: ask the distill server to enable HNSW on one
+/// collection. This starts a background index build over the whole
+/// collection on the shared Qdrant host, so it needs an explicit `--yes`.
+async fn cmd_hnsw_enable(
+    collection: &str,
+    yes: bool,
+    server: Option<&str>,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    let servers = resolve_servers(server).await;
+    let client = DistillClient::new(&servers[0])?;
+    hnsw_enable(&client, &servers[0], collection, yes, reporter).await
+}
+
+async fn hnsw_enable(
+    client: &DistillClient,
+    server_url: &str,
+    collection: &str,
+    yes: bool,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    if !yes {
+        reporter.status(
+            "Would enable",
+            &format!(
+                "HNSW on collection `{collection}` via {server_url}: Qdrant would build the \
+                 graph in the background over the whole collection (CPU/disk load on the \
+                 shared host, capped by the server's hnsw.max_indexing_threads)"
+            ),
+        );
+        anyhow::bail!("not submitted: re-run with --yes to start the index build");
+    }
+    let result = client.enable_hnsw(Some(collection)).await.map_err(|e| {
+        match e.downcast_ref::<hs_distill::client::ServerError>() {
+            Some(se) if se.status == reqwest::StatusCode::UNAUTHORIZED => anyhow::anyhow!(
+                "distill rejected the request (401): the backend token is missing or wrong; \
+                 set HS_BACKEND_TOKEN to the token the server was started with"
+            ),
+            _ => e,
+        }
+    })?;
+    if result.submitted {
+        reporter.finish(&format!(
+            "submitted: HNSW enable on `{}` (m={}, ef_construct={}, max_indexing_threads={}); {}",
+            result.collection,
+            result.m,
+            result.ef_construct,
+            result.max_indexing_threads,
+            result.message
+        ));
+    } else {
+        reporter.finish(&format!(
+            "already enabled: `{}` (m={}, ef_construct={}); nothing submitted",
+            result.collection, result.m, result.ef_construct
+        ));
+    }
+    Ok(())
+}
+
+// ── Reconcile (driver) ──────────────────────────────────────────
 
 /// Walk markdown, Qdrant and catalog; heal the divergences that let
 /// phantom "unembedded" docs accumulate. See `hs_distill::reconcile` for
@@ -2085,5 +2154,70 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+    }
+}
+
+#[cfg(test)]
+mod hnsw_tests {
+    use super::*;
+    use crate::test_http::{FakeServer, Response};
+
+    fn reporter() -> Arc<dyn Reporter> {
+        Arc::new(hs_common::reporter::SilentReporter)
+    }
+
+    async fn server(status: u16, body: serde_json::Value) -> FakeServer {
+        FakeServer::start(move |_| Response::json(status, &body)).await
+    }
+
+    fn ok_body(submitted: bool) -> serde_json::Value {
+        serde_json::json!({"collection": "academic_papers", "submitted": submitted, "m": 16,
+            "ef_construct": 100, "max_indexing_threads": 4, "message": "building"})
+    }
+
+    #[tokio::test]
+    async fn without_yes_nothing_is_sent_and_the_command_fails() {
+        let s = server(200, ok_body(true)).await;
+        let c = DistillClient::new(&s.base).unwrap();
+        let err = hnsw_enable(&c, &s.base, "academic_papers", false, &reporter())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("--yes"));
+        assert!(s.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_yes_the_named_collection_is_posted() {
+        for submitted in [true, false] {
+            let s = server(200, ok_body(submitted)).await;
+            let c = DistillClient::new(&s.base).unwrap();
+            hnsw_enable(&c, &s.base, "academic_papers", true, &reporter())
+                .await
+                .unwrap();
+            let reqs = s.requests();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0].method, "POST");
+            assert_eq!(reqs[0].path, "/collection/hnsw?collection=academic_papers");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_401_names_the_backend_token_and_a_400_is_shown_verbatim() {
+        let s = server(401, serde_json::json!({"error": "unauthorized"})).await;
+        let c = DistillClient::new(&s.base).unwrap();
+        let err = hnsw_enable(&c, &s.base, "x", true, &reporter())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("HS_BACKEND_TOKEN"), "{err:#}");
+
+        let s = server(400, serde_json::json!({"error": "unknown collection nope"})).await;
+        let c = DistillClient::new(&s.base).unwrap();
+        let err = hnsw_enable(&c, &s.base, "nope", true, &reporter())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown collection nope"),
+            "{err:#}"
+        );
     }
 }

@@ -21,6 +21,7 @@ hs distill index   Index markdown files into Qdrant
 hs distill search  Semantic search across indexed documents
 hs distill server  Manage distill server (start/stop/ping)
 hs distill status  Show collection statistics
+hs distill hnsw enable --collection <name> --yes   Start the background HNSW index build (needs HS_BACKEND_TOKEN; without --yes it prints the plan and exits 1)
 
 hs serve scribe    Run scribe service on this machine (auto-init)
 hs serve distill   Run distill service on this machine (auto-init)
