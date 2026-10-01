@@ -1816,6 +1816,13 @@ async fn cmd_reconcile(
         "Reconcile complete: ok={} stamps_fixed={} embeds_done={} (failures: stamps={} embeds={})",
         counts.ok, stamp_done, embed_done, stamp_failed, embed_failed
     ));
+    if stamp_failed + embed_failed > 0 {
+        anyhow::bail!(
+            "reconcile left {} stamp failure(s) and {} embed failure(s) (see the log)",
+            stamp_failed,
+            embed_failed
+        );
+    }
     Ok(())
 }
 
