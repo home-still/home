@@ -42,7 +42,7 @@ fn init_logging(
     Option<hs_common::storage::StorageConfig>,
     String,
 ) {
-    use hs_common::logging::{self, LoggingConfig, StderrOutput};
+    use hs_common::logging::{self, StderrOutput};
 
     let (service, force_info_stderr) = match &cli.command {
         TopCmd::Scribe {
@@ -54,7 +54,19 @@ fn init_logging(
         _ => ("hs", false),
     };
 
-    let (primary_storage, logs_yaml) = logging::load_config_sections();
+    // Commands that exist to create or locate the config file must run when
+    // that file is broken, or the operator has no tool left to repair it.
+    // Every other command refuses to run on a malformed config.
+    let sections = if matches!(
+        &cli.command,
+        TopCmd::Config {
+            action: cli::ConfigAction::Init { .. } | cli::ConfigAction::Path
+        }
+    ) {
+        logging::ConfigSections::without_config_file()
+    } else {
+        logging::load_config_sections().unwrap_or_else(|e| logging::exit_on_config_error("hs", e))
+    };
 
     let stderr_output = if force_info_stderr && !cli.global.quiet {
         // Long-running daemons whose only signal is periodic INFO logs
@@ -69,20 +81,23 @@ fn init_logging(
             quiet: cli.global.quiet,
         }
     };
-    let mut cfg = LoggingConfig::for_service(service).with_stderr(stderr_output);
-    logs_yaml.apply_to(&mut cfg).unwrap_or_else(|e| {
-        eprintln!("{service}: {e}");
-        std::process::exit(2)
-    });
+    let cfg = sections
+        .logging_config(service, stderr_output)
+        .unwrap_or_else(|e| logging::exit_on_config_error(service, e));
 
     let handle = logging::init(cfg);
 
-    (handle, primary_storage, logs_yaml.bucket)
+    (handle, sections.storage, sections.logs.bucket)
 }
 
 fn main() -> ExitCode {
-    let _ = hs_common::secrets::load_default_secrets();
     let cli = Cli::parse();
+    // Secrets are exported into the environment before the tokio runtime
+    // (and its worker threads) exist; an unreadable secrets.env is fatal.
+    if let Err(e) = hs_common::secrets::load_default_secrets() {
+        eprintln!("hs: loading ~/.home-still/secrets.env: {e}");
+        return ExitCode::from(2);
+    }
 
     let (logging_handle, primary_storage_cfg, logs_bucket) = init_logging(&cli);
 
@@ -287,7 +302,7 @@ async fn handle_config(
             }
 
             // Create project directory structure
-            let project = hs_common::resolve_project_dir();
+            let project = hs_common::resolve_project_dir()?;
             std::fs::create_dir_all(project.join("papers").join("manually_downloaded"))?;
             std::fs::create_dir_all(project.join("markdown"))?;
             std::fs::create_dir_all(project.join("catalog"))?;

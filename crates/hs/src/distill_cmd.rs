@@ -10,8 +10,6 @@ use hs_distill::cli::DistillCmd;
 use hs_distill::client::DistillClient;
 use hs_distill::config::{DistillClientConfig, DistillServerConfig};
 
-const DEFAULT_SERVER: &str = "http://localhost:7434";
-
 /// Create a DistillClient, with auth headers if the URL is a cloud gateway.
 pub(crate) async fn make_distill_client(url: &str) -> Result<DistillClient> {
     if is_cloud_url(url) {
@@ -29,17 +27,14 @@ pub(crate) async fn make_distill_client(url: &str) -> Result<DistillClient> {
 const QDRANT_REST_PORT: u16 = 6333;
 const QDRANT_GRPC_PORT: u16 = 6334;
 
-pub(crate) async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
+pub(crate) async fn resolve_servers(cli_server: Option<&str>) -> Result<Vec<String>> {
     if let Some(s) = cli_server {
-        return vec![s.to_string()];
+        return Ok(vec![s.to_string()]);
     }
     // Config is the sole source of truth — to route through a cloud
-    // gateway, set the gateway URL explicitly in config instead of
-    // relying on per-request registry discovery with a fallback.
-    match DistillClientConfig::load() {
-        Ok(cfg) if !cfg.servers.is_empty() => cfg.servers,
-        _ => vec![DEFAULT_SERVER.to_string()],
-    }
+    // gateway, set the gateway URL explicitly in config. No local default:
+    // an empty `distill.servers` is an error naming that key.
+    Ok(DistillClientConfig::load()?.require_servers()?.to_vec())
 }
 
 fn hidden_dir() -> PathBuf {
@@ -80,12 +75,12 @@ fn distill_compose_yaml(data_dir: &std::path::Path) -> String {
     )
 }
 
-fn find_distill_binary() -> Option<PathBuf> {
+fn find_distill_binary() -> Result<Option<PathBuf>> {
     // Check ~/.local/bin (install script location)
     if let Some(home) = dirs::home_dir() {
         let path = home.join(".local/bin/hs-distill-server");
         if path.exists() {
-            return Some(path);
+            return Ok(Some(path));
         }
     }
     // Check next to the current binary (same install dir)
@@ -93,22 +88,22 @@ fn find_distill_binary() -> Option<PathBuf> {
         if let Some(dir) = exe.parent() {
             let path = dir.join("hs-distill-server");
             if path.exists() {
-                return Some(path);
+                return Ok(Some(path));
             }
         }
     }
     // Check cargo target dirs (dev builds)
-    let project = hs_common::resolve_project_dir();
+    let project = hs_common::resolve_project_dir()?;
     for profile in ["release", "debug"] {
         let path = project
             .join("target")
             .join(profile)
             .join("hs-distill-server");
         if path.exists() {
-            return Some(path);
+            return Ok(Some(path));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Find the ort cache directory containing CUDA provider .so files.
@@ -188,7 +183,7 @@ pub async fn dispatch(
 }
 
 async fn cmd_purge(doc_id: &str, server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let servers = resolve_servers(server).await;
+    let servers = resolve_servers(server).await?;
     let client = DistillClient::new(&servers[0])?;
     reporter.status("Purging", doc_id);
     let deleted = client
@@ -380,7 +375,7 @@ async fn cmd_abstracts_build(
     let stop = crate::shutdown::cooperative();
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage()?;
-    let servers = resolve_servers(server).await;
+    let servers = resolve_servers(server).await?;
     let client = DistillClient::new(&servers[0])?;
 
     reporter.status("Init", "opening OpenAlex DuckDB (read-only)");
@@ -494,9 +489,10 @@ pub(crate) async fn cmd_watch_events(
     let storage = cfg.build_storage()?;
     let bus = cfg.build_event_bus().await?;
 
-    let server_url = server_override
-        .or_else(|| cfg.servers.first().cloned())
-        .unwrap_or_else(|| "http://localhost:7434".into());
+    let server_url = match server_override {
+        Some(s) => s,
+        None => cfg.require_servers()?[0].clone(),
+    };
     let distill =
         Arc::new(DistillClient::new(&server_url)?.with_index_timeout(cfg.index_timeout()));
 
@@ -524,7 +520,7 @@ pub(crate) async fn cmd_watch_events(
 // ── Init ────────────────────────────────────────────────────────
 
 async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let config = DistillServerConfig::load().unwrap_or_default();
+    let config = DistillServerConfig::load()?;
     let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
 
     // Step 1: Check Qdrant availability
@@ -581,7 +577,7 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     // Check for distill binary
-    if find_distill_binary().is_none() {
+    if find_distill_binary()?.is_none() {
         reporter.warn(
             "hs-distill-server binary not found. Build with:\n  \
              HS_RELEASE_TAG=<tag> cargo build --release -p hs-distill --features server,cuda\n  \
@@ -598,7 +594,7 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
 // ── Server ──────────────────────────────────────────────────────
 
 pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let config = DistillServerConfig::load().unwrap_or_default();
+    let config = DistillServerConfig::load()?;
     let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
 
     // 1. Start Qdrant container if compose file exists
@@ -651,14 +647,14 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
         }
     }
 
-    let binary = find_distill_binary().ok_or_else(|| {
+    let binary = find_distill_binary()?.ok_or_else(|| {
         anyhow::anyhow!(
             "hs-distill-server binary not found. Build with:\n  \
              HS_RELEASE_TAG=<tag> cargo build --release -p hs-distill --features server,cuda"
         )
     })?;
 
-    let log_dir = hs_common::resolve_log_dir();
+    let log_dir = hs_common::resolve_log_dir()?;
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("distill-server.log");
     let log_file = std::fs::OpenOptions::new()
@@ -820,7 +816,7 @@ pub async fn ensure_init(reporter: &Arc<dyn Reporter>) -> Result<()> {
 /// Start the distill server in the foreground (blocks until shutdown).
 /// Runs the native binary directly instead of as a background daemon.
 pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let config = DistillServerConfig::load().unwrap_or_default();
+    let config = DistillServerConfig::load()?;
     let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
 
     // Ensure Qdrant is running
@@ -846,7 +842,7 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         }
     }
 
-    let binary = find_distill_binary().ok_or_else(|| {
+    let binary = find_distill_binary()?.ok_or_else(|| {
         anyhow::anyhow!(
             "hs-distill-server binary not found. Build with:\n  \
              HS_RELEASE_TAG=<tag> cargo build --release -p hs-distill --features server,cuda"
@@ -966,17 +962,14 @@ pub async fn ensure_index_running() -> Result<bool> {
         crate::daemon::remove_pid_file(&pid_path);
     }
 
-    if find_distill_binary().is_none() {
+    if find_distill_binary()?.is_none() {
         tracing::debug!("Skipping auto-index: hs-distill-server binary not found");
         return Ok(false);
     }
 
     // Uses an HTTP health check so it works for both local and remote
     // servers (e.g. big_mac → big).
-    let server_url = DistillClientConfig::load()
-        .ok()
-        .and_then(|cfg| cfg.servers.into_iter().next())
-        .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+    let server_url = DistillClientConfig::load()?.require_servers()?[0].clone();
     let client = DistillClient::new(&server_url)
         .with_context(|| format!("building distill client for {server_url}"))?;
     if client.health().await.is_err() {
@@ -991,7 +984,7 @@ pub async fn ensure_index_running() -> Result<bool> {
 }
 
 async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let config = DistillServerConfig::load().unwrap_or_default();
+    let config = DistillServerConfig::load()?;
     let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
 
     // Qdrant health
@@ -1017,7 +1010,7 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
     }
 
     // Collection info (if server is reachable)
-    let servers = resolve_servers(server).await;
+    let servers = resolve_servers(server).await?;
     let client = DistillClient::new(&servers[0])?;
     match client.status().await {
         Ok(status) => {
@@ -1124,7 +1117,7 @@ fn spawn_index_daemon(
         }
     }
 
-    let log_path = hs_common::resolve_log_dir().join("distill-index.log");
+    let log_path = hs_common::resolve_log_dir()?.join("distill-index.log");
     let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
 
     let log_file = std::fs::OpenOptions::new()
@@ -1166,7 +1159,7 @@ async fn cmd_index(
     }
 
     // Health check before spawning
-    let servers = resolve_servers(server).await;
+    let servers = resolve_servers(server).await?;
     let client = DistillClient::new(&servers[0])?;
     match client.health().await {
         Ok(h) => reporter.status(
@@ -1261,7 +1254,7 @@ async fn cmd_index_daemon(
     let pid_path = index_pid_path();
     crate::daemon::write_pid_file(&pid_path)?;
 
-    let servers = resolve_servers(server).await;
+    let servers = resolve_servers(server).await?;
     let client = DistillClient::new(&servers[0])?;
 
     // Health check
@@ -1271,7 +1264,7 @@ async fn cmd_index_daemon(
         .context(format!("Is hs-distill-server running at {}?", servers[0]))?;
 
     // Determine files
-    let config = DistillClientConfig::load().unwrap_or_default();
+    let config = DistillClientConfig::load()?;
     let catalog_dir = config.catalog_dir.clone();
     let markdown_dir = config.markdown_dir;
 
@@ -1370,7 +1363,7 @@ async fn cmd_search(
         anyhow::bail!("Search query cannot be empty");
     }
 
-    let servers = resolve_servers(server).await;
+    let servers = resolve_servers(server).await?;
     let client = make_distill_client(&servers[0]).await?;
 
     let filters = hs_distill::client::SearchFilters {
@@ -1649,10 +1642,10 @@ async fn cmd_reconcile(
     let cfg = DistillClientConfig::load().context("loading distill client config")?;
     let storage = cfg.build_storage().context("building storage backend")?;
 
-    let server_url = server_override
-        .map(|s| s.to_string())
-        .or_else(|| cfg.servers.first().cloned())
-        .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+    let server_url = match server_override {
+        Some(s) => s.to_string(),
+        None => cfg.require_servers()?[0].clone(),
+    };
     let distill = make_distill_client(&server_url).await?;
 
     reporter.status("Scan", "listing markdown stems from storage");

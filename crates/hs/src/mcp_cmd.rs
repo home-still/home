@@ -262,7 +262,7 @@ async fn cmd_install(
     };
 
     let mcp_bin = if !remote {
-        let bin = match super::serve_cmd::find_mcp_binary() {
+        let bin = match super::serve_cmd::find_mcp_binary()? {
             Some(p) => p,
             None => {
                 reporter.status("hs-mcp", "not found locally, downloading from GitHub...");

@@ -18,7 +18,6 @@ use hs_distill::config::DistillClientConfig;
 use crate::shutdown::Shutdown;
 
 const CONFIRM_TOKEN: &str = "rebuild-from-papers";
-const DEFAULT_DISTILL_URL: &str = "http://localhost:7434";
 
 #[derive(Subcommand, Debug)]
 pub enum PipelineCmd {
@@ -172,19 +171,18 @@ pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<
 
 async fn cmd_events_reset(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let bus_cfg = cfg.events.clone();
-    if bus_cfg.backend != hs_common::event_bus::EventsBackend::Nats {
-        reporter.warn("events.backend is not `nats` — nothing to reset.");
-        return Ok(());
-    }
-    let nats =
-        hs_common::event_bus::nats::NatsBus::connect(hs_common::event_bus::nats::NatsConfig {
-            url: bus_cfg.nats.url.clone(),
-            ack_wait: std::time::Duration::from_secs(bus_cfg.nats.ack_wait_secs),
-            max_deliver: bus_cfg.nats.max_deliver,
-            max_age: std::time::Duration::from_secs(bus_cfg.nats.max_age_secs),
-            max_ack_pending: bus_cfg.nats.max_ack_pending,
-        })
+    let events = match cfg.events.as_ref() {
+        Some(e) if e.backend == hs_common::event_bus::EventsBackend::Nats => e,
+        _ => anyhow::bail!(
+            "events reset needs `events.backend: nats` in config (found {}); there are no streams to reset on any other backend",
+            match cfg.events.as_ref() {
+                Some(_) => "a different backend",
+                None => "no `events:` section",
+            }
+        ),
+    };
+    let nats_cfg = events.nats.connection(|n| std::env::var(n).ok())?;
+    let nats = hs_common::event_bus::nats::NatsBus::connect(nats_cfg)
         .await
         .context("connecting to NATS for stream reset")?;
     nats.reset_streams()
@@ -382,11 +380,7 @@ async fn cmd_rebuild(
     let stop = crate::shutdown::cooperative();
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage().context("building storage backend")?;
-    let server_url = cfg
-        .servers
-        .first()
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_DISTILL_URL.to_string());
+    let server_url = cfg.require_servers()?[0].clone();
     let client = DistillClient::new(&server_url)?;
 
     // Inventory: used for both dry-run report and live-run "before" snapshot.
@@ -794,11 +788,7 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
 
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage().context("building storage backend")?;
-    let server_url = cfg
-        .servers
-        .first()
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_DISTILL_URL.to_string());
+    let server_url = cfg.require_servers()?[0].clone();
     let client = DistillClient::new(&server_url)?;
 
     reporter.status("Scan", "markdown for known interstitial signatures");
@@ -1071,11 +1061,7 @@ async fn cmd_purge_poisoned_chunks(
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let server_url = cfg
-        .servers
-        .first()
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_DISTILL_URL.to_string());
+    let server_url = cfg.require_servers()?[0].clone();
     let client = DistillClient::new(&server_url)?;
 
     // First pass: dry-run scan so the user can see what would be deleted.

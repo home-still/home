@@ -714,10 +714,9 @@ impl HomeStillMcp {
         // a build without NATS stops the start; the previous fallback to a
         // bus that drops every publish reported success for downloads nobody
         // would ever convert.
-        let events: Arc<dyn EventBus> = scribe_cfg
-            .build_event_bus()
-            .await
-            .map_err(|e| e.context("hs-mcp needs the event bus (`events:` in ~/.home-still/config.yaml)"))?;
+        let events: Arc<dyn EventBus> = scribe_cfg.build_event_bus().await.map_err(|e| {
+            e.context("hs-mcp needs the event bus (`events:` in ~/.home-still/config.yaml)")
+        })?;
 
         // Config is the sole source of server URLs. To route through the
         // gateway, set the gateway URL explicitly in config (e.g.

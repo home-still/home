@@ -7,8 +7,6 @@ use hs_scribe::config::ScribeConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const DEFAULT_SERVER: &str = "http://localhost:7433";
-
 /// Create a ScribeClient, with auth headers if the URL is a cloud gateway.
 /// `convert_timeout` caps each PDF conversion so a stuck server can't
 /// pin the caller. The cloud path honors it as the client's overall timeout
@@ -31,18 +29,19 @@ async fn make_scribe_client(
     }
 }
 
-/// Resolve the server list from CLI flag, config file, or the local
-/// default. Config is the sole source of truth — to route through a cloud
-/// gateway, set the gateway URL explicitly in config instead of relying
-/// on per-request registry discovery with a fallback.
-async fn resolve_servers(cli_server: Option<&str>) -> Vec<String> {
+/// Resolve the server list from the CLI flag or config. There is no local
+/// default: with neither, the error names `scribe.servers`. Config is the
+/// sole source of truth — to route through a cloud gateway, set the
+/// gateway URL explicitly in config.
+fn resolve_servers(cli_server: Option<&str>, cfg: &ScribeConfig) -> Result<Vec<String>> {
     if let Some(s) = cli_server {
-        return vec![s.to_string()];
+        return Ok(vec![s.to_string()]);
     }
-    match ScribeConfig::load() {
-        Ok(cfg) if !cfg.servers.is_empty() => cfg.servers.into_iter().map(|e| e.url).collect(),
-        _ => vec![DEFAULT_SERVER.to_string()],
-    }
+    Ok(cfg
+        .require_servers()?
+        .iter()
+        .map(|e| e.url.clone())
+        .collect())
 }
 
 #[derive(Subcommand, Debug)]
@@ -198,7 +197,7 @@ async fn cmd_reconvert(stem: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
     // server is unreachable this aborts with nothing mutated, instead of
     // leaving a half-reset row whose stale chunks keep matching searches.
     if entry.embedding.is_some() || entry.embedding_skip.is_some() {
-        let servers = crate::distill_cmd::resolve_servers(None).await;
+        let servers = crate::distill_cmd::resolve_servers(None).await?;
         let client = crate::distill_cmd::make_distill_client(&servers[0]).await?;
         let deleted = client.delete_doc(stem).await.with_context(|| {
             format!(
@@ -372,22 +371,17 @@ pub(crate) async fn cmd_watch_events(
     let convert_timeout = std::time::Duration::from_secs(cfg.convert_timeout_secs);
     // Resolve the converter servers. CLI `--server` override collapses to a
     // single "unknown"-backend entry; otherwise use the configured servers
-    // (or the local default). Each entry carries its per-backend `concurrency`
+    // (`scribe.servers`, required). Each entry carries its per-backend `concurrency`
     // cap (config `scribe.servers[].concurrency`); it becomes the tier's
     // dispatch ceiling below.
     const DEFAULT_TIER_CONCURRENCY: usize = 4; // matches config.rs default_concurrency()
     let labelled_servers: Vec<(String, String, usize)> = match &server_override {
         Some(url) => vec![(url.clone(), "unknown".to_string(), DEFAULT_TIER_CONCURRENCY)],
-        None if !cfg.servers.is_empty() => cfg
-            .servers
+        None => cfg
+            .require_servers()?
             .iter()
             .map(|e| (e.url.clone(), e.backend.clone(), e.concurrency))
             .collect(),
-        None => vec![(
-            DEFAULT_SERVER.to_string(),
-            "glm_ocr".to_string(),
-            DEFAULT_TIER_CONCURRENCY,
-        )],
     };
     // Group servers into backend TIERS, preserving config order of first
     // appearance (e.g. `[olmocr, glm_ocr]`). Dispatch walks tiers
@@ -710,12 +704,9 @@ async fn cmd_convert(
     server: Option<String>,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    let servers = resolve_servers(server.as_deref()).await;
-    let convert_timeout = std::time::Duration::from_secs(
-        ScribeConfig::load()
-            .map(|c| c.convert_timeout_secs)
-            .unwrap_or(900),
-    );
+    let cfg = ScribeConfig::load()?;
+    let servers = resolve_servers(server.as_deref(), &cfg)?;
+    let convert_timeout = std::time::Duration::from_secs(cfg.convert_timeout_secs);
 
     // Health check
     let check_stage = reporter.begin_stage("Connecting", None);
@@ -878,9 +869,7 @@ async fn cmd_convert(
 /// `<output_dir>/<shard>/<stem>.md` for `input`, or `None` (print to stdout)
 /// when no output directory is configured.
 fn default_markdown_path(input: &std::path::Path) -> Result<Option<PathBuf>> {
-    let Ok(cfg) = ScribeConfig::load() else {
-        return Ok(None);
-    };
+    let cfg = ScribeConfig::load()?;
     let dir = &cfg.output_dir;
     if dir.as_os_str().is_empty() || dir == std::path::Path::new(".") {
         return Ok(None);
@@ -974,7 +963,9 @@ pub async fn cmd_server(action: ServerAction) -> Result<()> {
         ServerAction::Start => {
             compose.run_capture(&["-f", cf, "up", "-d"]).await?;
             eprintln!("Waiting for services...");
-            wait_for_health(DEFAULT_SERVER, 300).await?;
+            let cfg = ScribeConfig::load()?;
+            let server = cfg.require_servers()?[0].url.clone();
+            wait_for_health(&server, 300).await?;
             eprintln!("Ready.");
         }
         ServerAction::Stop => {
@@ -990,32 +981,32 @@ pub async fn cmd_server(action: ServerAction) -> Result<()> {
 /// Resolve the `hs-scribe-server` binary location. Preference order: user
 /// install (`~/.local/bin`), alongside the current `hs` binary, then
 /// development-build targets. Mirrors `find_distill_binary`.
-fn find_scribe_server_binary() -> Option<PathBuf> {
+fn find_scribe_server_binary() -> Result<Option<PathBuf>> {
     if let Some(home) = dirs::home_dir() {
         let path = home.join(".local/bin/hs-scribe-server");
         if path.exists() {
-            return Some(path);
+            return Ok(Some(path));
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let path = dir.join("hs-scribe-server");
             if path.exists() {
-                return Some(path);
+                return Ok(Some(path));
             }
         }
     }
-    let project = hs_common::resolve_project_dir();
+    let project = hs_common::resolve_project_dir()?;
     for profile in ["release", "debug"] {
         let path = project
             .join("target")
             .join(profile)
             .join("hs-scribe-server");
         if path.exists() {
-            return Some(path);
+            return Ok(Some(path));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Start the scribe server in the foreground (blocks until shutdown).
@@ -1023,7 +1014,7 @@ fn find_scribe_server_binary() -> Option<PathBuf> {
 /// container indirection. `lib_bootstrap` in the binary handles the
 /// platform-specific library-path setup (CUDA on Linux, pdfium on macOS).
 pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let binary = find_scribe_server_binary().ok_or_else(|| {
+    let binary = find_scribe_server_binary()?.ok_or_else(|| {
         anyhow::anyhow!(
             "hs-scribe-server binary not found. Build with:\n  \
              HS_RELEASE_TAG=<tag> cargo build --release -p hs-scribe --features server,cuda   (Linux with CUDA)\n  \
@@ -1071,7 +1062,7 @@ async fn wait_for_health(server_url: &str, timeout_secs: u64) -> Result<()> {
 }
 
 async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let scribe_cfg = ScribeConfig::load().unwrap_or_default();
+    let scribe_cfg = ScribeConfig::load()?;
     let markdown_dir = &scribe_cfg.output_dir;
     let catalog_dir = &scribe_cfg.catalog_dir;
     let catalog_store = hs_common::storage::LocalFsStorage::new(catalog_dir);
@@ -1315,5 +1306,27 @@ mod classify_convert_failure_tests {
             classify_convert_failure(&err),
             ConvertClassification::Escalate(r) if r == "permanent_convert_failure"
         ));
+    }
+}
+
+#[cfg(test)]
+mod resolve_servers_tests {
+    use super::*;
+
+    #[test]
+    fn no_flag_and_no_configured_servers_is_an_error_naming_the_key() {
+        let cfg = ScribeConfig::default();
+        assert!(cfg.servers.is_empty());
+        let err = resolve_servers(None, &cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("scribe.servers"), "{err:#}");
+    }
+
+    #[test]
+    fn the_server_flag_wins_even_with_no_configured_servers() {
+        let cfg = ScribeConfig::default();
+        assert_eq!(
+            resolve_servers(Some("http://flag:1"), &cfg).unwrap(),
+            vec!["http://flag:1".to_string()]
+        );
     }
 }

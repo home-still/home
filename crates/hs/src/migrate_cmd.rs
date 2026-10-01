@@ -16,8 +16,8 @@ use crate::shutdown::Shutdown;
 /// otherwise. Exits non-zero if any file could not be migrated or the run was
 /// interrupted.
 pub async fn run_sharding(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
-    let paper_cfg = paper::config::Config::load().unwrap_or_default();
+    let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
+    let paper_cfg = paper::config::Config::load()?;
 
     let dirs_to_migrate: Vec<(&str, &Path, &[&str])> = vec![
         ("papers", &paper_cfg.download_path, &["pdf", "html", "htm"]),
@@ -1512,7 +1512,7 @@ pub async fn run_canonicalize_doi_stems(
         return Ok(());
     }
 
-    let servers = crate::distill_cmd::resolve_servers(server).await;
+    let servers = crate::distill_cmd::resolve_servers(server).await?;
     let distill = hs_distill::client::DistillClient::new(&servers[0])?;
 
     let stop = crate::shutdown::cooperative();

@@ -771,7 +771,10 @@ mod tests {
             }
         })
         .await;
-        assert!(result.unwrap_err().to_string().contains("event stream ended"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("event stream ended"));
         assert_eq!(poison_log.decisions(), [Settlement::Term]);
         assert_eq!(a_log.decisions(), [Settlement::Ack]);
         assert_eq!(b_log.decisions(), [Settlement::Ack]);

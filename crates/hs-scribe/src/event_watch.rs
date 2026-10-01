@@ -1156,14 +1156,10 @@ mod tests {
     #[tokio::test]
     async fn a_panicking_handler_terminates_its_event_and_the_subscriber_keeps_running() {
         let bus = Arc::new(FakeBus::default());
-        let (poison, poison_log) = Event::recording(
-            "papers.ingested",
-            br#"{"key":"poison.pdf"}"#.to_vec(),
-        );
-        let (good_a, a_log) =
-            Event::recording("papers.ingested", br#"{"key":"a.pdf"}"#.to_vec());
-        let (good_b, b_log) =
-            Event::recording("papers.ingested", br#"{"key":"b.pdf"}"#.to_vec());
+        let (poison, poison_log) =
+            Event::recording("papers.ingested", br#"{"key":"poison.pdf"}"#.to_vec());
+        let (good_a, a_log) = Event::recording("papers.ingested", br#"{"key":"a.pdf"}"#.to_vec());
+        let (good_b, b_log) = Event::recording("papers.ingested", br#"{"key":"b.pdf"}"#.to_vec());
         *bus.to_consume.lock().unwrap() = vec![good_a, poison, good_b];
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in = seen.clone();
@@ -1181,7 +1177,10 @@ mod tests {
             }
         })
         .await;
-        assert!(result.unwrap_err().to_string().contains("event stream ended"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("event stream ended"));
         use hs_common::event_bus::Settlement;
         assert_eq!(poison_log.decisions(), [Settlement::Term]);
         assert_eq!(a_log.decisions(), [Settlement::Ack]);

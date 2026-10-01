@@ -139,7 +139,9 @@ mod tests {
                 .await
                 .unwrap();
             let status = response.status();
-            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
             (status, String::from_utf8_lossy(&body).into_owned())
         }
 

@@ -173,7 +173,7 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
 // ── Scribe ─────────────────────────────────────────────────────
 
 async fn serve_scribe(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+    let cfg = hs_scribe::config::ScribeConfig::load()?;
     if !cfg.local_server {
         anyhow::bail!(
             "local_server is disabled in scribe config. \
@@ -214,7 +214,7 @@ async fn serve_distill(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
 async fn serve_mcp(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     reporter.status("Serve", &format!("mcp on port {port}"));
 
-    let binary = find_mcp_binary().ok_or_else(|| {
+    let binary = find_mcp_binary()?.ok_or_else(|| {
         anyhow::anyhow!(
             "hs-mcp binary not found. Build with:\n  \
              HS_RELEASE_TAG=<tag> cargo build --release -p hs-mcp"
@@ -964,12 +964,12 @@ fn check_system_service_conflict(service_type: &str) -> Result<()> {
 
 // ── Helpers ────────────────────────────────────────────────────
 
-pub(crate) fn find_mcp_binary() -> Option<PathBuf> {
+pub(crate) fn find_mcp_binary() -> Result<Option<PathBuf>> {
     // Check ~/.local/bin (install script location)
     if let Some(home) = dirs::home_dir() {
         let path = home.join(".local/bin/hs-mcp");
         if path.exists() {
-            return Some(path);
+            return Ok(Some(path));
         }
     }
     // Check next to the current binary
@@ -977,19 +977,19 @@ pub(crate) fn find_mcp_binary() -> Option<PathBuf> {
         if let Some(dir) = exe.parent() {
             let path = dir.join("hs-mcp");
             if path.exists() {
-                return Some(path);
+                return Ok(Some(path));
             }
         }
     }
     // Check cargo target dirs (dev builds)
-    let project = hs_common::resolve_project_dir();
+    let project = hs_common::resolve_project_dir()?;
     for profile in ["release", "debug"] {
         let path = project.join("target").join(profile).join("hs-mcp");
         if path.exists() {
-            return Some(path);
+            return Ok(Some(path));
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]

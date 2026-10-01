@@ -60,7 +60,9 @@ fn build_with_sessions(
         // Outermost: a handler panic is a 500 and the server keeps serving.
         // (A panic inside an rmcp tool call runs on the session's worker
         // task, not this request: it ends that task, not the process.)
-        .layer(middleware::from_fn(hs_common::panic_guard::http::catch_panic));
+        .layer(middleware::from_fn(
+            hs_common::panic_guard::http::catch_panic,
+        ));
     (router, sessions)
 }
 

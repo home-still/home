@@ -230,7 +230,7 @@ fn hidden_dir() -> PathBuf {
 }
 
 async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+    let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
     let scribe_compose = hidden_dir().join("docker-compose.yml");
     let distill_compose = hidden_dir().join("docker-compose-distill.yml");
 
@@ -343,7 +343,7 @@ async fn assert_distill_cuda(base_url: &str) -> Result<()> {
 }
 
 async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+    let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
     let scribe_compose = hidden_dir().join("docker-compose.yml");
     if scribe_cfg.local_server && scribe_compose.exists() {
         let url = local_service_url(scribe_cfg.servers.iter().map(|s| s.url.as_str()), "scribe")?;

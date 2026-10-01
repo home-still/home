@@ -53,8 +53,7 @@ async fn async_main() -> Result<()> {
 
     // No fallback: a malformed `distill_server:` section or a bad
     // HS_DISTILL_* value stops the start instead of running on defaults.
-    let config =
-        DistillServerConfig::load().context("loading the distill server configuration")?;
+    let config = DistillServerConfig::load().context("loading the distill server configuration")?;
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid distill_server config: {e}"))?;
@@ -115,8 +114,8 @@ async fn async_main() -> Result<()> {
 async fn install_logging() -> hs_common::logging::LoggingHandle {
     use hs_common::logging::{self, StderrOutput};
     const SERVICE: &str = "hs-distill-server";
-    let sections =
-        logging::load_config_sections().unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));
+    let sections = logging::load_config_sections()
+        .unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));
     let cfg = sections
         .logging_config(SERVICE, StderrOutput::EnvFilter("info".into()))
         .unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));

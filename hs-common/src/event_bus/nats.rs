@@ -104,10 +104,7 @@ impl NatsYaml {
     ///
     /// An auth variable that is unset or empty is an error naming the
     /// variable, never a connection without credentials.
-    pub fn connection(
-        &self,
-        env: impl Fn(&str) -> Option<String>,
-    ) -> anyhow::Result<NatsConfig> {
+    pub fn connection(&self, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<NatsConfig> {
         self.validate()
             .map_err(|e| anyhow::anyhow!("events.nats: {e}"))?;
         let secret = |key: &str, var: &str| -> anyhow::Result<String> {
@@ -456,7 +453,10 @@ mod tests {
         assert_eq!(stream.next().await.unwrap().unwrap().payload, b"two");
         let err = stream.next().await.unwrap().unwrap_err().to_string();
         assert!(err.contains("consumer deleted"), "{err}");
-        assert!(stream.next().await.is_none(), "the error must end the stream");
+        assert!(
+            stream.next().await.is_none(),
+            "the error must end the stream"
+        );
         assert!(stream.next().await.is_none(), "and stay ended");
     }
 
@@ -471,12 +471,10 @@ mod tests {
             .await
             .expect("the error must arrive without waiting for the broker");
         assert!(first.unwrap().is_err());
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), stream.next())
-                .await
-                .expect("ended, not pending")
-                .is_none()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("ended, not pending")
+            .is_none());
     }
 
     #[tokio::test]
@@ -489,8 +487,10 @@ mod tests {
     }
 
     fn yaml(extra: &str) -> NatsYaml {
-        serde_yaml_ng::from_str(&format!("url: nats://broker.example.internal:4222\n{extra}"))
-            .unwrap()
+        serde_yaml_ng::from_str(&format!(
+            "url: nats://broker.example.internal:4222\n{extra}"
+        ))
+        .unwrap()
     }
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -498,7 +498,12 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        move |name| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
     }
 
     #[test]
@@ -595,7 +600,10 @@ mod tests {
             (
                 NatsAuth::None,
                 NatsTls {
-                    client_cert_and_key: Some(("/nonexistent/c.pem".into(), "/nonexistent/k.pem".into())),
+                    client_cert_and_key: Some((
+                        "/nonexistent/c.pem".into(),
+                        "/nonexistent/k.pem".into(),
+                    )),
                     ..NatsTls::default()
                 },
                 "tls_client_cert",
@@ -606,8 +614,15 @@ mod tests {
                 tls,
                 ..NatsConfig::default()
             };
-            let err = connect_options(&cfg).await.err().expect("must fail").to_string();
-            assert!(err.contains(needle) && err.contains("/nonexistent/"), "{err}");
+            let err = connect_options(&cfg)
+                .await
+                .err()
+                .expect("must fail")
+                .to_string();
+            assert!(
+                err.contains(needle) && err.contains("/nonexistent/"),
+                "{err}"
+            );
         }
     }
 

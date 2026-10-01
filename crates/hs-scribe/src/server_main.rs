@@ -32,6 +32,13 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let logging_handle = install_logging().await;
+    let args = Args::parse();
+
+    // No fallback: a malformed `scribe_server:` section, a bad HS_SCRIBE_*
+    // value or a setting the server cannot run with stops the start (before
+    // anything heavy is initialised).
+    let config = AppConfig::load().context("loading the scribe server configuration")?;
+
     // libonnxruntime defaults to "warning" verbosity, which floods the log with
     // shape-inference noise (logical_and_0.tmp_0.0, fill_constant_27.tmp_0.0)
     // for every page. The only API in ort 2.0.0-rc.11 to silence this on the
@@ -40,11 +47,6 @@ async fn async_main() -> Result<()> {
     if let Ok(env) = ort::environment::get_environment() {
         env.set_log_level(ort::logging::LogLevel::Error);
     }
-    let args = Args::parse();
-
-    // No fallback: a malformed `scribe_server:` section, a bad HS_SCRIBE_*
-    // value or a setting the server cannot run with stops the start.
-    let config = AppConfig::load().context("loading the scribe server configuration")?;
 
     let backend_url = match config.backend {
         hs_scribe::config::BackendChoice::OpenAi => &config.openai_url,
@@ -78,8 +80,8 @@ async fn async_main() -> Result<()> {
 async fn install_logging() -> hs_common::logging::LoggingHandle {
     use hs_common::logging::{self, StderrOutput};
     const SERVICE: &str = "hs-scribe-server";
-    let sections =
-        logging::load_config_sections().unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));
+    let sections = logging::load_config_sections()
+        .unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));
     let cfg = sections
         .logging_config(SERVICE, StderrOutput::EnvFilter("info".into()))
         .unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));

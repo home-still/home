@@ -62,7 +62,11 @@ impl fmt::Display for ConfigError {
                 "cannot locate {CONFIG_REL_PATH}: the home directory is unknown (is $HOME set?)"
             ),
             Self::Unreadable { path, source } => {
-                write!(f, "{}: cannot read the config file: {source}", path.display())
+                write!(
+                    f,
+                    "{}: cannot read the config file: {source}",
+                    path.display()
+                )
             }
             Self::Malformed { path, reason } => {
                 write!(f, "{}: not a valid config file: {reason}", path.display())
@@ -71,7 +75,11 @@ impl fmt::Display for ConfigError {
                 path,
                 section,
                 reason,
-            } => write!(f, "{}: invalid `{section}` section: {reason}", path.display()),
+            } => write!(
+                f,
+                "{}: invalid `{section}` section: {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -127,12 +135,7 @@ impl ConfigFile {
         let (exists, root) = match std::fs::read_to_string(&path) {
             Ok(text) => (true, parse_root(&path, &text)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, Mapping::new()),
-            Err(source) => {
-                return Err(ConfigError::Unreadable {
-                    path,
-                    source,
-                })
-            }
+            Err(source) => return Err(ConfigError::Unreadable { path, source }),
         };
         Ok(Self {
             home: home.to_path_buf(),
@@ -356,7 +359,10 @@ mod tests {
             file.log_dir().unwrap(),
             home.path().join("home-still").join("logs")
         );
-        assert!(file.section::<serde_yaml_ng::Value>("storage").unwrap().is_none());
+        assert!(file
+            .section::<serde_yaml_ng::Value>("storage")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

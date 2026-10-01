@@ -272,15 +272,19 @@ mod tests {
         assert!(EventBusConfig::from_file(&write("storage: {}\n"))
             .unwrap()
             .is_none());
-        assert!(EventBusConfig::from_file(&write("events:\n  backend: noop\n"))
-            .unwrap()
-            .is_some());
+        assert!(
+            EventBusConfig::from_file(&write("events:\n  backend: noop\n"))
+                .unwrap()
+                .is_some()
+        );
         for bad in [
             "events:\n  nats: {url: nats://x}\n",
             "events: nats\n",
             "events:\n  backend: nats\n  nats:\n    user: only-a-user\n",
         ] {
-            let err = EventBusConfig::from_file(&write(bad)).unwrap_err().to_string();
+            let err = EventBusConfig::from_file(&write(bad))
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("`events`"), "{bad}: {err}");
         }
     }

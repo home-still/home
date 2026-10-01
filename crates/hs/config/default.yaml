@@ -78,12 +78,16 @@ storage:
   #   allow_http: true
 
 # --- Event bus (cross-node notifications) ------------------------------
-# `noop` drops publishes and never yields events — the default, which keeps
-# the legacy filesystem-watcher flow untouched.
+# `noop` is an explicit choice: it drops publishes and can NEVER be consumed
+# from, so watchers, the scribe inbox and pipeline commands refuse to run on it.
 # `nats` connects to a NATS server; pairs with `hs scribe watch-events` and
 # `hs distill watch-events` to run the event-driven pipeline.
+# Required: omitting `events.backend` makes watchers/inbox/pipeline commands
+# refuse to run.
 events:
+  # Set to nats to run the event-driven pipeline (example below).
   backend: noop           # noop | nats
+  # backend: nats
   # nats:
   #   url: nats://three:4222
 
@@ -109,3 +113,10 @@ scribe:
   # Scribe servers (PDFs are load-balanced across all servers)
   servers:
     - http://localhost:7433
+
+# --- Distill (semantic indexing / search) ---
+# `distill.servers` is REQUIRED by the distill and pipeline commands; there
+# is no built-in server address. Example:
+# distill:
+#   servers:
+#     - http://localhost:7434

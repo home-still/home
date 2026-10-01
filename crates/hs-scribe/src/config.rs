@@ -887,7 +887,10 @@ mod tests {
         assert_eq!(cfg.convert_timeout_secs, 1234);
         assert_eq!(cfg.output_dir, PathBuf::from("/srv/hs/markdown"));
         let urls: Vec<_> = cfg.servers.iter().map(|s| s.url.as_str()).collect();
-        assert_eq!(urls, ["http://host-a.example:7433", "http://host-b.example:7435"]);
+        assert_eq!(
+            urls,
+            ["http://host-a.example:7433", "http://host-b.example:7435"]
+        );
         assert_eq!(cfg.servers[1].backend, "olmocr");
         assert_eq!(cfg.servers[1].concurrency, 2);
         assert_eq!(
@@ -916,7 +919,10 @@ mod tests {
         })
         .unwrap_err()
         .to_string();
-        assert!(err.to_ascii_lowercase().contains("convert_timeout_secs"), "{err}");
+        assert!(
+            err.to_ascii_lowercase().contains("convert_timeout_secs"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -924,7 +930,10 @@ mod tests {
         for (yaml, section) in [
             ("scribe:\n  convert_timeout_secs: soon\n", "scribe"),
             ("scribe:\n  servers: not-a-list\n", "scribe"),
-            ("scribe:\n  timeout_policy:\n    floor_secs: 4000\n    ceiling_secs: 3600\n", "scribe"),
+            (
+                "scribe:\n  timeout_policy:\n    floor_secs: 4000\n    ceiling_secs: 3600\n",
+                "scribe",
+            ),
             ("storage:\n  backend: carrier-pigeon\n", "storage"),
             ("events:\n  backend: carrier-pigeon\n", "events"),
             ("events:\n  nats: {url: nats://x:4222}\n", "events"),
@@ -944,27 +953,46 @@ mod tests {
             "scribe:\n  vlm_concurrency: 99\nscribe_server:\n  vlm_concurrency: 9\n  backend: OpenAi\n  openai_url: http://llm.example:8080\n",
         ));
         let cfg = with_env(&[], || AppConfig::from_file(&file)).unwrap();
-        assert_eq!(cfg.vlm_concurrency, 9, "the scribe: section is the client's");
+        assert_eq!(
+            cfg.vlm_concurrency, 9,
+            "the scribe: section is the client's"
+        );
         assert_eq!(cfg.backend, BackendChoice::OpenAi);
         assert_eq!(cfg.openai_url, "http://llm.example:8080");
 
         let cfg = with_env(
-            &[("HS_SCRIBE_VLM_CONCURRENCY", "3"), ("HS_SCRIBE_CONVERTER", "olmocr")],
+            &[
+                ("HS_SCRIBE_VLM_CONCURRENCY", "3"),
+                ("HS_SCRIBE_CONVERTER", "olmocr"),
+            ],
             || AppConfig::from_file(&file),
         )
         .unwrap();
         assert_eq!(cfg.vlm_concurrency, 3);
         assert_eq!(cfg.converter, ConverterMode::Olmocr);
-        assert_eq!(cfg.backend, BackendChoice::OpenAi, "untouched keys keep the file's value");
+        assert_eq!(
+            cfg.backend,
+            BackendChoice::OpenAi,
+            "untouched keys keep the file's value"
+        );
     }
 
     #[test]
     fn a_bad_server_setting_stops_the_load_wherever_it_comes_from() {
         let (_home, ok) = home_with(Some("scribe_server:\n  vlm_concurrency: 9\n"));
         for (vars, what) in [
-            (vec![("HS_SCRIBE_VLM_CONCURRENCY", "many")], "env value of the wrong type"),
-            (vec![("HS_SCRIBE_VLM_CONCURRENCY", "0")], "env value the server cannot run with"),
-            (vec![("HS_SCRIBE_BACKEND", "sglang")], "env backend that does not exist"),
+            (
+                vec![("HS_SCRIBE_VLM_CONCURRENCY", "many")],
+                "env value of the wrong type",
+            ),
+            (
+                vec![("HS_SCRIBE_VLM_CONCURRENCY", "0")],
+                "env value the server cannot run with",
+            ),
+            (
+                vec![("HS_SCRIBE_BACKEND", "sglang")],
+                "env backend that does not exist",
+            ),
         ] {
             let err = with_env(&vars, || AppConfig::from_file(&ok)).expect_err(what);
             assert!(err.to_string().contains("scribe_server"), "{what}: {err}");

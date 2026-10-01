@@ -798,7 +798,7 @@ async fn restart_compose_services(reporter: &Arc<dyn Reporter>) -> Result<(u32, 
         .unwrap_or_default()
         .join(hs_common::HIDDEN_DIR);
 
-    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+    let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
 
     let mut compose_files: Vec<(&str, std::path::PathBuf)> = Vec::new();
     if scribe_cfg.local_server {

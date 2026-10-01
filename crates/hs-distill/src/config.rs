@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use figment::{providers::{Env, Serialized}, Figment};
+use figment::{
+    providers::{Env, Serialized},
+    Figment,
+};
 use hs_common::config_file::{ConfigError, ConfigFile};
 use hs_common::event_bus::{EventBus, EventBusConfig};
 use hs_common::hardware_profile::HardwareProfile;
@@ -901,7 +904,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(loaded.port, 7555);
-        assert_eq!(loaded.qdrant_data_dir, std::path::PathBuf::from("/srv/hs/data/qdrant"));
+        assert_eq!(
+            loaded.qdrant_data_dir,
+            std::path::PathBuf::from("/srv/hs/data/qdrant")
+        );
     }
 
     #[test]
@@ -923,7 +929,10 @@ mod tests {
         })
         .unwrap_err()
         .to_string();
-        assert!(err.contains("distill_server") && err.to_ascii_lowercase().contains("port"), "{err}");
+        assert!(
+            err.contains("distill_server") && err.to_ascii_lowercase().contains("port"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -991,7 +1000,10 @@ mod tests {
             "distill:\n  servers: [http://host-a.example:7434]\n  index_timeout_secs: 600\nevents:\n  backend: noop\n",
         ));
         let cfg = with_env(&[], || DistillClientConfig::from_file(&file)).unwrap();
-        assert_eq!(cfg.require_servers().unwrap(), ["http://host-a.example:7434"]);
+        assert_eq!(
+            cfg.require_servers().unwrap(),
+            ["http://host-a.example:7434"]
+        );
         assert_eq!(cfg.index_timeout_secs, 600);
         assert!(cfg.events.is_some());
     }
@@ -1003,7 +1015,10 @@ mod tests {
             ("distill:\n  index_timeout_secs: 0\n", "distill"),
             ("storage:\n  backend: carrier-pigeon\n", "storage"),
             ("events:\n  backend: carrier-pigeon\n", "events"),
-            ("events:\n  backend: nats\n  nats:\n    ack_wait_secs: 100\n", "distill"),
+            (
+                "events:\n  backend: nats\n  nats:\n    ack_wait_secs: 100\n",
+                "distill",
+            ),
         ] {
             let (_home, file) = home_with(Some(yaml));
             let err = with_env(&[], || DistillClientConfig::from_file(&file))

@@ -490,7 +490,9 @@ mod tests {
         home
     }
 
-    fn sections(home: &tempfile::TempDir) -> Result<ConfigSections, crate::config_file::ConfigError> {
+    fn sections(
+        home: &tempfile::TempDir,
+    ) -> Result<ConfigSections, crate::config_file::ConfigError> {
         sections_of(&crate::config_file::ConfigFile::load_in(home.path())?)
     }
 
