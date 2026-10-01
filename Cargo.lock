@@ -2337,6 +2337,7 @@ dependencies = [
  "paper",
  "percent-encoding",
  "personal",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",

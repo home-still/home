@@ -20,6 +20,7 @@ use rmcp::{
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
 
+mod http_app;
 #[cfg(test)]
 mod testkit;
 #[cfg(test)]
@@ -3540,16 +3541,57 @@ impl ServerHandler for HomeStillMcp {
 #[derive(Parser)]
 #[command(name = "hs-mcp", version = env!("HS_VERSION"))]
 struct Args {
-    /// Run as HTTP/SSE server on this address (default: stdio mode)
+    /// Run as HTTP/SSE server on this address (default: stdio mode). The HTTP
+    /// transport requires HS_BACKEND_TOKEN (at least 32 bytes): every request
+    /// must carry `Authorization: Bearer <HS_BACKEND_TOKEN>`.
     /// Example: --serve 127.0.0.1:7445
     #[arg(long)]
     serve: Option<String>,
+    /// HTTP only: drop an MCP session after this many seconds without any
+    /// message. Must exceed the longest tool call that sends no progress.
+    #[arg(long, default_value_t = http_app::DEFAULT_SESSION_IDLE_TIMEOUT.as_secs())]
+    session_idle_timeout_secs: u64,
+}
+
+/// How this process talks MCP, resolved before anything is started so that a
+/// misconfiguration stops the process instead of running it half-protected.
+enum Transport {
+    Stdio,
+    Http {
+        addr: String,
+        token: hs_common::auth::backend::BackendToken,
+        session_idle_timeout: std::time::Duration,
+    },
+}
+
+impl Transport {
+    /// `env` looks a variable up (the process environment in `main`).
+    fn resolve(
+        args: &Args,
+        env: impl Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> anyhow::Result<Self> {
+        let Some(addr) = args.serve.clone() else {
+            return Ok(Self::Stdio);
+        };
+        anyhow::ensure!(
+            args.session_idle_timeout_secs > 0,
+            "--session-idle-timeout-secs must be greater than zero"
+        );
+        let token = hs_common::auth::backend::BackendToken::from_lookup(env)
+            .map_err(|e| e.context("refusing to serve MCP over HTTP without a backend token"))?;
+        Ok(Self::Http {
+            addr,
+            token,
+            session_idle_timeout: std::time::Duration::from_secs(args.session_idle_timeout_secs),
+        })
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = hs_common::secrets::load_default_secrets();
     let args = Args::parse();
+    let transport = Transport::resolve(&args, |name| std::env::var(name))?;
 
     // In stdio mode, stdout is the MCP protocol — never write human-readable
     // lines to stderr either, so logs are spool-only and ship to the logs
@@ -3558,41 +3600,21 @@ async fn main() -> anyhow::Result<()> {
 
     let server = HomeStillMcp::new().await?;
 
-    let result: anyhow::Result<()> = if let Some(addr) = args.serve {
-        tracing::info!("Starting MCP SSE server on {addr}");
-
-        use rmcp::transport::streamable_http_server::{
-            session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
-        };
-
-        // Default rmcp session config times out idle sessions; the Mac dashboard
-        // holds an SSE connection open between `hs status` refreshes, so we
-        // disable the idle timeout.
-        let mut session_manager = LocalSessionManager::default();
-        session_manager.session_config.keep_alive = None;
-
-        let service = StreamableHttpService::new(
-            move || Ok(server.clone()),
-            std::sync::Arc::new(session_manager),
-            StreamableHttpServerConfig::default(),
-        );
-
-        let router = axum::Router::new().fallback_service(service);
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-        tracing::info!("MCP server listening on {addr}");
-
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async {
-                tokio::signal::ctrl_c().await.ok();
-            })
-            .await?;
-        Ok(())
-    } else {
-        // stdio mode: standard MCP transport
-        let transport = rmcp::transport::io::stdio();
-        let ct = rmcp::service::serve_server(server, transport).await?;
-        let _ = ct.waiting().await;
-        Ok(())
+    let result: anyhow::Result<()> = match transport {
+        Transport::Http {
+            addr,
+            token,
+            session_idle_timeout,
+        } => {
+            tracing::info!("Starting MCP HTTP server on {addr}");
+            http_app::serve(&addr, http_app::build(server, token, session_idle_timeout)).await
+        }
+        Transport::Stdio => {
+            let transport = rmcp::transport::io::stdio();
+            let ct = rmcp::service::serve_server(server, transport).await?;
+            let _ = ct.waiting().await;
+            Ok(())
+        }
     };
 
     let _ = logging_handle.shutdown().await;
@@ -3722,6 +3744,72 @@ mod startup_tests {
             msg.contains("storage"),
             "error should mention storage; got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::{Args, Transport};
+    use clap::Parser;
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    fn args(extra: &[&str]) -> Args {
+        Args::parse_from(std::iter::once("hs-mcp").chain(extra.iter().copied()))
+    }
+
+    fn env_with(
+        value: Option<&'static str>,
+    ) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+        move |name| match value {
+            Some(v) if name == "HS_BACKEND_TOKEN" => Ok(v.to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        }
+    }
+
+    /// RA-24: the network-facing transport must not come up unprotected.
+    #[test]
+    fn http_refuses_to_start_without_a_backend_token() {
+        let err = Transport::resolve(&args(&["--serve", "127.0.0.1:0"]), env_with(None))
+            .err()
+            .expect("must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HS_BACKEND_TOKEN"), "{msg}");
+    }
+
+    #[test]
+    fn http_refuses_a_short_token_without_printing_it() {
+        let err = Transport::resolve(
+            &args(&["--serve", "127.0.0.1:0"]),
+            env_with(Some("correct-horse-battery")),
+        )
+        .err()
+        .expect("must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HS_BACKEND_TOKEN"), "{msg}");
+        assert!(!msg.contains("correct-horse"), "the secret leaked: {msg}");
+    }
+
+    #[test]
+    fn http_starts_with_a_valid_token() {
+        let transport =
+            Transport::resolve(&args(&["--serve", "127.0.0.1:0"]), env_with(Some(SECRET))).unwrap();
+        assert!(matches!(transport, Transport::Http { .. }));
+    }
+
+    #[test]
+    fn stdio_does_not_need_a_token() {
+        let transport = Transport::resolve(&args(&[]), env_with(None)).unwrap();
+        assert!(matches!(transport, Transport::Stdio));
+    }
+
+    #[test]
+    fn a_zero_session_timeout_is_refused() {
+        let result = Transport::resolve(
+            &args(&["--serve", "127.0.0.1:0", "--session-idle-timeout-secs", "0"]),
+            env_with(Some(SECRET)),
+        );
+        assert!(result.is_err());
     }
 }
 
