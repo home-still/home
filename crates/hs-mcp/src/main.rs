@@ -20,6 +20,11 @@ use rmcp::{
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
 
+#[cfg(test)]
+mod testkit;
+#[cfg(test)]
+mod tool_tests;
+
 // ── Tool parameter types ────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -258,14 +263,16 @@ struct DistillReconcileParams {
     #[schemars(description = "If true, report orphans without deleting. Default: true.")]
     #[serde(default = "default_true")]
     dry_run: bool,
-    #[schemars(description = "Maximum number of doc_ids to scan. Default: 100000.")]
+    #[schemars(
+        description = "Maximum number of doc_ids to check for missing markdown. Default: every doc_id in the collection."
+    )]
     #[serde(default)]
     limit: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DistillReindexParams {
-    #[schemars(description = "Paper stem name (filename without extension) to purge and re-index")]
+    #[schemars(description = "Paper stem name (filename without extension) to re-index")]
     stem: String,
 }
 
@@ -545,7 +552,6 @@ fn duckdb_value_to_json(v: duckdb::types::Value) -> serde_json::Value {
 // ── MCP Server ──────────────────────────────────────────────────
 
 #[derive(Clone)]
-#[allow(dead_code)]
 struct HomeStillMcp {
     // Primary read-path handle: Storage trait (local fs or Garage/S3).
     storage: Arc<dyn Storage>,
@@ -556,13 +562,6 @@ struct HomeStillMcp {
     catalog_prefix: String,
     markdown_prefix: String,
     papers_prefix: String,
-    // TODO: We should remove legacy code, this is a grienfield project.
-    // Legacy filesystem paths used only by mutation handlers that bridge to
-    // external server binaries expecting local paths (scribe_convert,
-    // distill_index). Derived from `home.project_dir` in config.
-    legacy_papers_dir: std::path::PathBuf,
-    legacy_markdown_dir: std::path::PathBuf,
-    legacy_catalog_dir: std::path::PathBuf,
     scribe_servers: Vec<String>,
     scribe_convert_timeout: std::time::Duration,
     distill_servers: Vec<String>,
@@ -572,6 +571,30 @@ struct HomeStillMcp {
     openalex_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
+}
+
+/// Everything a [`HomeStillMcp`] is built from. `HomeStillMcp::new` fills it
+/// from the config files; tests fill it with fakes.
+struct Deps {
+    storage: Arc<dyn Storage>,
+    events: Arc<dyn EventBus>,
+    scribe_servers: Vec<String>,
+    scribe_convert_timeout: std::time::Duration,
+    distill_servers: Vec<String>,
+    openalex_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
+}
+
+/// See [`HomeStillMcp::probe_markdown`].
+struct MarkdownProbe {
+    key: String,
+    present: bool,
+    catalog: Option<hs_common::catalog::CatalogEntry>,
+}
+
+/// Serialize a tool result. A serialization failure is a tool error, never
+/// an empty "success".
+fn to_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, String> {
+    serde_json::to_string_pretty(value).map_err(|e| format!("serializing the result failed: {e}"))
 }
 
 impl HomeStillMcp {
@@ -631,6 +654,26 @@ impl HomeStillMcp {
             .ok()
             .map(|conn| Arc::new(std::sync::Mutex::new(conn)));
 
+        Ok(Self::from_deps(Deps {
+            storage,
+            events,
+            scribe_servers,
+            scribe_convert_timeout: std::time::Duration::from_secs(scribe_cfg.convert_timeout_secs),
+            distill_servers,
+            openalex_db,
+        }))
+    }
+
+    fn from_deps(deps: Deps) -> Self {
+        let Deps {
+            storage,
+            events,
+            scribe_servers,
+            scribe_convert_timeout,
+            distill_servers,
+            openalex_db,
+        } = deps;
+
         // Gate: check the readiness sentinel BEFORE building the tool
         // router. If the openalex corpus isn't fully loaded + indexed + FTS'd,
         // strip the 5 `openalex_*` tools from the router so they don't show
@@ -666,22 +709,19 @@ impl HomeStillMcp {
             tracing::info!("openalex corpus ready; openalex_* tools enabled");
         }
 
-        Ok(Self {
+        Self {
             storage,
             events,
             catalog_prefix: "catalog".to_string(),
             markdown_prefix: hs_common::markdown::MARKDOWN_PREFIX.to_string(),
             papers_prefix: "papers".to_string(),
-            legacy_papers_dir: scribe_cfg.watch_dir.clone(),
-            legacy_markdown_dir: scribe_cfg.output_dir.clone(),
-            legacy_catalog_dir: scribe_cfg.catalog_dir.clone(),
             scribe_servers,
-            scribe_convert_timeout: std::time::Duration::from_secs(scribe_cfg.convert_timeout_secs),
+            scribe_convert_timeout,
             distill_servers,
             openalex_db,
             tool_router,
             prompt_router: Self::prompt_router(),
-        })
+        }
     }
 
     fn scribe_client(&self) -> anyhow::Result<Option<hs_scribe::client::ScribeClient>> {
@@ -699,6 +739,84 @@ impl HomeStillMcp {
             Some(url) => Ok(Some(hs_distill::client::DistillClient::new(url)?)),
             None => Ok(None),
         }
+    }
+
+    /// What storage says about a document's markdown: the key the object
+    /// lives (or would live) at, whether it is there, and the catalog row
+    /// read on the way. Every storage error is returned; "absent" only ever
+    /// means the backend answered "not found".
+    async fn probe_markdown(&self, stem: &str) -> Result<MarkdownProbe, String> {
+        // The catalog row first: its `markdown_path` is the exact key scribe
+        // wrote, which re-deriving via `sharded_key` can miss (stems with
+        // apostrophes or percent-encoded bytes, pre-rc.241 unsharded rows).
+        let catalog =
+            hs_common::catalog::read_catalog_entry_via(&*self.storage, &self.catalog_prefix, stem)
+                .await
+                .map_err(|e| format!("catalog read for '{stem}' failed: {e:#}"))?;
+        let key = hs_common::markdown::resolve_markdown_key_verified(
+            &*self.storage,
+            &self.markdown_prefix,
+            stem,
+            catalog.as_ref().and_then(|e| e.markdown_path.as_deref()),
+        )
+        .await
+        .map_err(|e| format!("resolving the markdown key for '{stem}' failed: {e:#}"))?;
+        let present = self
+            .storage
+            .exists(&key)
+            .await
+            .map_err(|e| format!("checking markdown '{key}' for '{stem}' failed: {e:#}"))?;
+        Ok(MarkdownProbe {
+            key,
+            present,
+            catalog,
+        })
+    }
+
+    /// [`Self::probe_markdown`] for callers that need the document: absent
+    /// markdown is an error.
+    async fn existing_markdown(
+        &self,
+        stem: &str,
+    ) -> Result<(String, Option<hs_common::catalog::CatalogEntry>), String> {
+        let probe = self.probe_markdown(stem).await?;
+        if !probe.present {
+            return Err(format!(
+                "Markdown not found for '{stem}' at storage key '{}'. Convert the PDF first.",
+                probe.key
+            ));
+        }
+        Ok((probe.key, probe.catalog))
+    }
+
+    /// Stamp the catalog with the outcome of an index call (`embedding` on
+    /// chunks, `embedding_skip` on zero), so the catalog tells "indexed" from
+    /// "tried and skipped" from "never tried". The vectors are already in
+    /// Qdrant when this runs; a failed stamp is an error so the caller knows
+    /// the row is stale (the index call is idempotent, so a retry repairs it).
+    async fn stamp_embedding(
+        &self,
+        stem: &str,
+        result: &hs_distill::client::IndexResult,
+    ) -> Result<(), String> {
+        hs_common::catalog::record_embedding_outcome_via(
+            &*self.storage,
+            &self.catalog_prefix,
+            stem,
+            self.distill_servers
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or(""),
+            result.chunks_indexed,
+            &result.embedding_device,
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "'{stem}' was indexed ({} chunks) but the catalog embedding stamp failed: {e:#}",
+                result.chunks_indexed
+            )
+        })
     }
 }
 
@@ -2135,68 +2253,18 @@ impl HomeStillMcp {
             .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
-        // Load the catalog entry first so we can prefer the exact key scribe
-        // wrote (`markdown_path`). Re-deriving via `sharded_key` is unsafe
-        // for stems with apostrophes or percent-encoded bytes — the derived
-        // key can silently miss the stored object. Fall back to re-derivation
-        // only for pre-rc.241 rows that predate the `markdown_path` field.
-        let catalog_entry = hs_common::catalog::read_catalog_entry_via(
-            &*self.storage,
-            &self.catalog_prefix,
-            &p.stem,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let (key, catalog_entry) = self.existing_markdown(&p.stem).await?;
 
-        let key = hs_common::markdown::resolve_markdown_key_verified(
-            &*self.storage,
-            &self.markdown_prefix,
-            &p.stem,
-            catalog_entry
-                .as_ref()
-                .and_then(|e| e.markdown_path.as_deref()),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        if !self.storage.exists(&key).await.unwrap_or(false) {
-            return Err(format!(
-                "Markdown not found for '{}' at storage key '{key}'. Convert the PDF first.",
-                p.stem
-            ));
-        }
-
-        match client
+        let result = client
             .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
             .await
-        {
-            Ok(result) => {
-                // Stamp embedding on success or embedding_skip on a 0-chunk return,
-                // so the catalog distinguishes "indexed" from "tried-and-skipped"
-                // from "never tried."
-                if let Err(e) = hs_common::catalog::record_embedding_outcome_via(
-                    &*self.storage,
-                    &self.catalog_prefix,
-                    &p.stem,
-                    self.distill_servers
-                        .first()
-                        .map(|s| s.as_str())
-                        .unwrap_or(""),
-                    result.chunks_indexed,
-                    &result.embedding_device,
-                )
-                .await
-                {
-                    tracing::warn!("embedding catalog update failed for {}: {e}", p.stem);
-                }
-                Ok(serde_json::to_string_pretty(&serde_json::json!({
-                    "stem": p.stem,
-                    "chunks_indexed": result.chunks_indexed,
-                    "embedding_device": result.embedding_device,
-                }))
-                .unwrap_or_default())
-            }
-            Err(e) => Err(format!("Indexing failed: {e}")),
-        }
+            .map_err(|e| format!("Indexing failed for '{}': {e:#}", p.stem))?;
+        self.stamp_embedding(&p.stem, &result).await?;
+        to_json(&serde_json::json!({
+            "stem": p.stem,
+            "chunks_indexed": result.chunks_indexed,
+            "embedding_device": result.embedding_device,
+        }))
     }
 
     // distill_purge: removed in rc.306. Bulk-delete is CLI-only via
@@ -2224,46 +2292,37 @@ impl HomeStillMcp {
             .distill_client()
             .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
-        let limit = p.limit.unwrap_or(100_000);
+        // The client refuses a partial list (a missing id would read as a
+        // document that was never indexed), so ask for everything the server
+        // can return; `limit` only caps how many of those ids are checked.
         let doc_ids = client
-            .list_docs(limit)
+            .list_docs(hs_distill::client::MAX_DOC_LIST_LIMIT)
             .await
-            .map_err(|e| format!("list_docs failed: {e}"))?;
+            .map_err(|e| format!("list_docs failed: {e:#}"))?;
+        let scan_cap = p.limit.map_or(usize::MAX, |l| l as usize);
 
         let mut orphans: Vec<String> = Vec::new();
-        for doc_id in &doc_ids {
-            let catalog_entry = hs_common::catalog::read_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                doc_id,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            let key = hs_common::markdown::resolve_markdown_key_verified(
-                &*self.storage,
-                &self.markdown_prefix,
-                doc_id,
-                catalog_entry
-                    .as_ref()
-                    .and_then(|e| e.markdown_path.as_deref()),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            if !self.storage.exists(&key).await.unwrap_or(false) {
+        let mut scanned = 0usize;
+        for doc_id in doc_ids.iter().take(scan_cap) {
+            // A storage error here is an error: reporting it as "markdown
+            // missing" would hand the operator a false orphan to purge.
+            let probe = self.probe_markdown(doc_id).await?;
+            if !probe.present {
                 orphans.push(doc_id.clone());
             }
+            scanned += 1;
         }
 
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        to_json(&serde_json::json!({
             "dry_run": true,
             "mcp_forced_dry_run": true,
             "apply_hint": "use `hs distill reconcile --reembed` or `hs distill purge <doc_id>` (CLI-only) for the delete path",
-            "scanned_doc_ids": doc_ids.len(),
+            "total_doc_ids": doc_ids.len(),
+            "scanned_doc_ids": scanned,
             "orphan_count": orphans.len(),
             "orphans": orphans,
             "points_deleted": 0,
         }))
-        .unwrap_or_default())
     }
 
     #[tool(
@@ -2344,10 +2403,10 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Purge all vectors for a document and re-index it from storage with fresh catalog metadata. Use to fix documents with null/wrong metadata or stale embeddings.",
+        description = "Re-index a document from storage with fresh catalog metadata, replacing its vectors in place: the new chunks are upserted and stale tail chunks are removed only after the index succeeded, so a failure leaves the previous vectors untouched. Use to fix documents with null/wrong metadata or stale embeddings. Nothing is deleted up front; there is no purge step.",
         annotations(
             read_only_hint = false,
-            destructive_hint = true,
+            destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
         )
@@ -2361,66 +2420,21 @@ impl HomeStillMcp {
             .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
-        let deleted = client
-            .delete_doc(&p.stem)
-            .await
-            .map_err(|e| format!("Purge failed for '{}': {e}", p.stem))?;
-
-        // Read the catalog BEFORE resolving the key so we pick up the
-        // canonical markdown_path for pre-rc.241 unsharded rows.
-        let catalog_entry = hs_common::catalog::read_catalog_entry_via(
-            &*self.storage,
-            &self.catalog_prefix,
-            &p.stem,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let key = hs_common::markdown::resolve_markdown_key_verified(
-            &*self.storage,
-            &self.markdown_prefix,
-            &p.stem,
-            catalog_entry
-                .as_ref()
-                .and_then(|e| e.markdown_path.as_deref()),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        if !self.storage.exists(&key).await.unwrap_or(false) {
-            return Err(format!(
-                "Purged {deleted} old vectors but markdown not found at '{key}'. Convert the paper first.",
-            ));
-        }
-
+        // Verify the markdown and read the fresh catalog row BEFORE talking
+        // to the vector store. Every failure on the way is returned as is.
+        let (key, catalog_entry) = self.existing_markdown(&p.stem).await?;
         let result = client
             .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
             .await
-            .map_err(|e| format!("Re-index failed for '{}': {e}", p.stem))?;
+            .map_err(|e| format!("Re-index failed for '{}': {e:#}", p.stem))?;
+        self.stamp_embedding(&p.stem, &result).await?;
 
-        if let Err(e) = hs_common::catalog::record_embedding_outcome_via(
-            &*self.storage,
-            &self.catalog_prefix,
-            &p.stem,
-            self.distill_servers
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or(""),
-            result.chunks_indexed,
-            &result.embedding_device,
-        )
-        .await
-        {
-            tracing::warn!("embedding catalog update failed for {}: {e}", p.stem);
-        }
-
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        to_json(&serde_json::json!({
             "stem": p.stem,
-            "old_vectors_purged": deleted,
             "chunks_indexed": result.chunks_indexed,
             "embedding_device": result.embedding_device,
             "has_catalog": catalog_entry.is_some(),
         }))
-        .unwrap_or_default())
     }
 
     #[tool(
@@ -2482,52 +2496,22 @@ impl HomeStillMcp {
         let mut errors: Vec<String> = Vec::new();
 
         for stem in take {
-            let catalog_entry = hs_common::catalog::read_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                stem,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            let key = match hs_common::markdown::resolve_markdown_key_verified(
-                &*self.storage,
-                &self.markdown_prefix,
-                stem,
-                catalog_entry
-                    .as_ref()
-                    .and_then(|e| e.markdown_path.as_deref()),
-            )
-            .await
-            {
-                Ok(key) => key,
+            // Every per-document failure is reported in `errors` with its
+            // cause; a storage error is never turned into "markdown missing".
+            let (key, catalog_entry) = match self.existing_markdown(stem).await {
+                Ok(found) => found,
                 Err(e) => {
-                    errors.push(format!("{stem}: {e:#}"));
+                    errors.push(format!("{stem}: {e}"));
                     continue;
                 }
             };
-            if !self.storage.exists(&key).await.unwrap_or(false) {
-                errors.push(format!("{stem}: markdown missing at {key}"));
-                continue;
-            }
             match client
                 .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
                 .await
             {
                 Ok(result) => {
-                    if let Err(e) = hs_common::catalog::record_embedding_outcome_via(
-                        &*self.storage,
-                        &self.catalog_prefix,
-                        stem,
-                        self.distill_servers
-                            .first()
-                            .map(|s| s.as_str())
-                            .unwrap_or(""),
-                        result.chunks_indexed,
-                        &result.embedding_device,
-                    )
-                    .await
-                    {
-                        errors.push(format!("{stem}: catalog stamp failed: {e}"));
+                    if let Err(e) = self.stamp_embedding(stem, &result).await {
+                        errors.push(format!("{stem}: {e}"));
                     }
                     if result.chunks_indexed > 0 {
                         indexed += 1;
@@ -2535,11 +2519,11 @@ impl HomeStillMcp {
                         still_skipped += 1;
                     }
                 }
-                Err(e) => errors.push(format!("{stem}: {e}")),
+                Err(e) => errors.push(format!("{stem}: {e:#}")),
             }
         }
 
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        to_json(&serde_json::json!({
             "candidates": total,
             "indexed": indexed,
             "still_skipped": still_skipped,
@@ -2547,7 +2531,6 @@ impl HomeStillMcp {
             "samples": sample,
             "dry_run": false,
         }))
-        .unwrap_or_default())
     }
 
     // ── Personal Tools ─────────────────────────────────────────

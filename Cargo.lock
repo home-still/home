@@ -2322,6 +2322,7 @@ name = "hs-mcp"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.8.8",
  "chrono",
  "clap",
