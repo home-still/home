@@ -39,19 +39,29 @@ distill_server:
   collection_name: academic_papers
 ```
 
-All fields have defaults and are optional. The defaults are:
+All fields have defaults and are optional. The server refuses to start on an invalid configuration (it names the key). The defaults are:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `host` | `0.0.0.0` | Bind address |
-| `port` | `7434` | HTTP port |
+| `host` | `0.0.0.0` | Bind address (the `--host` flag wins) |
+| `port` | `7434` | HTTP port (the `--port` flag wins; `hs serve distill --port` sets `HS_DISTILL_PORT`) |
 | `qdrant_url` | `http://localhost:6334` | Qdrant gRPC endpoint |
 | `qdrant_data_dir` | `{project_dir}/data/qdrant` | Qdrant storage on disk |
-| `collection_name` | `academic_papers` | Qdrant collection name |
-| `embedding.model` | `bge-m3` | Embedding model |
-| `embedding.dimension` | `1024` | Vector dimension |
+| `collection_name` | `academic_papers` | Default Qdrant collection |
+| `collections` | `[paper_abstracts, personal_docs]` | Further collections requests may name. Every configured collection is created/verified at startup; a request naming any other collection gets HTTP 400 and nothing is created. |
+| `embedding.dimension` | `1024` | Expected vector width. Checked against what the model actually returns at startup; a mismatch is a startup error. |
+| `embedding.max_length` | `1280` | Tokens the model sees per text (longer input is truncated by the tokenizer). `chunk_max_tokens + 48` must fit. Raising it costs VRAM per batch, so `embedding.batch_size` is capped at `128 x 512^2 / max_length^2` rows (32 rows at 1024, 20 at 1280). Max 8192. |
+| `embedding.batch_size` | `32` (capped) | Rows per forward pass; at least 1 |
+| `embedding.pool_size` | `1` | Model copies; at least 1 |
+| `hnsw.m` / `hnsw.ef_construct` | `16` / `100` | HNSW graph of **new** collections (`m: 0` is rejected) |
+| `hnsw.search_ef` | `128` | Candidates considered per query |
 | `chunk_max_tokens` | `1000` | Max tokens per chunk |
-| `chunk_overlap` | `100` | Token overlap between chunks |
+| `chunk_overlap` | `100` | Token overlap between chunks (must be smaller than `chunk_max_tokens`) |
+| `llm_metadata` | `false` | Extract keywords/topics with Ollama (`ollama_url` incl. port, `metadata_model`, `ollama_timeout_secs: 120`); a failed call fails that document |
+
+Removed keys `embedding.model` and `embedding.sparse_enabled` have no effect (the model is fixed and embeddings are dense-only); the server logs a warning if they are still set.
+
+**Collections created before the HNSW settings existed were built with HNSW off (`m: 0`)**: every query is a brute-force scan. The server reports such a collection at ERROR level on every start and does not change it, because enabling HNSW makes Qdrant index the whole corpus. Vectors indexed before `embedding.max_length` existed were truncated at 512 tokens and need a re-embed to cover the tail of each chunk.
 
 Environment variable overrides use the `HS_DISTILL_` prefix (e.g., `HS_DISTILL_PORT=7434`).
 
@@ -112,6 +122,7 @@ distill:
 | `servers` | `["http://localhost:7434"]` | Distill server URL(s); overridden by gateway registry when available |
 | `markdown_dir` | `{project_dir}/markdown` | Where to find `.md` files |
 | `catalog_dir` | `{project_dir}/catalog` | Where to find catalog `.yaml` files |
+| `index_timeout_secs` | `1800` | Deadline for one indexing request. With NATS events it must be at least 120 s below `events.nats.ack_wait_secs` (default 7200). |
 
 Server discovery uses the gateway service registry when available, falling back to the configured server list.
 
@@ -122,7 +133,7 @@ hs distill index                        # index all markdown files
 hs distill index --file doc1.md doc2.md # index specific files
 ```
 
-The client reads each `.md` file locally and sends its content to the server for chunking, embedding, and storage. Files are identified by their stem name (e.g., `paper.md` becomes doc_id `paper`).
+The client reads each `.md` file locally and sends its content to the server for chunking, embedding, and storage. Files are identified by their stem name (e.g., `paper.md` becomes doc_id `paper`). The server never reads documents from disk: a request without `content` is rejected with HTTP 400. Re-indexing a document replaces all of its chunks (including ones past the new end), and a document that is skipped (empty, an anti-bot stub, nothing passes the quality filter) has its old chunks removed.
 
 Indexing can also be triggered automatically: `hs scribe watch` auto-starts the distill indexer when new conversions complete, so newly converted markdown is embedded without a separate manual step.
 
@@ -148,19 +159,23 @@ Each markdown file goes through:
 
 1. **Chunking** -- split at sentence boundaries with configurable max tokens and overlap. Page-aware (respects `---` page separators from scribe).
 2. **Metadata extraction** -- pulls title, authors, DOI, year from catalog YAML + regex patterns. Optional LLM extraction for keywords/topics via Ollama.
-3. **Embedding** -- BGE-M3 via ONNX (fastembed). 1024-dimensional dense vectors.
-4. **Qdrant upsert** -- deterministic point IDs (xxhash + UUID v5) enable idempotent re-indexing. Rich payload with full metadata for filtered search.
+3. **Embedding** -- BGE-M3 via ONNX (fastembed) on CUDA. 1024-dimensional dense vectors. A panic inside ONNX Runtime poisons its model slot; `/health` reports it and the process exits so the supervisor restarts it.
+4. **Qdrant upsert** -- deterministic point IDs (xxhash + UUID v5) enable idempotent re-indexing; chunks past the document's new end are deleted after the upsert succeeds. Rich payload with full metadata for filtered search.
 
 ## API endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Server status and compute device |
-| `/readiness` | GET | Ready status + in-flight request count |
-| `/status` | GET | Collection stats (points, documents, device) |
-| `/distill` | POST | Index a document (non-streaming) |
-| `/distill/stream` | POST | Index with NDJSON streaming progress |
-| `/search` | POST | Semantic search with optional filters |
+| `/health` | GET | 200 with server status; 503 if the embedder is unusable or Qdrant is unreachable |
+| `/readiness` | GET | `ready` (embedder healthy and Qdrant answering), `capacity` (embedder slots), `in_flight`, `reason`; 503 when not ready |
+| `/status` | GET | Collection stats (points, documents, device); `documents_count_truncated` if the count hit 1,000,000 |
+| `/distill` | POST | Index a document (non-streaming). `content` is required |
+| `/distill/stream` | POST | Index with NDJSON streaming progress. `content` is required |
+| `/search` | POST | Semantic search with optional filters. `limit` defaults to 10 and is clamped to 200; an unparseable `year` filter is a 400 |
+| `/exists/{doc_id}`, `/docs` | GET | Per-document chunk count; distinct doc ids (`limit` up to 1,000,000, larger is a 400; `truncated` flags a partial list) |
+| `/doc/{doc_id}`, `/collection/reset`, `/scrub-interstitials` | DELETE / POST | Destructive maintenance. **Unauthenticated** (RA-26 auth pending): do not expose the port beyond trusted hosts |
+
+Client errors (bad input, unknown collection) are HTTP 400; a missing dependency is 503; anything else is 500.
 
 ## Building from source
 
