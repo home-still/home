@@ -112,7 +112,9 @@ impl Config {
     /// instead. A `HOME_STILL_PERSONAL_*` variable that names no key is an
     /// error.
     pub fn load() -> Result<Self> {
-        let home = dirs::home_dir().ok_or(ConfigError::NoHomeDir).map_err(config_error)?;
+        let home = dirs::home_dir()
+            .ok_or(ConfigError::NoHomeDir)
+            .map_err(config_error)?;
         let user = ConfigFile::load_in(&home).map_err(config_error)?;
         let system =
             ConfigFile::load_at(Path::new(SYSTEM_CONFIG_PATH), &home).map_err(config_error)?;
@@ -218,8 +220,7 @@ mod tests {
                 std::fs::write(path, yaml).unwrap();
             }
             let user = ConfigFile::load_in(&home).unwrap();
-            let system =
-                ConfigFile::load_at(Path::new("/nonexistent/config.yaml"), &home).unwrap();
+            let system = ConfigFile::load_at(Path::new("/nonexistent/config.yaml"), &home).unwrap();
             out = Some(Config::load_from(&system, &user));
             Ok(())
         });
@@ -236,7 +237,10 @@ mod tests {
                 ("HOME_STILL_PERSONAL_STORAGE_DIR", "scans"),
                 ("HOME_STILL_PERSONAL_COLLECTION_NAME", "my_docs"),
                 ("HOME_STILL_PERSONAL_NAMING_MAX_INPUT_TOKENS", "512"),
-                ("HOME_STILL_PERSONAL_NAMING_OLLAMA_URL", "http://llm.example:11434"),
+                (
+                    "HOME_STILL_PERSONAL_NAMING_OLLAMA_URL",
+                    "http://llm.example:11434",
+                ),
                 ("HOME_STILL_PERSONAL_INGEST_INBOX", "drop"),
             ],
         )
@@ -253,8 +257,15 @@ mod tests {
     fn env_beats_the_file_and_the_file_beats_the_default() {
         let yaml = "personal:\n  storage_dir: from_file\n  naming:\n    model: file-model\n";
         let c = load_yaml(Some(yaml), &[]).unwrap();
-        assert_eq!((c.storage_dir.as_str(), c.naming.model.as_str()), ("from_file", "file-model"));
-        let c = load_yaml(Some(yaml), &[("HOME_STILL_PERSONAL_STORAGE_DIR", "from_env")]).unwrap();
+        assert_eq!(
+            (c.storage_dir.as_str(), c.naming.model.as_str()),
+            ("from_file", "file-model")
+        );
+        let c = load_yaml(
+            Some(yaml),
+            &[("HOME_STILL_PERSONAL_STORAGE_DIR", "from_env")],
+        )
+        .unwrap();
         assert_eq!(c.storage_dir, "from_env");
         assert_eq!(c.naming.model, "file-model");
     }

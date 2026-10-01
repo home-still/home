@@ -39,7 +39,6 @@ fn known_keys() -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::Value::Object(root))
 }
 
-
 /// A `HOME_STILL_PAPER_*` variable that matches no `paper.*` key is a typo
 /// that would otherwise be silently ignored.
 fn reject_unknown_paper_env(tree: &serde_json::Value) -> anyhow::Result<()> {
@@ -159,11 +158,10 @@ impl Config {
         );
 
         let shown = user.path().display();
-        let mut config: Config = figment
-            .clone()
-            .focus("paper")
-            .extract()
-            .with_context(|| format!("Failed to parse config ({shown}).  Run: hs config init"))?;
+        let mut config: Config =
+            figment.clone().focus("paper").extract().with_context(|| {
+                format!("Failed to parse config ({shown}).  Run: hs config init")
+            })?;
 
         config.storage = if figment.contains("storage") {
             figment
@@ -760,7 +758,10 @@ mod tests {
             ("storage: [1, 2]\n", "storage"),
             ("events:\n  backend: carrier-pigeon\n", "events"),
             ("events:\n  nats:\n    url: nats://x:4222\n", "events"),
-            ("events:\n  backend: nats\n  nats:\n    user: only-a-user\n", "events"),
+            (
+                "events:\n  backend: nats\n  nats:\n    user: only-a-user\n",
+                "events",
+            ),
             ("paper:\n  download:\n    timeout_secs: soon\n", "paper"),
         ] {
             let err = format!("{:#}", load_yaml(Some(yaml)).expect_err(yaml));
