@@ -401,6 +401,25 @@ fn a_partition_without_data_files_fails_instead_of_logging_ok() {
 }
 
 #[test]
+fn a_gz_partition_loads_like_a_jsonl_one() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let f = fixture();
+    let dir = f.snap.join("works").join(NEW);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut enc = GzEncoder::new(
+        std::fs::File::create(dir.join("part_0000.gz")).unwrap(),
+        Compression::default(),
+    );
+    writeln!(enc, "{}", work(1, "from gz", None)).unwrap();
+    enc.finish().unwrap();
+    let stats = f.load().unwrap();
+    assert_eq!(stats.rows_inserted, 1);
+    assert_eq!(f.titles(), [("W1".to_string(), "from gz".to_string())]);
+}
+
+#[test]
 fn a_truncated_gz_file_fails_the_partition() {
     use flate2::write::GzEncoder;
     use flate2::Compression;
