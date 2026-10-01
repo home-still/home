@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CatalogEntry {
@@ -285,123 +284,26 @@ pub fn resolve_page_accounting(md_pages: u64, source_pages: Option<u32>) -> Page
     }
 }
 
-/// Read an existing catalog entry, or return None if it doesn't exist.
-pub fn read_catalog_entry(catalog_dir: &Path, stem: &str) -> Option<CatalogEntry> {
-    let path = crate::sharded_path(catalog_dir, stem, "yaml");
-    let contents = std::fs::read_to_string(&path).ok()?;
-    serde_yaml_ng::from_str(&contents).ok()
-}
-
-/// Write a catalog entry to disk. Errors (disk full, permission denied,
-/// missing parent dir we couldn't create, serde failure) propagate — no
-/// silent discard of the `Result` (rc.306 P0-9).
-pub fn write_catalog_entry(
-    catalog_dir: &Path,
-    stem: &str,
-    entry: &CatalogEntry,
-) -> std::io::Result<()> {
-    let path = crate::sharded_path(catalog_dir, stem, "yaml");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let yaml = serde_yaml_ng::to_string(entry)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&path, yaml)
-}
-
-/// Update only the conversion section of an existing catalog entry.
-/// If no entry exists, creates a minimal one with just conversion metadata.
-#[allow(clippy::too_many_arguments)]
-pub fn update_conversion_catalog(
-    catalog_dir: &Path,
-    stem: &str,
-    server: &str,
-    duration_secs: f64,
-    total_pages: u64,
-    pages: Vec<PageOffset>,
-    markdown_path: &str,
-    converted_by: Option<String>,
-    attempts_log: Vec<AttemptEntry>,
-) -> std::io::Result<()> {
-    let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
-
-    entry.markdown_path = Some(markdown_path.to_string());
-    entry.conversion = Some(ConversionMeta {
-        server: server.to_string(),
-        duration_secs,
-        total_pages,
-        converted_at: chrono::Utc::now().to_rfc3339(),
-        pages,
-        converted_by,
-        attempts_log,
-    });
-
-    write_catalog_entry(catalog_dir, stem, &entry)
-}
-
-/// Update only the embedding section of an existing catalog entry.
-/// If no entry exists, creates a minimal one with just embedding metadata.
-/// Returns early when `chunks_indexed == 0` so nothing gets stamped unless
-/// Qdrant actually received points.
-pub fn update_embedding_catalog(
-    catalog_dir: &Path,
-    stem: &str,
-    server: &str,
-    chunks_indexed: u32,
-    compute_device: &str,
-) -> std::io::Result<()> {
-    if chunks_indexed == 0 {
-        return Ok(());
-    }
-    let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
-
-    entry.embedding = Some(EmbeddingMeta {
-        server: server.to_string(),
-        chunks_indexed,
-        compute_device: compute_device.to_string(),
-        embedded_at: chrono::Utc::now().to_rfc3339(),
-    });
-
-    write_catalog_entry(catalog_dir, stem, &entry)
-}
-
-/// Stamp the `paper_abstracts` embed result onto a catalog entry. Called
-/// by `hs distill abstracts build` after the embed + Qdrant upsert succeed.
-/// `source` is `"openalex"`, `"markdown"`, or `"title_only"` — matches the
-/// `AbstractSource` enum's serialized form in hs-distill.
-pub fn update_abstract_embed_catalog(
-    catalog_dir: &Path,
-    stem: &str,
-    source: &str,
-    abstract_chars: u32,
-) -> std::io::Result<()> {
-    let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
-
-    entry.abstract_embed = Some(AbstractEmbedStamp {
-        source: source.to_string(),
-        abstract_chars,
-        embedded_at: chrono::Utc::now().to_rfc3339(),
-    });
-
-    write_catalog_entry(catalog_dir, stem, &entry)
-}
-
-// ── Storage-backed variants ─────────────────────────────────────────────
+// ── Storage-backed catalog access ───────────────────────────────────────
 //
-// These mirror the path-based helpers above but read and write via the
-// `Storage` trait, so callers can point at either a local filesystem or an
-// Garage/S3 bucket with the same code. `prefix` is the sub-path inside the
-// storage backend where catalog YAMLs live (e.g. "catalog" for a local
-// backend rooted at the project dir, or "" for a dedicated `catalog` bucket).
+// The only way to read or write catalog rows: everything goes through the
+// `Storage` trait, so callers point at either a local filesystem or an
+// Garage/S3 bucket with the same code, and every stamp helper shares one
+// read-modify-write kernel (`read_catalog_entry_via`, which refuses to turn
+// a corrupt or unreadable row into an empty one). `prefix` is the sub-path
+// inside the storage backend where catalog YAMLs live (e.g. "catalog" for a
+// local backend rooted at the project dir, or "" for a dedicated `catalog`
+// bucket).
 
 #[cfg(feature = "storage")]
-fn catalog_key(prefix: &str, stem: &str) -> String {
+fn catalog_key(prefix: &str, stem: &str) -> anyhow::Result<String> {
+    crate::validate_stem(stem).map_err(|e| anyhow::anyhow!("catalog stem {stem:?}: {e}"))?;
     let key = crate::sharded_key(stem, "yaml");
-    if prefix.is_empty() {
+    Ok(if prefix.is_empty() {
         key
     } else {
         format!("{}/{}", prefix.trim_end_matches('/'), key)
-    }
+    })
 }
 
 /// Read a catalog entry through storage. Distinguishes three states:
@@ -417,7 +319,7 @@ pub async fn read_catalog_entry_via(
     prefix: &str,
     stem: &str,
 ) -> anyhow::Result<Option<CatalogEntry>> {
-    let key = catalog_key(prefix, stem);
+    let key = catalog_key(prefix, stem)?;
     // Prefer `head` to distinguish absent (Ok(None)) from a storage-layer
     // failure — `get` surfaces both as Err, which is exactly the ambiguity
     // we're trying to eliminate.
@@ -437,7 +339,7 @@ pub async fn write_catalog_entry_via(
     stem: &str,
     entry: &CatalogEntry,
 ) -> anyhow::Result<()> {
-    let key = catalog_key(prefix, stem);
+    let key = catalog_key(prefix, stem)?;
     let yaml = serde_yaml_ng::to_string(entry)?;
     storage.put(&key, yaml.into_bytes()).await
 }
@@ -448,7 +350,7 @@ pub async fn delete_catalog_entry_via(
     prefix: &str,
     stem: &str,
 ) -> anyhow::Result<()> {
-    let key = catalog_key(prefix, stem);
+    let key = catalog_key(prefix, stem)?;
     storage.delete(&key).await
 }
 
@@ -729,17 +631,6 @@ pub async fn update_embedding_skip_via(
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
 
-/// Path-variant of `update_embedding_skip_via` for the local-CLI flows that
-/// still walk the filesystem directly.
-pub fn update_embedding_skip(catalog_dir: &Path, stem: &str, reason: &str) -> std::io::Result<()> {
-    let mut entry = read_catalog_entry(catalog_dir, stem).unwrap_or_default();
-    entry.embedding_skip = Some(EmbeddingSkip {
-        reason: reason.to_string(),
-        at: chrono::Utc::now().to_rfc3339(),
-    });
-    write_catalog_entry(catalog_dir, stem, &entry)
-}
-
 #[cfg(feature = "storage")]
 pub async fn update_embedding_catalog_via(
     storage: &dyn crate::storage::Storage,
@@ -766,7 +657,11 @@ pub async fn update_embedding_catalog_via(
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
 
-/// Storage-backed sibling of [`update_abstract_embed_catalog`].
+/// Stamp the `paper_abstracts` embed result onto a catalog entry. Called
+/// by `hs distill abstracts build` after the embed + Qdrant upsert succeed.
+/// `source` is `"openalex"`, `"markdown"`, or `"title_only"` — matches the
+/// `AbstractSource` enum's serialized form in hs-distill.
+#[cfg(feature = "storage")]
 pub async fn update_abstract_embed_catalog_via(
     storage: &dyn crate::storage::Storage,
     prefix: &str,
@@ -1108,26 +1003,84 @@ conversion:
         );
     }
 
-    #[test]
-    fn write_catalog_entry_surfaces_io_errors() {
-        // Pointing write at a file path as the "directory" forces
-        // create_dir_all to error — exactly the class of failure that the
-        // pre-P0-9 `let _ = ...` shrugged off. We need the error to
-        // propagate.
+    #[tokio::test]
+    async fn write_catalog_entry_surfaces_io_errors() {
+        // Pointing the storage root at a regular file forces `create_dir_all`
+        // to error — exactly the class of failure that the pre-P0-9
+        // `let _ = ...` shrugged off. We need the error to propagate.
         let tmp = tempfile::tempdir().unwrap();
         let sentinel = tmp.path().join("not-a-dir");
         std::fs::write(&sentinel, b"blocking file\n").unwrap();
-        // `sentinel` is a file; using it as catalog_dir means create_dir_all
-        // on a subpath fails with NotADirectory/AlreadyExists.
+        let storage = LocalFsStorage::new(&sentinel);
         let entry = CatalogEntry {
             title: Some("doomed".into()),
             ..Default::default()
         };
-        let res = write_catalog_entry(&sentinel, "abcdef", &entry);
+        let res = write_catalog_entry_via(&storage, "", "abcdef", &entry).await;
         assert!(
             res.is_err(),
             "write into a path blocked by a regular file must error"
         );
+    }
+
+    /// RA-29: every stamp helper reads through `read_catalog_entry_via`, so a
+    /// corrupt row is an error — never a fresh near-empty row written over
+    /// the top of it.
+    #[tokio::test]
+    async fn stamping_a_corrupt_row_errors_and_leaves_it_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let key = format!("catalog/{}", crate::sharded_key("corrupt", "yaml"));
+        let garbage = b"{{ not valid yaml ::: at all }}\n".to_vec();
+        storage.put(&key, garbage.clone()).await.unwrap();
+
+        update_embedding_skip_via(&storage, "catalog", "corrupt", "why")
+            .await
+            .unwrap_err();
+        update_embedding_catalog_via(&storage, "catalog", "corrupt", "srv", 3, "cuda")
+            .await
+            .unwrap_err();
+        update_abstract_embed_catalog_via(&storage, "catalog", "corrupt", "openalex", 10)
+            .await
+            .unwrap_err();
+        update_conversion_failed_via(&storage, "catalog", "corrupt", "bad", Vec::new())
+            .await
+            .unwrap_err();
+        update_conversion_catalog_via(
+            &storage,
+            "catalog",
+            "corrupt",
+            "srv",
+            1.0,
+            1,
+            Vec::new(),
+            "markdown/co/corrupt.md",
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(storage.get(&key).await.unwrap(), garbage);
+    }
+
+    /// A stem that is not a single file-name component never reaches storage.
+    #[tokio::test]
+    async fn catalog_rejects_stems_that_escape_the_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        for stem in ["", ".", "..", "a/b", "../x", "a\\b"] {
+            read_catalog_entry_via(&storage, "catalog", stem)
+                .await
+                .expect_err(stem);
+            write_catalog_entry_via(&storage, "catalog", stem, &CatalogEntry::default())
+                .await
+                .expect_err(stem);
+            delete_catalog_entry_via(&storage, "catalog", stem)
+                .await
+                .expect_err(stem);
+        }
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

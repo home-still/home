@@ -1222,13 +1222,16 @@ async fn cmd_index_daemon(
             Ok(result) => {
                 status.total_chunks += result.chunks_indexed;
                 status.indexed += 1;
-                if let Err(e) = hs_common::catalog::update_embedding_catalog(
-                    &catalog_dir,
+                if let Err(e) = hs_common::catalog::update_embedding_catalog_via(
+                    &hs_common::storage::LocalFsStorage::new(&catalog_dir),
+                    "",
                     stem,
                     &servers[0],
                     result.chunks_indexed,
                     &result.embedding_device,
-                ) {
+                )
+                .await
+                {
                     tracing::warn!("{stem}: embedding stamp write failed: {e}");
                 }
             }

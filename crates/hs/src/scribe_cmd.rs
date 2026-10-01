@@ -979,6 +979,7 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let scribe_cfg = ScribeConfig::load().unwrap_or_default();
     let markdown_dir = &scribe_cfg.output_dir;
     let catalog_dir = &scribe_cfg.catalog_dir;
+    let catalog_store = hs_common::storage::LocalFsStorage::new(catalog_dir);
     let papers_dir = &scribe_cfg.watch_dir;
 
     let entries = hs_common::collect_files_recursive(markdown_dir, "md");
@@ -993,7 +994,11 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
             .unwrap_or_default();
 
         // Skip if catalog entry already exists
-        if hs_common::catalog::read_catalog_entry(catalog_dir, stem).is_some() {
+        if hs_common::catalog::read_catalog_entry_via(&catalog_store, "", stem)
+            .await
+            .with_context(|| format!("read catalog {stem}.yaml"))?
+            .is_some()
+        {
             skipped += 1;
             continue;
         }
@@ -1054,7 +1059,8 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
             ..Default::default()
         };
 
-        hs_common::catalog::write_catalog_entry(catalog_dir, stem, &entry)
+        hs_common::catalog::write_catalog_entry_via(&catalog_store, "", stem, &entry)
+            .await
             .with_context(|| format!("write catalog {stem}.yaml"))?;
         created += 1;
     }

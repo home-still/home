@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use hs_common::catalog::{read_catalog_entry, PageOffset};
+use hs_common::catalog::PageOffset;
 
 use crate::chunker::{chunk_markdown, ChunkerConfig};
 use crate::client::DistillProgress;
@@ -134,7 +134,13 @@ pub async fn index_document(
                 .and_then(|p| p.parent())
                 .map(|p| p.join("catalog"))
                 .unwrap_or_default();
-            read_catalog_entry(&catalog_dir, stem)
+            hs_common::catalog::read_catalog_entry_via(
+                &hs_common::storage::LocalFsStorage::new(catalog_dir),
+                "",
+                stem,
+            )
+            .await
+            .map_err(|e| DistillError::Metadata(format!("catalog read failed for {stem}: {e:#}")))?
         }
     };
     let page_offsets: Vec<PageOffset> = catalog_entry
