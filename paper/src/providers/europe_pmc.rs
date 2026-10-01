@@ -201,17 +201,29 @@ impl PaperProvider for EuropePmcProvider {
             total_results: body.hit_count,
             next_offset,
             provider: String::from("europe_pmc"),
+            provider_failures: Vec::new(),
         })
     }
 
     async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
-        let bare_doi = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
-        let url = format!(
-            "{}/webservices/rest/search?query=DOI:{}&format=json&resultType=core",
-            self.base_url, bare_doi
-        );
+        let doi = crate::stem::normalize_doi(doi)?;
 
-        let response = self.client.get(&url).send().await?;
+        // A Lucene phrase: quoting keeps `:`, `(`, spaces and friends inside
+        // a DOI from being parsed as query syntax; the whole query is then
+        // percent-encoded by the URL builder.
+        let phrase = format!("DOI:\"{}\"", doi.replace('\\', "\\\\").replace('"', "\\\""));
+        let mut url = url::Url::parse(&self.base_url)
+            .map_err(|e| PaperError::InvalidInput(format!("bad Europe PMC base_url: {e}")))?;
+        url.path_segments_mut()
+            .map_err(|_| PaperError::InvalidInput("Europe PMC base_url cannot be a base".into()))?
+            .pop_if_empty()
+            .extend(["webservices", "rest", "search"]);
+        url.query_pairs_mut()
+            .append_pair("query", &phrase)
+            .append_pair("format", "json")
+            .append_pair("resultType", "core");
+
+        let response = self.client.get(url).send().await?;
 
         check_response(&response, "europe_pmc")?;
 

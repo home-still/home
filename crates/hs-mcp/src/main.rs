@@ -723,8 +723,9 @@ impl HomeStillMcp {
 
         let provider_arg = resolve_provider_arg(p.provider.as_deref())?;
 
-        let provider = paper::commands::paper::make_provider(&provider_arg, &config)
-            .map_err(|e| format!("Provider error: {e}"))?;
+        let provider = paper::providers::set::ProviderSet::new(&config)
+            .map_err(|e| format!("Provider error: {e}"))?
+            .provider(&provider_arg);
 
         let search_type = match p.search_type.as_deref() {
             Some("title") => paper::models::SearchType::Title,
@@ -756,7 +757,16 @@ impl HomeStillMcp {
         };
 
         match provider.search_by_query(&query).await {
-            Ok(result) => Ok(serde_json::to_string_pretty(&result.papers).unwrap_or_default()),
+            // A bare array when every provider answered; an object naming the
+            // failed providers when some did not (never a silent partial).
+            Ok(result) if result.provider_failures.is_empty() => {
+                Ok(serde_json::to_string_pretty(&result.papers).unwrap_or_default())
+            }
+            Ok(result) => Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "papers": result.papers,
+                "provider_failures": result.provider_failures,
+            }))
+            .unwrap_or_default()),
             Err(e) => Err(format!("Search failed: {e}")),
         }
     }
@@ -773,9 +783,9 @@ impl HomeStillMcp {
     async fn paper_get(&self, Parameters(p): Parameters<PaperGetParams>) -> Result<String, String> {
         let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
 
-        let provider_arg = paper::cli::ProviderArg::All;
-        let provider = paper::commands::paper::make_provider(&provider_arg, &config)
-            .map_err(|e| format!("Provider error: {e}"))?;
+        let provider = paper::providers::set::ProviderSet::new(&config)
+            .map_err(|e| format!("Provider error: {e}"))?
+            .provider(&paper::cli::ProviderArg::All);
 
         match provider.get_by_doi(&p.doi).await {
             Ok(Some(paper)) => Ok(serde_json::to_string_pretty(&paper).unwrap_or_default()),
@@ -855,23 +865,10 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
 
-        // Build provider resolvers for PDF URL resolution (Semantic Scholar, Europe PMC, CORE)
-        let mut resolvers: Vec<Box<dyn paper::ports::provider::PaperProvider>> = Vec::new();
-        if let Ok(s2) = paper::providers::semantic_scholar::SemanticScholarProvider::new(
-            &config.providers.semantic_scholar,
-        ) {
-            resolvers.push(Box::new(s2));
-        }
-        if let Ok(epmc) =
-            paper::providers::europe_pmc::EuropePmcProvider::new(&config.providers.europe_pmc)
-        {
-            resolvers.push(Box::new(epmc));
-        }
-        if config.providers.core.api_key.is_some() {
-            if let Ok(core) = paper::providers::core::CoreProvider::new(&config.providers.core) {
-                resolvers.push(Box::new(core));
-            }
-        }
+        // Providers (and their rate limiters / circuit breakers) are built by
+        // `ProviderSet`; the download resolvers are its shared instances.
+        let providers = paper::providers::set::ProviderSet::new(&config)
+            .map_err(|e| format!("Provider error: {e}"))?;
 
         let storage = config
             .build_storage()
@@ -884,7 +881,7 @@ impl HomeStillMcp {
             storage,
             events,
             &config.download,
-            resolvers,
+            providers.download_resolvers(),
         )
         .map_err(|e| format!("Downloader init failed: {e}"))?;
 
@@ -906,13 +903,12 @@ impl HomeStillMcp {
         }
 
         // Look up paper metadata to populate catalog entry
-        let provider_arg = paper::cli::ProviderArg::All;
-        let paper_meta =
-            if let Ok(provider) = paper::commands::paper::make_provider(&provider_arg, &config) {
-                provider.get_by_doi(&p.doi).await.ok().flatten()
-            } else {
-                None
-            };
+        let paper_meta = providers
+            .provider(&paper::cli::ProviderArg::All)
+            .get_by_doi(&p.doi)
+            .await
+            .ok()
+            .flatten();
 
         // Write catalog entry
         let stem = result
@@ -1657,12 +1653,12 @@ impl HomeStillMcp {
             .unwrap_or_default());
         }
 
-        // Provider aggregate for metadata fan-in. Same factory `paper_download`
-        // uses, so behavior is consistent.
+        // Provider aggregate for metadata fan-in. Same `ProviderSet` factory
+        // `paper_download` uses, so behavior is consistent.
         let config = paper::config::Config::load().map_err(|e| format!("Config error: {e}"))?;
-        let provider_arg = paper::cli::ProviderArg::All;
-        let provider = paper::commands::paper::make_provider(&provider_arg, &config)
-            .map_err(|e| format!("Provider init failed: {e}"))?;
+        let provider = paper::providers::set::ProviderSet::new(&config)
+            .map_err(|e| format!("Provider init failed: {e}"))?
+            .provider(&paper::cli::ProviderArg::All);
 
         let now = chrono::Utc::now().to_rfc3339();
         let mut backfilled = 0u64;

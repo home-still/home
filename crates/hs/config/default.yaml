@@ -21,12 +21,12 @@ paper:
   # Search providers
   providers:
     arxiv:
-      base_url: http://export.arxiv.org/api/query
+      base_url: https://export.arxiv.org/api/query
       timeout_secs: 30
       rate_limit_interval_ms: 3000
 
     openalex:
-      base_url: http://api.openalex.org
+      base_url: https://api.openalex.org
       # api_key: your-key-here
       timeout_secs: 30
       rate_limit_interval_ms: 100
@@ -49,6 +49,8 @@ paper:
     # core_api_key: your-key-here
     max_concurrent: 4
     timeout_secs: 120
+    # Hard cap on one downloaded file, enforced while streaming (default 256 MiB)
+    # max_download_bytes: 268435456
 
   # Resilience patterns
   resilience:

@@ -127,14 +127,14 @@ pub struct PaperDownloader {
     papers_prefix: String,
     max_bytes: u64,
     endpoints: Endpoints,
-    resolvers: Vec<Box<dyn PaperProvider>>,
+    resolvers: Vec<Arc<dyn PaperProvider>>,
 }
 
 impl PaperDownloader {
     pub fn new(
         storage: Arc<dyn Storage>,
         config: &DownloadConfig,
-        resolvers: Vec<Box<dyn PaperProvider>>,
+        resolvers: Vec<Arc<dyn PaperProvider>>,
     ) -> Result<Self, PaperError> {
         Self::with_event_bus(storage, Arc::new(NoOpBus), config, resolvers)
     }
@@ -143,7 +143,7 @@ impl PaperDownloader {
         storage: Arc<dyn Storage>,
         events: Arc<dyn EventBus>,
         config: &DownloadConfig,
-        resolvers: Vec<Box<dyn PaperProvider>>,
+        resolvers: Vec<Arc<dyn PaperProvider>>,
     ) -> Result<Self, PaperError> {
         Self::build(
             storage,
@@ -159,7 +159,7 @@ impl PaperDownloader {
         storage: Arc<dyn Storage>,
         events: Arc<dyn EventBus>,
         config: &DownloadConfig,
-        resolvers: Vec<Box<dyn PaperProvider>>,
+        resolvers: Vec<Arc<dyn PaperProvider>>,
         policy: UrlPolicy,
         endpoints: Endpoints,
     ) -> Result<Self, PaperError> {
@@ -210,7 +210,7 @@ impl PaperDownloader {
         storage: Arc<dyn Storage>,
         events: Arc<dyn EventBus>,
         config: &DownloadConfig,
-        resolvers: Vec<Box<dyn PaperProvider>>,
+        resolvers: Vec<Arc<dyn PaperProvider>>,
         base: &str,
     ) -> Self {
         let endpoints = Endpoints {

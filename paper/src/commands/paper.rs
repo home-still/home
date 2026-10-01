@@ -4,23 +4,13 @@ use hs_common::styles::Styles;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use crate::config::Config;
-use crate::models::{Paper, SearchQuery, SearchResult, SortBy};
+use crate::models::{Paper, ProviderFailure, SearchQuery, SearchResult, SortBy};
 use crate::ports::provider::PaperProvider;
-use crate::providers::arxiv::ArxivProvider;
-use crate::providers::core::CoreProvider;
-use crate::providers::crossref::CrossRefProvider;
 use crate::providers::downloader::PaperDownloader;
-use crate::providers::europe_pmc::EuropePmcProvider;
-use crate::providers::openalex::OpenAlexProvider;
-use crate::providers::resilient::ResilientProvider;
-use crate::providers::semantic_scholar::SemanticScholarProvider;
-use crate::resilience::circuit_breaker::new_circuit_breaker;
-use crate::resilience::config::ResilienceConfig;
+use crate::providers::set::ProviderSet;
 use crate::services::download::{download_batch, DownloadEvent, OnProgress};
-use crate::services::search::AggregateProvider;
 
 use crate::cli::SortByArg;
 use crate::cli::{ProviderArg, SearchTypeArg};
@@ -44,7 +34,7 @@ pub async fn run_search(
     mode: &hs_common::mode::OutputMode,
 ) -> Result<()> {
     let config = Config::load().context("Failed to load config")?;
-    let provider = make_provider(&provider, &config)?;
+    let provider = ProviderSet::new(&config)?.provider(&provider);
 
     let stage = reporter.begin_stage("Searching", None);
     stage.set_message(&format!("{} for '{}'", provider.name(), query));
@@ -78,6 +68,7 @@ pub async fn run_search(
         .context("Search failed")?;
 
     stage.finish_and_clear();
+    warn_provider_failures(&result.provider_failures, reporter);
 
     if result.papers.is_empty() && !global.is_json() {
         reporter.warn("No papers found. Try broadening your query or removing filters.");
@@ -112,7 +103,7 @@ pub async fn run_get(
     let stage = reporter.begin_stage("Looking up", None);
     stage.set_message(&format!("DOI: {}", doi));
 
-    let provider = make_provider(&provider, &config)?;
+    let provider = ProviderSet::new(&config)?.provider(&provider);
 
     let paper = provider
         .get_by_doi(&doi)
@@ -151,25 +142,7 @@ pub async fn run_download(
 ) -> Result<()> {
     let config = Config::load().context("Failed to load config")?;
 
-    // Build lightweight provider instances for PDF resolution
-    let mut resolvers: Vec<Box<dyn PaperProvider>> = Vec::new();
-    if let Ok(s2) = SemanticScholarProvider::new(&config.providers.semantic_scholar) {
-        resolvers.push(Box::new(s2));
-    }
-    if let Ok(epmc) = EuropePmcProvider::new(&config.providers.europe_pmc) {
-        resolvers.push(Box::new(epmc));
-    }
-    if config.providers.core.api_key.is_some() {
-        if let Ok(core) = CoreProvider::new(&config.providers.core) {
-            resolvers.push(Box::new(core));
-        }
-    }
-    if let Ok(oa) = OpenAlexProvider::new(&config.providers.openalex) {
-        resolvers.push(Box::new(oa));
-    }
-    if let Ok(cr) = CrossRefProvider::new(&config.providers.crossref) {
-        resolvers.push(Box::new(cr));
-    }
+    let providers = ProviderSet::new(&config).context("Failed to create providers")?;
 
     let storage = config
         .build_storage()
@@ -178,8 +151,13 @@ pub async fn run_download(
         .build_event_bus()
         .await
         .context("Failed to build event bus")?;
-    let downloader = PaperDownloader::with_event_bus(storage, events, &config.download, resolvers)
-        .context("Failed to create downloader")?;
+    let downloader = PaperDownloader::with_event_bus(
+        storage,
+        events,
+        &config.download,
+        providers.download_resolvers(),
+    )
+    .context("Failed to create downloader")?;
     let downloader: Arc<dyn crate::ports::download_service::DownloadService> = Arc::new(downloader);
 
     if let Some(doi_str) = doi {
@@ -218,8 +196,12 @@ pub async fn run_download(
             search_stage_cb.inc(1);
         });
 
-        let provider_impl =
-            make_provider_with_search_progress(&provider, &config, on_provider_done)?;
+        let provider_impl: Arc<dyn PaperProvider> = if matches!(provider, ProviderArg::All) {
+            // Own aggregate (for the progress callback) over the shared members.
+            Arc::new(providers.aggregate().on_provider_done(on_provider_done))
+        } else {
+            providers.provider(&provider)
+        };
 
         let date_filter = parse_date_arg(date)?;
 
@@ -241,6 +223,7 @@ pub async fn run_download(
             .context("Search failed")?;
 
         search_stage.finish_and_clear();
+        warn_provider_failures(&search_result.provider_failures, reporter);
 
         let total_found = search_result.papers.len();
         if total_found == 0 {
@@ -294,6 +277,7 @@ pub async fn run_download(
             total_results: search_result.total_results,
             next_offset: search_result.next_offset,
             provider: search_result.provider,
+            provider_failures: search_result.provider_failures,
         };
 
         // Overall progress counter (ephemeral — cleared when done)
@@ -402,119 +386,11 @@ pub async fn run_download(
     Ok(())
 }
 
-fn make_resilient<P: PaperProvider + 'static>(
-    inner: P,
-    rate_limit_ms: u64,
-    resilience: &ResilienceConfig,
-) -> Box<dyn PaperProvider> {
-    let interval = Duration::from_millis(rate_limit_ms);
-    let cb = new_circuit_breaker(resilience);
-    Box::new(ResilientProvider::new(
-        Box::new(inner),
-        interval,
-        cb,
-        resilience.clone(),
-    ))
-}
-
-pub fn make_provider(provider: &ProviderArg, config: &Config) -> Result<Box<dyn PaperProvider>> {
-    make_provider_inner(provider, config, None)
-}
-
-fn make_provider_with_search_progress(
-    provider: &ProviderArg,
-    config: &Config,
-    on_done: crate::services::search::OnProviderDone,
-) -> Result<Box<dyn PaperProvider>> {
-    make_provider_inner(provider, config, Some(on_done))
-}
-
-fn make_provider_inner(
-    provider: &ProviderArg,
-    config: &Config,
-    on_done: Option<crate::services::search::OnProviderDone>,
-) -> Result<Box<dyn PaperProvider>> {
-    let r = &config.resilience;
-    let p = &config.providers;
-
-    match provider {
-        ProviderArg::Arxiv => Ok(make_resilient(
-            ArxivProvider::new(&p.arxiv).context("Failed to create arXiv provider")?,
-            p.arxiv.rate_limit_interval_ms,
-            r,
-        )),
-        ProviderArg::OpenAlex => Ok(make_resilient(
-            OpenAlexProvider::new(&p.openalex).context("Failed to create OpenAlex provider")?,
-            p.openalex.rate_limit_interval_ms,
-            r,
-        )),
-        ProviderArg::SemanticScholar => Ok(make_resilient(
-            SemanticScholarProvider::new(&p.semantic_scholar)
-                .context("Failed to create Semantic Scholar provider")?,
-            p.semantic_scholar.rate_limit_interval_ms,
-            r,
-        )),
-        ProviderArg::EuropePmc => Ok(make_resilient(
-            EuropePmcProvider::new(&p.europe_pmc)
-                .context("Failed to create Europe PMC provider")?,
-            p.europe_pmc.rate_limit_interval_ms,
-            r,
-        )),
-        ProviderArg::CrossRef => Ok(make_resilient(
-            CrossRefProvider::new(&p.crossref).context("Failed to create CrossRef provider")?,
-            p.crossref.rate_limit_interval_ms,
-            r,
-        )),
-        ProviderArg::Core => Ok(make_resilient(
-            CoreProvider::new(&p.core).context("Failed to create CORE provider")?,
-            p.core.rate_limit_interval_ms,
-            r,
-        )),
-        ProviderArg::All => {
-            let timeout = Duration::from_secs(30);
-            let aggregate = AggregateProvider::new(
-                vec![
-                    make_resilient(
-                        ArxivProvider::new(&p.arxiv).context("arXiv")?,
-                        p.arxiv.rate_limit_interval_ms,
-                        r,
-                    ),
-                    make_resilient(
-                        OpenAlexProvider::new(&p.openalex).context("OpenAlex")?,
-                        p.openalex.rate_limit_interval_ms,
-                        r,
-                    ),
-                    make_resilient(
-                        SemanticScholarProvider::new(&p.semantic_scholar)
-                            .context("Semantic Scholar")?,
-                        p.semantic_scholar.rate_limit_interval_ms,
-                        r,
-                    ),
-                    make_resilient(
-                        EuropePmcProvider::new(&p.europe_pmc).context("Europe PMC")?,
-                        p.europe_pmc.rate_limit_interval_ms,
-                        r,
-                    ),
-                    make_resilient(
-                        CrossRefProvider::new(&p.crossref).context("CrossRef")?,
-                        p.crossref.rate_limit_interval_ms,
-                        r,
-                    ),
-                    make_resilient(
-                        CoreProvider::new(&p.core).context("CORE")?,
-                        p.core.rate_limit_interval_ms,
-                        r,
-                    ),
-                ],
-                timeout,
-            );
-            let aggregate = if let Some(cb) = on_done {
-                aggregate.on_provider_done(cb)
-            } else {
-                aggregate
-            };
-            Ok(Box::new(aggregate))
-        }
+/// Print one warning line per provider that failed while others answered.
+/// (A search where *every* provider failed is an `Err`, not a warning.)
+fn warn_provider_failures(failures: &[ProviderFailure], reporter: &Arc<dyn Reporter>) {
+    for f in failures {
+        reporter.warn(&format!("{} failed: {}", f.provider, f.error));
     }
 }
 

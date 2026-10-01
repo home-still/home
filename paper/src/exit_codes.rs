@@ -9,9 +9,11 @@ pub fn from_error(err: &anyhow::Error) -> ExitCode {
             return ExitCode::from(match pfe {
                 InvalidInput(_) | NoDownloadUrl(_) => USAGE_ERROR,
                 NotFound(_) | ParseError(_) => GENERAL_ERROR,
-                Http(_) | RateLimited { .. } | ProviderUnavailable(_) | CircuitBreakerOpen(_) => {
-                    NETWORK_ERROR
-                }
+                Http(_)
+                | RateLimited { .. }
+                | ProviderUnavailable(_)
+                | CircuitBreakerOpen(_)
+                | ProvidersFailed { .. } => NETWORK_ERROR,
                 Io(_) | Storage(_) => GENERAL_ERROR,
                 UnsafeUrl { .. } | TooLarge { .. } | NotPdf { .. } => GENERAL_ERROR,
                 NoSourceYielded { sources, .. } => {

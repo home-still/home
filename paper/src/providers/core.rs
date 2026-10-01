@@ -193,18 +193,21 @@ impl PaperProvider for CoreProvider {
             total_results: body.total_hits,
             next_offset,
             provider: String::from("core"),
+            provider_failures: Vec::new(),
         })
     }
 
     async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
-        let bare_doi = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
-        let url = format!(
-            "{}/v3/search/works?q=doi:\"{}\"&limit=1",
-            self.base_url, bare_doi
-        );
+        let doi = crate::stem::normalize_doi(doi)?;
+        let phrase = format!("doi:\"{}\"", doi.replace('\\', "\\\\").replace('"', "\\\""));
+        let url = url::Url::parse_with_params(
+            &format!("{}/v3/search/works", self.base_url),
+            &[("q", phrase.as_str()), ("limit", "1")],
+        )
+        .map_err(|e| PaperError::InvalidInput(e.to_string()))?;
 
-        let mut request = self.client.get(&url);
-        if let Some(ref key) = self.api_key {
+        let mut request = self.client.get(url);
+        if let Some(key) = &self.api_key {
             request = request.header("Authorization", format!("Bearer {}", key));
         }
 

@@ -250,18 +250,26 @@ impl PaperProvider for CrossRefProvider {
             total_results: body.message.total_results,
             next_offset,
             provider: String::from("crossref"),
+            provider_failures: Vec::new(),
         })
     }
 
     async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
-        let bare_doi = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
+        let doi = crate::stem::normalize_doi(doi)?;
 
-        let mut url = format!("{}/works/{}", self.base_url, bare_doi);
-        if let Some(ref email) = self.mailto {
-            url.push_str(&format!("?mailto={}", email));
+        // DOI `/` separates path segments (Crossref takes them literally);
+        // `?`, `#`, spaces inside a DOI and the mailto are percent-encoded.
+        let mut url = url::Url::parse(&self.base_url)
+            .map_err(|e| PaperError::InvalidInput(format!("bad CrossRef base_url: {e}")))?;
+        url.path_segments_mut()
+            .map_err(|_| PaperError::InvalidInput("CrossRef base_url cannot be a base".into()))?
+            .pop_if_empty()
+            .extend(std::iter::once("works").chain(doi.split('/')));
+        if let Some(email) = &self.mailto {
+            url.query_pairs_mut().append_pair("mailto", email);
         }
 
-        let response = self.client.get(&url).send().await?;
+        let response = self.client.get(url).send().await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);

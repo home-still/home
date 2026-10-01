@@ -12,6 +12,83 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Prefix of the environment variables that override config keys.
+const ENV_PREFIX: &str = "HOME_STILL_";
+
+/// The config key tree, derived from the defaults of the three sections this
+/// crate reads (`paper`, `storage`, `events`). It is the single list of valid
+/// keys: env overrides are matched against it and nothing else.
+fn known_keys() -> anyhow::Result<serde_json::Value> {
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "paper".into(),
+        serde_json::to_value(Config::default()).context("serialize paper config defaults")?,
+    );
+    root.insert(
+        "storage".into(),
+        serde_json::to_value(StorageConfig::default()).context("serialize storage defaults")?,
+    );
+    root.insert(
+        "events".into(),
+        serde_json::to_value(EventBusConfig::default()).context("serialize events defaults")?,
+    );
+    Ok(serde_json::Value::Object(root))
+}
+
+/// `PAPER_DOWNLOAD_TIMEOUT_SECS` (an env name without its prefix) →
+/// `paper.download.timeout_secs`, by finding the way to group the
+/// `_`-separated words into keys that exists in `tree`. `None` when no
+/// grouping names a leaf.
+fn env_key_path(tree: &serde_json::Value, name: &str) -> Option<String> {
+    fn walk(node: &serde_json::Value, words: &[&str], path: &mut Vec<String>) -> bool {
+        let Some(object) = node.as_object() else {
+            return words.is_empty();
+        };
+        if words.is_empty() {
+            return false;
+        }
+        for take in 1..=words.len() {
+            let key = words[..take].join("_");
+            if let Some(child) = object.get(&key) {
+                path.push(key);
+                if walk(child, &words[take..], path) {
+                    return true;
+                }
+                path.pop();
+            }
+        }
+        false
+    }
+
+    let lowered = name.to_ascii_lowercase();
+    let words: Vec<&str> = lowered.split('_').collect();
+    let mut path = Vec::new();
+    walk(tree, &words, &mut path).then(|| path.join("."))
+}
+
+/// A `HOME_STILL_PAPER_*` variable that matches no `paper.*` key is a typo
+/// that would otherwise be silently ignored.
+fn reject_unknown_paper_env(tree: &serde_json::Value) -> anyhow::Result<()> {
+    let section = format!("{ENV_PREFIX}PAPER_");
+    let mut unknown: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| name.to_ascii_uppercase().starts_with(&section))
+        .filter(|name| {
+            name.get(ENV_PREFIX.len()..)
+                .is_some_and(|key| env_key_path(tree, key).is_none())
+        })
+        .collect();
+    unknown.sort();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "environment variable(s) {} name no paper config key (words in a key are joined by `_`, \
+         e.g. HOME_STILL_PAPER_DOWNLOAD_TIMEOUT_SECS); fix or unset them",
+        unknown.join(", ")
+    )
+}
+
 /// Main application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -62,6 +139,16 @@ impl Config {
         dirs::home_dir().map(|h| h.join(CONFIG_REL_PATH))
     }
 
+    /// Load the effective configuration: system file, user file, then
+    /// `HOME_STILL_*` environment overrides, validated.
+    ///
+    /// Environment keys name the config path with `_` between *words as well
+    /// as levels*: `HOME_STILL_PAPER_DOWNLOAD_PATH` is `paper.download_path`,
+    /// `HOME_STILL_PAPER_DOWNLOAD_TIMEOUT_SECS` is `paper.download.timeout_secs`.
+    /// A blanket `.split("_")` cannot express that (it turns
+    /// `…_TIMEOUT_SECS` into `timeout.secs`), so each variable is matched
+    /// against the known key tree instead; see [`env_key_path`]. A
+    /// `HOME_STILL_PAPER_*` variable that names no key is an error.
     pub fn load() -> anyhow::Result<Self> {
         let mut figment = Figment::new();
 
@@ -77,7 +164,13 @@ impl Config {
             }
         }
 
-        figment = figment.merge(Env::prefixed("HOME_STILL_").split("_"));
+        let keys = Arc::new(known_keys()?);
+        reject_unknown_paper_env(&keys)?;
+        let env_keys = Arc::clone(&keys);
+        figment = figment.merge(
+            Env::prefixed(ENV_PREFIX)
+                .filter_map(move |key| env_key_path(&env_keys, key.as_str()).map(Into::into)),
+        );
 
         let mut config: Config = figment.clone().focus("paper").extract().context(format!(
             "Failed to parse config ({}).  Run: hs config init",
@@ -100,7 +193,16 @@ impl Config {
         config.download_path = expand_tilde(&config.download_path);
         config.cache_path = expand_tilde(&config.cache_path);
 
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Reject settings that would panic, hang or send credentials in clear
+    /// later. Run by [`Config::load`]; call it on a hand-built `Config` too.
+    pub fn validate(&self) -> Result<(), PaperError> {
+        self.resilience.validate()?;
+        self.download.validate()?;
+        self.providers.validate()
     }
 
     /// Build the configured storage backend.
@@ -125,7 +227,7 @@ pub struct ArxivConfig {
 impl Default for ArxivConfig {
     fn default() -> Self {
         Self {
-            base_url: String::from("http://export.arxiv.org/api/query"),
+            base_url: String::from("https://export.arxiv.org/api/query"),
             timeout_secs: 30,
             rate_limit_interval_ms: 3000,
         }
@@ -144,7 +246,7 @@ pub struct OpenAlexConfig {
 impl Default for OpenAlexConfig {
     fn default() -> Self {
         Self {
-            base_url: String::from("http://api.openalex.org"),
+            base_url: String::from("https://api.openalex.org"),
             api_key: None,
             timeout_secs: 30,
             rate_limit_interval_ms: 100,
@@ -159,6 +261,11 @@ pub struct SemanticScholarConfig {
     pub api_key: Option<String>,
     pub timeout_secs: u64,
     pub rate_limit_interval_ms: u64,
+    /// Longest a `Retry-After` (or default 429 backoff) is allowed to make a
+    /// request sleep, in seconds (>= 1). A larger server directive is
+    /// clamped to this; the 429 then surfaces as `RateLimited` with the
+    /// server's real `retry_after`.
+    pub max_retry_after_secs: u64,
 }
 
 impl Default for SemanticScholarConfig {
@@ -168,6 +275,7 @@ impl Default for SemanticScholarConfig {
             api_key: None,
             timeout_secs: 30,
             rate_limit_interval_ms: 1100, // just over 1 req/s
+            max_retry_after_secs: 30,
         }
     }
 }
@@ -239,6 +347,120 @@ pub struct ProvidersConfig {
     pub europe_pmc: EuropePmcConfig,
     pub crossref: CrossRefConfig,
     pub core: CoreConfig,
+}
+
+impl ProvidersConfig {
+    /// Every provider needs a usable base URL, a non-zero timeout and a
+    /// non-zero rate-limit interval (`governor` panics on a zero period),
+    /// and a credential may only be configured for an `https` endpoint.
+    pub fn validate(&self) -> Result<(), PaperError> {
+        let p = self;
+        check_provider(
+            "arxiv",
+            &p.arxiv.base_url,
+            p.arxiv.timeout_secs,
+            p.arxiv.rate_limit_interval_ms,
+            false,
+        )?;
+        check_provider(
+            "openalex",
+            &p.openalex.base_url,
+            p.openalex.timeout_secs,
+            p.openalex.rate_limit_interval_ms,
+            p.openalex.api_key.is_some(),
+        )?;
+        check_provider(
+            "semantic_scholar",
+            &p.semantic_scholar.base_url,
+            p.semantic_scholar.timeout_secs,
+            p.semantic_scholar.rate_limit_interval_ms,
+            p.semantic_scholar.api_key.is_some(),
+        )?;
+        if p.semantic_scholar.max_retry_after_secs == 0 {
+            return Err(invalid(
+                "providers.semantic_scholar.max_retry_after_secs must be at least 1",
+            ));
+        }
+        check_provider(
+            "europe_pmc",
+            &p.europe_pmc.base_url,
+            p.europe_pmc.timeout_secs,
+            p.europe_pmc.rate_limit_interval_ms,
+            false,
+        )?;
+        check_provider(
+            "crossref",
+            &p.crossref.base_url,
+            p.crossref.timeout_secs,
+            p.crossref.rate_limit_interval_ms,
+            false,
+        )?;
+        if let Some(mailto) = &p.crossref.mailto {
+            validate_contact_email("providers.crossref.mailto", mailto)?;
+        }
+        check_provider(
+            "core",
+            &p.core.base_url,
+            p.core.timeout_secs,
+            p.core.rate_limit_interval_ms,
+            p.core.api_key.is_some(),
+        )?;
+        Ok(())
+    }
+}
+
+fn invalid(msg: impl Into<String>) -> PaperError {
+    PaperError::InvalidInput(format!("paper.{}", msg.into()))
+}
+
+fn check_provider(
+    name: &str,
+    base_url: &str,
+    timeout_secs: u64,
+    rate_limit_interval_ms: u64,
+    has_credential: bool,
+) -> Result<(), PaperError> {
+    let url = url::Url::parse(base_url).map_err(|e| {
+        invalid(format!(
+            "providers.{name}.base_url {base_url:?} is not a valid URL ({e})"
+        ))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        return Err(invalid(format!(
+            "providers.{name}.base_url must be an http(s) URL with a host (got {base_url:?})"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid(format!(
+            "providers.{name}.base_url must not embed credentials"
+        )));
+    }
+    if has_credential && url.scheme() != "https" && !is_loopback_host(&url) {
+        return Err(invalid(format!(
+            "providers.{name}.base_url is plain http but an API key is configured; \
+             use https so the key is not sent in clear"
+        )));
+    }
+    if timeout_secs == 0 {
+        return Err(invalid(format!(
+            "providers.{name}.timeout_secs must be at least 1"
+        )));
+    }
+    if rate_limit_interval_ms == 0 {
+        return Err(invalid(format!(
+            "providers.{name}.rate_limit_interval_ms must be at least 1"
+        )));
+    }
+    Ok(())
+}
+
+fn is_loopback_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,4 +564,169 @@ fn expand_tilde(path: &std::path::Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `f` with a hermetic env: no inherited vars, `$HOME` an empty dir.
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure type
+    fn with_env(vars: &[(&str, &str)], f: impl FnOnce(anyhow::Result<Config>)) {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("HOME", jail.directory().display().to_string());
+            for (k, v) in vars {
+                jail.set_env(k, v);
+            }
+            f(Config::load());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn defaults_validate_and_use_https() {
+        let config = Config::default();
+        config.validate().unwrap();
+        let p = &config.providers;
+        for url in [
+            &p.arxiv.base_url,
+            &p.openalex.base_url,
+            &p.semantic_scholar.base_url,
+            &p.europe_pmc.base_url,
+            &p.crossref.base_url,
+            &p.core.base_url,
+        ] {
+            assert!(url.starts_with("https://"), "{url}");
+        }
+    }
+
+    #[test]
+    fn values_that_panic_or_hang_later_are_rejected_at_load_time() {
+        let mut cases: Vec<(&str, Config)> = Vec::new();
+        let mut c = Config::default();
+        c.providers.crossref.rate_limit_interval_ms = 0; // governor panics
+        cases.push(("zero rate limit interval", c));
+        let mut c = Config::default();
+        c.download.max_concurrent = 0; // buffer_unordered(0) hangs
+        cases.push(("zero max_concurrent", c));
+        let mut c = Config::default();
+        c.download.timeout_secs = 0;
+        cases.push(("zero download timeout", c));
+        let mut c = Config::default();
+        c.providers.arxiv.timeout_secs = 0;
+        cases.push(("zero provider timeout", c));
+        let mut c = Config::default();
+        c.resilience.cb_initial_backoff_secs = 0; // failsafe asserts
+        cases.push(("zero breaker backoff", c));
+        let mut c = Config::default();
+        c.providers.openalex.base_url = "not a url".into();
+        cases.push(("bad base_url", c));
+        let mut c = Config::default();
+        c.providers.openalex.base_url = "ftp://api.openalex.org".into();
+        cases.push(("non-http base_url", c));
+        let mut c = Config::default();
+        c.download.unpaywall_email = Some("not an email".into());
+        cases.push(("bad email", c));
+        let mut c = Config::default();
+        c.download.papers_prefix = "/".into();
+        cases.push(("empty papers prefix", c));
+        for (name, config) in cases {
+            assert!(config.validate().is_err(), "{name} must be rejected");
+        }
+    }
+
+    #[test]
+    fn an_api_key_is_never_sent_over_plain_http_except_to_loopback() {
+        let mut c = Config::default();
+        c.providers.openalex.base_url = "http://api.openalex.org".into();
+        c.providers.openalex.api_key = Some("k".into());
+        assert!(c.validate().is_err());
+        // Without a key, plain http is allowed (it was the old default).
+        c.providers.openalex.api_key = None;
+        c.validate().unwrap();
+        // A local mirror may use http with a key.
+        c.providers.openalex.base_url = "http://127.0.0.1:9000".into();
+        c.providers.openalex.api_key = Some("k".into());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn documented_multi_word_env_keys_bind() {
+        with_env(
+            &[
+                // README: `HOME_STILL_PAPER_DOWNLOAD_PATH=/tmp/papers`
+                ("HOME_STILL_PAPER_DOWNLOAD_PATH", "/tmp/papers"),
+                ("HOME_STILL_PAPER_DOWNLOAD_TIMEOUT_SECS", "77"),
+                (
+                    "HOME_STILL_PAPER_PROVIDERS_SEMANTIC_SCHOLAR_RATE_LIMIT_INTERVAL_MS",
+                    "2500",
+                ),
+                ("HOME_STILL_PAPER_RESILIENCE_CB_FAILURE_THRESHOLD", "9"),
+                (
+                    "HOME_STILL_PAPER_PROVIDERS_CROSSREF_MAILTO",
+                    "ops@example.org",
+                ),
+                ("HOME_STILL_STORAGE_S3_ACCESS_KEY", "akey"),
+                ("HOME_STILL_STORAGE_BACKEND", "s3"),
+            ],
+            |loaded| {
+                let c = loaded.unwrap();
+                assert_eq!(c.download_path, PathBuf::from("/tmp/papers"));
+                assert_eq!(c.download.timeout_secs, 77);
+                assert_eq!(c.providers.semantic_scholar.rate_limit_interval_ms, 2500);
+                assert_eq!(c.resilience.cb_failure_threshold, 9);
+                assert_eq!(
+                    c.resilience.cb_initial_backoff_secs, 10,
+                    "others keep defaults"
+                );
+                assert_eq!(
+                    c.providers.crossref.mailto.as_deref(),
+                    Some("ops@example.org")
+                );
+                assert_eq!(c.storage.s3.access_key, "akey");
+                assert_eq!(c.storage.backend, hs_common::storage::config::Backend::S3);
+            },
+        );
+    }
+
+    #[test]
+    fn an_env_key_that_names_nothing_is_an_error_not_silence() {
+        with_env(&[("HOME_STILL_PAPER_DOWNLOAD_TIMEOUT", "5")], |loaded| {
+            let err = loaded.unwrap_err().to_string();
+            assert!(err.contains("HOME_STILL_PAPER_DOWNLOAD_TIMEOUT"), "{err}");
+        });
+    }
+
+    #[test]
+    fn an_env_value_that_fails_validation_fails_the_load() {
+        with_env(
+            &[(
+                "HOME_STILL_PAPER_PROVIDERS_ARXIV_RATE_LIMIT_INTERVAL_MS",
+                "0",
+            )],
+            |loaded| assert!(loaded.is_err()),
+        );
+    }
+
+    #[test]
+    fn env_paths_resolve_the_way_words_group() {
+        let tree = known_keys().unwrap();
+        let path = |n: &str| env_key_path(&tree, n);
+        assert_eq!(
+            path("PAPER_DOWNLOAD_PATH").as_deref(),
+            Some("paper.download_path")
+        );
+        assert_eq!(
+            path("PAPER_DOWNLOAD_TIMEOUT_SECS").as_deref(),
+            Some("paper.download.timeout_secs")
+        );
+        assert_eq!(
+            path("paper_providers_europe_pmc_base_url").as_deref(),
+            Some("paper.providers.europe_pmc.base_url")
+        );
+        assert_eq!(path("PAPER_DOWNLOAD"), None, "a section is not a value");
+        assert_eq!(path("PAPER_NOPE"), None);
+        assert_eq!(path("COLOR"), None);
+    }
 }

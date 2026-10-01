@@ -180,6 +180,7 @@ mod tests {
             next_offset: None,
             provider: "test".into(),
             papers,
+            provider_failures: Vec::new(),
         }
     }
 

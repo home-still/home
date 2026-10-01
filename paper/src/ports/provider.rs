@@ -26,6 +26,7 @@ pub trait PaperProvider: Send + Sync {
                 papers: paper.into_iter().collect(),
                 next_offset: None,
                 provider: self.name().to_string(),
+                provider_failures: Vec::new(),
             });
         }
         self.search_by_query(query).await

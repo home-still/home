@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use chrono::NaiveDate;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use url::Url;
 
 use crate::config::SemanticScholarConfig;
 use crate::error::PaperError;
@@ -175,12 +177,13 @@ pub struct SemanticScholarProvider {
     client: Client,
     base_url: String,
     api_key: Option<String>,
+    max_retry_after: Duration,
 }
 
 impl SemanticScholarProvider {
     pub fn new(config: &SemanticScholarConfig) -> Result<Self> {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .timeout(Duration::from_secs(config.timeout_secs))
             .build()
             .context("Failed to build HTTP client")?;
 
@@ -188,7 +191,42 @@ impl SemanticScholarProvider {
             client,
             base_url: config.base_url.clone(),
             api_key: config.api_key.clone(),
+            max_retry_after: Duration::from_secs(config.max_retry_after_secs),
         })
+    }
+
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => request.header("x-api-key", key),
+            None => request,
+        }
+    }
+
+    /// `{base}/graph/v1/paper/{id}/{tail…}?{query}` with every piece
+    /// percent-encoded. `id` is `DOI:<doi>` / `ARXIV:<id>`; a DOI's `/`
+    /// separates path segments (Semantic Scholar takes them literally), and
+    /// a `?`, `#` or space inside a DOI is encoded rather than ending the
+    /// path.
+    fn paper_url(
+        &self,
+        id: &str,
+        tail: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<Url, PaperError> {
+        let mut url = Url::parse(&self.base_url)
+            .map_err(|e| PaperError::InvalidInput(format!("bad Semantic Scholar base_url: {e}")))?;
+        url.path_segments_mut()
+            .map_err(|_| {
+                PaperError::InvalidInput("Semantic Scholar base_url cannot be a base".into())
+            })?
+            .pop_if_empty()
+            .extend(["graph", "v1", "paper"])
+            .extend(id.split('/'))
+            .extend(tail.iter().copied());
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query.iter().copied());
+        }
+        Ok(url)
     }
 
     fn s2_paper_to_paper(&self, s2: S2Paper) -> Paper {
@@ -276,18 +314,25 @@ impl SemanticScholarProvider {
     /// `{ID}` is `DOI:{doi}` for normal DOIs and `ARXIV:{id}` for the
     /// arXiv DataCite form (SS doesn't index those under `DOI:`).
     pub async fn references(&self, doi: &str) -> Result<ReferencesResponse, PaperError> {
-        let id = ss_identifier_for_doi(doi);
-        let url = format!(
-            "{}/graph/v1/paper/{}/references?fields=externalIds,title,year,authors,venue,citationCount&limit=1000",
-            self.base_url, id
-        );
+        let id = ss_identifier_for_doi(&crate::stem::normalize_doi(doi)?);
+        let url = self.paper_url(
+            &id,
+            &["references"],
+            &[
+                (
+                    "fields",
+                    "externalIds,title,year,authors,venue,citationCount",
+                ),
+                ("limit", "1000"),
+            ],
+        )?;
 
-        let mut request = self.client.get(&url);
-        if let Some(ref key) = self.api_key {
-            request = request.header("x-api-key", key);
-        }
-
-        let response = send_with_429_retry(request, "semantic_scholar").await?;
+        let response = send_with_429_retry(
+            self.authorized(self.client.get(url)),
+            "semantic_scholar",
+            self.max_retry_after,
+        )
+        .await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(PaperError::NotFound(doi.to_string()));
@@ -329,7 +374,7 @@ impl SemanticScholarProvider {
         doi: &str,
         opts: CitationsOpts,
     ) -> Result<CitationsResponse, PaperError> {
-        let id = ss_identifier_for_doi(doi);
+        let id = ss_identifier_for_doi(&crate::stem::normalize_doi(doi)?);
         let effective_limit = opts.limit.unwrap_or(100).min(1000) as usize;
 
         const PAGE_SIZE: u32 = 1000;
@@ -345,6 +390,10 @@ impl SemanticScholarProvider {
         // the offset explicitly. For sort=citations this means we rank the top-N
         // among the first ~9000 edges SS will serve — its hard ceiling.
         const SS_CITATIONS_OFFSET_LIMIT: u32 = 10_000;
+        // Backstop for the loop below: with the offset ceiling above, ten
+        // 1000-edge pages is all Semantic Scholar will ever serve, so more
+        // than this many requests means the cursor is not progressing.
+        const MAX_CITATION_PAGES: u32 = 12;
         let sort_by_citations = opts.sort.as_deref() == Some("citations");
         let fetch_target = if sort_by_citations {
             MAX_CITATION_SORT_FETCH
@@ -355,25 +404,40 @@ impl SemanticScholarProvider {
         let mut offset: u32 = 0;
         let mut total_available: Option<u32> = None;
         let mut hit_limit = false;
+        let mut pages: u32 = 0;
 
         loop {
-            if offset + PAGE_SIZE >= SS_CITATIONS_OFFSET_LIMIT {
+            if offset.saturating_add(PAGE_SIZE) >= SS_CITATIONS_OFFSET_LIMIT {
                 // Next page would hit SS's offset+limit ceiling — stop here
                 // rather than issue a request SS rejects with 400.
                 hit_limit = true;
                 break;
             }
-            let url = format!(
-                "{}/graph/v1/paper/{}/citations?fields=externalIds,title,year,authors,venue,citationCount&limit={}&offset={}",
-                self.base_url, id, PAGE_SIZE, offset
-            );
-
-            let mut request = self.client.get(&url);
-            if let Some(ref key) = self.api_key {
-                request = request.header("x-api-key", key);
+            pages += 1;
+            if pages > MAX_CITATION_PAGES {
+                return Err(PaperError::ParseError(format!(
+                    "Semantic Scholar citations for {doi} needed more than {MAX_CITATION_PAGES} pages"
+                )));
             }
+            let url = self.paper_url(
+                &id,
+                &["citations"],
+                &[
+                    (
+                        "fields",
+                        "externalIds,title,year,authors,venue,citationCount",
+                    ),
+                    ("limit", &PAGE_SIZE.to_string()),
+                    ("offset", &offset.to_string()),
+                ],
+            )?;
 
-            let response = send_with_429_retry(request, "semantic_scholar").await?;
+            let response = send_with_429_retry(
+                self.authorized(self.client.get(url)),
+                "semantic_scholar",
+                self.max_retry_after,
+            )
+            .await?;
             if response.status() == reqwest::StatusCode::NOT_FOUND {
                 return Err(PaperError::NotFound(doi.to_string()));
             }
@@ -405,11 +469,19 @@ impl SemanticScholarProvider {
             }
 
             if let Some(next_offset) = body.next {
+                // `next` is remote data. A cursor that does not move forward
+                // would re-request the same page forever (entries that are all
+                // null edges never reach `fetch_target`), so it is an error.
+                if next_offset <= offset {
+                    return Err(PaperError::ParseError(format!(
+                        "Semantic Scholar citations pagination did not advance for {doi} (offset {offset}, next {next_offset})"
+                    )));
+                }
                 offset = next_offset;
             } else if page_count < PAGE_SIZE as usize {
                 break;
             } else {
-                offset += PAGE_SIZE;
+                offset = offset.saturating_add(PAGE_SIZE);
             }
         }
 
@@ -465,12 +537,12 @@ impl PaperProvider for SemanticScholarProvider {
     async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
         let url = self.build_search_url(query)?;
 
-        let mut request = self.client.get(&url);
-        if let Some(ref key) = self.api_key {
-            request = request.header("x-api-key", key);
-        }
-
-        let response = send_with_429_retry(request, "semantic_scholar").await?;
+        let response = send_with_429_retry(
+            self.authorized(self.client.get(&url)),
+            "semantic_scholar",
+            self.max_retry_after,
+        )
+        .await?;
 
         check_response(&response, "semantic_scholar")?;
 
@@ -496,22 +568,27 @@ impl PaperProvider for SemanticScholarProvider {
             total_results: body.total,
             next_offset,
             provider: String::from("semantic_scholar"),
+            provider_failures: Vec::new(),
         })
     }
 
     async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
-        let bare_doi = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
-        let url = format!(
-              "{}/graph/v1/paper/DOI:{}?fields=title,abstract,externalIds,openAccessPdf,year,authors,citationCount",
-              self.base_url, bare_doi
-          );
+        let id = ss_identifier_for_doi(&crate::stem::normalize_doi(doi)?);
+        let url = self.paper_url(
+            &id,
+            &[],
+            &[(
+                "fields",
+                "title,abstract,externalIds,openAccessPdf,year,authors,citationCount",
+            )],
+        )?;
 
-        let mut request = self.client.get(&url);
-        if let Some(ref key) = self.api_key {
-            request = request.header("x-api-key", key);
-        }
-
-        let response = send_with_429_retry(request, "semantic_scholar").await?;
+        let response = send_with_429_retry(
+            self.authorized(self.client.get(url)),
+            "semantic_scholar",
+            self.max_retry_after,
+        )
+        .await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -1146,5 +1223,111 @@ mod tests {
             "live citations: returned={} total_available={:?} truncated={}",
             cites.total_returned, cites.total_available, cites.truncated
         );
+    }
+
+    fn citations_page(next: Option<u32>, with_paper: bool) -> String {
+        let edge = if with_paper {
+            r#"{"citingPaper":{"paperId":"p1","title":"T","year":2020,"externalIds":{"DOI":"10.1/x"}}}"#
+        } else {
+            r#"{"citingPaper":null}"#
+        };
+        let next = next.map_or(String::new(), |n| format!(r#","next":{n}"#));
+        format!(r#"{{"total":5000,"data":[{edge}]{next}}}"#)
+    }
+
+    #[tokio::test]
+    async fn a_citations_cursor_that_does_not_advance_is_an_error_not_a_hang() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Only null edges, `next` stuck at 0: `entries` never grows and
+        // `offset` never moves, so the old loop never ended.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(citations_page(Some(0), false)),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = provider_pointing_at(&server.uri());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.citations("10.1/x", CitationsOpts::default()),
+        )
+        .await
+        .expect("pagination must terminate");
+
+        let err = result.expect_err("a stuck cursor must be an error");
+        assert!(
+            matches!(&err, PaperError::ParseError(m) if m.contains("did not advance")),
+            "{err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_huge_next_offset_stops_paging_without_overflowing() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // `offset + PAGE_SIZE` overflowed u32 (panic in debug, wrap in release).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(citations_page(Some(u32::MAX), true)),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = provider_pointing_at(&server.uri());
+        let resp = provider
+            .citations(
+                "10.1/x",
+                CitationsOpts {
+                    limit: Some(500),
+                    ..CitationsOpts::default()
+                },
+            )
+            .await
+            .expect("stops at the offset ceiling");
+        assert_eq!(resp.citations.len(), 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reserved_characters_in_a_doi_are_encoded_not_interpreted() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/graph/v1/paper/DOI:10.1234/a%3Fb%23c/references"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(REFERENCES_FIXTURE))
+            .mount(&server)
+            .await;
+
+        let provider = provider_pointing_at(&server.uri());
+        provider
+            .references("10.1234/a?b#c")
+            .await
+            .expect("`?` and `#` stay inside the path segment");
+    }
+
+    #[test]
+    fn malformed_dois_are_invalid_input_before_any_request() {
+        let provider = provider_pointing_at("http://127.0.0.1:1");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for doi in ["", "nope", "10.1234/../x"] {
+            let err = rt
+                .block_on(provider.references(doi))
+                .expect_err("must be rejected");
+            assert!(
+                matches!(err, PaperError::InvalidInput(_)),
+                "{doi:?}: {err:?}"
+            );
+        }
     }
 }

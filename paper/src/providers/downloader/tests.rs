@@ -241,7 +241,7 @@ impl Rig {
     fn new(
         server: &FakeServer,
         cfg: &DownloadConfig,
-        resolvers: Vec<Box<dyn PaperProvider>>,
+        resolvers: Vec<Arc<dyn PaperProvider>>,
     ) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Arc::new(LocalFsStorage::new(tmp.path()));
@@ -321,8 +321,8 @@ fn paper_with(id: &str, doi: Option<&str>, urls: Vec<String>) -> Paper {
     }
 }
 
-fn provider_returning(name: &'static str, urls: Vec<String>) -> Box<dyn PaperProvider> {
-    Box::new(FakeProvider {
+fn provider_returning(name: &'static str, urls: Vec<String>) -> Arc<dyn PaperProvider> {
+    Arc::new(FakeProvider {
         name,
         reply: Box::new(move || Ok(Some(paper_with("p", Some("10.1234/x"), urls.clone())))),
     })
@@ -823,12 +823,12 @@ async fn when_every_source_fails_the_error_lists_each_outcome() {
         }
     })
     .await;
-    let resolvers: Vec<Box<dyn PaperProvider>> = vec![
-        Box::new(FakeProvider {
+    let resolvers: Vec<Arc<dyn PaperProvider>> = vec![
+        Arc::new(FakeProvider {
             name: "semantic_scholar",
             reply: Box::new(|| Ok(None)),
         }),
-        Box::new(FakeProvider {
+        Arc::new(FakeProvider {
             name: "europe_pmc",
             reply: Box::new(|| {
                 Err(PaperError::RateLimited {
@@ -841,7 +841,7 @@ async fn when_every_source_fails_the_error_lists_each_outcome() {
             "openalex",
             vec![server.url("/landing"), server.url("/gone.pdf")],
         ),
-        Box::new(FakeProvider {
+        Arc::new(FakeProvider {
             name: "crossref",
             reply: Box::new(|| Ok(Some(paper_with("c", Some("10.1234/abc"), vec![])))),
         }),

@@ -1,5 +1,6 @@
 use crate::error::PaperError;
 use serde::de::DeserializeOwned;
+use std::time::Duration;
 
 /// Send a request, and on a 429 retry up to two more times with growing
 /// jittered backoff. Returns the final response (which may itself be a 429
@@ -11,9 +12,17 @@ use serde::de::DeserializeOwned;
 /// `Retry-After` header. Two bounded retries (≈2s + ≈5s) silently absorb
 /// the common case where the bucket refills within a few seconds; only the
 /// pathological "bucket stays empty" cases reach the caller.
+///
+/// A server-supplied `Retry-After` is honoured only up to `max_retry_after`:
+/// the header is remote text, and `Retry-After: 86400` must not park a
+/// request (and the caller's permit) for a day. A longer directive costs one
+/// capped sleep, then the next attempt gets the 429 again and the
+/// `RateLimited` error — carrying the real `retry_after` — reaches the
+/// caller.
 pub async fn send_with_429_retry(
     builder: reqwest::RequestBuilder,
     provider: &str,
+    max_retry_after: Duration,
 ) -> Result<reqwest::Response, PaperError> {
     // Backoff delays applied between attempts. `len() + 1` total attempts.
     const RETRY_DELAYS_MS: [u64; 2] = [2000, 5000];
@@ -39,19 +48,22 @@ pub async fn send_with_429_retry(
             .headers()
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(std::time::Duration::from_secs);
-        let sleep = header_retry_after.unwrap_or_else(|| {
-            let jitter_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| (d.subsec_millis() as u64) % 1000)
-                .unwrap_or(0);
-            std::time::Duration::from_millis(base_ms + jitter_ms)
-        });
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let sleep = header_retry_after
+            .unwrap_or_else(|| {
+                let jitter_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| (d.subsec_millis() as u64) % 1000)
+                    .unwrap_or(0);
+                Duration::from_millis(base_ms + jitter_ms)
+            })
+            .min(max_retry_after);
         tracing::info!(
             provider = provider,
             attempt = attempt + 1,
             sleep_ms = sleep.as_millis() as u64,
+            retry_after_header_secs = header_retry_after.map(|d| d.as_secs()),
             "429 received, retrying"
         );
         drop(response);
@@ -120,5 +132,91 @@ pub async fn parse_json_or_log<T: DeserializeOwned>(
                 provider, e, content_type, preview
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn server_429_then_200(retry_after: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", retry_after))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_huge_retry_after_sleeps_at_most_the_cap() {
+        // `Retry-After: 86400` used to park the request for a day.
+        let server = server_429_then_200("86400").await;
+        let client = reqwest::Client::new();
+
+        let started = Instant::now();
+        let response =
+            send_with_429_retry(client.get(server.uri()), "test", Duration::from_millis(300))
+                .await
+                .unwrap();
+
+        assert_eq!(response.status(), 200);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "slept {:?} despite a 300 ms cap",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_or_overflowing_retry_after_is_capped_too() {
+        for header in ["99999999999999999999999", "Wed, 21 Oct 2099 07:28:00 GMT"] {
+            let server = server_429_then_200(header).await;
+            let client = reqwest::Client::new();
+            let started = Instant::now();
+            let response =
+                send_with_429_retry(client.get(server.uri()), "test", Duration::from_millis(200))
+                    .await
+                    .unwrap();
+            assert_eq!(response.status(), 200, "{header}");
+            // Fallback backoff is 2-3 s; the cap clamps it to 200 ms.
+            assert!(started.elapsed() < Duration::from_secs(2), "{header}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_within_the_cap_is_honoured() {
+        let server = server_429_then_200("1").await;
+        let client = reqwest::Client::new();
+        let started = Instant::now();
+        send_with_429_retry(client.get(server.uri()), "test", Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(900));
+    }
+
+    #[tokio::test]
+    async fn a_persistent_429_reaches_the_caller_with_the_real_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "7200"))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+
+        let response =
+            send_with_429_retry(client.get(server.uri()), "test", Duration::from_millis(50))
+                .await
+                .unwrap();
+        let err = check_response(&response, "test").unwrap_err();
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(7200)));
     }
 }

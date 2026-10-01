@@ -2,19 +2,25 @@ use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use std::num::NonZeroU32;
 use std::time::Duration;
 
+use crate::error::PaperError;
+
 pub struct ProviderRateLimiter {
     limiter: DefaultDirectRateLimiter,
 }
 
 impl ProviderRateLimiter {
-    pub fn new(interval: Duration) -> Self {
+    /// One request per `interval`, no bursts. A zero interval is an `Err`
+    /// (governor cannot express "no limit" and panicked on it).
+    pub fn new(interval: Duration) -> Result<Self, PaperError> {
         let quota = Quota::with_period(interval)
-            .expect("interval must be non-zero")
-            .allow_burst(NonZeroU32::new(1).unwrap());
+            .ok_or_else(|| {
+                PaperError::InvalidInput("rate_limit_interval_ms must be at least 1".to_string())
+            })?
+            .allow_burst(NonZeroU32::MIN);
 
-        Self {
+        Ok(Self {
             limiter: RateLimiter::direct(quota),
-        }
+        })
     }
 
     pub async fn acquire(&self) {

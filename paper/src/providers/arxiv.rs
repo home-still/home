@@ -273,19 +273,22 @@ impl PaperProvider for ArxivProvider {
             total_results,
             next_offset: Some(query.offset + query.max_results),
             provider: String::from("arxiv"),
+            provider_failures: Vec::new(),
         })
     }
 
     async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
+        let doi = crate::stem::normalize_doi(doi)?;
+
         // DataCite-registered arXiv DOIs (`10.48550/arXiv.<id>`, any casing)
         // have a direct translation to an arXiv id. Use the id_list API
         // rather than relevance search — it's both faster and correct.
-        if let Some(arxiv_id) = super::downloader::strip_arxiv_doi_prefix(doi) {
+        if let Some(arxiv_id) = super::downloader::strip_arxiv_doi_prefix(&doi) {
             return self.get_by_arxiv_id(arxiv_id).await;
         }
 
         let query = SearchQuery {
-            query: String::from(doi),
+            query: doi,
             search_type: SearchType::DOI,
             max_results: 1,
             offset: 0,

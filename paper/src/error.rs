@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::models::ProviderFailure;
+
 #[derive(Error, Debug)]
 pub enum PaperError {
     #[error("Invalid input: {0}. See: hs paper search --help")]
@@ -26,14 +28,23 @@ pub enum PaperError {
     #[error("Not found: {0}. Check the identifier or try: hs paper search")]
     NotFound(String),
 
-    #[error("Parse error: {0}")]
-    ParseError(String),
-
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
     #[error("No download URL for paper: {0}. Try --provider to search a different source")]
     NoDownloadUrl(String),
+
+    /// A fan-out over several providers produced no answer: either every
+    /// provider failed (`succeeded == 0`), or none had the paper and some
+    /// failed, so its absence is unconfirmed. Lists each failure.
+    #[error("{}", format_provider_failures(*.succeeded, .failures))]
+    ProvidersFailed {
+        succeeded: usize,
+        failures: Vec<ProviderFailure>,
+    },
 
     /// The storage backend failed (head/put/verify/invalid key). Local to
     /// this host: no other source can fix it, so a download aborts on it.
@@ -126,6 +137,21 @@ fn format_outcomes(sources: &[SourceOutcome]) -> String {
     out
 }
 
+fn format_provider_failures(succeeded: usize, failures: &[ProviderFailure]) -> String {
+    let mut out = if succeeded == 0 {
+        format!("All {} providers failed:", failures.len())
+    } else {
+        format!(
+            "No provider returned the paper and {} failed, so its absence is unconfirmed:",
+            failures.len()
+        )
+    };
+    for f in failures {
+        out.push_str(&format!("\n  - {}: {}", f.provider, f.error));
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ErrorCategory {
     Permanent,
@@ -145,6 +171,7 @@ impl PaperError {
             Self::TooLarge { .. } => ErrorCategory::Permanent,
             Self::NotPdf { .. } => ErrorCategory::Permanent,
             Self::Storage(_) => ErrorCategory::Transient,
+            Self::ProvidersFailed { .. } => ErrorCategory::Transient,
             Self::NoSourceYielded { sources, .. } => {
                 if sources.iter().any(|s| s.kind == OutcomeKind::Failed) {
                     ErrorCategory::Transient

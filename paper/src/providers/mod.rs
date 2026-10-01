@@ -8,4 +8,5 @@ pub mod query_utils;
 pub mod resilient;
 pub mod response;
 pub mod semantic_scholar;
+pub mod set;
 pub mod url_guard;

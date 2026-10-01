@@ -11,6 +11,9 @@ use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType, SortBy
 use crate::ports::provider::PaperProvider;
 use crate::providers::response::check_response;
 
+/// Fields requested from `/works`: everything `work_to_paper` reads.
+const WORK_FIELDS: &str = "id,doi,display_name,publication_date,abstract_inverted_index,authorships,open_access,best_oa_location,cited_by_count";
+
 #[derive(Debug, Deserialize)]
 struct OpenAlexResponse {
     meta: Meta,
@@ -242,7 +245,7 @@ impl OpenAlexProvider {
         params.push(("page", page.to_string()));
 
         // Select fields
-        params.push(("select", String::from("id,doi,display_name,publication_date,abstract_inverted_index,authorships,open_access,best_oa_location,cited_by_count")));
+        params.push(("select", String::from(WORK_FIELDS)));
 
         // API key
         if let Some(ref key) = self.api_key {
@@ -304,21 +307,34 @@ impl PaperProvider for OpenAlexProvider {
             total_results: body.meta.count,
             next_offset,
             provider: String::from("openalex"),
+            provider_failures: Vec::new(),
         })
     }
 
     async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
-        let bare_doi = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
+        let doi = crate::stem::normalize_doi(doi)?;
 
-        let mut url = format!("{}/works/doi:{}?select=id,doi,display_name,publication_date,abstract_inverted_index,authorships,open_access,best_oa_location,cited_by_count",
-          self.base_url, bare_doi
-        );
-
-        if let Some(ref key) = self.api_key {
-            url.push_str(&format!("&api_key={}", key));
+        // `/works/doi:<doi>`: the DOI's `/` separates path segments, anything
+        // else reserved inside it is percent-encoded; the key and field list
+        // go through the query builder.
+        let mut url = url::Url::parse(&self.base_url)
+            .map_err(|e| PaperError::InvalidInput(format!("bad OpenAlex base_url: {e}")))?;
+        let mut segments = doi.split('/');
+        let first = format!("doi:{}", segments.next().unwrap_or_default());
+        url.path_segments_mut()
+            .map_err(|_| PaperError::InvalidInput("OpenAlex base_url cannot be a base".into()))?
+            .pop_if_empty()
+            .extend(["works", first.as_str()])
+            .extend(segments);
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("select", WORK_FIELDS);
+            if let Some(key) = &self.api_key {
+                query.append_pair("api_key", key);
+            }
         }
 
-        let response = self.client.get(&url).send().await?;
+        let response = self.client.get(url).send().await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);

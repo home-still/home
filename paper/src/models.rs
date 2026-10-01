@@ -174,6 +174,19 @@ pub struct SearchResult {
     pub total_results: usize,
     pub next_offset: Option<usize>,
     pub provider: String,
+    /// Providers that were asked and failed (error, rate limit, open
+    /// circuit, timeout) while others answered. Always empty for a single
+    /// provider (its failure is the call's `Err`); only an aggregate search
+    /// can return results *and* failures.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_failures: Vec<ProviderFailure>,
+}
+
+/// One provider's failure inside a fan-out call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderFailure {
+    pub provider: String,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
