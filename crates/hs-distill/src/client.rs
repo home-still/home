@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use hs_common::auth::client::AuthedHttp;
 use hs_common::service::protocol::{ReadinessInfo, ServiceClient};
 use hs_common::storage::Storage;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 // ── Protocol types ─────────────────────────────────────────────
@@ -117,7 +117,7 @@ pub type DistillStreamLine = hs_common::service::protocol::StreamLine<DistillPro
 // ── Client ─────────────────────────────────────────────────────
 
 pub struct DistillClient {
-    http: Client,
+    http: AuthedHttp,
     server_url: String,
 }
 
@@ -131,13 +131,14 @@ impl DistillClient {
             .build()
             .context("failed to build DistillClient reqwest Client")?;
         Ok(Self {
-            http,
+            http: AuthedHttp::plain(http),
             server_url: server_url.trim_end_matches('/').to_string(),
         })
     }
 
-    /// Create a client with a pre-configured reqwest Client (e.g., with auth headers).
-    pub fn new_with_client(server_url: &str, http: Client) -> Self {
+    /// Create a client over a pre-built [`AuthedHttp`] (cloud gateway: the
+    /// token is attached per request).
+    pub fn new_with_client(server_url: &str, http: AuthedHttp) -> Self {
         Self {
             http,
             server_url: server_url.trim_end_matches('/').to_string(),

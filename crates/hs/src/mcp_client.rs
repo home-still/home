@@ -17,10 +17,10 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
-use hs_common::auth::client::AuthenticatedClient;
+use hs_common::auth::client::{AuthedHttp, AuthenticatedClient};
 
 pub struct McpClient {
-    http: reqwest::Client,
+    http: AuthedHttp,
     endpoint: String,
     session_id: Option<String>,
 }
@@ -40,7 +40,7 @@ impl McpClient {
                 .build()
                 .context("build direct-mode http client for MCP")?;
             let mut client = Self {
-                http,
+                http: AuthedHttp::plain(http),
                 endpoint: direct,
                 session_id: None,
             };
@@ -50,11 +50,9 @@ impl McpClient {
 
         let auth = AuthenticatedClient::from_default_path()
             .context("load cloud credentials (hs cloud enroll --gateway <url>)")?;
-        let http = auth
-            .build_reqwest_client()
-            .await
-            .context("build authenticated http client for MCP")?;
         let endpoint = format!("{}/mcp", auth.gateway_url().trim_end_matches('/'));
+        let http = AuthedHttp::with_auth(auth, std::time::Duration::from_secs(30))
+            .context("build authenticated http client for MCP")?;
         let mut client = Self {
             http,
             endpoint,

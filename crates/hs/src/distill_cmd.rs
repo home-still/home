@@ -17,7 +17,10 @@ pub(crate) async fn make_distill_client(url: &str) -> Result<DistillClient> {
     if is_cloud_url(url) {
         let auth = hs_common::auth::client::AuthenticatedClient::from_default_path()
             .context("Cloud credentials not found. Run `hs cloud enroll` first.")?;
-        let http = auth.build_reqwest_client().await?;
+        let http = hs_common::auth::client::AuthedHttp::with_auth(
+            auth,
+            std::time::Duration::from_secs(900),
+        )?;
         Ok(DistillClient::new_with_client(url, http))
     } else {
         DistillClient::new(url)

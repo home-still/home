@@ -224,51 +224,127 @@ impl AuthenticatedClient {
         Ok(body.access_token)
     }
 
-    /// Build a reqwest::Client with the current access token as default bearer auth.
-    ///
-    /// This is useful for passing to `ScribeClient::new_with_client()` etc.
-    pub async fn build_reqwest_client(&self) -> anyhow::Result<reqwest::Client> {
+    /// Attach a bearer token to `req` — fetched now, refreshed when within
+    /// 60 s of expiry — plus the Cloudflare Access headers when configured.
+    /// Called at send time for every request, so a long-lived process never
+    /// carries a stale token. A rejected refresh token is an `Err`
+    /// ([`RefreshRejected`]); nothing retries.
+    pub async fn authorize(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
         let token = self.get_access_token().await?;
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {token}").parse().unwrap(),
-        );
-
-        // Add Cloudflare Access headers if available
-        if let (Some(ref id), Some(ref secret)) = (
+        let mut req = req.bearer_auth(token);
+        if let (Some(id), Some(secret)) = (
             &self.credentials.cf_access_client_id,
             &self.credentials.cf_access_client_secret,
         ) {
-            headers.insert("CF-Access-Client-Id", id.parse().unwrap());
-            headers.insert("CF-Access-Client-Secret", secret.parse().unwrap());
+            req = req
+                .header("CF-Access-Client-Id", id)
+                .header("CF-Access-Client-Secret", secret);
         }
+        Ok(req)
+    }
+}
 
-        Ok(reqwest::Client::builder()
+/// Default overall timeout of an authenticated client when the caller has
+/// no better number (connect has its own 10 s).
+pub const DEFAULT_AUTHED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// HTTP client that authorizes each request at send time. Mirrors the
+/// `reqwest::Client` request surface the service clients use. `plain` wraps
+/// an unauthenticated client (LAN servers) behind the same type.
+#[derive(Clone)]
+pub struct AuthedHttp {
+    http: reqwest::Client,
+    auth: Option<std::sync::Arc<AuthenticatedClient>>,
+}
+
+impl AuthedHttp {
+    /// No authentication: requests go out exactly as built.
+    pub fn plain(http: reqwest::Client) -> Self {
+        Self { http, auth: None }
+    }
+
+    /// Cloud client: every request gets a fresh token. `timeout` is the
+    /// overall per-request timeout (override per request with
+    /// [`AuthedRequest::timeout`]).
+    pub fn with_auth(
+        auth: AuthenticatedClient,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Self> {
+        let http = crate::http::client_builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .default_headers(headers)
-            .build()?)
+            .timeout(timeout)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .build()?;
+        Ok(Self {
+            http,
+            auth: Some(std::sync::Arc::new(auth)),
+        })
+    }
+
+    fn req(&self, b: reqwest::RequestBuilder) -> AuthedRequest {
+        AuthedRequest {
+            builder: b,
+            auth: self.auth.clone(),
+        }
+    }
+
+    pub fn get(&self, url: impl reqwest::IntoUrl) -> AuthedRequest {
+        self.req(self.http.get(url))
+    }
+
+    pub fn post(&self, url: impl reqwest::IntoUrl) -> AuthedRequest {
+        self.req(self.http.post(url))
+    }
+
+    pub fn delete(&self, url: impl reqwest::IntoUrl) -> AuthedRequest {
+        self.req(self.http.delete(url))
+    }
+}
+
+/// A request being built; the token is attached in [`AuthedRequest::send`].
+pub struct AuthedRequest {
+    builder: reqwest::RequestBuilder,
+    auth: Option<std::sync::Arc<AuthenticatedClient>>,
+}
+
+impl AuthedRequest {
+    pub fn json<T: Serialize + ?Sized>(mut self, body: &T) -> Self {
+        self.builder = self.builder.json(body);
+        self
+    }
+
+    pub fn multipart(mut self, form: reqwest::multipart::Form) -> Self {
+        self.builder = self.builder.multipart(form);
+        self
+    }
+
+    pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.builder = self.builder.timeout(timeout);
+        self
+    }
+
+    pub fn header(mut self, key: &str, value: impl AsRef<str>) -> Self {
+        self.builder = self.builder.header(key, value.as_ref());
+        self
+    }
+
+    /// Authorize (when the client is authenticated) and send. A token
+    /// failure is returned as the error, never retried.
+    pub async fn send(self) -> anyhow::Result<reqwest::Response> {
+        let builder = match &self.auth {
+            Some(auth) => auth.authorize(self.builder).await?,
+            None => self.builder,
+        };
+        Ok(builder.send().await?)
     }
 }
 
 /// Check if a server URL appears to be a cloud gateway URL.
 pub fn is_cloud_url(server_url: &str) -> bool {
     server_url.starts_with("https://")
-}
-
-/// Build an authenticated reqwest client for a cloud URL, or a plain one for local URLs.
-///
-/// Returns `None` if the URL is local (no auth needed), or `Some(client)` for cloud URLs.
-pub async fn maybe_authenticated_client(
-    server_url: &str,
-) -> anyhow::Result<Option<reqwest::Client>> {
-    if !is_cloud_url(server_url) {
-        return Ok(None);
-    }
-
-    let auth_client = AuthenticatedClient::from_default_path()?;
-    let client = auth_client.build_reqwest_client().await?;
-    Ok(Some(client))
 }
 
 #[cfg(test)]
@@ -327,5 +403,138 @@ mod tests {
         creds().save(&fresh).unwrap();
         let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    use crate::auth::token::{create_token, now_epoch, TokenClaims};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn token(ttl: u64) -> String {
+        let now = now_epoch();
+        create_token(
+            b"test-secret-0123456789abcdef0123456789",
+            &TokenClaims {
+                sub: "d".into(),
+                iat: now,
+                exp: now + ttl,
+                scope: vec!["scribe".into()],
+            },
+        )
+        .unwrap()
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        refreshes: usize,
+        auth_headers: Vec<String>,
+    }
+
+    /// Loopback gateway: `/cloud/refresh` answers from `refresh` (status,
+    /// body) in order, every other path records its Authorization header.
+    async fn gateway(refresh: Vec<(u16, String)>) -> (String, Arc<StdMutex<Seen>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(StdMutex::new(Seen::default()));
+        let (s2, refresh) = (seen.clone(), Arc::new(StdMutex::new(refresh)));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let (seen, refresh) = (s2.clone(), refresh.clone());
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (status, body) = if head.starts_with("POST /cloud/refresh") {
+                        let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
+                        g.refreshes += 1;
+                        let mut r = refresh.lock().unwrap_or_else(|e| e.into_inner());
+                        if r.is_empty() {
+                            (500, String::new())
+                        } else {
+                            r.remove(0)
+                        }
+                    } else {
+                        let auth = head
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                            .unwrap_or("")
+                            .to_string();
+                        seen.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .auth_headers
+                            .push(auth);
+                        (200, "{}".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn authed(gw: &str) -> AuthedHttp {
+        let mut c = creds();
+        c.gateway_url = gw.to_string();
+        AuthedHttp::with_auth(AuthenticatedClient::new(c).unwrap(), DEFAULT_AUTHED_TIMEOUT).unwrap()
+    }
+
+    /// RA-58: the token is fetched per request. The first token is about to
+    /// expire, so the second request must go out with the refreshed one.
+    #[tokio::test]
+    async fn each_request_carries_the_current_token_across_a_refresh() {
+        let (t1, t2) = (token(30), token(3600));
+        let (gw, seen) = gateway(vec![
+            (200, format!(r#"{{"access_token":"{t1}"}}"#)),
+            (200, format!(r#"{{"access_token":"{t2}"}}"#)),
+        ])
+        .await;
+        let http = authed(&gw);
+        http.get(format!("{gw}/x")).send().await.unwrap();
+        http.post(format!("{gw}/y"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        http.get(format!("{gw}/z")).send().await.unwrap();
+
+        let g = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            g.refreshes, 2,
+            "token near expiry is refreshed, a fresh one is reused"
+        );
+        assert_eq!(g.auth_headers.len(), 3);
+        assert!(g.auth_headers[0].contains(&t1));
+        assert!(g.auth_headers[1].contains(&t2));
+        assert_ne!(g.auth_headers[0], g.auth_headers[1]);
+        assert_eq!(g.auth_headers[1], g.auth_headers[2]);
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_is_an_error_and_is_not_retried() {
+        let (gw, seen) = gateway(vec![(401, "{}".into())]).await;
+        let err = authed(&gw).get(format!("{gw}/x")).send().await.unwrap_err();
+        assert!(err.downcast_ref::<RefreshRejected>().is_some(), "{err:#}");
+        let g = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(g.refreshes, 1);
+        assert!(
+            g.auth_headers.is_empty(),
+            "no request may go out unauthenticated"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_client_sends_no_authorization() {
+        let (gw, seen) = gateway(vec![]).await;
+        let http = AuthedHttp::plain(reqwest::Client::new());
+        http.get(format!("{gw}/x")).send().await.unwrap();
+        let g = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(g.refreshes, 0);
+        assert_eq!(g.auth_headers, vec![String::new()]);
     }
 }

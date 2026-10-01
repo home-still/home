@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use hs_common::auth::client::AuthedHttp;
 use hs_common::service::protocol::{ReadinessInfo, ServiceClient};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::config::TimeoutPolicy;
@@ -189,7 +189,7 @@ impl ReadinessInfo for ReadinessResponse {
 }
 
 pub struct ScribeClient {
-    http: Client,
+    http: AuthedHttp,
     server_url: String,
 }
 
@@ -217,14 +217,14 @@ impl ScribeClient {
             .build()
             .context("failed to build ScribeClient reqwest Client")?;
         Ok(Self {
-            http,
+            http: AuthedHttp::plain(http),
             server_url: server_url.trim_end_matches('/').to_string(),
         })
     }
 
-    /// Create a client with a pre-configured reqwest Client (e.g., with auth headers).
-    /// The caller is responsible for setting a request timeout on the provided client.
-    pub fn new_with_client(server_url: &str, http: Client) -> Self {
+    /// Create a client over a pre-built [`AuthedHttp`] (cloud gateway: the
+    /// token is attached per request). The caller sets its overall timeout.
+    pub fn new_with_client(server_url: &str, http: AuthedHttp) -> Self {
         Self {
             http,
             server_url: server_url.trim_end_matches('/').to_string(),

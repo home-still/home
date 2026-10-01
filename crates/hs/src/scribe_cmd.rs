@@ -11,9 +11,8 @@ const DEFAULT_SERVER: &str = "http://localhost:7433";
 
 /// Create a ScribeClient, with auth headers if the URL is a cloud gateway.
 /// `convert_timeout` caps each PDF conversion so a stuck server can't
-/// pin the caller. Cloud path uses the auth-injected reqwest client; the
-/// caller is responsible for configuring its timeouts (see
-/// `AuthenticatedClient::build_reqwest_client`).
+/// pin the caller. The cloud path honors it as the client's overall timeout
+/// and attaches a fresh token to every request (`AuthedHttp::with_auth`).
 async fn make_scribe_client(
     url: &str,
     convert_timeout: std::time::Duration,
@@ -21,7 +20,7 @@ async fn make_scribe_client(
     if is_cloud_url(url) {
         let auth = hs_common::auth::client::AuthenticatedClient::from_default_path()
             .context("Cloud credentials not found. Run `hs cloud enroll` first.")?;
-        let http = auth.build_reqwest_client().await?;
+        let http = hs_common::auth::client::AuthedHttp::with_auth(auth, convert_timeout)?;
         Ok(hs_scribe::client::ScribeClient::new_with_client(url, http))
     } else {
         hs_scribe::client::ScribeClient::new_with_timeout(url, convert_timeout)
