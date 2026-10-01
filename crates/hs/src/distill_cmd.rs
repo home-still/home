@@ -426,7 +426,8 @@ pub(crate) async fn cmd_watch_events(
     let server_url = server_override
         .or_else(|| cfg.servers.first().cloned())
         .unwrap_or_else(|| "http://localhost:7434".into());
-    let distill = Arc::new(DistillClient::new(&server_url)?);
+    let distill =
+        Arc::new(DistillClient::new(&server_url)?.with_index_timeout(cfg.index_timeout()));
 
     let concurrency = cfg.resolved_concurrency();
     tracing::info!(%server_url, concurrency, "starting distill event-bus watcher");

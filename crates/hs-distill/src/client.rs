@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use hs_common::auth::client::AuthedHttp;
 use hs_common::service::protocol::{ReadinessInfo, ServiceClient};
 use hs_common::storage::Storage;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 // ── Protocol types ─────────────────────────────────────────────
 
@@ -137,24 +137,41 @@ pub type DistillStreamLine = hs_common::service::protocol::StreamLine<DistillPro
 
 // ── Client ─────────────────────────────────────────────────────
 
+/// Upper bound on one indexing request (`/distill`, `/distill/stream`) unless
+/// the caller sets another with [`DistillClient::with_index_timeout`].
+///
+/// Indexing a book-length markdown is chunk -> GPU embed -> upsert on a card
+/// shared with the scribe VLM: minutes under contention, never close to
+/// half an hour. The bound exists for the stalled-server case, where a
+/// request with no deadline holds its handler slot for as long as the
+/// event's `ack_wait` (default 7200 s), after which the broker redelivers
+/// the event and a second worker indexes the same document concurrently.
+/// 1800 s leaves >5000 s of that window for the stamp and publish that
+/// follow.
+pub const DEFAULT_INDEX_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// Bound for every request that is not an index, a scrub or a reset and does
+/// not set its own: the client-wide default, so no request site can be left
+/// without one.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct DistillClient {
     http: AuthedHttp,
     server_url: String,
+    index_timeout: Duration,
 }
 
 impl DistillClient {
     pub fn new(server_url: &str) -> Result<Self> {
         let http = hs_common::http::client_builder()
             .connect_timeout(Duration::from_secs(10))
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             // Match ScribeClient's jitter tolerance: catch half-open TCP
             // in ~30 s, not the kernel's default ~2 h.
             .tcp_keepalive(Duration::from_secs(30))
             .build()
             .context("failed to build DistillClient reqwest Client")?;
-        Ok(Self {
-            http: AuthedHttp::plain(http),
-            server_url: server_url.trim_end_matches('/').to_string(),
-        })
+        Ok(Self::new_with_client(server_url, AuthedHttp::plain(http)))
     }
 
     /// Create a client over a pre-built [`AuthedHttp`] (cloud gateway: the
@@ -163,7 +180,15 @@ impl DistillClient {
         Self {
             http,
             server_url: server_url.trim_end_matches('/').to_string(),
+            index_timeout: DEFAULT_INDEX_TIMEOUT,
         }
+    }
+
+    /// Bound each indexing request at `timeout` instead of
+    /// [`DEFAULT_INDEX_TIMEOUT`].
+    pub fn with_index_timeout(mut self, timeout: Duration) -> Self {
+        self.index_timeout = timeout;
+        self
     }
 
     pub async fn health(&self) -> Result<HealthResponse> {
@@ -175,9 +200,12 @@ impl DistillClient {
             .send()
             .await
             .context("Failed to reach distill server")?;
-        resp.json().await.context("Invalid health response")
+        json_or_server_error(resp, "health").await
     }
 
+    /// `/readiness` answers 503 with a JSON body (`ready: false`, `reason`)
+    /// when the server is up but not ready; that body is the answer, so it
+    /// is parsed whatever the status.
     pub async fn readiness(&self) -> Result<ReadinessResponse> {
         let url = format!("{}/readiness", self.server_url);
         let resp = self
@@ -197,11 +225,11 @@ impl DistillClient {
         self.index_content(markdown_path, &content, None).await
     }
 
-    /// Index markdown already held in memory. `path_hint` is used server-side for
-    /// logging and catalog lookup (derive the doc stem) but the server never
-    /// reads it from disk. Pass `catalog` when the caller already has the
-    /// catalog entry so metadata ends up on the Qdrant payload even when the
-    /// server has no local catalog directory.
+    /// Index markdown already held in memory. `path_hint` names the document
+    /// (its file stem becomes the doc id) but the server never reads it from
+    /// disk. Pass `catalog` when the caller already has the catalog entry:
+    /// the server has no catalog of its own, so without one the Qdrant
+    /// payload carries no title, authors, DOI or year.
     pub async fn index_content(
         &self,
         path_hint: &str,
@@ -213,7 +241,9 @@ impl DistillClient {
     }
 
     /// Same as `index_content` but routes the upsert to a non-default Qdrant
-    /// collection. The server lazily creates the collection on first use.
+    /// collection. The collection must be one the server is configured to
+    /// serve (`distill_server.collections`); an unknown name is a 400. The
+    /// request is bounded by the client's index timeout.
     pub async fn index_content_in(
         &self,
         path_hint: &str,
@@ -222,28 +252,17 @@ impl DistillClient {
         collection: Option<&str>,
     ) -> Result<IndexResult> {
         let url = format!("{}/distill", self.server_url);
-        let mut body = serde_json::json!({ "path": path_hint, "content": content });
-        if let Some(cat) = catalog {
-            body["catalog"] = serde_json::to_value(cat).unwrap_or(serde_json::Value::Null);
-        }
-        if let Some(c) = collection {
-            body["collection"] = serde_json::Value::String(c.to_string());
-        }
+        let body = index_body(path_hint, content, catalog, collection)?;
         let resp = self
             .http
             .post(&url)
             .json(&body)
+            .timeout(self.index_timeout)
             .send()
             .await
             .context("Failed to send index request")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Server error {status}: {body}");
-        }
-
-        resp.json().await.context("Invalid index response")
+        json_or_server_error(resp, "index").await
     }
 
     /// Index a markdown object pulled from a `Storage` backend (local or S3).
@@ -257,8 +276,7 @@ impl DistillClient {
     }
 
     /// Same as `index_from_storage` but forwards a catalog entry loaded by
-    /// the caller (so the server's metadata extraction doesn't have to walk
-    /// the filesystem).
+    /// the caller (the server cannot look one up itself).
     pub async fn index_from_storage_with_catalog(
         &self,
         storage: &dyn Storage,
@@ -275,7 +293,8 @@ impl DistillClient {
     }
 
     /// Index a markdown file with streaming progress via NDJSON.
-    /// Reads the file locally and sends content to the server.
+    /// Reads the file locally and sends content to the server. Bounded by
+    /// the client's index timeout (the whole stream, not each line).
     pub async fn index_file_with_progress(
         &self,
         markdown_path: &str,
@@ -287,14 +306,11 @@ impl DistillClient {
         let resp = self
             .http
             .post(&url)
-            .json(&serde_json::json!({ "path": markdown_path, "content": content }))
+            .json(&index_body(markdown_path, &content, None, None)?)
+            .timeout(self.index_timeout)
             .send()
             .await
             .context("Failed to send index request")?;
-
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return self.index_file(markdown_path).await;
-        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -316,8 +332,8 @@ impl DistillClient {
     }
 
     /// Same as `search` but targets a non-default collection (e.g.
-    /// `personal_docs`). The server lazily creates the collection on first
-    /// use; an empty result on a fresh collection is still a successful call.
+    /// `personal_docs`), which must be one the server is configured to serve.
+    /// The server clamps `limit` to [`MAX_SEARCH_LIMIT`].
     pub async fn search_in(
         &self,
         query: &str,
@@ -343,13 +359,7 @@ impl DistillClient {
             .await
             .context("Failed to send search request")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Server error {status}: {body}");
-        }
-
-        resp.json().await.context("Invalid search response")
+        json_or_server_error(resp, "search").await
     }
 
     /// Get collection status.
@@ -362,7 +372,7 @@ impl DistillClient {
             .send()
             .await
             .context("Failed to reach distill server")?;
-        resp.json().await.context("Invalid status response")
+        json_or_server_error(resp, "status").await
     }
 
     /// Check if a document is already indexed.
@@ -373,6 +383,11 @@ impl DistillClient {
     /// Return `(exists, chunk_count)` for a doc. Chunk count is needed by the
     /// reconciler to backfill catalog stamps that were lost on earlier writes.
     pub async fn doc_chunks(&self, doc_id: &str) -> Result<(bool, u64)> {
+        #[derive(Deserialize)]
+        struct Exists {
+            exists: bool,
+            chunks: u64,
+        }
         let url = format!("{}/exists/{}", self.server_url, doc_id);
         let resp = self
             .http
@@ -381,10 +396,8 @@ impl DistillClient {
             .send()
             .await
             .context("Failed to reach distill server")?;
-        let data: serde_json::Value = resp.json().await.context("Invalid exists response")?;
-        let exists = data["exists"].as_bool().unwrap_or(false);
-        let chunks = data["chunks"].as_u64().unwrap_or(0);
-        Ok((exists, chunks))
+        let data: Exists = json_or_server_error(resp, "exists").await?;
+        Ok((data.exists, data.chunks))
     }
 
     /// Delete every point whose `doc_id` matches. Returns the number of
@@ -395,6 +408,10 @@ impl DistillClient {
 
     /// Same as `delete_doc` but targets a non-default collection.
     pub async fn delete_doc_in(&self, doc_id: &str, collection: Option<&str>) -> Result<u64> {
+        #[derive(Deserialize)]
+        struct Deleted {
+            deleted: u64,
+        }
         let mut url = format!("{}/doc/{}", self.server_url, doc_id);
         if let Some(c) = collection {
             url.push_str(&format!("?collection={c}"));
@@ -406,18 +423,17 @@ impl DistillClient {
             .send()
             .await
             .context("Failed to reach distill server")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Server error {status}: {body}");
-        }
-        let data: serde_json::Value = resp.json().await.context("Invalid delete response")?;
-        Ok(data["deleted"].as_u64().unwrap_or(0))
+        let data: Deleted = json_or_server_error(resp, "delete").await?;
+        Ok(data.deleted)
     }
 
     /// Drop + recreate the Qdrant collection, wiping every vector.
     /// Returns the pre-drop point count for reporting.
     pub async fn reset_collection(&self) -> Result<u64> {
+        #[derive(Deserialize)]
+        struct Reset {
+            deleted_points: u64,
+        }
         let url = format!("{}/collection/reset", self.server_url);
         let resp = self
             .http
@@ -426,16 +442,8 @@ impl DistillClient {
             .send()
             .await
             .context("Failed to reach distill server")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Server error {status}: {body}");
-        }
-        let data: serde_json::Value = resp
-            .json()
-            .await
-            .context("Invalid reset_collection response")?;
-        Ok(data["deleted_points"].as_u64().unwrap_or(0))
+        let data: Reset = json_or_server_error(resp, "reset_collection").await?;
+        Ok(data.deleted_points)
     }
 
     /// Scan every point in the collection for chunks whose `chunk_text`
@@ -458,20 +466,23 @@ impl DistillClient {
             .send()
             .await
             .context("Failed to reach distill server")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Server error {status}: {body}");
-        }
-        let report: crate::types::ScrubReport = resp
-            .json()
-            .await
-            .context("Invalid scrub_interstitials response")?;
-        Ok(report)
+        json_or_server_error(resp, "scrub_interstitials").await
     }
 
-    /// List every distinct `doc_id` present in the collection.
+    /// List every distinct `doc_id` present in the collection. `limit` is a
+    /// safety cap, not a page size: a collection with more documents than
+    /// `limit` (or than the server maximum, [`MAX_DOC_LIST_LIMIT`]) is an
+    /// error, never a silently partial list — callers diff this list against
+    /// storage, and a missing id looks like a document that was never
+    /// indexed.
     pub async fn list_docs(&self, limit: u64) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Docs {
+            doc_ids: Vec<String>,
+            #[serde(default)]
+            truncated: bool,
+        }
+        let limit = limit.min(MAX_DOC_LIST_LIMIT);
         let url = format!("{}/docs?limit={}", self.server_url, limit);
         let resp = self
             .http
@@ -480,17 +491,49 @@ impl DistillClient {
             .send()
             .await
             .context("Failed to reach distill server")?;
-        let data: serde_json::Value = resp.json().await.context("Invalid list_docs response")?;
-        let ids = data["doc_ids"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(ids)
+        let data: Docs = json_or_server_error(resp, "list_docs").await?;
+        if data.truncated {
+            anyhow::bail!(
+                "the collection holds more than {limit} documents (server maximum {MAX_DOC_LIST_LIMIT}); \
+                 the list would be incomplete"
+            );
+        }
+        Ok(data.doc_ids)
     }
+}
+
+/// Body of an index request.
+fn index_body(
+    path_hint: &str,
+    content: &str,
+    catalog: Option<&hs_common::catalog::CatalogEntry>,
+    collection: Option<&str>,
+) -> Result<serde_json::Value> {
+    let mut body = serde_json::json!({ "path": path_hint, "content": content });
+    if let Some(cat) = catalog {
+        body["catalog"] =
+            serde_json::to_value(cat).context("Failed to serialize the catalog entry")?;
+    }
+    if let Some(c) = collection {
+        body["collection"] = serde_json::Value::String(c.to_string());
+    }
+    Ok(body)
+}
+
+/// Decode a 2xx JSON reply into `T`; any other status is an error carrying
+/// the server's message (it explains 400/503/500 precisely).
+async fn json_or_server_error<T: DeserializeOwned>(
+    resp: reqwest::Response,
+    what: &str,
+) -> Result<T> {
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Server error {status}: {body}");
+    }
+    resp.json()
+        .await
+        .with_context(|| format!("Invalid {what} response"))
 }
 
 #[async_trait]
@@ -508,5 +551,172 @@ impl ServiceClient for DistillClient {
 
     async fn readiness(&self) -> Result<Self::Readiness> {
         DistillClient::readiness(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{serve, Reply};
+    use std::time::Instant;
+
+    fn client(fake: &crate::testutil::FakeHttp) -> DistillClient {
+        DistillClient::new(&fake.url()).unwrap()
+    }
+
+    fn is_timeout(err: &anyhow::Error) -> bool {
+        err.chain()
+            .filter_map(|c| c.downcast_ref::<reqwest::Error>())
+            .any(|e| e.is_timeout())
+    }
+
+    #[tokio::test]
+    async fn a_stalled_server_cannot_hold_an_index_request_past_its_timeout() {
+        // RA-46: no deadline meant the handler slot was held until the
+        // event's ack_wait elapsed.
+        let fake = serve(|_| Reply::Hang).await;
+        let c = client(&fake).with_index_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let err = c.index_content("doc.md", "text", None).await.unwrap_err();
+        assert!(is_timeout(&err), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn the_streaming_index_request_is_bounded_too() {
+        let fake = serve(|_| Reply::Hang).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.md");
+        std::fs::write(&file, "some markdown").unwrap();
+        let c = client(&fake).with_index_timeout(Duration::from_millis(300));
+        let err = c
+            .index_file_with_progress(file.to_str().unwrap(), |_| {})
+            .await
+            .unwrap_err();
+        assert!(is_timeout(&err), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn index_timeout_is_set_per_client() {
+        let fake = serve(|_| Reply::Hang).await;
+        let default = client(&fake);
+        assert_eq!(default.index_timeout, DEFAULT_INDEX_TIMEOUT);
+        let custom = client(&fake).with_index_timeout(Duration::from_secs(42));
+        assert_eq!(custom.index_timeout, Duration::from_secs(42));
+    }
+
+    #[tokio::test]
+    async fn index_request_always_carries_content_and_the_catalog() {
+        let fake = serve(|_| {
+            Reply::Json(
+                200,
+                r#"{"doc_id":"doc","chunks_indexed":3,"embedding_device":"Cuda"}"#.into(),
+            )
+        })
+        .await;
+        let catalog = hs_common::catalog::CatalogEntry {
+            title: Some("T".into()),
+            ..Default::default()
+        };
+        let got = client(&fake)
+            .index_content_in(
+                "markdown/ab/doc.md",
+                "# body",
+                Some(&catalog),
+                Some("personal_docs"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.chunks_indexed, 3);
+
+        let seen = fake.recorded();
+        assert!(seen[0].request_line.starts_with("POST /distill "));
+        let body: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
+        assert_eq!(body["content"], "# body");
+        assert_eq!(body["path"], "markdown/ab/doc.md");
+        assert_eq!(body["collection"], "personal_docs");
+        assert_eq!(body["catalog"]["title"], "T");
+    }
+
+    #[tokio::test]
+    async fn server_errors_surface_the_status_and_message() {
+        let fake = serve(|_| Reply::Json(400, "`content` is required".into())).await;
+        let err = client(&fake)
+            .index_content("doc.md", "x", None)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("400") && msg.contains("`content` is required"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_404_from_the_stream_endpoint_is_an_error_not_a_second_request() {
+        // The old client answered a 404 by silently re-posting to /distill.
+        let fake = serve(|_| Reply::Json(404, "not found".into())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.md");
+        std::fs::write(&file, "some markdown").unwrap();
+        let err = client(&fake)
+            .index_file_with_progress(file.to_str().unwrap(), |_| {})
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("404"));
+        let seen = fake.recorded();
+        assert_eq!(seen.len(), 1, "no fallback request: {seen:?}");
+        assert!(seen[0].request_line.contains("/distill/stream"));
+    }
+
+    #[tokio::test]
+    async fn list_docs_refuses_a_partial_list() {
+        let fake =
+            serve(|_| Reply::Json(200, r#"{"doc_ids":["a","b"],"truncated":true}"#.into())).await;
+        let err = client(&fake).list_docs(2).await.unwrap_err();
+        assert!(format!("{err:#}").contains("more than 2"), "{err:#}");
+
+        let fake = serve(|_| Reply::Json(200, r#"{"doc_ids":["a","b"]}"#.into())).await;
+        assert_eq!(client(&fake).list_docs(10).await.unwrap(), ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn list_docs_never_asks_for_more_than_the_server_maximum() {
+        let fake = serve(|_| Reply::Json(200, r#"{"doc_ids":[]}"#.into())).await;
+        client(&fake).list_docs(u64::MAX).await.unwrap();
+        let line = &fake.recorded()[0].request_line;
+        assert!(
+            line.contains(&format!("limit={MAX_DOC_LIST_LIMIT}")),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_or_error_replies_are_errors_not_defaults() {
+        // `doc_chunks` used to read a missing `exists` as false.
+        let fake = serve(|_| Reply::Json(200, "{}".into())).await;
+        assert!(client(&fake).doc_chunks("d").await.is_err());
+        let fake = serve(|_| Reply::Json(503, "embedder unusable".into())).await;
+        let err = client(&fake).doc_chunks("d").await.unwrap_err();
+        assert!(format!("{err:#}").contains("503"));
+        let err = client(&fake).health().await.unwrap_err();
+        assert!(format!("{err:#}").contains("embedder unusable"), "{err:#}");
+        let fake = serve(|_| Reply::Json(200, "{}".into())).await;
+        assert!(client(&fake).delete_doc("d").await.is_err());
+        assert!(client(&fake).reset_collection().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_503_readiness_body_is_the_answer() {
+        let fake = serve(|_| {
+            Reply::Json(
+                503,
+                r#"{"ready":false,"in_flight":0,"capacity":1,"reason":"embedder unusable"}"#.into(),
+            )
+        })
+        .await;
+        let r = client(&fake).readiness().await.unwrap();
+        assert!(!r.ready);
+        assert_eq!(r.reason.as_deref(), Some("embedder unusable"));
     }
 }

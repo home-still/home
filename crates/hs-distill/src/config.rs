@@ -449,6 +449,12 @@ pub struct DistillClientConfig {
     /// (Pi=2, AppleSiliconLow=4, AppleSiliconHigh=6, Nvidia*=8, GenericCpu
     /// scales with `cpu_count/4`). Explicit override wins.
     pub concurrency: Option<usize>,
+    /// Deadline for one indexing request, seconds. It must leave room
+    /// inside the event bus's `ack_wait` (default 7200 s) for the stamp and
+    /// publish that follow indexing — otherwise the broker redelivers an
+    /// event whose first delivery is still running. See
+    /// `client::DEFAULT_INDEX_TIMEOUT` for the reasoning behind the default.
+    pub index_timeout_secs: u64,
     #[serde(skip)]
     pub storage: StorageConfig,
     #[serde(skip)]
@@ -463,6 +469,7 @@ impl Default for DistillClientConfig {
             markdown_dir: project.join("markdown"),
             catalog_dir: project.join("catalog"),
             concurrency: None,
+            index_timeout_secs: crate::client::DEFAULT_INDEX_TIMEOUT.as_secs(),
             storage: StorageConfig::default(),
             events: EventBusConfig::default(),
         }
@@ -504,7 +511,46 @@ impl DistillClientConfig {
         let mut cfg: DistillClientConfig = figment.select("distill").extract().map_err(Box::new)?;
         cfg.storage = storage;
         cfg.events = events;
+        cfg.validate()
+            .map_err(|e| Box::new(figment::Error::from(e.to_string())))?;
         Ok(cfg)
+    }
+
+    /// Seconds of `ack_wait` that must remain after an index request ends
+    /// (catalog stamp with retries, `distill.completed` publish).
+    const ACK_WAIT_HEADROOM_SECS: u64 = 120;
+
+    pub fn validate(&self) -> Result<(), DistillError> {
+        if self.index_timeout_secs == 0 {
+            return Err(DistillError::Config(
+                "distill.index_timeout_secs must be at least 1".into(),
+            ));
+        }
+        if self.concurrency == Some(0) {
+            return Err(DistillError::Config(
+                "distill.concurrency must be at least 1 (omit it for the hardware default)".into(),
+            ));
+        }
+        if matches!(
+            self.events.backend,
+            hs_common::event_bus::EventsBackend::Nats
+        ) {
+            let ack_wait = self.events.nats.ack_wait_secs;
+            if self.index_timeout_secs + Self::ACK_WAIT_HEADROOM_SECS > ack_wait {
+                return Err(DistillError::Config(format!(
+                    "distill.index_timeout_secs ({}) + {} s headroom exceeds events.nats.ack_wait_secs \
+                     ({ack_wait}): the broker would redeliver an event that is still being indexed",
+                    self.index_timeout_secs,
+                    Self::ACK_WAIT_HEADROOM_SECS
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The deadline for one indexing request.
+    pub fn index_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.index_timeout_secs)
     }
 
     /// Build the configured storage backend.
@@ -756,5 +802,41 @@ mod tests {
         let clean = Figment::from(Serialized::defaults(DistillServerConfig::default()))
             .select("distill_server");
         assert!(removed_keys_present(&clean).is_empty());
+    }
+
+    // ── Client config ──────────────────────────────────────────────────
+
+    fn nats_client_config(index_timeout_secs: u64, ack_wait_secs: u64) -> DistillClientConfig {
+        let mut c = DistillClientConfig::default();
+        c.index_timeout_secs = index_timeout_secs;
+        c.events.backend = hs_common::event_bus::EventsBackend::Nats;
+        c.events.nats.ack_wait_secs = ack_wait_secs;
+        c
+    }
+
+    #[test]
+    fn default_client_config_is_valid_against_the_default_ack_wait() {
+        let mut c = DistillClientConfig::default();
+        c.validate().unwrap();
+        c.events.backend = hs_common::event_bus::EventsBackend::Nats;
+        c.validate()
+            .expect("1800 s index timeout fits the 7200 s ack_wait");
+        assert_eq!(c.index_timeout(), crate::client::DEFAULT_INDEX_TIMEOUT);
+    }
+
+    #[test]
+    fn index_timeout_must_fit_inside_ack_wait() {
+        // Equal to ack_wait would let the broker redeliver mid-index.
+        assert!(nats_client_config(7200, 7200).validate().is_err());
+        assert!(nats_client_config(7100, 7200).validate().is_err());
+        nats_client_config(7080, 7200).validate().unwrap();
+    }
+
+    #[test]
+    fn zero_timeout_or_concurrency_is_rejected() {
+        assert!(nats_client_config(0, 7200).validate().is_err());
+        let mut c = DistillClientConfig::default();
+        c.concurrency = Some(0);
+        assert!(c.validate().is_err());
     }
 }
