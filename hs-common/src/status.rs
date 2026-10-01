@@ -158,6 +158,21 @@ pub struct PipelineCounts {
     /// Threshold the self-test uses when asserting `pipeline_drift`.
     #[serde(default)]
     pub pipeline_drift_threshold: u64,
+    /// `Some(reason)` when the object counts could not be taken because a
+    /// storage listing failed. The counts above are then placeholders
+    /// (`0`) and MUST be rendered as "unknown", never as data: a storage
+    /// outage looks exactly like an empty, fully converted corpus otherwise.
+    #[serde(default)]
+    pub counts_error: Option<String>,
+}
+
+impl PipelineCounts {
+    /// Record that the counts are unavailable. The first reason wins.
+    pub fn mark_unavailable(&mut self, reason: impl std::fmt::Display) {
+        if self.counts_error.is_none() {
+            self.counts_error = Some(format!("{reason:#}"));
+        }
+    }
 }
 
 /// Per-service health row. Same shape for scribe and distill; fields unused
@@ -349,23 +364,35 @@ pub fn build_history(
     events
 }
 
-/// Count objects under `prefix` whose filename ends with `.{ext}`.
+/// Number of `objs` whose filename ends with `.{ext}` (macOS `._*`
+/// resource forks excluded).
 #[cfg(feature = "storage")]
-pub async fn count_ext_via(storage: &dyn Storage, prefix: &str, ext: &str) -> u64 {
+fn count_ext(objs: &[crate::storage::ObjectMeta], ext: &str) -> u64 {
     let suffix = format!(".{ext}");
-    match storage.list(prefix).await {
-        Ok(objs) => objs
-            .iter()
-            .filter(|o| {
-                o.key.ends_with(&suffix)
-                    && o.key
-                        .rsplit('/')
-                        .next()
-                        .is_some_and(|name| !name.starts_with("._"))
-            })
-            .count() as u64,
-        Err(_) => 0,
-    }
+    objs.iter()
+        .filter(|o| {
+            o.key.ends_with(&suffix)
+                && o.key
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| !name.starts_with("._"))
+        })
+        .count() as u64
+}
+
+/// Count objects under `prefix` whose filename ends with `.{ext}`.
+///
+/// A failed listing is an `Err`, never a count of 0: a storage outage must
+/// not read as an empty corpus.
+#[cfg(feature = "storage")]
+pub async fn count_ext_via(storage: &dyn Storage, prefix: &str, ext: &str) -> anyhow::Result<u64> {
+    use anyhow::Context;
+
+    let objs = storage
+        .list(prefix)
+        .await
+        .with_context(|| format!("list {prefix:?} to count .{ext} objects"))?;
+    Ok(count_ext(&objs, ext))
 }
 
 /// Count distinct source stems under `papers_prefix` that have no markdown.
@@ -399,7 +426,9 @@ pub async fn count_unconverted_stems(
     storage: &dyn Storage,
     papers_prefix: &str,
     markdown_prefix: &str,
-) -> u64 {
+) -> anyhow::Result<u64> {
+    use anyhow::Context;
+
     fn stem_of(key: &str, exts: &[&str]) -> Option<String> {
         let name = key.rsplit('/').next()?;
         if name.starts_with("._") {
@@ -409,13 +438,16 @@ pub async fn count_unconverted_stems(
         exts.contains(&ext).then(|| stem.to_string())
     }
 
-    let (papers, markdown) = match (
-        storage.list(papers_prefix).await,
-        storage.list(markdown_prefix).await,
-    ) {
-        (Ok(p), Ok(m)) => (p, m),
-        _ => return 0,
-    };
+    // A failed listing is an error, never "0 unconverted": an S3 outage must
+    // not read as a fully converted corpus.
+    let papers = storage
+        .list(papers_prefix)
+        .await
+        .with_context(|| format!("list {papers_prefix:?} to count unconverted stems"))?;
+    let markdown = storage
+        .list(markdown_prefix)
+        .await
+        .with_context(|| format!("list {markdown_prefix:?} to count unconverted stems"))?;
 
     let md_stems: std::collections::HashSet<String> = markdown
         .iter()
@@ -429,7 +461,7 @@ pub async fn count_unconverted_stems(
         .filter(|stem| !md_stems.contains(stem))
         .collect();
 
-    unconverted.len() as u64
+    Ok(unconverted.len() as u64)
 }
 
 /// A single listing-and-deserialization pass over the three prefixes that
@@ -1072,6 +1104,10 @@ pub async fn read_inbox_heartbeat(storage: &dyn Storage) -> Option<InboxHeartbea
 }
 
 /// Pipeline counts via Storage. Same source of truth as MCP today.
+///
+/// Any failed listing fails the whole call: a partial or zeroed count would
+/// render as a healthy (false-green) corpus during a storage outage. Callers
+/// turn the `Err` into [`PipelineCounts::mark_unavailable`].
 #[cfg(feature = "storage")]
 pub async fn collect_pipeline_counts(
     storage: &dyn Storage,
@@ -1081,14 +1117,20 @@ pub async fn collect_pipeline_counts(
     embedded_documents: Option<u64>,
     embedded_chunks: Option<u64>,
     embedding_skipped: Option<u64>,
-) -> PipelineCounts {
-    let pdfs = count_ext_via(storage, papers_prefix, "pdf").await;
-    let htmls = count_ext_via(storage, papers_prefix, "html").await;
-    let epubs = count_ext_via(storage, papers_prefix, "epub").await;
+) -> anyhow::Result<PipelineCounts> {
+    use anyhow::Context;
+
+    let papers = storage
+        .list(papers_prefix)
+        .await
+        .with_context(|| format!("list {papers_prefix:?} for pipeline counts"))?;
+    let pdfs = count_ext(&papers, "pdf");
+    let htmls = count_ext(&papers, "html");
+    let epubs = count_ext(&papers, "epub");
     let documents = pdfs + htmls + epubs;
-    let markdown = count_ext_via(storage, markdown_prefix, "md").await;
-    let catalog_entries = count_ext_via(storage, catalog_prefix, "yaml").await;
-    PipelineCounts {
+    let markdown = count_ext_via(storage, markdown_prefix, "md").await?;
+    let catalog_entries = count_ext_via(storage, catalog_prefix, "yaml").await?;
+    Ok(PipelineCounts {
         documents,
         pdfs,
         htmls,
@@ -1106,7 +1148,8 @@ pub async fn collect_pipeline_counts(
         in_flight_conversions: None,
         pipeline_drift: 0,
         pipeline_drift_threshold: PIPELINE_DRIFT_THRESHOLD,
-    }
+        counts_error: None,
+    })
 }
 
 #[cfg(all(test, feature = "catalog"))]
@@ -1241,7 +1284,9 @@ mod unconverted_stem_tests {
             .await
             .unwrap();
 
-        let n = count_unconverted_stems(&storage, "papers", "markdown").await;
+        let n = count_unconverted_stems(&storage, "papers", "markdown")
+            .await
+            .unwrap();
         assert_eq!(n, 1, "only `dual` owes markdown");
     }
 
@@ -1275,9 +1320,84 @@ mod unconverted_stem_tests {
             .unwrap();
 
         assert_eq!(
-            count_unconverted_stems(&storage, "papers", "markdown").await,
+            count_unconverted_stems(&storage, "papers", "markdown")
+                .await
+                .unwrap(),
             0
         );
+    }
+
+    /// Storage whose listings always fail, standing in for an S3 outage.
+    struct Unreachable;
+
+    #[async_trait::async_trait]
+    impl Storage for Unreachable {
+        async fn get(&self, _: &str) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("backend unreachable")
+        }
+        async fn put(&self, _: &str, _: Vec<u8>) -> anyhow::Result<()> {
+            anyhow::bail!("backend unreachable")
+        }
+        async fn head(&self, _: &str) -> anyhow::Result<Option<crate::storage::ObjectMeta>> {
+            anyhow::bail!("backend unreachable")
+        }
+        async fn list(&self, _: &str) -> anyhow::Result<Vec<crate::storage::ObjectMeta>> {
+            anyhow::bail!("backend unreachable")
+        }
+        async fn delete(&self, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("backend unreachable")
+        }
+    }
+
+    /// RA-30: a failed listing is an error, not "0 documents, 0 drift".
+    #[tokio::test]
+    async fn storage_outage_is_an_error_not_a_zero_count() {
+        let s = Unreachable;
+        let e = count_ext_via(&s, "papers", "pdf").await.unwrap_err();
+        assert!(format!("{e:#}").contains("backend unreachable"), "{e:#}");
+        count_unconverted_stems(&s, "papers", "markdown")
+            .await
+            .unwrap_err();
+        collect_pipeline_counts(&s, "papers", "markdown", "catalog", None, None, None)
+            .await
+            .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn collect_pipeline_counts_tallies_extensions_from_one_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        for key in [
+            "papers/aa/a.pdf",
+            "papers/bb/b.pdf",
+            "papers/cc/c.html",
+            "papers/dd/d.epub",
+            "papers/ee/._e.pdf",
+            "markdown/aa/a.md",
+            "catalog/aa/a.yaml",
+            "catalog/bb/b.yaml",
+        ] {
+            storage.put(key, b"x".to_vec()).await.unwrap();
+        }
+        let c =
+            collect_pipeline_counts(&storage, "papers", "markdown", "catalog", None, None, None)
+                .await
+                .unwrap();
+        assert_eq!(
+            (c.pdfs, c.htmls, c.epubs, c.documents),
+            (2, 1, 1, 4),
+            "resource fork `._e.pdf` is not a document"
+        );
+        assert_eq!((c.markdown, c.catalog_entries), (1, 2));
+        assert!(c.counts_error.is_none());
+    }
+
+    #[test]
+    fn mark_unavailable_keeps_the_first_reason() {
+        let mut c = PipelineCounts::default();
+        c.mark_unavailable("first");
+        c.mark_unavailable("second");
+        assert_eq!(c.counts_error.as_deref(), Some("first"));
     }
 }
 

@@ -3157,7 +3157,9 @@ impl HomeStillMcp {
                 .count() as u64
         });
 
-        let mut pipeline = collect_pipeline_counts(
+        // A failed listing must not read as a fully converted, empty corpus:
+        // mark the counts unavailable so `hs status` renders "unknown".
+        let mut pipeline = match collect_pipeline_counts(
             &*self.storage,
             &self.papers_prefix,
             &self.markdown_prefix,
@@ -3166,7 +3168,20 @@ impl HomeStillMcp {
             embedded_chunks,
             embedding_skipped,
         )
-        .await;
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let mut p = hs_common::status::PipelineCounts {
+                    embedded_documents,
+                    embedded_chunks,
+                    embedding_skipped,
+                    ..Default::default()
+                };
+                p.mark_unavailable(&e);
+                p
+            }
+        };
 
         // Pipeline drift: distinct source stems that haven't produced
         // markdown yet, less whatever is converting right now. Saturating
@@ -3188,13 +3203,18 @@ impl HomeStillMcp {
         // indicate either stamped failures or stems that errored without a
         // stamp; check scribe/event-watch logs for the latter.
         let total_in_flight: u64 = scribe_instances.iter().map(|s| s.in_flight).sum();
-        pipeline.pipeline_drift = hs_common::status::count_unconverted_stems(
+        match hs_common::status::count_unconverted_stems(
             &*self.storage,
             &self.papers_prefix,
             &self.markdown_prefix,
         )
         .await
-        .saturating_sub(total_in_flight);
+        {
+            Ok(unconverted) => {
+                pipeline.pipeline_drift = unconverted.saturating_sub(total_in_flight);
+            }
+            Err(e) => pipeline.mark_unavailable(&e),
+        }
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
         pipeline.corrupted_pdfs = corrupted_pdfs;
         pipeline.inbox_pending = inbox_pending;

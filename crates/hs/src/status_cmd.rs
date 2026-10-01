@@ -48,6 +48,9 @@ struct DashboardData {
 
     /// True before the first data collection completes.
     loading: bool,
+
+    /// Why the pipeline counts are unknown (storage listing failed), if so.
+    counts_error: Option<String>,
 }
 
 /// Status of the inbox-sweeper daemon (`hs scribe inbox` cmd_run). Derived
@@ -143,6 +146,7 @@ async fn collect_data() -> DashboardData {
             indexer: read_indexer_status(),
             history: Vec::new(),
             loading: false,
+            counts_error: None,
         },
     }
 }
@@ -231,10 +235,13 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         })
         .collect();
 
+    // Counts the storage layer could not take are unknown, not zero.
+    let counts_ok = snap.pipeline.counts_error.is_none();
     DashboardData {
-        doc_counts: Some((snap.pipeline.documents, 0)),
-        markdown_counts: Some((snap.pipeline.markdown, 0)),
-        catalog_count: Some(snap.pipeline.catalog_entries),
+        doc_counts: counts_ok.then_some((snap.pipeline.documents, 0)),
+        markdown_counts: counts_ok.then_some((snap.pipeline.markdown, 0)),
+        catalog_count: counts_ok.then_some(snap.pipeline.catalog_entries),
+        counts_error: snap.pipeline.counts_error.clone(),
         corrupted_count: snap.pipeline.corrupted_pdfs,
         embedded_docs: snap.pipeline.embedded_documents.unwrap_or(0),
         embedded_chunks: snap.pipeline.embedded_chunks.unwrap_or(0),
@@ -425,7 +432,11 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     };
 
     // Helper: show "Scanning..." when None, count when Some.
-    let scanning = "  ...".to_string();
+    let scanning = if data.counts_error.is_some() {
+        "   n/a".to_string()
+    } else {
+        "  ...".to_string()
+    };
 
     let rows = vec![
         Row::new(vec![
@@ -823,6 +834,9 @@ async fn run_oneshot_text() -> Result<()> {
 
     // Pipeline counts
     println!("Pipeline:");
+    if let Some(reason) = &data.counts_error {
+        println!("  Counts unavailable: {reason}");
+    }
     if let Some((docs, _)) = data.doc_counts {
         println!("  Documents : {docs}");
     }
@@ -952,6 +966,7 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
         indexer: IndexerInfo::Stopped,
         history: vec![],
         loading: true,
+        counts_error: None,
     };
 
     let mut collect_task: Option<tokio::task::JoinHandle<DashboardData>> = None;
