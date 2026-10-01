@@ -353,6 +353,7 @@ async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     if hidden_dir().join("docker-compose-distill.yml").exists() {
+        // Docker: the container must come up and be on CUDA.
         let cfg = hs_distill::config::DistillClientConfig::load()
             .map_err(|e| anyhow::anyhow!("distill config: {e}"))?;
         let url = local_service_url(cfg.servers.iter().map(String::as_str), "distill")?;
@@ -360,8 +361,45 @@ async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
             .await?;
         assert_distill_cuda(&url).await?;
         reporter.status("Health", "distill: OK (cuda)");
+    } else if find_companion_binary("hs-distill-server").is_some() {
+        // Native install: distill is a unit running `hs-distill-server`.
+        let cfg = hs_distill::config::DistillClientConfig::load()
+            .map_err(|e| anyhow::anyhow!("distill config: {e}"))?;
+        verify_native_distill(&cfg.servers, reporter).await?;
     }
     Ok(())
+}
+
+/// After an upgrade of a natively installed distill server: a local distill
+/// that is answering MUST be on CUDA (never CPU, never flipped here). If it is
+/// not answering at all, the unit is stopped — the restart phase has already
+/// failed the upgrade for a unit that was running and did not come back — so
+/// there is nothing to assert; say so rather than pretend it was verified.
+async fn verify_native_distill(servers: &[String], reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let Ok(url) = local_service_url(servers.iter().map(String::as_str), "distill") else {
+        reporter.status(
+            "Health",
+            "distill: no loopback server configured, CUDA not checked",
+        );
+        return Ok(());
+    };
+    let client = hs_distill::client::DistillClient::new(&url)?;
+    match client.health().await {
+        Ok(health) if health.compute_device.eq_ignore_ascii_case("cuda") => {
+            reporter.status("Health", "distill: OK (cuda)");
+            Ok(())
+        }
+        Ok(health) => anyhow::bail!(
+            "distill at {url} reports compute_device `{}`, expected cuda",
+            health.compute_device
+        ),
+        Err(e) => {
+            reporter.warn(&format!(
+                "distill at {url} is not answering ({e:#}): its unit is stopped, CUDA was NOT verified"
+            ));
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -474,5 +512,24 @@ mod tests {
         assert_eq!(url, "http://localhost:9911");
         assert!(local_service_url(["http://scribe-1.example.local:7433"], "scribe").is_err());
         assert!(local_service_url([], "distill").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_native_distill_that_answers_must_be_on_cuda() {
+        let cpu = serve(health_route("Cpu")).await;
+        let err = verify_native_distill(&[cpu], &reporter())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("cuda"), "{err:#}");
+
+        let cuda = serve(health_route("Cuda")).await;
+        verify_native_distill(&[cuda], &reporter()).await.unwrap();
+
+        // Stopped unit: nothing to assert (the restart phase owns that failure).
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        verify_native_distill(&[dead], &reporter()).await.unwrap();
     }
 }
