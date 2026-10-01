@@ -11,6 +11,12 @@
 //! [`SseBuffer::feed`] with each `Bytes` chunk and iterates the returned
 //! events. ~40 LoC + tests; no external SSE crate needed.
 
+/// A complete SSE event whose bytes cannot be decoded. Dropping it would
+/// silently lose part of the model's output, so it ends the stream.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("SSE event is not valid UTF-8")]
+pub struct SseError;
+
 /// Accumulator that yields complete SSE events as bytes arrive.
 ///
 /// One event is everything between two consecutive blank lines (`\n\n`).
@@ -39,14 +45,15 @@ impl SseBuffer {
     /// strings extracted so far. Each returned string is a complete event
     /// payload (the part after `data: `). The terminating `[DONE]` sentinel
     /// is yielded as the literal string `"[DONE]"` so the caller can stop
-    /// iterating.
+    /// iterating. A complete event that is not valid UTF-8 is an error
+    /// ([`SseError`]), not a skipped event.
     ///
     /// This implementation accepts both `\n\n` and `\r\n\r\n` line
     /// terminators. llama.cpp's `llama-server` uses `\n\n`; vLLM also
     /// uses `\n\n`; some hosted OpenAI-compat proxies (CloudFront in
     /// front of a self-hosted gateway) normalize to `\r\n\r\n`. Cheap to
     /// handle both rather than discover the wrong assumption in prod.
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<String>, SseError> {
         self.buf.extend_from_slice(chunk);
 
         let mut out = Vec::new();
@@ -57,11 +64,11 @@ impl SseBuffer {
             let event_bytes: Vec<u8> = self.buf.drain(..event_end + sep_len).collect();
             // Only the separator was drained from the trailing slice.
             // Parse the event body for `data:` lines.
-            if let Some(payload) = parse_data_lines(&event_bytes[..event_end]) {
+            if let Some(payload) = parse_data_lines(&event_bytes[..event_end])? {
                 out.push(payload);
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -88,9 +95,10 @@ fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
 /// Extract the `data:` payload from a single SSE event body. The event may
 /// contain multiple `data:` lines for one logical message — concatenate them
 /// with `\n` per the SSE spec. Lines that are blank, comments (`:`), or
-/// non-`data:` directives are skipped.
-fn parse_data_lines(event: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(event).ok()?;
+/// non-`data:` directives are skipped; an event with no `data:` line at all
+/// is `Ok(None)`.
+fn parse_data_lines(event: &[u8]) -> Result<Option<String>, SseError> {
+    let text = std::str::from_utf8(event).map_err(|_| SseError)?;
     let mut payloads: Vec<&str> = Vec::new();
     for line in text.split('\n') {
         // Tolerate a trailing CR from CRLF-terminated streams.
@@ -106,9 +114,9 @@ fn parse_data_lines(event: &[u8]) -> Option<String> {
         }
     }
     if payloads.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(payloads.join("\n"))
+    Ok(Some(payloads.join("\n")))
 }
 
 #[cfg(test)]
@@ -118,15 +126,15 @@ mod tests {
     #[test]
     fn whole_event_in_one_chunk() {
         let mut b = SseBuffer::new();
-        let events = b.feed(b"data: hello\n\n");
+        let events = b.feed(b"data: hello\n\n").unwrap();
         assert_eq!(events, vec!["hello"]);
     }
 
     #[test]
     fn event_split_across_chunks_yields_once() {
         let mut b = SseBuffer::new();
-        let part1 = b.feed(b"data: hel");
-        let part2 = b.feed(b"lo\n\n");
+        let part1 = b.feed(b"data: hel").unwrap();
+        let part2 = b.feed(b"lo\n\n").unwrap();
         assert!(part1.is_empty());
         assert_eq!(part2, vec!["hello"]);
     }
@@ -134,7 +142,9 @@ mod tests {
     #[test]
     fn multiple_events_in_one_chunk() {
         let mut b = SseBuffer::new();
-        let events = b.feed(b"data: alpha\n\ndata: beta\n\ndata: gamma\n\n");
+        let events = b
+            .feed(b"data: alpha\n\ndata: beta\n\ndata: gamma\n\n")
+            .unwrap();
         assert_eq!(events, vec!["alpha", "beta", "gamma"]);
     }
 
@@ -142,30 +152,32 @@ mod tests {
     fn separator_split_across_chunks() {
         let mut b = SseBuffer::new();
         // Send the body but end before the separator.
-        let p1 = b.feed(b"data: hello\n");
+        let p1 = b.feed(b"data: hello\n").unwrap();
         assert!(p1.is_empty(), "incomplete separator must not yield");
-        let p2 = b.feed(b"\n");
+        let p2 = b.feed(b"\n").unwrap();
         assert_eq!(p2, vec!["hello"]);
     }
 
     #[test]
     fn done_sentinel_passes_through_verbatim() {
         let mut b = SseBuffer::new();
-        let events = b.feed(b"data: [DONE]\n\n");
+        let events = b.feed(b"data: [DONE]\n\n").unwrap();
         assert_eq!(events, vec!["[DONE]"]);
     }
 
     #[test]
     fn comments_and_other_directives_are_skipped() {
         let mut b = SseBuffer::new();
-        let events = b.feed(b": keepalive comment\nevent: ping\nid: 42\ndata: real\n\n");
+        let events = b
+            .feed(b": keepalive comment\nevent: ping\nid: 42\ndata: real\n\n")
+            .unwrap();
         assert_eq!(events, vec!["real"]);
     }
 
     #[test]
     fn crlf_terminators_are_accepted() {
         let mut b = SseBuffer::new();
-        let events = b.feed(b"data: hello\r\n\r\n");
+        let events = b.feed(b"data: hello\r\n\r\n").unwrap();
         assert_eq!(events, vec!["hello"]);
     }
 
@@ -173,7 +185,7 @@ mod tests {
     fn data_without_post_colon_space_is_accepted() {
         // Some non-OpenAI servers emit `data:value` without the space.
         let mut b = SseBuffer::new();
-        let events = b.feed(b"data:hello\n\n");
+        let events = b.feed(b"data:hello\n\n").unwrap();
         assert_eq!(events, vec!["hello"]);
     }
 
@@ -182,17 +194,23 @@ mod tests {
         // SSE spec: multiple `data:` lines in one event concatenate
         // with newline as the logical message.
         let mut b = SseBuffer::new();
-        let events = b.feed(b"data: line1\ndata: line2\n\n");
+        let events = b.feed(b"data: line1\ndata: line2\n\n").unwrap();
         assert_eq!(events, vec!["line1\nline2"]);
     }
 
     #[test]
-    fn invalid_utf8_event_is_dropped_not_crashed() {
+    fn a_complete_event_that_is_not_utf8_is_an_error_not_a_skipped_event() {
         let mut b = SseBuffer::new();
-        // 0xff is not valid UTF-8 in any position — entire event is
-        // skipped, not panicked.
-        let events = b.feed(b"data: \xff\xfe\xfd\n\n");
-        assert!(events.is_empty());
+        // 0xff is not valid UTF-8 in any position.
+        assert_eq!(b.feed(b"data: \xff\xfe\xfd\n\n"), Err(SseError));
+    }
+
+    #[test]
+    fn a_multibyte_character_split_across_chunks_is_not_mistaken_for_bad_utf8() {
+        // "é" is 0xC3 0xA9; the event is only decoded once complete.
+        let mut b = SseBuffer::new();
+        assert!(b.feed(b"data: caf\xc3").unwrap().is_empty());
+        assert_eq!(b.feed(b"\xa9\n\n").unwrap(), vec!["café"]);
     }
 
     #[test]
@@ -202,10 +220,16 @@ mod tests {
         // last. Simulate small TCP-window splits.
         let mut b = SseBuffer::new();
         let mut all = Vec::new();
-        all.extend(b.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\n"));
-        all.extend(b.feed(b"\ndata: {\"choices"));
-        all.extend(b.feed(b"\":[{\"delta\":{\"content\":\"llo\"}}]}\n\ndata: [DONE]"));
-        all.extend(b.feed(b"\n\n"));
+        all.extend(
+            b.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\n")
+                .unwrap(),
+        );
+        all.extend(b.feed(b"\ndata: {\"choices").unwrap());
+        all.extend(
+            b.feed(b"\":[{\"delta\":{\"content\":\"llo\"}}]}\n\ndata: [DONE]")
+                .unwrap(),
+        );
+        all.extend(b.feed(b"\n\n").unwrap());
         assert_eq!(all.len(), 3);
         assert!(all[0].contains("\"He\""));
         assert!(all[1].contains("\"llo\""));

@@ -1,5 +1,6 @@
 use crate::config::{AppConfig, BackendChoice};
 use anyhow::Result;
+use std::time::Duration;
 
 use super::cloud::CloudBackend;
 use super::ollama::OllamaBackend;
@@ -14,6 +15,7 @@ pub enum OcrEngine {
 
 impl OcrEngine {
     pub fn from_config(config: &AppConfig) -> Result<Self> {
+        let idle_timeout = Duration::from_secs(config.vlm_idle_timeout_secs);
         Ok(match config.backend {
             BackendChoice::Ollama => {
                 OcrEngine::Ollama(OllamaBackend::new(&config.ollama_url, &config.model)?)
@@ -21,12 +23,14 @@ impl OcrEngine {
             BackendChoice::Cloud => OcrEngine::Cloud(CloudBackend::new(
                 &config.cloud_url,
                 config.cloud_api_key.clone(),
-            )),
+                idle_timeout,
+            )?),
             BackendChoice::OpenAi => OcrEngine::OpenAi(OpenAiBackend::new(
                 &config.openai_url,
                 &config.model,
                 config.openai_api_key.clone(),
-            )),
+                idle_timeout,
+            )?),
         })
     }
 

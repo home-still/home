@@ -98,8 +98,13 @@ impl LayoutDetector {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         if use_cuda {
+            // error_on_failure: ort logs and silently falls back to the CPU
+            // provider when CUDA registration fails. `use_cuda: true` is an
+            // instruction, not a preference.
             builder = builder
-                .with_execution_providers([CUDAExecutionProvider::default().build()])
+                .with_execution_providers([CUDAExecutionProvider::default()
+                    .build()
+                    .error_on_failure()])
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
@@ -113,6 +118,13 @@ impl LayoutDetector {
             .iter()
             .map(|i| i.name().to_string())
             .collect();
+
+        if inputs.len() < 3 {
+            anyhow::bail!(
+                "layout model has {} inputs ({inputs:?}), expected im_shape, image and scale_factor",
+                inputs.len()
+            );
+        }
 
         // Expected: im_shape, image, scale_factor (order may vary)
         let im_shape_input_name = inputs
@@ -190,7 +202,7 @@ impl LayoutDetector {
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let num_dets = det_shape[0] as usize;
+        let num_dets = detection_count(det_shape)?;
 
         let mut bboxes = Vec::new();
 
@@ -331,5 +343,29 @@ mod tests {
         assert!((a.iou(&make_bbox(5.0, 5.0, 15.0, 15.0)) - 25.0 / 175.0).abs() < 1e-5);
         // Zero-area box
         assert!((make_bbox(0.0, 0.0, 0.0, 0.0).iou(&a) - 0.0).abs() < f32::EPSILON);
+    }
+}
+
+/// Number of detections in the model's `(N, 7)` output, or why the output
+/// is not a detection table. Indexing `shape[0]` of an output with another
+/// rank would panic on a model file that is not PP-DocLayout-V3.
+fn detection_count(shape: &[i64]) -> Result<usize> {
+    match shape {
+        [n, 7] if *n >= 0 => Ok(*n as usize),
+        _ => anyhow::bail!("layout model output has shape {shape:?}, expected (N, 7)"),
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::detection_count;
+
+    #[test]
+    fn only_an_n_by_7_output_is_a_detection_table() {
+        assert_eq!(detection_count(&[0, 7]).unwrap(), 0);
+        assert_eq!(detection_count(&[12, 7]).unwrap(), 12);
+        for bad in [vec![], vec![7], vec![12, 6], vec![1, 12, 7], vec![-1, 7]] {
+            assert!(detection_count(&bad).is_err(), "{bad:?}");
+        }
     }
 }

@@ -1,10 +1,15 @@
 use super::region::RegionType;
 use super::repetition_detector::{RepetitionDetector, RepetitionLoopError};
 use super::sse_buffer::SseBuffer;
-use anyhow::Result;
-use futures_util::StreamExt;
+use crate::classify::{ConvertFailure, FailureCode};
+use anyhow::{Context, Result};
+use futures_util::{Stream, StreamExt};
 use std::error::Error as _;
 use std::time::Duration;
+
+/// How long a connection attempt to the VLM backend may take. The backend
+/// is on the LAN or loopback; a connect that takes longer is a dead host.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Backoff schedule for retriable VLM transport errors. The total worst-case
 /// added latency per region is ~4.2 s, which fits under the per-page scribe
@@ -28,13 +33,30 @@ pub struct OpenAiBackend {
 }
 
 impl OpenAiBackend {
-    pub fn new(url: &str, model: &str, api_key: Option<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    /// `idle_timeout` bounds the silence on the connection: the wait for the
+    /// first byte (a cold model load or a prompt-cache rebuild can take a
+    /// minute or more) and the gap between any two reads of the stream. A
+    /// stalled backend therefore fails the region instead of pinning a VLM
+    /// permit until the whole-convert deadline. There is deliberately no
+    /// overall timeout: a long generation that keeps producing tokens is
+    /// healthy.
+    pub fn new(
+        url: &str,
+        model: &str,
+        api_key: Option<String>,
+        idle_timeout: Duration,
+    ) -> Result<Self> {
+        let client = hs_common::http::client_builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(idle_timeout)
+            .build()
+            .context("failed to build the VLM HTTP client")?;
+        Ok(Self {
+            client,
             url: url.trim_end_matches('/').to_string(),
             model: model.strip_suffix(":latest").unwrap_or(model).to_string(),
             api_key: api_key.filter(|k| !k.is_empty()),
-        }
+        })
     }
 
     pub async fn recognize(&self, image_bytes: &[u8]) -> Result<String> {
@@ -61,46 +83,7 @@ impl OpenAiBackend {
 
         let resp = self.send_with_retry(&body).await?;
 
-        let mut stream = resp.bytes_stream();
-        let mut sse = SseBuffer::new();
-        let mut detector = RepetitionDetector::default();
-        let mut output = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk?;
-            for event in sse.feed(&bytes) {
-                if event == "[DONE]" {
-                    return Ok(output);
-                }
-                let Some(delta) = parse_delta_content(&event) else {
-                    continue;
-                };
-                if delta.is_empty() {
-                    continue;
-                }
-                output.push_str(&delta);
-                detector.feed(&delta);
-                if let Some(reason) = detector.check() {
-                    let bytes_at_abort = output.len();
-                    // Dropping the stream closes the underlying reqwest
-                    // body, which signals the server to stop generation.
-                    drop(stream);
-                    return Err(anyhow::Error::new(RepetitionLoopError {
-                        reason,
-                        partial_output: output,
-                        bytes_at_abort,
-                    }));
-                }
-            }
-        }
-        // Stream ended without `[DONE]`. llama-server emits `[DONE]`
-        // reliably on graceful completion; we got here either because
-        // the connection dropped mid-stream (treat as transport error)
-        // or the server closed without a sentinel (some non-llama.cpp
-        // backends). Return what we have rather than fail — the
-        // postprocess QC gate will catch a truncated output as low
-        // quality if it's actually broken.
-        Ok(output)
+        read_completion(resp.bytes_stream()).await
     }
 
     /// POST the chat-completions request with bounded exponential backoff
@@ -203,14 +186,138 @@ fn jittered(base: Duration) -> Duration {
     base + Duration::from_millis(nanos % 50)
 }
 
-/// Extract `choices[0].delta.content` from a streamed event payload.
-/// Returns `None` for events that don't carry a content delta (e.g. the
-/// initial `role` event, the final usage event with `stream_options`).
-fn parse_delta_content(event_json: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(event_json).ok()?;
-    v["choices"][0]["delta"]["content"]
-        .as_str()
-        .map(|s| s.to_string())
+fn transport_failure(message: impl Into<String>) -> anyhow::Error {
+    ConvertFailure::err(FailureCode::VlmTransportError, message)
+}
+
+/// One decoded SSE event of a chat-completions stream.
+#[derive(Debug, PartialEq)]
+enum StreamEvent {
+    /// The `[DONE]` sentinel.
+    Done,
+    /// The backend reported an error inside the stream (`{"error": ...}`),
+    /// which it can do after the response has already started with 200.
+    BackendError(String),
+    /// `choices[0].delta.content` and `choices[0].finish_reason`, either of
+    /// which may be absent (the initial `role` event, the final usage event
+    /// with `stream_options`).
+    Chunk {
+        delta: Option<String>,
+        finish: Option<String>,
+    },
+}
+
+/// Decode one SSE event payload. `Err` means the payload is not a valid
+/// chat-completions event at all.
+fn parse_event(event: &str) -> Result<StreamEvent, String> {
+    if event == "[DONE]" {
+        return Ok(StreamEvent::Done);
+    }
+    let v: serde_json::Value = serde_json::from_str(event).map_err(|e| {
+        let head: String = event.chars().take(200).collect();
+        format!("VLM stream event is not JSON ({e}): {head}")
+    })?;
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| err.to_string());
+        return Ok(StreamEvent::BackendError(message));
+    }
+    let choice = &v["choices"][0];
+    Ok(StreamEvent::Chunk {
+        delta: choice["delta"]["content"].as_str().map(str::to_string),
+        finish: choice["finish_reason"].as_str().map(str::to_string),
+    })
+}
+
+/// Consume a chat-completions SSE body into the generated text.
+///
+/// A completion is complete only when the backend says so: the `[DONE]`
+/// sentinel, or `finish_reason == "stop"` (some servers omit the sentinel).
+/// Anything else that ends the stream is a failure, never a short success:
+/// a clean EOF without either (the connection died, or the server gave up),
+/// `finish_reason == "length"` (the token limit cut the answer off), an
+/// `{"error": ...}` event, an event that is not valid UTF-8 or JSON, and a
+/// read error on the body. Whatever the cause, the region's text is
+/// incomplete and must not be stamped as a conversion. The streaming
+/// repetition detector aborts with a [`RepetitionLoopError`] holding the
+/// partial output; dropping `stream` closes the connection so the backend
+/// stops generating.
+async fn read_completion<S, E>(mut stream: S) -> Result<String>
+where
+    S: Stream<Item = std::result::Result<bytes::Bytes, E>> + Unpin,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut sse = SseBuffer::new();
+    let mut detector = RepetitionDetector::default();
+    let mut output = String::new();
+    let mut finished = false;
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| {
+            transport_failure(format!(
+                "VLM stream failed after {} bytes of output: {e}",
+                output.len()
+            ))
+        })?;
+        for event in sse
+            .feed(&bytes)
+            .map_err(|e| transport_failure(e.to_string()))?
+        {
+            match parse_event(&event).map_err(transport_failure)? {
+                StreamEvent::Done => return Ok(output),
+                StreamEvent::BackendError(message) => {
+                    return Err(transport_failure(format!(
+                        "VLM backend reported an error mid-stream after {} bytes of output: {message}",
+                        output.len()
+                    )));
+                }
+                StreamEvent::Chunk { delta, finish } => {
+                    if let Some(delta) = delta.filter(|d| !d.is_empty()) {
+                        output.push_str(&delta);
+                        detector.feed(&delta);
+                        if let Some(reason) = detector.check() {
+                            let bytes_at_abort = output.len();
+                            return Err(anyhow::Error::new(RepetitionLoopError {
+                                reason,
+                                partial_output: output,
+                                bytes_at_abort,
+                            }));
+                        }
+                    }
+                    match finish.as_deref() {
+                        None => {}
+                        Some("stop") => finished = true,
+                        Some("length") => {
+                            return Err(ConvertFailure::err(
+                                FailureCode::VlmOutputTruncated,
+                                format!(
+                                    "VLM hit its token limit (finish_reason=length) after {} bytes of output",
+                                    output.len()
+                                ),
+                            ));
+                        }
+                        Some(other) => {
+                            return Err(transport_failure(format!(
+                                "VLM stopped abnormally (finish_reason={other}) after {} bytes of output",
+                                output.len()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if finished {
+        Ok(output)
+    } else {
+        Err(transport_failure(format!(
+            "VLM stream ended after {} bytes of output without [DONE] or finish_reason=stop",
+            output.len()
+        )))
+    }
 }
 
 /// Sampling parameters tuned for verbatim OCR on academic layouts.
@@ -301,31 +408,216 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
-    #[test]
-    fn parse_delta_content_extracts_streaming_chunk() {
-        let event = r#"{"choices":[{"delta":{"content":"Hello"}}]}"#;
-        assert_eq!(parse_delta_content(event), Some("Hello".to_string()));
+    // ── stream completion ──────────────────────────────────────────────
+
+    fn sse_body(parts: &[&str]) -> Vec<std::result::Result<bytes::Bytes, std::io::Error>> {
+        parts
+            .iter()
+            .map(|p| Ok(bytes::Bytes::from(p.as_bytes().to_vec())))
+            .collect()
+    }
+
+    fn delta(text: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": text}}]})
+        )
+    }
+
+    fn finish(reason: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": reason}]})
+        )
+    }
+
+    async fn run(parts: &[&str]) -> Result<String> {
+        read_completion(futures_util::stream::iter(sse_body(parts))).await
+    }
+
+    fn code_of(err: &anyhow::Error) -> Option<FailureCode> {
+        crate::classify::failure_code(err)
+    }
+
+    #[tokio::test]
+    async fn a_stream_closed_by_done_returns_the_text() {
+        let (a, b) = (delta("Hello, "), delta("world"));
+        let out = run(&[&a, &b, &finish("stop"), "data: [DONE]\n\n"])
+            .await
+            .unwrap();
+        assert_eq!(out, "Hello, world");
+    }
+
+    #[tokio::test]
+    async fn finish_reason_stop_completes_a_stream_that_omits_done() {
+        let a = delta("text");
+        let out = run(&[&a, &finish("stop")]).await.unwrap();
+        assert_eq!(out, "text");
+    }
+
+    #[tokio::test]
+    async fn done_alone_completes_a_stream_that_never_sent_a_finish_reason() {
+        let a = delta("text");
+        assert_eq!(run(&[&a, "data: [DONE]\n\n"]).await.unwrap(), "text");
+    }
+
+    #[tokio::test]
+    async fn events_split_across_chunks_are_reassembled() {
+        let full = format!("{}{}data: [DONE]\n\n", delta("Hel"), delta("lo"));
+        let (head, tail) = full.split_at(17);
+        assert_eq!(run(&[head, tail]).await.unwrap(), "Hello");
+    }
+
+    #[tokio::test]
+    async fn a_clean_eof_without_done_or_stop_is_a_failure_not_a_short_success() {
+        let a = delta("only half of the pa");
+        let err = run(&[&a]).await.unwrap_err();
+        assert_eq!(
+            code_of(&err),
+            Some(FailureCode::VlmTransportError),
+            "{err:#}"
+        );
+        let err = run(&[]).await.unwrap_err();
+        assert_eq!(code_of(&err), Some(FailureCode::VlmTransportError));
+    }
+
+    #[tokio::test]
+    async fn hitting_the_token_limit_is_a_failure() {
+        let a = delta("a very long answer that was cut");
+        let err = run(&[&a, &finish("length"), "data: [DONE]\n\n"])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            code_of(&err),
+            Some(FailureCode::VlmOutputTruncated),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_other_finish_reason_is_a_failure() {
+        let err = run(&[&finish("content_filter")]).await.unwrap_err();
+        assert_eq!(code_of(&err), Some(FailureCode::VlmTransportError));
+    }
+
+    #[tokio::test]
+    async fn an_error_event_inside_the_stream_is_a_failure() {
+        let a = delta("partial");
+        let boom =
+            "data: {\"error\":{\"message\":\"CUDA out of memory\",\"type\":\"server_error\"}}\n\n";
+        let err = run(&[&a, boom, "data: [DONE]\n\n"]).await.unwrap_err();
+        assert_eq!(code_of(&err), Some(FailureCode::VlmTransportError));
+        assert!(format!("{err:#}").contains("CUDA out of memory"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn an_event_that_is_not_valid_utf8_is_a_failure_not_a_dropped_event() {
+        let a = delta("before");
+        let err = read_completion(futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from(a.into_bytes())),
+            Ok(bytes::Bytes::from_static(b"data: \xff\xfe\n\n")),
+            Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")),
+        ]))
+        .await
+        .unwrap_err();
+        assert_eq!(
+            code_of(&err),
+            Some(FailureCode::VlmTransportError),
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("UTF-8"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn an_event_that_is_not_json_is_a_failure() {
+        let err = run(&["data: this is not json\n\n", "data: [DONE]\n\n"])
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&err), Some(FailureCode::VlmTransportError));
+    }
+
+    #[tokio::test]
+    async fn a_body_read_error_mid_stream_is_a_failure() {
+        let a = delta("text");
+        let err = read_completion(futures_util::stream::iter(vec![
+            Ok(bytes::Bytes::from(a.into_bytes())),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection closed before message completed",
+            )),
+        ]))
+        .await
+        .unwrap_err();
+        assert_eq!(code_of(&err), Some(FailureCode::VlmTransportError));
+    }
+
+    #[tokio::test]
+    async fn a_repetition_loop_aborts_with_the_partial_output() {
+        let looped = "and relationship ".repeat(40);
+        let a = delta(&looped);
+        let err = run(&[&a, "data: [DONE]\n\n"]).await.unwrap_err();
+        let loop_err = err
+            .downcast_ref::<RepetitionLoopError>()
+            .expect("a loop is reported as the controlled abort, not a transport failure");
+        assert!(loop_err.bytes_at_abort > 0);
+        assert_eq!(code_of(&err), None);
     }
 
     #[test]
-    fn parse_delta_content_returns_none_for_role_only_event() {
+    fn parse_event_reads_content_and_finish_reason() {
+        assert_eq!(
+            parse_event(r#"{"choices":[{"delta":{"content":"Hello"}}]}"#),
+            Ok(StreamEvent::Chunk {
+                delta: Some("Hello".into()),
+                finish: None
+            })
+        );
+        assert_eq!(
+            parse_event(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+            Ok(StreamEvent::Chunk {
+                delta: None,
+                finish: Some("stop".into())
+            })
+        );
+    }
+
+    #[test]
+    fn role_only_and_usage_events_carry_nothing() {
+        let nothing = StreamEvent::Chunk {
+            delta: None,
+            finish: None,
+        };
         // First event in a stream typically carries only role, no content.
-        let event = r#"{"choices":[{"delta":{"role":"assistant"}}]}"#;
-        assert_eq!(parse_delta_content(event), None);
-    }
-
-    #[test]
-    fn parse_delta_content_returns_none_for_final_usage_event() {
+        assert_eq!(
+            parse_event(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#),
+            Ok(StreamEvent::Chunk {
+                delta: None,
+                finish: None
+            })
+        );
         // With stream_options.include_usage=true, the final event has
         // empty choices and a usage block we don't care about.
-        let event = r#"{"choices":[],"usage":{"prompt_tokens":42}}"#;
-        assert_eq!(parse_delta_content(event), None);
+        assert_eq!(
+            parse_event(r#"{"choices":[],"usage":{"prompt_tokens":42}}"#),
+            Ok(nothing)
+        );
     }
 
     #[test]
-    fn parse_delta_content_returns_none_for_malformed_json() {
-        let event = "not json";
-        assert_eq!(parse_delta_content(event), None);
+    fn parse_event_rejects_malformed_payloads_and_reads_error_events() {
+        assert!(parse_event("not json").is_err());
+        assert_eq!(parse_event("[DONE]"), Ok(StreamEvent::Done));
+        assert_eq!(
+            parse_event(r#"{"error":"plain string error"}"#),
+            Ok(StreamEvent::BackendError("\"plain string error\"".into()))
+        );
+        assert_eq!(
+            parse_event(r#"{"error":null,"choices":[]}"#),
+            Ok(StreamEvent::Chunk {
+                delta: None,
+                finish: None
+            })
+        );
     }
 
     #[test]

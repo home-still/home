@@ -91,6 +91,83 @@ pub struct TableStructureRecognizer {
     session: Session,
 }
 
+/// The structure head's `(sequence length, vocabulary size)`, or why this
+/// model is not the SLANet-Plus the character dictionary was written for.
+/// The decode loop slices `seq_len * vocab` logits and indexes `CHAR_DICT`
+/// by the arg-max, so a model with a different vocabulary would otherwise
+/// panic (or silently mislabel tokens) on the first table.
+fn structure_dims(shape: &[i64]) -> Result<(usize, usize)> {
+    let [batch, seq, vocab] = shape else {
+        anyhow::bail!(
+            "table structure head has rank {} (shape {shape:?}), expected 3",
+            shape.len()
+        );
+    };
+    if *batch != 1 || *seq < 1 {
+        anyhow::bail!(
+            "table structure head has shape {shape:?}, expected [1, seq >= 1, {}]",
+            CHAR_DICT.len()
+        );
+    }
+    if *vocab != CHAR_DICT.len() as i64 {
+        anyhow::bail!(
+            "table structure head has {vocab} classes but the character dictionary has {}; \
+             this is not a SLANet-Plus model",
+            CHAR_DICT.len()
+        );
+    }
+    Ok((*seq as usize, *vocab as usize))
+}
+
+/// The bbox head must be `[1, seq, 8]` (four corner points per step).
+fn check_bbox_dims(shape: &[i64], seq_len: usize) -> Result<()> {
+    if shape != [1, seq_len as i64, 8] {
+        anyhow::bail!("table bbox head has shape {shape:?}, expected [1, {seq_len}, 8]");
+    }
+    Ok(())
+}
+
+/// Declared output shapes, checked at load. A `-1` is a dynamic dimension
+/// that can only be checked per inference; a static one that is wrong
+/// rejects the model file before it serves a single table.
+fn check_declared_outputs(shapes: &[Option<Vec<i64>>]) -> Result<()> {
+    let (Some(bbox), Some(structure)) = (shapes.first(), shapes.get(1)) else {
+        anyhow::bail!(
+            "table model has {} outputs, expected bbox and structure heads",
+            shapes.len()
+        );
+    };
+    let bbox = bbox
+        .as_ref()
+        .context("table model's first output is not a tensor")?;
+    let structure = structure
+        .as_ref()
+        .context("table model's second output is not a tensor")?;
+    if bbox.len() != 3 || (bbox[2] != -1 && bbox[2] != 8) {
+        anyhow::bail!("table bbox head is declared {bbox:?}, expected [1, seq, 8]");
+    }
+    if structure.len() != 3 || (structure[2] != -1 && structure[2] != CHAR_DICT.len() as i64) {
+        anyhow::bail!(
+            "table structure head is declared {structure:?}, expected [1, seq, {}]",
+            CHAR_DICT.len()
+        );
+    }
+    Ok(())
+}
+
+/// Pixel size the table image is resized to so its longer side is
+/// `MAX_LEN`. A sliver whose short side rounds to 0 keeps 1 pixel (an
+/// empty image would panic the resize); an empty image is refused.
+fn resize_dims(orig_w: u32, orig_h: u32) -> Result<(u32, u32, f32)> {
+    if orig_w == 0 || orig_h == 0 {
+        anyhow::bail!("table crop is {orig_w}x{orig_h}: nothing to recognize");
+    }
+    let ratio = MAX_LEN as f32 / (orig_w.max(orig_h) as f32);
+    let resize_w = ((orig_w as f32 * ratio) as u32).max(1);
+    let resize_h = ((orig_h as f32 * ratio) as u32).max(1);
+    Ok((resize_w, resize_h, ratio))
+}
+
 impl TableStructureRecognizer {
     pub fn new(model_path: &str, use_cuda: bool) -> Result<Self> {
         let mut builder = Session::builder()
@@ -99,8 +176,13 @@ impl TableStructureRecognizer {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         if use_cuda {
+            // error_on_failure: ort logs and silently falls back to the CPU
+            // provider when CUDA registration fails. `use_cuda: true` is an
+            // instruction, not a preference.
             builder = builder
-                .with_execution_providers([CUDAExecutionProvider::default().build()])
+                .with_execution_providers([CUDAExecutionProvider::default()
+                    .build()
+                    .error_on_failure()])
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
@@ -109,6 +191,16 @@ impl TableStructureRecognizer {
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("Failed to load SLANet-Plus model")?;
 
+        if !session.inputs().iter().any(|i| i.name() == "x") {
+            anyhow::bail!("table model has no input named `x`");
+        }
+        let declared: Vec<Option<Vec<i64>>> = session
+            .outputs()
+            .iter()
+            .map(|o| o.dtype().tensor_shape().map(|s| s.to_vec()))
+            .collect();
+        check_declared_outputs(&declared).context("table model rejected")?;
+
         Ok(Self { session })
     }
 
@@ -116,9 +208,7 @@ impl TableStructureRecognizer {
         let rgb = image.to_rgb8();
         let (orig_w, orig_h) = (rgb.width(), rgb.height());
 
-        let ratio = MAX_LEN as f32 / (orig_w.max(orig_h) as f32);
-        let resize_w = (orig_w as f32 * ratio) as u32;
-        let resize_h = (orig_h as f32 * ratio) as u32;
+        let (resize_w, resize_h, ratio) = resize_dims(orig_w, orig_h)?;
 
         let resized = image::imageops::resize(
             &rgb,
@@ -144,18 +234,22 @@ impl TableStructureRecognizer {
             .run(ort::inputs!["x" => input])
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+        let outputs_len = outputs.len();
+        if outputs_len < 2 {
+            anyhow::bail!("table model returned {outputs_len} outputs, expected 2");
+        }
         let bbox_output = &outputs[0];
         let structure_output = &outputs[1];
 
-        let (_, bbox_data) = bbox_output
+        let (bbox_shape, bbox_data) = bbox_output
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let (struct_shape, struct_data) = structure_output
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let seq_len = struct_shape[1] as usize;
-        let vocab_size = struct_shape[2] as usize;
+        let (seq_len, vocab_size) = structure_dims(struct_shape)?;
+        check_bbox_dims(bbox_shape, seq_len)?;
 
         let eos_idx = CHAR_DICT.len() - 1;
 
@@ -316,5 +410,72 @@ mod tests {
         assert_eq!(CHAR_DICT[7], "<td");
         assert_eq!(CHAR_DICT[48], "<td></td>");
         assert_eq!(CHAR_DICT[49], "eos");
+    }
+
+    #[test]
+    fn the_structure_head_must_match_the_character_dictionary() {
+        let dict = CHAR_DICT.len() as i64;
+        assert_eq!(
+            structure_dims(&[1, 488, dict]).unwrap(),
+            (488, CHAR_DICT.len())
+        );
+        // A different model file: another vocabulary, rank or batch.
+        for bad in [
+            vec![1, 488, dict - 1],
+            vec![1, 488, dict + 1],
+            vec![1, 488, 0],
+            vec![1, 0, dict],
+            vec![2, 488, dict],
+            vec![1, dict],
+            vec![1, 1, 488, dict],
+            vec![],
+        ] {
+            assert!(structure_dims(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_bbox_head_must_line_up_with_the_structure_head() {
+        check_bbox_dims(&[1, 488, 8], 488).unwrap();
+        for bad in [
+            vec![1, 487, 8],
+            vec![1, 488, 4],
+            vec![1, 488],
+            vec![2, 488, 8],
+        ] {
+            assert!(check_bbox_dims(&bad, 488).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn declared_output_shapes_are_checked_at_load_but_dynamic_dims_pass() {
+        let dict = CHAR_DICT.len() as i64;
+        let ok = |bbox: Vec<i64>, structure: Vec<i64>| {
+            check_declared_outputs(&[Some(bbox), Some(structure)])
+        };
+        ok(vec![1, 488, 8], vec![1, 488, dict]).unwrap();
+        ok(vec![-1, -1, 8], vec![-1, -1, dict]).unwrap();
+        ok(vec![-1, -1, -1], vec![-1, -1, -1]).unwrap();
+        assert!(ok(vec![1, 488, 8], vec![1, 488, dict + 7]).is_err());
+        assert!(ok(vec![1, 488, 4], vec![1, 488, dict]).is_err());
+        assert!(ok(vec![1, 488], vec![1, 488, dict]).is_err());
+        assert!(check_declared_outputs(&[]).is_err());
+        assert!(check_declared_outputs(&[Some(vec![1, 488, 8])]).is_err());
+        assert!(check_declared_outputs(&[Some(vec![1, 488, 8]), None]).is_err());
+    }
+
+    #[test]
+    fn resize_never_produces_a_zero_side_and_refuses_an_empty_image() {
+        // 1 x 1000 px: the short side rounds to 0 at ratio 0.488.
+        let (w, h, ratio) = resize_dims(1, 1000).unwrap();
+        assert_eq!((w, h), (1, 488));
+        assert!((ratio - 0.488).abs() < 1e-3);
+        let (w, h, _) = resize_dims(2000, 1).unwrap();
+        assert_eq!((w, h), (488, 1));
+        let (w, h, _) = resize_dims(400, 400).unwrap();
+        assert_eq!((w, h), (488, 488));
+        assert!(resize_dims(0, 100).is_err());
+        assert!(resize_dims(100, 0).is_err());
+        assert!(resize_dims(0, 0).is_err());
     }
 }
