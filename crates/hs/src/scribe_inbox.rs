@@ -911,6 +911,15 @@ mod tests {
             b"dots stem",
         )
         .await;
+        // Stem `...` shards into `../...pdf`: it used to pass validation and
+        // then fail every sweep in `storage.put`.
+        put_settled(
+            &storage,
+            tmp.path(),
+            &format!("{INBOX}/....pdf"),
+            b"shards to dotdot",
+        )
+        .await;
         put_settled(&storage, tmp.path(), &format!("{INBOX}/ok.pdf"), b"fine").await;
 
         let first = sweep_inbox_once(&storage, &bus, PAPERS, &Shutdown::new())
@@ -918,7 +927,7 @@ mod tests {
             .unwrap();
 
         assert!(first.errors.is_empty(), "{:?}", first.errors);
-        assert_eq!(first.rejected.len(), 2, "{:?}", first.rejected);
+        assert_eq!(first.rejected.len(), 3, "{:?}", first.rejected);
         assert_eq!(first.relocated, 1, "the valid neighbour still relocates");
         assert!(
             first
@@ -931,13 +940,20 @@ mod tests {
 
         // Both rejected files are preserved under corrupted/, nothing else is.
         let kept = storage.list(&format!("{CORRUPTED_PREFIX}/")).await.unwrap();
-        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!(kept.len(), 3, "{kept:?}");
         let mut bodies = Vec::new();
         for meta in &kept {
             bodies.push(storage.get(&meta.key).await.unwrap());
         }
         bodies.sort();
-        assert_eq!(bodies, vec![b"dots stem".to_vec(), b"empty stem".to_vec()]);
+        assert_eq!(
+            bodies,
+            vec![
+                b"dots stem".to_vec(),
+                b"empty stem".to_vec(),
+                b"shards to dotdot".to_vec()
+            ]
+        );
 
         // Only the valid file was published; the inbox is empty.
         assert_eq!(bus.published.lock().await.len(), 1);
@@ -954,7 +970,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            2
+            3
         );
     }
 

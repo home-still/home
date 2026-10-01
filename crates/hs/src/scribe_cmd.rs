@@ -736,7 +736,7 @@ async fn cmd_convert(
             Err(e) => {
                 check_stage.finish_failed("server not reachable");
                 anyhow::bail!(
-                    "Cannot reach scribe server at {url}: {e:#}\n\nRun `hs scribe init` to set up the server."
+                    "Cannot reach scribe server at {url}: {e:#}\n\nStart it with `hs serve scribe` (or point `scribe.servers` at a running one)."
                 );
             }
         }
@@ -952,7 +952,7 @@ mod markdown_path_tests {
 pub async fn cmd_server(action: ServerAction) -> Result<()> {
     let compose_path = hidden_dir().join("docker-compose.yml");
     if !compose_path.exists() {
-        anyhow::bail!("No compose config found. Run `hs scribe init` first.");
+        anyhow::bail!("No compose config found at ~/.home-still/docker-compose.yml; the scribe server is started with `hs serve scribe` instead.");
     }
     let compose = ComposeCmd::detect()
         .await

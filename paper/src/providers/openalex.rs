@@ -350,29 +350,28 @@ impl PaperProvider for OpenAlexProvider {
     }
 }
 
+/// Largest word position accepted from an OpenAlex inverted index. Real
+/// abstracts are a few hundred words; the cap only bounds the allocation
+/// (`MAX_ABSTRACT_POSITION + 1` slots, ~16 MB) against a hostile payload.
+const MAX_ABSTRACT_POSITION: usize = 1_000_000;
+
 /// Rebuild the abstract from OpenAlex's `word -> [positions]` index.
 ///
-/// The positions are remote integers. A well-formed index is dense — each of
-/// the `n` positions `0..n` appears once — so the largest position is below
-/// the total number of positions. Anything else is a malformed (or hostile)
-/// payload: sizing the word table from it would either allocate an arbitrary
-/// amount (`{"x": [4000000000000]}`) or overflow `max + 1`, both of which
-/// abort the process. Such an index yields no abstract.
+/// The positions are remote integers, so the word table is sized from a fixed
+/// cap, never from the payload: `{"x": [4000000000000]}` would otherwise ask
+/// for terabytes or overflow `max + 1`, both of which abort the process. A
+/// position above the cap makes the index malformed and yields no abstract. A
+/// gap in the positions (a token OpenAlex stripped) renders as a blank, not
+/// as a lost abstract.
 fn reconstruct_abstract(inverted_index: &HashMap<String, Vec<usize>>) -> Option<String> {
-    let total: usize = inverted_index
-        .values()
-        .map(Vec::len)
-        .fold(0usize, usize::saturating_add);
-    let max_pos = inverted_index.values().flatten().copied().max();
-
-    let Some(max_pos) = max_pos else {
+    let Some(max_pos) = inverted_index.values().flatten().copied().max() else {
         return Some(String::new());
     };
-    if max_pos >= total {
+    if max_pos > MAX_ABSTRACT_POSITION {
         tracing::warn!(
             max_position = max_pos,
-            positions = total,
-            "OpenAlex abstract index is not dense; dropping the abstract"
+            limit = MAX_ABSTRACT_POSITION,
+            "OpenAlex abstract index has an implausible word position; dropping the abstract"
         );
         return None;
     }
@@ -421,10 +420,31 @@ mod tests {
     fn hostile_positions_yield_no_abstract_instead_of_aborting() {
         // `usize::MAX + 1` overflowed (release: wrapped to 0 and the next
         // index panicked); 4e12 asked the allocator for ~64 TB. Both abort.
-        for pos in [usize::MAX, 4_000_000_000_000, 10] {
+        for pos in [usize::MAX, 4_000_000_000_000, MAX_ABSTRACT_POSITION + 1] {
             let mut index = HashMap::new();
             index.insert("word".to_string(), vec![0, pos]);
             assert_eq!(reconstruct_abstract(&index), None, "position {pos}");
         }
+    }
+
+    /// F12: a gap in the positions used to drop the whole abstract.
+    #[test]
+    fn a_gap_in_positions_renders_as_a_blank() {
+        let mut index = HashMap::new();
+        index.insert("Hello".to_string(), vec![0]);
+        index.insert("world".to_string(), vec![3]);
+        assert_eq!(
+            reconstruct_abstract(&index).as_deref(),
+            Some("Hello   world")
+        );
+    }
+
+    #[test]
+    fn a_position_at_the_cap_is_accepted() {
+        let mut index = HashMap::new();
+        index.insert("end".to_string(), vec![MAX_ABSTRACT_POSITION]);
+        let text = reconstruct_abstract(&index).unwrap();
+        assert!(text.ends_with("end"));
+        assert_eq!(text.len(), MAX_ABSTRACT_POSITION + 3);
     }
 }

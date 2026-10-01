@@ -77,7 +77,9 @@ pub async fn reindex(cfg: &Config, stem: &str) -> Result<u32> {
     let entry = read_sidecar(&entry_path)?;
     let md = read_markdown(cfg, stem)?;
     let distill = PersonalDistill::new(cfg)?;
-    distill.delete(stem).await?;
+    // Indexing replaces a document in place (new chunks upserted, stale tail
+    // removed after success), so nothing is deleted first: a failed index
+    // call leaves the previous vectors untouched.
     let result = distill.index(&format!("{stem}.md"), &md, &entry).await?;
     Ok(result.chunks_indexed)
 }
@@ -125,4 +127,57 @@ fn walk_sidecars(root: &Path, f: &mut dyn FnMut(&Path) -> Result<()>) -> Result<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with_document(server_url: &str) -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            project_dir: dir.path().to_path_buf(),
+            distill_url: server_url.to_string(),
+            ..Config::default()
+        };
+        let sidecar = hs_common::sharded_path(&cfg.root_dir(), "record", "catalog.yaml");
+        let md = hs_common::sharded_path(&cfg.markdown_dir(), "record", "md");
+        for (path, body) in [
+            (
+                sidecar,
+                serde_yaml_ng::to_string(&CatalogEntry::default()).unwrap(),
+            ),
+            (md, "# Record\n\nBody.".to_string()),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        (dir, cfg)
+    }
+
+    /// F6: reindex used to delete the document's vectors before indexing, so
+    /// an embedder failure left a personal record with no vectors.
+    #[tokio::test]
+    async fn a_failing_index_call_never_costs_the_document_its_vectors() {
+        let mut distill = mockito::Server::new_async().await;
+        let delete = distill
+            .mock("DELETE", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let index = distill
+            .mock("POST", "/distill")
+            .with_status(500)
+            .with_body("embedder down")
+            .expect(1)
+            .create_async()
+            .await;
+        let (_dir, cfg) = store_with_document(&distill.url());
+
+        let err = reindex(&cfg, "record").await.unwrap_err();
+
+        assert!(err.to_string().contains("embedder down"), "{err}");
+        index.assert_async().await;
+        delete.assert_async().await;
+    }
 }

@@ -1730,12 +1730,8 @@ pub async fn run_canonicalize_doi_stems(
 
         if canonical_content_changed {
             // Re-index from the canonical key so the vectors match the bytes
-            // now sitting there.
-            if let Err(e) = distill.delete_doc(&v.canonical).await {
-                stats
-                    .errors
-                    .push(format!("purge canonical {}: {e}", v.canonical));
-            }
+            // now sitting there. Indexing replaces in place, so the old
+            // vectors are not deleted first.
             let cat = match hs_common::catalog::read_catalog_entry_via(
                 &*storage,
                 "catalog",
@@ -1898,13 +1894,16 @@ mod migration_safety_tests {
         let dir = outer.path().join("papers");
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("...pdf"), "x").unwrap();
+        // Stem `...` shards into `..`: a one-level escape.
+        std::fs::write(dir.join("....pdf"), "y").unwrap();
 
         let stats =
             shard_directory("papers", &dir, &["pdf"], &Shutdown::new(), &reporter()).unwrap();
 
         assert_eq!(stats.moved, 0);
-        assert_eq!(stats.failures.len(), 1, "{:?}", stats.failures);
+        assert_eq!(stats.failures.len(), 2, "{:?}", stats.failures);
         assert!(dir.join("...pdf").exists());
+        assert!(dir.join("....pdf").exists());
         let outside: Vec<_> = std::fs::read_dir(outer.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())

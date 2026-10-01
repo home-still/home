@@ -2661,7 +2661,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Re-chunk and re-embed an already-ingested personal document by stem. Useful after chunker/embedder changes. Deletes the existing Qdrant points for the stem and re-creates them from the stored markdown.",
+        description = "Re-chunk and re-embed an already-ingested personal document by stem. Useful after chunker/embedder changes. Replaces the document's vectors in place from the stored markdown: nothing is deleted first, so a failed re-embed leaves the previous vectors untouched.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3044,9 +3044,10 @@ impl HomeStillMcp {
                         .as_ref()
                         .map(|h| h.qdrant_version.clone())
                         .unwrap_or_default(),
-                    qdrant_url: health
+                    // Served only by the token-protected /status.
+                    qdrant_url: status
                         .as_ref()
-                        .map(|h| h.qdrant_url.clone())
+                        .map(|s| s.qdrant_url.clone())
                         .unwrap_or_default(),
                 });
             }

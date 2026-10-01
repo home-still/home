@@ -271,14 +271,16 @@ impl DistillServerState {
     // ── health / readiness / status ────────────────────────────────
 
     pub async fn health(&self) -> Result<HealthResponse, ApiError> {
+        // /health is unauthenticated: it says *that* a dependency is down,
+        // never why (the cause is logged). Detail lives behind the token.
         if let EmbedderHealth::Failed(why) = self.embedder.health() {
-            return Err(ApiError::unavailable(format!("embedder unusable: {why}")));
+            tracing::warn!("health: embedder unusable: {why}");
+            return Err(ApiError::unavailable("embedder unusable"));
         }
-        let qdrant_version = self
-            .store
-            .health()
-            .await
-            .map_err(|e| ApiError::unavailable(e.to_string()))?;
+        let qdrant_version = self.store.health().await.map_err(|e| {
+            tracing::warn!("health: qdrant unavailable: {e}");
+            ApiError::unavailable("qdrant unavailable")
+        })?;
         Ok(HealthResponse {
             status: "ok".into(),
             compute_device: self.embedder.device().to_string(),
@@ -286,7 +288,6 @@ impl DistillServerState {
             version: env!("HS_VERSION").to_string(),
             qdrant_version,
             embed_model: MODEL_NAME.into(),
-            qdrant_url: self.config.qdrant_url.clone(),
         })
     }
 
@@ -295,11 +296,17 @@ impl DistillServerState {
     /// count; `in_flight` the requests being served.
     pub async fn readiness(&self) -> ReadinessResponse {
         let reason = match self.embedder.health() {
-            EmbedderHealth::Failed(why) => Some(format!("embedder unusable: {why}")),
+            EmbedderHealth::Failed(why) => {
+                tracing::warn!("readiness: embedder unusable: {why}");
+                Some("embedder unusable".to_string())
+            }
             EmbedderHealth::Healthy => {
                 match tokio::time::timeout(READINESS_QDRANT_TIMEOUT, self.store.health()).await {
                     Ok(Ok(_)) => None,
-                    Ok(Err(e)) => Some(e.to_string()),
+                    Ok(Err(e)) => {
+                        tracing::warn!("readiness: qdrant unavailable: {e}");
+                        Some("qdrant unavailable".to_string())
+                    }
                     Err(_) => Some("qdrant health check timed out".to_string()),
                 }
             }
@@ -323,6 +330,7 @@ impl DistillServerState {
             documents_count_truncated: docs.truncated,
             compute_device: self.embedder.device().to_string(),
             embed_model: MODEL_NAME.into(),
+            qdrant_url: self.config.qdrant_url.clone(),
         })
     }
 
@@ -382,8 +390,8 @@ impl DistillServerState {
         })
     }
 
-    /// Drop and recreate a served collection. Destructive; see the RA-26
-    /// note in `server.rs` about the missing authentication.
+    /// Drop and recreate a served collection. Destructive; the route is behind
+    /// the backend-token middleware (see `server.rs`).
     pub async fn reset_collection(
         &self,
         collection: Option<&str>,
@@ -803,7 +811,12 @@ mod tests {
         let r = h.state.readiness().await;
         assert!(!r.ready);
         assert_eq!(r.available_slots(), 0);
-        assert!(r.reason.unwrap().contains("slot 0 poisoned"));
+        let reason = r.reason.unwrap();
+        assert!(reason.contains("embedder unusable"));
+        assert!(
+            !reason.contains("poisoned"),
+            "internal detail leaked: {reason}"
+        );
 
         *h.embedder.health.lock() = crate::embed::EmbedderHealth::Healthy;
         h.store.state.lock().down = true;
@@ -826,6 +839,31 @@ mod tests {
         *h.embedder.health.lock() = crate::embed::EmbedderHealth::Healthy;
         h.store.state.lock().down = true;
         assert_eq!(kind(h.state.health().await), ErrorKind::Unavailable);
+    }
+
+    /// F10/F11: the open probe must not reveal the Qdrant address or the
+    /// cause of a failure; the protected `/status` carries the address.
+    #[tokio::test]
+    async fn the_open_health_probe_leaks_neither_address_nor_cause() {
+        let h = harness();
+        let ok = serde_json::to_string(&h.state.health().await.unwrap()).unwrap();
+        assert!(
+            !ok.contains("qdrant_url") && !ok.contains(&h.state.config.qdrant_url),
+            "{ok}"
+        );
+
+        *h.embedder.health.lock() = crate::embed::EmbedderHealth::Failed("slot 0 poisoned".into());
+        let err = h.state.health().await.unwrap_err();
+        assert!(!err.to_string().contains("poisoned"), "{err}");
+
+        *h.embedder.health.lock() = crate::embed::EmbedderHealth::Healthy;
+        h.store.state.lock().down = true;
+        let err = h.state.health().await.unwrap_err().to_string();
+        assert!(err.contains("qdrant unavailable"), "{err}");
+        h.store.state.lock().down = false;
+
+        let status = h.state.status(None).await.unwrap();
+        assert_eq!(status.qdrant_url, h.state.config.qdrant_url);
     }
 
     #[test]

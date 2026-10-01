@@ -6,6 +6,61 @@ This guide assumes a sanitized topology with role-named hosts (`big`, `one`, `tw
 
 ---
 
+## Upgrade prerequisites (robustness release)
+
+Do these **before** restarting any service on the new binaries; each item names the symptom if it is skipped. Hosts are placeholders (`<gateway-host>`, `<gpu-host>`, ...).
+
+### 1. Provision `HS_BACKEND_TOKEN` (and understand its blast radius)
+
+* Generate once: `openssl rand -hex 32`. Put the **same** value in `~/.home-still/secrets.env` (`HS_BACKEND_TOKEN=<64-hex-chars>`, mode 0600) on the gateway host, on every backend host (`hs-mcp --serve`, distill, scribe) and on every host that runs `hs`. Minimum 32 bytes of visible ASCII; a shorter or malformed value stops the process with an error naming the variable.
+* Without it: `hs-mcp --serve` and the gateway refuse to start; clients get 401 from backends.
+* **What this secret is.** One static bearer for the whole cluster, not a per-service or per-user credential. It is sent **in cleartext over plain HTTP on the LAN**, and `AuthedHttp::plain` attaches it to *whatever URL is configured* under `scribe.servers` / `distill.servers` (and through `HTTP(S)_PROXY` if one is set). Consequences: keep those URLs on the trusted LAN and double-check them for typos; a LAN sniffer, or the compromise of **any one** client host, unlocks **every** backend and bypasses the gateway's scopes (including the `personal_*` tools). Treat `secrets.env` on every host as a cluster root credential, and rotate by regenerating and redeploying to all hosts at once.
+* Follow-up options (not implemented): per-service tokens (a leaked scribe token no longer opens distill/mcp), and TLS between gateway/clients and backends so the token is not on the wire in clear. Recommendation: TLS first, then per-service tokens.
+* The scribe server is about to require the token too. There is currently **no `hs scribe init`** command and no generated scribe compose file: provision the token in `secrets.env` as above (`hs serve scribe --install` units read it from there).
+
+### 2. Gateway
+
+* Re-enrollment is required: old access and refresh tokens are rejected. Order: upgrade `hs-gateway` **and** `hs` on the gateway host together, make sure the gateway unit runs the new binary, `hs cloud invite --name <device>` per device, then `hs cloud enroll --gateway https://<public-host>` on each device.
+* The unit's `ExecStart` needs `--gateway-url https://<public-host>` (startup fails without it).
+* `cloud.gateway.routes` must list **every** backend (`scribe`, `distill`, `mcp`; a single URL or a list of `http(s)://host[:port]` URLs). Other keys, paths in URLs or typos are startup errors; a service without a route answers 502. The dynamic registry and `hs server` are gone, and `hs serve ...` no longer registers with the gateway.
+* Remove the stale `cloud.role` / `cloud.gateway_url` keys; nothing reads them.
+
+### 3. Config that is now required or validated
+
+* `events:` with an explicit `backend` (`nats` or `noop`) is required by the watchers, `hs scribe inbox`, `hs pipeline`, `hs migrate`, `hs paper download` and `hs-mcp` (which also refuses to start when the broker is unreachable). Watchers need `backend: nats`.
+* `scribe.servers` on every host that runs a scribe client command; `distill.servers` on every host that runs distill commands.
+* Scribe **server** settings live under `scribe_server:` in `~/.home-still/config.yaml` (or `HS_SCRIBE_*` env, which wins). The old `~/.config/home-still/config.yaml` is no longer read. Invalid values stop `hs-scribe-server` instead of starting on defaults.
+* A malformed `storage:`, `events:`, `logs:`, `home:`, `scribe:`, `distill:`, `scribe_server:` or `distill_server:` section, an unreadable `secrets.env`, or an invalid `HS_*` / `HOME_STILL_*` value now stops the binary (exit 1, or 2 for logging) with the key named.
+* Paper config: a provider API key with a plain-`http` non-loopback `base_url` refuses to load (e.g. `openalex.api_key` with `http://api.openalex.org`: use https).
+
+### 4. Scribe hosts
+
+* **libpdfium is required** on hosts running the legacy/VLM scribe server (macOS: `libpdfium.dylib`, see 6.7). Legacy per-region hosts will not start without both ONNX models; check `/health` shows both loaded before upgrading.
+* Concurrency, dpi, timeout values must be >= 1 and `timeout_policy.floor_secs <= ceiling_secs`; `scribe.servers[].concurrency >= 1`.
+* More Escalate/NAK traffic during VLM instability is expected: failed pages now fail the conversion instead of leaving holes.
+
+### 5. Distill hosts
+
+* New `distill_server` keys: `collections`, `hnsw.*`, `embedding.max_length`, `ollama_timeout_secs`; `distill.index_timeout_secs`. Removed: `embedding.model`, `embedding.sparse_enabled`.
+* The server refuses to start when: `embedding.batch_size > 20`, `chunk_max_tokens > 1232`, `embedding.dimension != 1024`, `personal.collection_name` is not in `collections`, `qdrant_upsert_batch`/`parallelism` or `idle_release_secs` is 0, or `index_timeout_secs + 120 > events.nats.ack_wait_secs`. Each error names the key.
+* CUDA stays mandatory. `/health` and `/readiness` are open but now report only up/down (no Qdrant address, no error text); everything else, including `/status`, needs the token.
+* Vectors written before this release were embedded from at most 512 tokens per chunk; re-index documents gradually (indexing now replaces in place and removes stale tail chunks).
+
+### 6. Building and upgrading
+
+* `--release` builds need `HS_RELEASE_TAG=vX.Y.Z[-pre]`; there is no `git describe` fallback.
+* `hs upgrade` refuses to install a release without `<asset>.sha256`, and fails (exit 1) on version mismatch, failed health or CPU distill. Over ssh set `XDG_RUNTIME_DIR=/run/user/$(id -u)`.
+* Release binaries unwind on panic (`panic = "unwind"`).
+
+### 7. Behavior changes to expect
+
+* `paper_search` (MCP) always returns `{"papers": [...], "provider_failures": [...]}`; `scribe_convert` re-announces existing markdown instead of re-converting; `distill_reindex` and `personal_reindex` replace vectors in place and never delete first.
+* Stems beginning with `..` are rejected everywhere (an inbox file named `....pdf` goes to `corrupted/`).
+* Downloads that are not PDFs (landing pages, HTML) fail that source instead of being stored.
+* `hs pipeline`, `hs migrate`, `hs distill abstracts` exit 1 on any per-item error.
+
+---
+
 ## 1. Why this topology exists
 
 The split into "tunnel host", "storage server", "GPU compute", "DB host", and "clients" isn't a flex. Each role exists because:
@@ -1072,7 +1127,6 @@ On the new host:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/home-still/home/main/docs/install.sh | sh
 hs config init
-hs scribe init
 hs distill init
 hs cloud enroll --gateway https://cloud.example.com   # paste a fresh invite
 hs serve scribe

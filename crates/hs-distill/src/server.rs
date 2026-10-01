@@ -1,11 +1,11 @@
 //! axum adapter over [`crate::api`]: routing, JSON, status codes, NDJSON
 //! streaming. No request logic lives here.
 //!
-//! RA-26 (deferred): `/collection/reset`, `DELETE /doc/{doc_id}` and
-//! `/scrub-interstitials` are destructive and, like every other route, carry
-//! no authentication; the server binds all interfaces. The bearer mechanism
-//! for backend services is being designed separately — these three routes
-//! are the ones that must adopt it first.
+//! Every route except `GET /health` and `GET /readiness` requires the shared
+//! backend bearer token (`hs_common::auth::backend`, enforced by the
+//! middleware in [`router`]); the server binds all interfaces. The two open
+//! probes report only whether a dependency is up, never its address or error
+//! text — that detail is on the protected `/status`.
 
 use std::sync::Arc;
 
@@ -599,7 +599,12 @@ mod tests {
         assert_eq!(resp.status(), 503);
         let body: ReadinessResponse = resp.json().await.unwrap();
         assert!(!body.ready);
-        assert!(body.reason.unwrap().contains("poisoned"));
+        let reason = body.reason.unwrap();
+        assert!(reason.contains("embedder unusable"));
+        assert!(
+            !reason.contains("poisoned"),
+            "internal detail leaked: {reason}"
+        );
         assert_eq!(
             h.http.get(h.url("/health")).send().await.unwrap().status(),
             503

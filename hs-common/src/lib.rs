@@ -74,7 +74,8 @@ pub fn sharded_key(stem: &str, ext: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidStem {
     Empty,
-    /// `.` or `..`
+    /// `.` or `..`, or a stem whose shard directory would be `.` or `..`
+    /// (it starts with `..`, or with `.` followed by a wide character).
     DotSegment,
     /// `/` or `\`
     PathSeparator,
@@ -85,7 +86,7 @@ impl std::fmt::Display for InvalidStem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Empty => "stem is empty",
-            Self::DotSegment => "stem is '.' or '..'",
+            Self::DotSegment => "stem is '.' or '..' or would shard into such a directory",
             Self::PathSeparator => "stem contains a path separator",
             Self::Nul => "stem contains a NUL byte",
         })
@@ -97,8 +98,11 @@ impl std::error::Error for InvalidStem {}
 /// Check that `stem` is a single, plain file-name component, safe to feed to
 /// [`sharded_key`] / [`sharded_path`] and to splice into a storage key.
 ///
-/// Rejects the empty string, `.`, `..`, `/`, `\` and NUL. Everything else
-/// (non-ASCII, spaces, leading dots such as `.hidden`) is a valid stem.
+/// Rejects the empty string, `.`, `..`, `/`, `\` and NUL, and any stem whose
+/// shard directory ([`sharded_key`]'s first path segment) would itself be `.`
+/// or `..` — `..x` shards into `../..x.pdf` — which in practice means every
+/// stem starting with `..`. Everything else (non-ASCII, spaces, a single
+/// leading dot such as `.hidden`) is a valid stem.
 /// Call this at every untrusted boundary before the stem reaches storage.
 pub fn validate_stem(stem: &str) -> Result<(), InvalidStem> {
     if stem.is_empty() {
@@ -112,6 +116,9 @@ pub fn validate_stem(stem: &str) -> Result<(), InvalidStem> {
     }
     if stem.contains('\0') {
         return Err(InvalidStem::Nul);
+    }
+    if matches!(shard_prefix(stem), "." | "..") {
+        return Err(InvalidStem::DotSegment);
     }
     Ok(())
 }
@@ -236,7 +243,8 @@ mod tests {
             ".hidden",
             "a.b.c",
             "10.1016%2Fj.cell",
-            "...",
+            ".a",
+            "a..",
         ] {
             assert_eq!(validate_stem(stem), Ok(()), "{stem:?}");
         }
@@ -255,5 +263,59 @@ mod tests {
             );
         }
         assert_eq!(validate_stem("a\0b"), Err(InvalidStem::Nul));
+    }
+
+    /// F7: `..x` passed validation but sharded into `../..x.pdf`.
+    #[test]
+    fn stems_that_shard_into_a_dot_directory_are_rejected() {
+        for stem in ["..x", "...", "....", "..é", ".é", "..a.b"] {
+            assert_eq!(
+                validate_stem(stem),
+                Err(InvalidStem::DotSegment),
+                "{stem:?}"
+            );
+        }
+    }
+
+    /// Property: whatever `validate_stem` accepts stays under its root, as a
+    /// path and as a storage key.
+    #[test]
+    fn every_accepted_stem_shards_under_its_root() {
+        let alphabet = ['.', 'a', 'é', '中', ' ', '%', '_', '-', '/', '\\', '\0'];
+        let root = std::path::Path::new("/data/papers");
+        let mut accepted = 0;
+        let mut stems = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for base in &stems {
+                for c in alphabet {
+                    next.push(format!("{base}{c}"));
+                }
+            }
+            for stem in &next {
+                if validate_stem(stem).is_err() {
+                    continue;
+                }
+                accepted += 1;
+                let path = sharded_path(root, stem, "pdf");
+                assert!(
+                    path.starts_with(root)
+                        && path.components().all(|c| {
+                            matches!(
+                                c,
+                                std::path::Component::RootDir | std::path::Component::Normal(_)
+                            )
+                        }),
+                    "{stem:?} -> {path:?}"
+                );
+                let key = sharded_key(stem, "pdf");
+                assert!(
+                    key.split('/').all(|seg| !matches!(seg, "" | "." | "..")),
+                    "{stem:?} -> {key:?}"
+                );
+            }
+            stems = next;
+        }
+        assert!(accepted > 1000);
     }
 }
