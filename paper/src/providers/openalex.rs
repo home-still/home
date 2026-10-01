@@ -124,7 +124,7 @@ impl OpenAlexProvider {
             .abstract_inverted_index
             .filter(|idx| !idx.is_empty())
             .as_ref()
-            .map(reconstruct_abstract);
+            .and_then(reconstruct_abstract);
 
         let doi = work
             .doi
@@ -334,12 +334,32 @@ impl PaperProvider for OpenAlexProvider {
     }
 }
 
-fn reconstruct_abstract(inverted_index: &HashMap<String, Vec<usize>>) -> String {
-    let max_pos = inverted_index
+/// Rebuild the abstract from OpenAlex's `word -> [positions]` index.
+///
+/// The positions are remote integers. A well-formed index is dense — each of
+/// the `n` positions `0..n` appears once — so the largest position is below
+/// the total number of positions. Anything else is a malformed (or hostile)
+/// payload: sizing the word table from it would either allocate an arbitrary
+/// amount (`{"x": [4000000000000]}`) or overflow `max + 1`, both of which
+/// abort the process. Such an index yields no abstract.
+fn reconstruct_abstract(inverted_index: &HashMap<String, Vec<usize>>) -> Option<String> {
+    let total: usize = inverted_index
         .values()
-        .map(|positions| positions.iter().max().unwrap_or(&0_usize))
-        .max()
-        .unwrap_or(&0_usize);
+        .map(Vec::len)
+        .fold(0usize, usize::saturating_add);
+    let max_pos = inverted_index.values().flatten().copied().max();
+
+    let Some(max_pos) = max_pos else {
+        return Some(String::new());
+    };
+    if max_pos >= total {
+        tracing::warn!(
+            max_position = max_pos,
+            positions = total,
+            "OpenAlex abstract index is not dense; dropping the abstract"
+        );
+        return None;
+    }
 
     let mut abs = vec![""; max_pos + 1];
 
@@ -349,7 +369,7 @@ fn reconstruct_abstract(inverted_index: &HashMap<String, Vec<usize>>) -> String 
         }
     }
 
-    abs.join(" ")
+    Some(abs.join(" "))
 }
 
 #[cfg(test)]
@@ -369,15 +389,26 @@ mod tests {
         index.insert("results".to_string(), vec![9]);
         let result = reconstruct_abstract(&index);
         assert_eq!(
-            result,
-            "Despite growing interest in the field and in the results"
+            result.as_deref(),
+            Some("Despite growing interest in the field and in the results")
         );
     }
 
     #[test]
     fn test_reconstruct_abstract_empty() {
         let index = HashMap::new();
-        let result = reconstruct_abstract(&index);
+        let result = reconstruct_abstract(&index).expect("an empty index is not malformed");
         assert!(result.trim().is_empty());
+    }
+
+    #[test]
+    fn hostile_positions_yield_no_abstract_instead_of_aborting() {
+        // `usize::MAX + 1` overflowed (release: wrapped to 0 and the next
+        // index panicked); 4e12 asked the allocator for ~64 TB. Both abort.
+        for pos in [usize::MAX, 4_000_000_000_000, 10] {
+            let mut index = HashMap::new();
+            index.insert("word".to_string(), vec![0, pos]);
+            assert_eq!(reconstruct_abstract(&index), None, "position {pos}");
+        }
     }
 }

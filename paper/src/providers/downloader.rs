@@ -22,14 +22,19 @@ use crate::ports::provider::PaperProvider;
 /// other providers (which don't index this DOI prefix).
 pub fn strip_arxiv_doi_prefix(doi: &str) -> Option<&str> {
     const PREFIX: &str = "10.48550/arxiv.";
-    if doi.len() <= PREFIX.len() {
+    // `get` instead of `[..]`: `doi` is untrusted text, and a multi-byte
+    // character straddling the prefix length makes the byte slice panic
+    // (process abort under `panic = "abort"`). A non-boundary offset can
+    // never be the ASCII prefix, so `None` is the correct answer.
+    let head = doi.get(..PREFIX.len())?;
+    if !head.eq_ignore_ascii_case(PREFIX) {
         return None;
     }
-    if doi[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
-        Some(&doi[PREFIX.len()..])
-    } else {
-        None
+    let id = doi.get(PREFIX.len()..)?;
+    if id.is_empty() {
+        return None;
     }
+    Some(id)
 }
 
 #[derive(Deserialize)]
@@ -587,5 +592,32 @@ mod arxiv_doi_tests {
     #[test]
     fn rejects_nearby_prefix() {
         assert_eq!(strip_arxiv_doi_prefix("10.48551/arxiv.1234"), None);
+    }
+
+    #[test]
+    fn multibyte_text_around_the_prefix_boundary_is_not_an_arxiv_doi_and_never_panics() {
+        // `"10.48550/arxiv."` is 15 bytes. These inputs put multi-byte chars
+        // on or around byte 15 (the first, third and last straddle it), which
+        // made `doi[..15]` abort the process (`panic = "abort"` in release)
+        // on untrusted DOI text.
+        for doi in [
+            "10.48550/arxiv\u{00e9}2301.00001",
+            "10.48550/arxi\u{00e9}.2301.00001",
+            "10.48550/arxi\u{65e5}\u{672c}",
+            "\u{65e5}\u{672c}\u{8a9e}\u{65e5}\u{672c}\u{8a9e}\u{65e5}\u{672c}\u{8a9e}",
+            "10.48550/arxiv\u{1f600}",
+        ] {
+            assert_eq!(strip_arxiv_doi_prefix(doi), None, "input: {doi:?}");
+        }
+    }
+
+    #[test]
+    fn multibyte_id_after_a_valid_prefix_is_returned_verbatim() {
+        // The prefix check only fixes the boundary at byte 15; what follows
+        // is the caller's to validate.
+        assert_eq!(
+            strip_arxiv_doi_prefix("10.48550/arXiv.\u{00e9}1"),
+            Some("\u{00e9}1")
+        );
     }
 }

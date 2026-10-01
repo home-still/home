@@ -126,6 +126,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn take_chars_never_splits_a_multibyte_char() {
+        // `é` is 2 bytes, `日` is 3: every `max` that lands inside one must
+        // back off to the previous boundary instead of panicking in `[..end]`.
+        let s = "aé日b";
+        for max in 0..=s.len() + 2 {
+            let out = take_chars(s, max);
+            assert!(out.len() <= max.max(0), "max={max} out={out:?}");
+            assert!(s.starts_with(&out), "max={max} out={out:?}");
+        }
+        assert_eq!(take_chars(s, 1), "a");
+        assert_eq!(take_chars(s, 2), "a"); // byte 2 is inside `é`
+        assert_eq!(take_chars(s, 3), "aé");
+        assert_eq!(take_chars(s, 5), "aé"); // byte 5 is inside `日`
+        assert_eq!(take_chars(s, 6), "aé日");
+        assert_eq!(take_chars(s, 0), "");
+        assert_eq!(take_chars("日本語", 1), "");
+        assert_eq!(take_chars(s, s.len()), s);
+    }
+
     #[tokio::test]
     async fn parses_well_formed_response() {
         let mut server = mockito::Server::new_async().await;

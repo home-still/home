@@ -13,6 +13,18 @@ pub struct ArxivProvider {
     base_url: String,
 }
 
+/// Parse the leading `YYYY-MM-DD` of an Atom `<published>` timestamp.
+///
+/// The timestamp is remote text: `str::get` keeps a multi-byte character
+/// inside the first ten bytes from panicking the way `&s[..10]` did. Anything
+/// shorter than a date, or not a calendar date, yields `None` — the date is
+/// optional metadata, and dropping a malformed one must not discard the
+/// whole entry.
+fn parse_published_date(s: &str) -> Option<chrono::NaiveDate> {
+    let date = s.get(..10)?;
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
 impl ArxivProvider {
     pub fn new(config: &ArxivConfig) -> Result<Self> {
         let client = Client::builder()
@@ -150,7 +162,7 @@ impl ArxivProvider {
             .children()
             .find(|n| n.has_tag_name((ns, "published")))
             .and_then(|n| n.text())
-            .and_then(|s| chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").ok());
+            .and_then(parse_published_date);
 
         let download_url = entry
             .children()
@@ -372,5 +384,53 @@ mod tests {
         let (papers, total) = p.parse_atom_feed(xml).expect("Failed to parse");
         assert_eq!(total, 0);
         assert!(papers.is_empty());
+    }
+
+    #[test]
+    fn published_date_parses_the_leading_calendar_date() {
+        assert_eq!(
+            parse_published_date("2023-01-15T00:00:00Z"),
+            chrono::NaiveDate::from_ymd_opt(2023, 1, 15)
+        );
+        assert_eq!(
+            parse_published_date("2023-01-15"),
+            chrono::NaiveDate::from_ymd_opt(2023, 1, 15)
+        );
+    }
+
+    #[test]
+    fn published_date_never_panics_on_short_or_multibyte_text() {
+        // `2023-01-1é…` and `日本語…` put a multi-byte char across byte 10:
+        // `&s[..10]` aborted the process on each of them.
+        for s in [
+            "",
+            "2023",
+            "2023-01-1",
+            "2023-01-1é",
+            "2023-01-1é5T00:00:00Z",
+            "20é3-01-15",
+            "日本語の日付です",
+        ] {
+            assert_eq!(parse_published_date(s), None, "input: {s:?}");
+        }
+    }
+
+    #[test]
+    fn entry_with_a_hostile_published_field_still_yields_the_paper() {
+        let p = provider();
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+              <feed xmlns="http://www.w3.org/2005/Atom"
+                    xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+                  <opensearch:totalResults>1</opensearch:totalResults>
+                  <entry>
+                      <id>http://arxiv.org/abs/2301.00001v1</id>
+                      <title>Test Paper Title</title>
+                      <published>2023-01-1é5T00:00:00Z</published>
+                  </entry>
+              </feed>"#;
+
+        let (papers, _) = p.parse_atom_feed(xml).expect("feed parses");
+        assert_eq!(papers.len(), 1);
+        assert_eq!(papers[0].publication_date, None);
     }
 }
