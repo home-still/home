@@ -1,10 +1,15 @@
+//! Parses the first ~100 lines of a works JSONL file and prints the first
+//! few parse errors.
+//!
+//!   cargo run -p openalex-ingest --example sniff -- /path/to/works/updated_date=YYYY-MM-DD/part_0000.jsonl
+
 use openalex_ingest::model::Work;
 use std::io::BufRead;
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        "/home/ladvien/data/academic_papers/openalex-snapshot/data/works/updated_date=2016-06-24/part_0000.jsonl".to_string()
-    });
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: sniff <path to a works part_*.jsonl file>");
     let f = std::fs::File::open(&path).unwrap();
     let buf = std::io::BufReader::new(f);
     let mut errors_shown = 0;

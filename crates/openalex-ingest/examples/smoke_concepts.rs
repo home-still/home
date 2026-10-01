@@ -1,3 +1,9 @@
+//! Loads one snapshot entity (concepts) into a throwaway DuckDB file and
+//! prints a sample query. The snapshot is only read.
+//!
+//!   cargo run -p openalex-ingest --example smoke_concepts -- /path/to/openalex-snapshot/data
+
+use anyhow::Context;
 use openalex_ingest::{OpenAlexDb, SimpleEntity};
 use std::path::PathBuf;
 
@@ -8,7 +14,10 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let snapshot = PathBuf::from("/home/ladvien/data/academic_papers/openalex-snapshot/data");
+    let snapshot = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .context("usage: smoke_concepts <snapshot data dir>")?;
     let db_path = std::env::temp_dir().join(format!("oa-smoke-{}.duckdb", std::process::id()));
     println!("DB at {}", db_path.display());
 
