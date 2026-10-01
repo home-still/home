@@ -135,7 +135,7 @@ fn run(cfg: &Config, cmd: OpenAlexCmd) -> Result<()> {
             let col_names: Vec<String> = rows
                 .as_ref()
                 .map(|s| s.column_names().into_iter().collect())
-                .unwrap_or_default();
+                .ok_or_else(|| anyhow!("statement metadata unavailable after query"))?;
             let mut count = 0u64;
             while let Some(row) = rows.next()? {
                 let mut out = serde_json::Map::with_capacity(col_names.len());
