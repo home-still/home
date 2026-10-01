@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,8 +8,10 @@ use hs_common::event_bus::{specs, EventBus};
 use hs_common::storage::Storage;
 use serde::{Deserialize, Serialize};
 
-use crate::client::{compute_convert_timeout, ScribeClient};
+use crate::classify::{classify, ConvertFailure, FailureClass, FailureCode};
+use crate::client::{compute_convert_timeout, ConversionResult, ScribeClient};
 use crate::config::TimeoutPolicy;
+use crate::epub::EpubLimits;
 
 /// Handler outcome for the scribe consumer. `Permanent` → the message is
 /// TERMed (JetStream will never redeliver); `Transient` → NAK'd with
@@ -66,52 +69,83 @@ pub struct IngestedEvent {
 
 /// Once-per-event source preparation: parse the key, check whether the
 /// markdown already exists (idempotent retry), fetch the source bytes,
-/// and — for PDFs — count pages for the page-scaled timeout. Split out
-/// of [`convert_and_upload`] so the chain dispatcher fetches and parses
-/// ONCE and every backend attempt reuses the same bytes; escalation used
-/// to re-download and re-parse the whole book from storage per backend.
+/// and — for PDFs — validate them and count pages for the page-scaled
+/// timeout. Split out of [`convert_and_upload`] so the chain dispatcher
+/// fetches and parses ONCE and every backend attempt reuses the same
+/// bytes; escalation used to re-download and re-parse the whole book from
+/// storage per backend.
 pub enum SourcePrep {
-    /// Markdown already present under this key — nothing to convert.
+    /// Markdown already present under this key — nothing to convert. The
+    /// caller still owes distill the `scribe.completed` announcement: the
+    /// attempt that wrote this markdown may have died before publishing it
+    /// (see [`announce_completed`]).
     AlreadyConverted(String),
     Fetched(SourceObject),
 }
 
 /// The fetched source plus everything derivable from it that the chain
-/// needs per attempt. Bytes are shared (`Arc`) so per-backend dispatch
+/// needs per attempt. Bytes are shared (`Bytes`) so per-backend dispatch
 /// clones a refcount, not the file.
 pub struct SourceObject {
-    pub bytes: std::sync::Arc<Vec<u8>>,
+    pub bytes: bytes::Bytes,
     pub stem: String,
     pub ext: String,
-    /// PDF page count for the page-scaled timeout. `None` for non-PDF
-    /// sources or when lopdf can't parse a count.
+    /// PDF page count for the page-scaled timeout: `Some` for a PDF source
+    /// (a PDF whose pages cannot be counted never gets this far), `None`
+    /// for every other source type.
     pub pdf_pages: Option<u32>,
+}
+
+/// A failure of the event itself that no retry can fix.
+fn permanent(code: FailureCode, message: impl Into<String>) -> HandlerError {
+    HandlerError::Permanent(ConvertFailure::err(code, message))
+}
+
+/// Classify a storage error: a key that cannot name an object is the
+/// event's fault and never worth redelivering; every other storage error
+/// (network, 5xx, auth) is cluster state that may clear up.
+fn storage_failure(err: anyhow::Error, context: String) -> HandlerError {
+    if hs_common::storage::is_invalid_key(&err) {
+        permanent(FailureCode::InvalidKey, format!("{context}: {err:#}"))
+    } else {
+        HandlerError::Transient(err.context(context))
+    }
+}
+
+/// The document stem and lower-cased extension an event key designates, or
+/// the reason the key cannot be converted. The key is untrusted (it arrives
+/// on the bus): it must be a legal storage key and its stem a legal stem
+/// before either is used to build another key.
+fn parse_event_key(key: &str) -> Result<(String, String), HandlerError> {
+    hs_common::storage::validate_key(key)
+        .map_err(|e| permanent(FailureCode::InvalidKey, format!("event key rejected: {e}")))?;
+    let filename = key.rsplit_once('/').map(|(_, f)| f).unwrap_or(key);
+    let Some((stem, ext)) = filename.rsplit_once('.') else {
+        return Err(permanent(
+            FailureCode::MissingExtension,
+            format!("key {key} has no extension"),
+        ));
+    };
+    hs_common::validate_stem(stem).map_err(|e| {
+        permanent(
+            FailureCode::InvalidKey,
+            format!("event key {key:?} has an unusable stem: {e}"),
+        )
+    })?;
+    Ok((stem.to_string(), ext.to_ascii_lowercase()))
 }
 
 pub async fn prepare_source(
     storage: &dyn Storage,
     event: &IngestedEvent,
 ) -> Result<SourcePrep, HandlerError> {
-    let filename = event
-        .key
-        .rsplit_once('/')
-        .map(|(_, f)| f)
-        .unwrap_or(&event.key);
-    let (stem, ext) = match filename.rsplit_once('.') {
-        Some((s, e)) => (s.to_string(), e.to_ascii_lowercase()),
-        None => {
-            return Err(HandlerError::Permanent(anyhow::anyhow!(
-                "key {} has no extension",
-                event.key
-            )));
-        }
-    };
+    let (stem, ext) = parse_event_key(&event.key)?;
     let md_key = hs_common::markdown::markdown_storage_key(&stem);
 
     let exists = storage
         .exists(&md_key)
         .await
-        .map_err(|e| HandlerError::Transient(e.context(format!("head({md_key}) failed"))))?;
+        .map_err(|e| storage_failure(e, format!("head({md_key}) failed")))?;
     if exists {
         tracing::info!(md_key = %md_key, "markdown already present; skipping");
         return Ok(SourcePrep::AlreadyConverted(md_key));
@@ -131,7 +165,7 @@ pub async fn prepare_source(
                     storage,
                     "catalog",
                     &stem,
-                    "source_missing",
+                    FailureCode::SourceMissing.wire(),
                     Vec::new(),
                 )
                 .await
@@ -142,26 +176,55 @@ pub async fn prepare_source(
                         "stamp source_missing failed",
                     );
                 }
-                return Err(HandlerError::Permanent(
-                    e.context(format!("source bytes missing for {}", event.key)),
+                return Err(permanent(
+                    FailureCode::SourceMissing,
+                    format!("source bytes missing for {}: {e:#}", event.key),
                 ));
             }
-            return Err(HandlerError::Transient(
-                e.context(format!("get({}) failed", event.key)),
-            ));
+            return Err(storage_failure(e, format!("get({}) failed", event.key)));
         }
     };
-    let bytes = std::sync::Arc::new(raw_bytes);
+    let bytes = bytes::Bytes::from(raw_bytes);
 
     let pdf_pages = if ext == "pdf" {
-        // Parsing lopdf is CPU-bound; run it on the blocking pool so a
-        // 500-page book doesn't stall the subscriber event loop. Arc
-        // clone — no byte copy.
-        let bytes_for_meta = std::sync::Arc::clone(&bytes);
-        tokio::task::spawn_blocking(move || crate::pdf_meta::count_pages(&bytes_for_meta))
-            .await
-            .ok()
-            .flatten()
+        // lopdf parses the whole file (CPU-bound, up to 256 MiB of untrusted
+        // bytes): run it on the blocking pool so a 500-page book doesn't
+        // stall the subscriber event loop. `Bytes` clone — no byte copy.
+        // A failure is a verdict on the document, never "unknown pages": a
+        // PDF that cannot be parsed or counted is refused here, with the
+        // cause, instead of being dispatched under a fallback timeout.
+        let bytes_for_meta = bytes.clone();
+        let counted =
+            tokio::task::spawn_blocking(move || crate::pdf_meta::count_pages(&bytes_for_meta))
+                .await
+                .map_err(|join| {
+                    if join.is_panic() {
+                        permanent(
+                            FailureCode::PdfParseError,
+                            format!("PDF parser panicked on {}", event.key),
+                        )
+                    } else {
+                        HandlerError::Transient(anyhow::anyhow!(
+                            "page-count task for {} was cancelled: {join}",
+                            event.key
+                        ))
+                    }
+                })?;
+        match counted {
+            Ok(pages) => Some(pages),
+            Err(failure) => {
+                tracing::warn!(
+                    key = %event.key,
+                    code = failure.code().wire(),
+                    error = %failure,
+                    "PDF refused before dispatch"
+                );
+                return Err(HandlerError::Permanent(
+                    anyhow::Error::new(failure)
+                        .context(format!("{} cannot be converted", event.key)),
+                ));
+            }
+        }
     } else {
         None
     };
@@ -174,23 +237,138 @@ pub async fn prepare_source(
     }))
 }
 
+/// Tell distill that the markdown at `md_key` is ready by publishing
+/// `scribe.completed`. A publish that fails is `Transient`: the event is
+/// NAKed, and its redelivery lands on [`SourcePrep::AlreadyConverted`] —
+/// whose caller announces again through here — so the announcement is
+/// retried until it gets through instead of being lost behind an ACK.
+/// Distill's handler is idempotent, so a repeat announcement only repeats
+/// the index.
+pub async fn announce_completed(
+    bus: &dyn EventBus,
+    md_key: &str,
+    source_key: &str,
+) -> Result<(), HandlerError> {
+    let payload = serde_json::json!({
+        "key": md_key,
+        "source_key": source_key,
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|e| {
+        HandlerError::Permanent(anyhow::Error::new(e).context("encoding scribe.completed"))
+    })?;
+    bus.publish("scribe.completed", &bytes).await.map_err(|e| {
+        HandlerError::Transient(e.context(format!("scribe.completed publish failed for {md_key}")))
+    })
+}
+
+/// Everything the QC gate decided about a VLM conversion. Computed on the
+/// blocking pool: `longest_repeated_run_bytes` and the repetition cleanup
+/// are O(document) and allocate per character.
+struct QcOutcome {
+    markdown: String,
+    verdict: crate::postprocess::QcVerdict,
+    truncations: usize,
+    longest_run: usize,
+    skipped_regions: usize,
+    total_pages: usize,
+}
+
+fn run_qc(conversion: ConversionResult, stem: &str) -> QcOutcome {
+    let qc_started = std::time::Instant::now();
+    let skipped_regions = conversion.skipped_regions();
+    let ConversionResult {
+        markdown,
+        per_page_region_classes,
+        per_page_diags,
+    } = conversion;
+    let longest_run = crate::postprocess::longest_repeated_run_bytes(&markdown);
+    let (md_clean, per_page_truncations) =
+        crate::postprocess::clean_repetitions_per_page(&markdown);
+    let truncations: usize = per_page_truncations.iter().map(|t| t.total()).sum();
+    // Align the bibliography flags with per_page_truncations.len().
+    // The olmocr backend supplies an empty class vec; pad with
+    // empty class lists so qc_verdict sees the same length on
+    // both sides, all flagged as non-bibliography.
+    let total_pages = per_page_truncations.len();
+    let per_page_is_bibliography: Vec<bool> = (0..total_pages)
+        .map(|i| {
+            per_page_region_classes
+                .get(i)
+                .map(|classes| crate::postprocess::is_bibliography_page(classes))
+                .unwrap_or(false)
+        })
+        .collect();
+    let verdict = crate::postprocess::qc_verdict(
+        &per_page_truncations,
+        &per_page_is_bibliography,
+        longest_run,
+        skipped_regions,
+    );
+    // Optional --diag JSONL: opt-in via HS_SCRIBE_DIAG_DIR env var.
+    // Server-side per-page records (collected during conversion)
+    // and the document summary land in one append-only file per
+    // stem for grep/jq inspection. Disabled in steady state via
+    // the Option::is_none() check inside DiagWriter.
+    let diag_dir = std::env::var_os("HS_SCRIBE_DIAG_DIR").map(std::path::PathBuf::from);
+    let mut diag = crate::diag::DiagWriter::open(diag_dir.as_ref(), stem);
+    for record in per_page_diags {
+        diag.write_page(stem, record);
+    }
+    diag.write_document(crate::diag::DocSummaryRecord {
+        stem: stem.to_string(),
+        total_pages,
+        per_page_truncation_counts: per_page_truncations,
+        longest_run_bytes: longest_run,
+        qc_verdict: format!("{verdict:?}"),
+        wall_clock_ms: qc_started.elapsed().as_millis() as u64,
+    });
+    QcOutcome {
+        markdown: md_clean,
+        verdict,
+        truncations,
+        longest_run,
+        skipped_regions,
+        total_pages,
+    }
+}
+
+/// Run a CPU-bound conversion step on the blocking pool. A panic inside it
+/// is a deterministic fault of this document (permanent); losing the task
+/// to runtime shutdown is not.
+async fn blocking<T: Send + 'static>(
+    what: &'static str,
+    key: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, HandlerError> {
+    tokio::task::spawn_blocking(f).await.map_err(|join| {
+        if join.is_panic() {
+            HandlerError::Permanent(anyhow::anyhow!("{what} panicked on {key}: {join}"))
+        } else {
+            HandlerError::Transient(anyhow::anyhow!(
+                "{what} task for {key} was cancelled: {join}"
+            ))
+        }
+    })
+}
+
 /// Given a prepared source, dispatch to the converter for its file type
 /// (PDF → scribe VLM, HTML → parser, EPUB → parser), and put the
 /// markdown back under `markdown/{shard}/{stem}.md`. Publishes
 /// `scribe.completed` with the markdown key on success.
 ///
-/// Error classification:
+/// Error classification (`classify.rs`, from typed [`FailureCode`]s — never
+/// from message text):
 ///
 /// - `Permanent` — content is unconvertable no matter how many times we
 ///   retry: unsupported extension, HTML not UTF-8, paywall/loading HTML,
-///   EPUB parse failure, and scribe-side PDF parse errors
-///   (`FormatError`, `Invalid image size`, `PdfiumLibrary`). The
-///   `/scribe` endpoint also returns HTTP 415 with a
-///   `unsupported_content_type:{html,binary}` body for bytes that fail
-///   the `%PDF` magic-byte gate; those bubble up as Permanent too.
+///   EPUB parse failure, and scribe-side PDF parse errors. The scribe
+///   server returns HTTP 415 with a `unsupported_content_type:{html,binary}`
+///   body for bytes that fail the `%PDF` magic-byte gate; those bubble up
+///   as Permanent too.
 /// - `Transient` — cluster state that will recover: storage GET/PUT
 ///   failure, scribe 5xx / connection reset / dispatch timeout, no ready
-///   scribe servers. The caller NAKs with backoff.
+///   scribe servers, a failed `scribe.completed` publish. The caller NAKs
+///   with backoff.
 #[allow(clippy::too_many_arguments)]
 pub async fn convert_and_upload(
     storage: &dyn Storage,
@@ -198,6 +376,7 @@ pub async fn convert_and_upload(
     bus: &dyn EventBus,
     event: &IngestedEvent,
     timeout_policy: &TimeoutPolicy,
+    epub_limits: &EpubLimits,
     source: &SourceObject,
     // Step 2d chain context. `converted_by` identifies which backend in
     // `ScribeConfig.servers` ran this call so the catalog can record it;
@@ -215,11 +394,16 @@ pub async fn convert_and_upload(
         "pdf" => {
             // Size the per-request timeout by the page count prepared
             // once per event in `prepare_source`.
-            let pages = source.pdf_pages;
+            let pages = source.pdf_pages.ok_or_else(|| {
+                HandlerError::Permanent(anyhow::anyhow!(
+                    "{} reached the PDF converter without a page count",
+                    event.key
+                ))
+            })?;
             let timeout = compute_convert_timeout(pages, timeout_policy);
             tracing::info!(
                 key = %event.key,
-                pages = pages.map(|n| n as i64).unwrap_or(-1),
+                pages,
                 timeout_secs = timeout.as_secs(),
                 "dispatching pdf to scribe with page-scaled timeout"
             );
@@ -228,9 +412,10 @@ pub async fn convert_and_upload(
             // bibliography multiplier. Pass a no-op progress callback; this
             // handler has no UI to drive. The olmocr backend returns an
             // empty class vec; QC treats it as "not bibliography" → strict
-            // default ceiling everywhere.
+            // default ceiling everywhere. The source bytes are shared with
+            // the request body, not copied per attempt.
             let conversion = scribe
-                .convert_with_progress((*source.bytes).clone(), Some(timeout), Some(stem), |_| {})
+                .convert_with_progress(source.bytes.clone(), Some(timeout), Some(stem), |_| {})
                 .await
                 .map_err(|e| {
                     // Permanent/Escalate-class failures (broken PDF,
@@ -240,20 +425,18 @@ pub async fn convert_and_upload(
                     // redeliver every 30 s on JetStream and hog every
                     // in-flight slot. They surface as
                     // HandlerError::Permanent so the chain dispatcher
-                    // can consult `classify::classify_failure` for the
+                    // can consult `classify::classify` for the
                     // stop-vs-next-backend decision. Only
-                    // `FailureClass::Transient` (cluster-state problems)
-                    // NAKs. One table decides: `classify.rs`.
-                    let msg = format!("{e:#}");
+                    // `FailureClass::Transient` (cluster-state problems,
+                    // and any failure the server did not type) NAKs. One
+                    // table decides: `classify.rs`.
+                    let class = classify(&e);
                     let ctx = e.context(format!("scribe convert failed for {}", event.key));
-                    match crate::classify::classify_failure(&msg) {
-                        crate::classify::FailureClass::Transient => HandlerError::Transient(ctx),
+                    match class {
+                        FailureClass::Transient => HandlerError::Transient(ctx),
                         _ => HandlerError::Permanent(ctx),
                     }
                 })?;
-            let md = conversion.markdown;
-            let per_page_region_classes = conversion.per_page_region_classes;
-            let per_page_diags = conversion.per_page_diags;
             // VLM-only QC. HTML/EPUB parsers don't repeat tokens, and
             // their natural structural repetition (headings, tables)
             // trips clean_repetitions and explodes into a retry storm.
@@ -264,117 +447,113 @@ pub async fn convert_and_upload(
             // 2026-04-23) didn't write the terminal stamp and the source
             // got re-queued forever. Operators retry via `hs scribe
             // reconvert`, which clears the stamp and republishes once.
-            let qc_started = std::time::Instant::now();
-            let original_md = md.clone();
-            let (md_clean, per_page_truncations) =
-                crate::postprocess::clean_repetitions_per_page(&md);
-            let truncations: usize = per_page_truncations.iter().map(|t| t.total()).sum();
-            let longest_run = crate::postprocess::longest_repeated_run_bytes(&original_md);
-            // Align the bibliography flags with per_page_truncations.len().
-            // The olmocr backend supplies an empty class vec; pad with
-            // empty class lists so qc_verdict sees the same length on
-            // both sides, all flagged as non-bibliography.
-            let total_pages = per_page_truncations.len();
-            let per_page_is_bibliography: Vec<bool> = (0..total_pages)
-                .map(|i| {
-                    per_page_region_classes
-                        .get(i)
-                        .map(|classes| crate::postprocess::is_bibliography_page(classes))
-                        .unwrap_or(false)
-                })
-                .collect();
-            let verdict = crate::postprocess::qc_verdict(
-                &per_page_truncations,
-                &per_page_is_bibliography,
-                longest_run,
-            );
-            // Optional --diag JSONL: opt-in via HS_SCRIBE_DIAG_DIR env var.
-            // Server-side per-page records (collected during conversion)
-            // and the document summary land in one append-only file per
-            // stem for grep/jq inspection. Disabled in steady state via
-            // the Option::is_none() check inside DiagWriter.
-            let diag_dir = std::env::var_os("HS_SCRIBE_DIAG_DIR").map(std::path::PathBuf::from);
-            let mut diag = crate::diag::DiagWriter::open(diag_dir.as_ref(), stem);
-            for record in &per_page_diags {
-                diag.write_page(stem, record.clone());
-            }
-            diag.write_document(crate::diag::DocSummaryRecord {
-                stem: stem.to_string(),
-                total_pages,
-                per_page_truncation_counts: per_page_truncations.clone(),
-                longest_run_bytes: longest_run,
-                qc_verdict: format!("{verdict:?}"),
-                wall_clock_ms: qc_started.elapsed().as_millis() as u64,
-            });
-            match verdict {
-                crate::postprocess::QcVerdict::RejectLoop => {
-                    if let Err(e) = hs_common::catalog::update_conversion_failed_via(
-                        storage,
-                        "catalog",
-                        stem,
-                        "vlm_repetition_loop",
-                        Vec::new(),
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            stem = %stem,
-                            error = %e,
-                            "stamp conversion_failed failed",
-                        );
-                    }
-                    return Err(HandlerError::Permanent(anyhow::anyhow!(
+            let stem_for_qc = stem.to_string();
+            let qc = blocking("VLM output QC", &event.key, move || {
+                run_qc(conversion, &stem_for_qc)
+            })
+            .await?;
+            let reject = match qc.verdict {
+                crate::postprocess::QcVerdict::Accept => None,
+                crate::postprocess::QcVerdict::RejectLoop => Some(ConvertFailure::new(
+                    FailureCode::VlmRepetitionLoop,
+                    format!(
                         "VLM repetition loop on {} (truncations={}, longest_run={}B)",
-                        event.key,
-                        truncations,
-                        longest_run
-                    )));
+                        event.key, qc.truncations, qc.longest_run
+                    ),
+                )),
+                crate::postprocess::QcVerdict::RejectGapped => Some(ConvertFailure::new(
+                    FailureCode::GappedConversion,
+                    format!(
+                        "{} converted with {} region(s) the server could not process; \
+                         refusing to record a conversion with holes",
+                        event.key, qc.skipped_regions
+                    ),
+                )),
+            };
+            if let Some(failure) = reject {
+                if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+                    storage,
+                    "catalog",
+                    stem,
+                    failure.code().wire(),
+                    Vec::new(),
+                )
+                .await
+                {
+                    tracing::error!(
+                        stem = %stem,
+                        error = %e,
+                        "stamp conversion_failed failed",
+                    );
                 }
-                crate::postprocess::QcVerdict::Accept => {
-                    if truncations > 0 {
-                        tracing::info!(
-                            stem = %stem,
-                            truncations,
-                            longest_run,
-                            "cleaned VLM repetition site(s)",
-                        );
-                    }
-                }
+                return Err(HandlerError::Permanent(anyhow::Error::new(failure)));
             }
-            (md_clean, "scribe-vlm")
+            if qc.truncations > 0 {
+                tracing::info!(
+                    stem = %stem,
+                    truncations = qc.truncations,
+                    longest_run = qc.longest_run,
+                    pages = qc.total_pages,
+                    "cleaned VLM repetition site(s)",
+                );
+            }
+            (qc.markdown, "scribe-vlm")
         }
         "html" | "htm" => {
-            let html = String::from_utf8((*source.bytes).clone()).map_err(|e| {
-                HandlerError::Permanent(anyhow::anyhow!(
-                    "HTML at {} is not valid UTF-8: {e}",
-                    event.key
-                ))
-            })?;
-            // Reject paywall / loading-stub / landing-page HTML before we
-            // spend time extracting markdown that would just be stamped
-            // `embedding_skip: zero_chunks_or_empty` downstream. Mirrors
-            // the check the downloader runs at ingress — putting it here
-            // too catches HTMLs that entered via any other path
-            // (scribe_inbox, bulk import, etc.).
-            if hs_common::html::is_paywall_html(&html) {
-                return Err(HandlerError::Permanent(anyhow::anyhow!(
-                    "{} looks like a paywall/loading-stub HTML; refusing to convert",
-                    event.key
-                )));
-            }
-            (crate::html::convert_html_to_markdown(&html), "html-parser")
+            let bytes = source.bytes.clone();
+            let key = event.key.clone();
+            let converted = blocking("HTML conversion", &event.key, move || {
+                let html = std::str::from_utf8(&bytes).map_err(|e| {
+                    ConvertFailure::new(
+                        FailureCode::HtmlNotUtf8,
+                        format!("HTML at {key} is not valid UTF-8: {e}"),
+                    )
+                })?;
+                // Reject paywall / loading-stub / landing-page HTML before we
+                // spend time extracting markdown that would just be stamped
+                // `embedding_skip: zero_chunks_or_empty` downstream. Mirrors
+                // the check the downloader runs at ingress — putting it here
+                // too catches HTMLs that entered via any other path
+                // (scribe_inbox, bulk import, etc.).
+                if hs_common::html::is_paywall_html(html) {
+                    return Err(ConvertFailure::new(
+                        FailureCode::PaywallHtml,
+                        format!(
+                            "{key} looks like a paywall/loading-stub HTML; refusing to convert"
+                        ),
+                    ));
+                }
+                Ok(crate::html::convert_html_to_markdown(html))
+            })
+            .await?;
+            (
+                converted.map_err(|f| HandlerError::Permanent(anyhow::Error::new(f)))?,
+                "html-parser",
+            )
         }
         "epub" => {
-            let md = crate::epub::convert_epub_to_markdown(&source.bytes).map_err(|e| {
-                HandlerError::Permanent(anyhow::anyhow!("EPUB parse failed for {}: {e}", event.key))
+            let bytes = source.bytes.clone();
+            let limits = epub_limits.clone();
+            let converted = blocking("EPUB conversion", &event.key, move || {
+                crate::epub::convert_epub_to_markdown_with(&bytes, &limits)
+            })
+            .await?;
+            let md = converted.map_err(|e| {
+                permanent(
+                    FailureCode::EpubParseError,
+                    format!("EPUB parse failed for {}: {e:#}", event.key),
+                )
             })?;
             (md, "epub-parser")
         }
         other => {
-            return Err(HandlerError::Permanent(anyhow::anyhow!(
-                "unsupported source type `.{other}` for {} — supported: .pdf, .html, .htm, .epub",
-                event.key
-            )));
+            return Err(permanent(
+                FailureCode::UnsupportedExtension,
+                format!(
+                    "unsupported source type `.{other}` for {} — supported: .pdf, .html, .htm, .epub",
+                    event.key
+                ),
+            ));
         }
     };
     let duration_secs = start.elapsed().as_secs_f64();
@@ -387,26 +566,38 @@ pub async fn convert_and_upload(
     // catalog row claiming success for a document that never had content.
     // Observed shape: a Radware 302 anti-bot page that reached the
     // html-parser as `# 302 Found\n\nrdwr` (17 bytes).
+    //
+    // Parser output under the floor is content-intrinsic (every tier runs
+    // the same parser); VLM output under the floor is not — a different VLM
+    // may read a scan the first could not — so the two are different codes.
     if !hs_common::quality::has_indexable_content(&markdown) {
+        let code = if server == "scribe-vlm" {
+            FailureCode::EmptyVlmConversion
+        } else {
+            FailureCode::EmptyConversion
+        };
         if let Err(e) = hs_common::catalog::update_conversion_failed_via(
             storage,
             "catalog",
             stem,
-            "empty_conversion",
+            code.wire(),
             Vec::new(),
         )
         .await
         {
             tracing::error!(stem = %stem, error = %e, "stamp conversion_failed failed");
         }
-        return Err(HandlerError::Permanent(anyhow::anyhow!(
-            "{} converted by {} to {} non-whitespace chars, below the {}-char indexable floor; \
-             refusing to record a conversion",
-            event.key,
-            server,
-            hs_common::quality::non_whitespace_len(&markdown),
-            hs_common::quality::MIN_INDEXABLE_NON_WS,
-        )));
+        return Err(permanent(
+            code,
+            format!(
+                "{} converted by {} to {} non-whitespace chars, below the {}-char indexable floor; \
+                 refusing to record a conversion",
+                event.key,
+                server,
+                hs_common::quality::non_whitespace_len(&markdown),
+                hs_common::quality::MIN_INDEXABLE_NON_WS,
+            ),
+        ));
     }
 
     // Two independent page signals: the separator structure the backend
@@ -426,13 +617,15 @@ pub async fn convert_and_upload(
     storage
         .put(&md_key, markdown.into_bytes())
         .await
-        .map_err(|e| HandlerError::Transient(e.context(format!("put({md_key}) failed"))))?;
+        .map_err(|e| storage_failure(e, format!("put({md_key}) failed")))?;
 
     // Stamp the catalog with the converter used so downstream can tell
-    // which pipeline produced this markdown without guessing. Stamp
-    // failures are logged but don't poison the event — the markdown is
-    // already committed to storage; retry-driving on a stamp hiccup
-    // would re-run the VLM for nothing.
+    // which pipeline produced this markdown without guessing. The markdown
+    // is already committed to storage, and a redelivery would find it
+    // (`AlreadyConverted`) rather than re-run the VLM, so a lost stamp
+    // cannot be retried through the event: it is logged as an ERROR and the
+    // event still completes, so distill is not held back by bookkeeping.
+    // `catalog_repair` reconciles markdown that has no conversion row.
     if let Err(e) = hs_common::catalog::update_conversion_catalog_via(
         storage,
         "catalog",
@@ -447,22 +640,16 @@ pub async fn convert_and_upload(
     )
     .await
     {
-        tracing::warn!(stem = %stem, error = %e, "conversion catalog stamp failed");
+        tracing::error!(
+            stem = %stem,
+            md_key = %md_key,
+            error = %e,
+            "conversion catalog stamp failed — markdown is stored without a conversion row; \
+             `catalog_repair` will report it as disk_no_catalog"
+        );
     }
 
-    let payload = serde_json::json!({
-        "key": md_key,
-        "source_key": event.key,
-    });
-    if let Err(e) = bus
-        .publish(
-            "scribe.completed",
-            serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
-        )
-        .await
-    {
-        tracing::warn!(error = %e, "scribe.completed publish failed");
-    }
+    announce_completed(bus, &md_key, &event.key).await?;
 
     Ok(md_key)
 }
@@ -481,6 +668,12 @@ pub async fn convert_and_upload(
 /// `max_deliver` on the consumer spec bounds total redeliveries, so a
 /// stuck-in-transient-loop message eventually surfaces as a permanent
 /// failure in operator logs.
+///
+/// This function returns only with an error. The message stream ends when
+/// the broker drops the consumer or the connection (a competing watcher
+/// deleting the durable, a broker restart); consumption has then stopped,
+/// so returning `Ok` would let the process exit 0 and stay down. Handlers
+/// already running are allowed to finish their ack/nak first.
 pub async fn run_subscriber<F, Fut>(
     bus: Arc<dyn EventBus>,
     _storage: Arc<dyn Storage>,
@@ -489,7 +682,7 @@ pub async fn run_subscriber<F, Fut>(
 ) -> Result<()>
 where
     F: Fn(IngestedEvent) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<(), HandlerError>> + Send + 'static,
+    Fut: Future<Output = Result<(), HandlerError>> + Send + 'static,
 {
     let mut stream = bus.consume(&specs::PAPERS_INGESTED).await?;
     let concurrency = concurrency.max(1);
@@ -521,10 +714,11 @@ where
             }
         };
 
-        let permit = match sem.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => break, // semaphore closed → shutting down
-        };
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("scribe worker semaphore closed"))?;
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
             let _permit = permit; // drop at scope end releases the slot
@@ -563,28 +757,462 @@ where
             }
         });
     }
-    Ok(())
+
+    // Let handlers that are already running finish their ack/nak first.
+    let _ = sem.acquire_many(concurrency as u32).await;
+    Err(anyhow::anyhow!(
+        "event stream ended: the consumer or broker connection for {} is gone",
+        specs::PAPERS_INGESTED.subject
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classify::{failure_code, FailureClass};
+    use crate::pdf_meta::tests::pdf_with_pages;
+    use hs_common::event_bus::{ConsumerSpec, Event, EventStream};
+    use hs_common::storage::LocalFsStorage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
-    #[test]
-    fn parses_payload() {
-        let payload = br#"{"key":"ab/cdef.pdf","sha256":"deadbeef","size_bytes":42,"source":"paper-download"}"#;
-        let e: IngestedEvent = serde_json::from_slice(payload).unwrap();
-        assert_eq!(e.key, "ab/cdef.pdf");
-        assert_eq!(e.sha256.as_deref(), Some("deadbeef"));
-        assert_eq!(e.size_bytes, Some(42));
+    #[derive(Default)]
+    struct FakeBus {
+        published: Mutex<Vec<(String, serde_json::Value)>>,
+        fail_next_publishes: AtomicUsize,
+        to_consume: Mutex<Vec<Event>>,
     }
 
-    #[test]
-    fn extension_parsing_rejects_no_dot() {
-        // Defense-in-depth: every key we ingest has `.pdf|.html|.htm|.epub`,
-        // but if some path slips through, we want a clean Permanent error
-        // (terminate the message) rather than a panic.
-        let filename = "no_extension_here";
-        assert!(filename.rsplit_once('.').is_none());
+    #[async_trait::async_trait]
+    impl EventBus for FakeBus {
+        async fn publish(&self, subject: &str, payload: &[u8]) -> anyhow::Result<()> {
+            if self
+                .fail_next_publishes
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                anyhow::bail!("broker unreachable");
+            }
+            self.published
+                .lock()
+                .unwrap()
+                .push((subject.to_string(), serde_json::from_slice(payload)?));
+            Ok(())
+        }
+        async fn consume(&self, _spec: &ConsumerSpec) -> anyhow::Result<EventStream> {
+            let events = std::mem::take(&mut *self.to_consume.lock().unwrap());
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+    }
+
+    fn event(key: &str) -> IngestedEvent {
+        IngestedEvent {
+            key: key.into(),
+            sha256: None,
+            size_bytes: None,
+            source: None,
+        }
+    }
+
+    fn code_of(err: &HandlerError) -> (&'static str, Option<FailureCode>) {
+        match err {
+            HandlerError::Permanent(e) => ("permanent", failure_code(e)),
+            HandlerError::Transient(e) => ("transient", failure_code(e)),
+        }
+    }
+
+    fn storage() -> (tempfile::TempDir, LocalFsStorage) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LocalFsStorage::new(dir.path());
+        (dir, s)
+    }
+
+    #[tokio::test]
+    async fn keys_that_cannot_name_a_document_are_permanent_and_touch_no_storage() {
+        let (_d, st) = storage();
+        for (key, code) in [
+            ("../../etc/passwd.pdf", FailureCode::InvalidKey),
+            ("/abs/doc.pdf", FailureCode::InvalidKey),
+            ("papers/ab/..pdf", FailureCode::InvalidKey),
+            ("papers/ab/.pdf", FailureCode::InvalidKey),
+            ("papers\\ab\\doc.pdf", FailureCode::InvalidKey),
+            ("papers/ab/noext", FailureCode::MissingExtension),
+        ] {
+            let err = prepare_source(&st, &event(key)).await.err().expect(key);
+            assert_eq!(code_of(&err), ("permanent", Some(code)), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_source_is_permanent_and_stamped() {
+        let (_d, st) = storage();
+        let err = prepare_source(&st, &event("papers/ab/absent.pdf"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            code_of(&err),
+            ("permanent", Some(FailureCode::SourceMissing))
+        );
+        let row = hs_common::catalog::read_catalog_entry_via(&st, "catalog", "absent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.conversion_failed.unwrap().reason, "source_missing");
+    }
+
+    #[tokio::test]
+    async fn html_named_pdf_and_broken_pdfs_are_refused_before_any_dispatch() {
+        let (_d, st) = storage();
+        st.put(
+            "papers/ab/paywall.pdf",
+            b"<!DOCTYPE html><html>log in</html>".to_vec(),
+        )
+        .await
+        .unwrap();
+        st.put("papers/ab/broken.pdf", b"%PDF-1.4\nnot really".to_vec())
+            .await
+            .unwrap();
+        let html = prepare_source(&st, &event("papers/ab/paywall.pdf"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            code_of(&html),
+            ("permanent", Some(FailureCode::UnsupportedContentTypeHtml))
+        );
+        let broken = prepare_source(&st, &event("papers/ab/broken.pdf"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            code_of(&broken),
+            ("permanent", Some(FailureCode::PdfParseError))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_pdf_is_fetched_with_its_page_count() {
+        let (_d, st) = storage();
+        st.put("papers/ab/ok.pdf", pdf_with_pages(3)).await.unwrap();
+        match prepare_source(&st, &event("papers/ab/ok.pdf")).await {
+            Ok(SourcePrep::Fetched(src)) => {
+                assert_eq!(src.pdf_pages, Some(3));
+                assert_eq!(src.stem, "ok");
+            }
+            _ => panic!("expected a fetched source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_markdown_is_already_converted_and_can_be_announced() {
+        let (_d, st) = storage();
+        let md_key = hs_common::markdown::markdown_storage_key("done");
+        st.put(&md_key, b"# text".to_vec()).await.unwrap();
+        let prep = prepare_source(&st, &event("papers/ab/done.pdf")).await;
+        let Ok(SourcePrep::AlreadyConverted(key)) = prep else {
+            panic!("expected AlreadyConverted");
+        };
+        assert_eq!(key, md_key);
+
+        let bus = FakeBus::default();
+        announce_completed(&bus, &key, "papers/ab/done.pdf")
+            .await
+            .unwrap();
+        let published = bus.published.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, "scribe.completed");
+        assert_eq!(published[0].1["key"], md_key);
+        assert_eq!(published[0].1["source_key"], "papers/ab/done.pdf");
+    }
+
+    #[tokio::test]
+    async fn a_failed_completed_publish_is_transient_and_the_retry_goes_through() {
+        let bus = FakeBus::default();
+        bus.fail_next_publishes.store(1, Ordering::SeqCst);
+        let err = announce_completed(&bus, "markdown/ab/x.md", "papers/ab/x.pdf")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::Transient(_)));
+        assert!(bus.published.lock().unwrap().is_empty());
+        announce_completed(&bus, "markdown/ab/x.md", "papers/ab/x.pdf")
+            .await
+            .unwrap();
+        assert_eq!(bus.published.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stem_that_names_a_verdict_is_still_transient_when_the_server_is_down() {
+        // The old substring table permanently failed any key containing
+        // "paywall". A refused connection says nothing about the document.
+        let (_d, st) = storage();
+        st.put("papers/pa/paywall-economics.pdf", pdf_with_pages(2))
+            .await
+            .unwrap();
+        let Ok(SourcePrep::Fetched(src)) =
+            prepare_source(&st, &event("papers/pa/paywall-economics.pdf")).await
+        else {
+            panic!("fetch");
+        };
+        let client =
+            ScribeClient::new_with_timeout("http://127.0.0.1:1", Duration::from_secs(5)).unwrap();
+        let bus = FakeBus::default();
+        let err = convert_and_upload(
+            &st,
+            &client,
+            &bus,
+            &event("papers/pa/paywall-economics.pdf"),
+            &TimeoutPolicy::default(),
+            &EpubLimits::default(),
+            &src,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code_of(&err), ("transient", None), "{err}");
+        assert!(bus.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stub_html_page_is_permanent_and_nothing_is_stored_or_announced() {
+        let (_d, st) = storage();
+        st.put(
+            "papers/ab/stub.html",
+            b"<html><body><p>hi</p></body></html>".to_vec(),
+        )
+        .await
+        .unwrap();
+        let Ok(SourcePrep::Fetched(src)) = prepare_source(&st, &event("papers/ab/stub.html")).await
+        else {
+            panic!("fetch");
+        };
+        let client =
+            ScribeClient::new_with_timeout("http://127.0.0.1:1", Duration::from_secs(5)).unwrap();
+        let bus = FakeBus::default();
+        let err = convert_and_upload(
+            &st,
+            &client,
+            &bus,
+            &event("papers/ab/stub.html"),
+            &TimeoutPolicy::default(),
+            &EpubLimits::default(),
+            &src,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        // Whichever stub verdict the HTML gates reach (paywall heuristic or
+        // the indexable floor), it is permanent and typed.
+        assert!(
+            matches!(
+                code_of(&err),
+                (
+                    "permanent",
+                    Some(FailureCode::PaywallHtml | FailureCode::EmptyConversion)
+                )
+            ),
+            "{err}"
+        );
+        assert_eq!(classify(&anyhow::anyhow!("x")), FailureClass::Transient);
+        assert!(!st
+            .exists(&hs_common::markdown::markdown_storage_key("stub"))
+            .await
+            .unwrap());
+        assert!(bus.published.lock().unwrap().is_empty());
+    }
+
+    async fn subscribe(
+        events: Vec<Event>,
+        concurrency: usize,
+    ) -> (anyhow::Result<()>, Vec<String>) {
+        let bus = Arc::new(FakeBus::default());
+        *bus.to_consume.lock().unwrap() = events;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
+        let result = run_subscriber(bus, storage, concurrency, move |e| {
+            let seen = seen_in.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                seen.lock().unwrap().push(e.key);
+                Ok(())
+            }
+        })
+        .await;
+        let seen = seen.lock().unwrap().clone();
+        (result, seen)
+    }
+
+    fn ingested(key: &str) -> Event {
+        Event::inert(
+            "papers.ingested",
+            format!(r#"{{"key":"{key}"}}"#).into_bytes(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_is_an_error_not_a_clean_exit() {
+        let (result, seen) = subscribe(Vec::new(), 2).await;
+        let err = result.expect_err("an ended stream must fail");
+        assert!(err.to_string().contains("event stream ended"), "{err}");
+        assert!(seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_already_received_finish_before_the_ended_stream_is_reported() {
+        let events = vec![
+            ingested("a.pdf"),
+            Event::inert("papers.ingested", b"not json".to_vec()),
+            ingested("b.pdf"),
+            ingested("c.pdf"),
+        ];
+        let (result, mut seen) = subscribe(events, 2).await;
+        assert!(result.is_err());
+        seen.sort();
+        assert_eq!(
+            seen,
+            ["a.pdf", "b.pdf", "c.pdf"],
+            "no handler may be cut off"
+        );
+    }
+
+    // ── against the real scribe server (olmocr mode, stand-in CLI) ─────
+
+    #[cfg(all(feature = "server", unix))]
+    mod served {
+        use super::*;
+        use crate::config::{AppConfig, ConverterMode};
+        use crate::server::{app, ServerState};
+        use std::os::unix::fs::PermissionsExt;
+
+        fn fake_olmocr(dir: &std::path::Path, tally: &str) -> std::path::PathBuf {
+            let script = dir.join("olmocr.sh");
+            let md = "A page of real converted text, long enough to be indexable. ".repeat(4);
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nmkdir -p \"$1/markdown\" && printf '# Title\\n\\n{md}' > \"$1/markdown/o.md\"\n{tally}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            script
+        }
+
+        async fn serve(tally: &str) -> (tempfile::TempDir, ScribeClient) {
+            let dir = tempfile::tempdir().unwrap();
+            let config = AppConfig {
+                converter: ConverterMode::Olmocr,
+                olmocr_bin: fake_olmocr(dir.path(), tally)
+                    .to_string_lossy()
+                    .into_owned(),
+                vlm_concurrency: 2,
+                ..AppConfig::default()
+            };
+            let state = Arc::new(ServerState::new(config).unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app(state)).await });
+            let client =
+                ScribeClient::new_with_timeout(&format!("http://{addr}"), Duration::from_secs(30))
+                    .unwrap();
+            (dir, client)
+        }
+
+        async fn fetched(st: &LocalFsStorage, key: &str, pages: usize) -> SourceObject {
+            st.put(key, pdf_with_pages(pages)).await.unwrap();
+            match prepare_source(st, &event(key)).await {
+                Ok(SourcePrep::Fetched(s)) => s,
+                _ => panic!("fetch"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_conversion_is_stored_stamped_and_announced_and_a_lost_announcement_is_retried() {
+            let (_srv, client) =
+                serve("echo 'Completed pages: 3' >&2; echo 'Failed pages: 0' >&2").await;
+            let (_d, st) = storage();
+            let src = fetched(&st, "papers/ab/book.pdf", 3).await;
+            let ev = event("papers/ab/book.pdf");
+            let bus = FakeBus::default();
+            bus.fail_next_publishes.store(1, Ordering::SeqCst);
+            let (policy, limits) = (TimeoutPolicy::default(), EpubLimits::default());
+
+            // First attempt: markdown stored and stamped, but the broker
+            // refused the announcement -> Transient (the event is NAKed).
+            let err = convert_and_upload(
+                &st,
+                &client,
+                &bus,
+                &ev,
+                &policy,
+                &limits,
+                &src,
+                Some("olmocr".into()),
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(code_of(&err).0, "transient", "{err}");
+            let md_key = hs_common::markdown::markdown_storage_key("book");
+            assert!(st.exists(&md_key).await.unwrap());
+            let row = hs_common::catalog::read_catalog_entry_via(&st, "catalog", "book")
+                .await
+                .unwrap()
+                .unwrap();
+            let conv = row.conversion.expect("conversion stamped");
+            assert_eq!(
+                (conv.server.as_str(), conv.converted_by.as_deref()),
+                ("scribe-vlm", Some("olmocr"))
+            );
+            assert!(bus.published.lock().unwrap().is_empty());
+
+            // Redelivery lands on AlreadyConverted, whose caller announces.
+            let Ok(SourcePrep::AlreadyConverted(key)) = prepare_source(&st, &ev).await else {
+                panic!("redelivery must find the stored markdown");
+            };
+            announce_completed(&bus, &key, &ev.key).await.unwrap();
+            assert_eq!(bus.published.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn an_olmocr_run_with_failed_pages_escalates_and_stores_nothing() {
+            let (_srv, client) =
+                serve("echo 'Completed pages: 2' >&2; echo 'Failed pages: 1' >&2").await;
+            let (_d, st) = storage();
+            let src = fetched(&st, "papers/ab/gappy.pdf", 3).await;
+            let bus = FakeBus::default();
+            let err = convert_and_upload(
+                &st,
+                &client,
+                &bus,
+                &event("papers/ab/gappy.pdf"),
+                &TimeoutPolicy::default(),
+                &EpubLimits::default(),
+                &src,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                code_of(&err),
+                ("permanent", Some(FailureCode::OlmocrIncompletePages))
+            );
+            assert_eq!(
+                match &err {
+                    HandlerError::Permanent(e) => classify(e),
+                    _ => unreachable!(),
+                },
+                FailureClass::Escalate("olmocr_incomplete_pages")
+            );
+            assert!(!st
+                .exists(&hs_common::markdown::markdown_storage_key("gappy"))
+                .await
+                .unwrap());
+            assert!(bus.published.lock().unwrap().is_empty());
+        }
     }
 }
