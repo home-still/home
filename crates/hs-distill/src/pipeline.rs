@@ -162,22 +162,23 @@ pub async fn index_document(
     // pdf_path is always populated as a sharded storage key by
     // `extract_rule_based`; no host-filesystem fallback.
 
-    // Optional LLM metadata extraction
+    // Optional LLM metadata extraction. A failure fails the document
+    // (surfaced to the caller, retried by the event bus) rather than
+    // indexing it without the keywords the operator asked for. A reply
+    // with an empty list never replaces metadata that is already present.
     if config.llm_metadata {
-        match crate::metadata::extract_llm_metadata(
+        let llm = crate::metadata::extract_llm_metadata(
             &markdown,
             &config.ollama_url,
             &config.metadata_model,
+            std::time::Duration::from_secs(config.ollama_timeout_secs),
         )
-        .await
-        {
-            Ok((keywords, topics)) => {
-                meta.keywords = keywords;
-                meta.topics = topics;
-            }
-            Err(e) => {
-                tracing::warn!("LLM metadata extraction failed: {e}");
-            }
+        .await?;
+        if !llm.keywords.is_empty() {
+            meta.keywords = llm.keywords;
+        }
+        if !llm.topics.is_empty() {
+            meta.topics = llm.topics;
         }
     }
 

@@ -46,6 +46,9 @@ async fn async_main() -> Result<()> {
         tracing::warn!("Config load error: {e}, using defaults");
         DistillServerConfig::default()
     });
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid distill_server config: {e}"))?;
 
     // Build embedder with GPU→CPU fallback
     let embedder = FallbackEmbedder::build(&config.embedding)

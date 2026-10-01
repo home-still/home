@@ -10,6 +10,8 @@ use hs_common::hardware_profile::HardwareProfile;
 use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
 
+use crate::error::DistillError;
+
 /// Compute device for embedding inference. rc.306 P0-7: CUDA is the
 /// only accepted value — the distill binary ships with no CPU code path.
 /// Attempting to load a config with `compute_device: cpu` (or anything
@@ -54,7 +56,12 @@ pub struct DistillServerConfig {
     pub qdrant_upsert_parallelism: usize,
     pub llm_metadata: bool,
     pub metadata_model: String,
+    /// Ollama base URL, including the port (`http://host:11434`). Only used
+    /// when `llm_metadata` is true; an unparseable URL is a startup error.
     pub ollama_url: String,
+    /// Upper bound on one metadata-model call, seconds. A stalled Ollama
+    /// fails that document's indexing instead of hanging it.
+    pub ollama_timeout_secs: u64,
 }
 
 impl Default for DistillServerConfig {
@@ -74,6 +81,7 @@ impl Default for DistillServerConfig {
             llm_metadata: false,
             metadata_model: "llama3.2:latest".into(),
             ollama_url: "http://localhost:11434".into(),
+            ollama_timeout_secs: 120,
         }
     }
 }
@@ -89,6 +97,26 @@ impl DistillServerConfig {
             .select("distill_server")
             .extract()
             .map_err(Box::new)
+    }
+
+    /// Reject configurations the server cannot run correctly. Call after
+    /// [`Self::load`] (or after building a config in code); the server
+    /// refuses to start on an `Err`.
+    pub fn validate(&self) -> Result<(), DistillError> {
+        if self.llm_metadata {
+            crate::metadata::parse_ollama_url(&self.ollama_url)?;
+            if self.metadata_model.trim().is_empty() {
+                return Err(DistillError::Config(
+                    "llm_metadata is true but metadata_model is empty".into(),
+                ));
+            }
+            if self.ollama_timeout_secs == 0 {
+                return Err(DistillError::Config(
+                    "ollama_timeout_secs must be at least 1".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
