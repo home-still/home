@@ -220,6 +220,9 @@ PP-DocLayout-V3 detects 25 region classes. hs-scribe maps them to 6 processing t
 # Client library (used by the hs CLI)
 cargo check -p hs-scribe
 
+# --release builds need the tag the binary ships as (build-support/version.rs)
+export HS_RELEASE_TAG=v0.0.1-rc.NNN
+
 # Server binary
 cargo build --release -p hs-scribe --features server --bin hs-scribe-server
 

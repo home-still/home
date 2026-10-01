@@ -489,6 +489,8 @@ This prevents the watcher, scribe container init, and compose operations from ru
 ## Build
 
 ```sh
+# --release builds bake the version, so they name the tag they ship as (see build-support/version.rs)
+export HS_RELEASE_TAG=v0.0.1-rc.NNN
 cargo build --release -p hs                           # unified CLI
 cargo build --release -p hs-gateway                   # cloud gateway
 cargo build --release -p hs-mcp                       # MCP server
@@ -496,6 +498,8 @@ cargo check -p hs-scribe --features server            # scribe server
 cargo check -p hs-distill --features server           # distill server
 cargo test --workspace                                # run tests
 ```
+
+Development builds (no `--release`) take their version from `git describe`. A `--release` build of `hs`, `hs-gateway`, `hs-mcp`, `hs-scribe`, `hs-distill` (or of anything that depends on the last two, e.g. `personal`) without `HS_RELEASE_TAG` fails by design.
 
 ## Related projects
 

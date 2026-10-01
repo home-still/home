@@ -230,8 +230,9 @@ payload = {
 ## Build
 
 ```sh
-cargo build --release -p hs-gateway
+# --release needs the tag the binary ships as (build-support/version.rs)
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs-gateway
 
 # Cross-compile for ARM64 (Raspberry Pi):
-cargo build --release --target aarch64-unknown-linux-gnu -p hs-gateway
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release --target aarch64-unknown-linux-gnu -p hs-gateway
 ```

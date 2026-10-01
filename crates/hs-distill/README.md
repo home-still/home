@@ -180,6 +180,9 @@ Client errors (bad input, unknown collection) are HTTP 400; a missing dependency
 ## Building from source
 
 ```bash
+# --release builds need the tag the binary ships as (build-support/version.rs)
+export HS_RELEASE_TAG=v0.0.1-rc.NNN
+
 # Client only (lightweight, no ONNX deps)
 cargo build --release -p hs-distill
 

@@ -83,5 +83,6 @@ The MCP server reads the same `~/.home-still/config.yaml` as the CLI. It discove
 ## Build
 
 ```sh
-cargo build --release -p hs-mcp
+# --release needs the tag the binary ships as (build-support/version.rs)
+HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs-mcp
 ```
