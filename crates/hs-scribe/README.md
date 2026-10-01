@@ -240,6 +240,7 @@ Multi-arch images (amd64 + arm64) are published to GHCR on every release:
 ```sh
 docker pull ghcr.io/home-still/hs-scribe-server:latest
 docker run -p 7433:7433 -v ~/.local/share/home-still/models:/models:ro \
+  -e HS_BACKEND_TOKEN="$(openssl rand -hex 32)" \
   -e HS_SCRIBE_OLLAMA_URL=http://host.docker.internal:11434 \
   ghcr.io/home-still/hs-scribe-server:latest
 ```
@@ -257,6 +258,7 @@ curl http://localhost:7433/health
 
 ```sh
 curl -X POST http://localhost:7433/scribe/stream \
+  -H "Authorization: Bearer $HS_BACKEND_TOKEN" \
   -F 'pdf=@paper.pdf' \
   --no-buffer
 # {"progress":{"stage":"parse","page":0,"total_pages":10,"message":"Parsed 10 pages"}}

@@ -22,6 +22,7 @@ services:
     volumes:
       - ${MODELS_DIR:-/tmp/models}:/models:ro
     environment:
+      HS_BACKEND_TOKEN: ${HS_BACKEND_TOKEN:?set HS_BACKEND_TOKEN (openssl rand -hex 32)}
       HS_SCRIBE_BACKEND: Ollama
       HS_SCRIBE_OLLAMA_URL: http://ollama:11434
       HS_SCRIBE_MODEL: moondream

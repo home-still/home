@@ -46,6 +46,26 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # hs-scribe's pdfium-backed tests print SKIPPED without libpdfium, and
+      # the scribe server needs it at startup. Same release the scribe image
+      # pins (crates/hs-scribe/docker/Dockerfile PDFIUM_VERSION); sha256 is
+      # the GitHub-computed asset digest:
+      #   gh api repos/bblanchon/pdfium-binaries/releases/tags/chromium%2F7749 \
+      #     --jq '.assets[]|select(.name=="pdfium-linux-x64.tgz")|.digest'
+      - name: Install libpdfium (linux-x64)
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          PDFIUM_URL: https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F7749/pdfium-linux-x64.tgz
+          PDFIUM_SHA256: 735abb28af7deab720dc54c8df3673a0a2a57bae9a0b16288842695fbd90a4b9
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/pdfium.tgz" "$PDFIUM_URL"
+          echo "$PDFIUM_SHA256  $RUNNER_TEMP/pdfium.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/pdfium"
+          tar -xzf "$RUNNER_TEMP/pdfium.tgz" -C "$RUNNER_TEMP/pdfium"
+          test -f "$RUNNER_TEMP/pdfium/lib/libpdfium.so"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/pdfium/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
       # --all: every workspace member, not a hand-kept list of them.
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --exclude hs-scribe --all-targets -- -D warnings

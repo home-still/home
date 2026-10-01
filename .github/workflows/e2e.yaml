@@ -75,6 +75,17 @@ jobs:
             -sOutputFile=/tmp/test.pdf /tmp/test.ps
           ls -lh /tmp/test.pdf
 
+      # Throwaway shared secret for the containers started below. The scribe
+      # server refuses to start without HS_BACKEND_TOKEN (>= 32 bytes) and
+      # answers 401 to everything except GET /health and GET /readiness.
+      # It reaches later steps only through the job environment.
+      - name: Generate backend token
+        run: |
+          set -euo pipefail
+          token=$(openssl rand -hex 32)
+          echo "::add-mask::$token"
+          echo "HS_BACKEND_TOKEN=$token" >> "$GITHUB_ENV"
+
       - name: Start services
         env:
           # Untrusted workflow_dispatch input: reaches the shell only through
@@ -116,7 +127,7 @@ jobs:
         run: |
           echo "Waiting for scribe-server..."
           for i in $(seq 1 30); do
-            RESP=$(curl -sf http://localhost:7432/health 2>/dev/null || true)
+            RESP=$(curl -sf http://localhost:7433/health 2>/dev/null || true)
             if echo "$RESP" | grep -q '"status":"ok"'; then
               echo "scribe-server healthy: $RESP"
               break
@@ -125,21 +136,39 @@ jobs:
             sleep 5
           done
           # Hard fail if not healthy
-          curl -sf http://localhost:7432/health | grep '"status":"ok"'
+          curl -sf http://localhost:7433/health | grep '"status":"ok"'
 
+      # POST /scribe was removed; /scribe/stream is the one conversion route:
+      # NDJSON, `{"progress":..}` lines then one final `{"result":{"markdown":..}}`
+      # (or `{"error":".."}`), bearer-authenticated.
       - name: Convert test PDF
         run: |
-          echo "Sending test PDF to /scribe..."
-          HTTP_CODE=$(curl -sf -o /tmp/result.md -w "%{http_code}" \
-            -X POST http://localhost:7432/scribe \
+          set -euo pipefail
+          echo "Sending test PDF to /scribe/stream..."
+          HTTP_CODE=$(curl -sS -o /tmp/stream.ndjson -w "%{http_code}" \
+            -X POST http://localhost:7433/scribe/stream \
+            -H "Authorization: Bearer ${HS_BACKEND_TOKEN}" \
             -F "pdf=@/tmp/test.pdf" \
             --max-time 600)
           echo "HTTP status: $HTTP_CODE"
           if [ "$HTTP_CODE" != "200" ]; then
             echo "FAIL: expected 200, got $HTTP_CODE"
-            cat /tmp/result.md || true
+            head -c 2000 /tmp/stream.ndjson || true
             exit 1
           fi
+          # The last line must be the result object; an error line or a
+          # stream that just ends is a failure.
+          last=$(tail -n 1 /tmp/stream.ndjson)
+          if ! printf '%s' "$last" | jq -e 'has("result")' >/dev/null; then
+            echo "FAIL: final stream line is not a result: ${last:0:500}"
+            exit 1
+          fi
+          if grep -q '^{"error"' /tmp/stream.ndjson; then
+            echo "FAIL: stream carried an error line"
+            grep '^{"error"' /tmp/stream.ndjson | head -3
+            exit 1
+          fi
+          printf '%s' "$last" | jq -r '.result.markdown' > /tmp/result.md
           echo "--- Output (first 50 lines) ---"
           head -50 /tmp/result.md
 
@@ -173,7 +202,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: scribe-e2e-output
-          path: /tmp/result.md
+          path: |
+            /tmp/result.md
+            /tmp/stream.ndjson
           retention-days: 7
 
       - name: Logs on failure

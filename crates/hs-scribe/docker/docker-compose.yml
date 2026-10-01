@@ -8,6 +8,7 @@ services:
     volumes:
       - ${HOME}/.local/share/home-still/models:/models:ro
     environment:
+      HS_BACKEND_TOKEN: ${HS_BACKEND_TOKEN:?set HS_BACKEND_TOKEN (openssl rand -hex 32)}
       HS_SCRIBE_BACKEND: sglang
       HS_SCRIBE_OPENAI_URL: http://vlm:8080
       HS_SCRIBE_USE_CUDA: "false"
