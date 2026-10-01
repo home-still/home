@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yaml runs exactly this workflow as its gate, so a tag cannot be
+  # published on gates weaker than the ones every push to main passed.
+  workflow_call:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,6 +22,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The same runner images release.yaml ships from, so the gate compiles
+        # on the toolchain/SDK the artifacts are built with (no floating
+        # `*-latest`).
+        #
         # windows-2022 (VS2022), NOT windows-latest: GitHub repointed
         # `windows-latest` and `windows-2025` to the VS2026 image, whose
         # MSVC dropped `stdext::checked_array_iterator` — DuckDB's
@@ -23,22 +33,43 @@ jobs:
         # build dies in cc-rs (`cl.exe` exit 2). Every crate but
         # hs-scribe pulls duckdb, so the whole leg failed. release.yaml
         # pinned the same runner for the same reason (rc.336/rc.337).
-        os: [ubuntu-latest, macos-latest, windows-2022]
+        os: [ubuntu-24.04, macos-14, windows-2022]
     steps:
-      - uses: actions/checkout@v4
-      
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          components: rustfmt, clippy
-      
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
 
-      - run: cargo fmt -p hs -p paper -p hs-common -p hs-scribe -p hs-distill --check      
-      - run: cargo clippy --workspace --exclude hs-scribe --all-targets -- -D warnings
-      - run: cargo clippy -p hs-scribe -- -D warnings
-      - run: cargo clippy -p hs-scribe --features server --all-targets -- -D warnings
-        if: matrix.os == 'ubuntu-latest'
-      - run: cargo test --workspace --exclude hs-scribe                     
-      - run: cargo test -p hs-scribe --features server          
-        if: matrix.os == 'ubuntu-latest'                                    
-  
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # --all: every workspace member, not a hand-kept list of them.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --exclude hs-scribe --all-targets -- -D warnings
+      - run: cargo clippy --locked -p hs-scribe -- -D warnings
+      - run: cargo test --locked --workspace --exclude hs-scribe
+
+      # `hs-scribe --features server` and `hs-distill --features server`/`cuda`
+      # are not part of the workspace invocations above (the `server`-gated
+      # modules — qdrant, server, embed::onnx, the HTTP handlers — only
+      # compile with the feature). Linux only: that is where release.yaml
+      # builds the distill server; the scribe server is also checked on macOS
+      # below because release.yaml ships it from there too.
+      - run: cargo clippy --locked -p hs-scribe --features server --all-targets -- -D warnings
+        if: matrix.os == 'ubuntu-24.04'
+      - run: cargo test --locked -p hs-scribe --features server
+        if: matrix.os == 'ubuntu-24.04'
+      # Exactly the feature set release.yaml builds for hs-distill-server
+      # (`--features cuda`, which implies `server`). Compiling is the point:
+      # it needs no GPU, but it does need the pyke ORT CUDA bundle download
+      # that the release build also performs.
+      - run: cargo clippy --locked -p hs-distill --features cuda --all-targets -- -D warnings
+        if: matrix.os == 'ubuntu-24.04'
+      - run: cargo test --locked -p hs-distill --features server --lib
+        if: matrix.os == 'ubuntu-24.04'
+      # The macOS scribe server release artifact (aarch64-apple-darwin).
+      - run: cargo check --locked -p hs-scribe --features server --bin hs-scribe-server
+        if: matrix.os == 'macos-14'
