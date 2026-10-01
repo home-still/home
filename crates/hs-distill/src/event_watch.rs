@@ -106,10 +106,16 @@ where
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("{op_name}: retries exhausted")))
 }
 
-/// Retrying cannot fix a key that names nothing legal, so those are
-/// permanent; every other storage error may clear up.
+/// Retrying cannot fix a key that names nothing legal, or a document the
+/// server has refused for what it contains (400/413/422), so those are
+/// permanent; every other error — storage or server outages included — may
+/// clear up.
 fn classify(err: anyhow::Error) -> HandlerError {
-    if hs_common::storage::is_invalid_key(&err) {
+    let refused = err
+        .chain()
+        .filter_map(|c| c.downcast_ref::<crate::client::ServerError>())
+        .any(|e| e.is_permanent_rejection());
+    if hs_common::storage::is_invalid_key(&err) || refused {
         HandlerError::Permanent(err)
     } else {
         HandlerError::Transient(err)
@@ -532,6 +538,29 @@ mod tests {
             .reason
             .starts_with("embed_failed"));
         assert!(rig.bus.published.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_document_the_server_refuses_is_permanent_but_an_outage_is_not() {
+        // 4xx for what the request contains (bad input, too large) will
+        // never succeed; 5xx and throttling will.
+        for (status, expected) in [
+            (400, "permanent"),
+            (413, "permanent"),
+            (422, "permanent"),
+            (429, "transient"),
+            (500, "transient"),
+            (503, "transient"),
+        ] {
+            let server = serve(move |_| Reply::Json(status, "no".into())).await;
+            let mut rig = rig(|| Reply::Json(200, OK_INDEX.into())).await;
+            rig.client = DistillClient::new(&server.url()).unwrap();
+            assert_eq!(
+                kind_of(run(&rig, "markdown/do/doc.md").await),
+                expected,
+                "HTTP {status}"
+            );
+        }
     }
 
     #[tokio::test]

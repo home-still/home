@@ -137,6 +137,33 @@ pub type DistillStreamLine = hs_common::service::protocol::StreamLine<DistillPro
 
 // ── Client ─────────────────────────────────────────────────────
 
+/// A non-2xx answer from the distill server. Typed so callers can tell a
+/// request the server will never accept (bad input) from an outage without
+/// matching on message text.
+#[derive(Debug, Clone)]
+pub struct ServerError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl ServerError {
+    /// The server understood the request and refuses it for what it
+    /// contains (400 bad input, 413 too large, 422 unprocessable): sending
+    /// it again cannot succeed. Everything else — 5xx, 404/405 during a
+    /// deploy, 401/403 until credentials are fixed, 408/429 — may clear up.
+    pub fn is_permanent_rejection(&self) -> bool {
+        matches!(self.status.as_u16(), 400 | 413 | 422)
+    }
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Server error {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for ServerError {}
+
 /// Upper bound on one indexing request (`/distill`, `/distill/stream`) unless
 /// the caller sets another with [`DistillClient::with_index_timeout`].
 ///
@@ -312,11 +339,7 @@ impl DistillClient {
             .await
             .context("Failed to send index request")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Server error {status}: {body}");
-        }
+        let resp = ensure_success(resp).await?;
 
         hs_common::service::protocol::read_ndjson_stream(resp, on_progress).await
     }
@@ -520,18 +543,25 @@ fn index_body(
     Ok(body)
 }
 
-/// Decode a 2xx JSON reply into `T`; any other status is an error carrying
-/// the server's message (it explains 400/503/500 precisely).
+/// Pass a 2xx response through; turn any other status into a [`ServerError`]
+/// carrying the server's message (it explains 400/503/500 precisely).
+async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    Err(ServerError { status, body }.into())
+}
+
+/// Decode a 2xx JSON reply into `T`.
 async fn json_or_server_error<T: DeserializeOwned>(
     resp: reqwest::Response,
     what: &str,
 ) -> Result<T> {
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Server error {status}: {body}");
-    }
-    resp.json()
+    ensure_success(resp)
+        .await?
+        .json()
         .await
         .with_context(|| format!("Invalid {what} response"))
 }
@@ -650,6 +680,33 @@ mod tests {
             msg.contains("400") && msg.contains("`content` is required"),
             "{msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn rejections_are_typed_so_callers_can_tell_bad_input_from_an_outage() {
+        for (status, permanent) in [
+            (400, true),
+            (413, true),
+            (422, true),
+            (401, false),
+            (403, false),
+            (404, false),
+            (408, false),
+            (429, false),
+            (500, false),
+            (503, false),
+        ] {
+            let fake = serve(move |_| Reply::Json(status, "no".into())).await;
+            let err = client(&fake)
+                .index_content("d.md", "x", None)
+                .await
+                .unwrap_err();
+            let typed = err
+                .downcast_ref::<ServerError>()
+                .unwrap_or_else(|| panic!("{status}: untyped error {err:#}"));
+            assert_eq!(typed.status.as_u16(), status);
+            assert_eq!(typed.is_permanent_rejection(), permanent, "{status}");
+        }
     }
 
     #[tokio::test]
