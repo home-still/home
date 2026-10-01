@@ -823,11 +823,16 @@ mod tests {
     // ── Client config ──────────────────────────────────────────────────
 
     fn nats_client_config(index_timeout_secs: u64, ack_wait_secs: u64) -> DistillClientConfig {
-        let mut c = DistillClientConfig::default();
-        c.index_timeout_secs = index_timeout_secs;
-        c.events.backend = hs_common::event_bus::EventsBackend::Nats;
-        c.events.nats.ack_wait_secs = ack_wait_secs;
-        c
+        let mut events = EventBusConfig {
+            backend: hs_common::event_bus::EventsBackend::Nats,
+            ..EventBusConfig::default()
+        };
+        events.nats.ack_wait_secs = ack_wait_secs;
+        DistillClientConfig {
+            index_timeout_secs,
+            events,
+            ..DistillClientConfig::default()
+        }
     }
 
     #[test]
@@ -851,8 +856,10 @@ mod tests {
     #[test]
     fn zero_timeout_or_concurrency_is_rejected() {
         assert!(nats_client_config(0, 7200).validate().is_err());
-        let mut c = DistillClientConfig::default();
-        c.concurrency = Some(0);
+        let c = DistillClientConfig {
+            concurrency: Some(0),
+            ..DistillClientConfig::default()
+        };
         assert!(c.validate().is_err());
     }
 }
