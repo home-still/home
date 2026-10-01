@@ -1,7 +1,12 @@
 FROM docker.io/library/rust:latest AS builder
 WORKDIR /build
+# The version the binary reports. A release-profile build without a valid tag
+# fails (build-support/version.rs), so `docker build` needs:
+#   --build-arg HS_RELEASE_TAG=v0.0.1-rc.NNN
+ARG HS_RELEASE_TAG
+ENV HS_RELEASE_TAG=${HS_RELEASE_TAG}
 COPY . .
-RUN cargo build --release -p hs-scribe \
+RUN cargo build --locked --release -p hs-scribe \
     --features server --bin hs-scribe-server
 
 FROM docker.io/library/debian:trixie-slim

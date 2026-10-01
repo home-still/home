@@ -4,40 +4,79 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-  packages: write
+# Nothing is writable by default. Each job below asks for exactly what it
+# needs: only `release` may write contents and only the docker jobs may write
+# packages; the jobs that compile code hold neither.
+permissions: {}
+
+# One run per tag, and never cancel one half-way: a cancelled run leaves a tag
+# with some of its artifacts published and some not.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   TOOL: hs
   CRATE: hs
+  IMAGE: ghcr.io/home-still/hs-scribe-server
+  # The version every binary built here reports (build-support/version.rs
+  # derives HS_VERSION from it). A tag that is not vMAJOR.MINOR.PATCH[-PRE]
+  # fails the build; nothing falls back to `git describe` or Cargo.toml.
+  HS_RELEASE_TAG: ${{ github.ref_name }}
+  # Pinned: these are installed into the jobs that compile what we publish.
+  ZIG_VERSION: "0.16.0"            # PyPI `ziglang`
+  CARGO_ZIGBUILD_VERSION: "0.23.4" # crates.io `cargo-zigbuild`
 
 
 jobs:
+  # The same fmt / clippy / test gates every push to main passes (ci.yaml is a
+  # reusable workflow), run on the tagged commit. Nothing builds or publishes
+  # unless they are green.
+  gate:
+    name: Gate (ci.yaml)
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yaml
+
   build:
     name: Build ${{ matrix.target }}
+    needs: gate
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
+          # macos-14 is arm64: this x86_64 binary is cross-compiled and cannot
+          # be executed here (run_native: false), so it is verified by file
+          # type + embedded version string only.
           - target: x86_64-apple-darwin
             runner: macos-14
             archive: tar.gz
+            run_native: false
           - target: aarch64-apple-darwin
             runner: macos-14
             archive: tar.gz
             build_scribe: true
+            run_native: true
+          # ubuntu-24.04, not ubuntu-latest: the runner image fixes the glibc
+          # the x86_64 binaries require, and a floating image raises it
+          # silently on GitHub's schedule.
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             archive: tar.gz
             build_scribe: true
             build_distill: true
+            run_native: true
+          # Cross-built on an x86_64 runner against glibc 2.28 by zigbuild;
+          # not executed here (run_native: false).
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             archive: tar.gz
             use_zigbuild: true
+            run_native: false
           - target: x86_64-pc-windows-msvc
             # Pinned to windows-2022 (VS2022 MSVC). GitHub repointed BOTH
             # `windows-latest` AND `windows-2025` to the VS2026 image
@@ -47,206 +86,195 @@ jobs:
             # windows-2022 is a distinct OS image that still ships VS2022.
             runner: windows-2022
             archive: zip
+            run_native: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
 
       - name: Install cargo-zigbuild + zig (ARM64 Linux only)
         if: matrix.use_zigbuild
         run: |
-          pip3 install ziglang --break-system-packages
-          cargo install cargo-zigbuild
-
-      - name: Add target
-        run: rustup target add ${{ matrix.target }}
+          pip3 install --break-system-packages "ziglang==${ZIG_VERSION}"
+          cargo install --locked cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}"
 
       - name: Build CLI (zigbuild)
         if: matrix.use_zigbuild
         run: >
-          cargo zigbuild --release
+          cargo zigbuild --locked --release
           --target ${{ matrix.target }}.2.28
           -p ${{ env.CRATE }}
 
       - name: Build CLI (native)
         if: ${{ !matrix.use_zigbuild }}
         run: >
-          cargo build --release
+          cargo build --locked --release
           --target ${{ matrix.target }}
           -p ${{ env.CRATE }}
 
       - name: Build scribe server (native)
         if: matrix.build_scribe
         run: >
-          cargo build --release
+          cargo build --locked --release
           --target ${{ matrix.target }}
           -p hs-scribe --features server --bin hs-scribe-server
 
       - name: Build distill server (native)
         if: matrix.build_distill
         run: >
-          cargo build --release
+          cargo build --locked --release
           --target ${{ matrix.target }}
           -p hs-distill --features cuda --bin hs-distill-server
 
+      # Gateway and MCP server are published for the tar.gz targets only; the
+      # Windows leg ships just `hs` (zip), so it does not build them.
       - name: Build gateway (zigbuild)
         if: matrix.use_zigbuild
         run: >
-          cargo zigbuild --release
+          cargo zigbuild --locked --release
           --target ${{ matrix.target }}.2.28
           -p hs-gateway
 
       - name: Build gateway (native)
-        if: ${{ !matrix.use_zigbuild }}
+        if: ${{ !matrix.use_zigbuild && matrix.archive == 'tar.gz' }}
         run: >
-          cargo build --release
+          cargo build --locked --release
           --target ${{ matrix.target }}
           -p hs-gateway
 
       - name: Build MCP server (zigbuild)
         if: matrix.use_zigbuild
         run: >
-          cargo zigbuild --release
+          cargo zigbuild --locked --release
           --target ${{ matrix.target }}.2.28
           -p hs-mcp
 
       - name: Build MCP server (native)
-        if: ${{ !matrix.use_zigbuild }}
+        if: ${{ !matrix.use_zigbuild && matrix.archive == 'tar.gz' }}
         run: >
-          cargo build --release
+          cargo build --locked --release
           --target ${{ matrix.target }}
           -p hs-mcp
 
+      # Every release asset goes through dist/: one archive per binary plus its
+      # .sha256, named <binary>-<tag>-<target>.tar.gz|zip (hs upgrade and
+      # docs/install.sh download by exactly these names).
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILD_SCRIBE: ${{ matrix.build_scribe }}
+          BUILD_DISTILL: ${{ matrix.build_distill }}
         run: |
-          ASSET="${{ env.TOOL }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
-          tar -czf "$ASSET" \
-            -C "target/${{ matrix.target }}/release" "${{ env.TOOL }}"
-          shasum -a 256 "$ASSET" > "$ASSET.sha256"
-          echo "ASSET=$ASSET" >> $GITHUB_ENV
+          set -euo pipefail
+          mkdir dist
+          pack() { # <binary>
+            local asset="$1-${GITHUB_REF_NAME}-${TARGET}.tar.gz"
+            tar -czf "dist/$asset" -C "target/${TARGET}/release" "$1"
+            (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
+          }
+          pack "$TOOL"
+          pack hs-gateway
+          pack hs-mcp
+          if [ "$BUILD_SCRIBE" = true ]; then pack hs-scribe-server; fi
+          if [ "$BUILD_DISTILL" = true ]; then pack hs-distill-server; fi
+          ls -l dist
 
       - name: Package (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          $asset = "${{ env.TOOL }}-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          New-Item -ItemType Directory dist | Out-Null
+          $asset = "${env:TOOL}-${env:GITHUB_REF_NAME}-${env:TARGET}.zip"
           Compress-Archive `
-            -Path "target\${{ matrix.target }}\release\${{ env.TOOL }}.exe" `
-            -DestinationPath $asset
-          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
-          "$hash  $asset" | Out-File -Encoding ascii "$asset.sha256"
-          echo "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
+            -Path "target\${env:TARGET}\release\${env:TOOL}.exe" `
+            -DestinationPath "dist\$asset"
+          $hash = (Get-FileHash "dist\$asset" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $asset" | Out-File -Encoding ascii "dist\$asset.sha256"
+          Get-ChildItem dist
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.TOOL }}-${{ matrix.target }}
-          path: |
-            ${{ env.ASSET }}
-            ${{ env.ASSET }}.sha256
-
-      - name: Upload scribe server binary (raw, for Docker)
-        if: matrix.build_scribe
-        uses: actions/upload-artifact@v4
-        with:
-          name: scribe-binary-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/hs-scribe-server
-
-      - name: Package scribe server
-        if: matrix.build_scribe
-        shell: bash
-        run: |
-          SCRIBE_ASSET="hs-scribe-server-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
-          tar -czf "$SCRIBE_ASSET" \
-            -C "target/${{ matrix.target }}/release" "hs-scribe-server"
-          shasum -a 256 "$SCRIBE_ASSET" > "$SCRIBE_ASSET.sha256"
-          echo "SCRIBE_ASSET=$SCRIBE_ASSET" >> $GITHUB_ENV
-
-      - name: Upload scribe server tarball
-        if: matrix.build_scribe
-        uses: actions/upload-artifact@v4
-        with:
-          name: scribe-${{ matrix.target }}
-          path: |
-            ${{ env.SCRIBE_ASSET }}
-            ${{ env.SCRIBE_ASSET }}.sha256
-
-      - name: Package distill server
-        if: matrix.build_distill
-        shell: bash
-        run: |
-          DISTILL_ASSET="hs-distill-server-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
-          tar -czf "$DISTILL_ASSET" \
-            -C "target/${{ matrix.target }}/release" "hs-distill-server"
-          shasum -a 256 "$DISTILL_ASSET" > "$DISTILL_ASSET.sha256"
-          echo "DISTILL_ASSET=$DISTILL_ASSET" >> $GITHUB_ENV
-
-      - name: Upload distill server
-        if: matrix.build_distill
-        uses: actions/upload-artifact@v4
-        with:
-          name: distill-${{ matrix.target }}
-          path: |
-            ${{ env.DISTILL_ASSET }}
-            ${{ env.DISTILL_ASSET }}.sha256
-
-      - name: Package gateway
+      # Verify what is about to be published, not what the build step claims:
+      # extract each archive and check the binary's architecture and baked
+      # version against the tag (see .github/scripts/verify-binaries.sh).
+      #   * hs, hs-gateway, hs-mcp have a clap --version: executed natively
+      #     when this runner can run the target (run_native).
+      #   * the scribe/distill servers have no --version flag: embedded
+      #     version string only.
+      #   * cross-built targets (aarch64-linux, x86_64-darwin): embedded
+      #     version string + `file` architecture only.
+      - name: Verify packaged binaries (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          RUN_NATIVE: ${{ matrix.run_native }}
+          BUILD_SCRIBE: ${{ matrix.build_scribe }}
+          BUILD_DISTILL: ${{ matrix.build_distill }}
         run: |
-          GW_ASSET="hs-gateway-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
-          tar -czf "$GW_ASSET" \
-            -C "target/${{ matrix.target }}/release" "hs-gateway"
-          shasum -a 256 "$GW_ASSET" > "$GW_ASSET.sha256"
-          echo "GW_ASSET=$GW_ASSET" >> $GITHUB_ENV
+          set -euo pipefail
+          verify() { # <binary> [--run]
+            local dir; dir=$(mktemp -d)
+            tar -xzf "dist/$1-${GITHUB_REF_NAME}-${TARGET}.tar.gz" -C "$dir"
+            bash .github/scripts/verify-binaries.sh --tag "$GITHUB_REF_NAME" --target "$TARGET" \
+              --dir "$dir" ${2:+"$2"} "$1"
+          }
+          run=
+          if [ "$RUN_NATIVE" = true ]; then run=--run; fi
+          verify "$TOOL" "$run"
+          verify hs-gateway "$run"
+          verify hs-mcp "$run"
+          if [ "$BUILD_SCRIBE" = true ]; then verify hs-scribe-server; fi
+          if [ "$BUILD_DISTILL" = true ]; then verify hs-distill-server; fi
 
-      - name: Upload gateway
-        if: matrix.archive == 'tar.gz'
-        uses: actions/upload-artifact@v4
-        with:
-          name: gateway-${{ matrix.target }}
-          path: |
-            ${{ env.GW_ASSET }}
-            ${{ env.GW_ASSET }}.sha256
+      - name: Extract packaged binary (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: Expand-Archive -Path "dist\${env:TOOL}-${env:GITHUB_REF_NAME}-${env:TARGET}.zip" -DestinationPath verify-win
 
-      - name: Package MCP server
-        if: matrix.archive == 'tar.gz'
+      - name: Verify packaged binary (Windows)
+        if: matrix.archive == 'zip'
         shell: bash
-        run: |
-          MCP_ASSET="hs-mcp-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
-          tar -czf "$MCP_ASSET" \
-            -C "target/${{ matrix.target }}/release" "hs-mcp"
-          shasum -a 256 "$MCP_ASSET" > "$MCP_ASSET.sha256"
-          echo "MCP_ASSET=$MCP_ASSET" >> $GITHUB_ENV
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash .github/scripts/verify-binaries.sh --tag "$GITHUB_REF_NAME" --target "$TARGET" --dir verify-win --run "$TOOL"
 
-      - name: Upload MCP server
-        if: matrix.archive == 'tar.gz'
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: mcp-${{ matrix.target }}
-          path: |
-            ${{ env.MCP_ASSET }}
-            ${{ env.MCP_ASSET }}.sha256
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
 
   release:
     name: Publish Github Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
+          pattern: dist-*
           merge-multiple: true
       - name: Combine Checksums
         run: cat artifacts/*.sha256 > checksums-sha256.txt
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             artifacts/*
@@ -255,70 +283,79 @@ jobs:
           draft: false
           fail_on_unmatched_files: true
 
-  docker-amd64:
-    name: Docker (amd64)
+  # One Dockerfile for both architectures, each built natively on its own
+  # runner from the tagged source (no separate pre-built-binary path).
+  docker:
+    name: Docker (${{ matrix.arch }})
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
-      - uses: actions/download-artifact@v4
-        with:
-          name: scribe-binary-x86_64-unknown-linux-gnu
-          path: docker-context/amd64/
-      - run: chmod +x docker-context/amd64/hs-scribe-server
-      - uses: docker/build-push-action@v5
-        with:
-          context: docker-context
-          file: crates/hs-scribe/docker/Dockerfile.prebuilt
-          platforms: linux/amd64
-          push: true
-          tags: ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-amd64
-          cache-from: type=gha,scope=docker-amd64
-          cache-to: type=gha,mode=max,scope=docker-amd64
-
-  docker-arm64:
-    name: Docker (arm64)
-    needs: build
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v5
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      # Build and load first; the image is pushed only after its binary has
+      # been checked against the tag.
+      - uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           file: crates/hs-scribe/docker/Dockerfile
-          platforms: linux/arm64
-          push: true
-          tags: ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-arm64
-          cache-from: type=gha,scope=docker-arm64
-          cache-to: type=gha,mode=max,scope=docker-arm64
+          platforms: linux/${{ matrix.arch }}
+          build-args: HS_RELEASE_TAG=${{ github.ref_name }}
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
+      - name: Verify the image (architecture + baked version == tag)
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}:${GITHUB_REF_NAME}-${ARCH}"
+          found=$(docker image inspect --format '{{.Architecture}}' "$ref")
+          [ "$found" = "$ARCH" ] || { echo "image is $found, expected $ARCH" >&2; exit 1; }
+          docker run --rm --entrypoint grep "$ref" -a -F -q -- "${GITHUB_REF_NAME#v}" /usr/local/bin/hs-scribe-server
+      - name: Push
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: docker push "${IMAGE}:${GITHUB_REF_NAME}-${ARCH}"
 
   docker-manifest:
     name: Docker Manifest
-    needs: [docker-amd64, docker-arm64]
-    runs-on: ubuntu-latest
+    needs: docker
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
     steps:
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      # `:latest` follows every tag, release candidates included: every tag
+      # this project cuts is an -rc, and the README / weekly e2e consume
+      # `:latest`. See BACKLOG.md RA-117 before changing that.
       - name: Create multi-arch manifest
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }} \
-            -t ghcr.io/home-still/hs-scribe-server:latest \
-            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-amd64 \
-            ghcr.io/home-still/hs-scribe-server:${{ github.ref_name }}-arm64
+            -t "${IMAGE}:${GITHUB_REF_NAME}" \
+            -t "${IMAGE}:latest" \
+            "${IMAGE}:${GITHUB_REF_NAME}-amd64" \
+            "${IMAGE}:${GITHUB_REF_NAME}-arm64"
