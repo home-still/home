@@ -129,4 +129,101 @@ mod tests {
             StatusCode::OK
         );
     }
+
+    fn token_post(body: String) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/token")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_flood_of_bad_grants_cannot_lock_out_a_valid_refresh() {
+        use hs_common::auth::token::TokenType;
+        let state = test_state_with(&[], "auth_rate_limit_per_minute: 3").await;
+        let refresh = crate::auth::issue_token(
+            &state,
+            "oauth:hs-client",
+            &["mcp".to_string()],
+            TokenType::Refresh,
+        )
+        .unwrap();
+        let valid = || token_post(format!("grant_type=refresh_token&refresh_token={refresh}"));
+        let bad = || token_post("grant_type=refresh_token&refresh_token=forged".into());
+
+        // The attacker burns the whole failure budget, then gets 429.
+        for _ in 0..3 {
+            assert_eq!(call(&state, bad()).await.status(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = call(&state, bad()).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().contains_key("retry-after"));
+
+        // A valid grant is still served, repeatedly, with the budget spent.
+        for _ in 0..5 {
+            assert_eq!(call(&state, valid()).await.status(), StatusCode::OK);
+        }
+        // And a wrong-class token is a failure, not a free pass.
+        let access = crate::auth::issue_token(
+            &state,
+            "oauth:hs-client",
+            &["mcp".to_string()],
+            TokenType::Access,
+        )
+        .unwrap();
+        let wrong_class = call(
+            &state,
+            token_post(format!("grant_type=refresh_token&refresh_token={access}")),
+        )
+        .await;
+        assert_eq!(wrong_class.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn enrollment_code_guessing_stays_bounded_and_valid_enrolments_are_free() {
+        let state = test_state_with(&[], "auth_rate_limit_per_minute: 3").await;
+        let enroll = |code: &str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/cloud/enroll")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                .unwrap()
+        };
+
+        // Successful enrolments do not use the budget.
+        for _ in 0..5 {
+            let code = crate::enrollment::register_enrollment(
+                &state.enrollments,
+                "laptop",
+                vec!["mcp".into()],
+            )
+            .unwrap();
+            assert_eq!(call(&state, enroll(&code)).await.status(), StatusCode::OK);
+        }
+
+        // Guessing is capped at the budget...
+        let mut guesses_answered = 0;
+        for _ in 0..10 {
+            if call(&state, enroll("AAA-AAA")).await.status() == StatusCode::UNAUTHORIZED {
+                guesses_answered += 1;
+            }
+        }
+        assert_eq!(guesses_answered, 3);
+
+        // ...and while exhausted even a real code is refused (a guess cannot
+        // be told apart from it before it is looked up).
+        let code = crate::enrollment::register_enrollment(
+            &state.enrollments,
+            "laptop",
+            vec!["mcp".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            call(&state, enroll(&code)).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
 }

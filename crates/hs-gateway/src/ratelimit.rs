@@ -1,13 +1,25 @@
 //! Request-rate limiting for the unauthenticated credential endpoints.
 //!
-//! Enrollment codes carry ~30 bits and OAuth authorization is gated by the same
-//! codes, so unlimited guessing is the attack to bound. The limiter is one
-//! token bucket per endpoint, deliberately NOT keyed by client address: behind
-//! cloudflared every peer is loopback, and `cf-connecting-ip` is attacker
-//! controlled whenever the listener is reachable directly, so no per-client key
-//! is trustworthy. A global bucket caps the total guess rate regardless of who
-//! is guessing; the cost is that a flood can briefly starve legitimate
-//! enrollment, which is the safe side of that trade.
+//! The limiter is one token bucket per endpoint, deliberately NOT keyed by
+//! client address: behind cloudflared every peer is loopback, and
+//! `cf-connecting-ip` is attacker controlled whenever the listener is
+//! reachable directly, so no per-client key is trustworthy. Buckets are global
+//! and charged according to what the endpoint can leak:
+//!
+//! * `/cloud/enroll`, `/authorize` — guessable (~30-bit codes). A token is
+//!   reserved *before* the handler runs (concurrent guesses cannot overshoot)
+//!   and refunded when the request succeeded, so only **failed** attempts use
+//!   the budget and total guessing is bounded by the bucket. Validation errors
+//!   that happen before the code is looked up charge too (harmless: they leak
+//!   nothing). While the bucket is empty every request gets 429, valid or not.
+//! * `/token` — nothing here is guessable: refresh tokens are HMAC-signed and
+//!   authorization codes are ~165-bit single-use values bound to PKCE. The
+//!   handler always runs; only **failed** grants are charged, and once the
+//!   failure budget is spent a failure is answered with 429. A valid code
+//!   exchange or refresh grant is never refused, so an anonymous flood cannot
+//!   lock OAuth clients out of refreshing.
+//! * `/register` — creates state (and evicts the oldest client when full), so
+//!   every request is charged.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -67,9 +79,27 @@ impl RateLimiter {
         };
         Err(wait.max(1))
     }
+
+    /// Give back a token taken by [`Self::check`] for a request that turned
+    /// out to be legitimate.
+    pub fn refund(&self) {
+        let mut bucket = self.bucket.lock();
+        bucket.tokens = (bucket.tokens + 1.0).min(self.capacity);
+    }
 }
 
-/// One bucket per guessable endpoint.
+/// How an endpoint charges its bucket (see the module docs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Policy {
+    /// Reserve before, refund on success: only failures are spent; empty ⇒ 429 for all.
+    ReserveRefundOnSuccess,
+    /// Always run; charge failures; a failure past the budget becomes 429.
+    ChargeFailuresOnly,
+    /// Charge every request.
+    ChargeAlways,
+}
+
+/// One bucket per credential endpoint.
 pub struct RateLimits {
     enroll: RateLimiter,
     authorize: RateLimiter,
@@ -87,35 +117,67 @@ impl RateLimits {
         }
     }
 
-    fn for_request(&self, method: &Method, path: &str) -> Option<&RateLimiter> {
+    fn for_request(&self, method: &Method, path: &str) -> Option<(&RateLimiter, Policy)> {
         if method != Method::POST {
             return None;
         }
         match path {
-            "/cloud/enroll" => Some(&self.enroll),
-            "/authorize" => Some(&self.authorize),
-            "/token" => Some(&self.token),
-            "/register" => Some(&self.register),
+            "/cloud/enroll" => Some((&self.enroll, Policy::ReserveRefundOnSuccess)),
+            "/authorize" => Some((&self.authorize, Policy::ReserveRefundOnSuccess)),
+            "/token" => Some((&self.token, Policy::ChargeFailuresOnly)),
+            "/register" => Some((&self.register, Policy::ChargeAlways)),
             _ => None,
         }
     }
 }
 
-/// Middleware: answer 429 once an endpoint's bucket is empty.
+fn too_many(retry_after: u64) -> Response {
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, "Too many requests").into_response();
+    if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+        resp.headers_mut().insert(header::RETRY_AFTER, v);
+    }
+    resp
+}
+
+/// A refused attempt: any 4xx/5xx from the handler.
+fn is_failure(resp: &Response) -> bool {
+    resp.status().is_client_error() || resp.status().is_server_error()
+}
+
+/// Middleware applying each credential endpoint's [`Policy`].
 pub async fn limit(State(state): State<Arc<GatewayState>>, req: Request, next: Next) -> Response {
-    if let Some(limiter) = state
+    let Some((limiter, policy)) = state
         .rate_limits
         .for_request(req.method(), req.uri().path())
-    {
-        if let Err(retry_after) = limiter.check() {
-            let mut resp = (StatusCode::TOO_MANY_REQUESTS, "Too many requests").into_response();
-            if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
-                resp.headers_mut().insert(header::RETRY_AFTER, v);
+    else {
+        return next.run(req).await;
+    };
+
+    match policy {
+        Policy::ChargeAlways => match limiter.check() {
+            Ok(()) => next.run(req).await,
+            Err(wait) => too_many(wait),
+        },
+        Policy::ReserveRefundOnSuccess => {
+            if let Err(wait) = limiter.check() {
+                return too_many(wait);
             }
-            return resp;
+            let resp = next.run(req).await;
+            if !is_failure(&resp) {
+                limiter.refund();
+            }
+            resp
+        }
+        Policy::ChargeFailuresOnly => {
+            let resp = next.run(req).await;
+            if is_failure(&resp) {
+                if let Err(wait) = limiter.check() {
+                    return too_many(wait);
+                }
+            }
+            resp
         }
     }
-    next.run(req).await
 }
 
 #[cfg(test)]
@@ -137,6 +199,22 @@ mod tests {
         assert!(limiter.check().is_ok());
         let wait = limiter.check().unwrap_err();
         assert!((1..=60).contains(&wait), "{wait}");
+    }
+
+    #[test]
+    fn refund_gives_a_token_back_but_never_beyond_capacity() {
+        let limiter = RateLimiter::new(2, 0.0);
+        assert!(limiter.check().is_ok());
+        assert!(limiter.check().is_ok());
+        assert!(limiter.check().is_err());
+        limiter.refund();
+        assert!(limiter.check().is_ok());
+        limiter.refund();
+        limiter.refund();
+        limiter.refund();
+        assert!(limiter.check().is_ok());
+        assert!(limiter.check().is_ok());
+        assert!(limiter.check().is_err(), "capacity is a hard ceiling");
     }
 
     #[test]
