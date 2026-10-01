@@ -555,10 +555,10 @@ mod tests {
 
     #[tokio::test]
     async fn gated_pool_fails_the_pick_at_once() {
-        // big's scribe answers `backend_unavailable` while another GPU
+        // A scribe host answers `backend_unavailable` while another GPU
         // tenant holds the card. Parking for the full ready timeout held
         // the tier permit and wedged every watch-events slot.
-        let pool = ServicePool::new(vec![gated("http://big:7435")])
+        let pool = ServicePool::new(vec![gated("http://host-a:7435")])
             .with_timing(Duration::from_secs(60), Duration::from_millis(50));
         let started = Instant::now();
         let err = pool
@@ -575,8 +575,8 @@ mod tests {
         // Only a refusal from EVERY host closes the pool; a gated host
         // beside a busy-but-admitting one means wait for the busy one.
         let pool = ServicePool::new(vec![
-            gated("http://big:7435"),
-            mk("http://bmb:7433", true, 0),
+            gated("http://host-a:7435"),
+            mk("http://host-b:7433", true, 0),
         ]);
         let res = pool.try_pick_once(false).await.unwrap();
         assert!(matches!(res, Probe::Wait), "got {res:?}");
@@ -587,8 +587,11 @@ mod tests {
         // A sleeping laptop is not a closed gate: the pick keeps polling
         // for the full timeout so the event is not NAKed through its
         // JetStream delivery budget in minutes.
-        let pool = ServicePool::new(vec![down("http://bmb:7433"), gated("http://big:7435")])
-            .with_timing(Duration::from_millis(300), Duration::from_millis(50));
+        let pool = ServicePool::new(vec![
+            down("http://host-b:7433"),
+            gated("http://host-a:7435"),
+        ])
+        .with_timing(Duration::from_millis(300), Duration::from_millis(50));
         let started = Instant::now();
         let err = pool.pick_server().await.err().expect("must time out");
         assert!(

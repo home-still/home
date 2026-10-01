@@ -1697,7 +1697,7 @@ mod inbox_heartbeat_tests {
 
     fn hb(sweep_interval_secs: u64) -> InboxHeartbeat {
         InboxHeartbeat {
-            host: "big".into(),
+            host: "host-a".into(),
             pid: 12345,
             last_tick: "2026-04-24T13:00:00+00:00".into(),
             sweep_interval_secs,
@@ -1713,7 +1713,7 @@ mod inbox_heartbeat_tests {
         let snap = classify_inbox_heartbeat(hb(5), now, now);
         assert!(snap.running);
         assert_eq!(snap.last_tick_seconds_ago, 0);
-        assert_eq!(snap.host, "big");
+        assert_eq!(snap.host, "host-a");
     }
 
     #[test]
