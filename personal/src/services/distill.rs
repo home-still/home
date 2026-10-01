@@ -1,7 +1,9 @@
 //! Thin facade over `hs_distill::client::DistillClient` that pins every call
-//! to the personal collection. The distill server now accepts a per-request
-//! `collection` parameter and lazy-creates the named collection on first use,
-//! so a single distill daemon serves both `academic_papers` and `personal_docs`.
+//! to the personal collection. The distill server accepts a per-request
+//! `collection` parameter for the collections it is configured to serve
+//! (`distill_server.collections`, which includes `personal_docs` by default)
+//! and answers HTTP 400 for any other name, so `personal.collection_name`
+//! must be listed there when it is not the default.
 
 use crate::config::Config;
 use crate::error::{PersonalError, Result};
