@@ -31,15 +31,18 @@ use crate::HomeStillMcp;
 /// call still running when it fires is cancelled with its session.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
-/// The router plus a handle on its session table.
-pub struct HttpApp {
-    pub router: Router,
-    pub sessions: Arc<LocalSessionManager>,
-}
-
 /// Build the HTTP app for `server`. Every request, whatever its path or
 /// method, is checked against `token` before the MCP service sees it.
-pub fn build(server: HomeStillMcp, token: BackendToken, session_idle_timeout: Duration) -> HttpApp {
+pub fn build(server: HomeStillMcp, token: BackendToken, session_idle_timeout: Duration) -> Router {
+    build_with_sessions(server, token, session_idle_timeout).0
+}
+
+/// [`build`], also returning the session table (tests count sessions in it).
+fn build_with_sessions(
+    server: HomeStillMcp,
+    token: BackendToken,
+    session_idle_timeout: Duration,
+) -> (Router, Arc<LocalSessionManager>) {
     // Stateful sessions stay: tools stream `notifications/progress` to the
     // caller (scribe_convert), which needs a session to carry them.
     let mut session_manager = LocalSessionManager::default();
@@ -54,7 +57,7 @@ pub fn build(server: HomeStillMcp, token: BackendToken, session_idle_timeout: Du
     let router = Router::new()
         .fallback_service(service)
         .layer(middleware::from_fn_with_state(token, require_token));
-    HttpApp { router, sessions }
+    (router, sessions)
 }
 
 async fn require_token(
@@ -87,11 +90,11 @@ fn unauthorized(why: BackendAuthError) -> Response {
         .into_response()
 }
 
-/// Serve `app` on `addr` until ctrl-c.
-pub async fn serve(addr: &str, app: HttpApp) -> anyhow::Result<()> {
+/// Serve `router` on `addr` until ctrl-c.
+pub async fn serve(addr: &str, router: Router) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("MCP server listening on {addr}");
-    axum::serve(listener, app.router)
+    axum::serve(listener, router)
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
         })
@@ -113,20 +116,19 @@ mod tests {
     }
 
     async fn start(idle: Duration) -> Running {
-        let app = build(
+        let (router, sessions) = build_with_sessions(
             server(FaultyStorage::new(), None),
             BackendToken::new(SECRET).unwrap(),
             idle,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let router = app.router;
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
         Running {
             base,
-            sessions: app.sessions,
+            sessions,
             http: reqwest::Client::new(),
         }
     }

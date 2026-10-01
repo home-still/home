@@ -248,7 +248,7 @@ struct PaperDownloadParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ScribeConvertParams {
     #[schemars(
-        description = "Paper stem name (filename without extension) of a PDF in the papers directory"
+        description = "Paper stem name (filename without extension) of a PDF, HTML or EPUB source stored in the papers directory"
     )]
     stem: Stem,
 }
@@ -567,6 +567,8 @@ struct HomeStillMcp {
     papers_prefix: String,
     scribe_servers: Vec<String>,
     scribe_convert_timeout: std::time::Duration,
+    scribe_timeout_policy: hs_scribe::config::TimeoutPolicy,
+    epub_limits: hs_scribe::epub::EpubLimits,
     distill_servers: Vec<String>,
     /// Read-only handle to the local OpenAlex DuckDB (when `openalex:` section
     /// is present in config and the file exists). `None` when the section is
@@ -583,6 +585,8 @@ struct Deps {
     events: Arc<dyn EventBus>,
     scribe_servers: Vec<String>,
     scribe_convert_timeout: std::time::Duration,
+    scribe_timeout_policy: hs_scribe::config::TimeoutPolicy,
+    epub_limits: hs_scribe::epub::EpubLimits,
     distill_servers: Vec<String>,
     openalex_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
 }
@@ -598,6 +602,46 @@ struct MarkdownProbe {
 /// an empty "success".
 fn to_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, String> {
     serde_json::to_string_pretty(value).map_err(|e| format!("serializing the result failed: {e}"))
+}
+
+/// Sends `notifications/progress` about every 20 s while it is alive, so a
+/// tool that runs for minutes without a natural progress signal keeps the
+/// client's tool-call timer and the server's session idle timer from firing.
+/// Does nothing when the caller sent no progress token.
+struct ProgressHeartbeat(Option<tokio::task::JoinHandle<()>>);
+
+impl ProgressHeartbeat {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
+    fn start(context: &RequestContext<RoleServer>, label: String) -> Self {
+        let Some(token) = context.meta.get_progress_token() else {
+            return Self(None);
+        };
+        let peer = context.peer.clone();
+        Self(Some(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut tick =
+                tokio::time::interval_at(tokio::time::Instant::now() + Self::EVERY, Self::EVERY);
+            loop {
+                tick.tick().await;
+                let secs = started.elapsed().as_secs();
+                let params = ProgressNotificationParam::new(token.clone(), secs as f64)
+                    .with_message(format!("{label}: still running ({secs}s)"));
+                if let Err(e) = peer.notify_progress(params).await {
+                    tracing::warn!(label = %label, error = %e, "progress heartbeat stopped");
+                    break;
+                }
+            }
+        })))
+    }
+}
+
+impl Drop for ProgressHeartbeat {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 impl HomeStillMcp {
@@ -662,6 +706,8 @@ impl HomeStillMcp {
             events,
             scribe_servers,
             scribe_convert_timeout: std::time::Duration::from_secs(scribe_cfg.convert_timeout_secs),
+            scribe_timeout_policy: scribe_cfg.timeout_policy.clone(),
+            epub_limits: scribe_cfg.epub.clone(),
             distill_servers,
             openalex_db,
         }))
@@ -673,6 +719,8 @@ impl HomeStillMcp {
             events,
             scribe_servers,
             scribe_convert_timeout,
+            scribe_timeout_policy,
+            epub_limits,
             distill_servers,
             openalex_db,
         } = deps;
@@ -720,6 +768,8 @@ impl HomeStillMcp {
             papers_prefix: "papers".to_string(),
             scribe_servers,
             scribe_convert_timeout,
+            scribe_timeout_policy,
+            epub_limits,
             distill_servers,
             openalex_db,
             tool_router,
@@ -820,6 +870,112 @@ impl HomeStillMcp {
                 result.chunks_indexed
             )
         })
+    }
+
+    /// The stored source for `stem`: the PDF if there is one, else HTML, else
+    /// EPUB. A missing object moves on to the next type; any other storage
+    /// error is returned — "storage is down" must never read as "no PDF" and
+    /// send the stem down another converter.
+    async fn find_source_key(&self, stem: &str) -> Result<String, String> {
+        let mut tried = Vec::new();
+        for ext in ["pdf", "html", "epub"] {
+            let key = format!(
+                "{}/{}",
+                self.papers_prefix.trim_end_matches('/'),
+                hs_common::sharded_key(stem, ext),
+            );
+            match self.storage.head(&key).await {
+                Ok(Some(_)) => return Ok(key),
+                Ok(None) => tried.push(key),
+                Err(e) if hs_common::storage::is_not_found(&e) => tried.push(key),
+                Err(e) => return Err(format!("checking for source {key} failed: {e:#}")),
+            }
+        }
+        Err(format!(
+            "No PDF, HTML, or EPUB found for '{stem}' (tried {})",
+            tried.join(", ")
+        ))
+    }
+
+    /// Convert the stored source of `stem` through the scribe watcher's own
+    /// functions (`prepare_source` + `convert_and_upload`).
+    async fn convert_source(&self, stem: &Stem) -> Result<String, String> {
+        use hs_scribe::event_watch::{
+            announce_completed, convert_and_upload, prepare_source, IngestedEvent, SourcePrep,
+        };
+
+        let source_key = self.find_source_key(stem).await?;
+        let event = IngestedEvent {
+            key: source_key.clone(),
+            sha256: None,
+            size_bytes: None,
+            source: Some("mcp:scribe_convert".to_string()),
+        };
+
+        let source = match prepare_source(&*self.storage, &event)
+            .await
+            .map_err(|e| format!("{source_key}: {e}"))?
+        {
+            SourcePrep::AlreadyConverted(md_key) => {
+                announce_completed(&*self.events, &md_key, &source_key)
+                    .await
+                    .map_err(|e| format!("{md_key} exists but announcing it failed: {e}"))?;
+                return to_json(&serde_json::json!({
+                    "stem": stem,
+                    "markdown_key": md_key,
+                    "source_key": source_key,
+                    "already_converted": true,
+                }));
+            }
+            SourcePrep::Fetched(source) => source,
+        };
+
+        let client = self
+            .scribe_client()
+            .map_err(|e| e.to_string())?
+            .ok_or("No scribe server configured")?;
+
+        let md_key = convert_and_upload(
+            &*self.storage,
+            &client,
+            &*self.events,
+            &event,
+            &self.scribe_timeout_policy,
+            &self.epub_limits,
+            &source,
+            None,
+            Vec::new(),
+        )
+        .await
+        .map_err(|e| format!("Conversion of {source_key} failed: {e}"))?;
+
+        // `convert_and_upload` completes the event even when the conversion
+        // stamp could not be written (it cannot be retried through the event).
+        // This caller can say so, instead of reporting a document the
+        // catalog does not know about.
+        let conversion =
+            hs_common::catalog::read_catalog_entry_via(&*self.storage, &self.catalog_prefix, stem)
+                .await
+                .map_err(|e| {
+                    format!("{md_key} was written but reading its catalog row failed: {e:#}")
+                })?
+                .and_then(|entry| entry.conversion)
+                .ok_or_else(|| {
+                    format!(
+                "{md_key} was written but the catalog has no conversion stamp for '{stem}'; \
+                 run `catalog_repair` to see it as disk_no_catalog"
+            )
+                })?;
+
+        to_json(&serde_json::json!({
+            "stem": stem,
+            "markdown_key": md_key,
+            "source_key": source_key,
+            "already_converted": false,
+            "total_pages": conversion.total_pages,
+            "duration_secs": conversion.duration_secs,
+            "server": conversion.server,
+        }))
     }
 }
 
@@ -1884,7 +2040,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Convert a paper to markdown. For PDFs, uses the scribe VLM server. For HTML papers (PMC/PubMed fallbacks), converts locally. Takes a stem name (filename without extension). Writes markdown to storage, updates the catalog, and returns a summary. Use `markdown_read` to fetch content.",
+        description = "Convert a stored source document (PDF, HTML or EPUB; PDF preferred when several exist) to markdown through the same code path the scribe event watcher uses: PDFs go to the scribe VLM server, HTML and EPUB are parsed by the shared parsers. Takes a stem name (filename without extension). Writes markdown to storage, stamps the catalog and announces `scribe.completed`. Markdown that already exists is not converted again (it is re-announced; `hs scribe reconvert` forces a fresh conversion). Fails, naming the cause, when storage is unreachable, the source is missing, the document is refused (not a PDF, paywall page, empty or looping output) or the catalog stamp did not land. While a conversion runs, the tool sends a progress notification about every 20 seconds. Use `markdown_read` to fetch content.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1897,211 +2053,11 @@ impl HomeStillMcp {
         Parameters(p): Parameters<ScribeConvertParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        let pdf_key = format!(
-            "{}/{}",
-            self.papers_prefix.trim_end_matches('/'),
-            hs_common::sharded_key(&p.stem, "pdf"),
-        );
-        let html_key = format!(
-            "{}/{}",
-            self.papers_prefix.trim_end_matches('/'),
-            hs_common::sharded_key(&p.stem, "html"),
-        );
-        let epub_key = format!(
-            "{}/{}",
-            self.papers_prefix.trim_end_matches('/'),
-            hs_common::sharded_key(&p.stem, "epub"),
-        );
-
-        let start = std::time::Instant::now();
-        // Dispatch by source type — one path per file extension. No
-        // fallback between types; if the named source isn't present, we
-        // error loudly instead of silently converting something else.
-        let (md, per_page_region_classes, source_key, server_label, source_pages, skipped_regions) =
-            if let Ok(pdf_bytes) = self.storage.get(&pdf_key).await {
-                // Count before the bytes move into the converter; olmocr
-                // returns one flat blob, so this is the only page-count
-                // ground truth this path will get.
-                let source_pages = hs_scribe::pdf_meta::count_pages(&pdf_bytes)
-                    .map_err(|e| format!("{pdf_key} cannot be converted: {e}"))?;
-                let client = self
-                    .scribe_client()
-                    .map_err(|e| e.to_string())?
-                    .ok_or("No scribe server configured")?;
-                // Stream scribe's per-page progress through the MCP peer as
-                // notifications/progress events. Each event resets Claude
-                // Desktop's 4-min tool-call timeout, so multi-page PDFs that
-                // take longer than 240s end-to-end can complete.
-                let progress_token = context.meta.get_progress_token();
-                let peer = context.peer.clone();
-                let stem_for_progress = p.stem.clone();
-                let on_progress = move |event: hs_scribe::client::ProgressEvent| {
-                    let Some(token) = progress_token.clone() else {
-                        return;
-                    };
-                    let peer = peer.clone();
-                    let stem = stem_for_progress.clone();
-                    tokio::spawn(async move {
-                        let mut params = ProgressNotificationParam::new(token, event.page as f64)
-                            .with_message(format!(
-                                "{stem}: {} {}/{}",
-                                event.stage, event.page, event.total_pages
-                            ));
-                        if event.total_pages > 0 {
-                            params = params.with_total(event.total_pages as f64);
-                        }
-                        if let Err(e) = peer.notify_progress(params).await {
-                            tracing::warn!(stem = %stem, error = %e, "notify_progress failed");
-                        }
-                    });
-                };
-                let conversion = client
-                    .convert_with_progress(pdf_bytes, None, Some(p.stem.as_str()), on_progress)
-                    .await
-                    .map_err(|e| format!("Conversion failed: {e}"))?;
-                let skipped_regions = conversion.skipped_regions();
-                (
-                    conversion.markdown,
-                    conversion.per_page_region_classes,
-                    pdf_key,
-                    "scribe-vlm".to_string(),
-                    Some(source_pages),
-                    skipped_regions,
-                )
-            } else if let Ok(html_bytes) = self.storage.get(&html_key).await {
-                let html = String::from_utf8(html_bytes)
-                    .map_err(|e| format!("HTML at {html_key} is not valid UTF-8: {e}"))?;
-                let md = hs_scribe::html::convert_html_to_markdown(&html);
-                (md, Vec::new(), html_key, "html-parser".to_string(), None, 0)
-            } else if let Ok(epub_bytes) = self.storage.get(&epub_key).await {
-                let md = hs_scribe::epub::convert_epub_to_markdown(&epub_bytes)
-                    .map_err(|e| format!("EPUB parse failed for {epub_key}: {e}"))?;
-                (md, Vec::new(), epub_key, "epub-parser".to_string(), None, 0)
-            } else {
-                return Err(format!(
-                "No PDF, HTML, or EPUB found for '{}' (tried {pdf_key}, {html_key}, {epub_key})",
-                p.stem
-            ));
-            };
-        let duration_secs = start.elapsed().as_secs_f64();
-
-        let longest_run = hs_scribe::postprocess::longest_repeated_run_bytes(&md);
-        let (md, per_page_truncations) = hs_scribe::postprocess::clean_repetitions_per_page(&md);
-        let truncations: usize = per_page_truncations.iter().map(|t| t.total()).sum();
-        if truncations > 0 {
-            tracing::info!("{}: cleaned {} repetition site(s)", p.stem, truncations);
-        }
-
-        // A conversion with no embeddable content is a failed conversion.
-        // Mirrors the daemon gate in hs-scribe's convert_and_upload: no
-        // markdown written, no catalog row, no scribe.completed.
-        if !hs_common::quality::has_indexable_content(&md) {
-            return Err(format!(
-                "{}: converted to {} non-whitespace chars, below the {}-char indexable floor — not persisted",
-                p.stem,
-                hs_common::quality::non_whitespace_len(&md),
-                hs_common::quality::MIN_INDEXABLE_NON_WS,
-            ));
-        }
-
-        let page_offsets = hs_common::catalog::compute_page_offsets(&md);
-        let accounting =
-            hs_common::catalog::resolve_page_accounting(page_offsets.len() as u64, source_pages);
-        let total_pages = accounting.total_pages;
-        let page_offsets = if accounting.offsets_trustworthy {
-            page_offsets
-        } else {
-            Vec::new()
-        };
-        let per_page_is_bibliography: Vec<bool> = (0..per_page_truncations.len())
-            .map(|i| {
-                per_page_region_classes
-                    .get(i)
-                    .map(|classes| hs_scribe::postprocess::is_bibliography_page(classes))
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        // VLM repetition-loop check: propagate as a hard error. No catalog
-        // row is written — operator sees it in MCP error response + logs.
-        match hs_scribe::postprocess::qc_verdict(
-            &per_page_truncations,
-            &per_page_is_bibliography,
-            longest_run,
-            skipped_regions,
-        ) {
-            hs_scribe::postprocess::QcVerdict::Accept => {}
-            hs_scribe::postprocess::QcVerdict::RejectLoop => {
-                return Err(format!(
-                    "{}: VLM repetition loop ({} truncation site(s), longest_run={}B across {} page(s)) — not persisted",
-                    p.stem, truncations, longest_run, total_pages
-                ));
-            }
-            hs_scribe::postprocess::QcVerdict::RejectGapped => {
-                return Err(format!(
-                    "{}: {} region(s) could not be processed by the server, so the markdown has holes — not persisted",
-                    p.stem, skipped_regions
-                ));
-            }
-        }
-
-        let md_key = format!(
-            "{}/{}",
-            self.markdown_prefix.trim_end_matches('/'),
-            hs_common::sharded_key(&p.stem, "md")
-        );
-        let md_bytes = md.into_bytes();
-        let bytes_written = md_bytes.len();
-        self.storage
-            .put(&md_key, md_bytes)
-            .await
-            .map_err(|e| format!("Failed to write markdown to storage ({md_key}): {e}"))?;
-
-        hs_common::catalog::update_conversion_catalog_via(
-            &*self.storage,
-            &self.catalog_prefix,
-            &p.stem,
-            &server_label,
-            duration_secs,
-            total_pages,
-            page_offsets,
-            &md_key,
-            None,
-            Vec::new(),
-        )
-        .await
-        .map_err(|e| format!("Failed to update catalog for '{}': {e}", p.stem))?;
-
-        let event_payload = serde_json::json!({
-            "key": md_key,
-            "source_key": source_key,
-        });
-        if let Err(e) = self
-            .events
-            .publish(
-                "scribe.completed",
-                serde_json::to_vec(&event_payload)
-                    .unwrap_or_default()
-                    .as_slice(),
-            )
-            .await
-        {
-            tracing::warn!(
-                stem = %p.stem,
-                error = %e,
-                "scribe.completed publish failed",
-            );
-        }
-
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "stem": p.stem,
-            "markdown_key": md_key,
-            "bytes_written": bytes_written,
-            "total_pages": total_pages,
-            "duration_secs": duration_secs,
-            "server": server_label,
-        }))
-        .unwrap_or_default())
+        // A long PDF converts for minutes with no per-page signal from this
+        // path; a periodic notification keeps the client's tool-call timer
+        // (Claude Desktop: 4 min) and the session idle timer from firing.
+        let _heartbeat = ProgressHeartbeat::start(&context, p.stem.to_string());
+        self.convert_source(&p.stem).await
     }
 
     // ── Distill Tools ──────────────────────────────────────────

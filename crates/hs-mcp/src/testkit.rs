@@ -164,9 +164,51 @@ pub fn server(storage: Arc<dyn Storage>, distill: Option<&FakeDistill>) -> HomeS
         storage,
         events: Arc::new(NoOpBus),
         scribe_servers: Vec::new(),
-        scribe_convert_timeout: std::time::Duration::from_secs(5),
         distill_servers: distill.map(|d| d.url.clone()).into_iter().collect(),
         openalex_db: None,
+        scribe_convert_timeout: std::time::Duration::from_secs(5),
+        scribe_timeout_policy: hs_scribe::config::TimeoutPolicy::default(),
+        epub_limits: hs_scribe::epub::EpubLimits::default(),
+    })
+}
+
+/// An event bus that remembers what was published.
+#[derive(Default)]
+pub struct RecordingBus {
+    pub published: Mutex<Vec<(String, serde_json::Value)>>,
+}
+
+#[async_trait::async_trait]
+impl hs_common::event_bus::EventBus for RecordingBus {
+    async fn publish(&self, subject: &str, payload: &[u8]) -> anyhow::Result<()> {
+        self.published
+            .lock()
+            .unwrap()
+            .push((subject.to_string(), serde_json::from_slice(payload)?));
+        Ok(())
+    }
+
+    async fn consume(
+        &self,
+        _spec: &hs_common::event_bus::ConsumerSpec,
+    ) -> anyhow::Result<hs_common::event_bus::EventStream> {
+        anyhow::bail!("RecordingBus only records publishes")
+    }
+}
+
+/// [`server`] with a recording bus and a scribe server that nothing listens
+/// on: enough for the sources that never reach the scribe (HTML, EPUB) and
+/// for proving that a source is refused before any request is made.
+pub fn server_with_bus(storage: Arc<dyn Storage>, bus: Arc<RecordingBus>) -> HomeStillMcp {
+    HomeStillMcp::from_deps(Deps {
+        storage,
+        events: bus,
+        scribe_servers: vec!["http://127.0.0.1:9".to_string()],
+        distill_servers: Vec::new(),
+        openalex_db: None,
+        scribe_convert_timeout: std::time::Duration::from_secs(5),
+        scribe_timeout_policy: hs_scribe::config::TimeoutPolicy::default(),
+        epub_limits: hs_scribe::epub::EpubLimits::default(),
     })
 }
 

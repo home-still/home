@@ -49,10 +49,6 @@ impl Stem {
         }
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
     /// The JSON-RPC error for a stem taken from a resource URI.
     pub fn invalid_params(e: InvalidStemArg) -> ErrorData {
         ErrorData::invalid_params(e.to_string(), None)
@@ -123,7 +119,7 @@ mod tests {
             ".hidden",
             "it's",
         ] {
-            assert_eq!(Stem::parse(ok).unwrap().as_str(), ok);
+            assert_eq!(&*Stem::parse(ok).unwrap(), ok);
         }
     }
 

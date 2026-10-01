@@ -169,3 +169,149 @@ mod reconcile {
         );
     }
 }
+
+mod convert {
+    use super::*;
+    use crate::stem::Stem;
+    use crate::testkit::{server_with_bus, RecordingBus};
+    use hs_common::storage::Storage;
+
+    const ARTICLE: &str = "<html><body><article><h1>A study of things</h1>\
+        <p>This paragraph is long enough to clear the indexable floor of the pipeline.</p>\
+        <p>A second paragraph keeps the converter from producing a stub document.</p>\
+        </article></body></html>";
+
+    fn stem(s: &str) -> Stem {
+        Stem::parse(s).unwrap()
+    }
+
+    async fn put_source(storage: &FaultyStorage, stem: &str, ext: &str, bytes: &[u8]) -> String {
+        use hs_common::storage::Storage;
+        let key = format!("papers/{}", hs_common::sharded_key(stem, ext));
+        storage.put(&key, bytes.to_vec()).await.unwrap();
+        key
+    }
+
+    /// RA-31: `if let Ok(pdf) = storage.get(..)` read an S3 outage as "no
+    /// PDF" and converted the HTML twin instead, stamping the catalog with a
+    /// worse document than the PDF the corpus holds.
+    #[tokio::test]
+    async fn a_storage_outage_never_sends_the_stem_to_another_converter() {
+        let storage = FaultyStorage::new();
+        put_source(&storage, "paper", "pdf", b"%PDF-1.4 stand-in").await;
+        put_source(&storage, "paper", "html", ARTICLE.as_bytes()).await;
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage.clone(), bus.clone());
+
+        *storage.only_keys_containing.lock().unwrap() = Some(".pdf".into());
+        FaultyStorage::set(&storage.fail_head, true);
+        let err = mcp.convert_source(&stem("paper")).await.unwrap_err();
+
+        assert!(err.contains("simulated storage outage"), "{err}");
+        assert!(
+            !storage
+                .exists(&hs_common::markdown::markdown_storage_key("paper"))
+                .await
+                .unwrap(),
+            "nothing may be converted"
+        );
+        assert!(bus.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_source_names_every_key_that_was_tried() {
+        let storage = FaultyStorage::new();
+        let mcp = server_with_bus(storage, Arc::new(RecordingBus::default()));
+
+        let err = mcp.convert_source(&stem("ghost")).await.unwrap_err();
+
+        for ext in ["pdf", "html", "epub"] {
+            assert!(err.contains(&format!("ghost.{ext}")), "{err}");
+        }
+    }
+
+    /// HTML goes through the watcher's function: markdown stored, catalog
+    /// stamped by the html parser, `scribe.completed` announced.
+    #[tokio::test]
+    async fn an_html_source_is_converted_by_the_shared_path() {
+        let storage = FaultyStorage::new();
+        let source_key = put_source(&storage, "paper", "html", ARTICLE.as_bytes()).await;
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage.clone(), bus.clone());
+
+        let out = mcp.convert_source(&stem("paper")).await.unwrap();
+
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["server"], "html-parser");
+        assert_eq!(out["already_converted"], false);
+        let md = hs_common::markdown::read_markdown_via(&*storage, "markdown", "paper")
+            .await
+            .unwrap()
+            .expect("markdown stored");
+        assert!(md.contains("A study of things"), "{md}");
+        let published = bus.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, "scribe.completed");
+        assert_eq!(published[0].1["source_key"], source_key);
+    }
+
+    /// A paywall page is refused, not converted into markdown, and the
+    /// refusal is the same one the watcher records.
+    #[tokio::test]
+    async fn a_paywall_page_is_refused_and_nothing_is_stored() {
+        let storage = FaultyStorage::new();
+        put_source(
+            &storage,
+            "wall",
+            "html",
+            b"<html><body><p>Access denied. Sign in to read this article.</p></body></html>",
+        )
+        .await;
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage.clone(), bus.clone());
+
+        let err = mcp.convert_source(&stem("wall")).await.unwrap_err();
+
+        assert!(err.to_lowercase().contains("paywall"), "{err}");
+        assert!(!storage
+            .exists(&hs_common::markdown::markdown_storage_key("wall"))
+            .await
+            .unwrap());
+        assert!(bus.published.lock().unwrap().is_empty());
+        let entry = hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", "wall")
+            .await
+            .unwrap();
+        assert!(
+            entry.is_none_or(|e| e.conversion.is_none()),
+            "a refused document must not carry a conversion stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_markdown_is_announced_not_converted_again() {
+        let storage = FaultyStorage::new();
+        put_source(&storage, "paper", "html", ARTICLE.as_bytes()).await;
+        seed_markdown(
+            &*storage,
+            "paper",
+            "# Already here\n\nBody text long enough to index.",
+        )
+        .await;
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage.clone(), bus.clone());
+
+        let out = mcp.convert_source(&stem("paper")).await.unwrap();
+
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["already_converted"], true);
+        let md = hs_common::markdown::read_markdown_via(&*storage, "markdown", "paper")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            md.contains("Already here"),
+            "the stored markdown must be untouched"
+        );
+        assert_eq!(bus.published.lock().unwrap().len(), 1);
+    }
+}
