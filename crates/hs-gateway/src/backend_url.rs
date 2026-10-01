@@ -150,9 +150,9 @@ mod tests {
     #[test]
     fn lan_addresses_are_registrable_and_canonicalized() {
         for (raw, want) in [
-            ("http://192.168.1.10:7433", "http://192.168.1.10:7433"),
-            ("http://10.0.0.5:7433/", "http://10.0.0.5:7433"),
-            ("http://172.16.5.5:7434", "http://172.16.5.5:7434"),
+            ("http://192.168.254.9:7433", "http://192.168.254.9:7433"),
+            ("http://10.254.0.5:7433/", "http://10.254.0.5:7433"),
+            ("http://172.31.254.5:7434", "http://172.31.254.5:7434"),
             ("https://192.0.2.7:8443", "https://192.0.2.7:8443"),
             ("http://100.64.1.1:7433", "http://100.64.1.1:7433"),
             ("http://[fd12:3456::1]:7433", "http://[fd12:3456::1]:7433"),
@@ -186,14 +186,14 @@ mod tests {
     #[test]
     fn malformed_or_unexpected_shapes_are_refused() {
         for raw in [
-            "ftp://192.168.1.10:21",
+            "ftp://192.0.2.9:21",
             "file:///etc/passwd",
             "javascript:alert(1)",
-            "http://user:pw@192.168.1.10:7433",
-            "http://192.168.1.10:7433/scribe",
-            "http://192.168.1.10:7433/?x=1",
-            "http://192.168.1.10:7433/#frag",
-            "http://192.168.1.10:0",
+            "http://user:pw@192.0.2.9:7433",
+            "http://192.0.2.9:7433/scribe",
+            "http://192.0.2.9:7433/?x=1",
+            "http://192.0.2.9:7433/#frag",
+            "http://192.0.2.9:0",
             "http://scribe.example.local:7433",
             "http://localhost:7433",
             "not a url",

@@ -336,7 +336,7 @@ fn validate_service_type(s: &str) -> Result<(), String> {
 
 /// Validate and canonicalize an announced URL (see [`backend_url`] for exactly
 /// what is refused). Every handler canonicalizes before keying the registry, so
-/// `http://10.0.0.5:7433` and `http://10.0.0.5:7433/` are the same entry.
+/// `http://192.0.2.5:7433` and `http://192.0.2.5:7433/` are the same entry.
 fn canonical_url(s: &str) -> Result<String, String> {
     if s.is_empty() {
         return Err("url cannot be empty".into());
