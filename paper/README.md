@@ -53,6 +53,21 @@ Ports-and-adapters pattern: providers implement the `PaperProvider` trait, wrapp
 
 Downloads filter out papers without download URLs or DOIs before counting toward `-n`. The search over-requests by 50% to compensate. Downloads show an overall progress bar with per-file title-as-progress-bar coloring and ETA.
 
+Guarantees of every download (`PaperDownloader`):
+
+- **One storage identity.** `paper::stem` is the only place a stem is built: the lowercased bare DOI with `/` → `_` (`10.1016/J.RASD` and `https://doi.org/10.1016/j.rasd` are one paper), else the provider id with separators replaced. A paper found by search and the same paper requested by DOI land on one key. Stems pass `hs_common::validate_stem`.
+- **PDF only, bounded.** The body must start with `%PDF-`; HTML landing pages, images and stubs are rejected and nothing is stored. The transfer is aborted once `paper.download.max_download_bytes` (default 256 MiB) is crossed; the remote `Content-Length` never sizes a buffer.
+- **Public hosts only.** Only `http`/`https` URLs without credentials, never a loopback / private / link-local / metadata address, checked before the request, on every redirect hop, and on the addresses a hostname resolves to. (Residual: if `HTTP(S)_PROXY` is set the proxy resolves the target, so the hostname check does not apply.)
+- **Honest failures.** The source chain is ordered (arXiv, MDPI, Unpaywall, PMC, then the providers). A storage/IO failure aborts at once with the real error; otherwise every source's outcome (`no copy` vs `failed`) is listed in the final error.
+
+### Sharing providers
+
+`providers::set::ProviderSet::new(&config)` builds every provider with its rate limiter and circuit breaker **once**; a long-lived process builds it at startup and reuses the `Arc`s (`provider(&arg)`, `download_resolvers()`, `references()`, `citations()`). Building a set per request shares no limiter/breaker state.
+
+### Configuration
+
+`paper.*` keys are validated when the config loads (zero intervals/timeouts/concurrency, bad base URLs, an API key on a plain-`http` URL are errors). Environment overrides join words and levels with `_`: `HOME_STILL_PAPER_DOWNLOAD_PATH`, `HOME_STILL_PAPER_DOWNLOAD_TIMEOUT_SECS`, `HOME_STILL_PAPER_PROVIDERS_SEMANTIC_SCHOLAR_API_KEY`; an unknown `HOME_STILL_PAPER_*` variable is an error. New keys: `download.max_download_bytes`, `providers.semantic_scholar.max_retry_after_secs` (cap on a `Retry-After` sleep, default 30).
+
 ## Build & test
 
 ```sh
