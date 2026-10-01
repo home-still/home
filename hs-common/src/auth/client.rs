@@ -44,6 +44,27 @@ impl std::fmt::Debug for CloudCredentials {
     }
 }
 
+/// The gateway refused the stored refresh token (HTTP 401/403): it expired
+/// or was revoked, and the device must be re-enrolled. Distinct from the
+/// gateway being unreachable, which a retry can fix.
+#[derive(Debug)]
+pub struct RefreshRejected {
+    pub status: u16,
+    pub body: String,
+}
+
+impl std::fmt::Display for RefreshRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gateway rejected the refresh token ({}): {}",
+            self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for RefreshRejected {}
+
 impl CloudCredentials {
     /// Default path for credential storage.
     pub fn default_path() -> PathBuf {
@@ -184,6 +205,13 @@ impl AuthenticatedClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if matches!(status.as_u16(), 401 | 403) {
+                return Err(RefreshRejected {
+                    status: status.as_u16(),
+                    body,
+                }
+                .into());
+            }
             anyhow::bail!("Token refresh failed ({status}): {body}");
         }
 
