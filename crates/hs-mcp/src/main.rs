@@ -1580,6 +1580,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         match hs_common::markdown::read_markdown_via(&*self.storage, &self.markdown_prefix, &p.stem)
             .await
+            .map_err(|e| format!("{e:#}"))?
         {
             Some(content) => {
                 if let Some(page) = p.page {
@@ -2147,7 +2148,8 @@ impl HomeStillMcp {
                 .as_ref()
                 .and_then(|e| e.markdown_path.as_deref()),
         )
-        .await;
+        .await
+        .map_err(|e| e.to_string())?;
         if !self.storage.exists(&key).await.unwrap_or(false) {
             return Err(format!(
                 "Markdown not found for '{}' at storage key '{key}'. Convert the PDF first.",
@@ -2237,7 +2239,8 @@ impl HomeStillMcp {
                     .as_ref()
                     .and_then(|e| e.markdown_path.as_deref()),
             )
-            .await;
+            .await
+            .map_err(|e| e.to_string())?;
             if !self.storage.exists(&key).await.unwrap_or(false) {
                 orphans.push(doc_id.clone());
             }
@@ -2373,7 +2376,8 @@ impl HomeStillMcp {
                 .as_ref()
                 .and_then(|e| e.markdown_path.as_deref()),
         )
-        .await;
+        .await
+        .map_err(|e| e.to_string())?;
         if !self.storage.exists(&key).await.unwrap_or(false) {
             return Err(format!(
                 "Purged {deleted} old vectors but markdown not found at '{key}'. Convert the paper first.",
@@ -2477,7 +2481,7 @@ impl HomeStillMcp {
             )
             .await
             .map_err(|e| e.to_string())?;
-            let key = hs_common::markdown::resolve_markdown_key_verified(
+            let key = match hs_common::markdown::resolve_markdown_key_verified(
                 &*self.storage,
                 &self.markdown_prefix,
                 stem,
@@ -2485,7 +2489,14 @@ impl HomeStillMcp {
                     .as_ref()
                     .and_then(|e| e.markdown_path.as_deref()),
             )
-            .await;
+            .await
+            {
+                Ok(key) => key,
+                Err(e) => {
+                    errors.push(format!("{stem}: {e:#}"));
+                    continue;
+                }
+            };
             if !self.storage.exists(&key).await.unwrap_or(false) {
                 errors.push(format!("{stem}: markdown missing at {key}"));
                 continue;
@@ -3499,6 +3510,7 @@ impl ServerHandler for HomeStillMcp {
             let content =
                 hs_common::markdown::read_markdown_via(&*self.storage, &self.markdown_prefix, stem)
                     .await
+                    .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))?
                     .ok_or_else(|| ErrorData::resource_not_found("markdown not found", None))?;
 
             let text = if let Some(page) = page {

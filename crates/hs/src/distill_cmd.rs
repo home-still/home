@@ -1346,6 +1346,7 @@ async fn cmd_diagnose(stem: &str, verbose: bool, reporter: &Arc<dyn Reporter>) -
 
     let markdown = hs_common::markdown::read_markdown_via(&*storage, "markdown", stem)
         .await
+        .with_context(|| format!("reading markdown for stem '{stem}'"))?
         .ok_or_else(|| anyhow::anyhow!("markdown not found for stem '{stem}'"))?;
     let non_ws = markdown.chars().filter(|c| !c.is_whitespace()).count();
     reporter.status(

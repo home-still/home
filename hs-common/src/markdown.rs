@@ -27,6 +27,13 @@ fn markdown_key(prefix: &str, stem: &str) -> String {
     }
 }
 
+/// [`markdown_key`] for a stem that came from outside: rejects stems that are
+/// not a single file-name component.
+fn checked_markdown_key(prefix: &str, stem: &str) -> anyhow::Result<String> {
+    crate::validate_stem(stem).map_err(|e| anyhow::anyhow!("markdown stem {stem:?}: {e}"))?;
+    Ok(markdown_key(prefix, stem))
+}
+
 /// Resolve the storage key for a doc_id's markdown object (pure derivation).
 ///
 /// Prefers the catalog-recorded path if present. Falls back to the sharded
@@ -58,19 +65,28 @@ pub fn resolve_markdown_key(prefix: &str, stem: &str, stored_path: Option<&str>)
 /// sharded derivation, or is `None`). Callers still need to check
 /// existence of the returned key — this helper only decides *which* key
 /// is worth checking.
+///
+/// A failed HEAD on the recorded path is an `Err`: falling back to the
+/// sharded key on a storage blip would report a valid document as missing.
+/// A recorded path that is not a valid storage key at all (a legacy row
+/// holding an absolute host path) cannot exist on storage, so it is skipped
+/// like any other stale path.
 pub async fn resolve_markdown_key_verified(
     storage: &dyn Storage,
     prefix: &str,
     stem: &str,
     stored_path: Option<&str>,
-) -> String {
-    let sharded = markdown_key(prefix, stem);
-    if let Some(p) = stored_path {
-        if p != sharded && storage.exists(p).await.unwrap_or(false) {
-            return p.to_string();
+) -> anyhow::Result<String> {
+    let sharded = checked_markdown_key(prefix, stem)?;
+    if let Some(p) = stored_path.filter(|p| *p != sharded) {
+        match storage.exists(p).await {
+            Ok(true) => return Ok(p.to_string()),
+            Ok(false) => {}
+            Err(e) if crate::storage::is_invalid_key(&e) => {}
+            Err(e) => return Err(e.context(format!("probe recorded markdown path {p}"))),
         }
     }
-    sharded
+    Ok(sharded)
 }
 
 /// List the stems of every markdown document under `prefix`.
@@ -108,14 +124,26 @@ pub async fn list_markdown_meta_via(
     Ok(out)
 }
 
-/// Read a single markdown document by stem. Returns `None` if the object
-/// doesn't exist. Reads the full document — callers that only need a
-/// specific page range should still do that locally after the fetch (same
-/// behavior as the filesystem variant in the MCP handler).
-pub async fn read_markdown_via(storage: &dyn Storage, prefix: &str, stem: &str) -> Option<String> {
-    let key = markdown_key(prefix, stem);
-    let bytes = storage.get(&key).await.ok()?;
-    String::from_utf8(bytes).ok()
+/// Read a single markdown document by stem. `Ok(None)` means the object
+/// genuinely doesn't exist; a storage failure or a non-UTF-8 payload is an
+/// `Err`, never "missing" (a transient S3 error must not read as a deleted
+/// document). Reads the full document — callers that only need a specific
+/// page range should still do that locally after the fetch (same behavior
+/// as the filesystem variant in the MCP handler).
+pub async fn read_markdown_via(
+    storage: &dyn Storage,
+    prefix: &str,
+    stem: &str,
+) -> anyhow::Result<Option<String>> {
+    let key = checked_markdown_key(prefix, stem)?;
+    let bytes = match storage.get(&key).await {
+        Ok(bytes) => bytes,
+        Err(e) if crate::storage::is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e.context(format!("read markdown {key}"))),
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("markdown {key} is not valid UTF-8: {e}"))
 }
 
 /// True if the named markdown document exists.
@@ -124,7 +152,7 @@ pub async fn markdown_exists_via(
     prefix: &str,
     stem: &str,
 ) -> anyhow::Result<bool> {
-    let key = markdown_key(prefix, stem);
+    let key = checked_markdown_key(prefix, stem)?;
     storage.exists(&key).await
 }
 
@@ -184,7 +212,8 @@ mod tests {
             "04947b2f",
             Some("markdown/04947b2f.md"),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(got, "markdown/04/04947b2f.md");
     }
 
@@ -205,7 +234,8 @@ mod tests {
             "legacy",
             Some("markdown/legacy.md"),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(got, "markdown/legacy.md");
     }
 
@@ -229,7 +259,8 @@ mod tests {
             "abcdef",
             Some("markdown/ab/abcdef.md"),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(got, "markdown/ab/abcdef.md");
     }
 
@@ -238,7 +269,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = LocalFsStorage::new(tmp.path());
         // Seed nothing — we only check the resolution logic, not existence.
-        let got = resolve_markdown_key_verified(&storage, "markdown", "abcdef", None).await;
+        let got = resolve_markdown_key_verified(&storage, "markdown", "abcdef", None)
+            .await
+            .unwrap();
         assert_eq!(got, "markdown/ab/abcdef.md");
     }
 
@@ -251,7 +284,8 @@ mod tests {
         let storage = LocalFsStorage::new(tmp.path());
         let got =
             resolve_markdown_key_verified(&storage, "markdown", "gone", Some("markdown/gone.md"))
-                .await;
+                .await
+                .unwrap();
         assert_eq!(got, "markdown/go/gone.md");
     }
 
@@ -288,10 +322,14 @@ mod tests {
         assert_eq!(metas.len(), 2);
         assert!(metas.iter().any(|(s, m)| s == "abcdef" && m.size == 9));
 
-        let doc = read_markdown_via(&storage, "markdown", "abcdef").await;
+        let doc = read_markdown_via(&storage, "markdown", "abcdef")
+            .await
+            .unwrap();
         assert_eq!(doc.as_deref(), Some("hello abc"));
 
-        let missing = read_markdown_via(&storage, "markdown", "nope").await;
+        let missing = read_markdown_via(&storage, "markdown", "nope")
+            .await
+            .unwrap();
         assert!(missing.is_none());
 
         assert!(markdown_exists_via(&storage, "markdown", "abcdef")
@@ -300,5 +338,105 @@ mod tests {
         assert!(!markdown_exists_via(&storage, "markdown", "nope")
             .await
             .unwrap());
+    }
+
+    /// Storage whose every call fails, standing in for an S3 blip.
+    struct Unreachable;
+
+    #[async_trait::async_trait]
+    impl Storage for Unreachable {
+        async fn get(&self, _: &str) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("backend unreachable")
+        }
+        async fn put(&self, _: &str, _: Vec<u8>) -> anyhow::Result<()> {
+            anyhow::bail!("backend unreachable")
+        }
+        async fn head(&self, _: &str) -> anyhow::Result<Option<ObjectMeta>> {
+            anyhow::bail!("backend unreachable")
+        }
+        async fn list(&self, _: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+            anyhow::bail!("backend unreachable")
+        }
+        async fn delete(&self, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("backend unreachable")
+        }
+    }
+
+    /// RA-83: a storage failure or a corrupt payload is not "missing".
+    #[tokio::test]
+    async fn read_distinguishes_missing_from_storage_error_and_bad_utf8() {
+        let err = read_markdown_via(&Unreachable, "markdown", "abcdef")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("backend unreachable"),
+            "{err:#}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        storage
+            .put("markdown/ab/abcdef.md", vec![0xff, 0xfe, 0x00])
+            .await
+            .unwrap();
+        let err = read_markdown_via(&storage, "markdown", "abcdef")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("UTF-8"), "{err:#}");
+
+        assert!(read_markdown_via(&storage, "markdown", "absent")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn verified_errors_when_the_recorded_path_probe_fails() {
+        let err = resolve_markdown_key_verified(
+            &Unreachable,
+            "markdown",
+            "legacy",
+            Some("markdown/legacy.md"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("backend unreachable"),
+            "{err:#}"
+        );
+    }
+
+    /// A legacy row recording an absolute host path can't exist in storage;
+    /// it is a stale hint, not an error.
+    #[tokio::test]
+    async fn verified_skips_a_recorded_path_that_is_not_a_valid_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let got = resolve_markdown_key_verified(
+            &storage,
+            "markdown",
+            "abcdef",
+            Some("/home/<user>/home-still/markdown/ab/abcdef.md"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, "markdown/ab/abcdef.md");
+    }
+
+    #[tokio::test]
+    async fn untrusted_stems_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        for stem in ["", "..", "a/b", "../x"] {
+            read_markdown_via(&storage, "markdown", stem)
+                .await
+                .expect_err(stem);
+            markdown_exists_via(&storage, "markdown", stem)
+                .await
+                .expect_err(stem);
+            resolve_markdown_key_verified(&storage, "markdown", stem, None)
+                .await
+                .expect_err(stem);
+        }
     }
 }
