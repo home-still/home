@@ -9,8 +9,8 @@
 //! Wire shape:
 //!
 //! ```text
-//! POST /scribe (PDF bytes) → handle_scribe → convert(...)
-//!     → write PDF to /tmp/<uuid>.pdf
+//! POST /scribe/stream (PDF bytes) → upload streamed to /tmp/<random>.pdf
+//!     → convert(path, source_pages, ...)
 //!     → mkdir workspace/{markdown,worker_locks,done_flags}
 //!     → olmocr workspace --server <endpoint> --model <model>
 //!                        --markdown --pdfs <pdf>
@@ -24,38 +24,35 @@
 //! APIServer (observed during the manual Phase A backfill). Capping at
 //! 4 matches the vLLM serve config on big and stays stable indefinitely.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::classify::{ConvertFailure, FailureCode};
 use crate::config::AppConfig;
 
-/// Convert a single PDF to markdown via the `olmocr` CLI.
+/// Convert the PDF at `pdf_path` (`source_pages` pages, counted from the
+/// file by the caller) to markdown via the `olmocr` CLI.
 ///
-/// Errors are wrapped so the server returns HTTP 500 with the chain;
-/// the orchestrator's `classify_convert_failure` (Step 2c) decides
-/// whether a particular failure is Permanent or Escalate.
-pub async fn convert(pdf_bytes: &[u8], config: &AppConfig) -> Result<String> {
+/// The markdown is returned only when olmocr accounts for every page it was
+/// given: `Completed pages` equal to `source_pages` and `Failed pages` of
+/// zero. A run that completed some pages and failed others leaves a
+/// markdown file with holes in it, and handing that back as a success
+/// stamps a partial book as converted. Those runs fail with an
+/// `Escalate`-class [`ConvertFailure`] so the next backend gets the document.
+pub async fn convert(pdf_path: &Path, source_pages: u32, config: &AppConfig) -> Result<String> {
     let workspace = tempfile::Builder::new()
         .prefix("hs-scribe-olmocr-")
         .tempdir()
         .context("creating olmocr workspace tempdir")?;
-    let pdf_tmp = tempfile::Builder::new()
-        .prefix("hs-scribe-olmocr-input-")
-        .suffix(".pdf")
-        .tempfile()
-        .context("creating olmocr input tempfile")?;
-    tokio::fs::write(pdf_tmp.path(), pdf_bytes)
-        .await
-        .context("writing PDF bytes to tempfile")?;
 
     let workspace_path = workspace.path().to_path_buf();
-    let pdf_path = pdf_tmp.path().to_path_buf();
 
     tracing::info!(
         endpoint = %config.olmocr_endpoint,
         model = %config.olmocr_model,
         workspace = %workspace_path.display(),
+        source_pages,
         "olmocr_subprocess: invoking CLI"
     );
 
@@ -69,7 +66,7 @@ pub async fn convert(pdf_bytes: &[u8], config: &AppConfig) -> Result<String> {
             "--markdown",
         ])
         .arg("--pdfs")
-        .arg(&pdf_path)
+        .arg(pdf_path)
         .args(["--workers", "1", "--max_concurrent_requests", "4"])
         // If the handler future is dropped (client disconnect, convert
         // deadline), kill the CLI rather than orphan a process that keeps
@@ -98,16 +95,15 @@ pub async fn convert(pdf_bytes: &[u8], config: &AppConfig) -> Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let (completed, failed) = parse_page_counts(&format!("{stdout}\n{stderr}"));
-    tracing::info!(completed, failed, "olmocr_subprocess: CLI exited cleanly");
-    if completed == 0 {
-        // Olmocr genuinely produced nothing — pypdfium2 couldn't open the
-        // PDF, or its output validation rejected every page. This is an
-        // OLMOCR-class failure, not proof the PDF is broken:
-        // classify_convert_failure treats the unrecognized message as
-        // Escalate, so the next backend gets its shot. A genuinely broken PDF
-        // dies in seconds there with a real FormatError (Permanent), so the
-        // wasted attempt is cheap. Log the CLI's stderr tail for post-mortem
-        // since the workspace tempdir is about to be dropped.
+    tracing::info!(
+        completed,
+        failed,
+        source_pages,
+        "olmocr_subprocess: CLI exited cleanly"
+    );
+    if let Err(failure) = check_page_accounting(completed, failed, source_pages) {
+        // The workspace tempdir is about to be dropped; keep the CLI's own
+        // account of what went wrong for the post-mortem.
         let stderr_tail: String = stderr
             .lines()
             .rev()
@@ -118,13 +114,13 @@ pub async fn convert(pdf_bytes: &[u8], config: &AppConfig) -> Result<String> {
             .collect::<Vec<_>>()
             .join("\n");
         tracing::warn!(
+            completed,
             failed,
+            source_pages,
             stderr_tail = %stderr_tail,
-            "olmocr_subprocess: 0 completed pages — escalating to next backend"
+            "olmocr_subprocess: {failure} — escalating to next backend"
         );
-        return Err(anyhow!(
-            "olmocr reported 0 completed pages (failed={failed}); content may need a different backend"
-        ));
+        return Err(anyhow::Error::new(failure));
     }
 
     let md_path = find_markdown_output(&workspace_path).context(
@@ -142,11 +138,46 @@ pub async fn convert(pdf_bytes: &[u8], config: &AppConfig) -> Result<String> {
     Ok(markdown)
 }
 
+/// Decide whether olmocr's end-of-run tally describes a complete
+/// conversion of a `source_pages`-page PDF.
+///
+/// - No completed page at all: olmocr genuinely produced nothing —
+///   pypdfium2 couldn't open the PDF, or its output validation rejected
+///   every page. That is an olmocr-class failure, not proof the PDF is
+///   broken, so the next backend gets its shot (a genuinely broken PDF dies
+///   in seconds there with a real parse error).
+/// - Any failed page, or a completed count that is not the page count: the
+///   markdown olmocr wrote has holes.
+fn check_page_accounting(
+    completed: u64,
+    failed: u64,
+    source_pages: u32,
+) -> std::result::Result<(), ConvertFailure> {
+    if completed == 0 {
+        return Err(ConvertFailure::new(
+            FailureCode::OlmocrZeroPages,
+            format!(
+                "olmocr reported 0 completed pages (failed={failed}); content may need a different backend"
+            ),
+        ));
+    }
+    if failed > 0 || completed != u64::from(source_pages) {
+        return Err(ConvertFailure::new(
+            FailureCode::OlmocrIncompletePages,
+            format!(
+                "olmocr completed {completed} of {source_pages} pages ({failed} failed); \
+                 the markdown would have holes"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Walk `workspace/markdown` and return the single `.md` file path.
 /// Olmocr mirrors the input PDF's directory tree under `markdown/`, so
 /// the exact subpath depends on where the temp file landed. Since we
 /// pass exactly one PDF per invocation, there is exactly one output.
-fn find_markdown_output(workspace: &std::path::Path) -> Result<PathBuf> {
+fn find_markdown_output(workspace: &Path) -> Result<PathBuf> {
     let markdown_root = workspace.join("markdown");
     if !markdown_root.exists() {
         return Err(anyhow!(
@@ -176,8 +207,8 @@ fn find_markdown_output(workspace: &std::path::Path) -> Result<PathBuf> {
 
 /// Parse the `Completed pages: N` / `Failed pages: N` lines olmocr logs to
 /// stderr at the end of a run (the caller passes stdout+stderr combined).
-/// Returns `(0, 0)` if the markers aren't found (treat as "we don't know" —
-/// the downstream empty-markdown check still catches blank output).
+/// Returns `(0, 0)` if the markers aren't found, which `check_page_accounting`
+/// reads as "nothing completed".
 fn parse_page_counts(stdout: &str) -> (u64, u64) {
     let mut completed = 0u64;
     let mut failed = 0u64;
@@ -198,6 +229,7 @@ fn parse_page_counts(stdout: &str) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classify::{classify, failure_code, FailureClass};
 
     #[test]
     fn parse_page_counts_extracts_completed_and_failed() {
@@ -225,5 +257,148 @@ mod tests {
         let (c, f) = parse_page_counts(stdout);
         assert_eq!(c, 0);
         assert_eq!(f, 0);
+    }
+
+    #[test]
+    fn every_page_completed_and_none_failed_is_a_complete_conversion() {
+        check_page_accounting(229, 0, 229).unwrap();
+        check_page_accounting(1, 0, 1).unwrap();
+    }
+
+    #[test]
+    fn zero_completed_pages_escalates_as_the_olmocr_zero_page_failure() {
+        for failed in [0, 5] {
+            let e = check_page_accounting(0, failed, 5).unwrap_err();
+            assert_eq!(e.code(), FailureCode::OlmocrZeroPages);
+        }
+    }
+
+    #[test]
+    fn a_failed_page_is_not_a_success_even_when_others_completed() {
+        let e = check_page_accounting(228, 1, 229).unwrap_err();
+        assert_eq!(e.code(), FailureCode::OlmocrIncompletePages);
+        // Failed pages alone, with the completed count looking right.
+        let e = check_page_accounting(229, 1, 229).unwrap_err();
+        assert_eq!(e.code(), FailureCode::OlmocrIncompletePages);
+    }
+
+    #[test]
+    fn a_completed_count_that_is_not_the_page_count_is_not_a_success() {
+        for completed in [1, 5, 9, 11, 1000] {
+            let e = check_page_accounting(completed, 0, 10).unwrap_err();
+            assert_eq!(e.code(), FailureCode::OlmocrIncompletePages, "{completed}");
+        }
+    }
+
+    #[test]
+    fn incomplete_runs_escalate_to_the_next_backend_rather_than_stamp_success() {
+        let e = anyhow::Error::new(check_page_accounting(3, 1, 4).unwrap_err());
+        assert_eq!(
+            classify(&e),
+            FailureClass::Escalate("olmocr_incomplete_pages")
+        );
+        let e = anyhow::Error::new(check_page_accounting(0, 0, 4).unwrap_err());
+        assert_eq!(classify(&e), FailureClass::Escalate("olmocr_zero_pages"));
+    }
+
+    // ── end to end against a stand-in `olmocr` executable ──────────────
+    //
+    // The real CLI is never run: these tests point `olmocr_bin` at a shell
+    // script that writes a markdown file and prints the tally olmocr prints.
+
+    #[cfg(unix)]
+    fn fake_olmocr(dir: &Path, tally: &str, write_markdown: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-olmocr.sh");
+        let body = format!(
+            "#!/bin/sh\nws=\"$1\"\n{}\n{tally}\n",
+            if write_markdown {
+                "mkdir -p \"$ws/markdown\" && printf '# Title\\n\\nbody text' > \"$ws/markdown/out.md\""
+            } else {
+                ":"
+            }
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    async fn run_fake(tally: &str, source_pages: u32) -> Result<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_olmocr(dir.path(), tally, true);
+        let pdf = dir.path().join("in.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let config = AppConfig {
+            olmocr_bin: script.to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
+        convert(&pdf, source_pages, &config).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_complete_run_returns_the_markdown() {
+        let md = run_fake(
+            "echo 'INFO - Completed pages: 4' >&2; echo 'INFO - Failed pages: 0' >&2",
+            4,
+        )
+        .await
+        .unwrap();
+        assert!(md.starts_with("# Title"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_with_a_failed_page_is_an_escalating_failure_not_partial_markdown() {
+        let err = run_fake(
+            "echo 'INFO - Completed pages: 3' >&2; echo 'INFO - Failed pages: 1' >&2",
+            4,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure_code(&err), Some(FailureCode::OlmocrIncompletePages));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_that_completed_fewer_pages_than_the_source_has_is_refused() {
+        let err = run_fake(
+            "echo 'INFO - Completed pages: 2' >&2; echo 'INFO - Failed pages: 0' >&2",
+            4,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure_code(&err), Some(FailureCode::OlmocrIncompletePages));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_with_no_tally_at_all_counts_as_zero_completed_pages() {
+        let err = run_fake("echo 'something unrelated' >&2", 4)
+            .await
+            .unwrap_err();
+        assert_eq!(failure_code(&err), Some(FailureCode::OlmocrZeroPages));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_nonzero_exit_is_an_untyped_transient_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("boom.sh");
+        std::fs::write(&script, "#!/bin/sh\necho 'vllm unreachable' >&2\nexit 3\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let pdf = dir.path().join("in.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let config = AppConfig {
+            olmocr_bin: script.to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
+        let err = convert(&pdf, 1, &config).await.unwrap_err();
+        assert_eq!(failure_code(&err), None);
+        assert!(format!("{err:#}").contains("vllm unreachable"), "{err:#}");
     }
 }

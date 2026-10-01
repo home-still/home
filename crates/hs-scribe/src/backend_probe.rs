@@ -161,13 +161,13 @@ mod tests {
 
     #[test]
     fn matches_the_verified_llama_swap_shape() {
-        // Captured verbatim from `curl localhost:8081/running` on big,
-        // llama-swap v229, 2026-09-21.
+        // Captured verbatim from `curl localhost:8081/running` on the GPU
+        // host, llama-swap v229, 2026-09-21 (home path anonymized).
         assert!(running_contains(
             &json!({"running": [{
                 "model": "glm-ocr",
                 "state": "ready",
-                "cmd": "bash /home/ladvien/.home-still/run-glm-ocr.sh 5801",
+                "cmd": "bash /home/<user>/.home-still/run-glm-ocr.sh 5801",
                 "proxy": "http://127.0.0.1:5801",
                 "ttl": 60,
                 "name": "",

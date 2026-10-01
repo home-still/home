@@ -1,8 +1,12 @@
 use crate::backend_probe::{self, BackendState};
+use crate::classify::{failure_code, ConvertFailure, FailureCode};
 use crate::client::{
-    HealthResponse, StreamLine, BACKEND_UNAVAILABLE, CONVERT_DEADLINE_HEADER, CONVERT_STEM_HEADER,
+    HealthResponse, ProgressEvent, StreamLine, BACKEND_UNAVAILABLE, CONVERT_DEADLINE_HEADER,
+    CONVERT_STEM_HEADER, FAILURE_STAGE,
 };
 use crate::config::{AppConfig, ConverterMode};
+use crate::ocr::RepetitionLoopError;
+use crate::pdf_meta::{check_header, HEADER_PROBE_BYTES, MAX_PDF_BYTES};
 use crate::pipeline::processor::Processor;
 use axum::{
     body::Body,
@@ -12,10 +16,20 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use hs_common::service::inflight::InFlightGuard;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
+
+/// Largest request body the server reads: a maximal PDF plus the multipart
+/// framing around it.
+pub const MAX_UPLOAD_BODY_BYTES: usize = MAX_PDF_BYTES + 64 * 1024;
+
+/// Why a request's `X-Convert-Deadline-Secs` was refused.
+#[derive(Debug, PartialEq, Eq)]
+struct BadDeadline(String);
 
 /// Resolve the per-request convert deadline. A caller-supplied
 /// `X-Convert-Deadline-Secs` header wins; otherwise fall back to the
@@ -23,15 +37,31 @@ use tokio_stream::wrappers::ReceiverStream;
 /// scaled deadlines stay in sync between client and server — without
 /// it, a 500-page book that needs 3600s would still be killed at the
 /// server's 900s default.
-fn resolve_deadline(headers: &HeaderMap, fallback_secs: u64) -> (Duration, bool) {
-    match headers
-        .get(CONVERT_DEADLINE_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        Some(secs) => (Duration::from_secs(secs), true),
-        None => (Duration::from_secs(fallback_secs), false),
+///
+/// A header that is present but not a positive integer is an error (a
+/// zero deadline would abort every conversion at once, and a value we cannot
+/// read is a client bug, not a request for the default). A value above
+/// `max_secs` is clamped to it: the operator's ceiling on how long one
+/// request may hold a converter slot. The `bool` is "came from the header".
+fn resolve_deadline(
+    header: Option<&str>,
+    default_secs: u64,
+    max_secs: u64,
+) -> Result<(Duration, bool), BadDeadline> {
+    let Some(raw) = header else {
+        return Ok((Duration::from_secs(default_secs), false));
+    };
+    let secs: u64 = raw.trim().parse().map_err(|_| {
+        BadDeadline(format!(
+            "{CONVERT_DEADLINE_HEADER} must be a positive integer number of seconds, got {raw:?}"
+        ))
+    })?;
+    if secs == 0 {
+        return Err(BadDeadline(format!(
+            "{CONVERT_DEADLINE_HEADER} must be at least 1 second"
+        )));
     }
+    Ok((Duration::from_secs(secs.min(max_secs)), true))
 }
 
 /// Read the catalog stem the dispatcher is converting from request
@@ -51,8 +81,16 @@ fn resolve_stem(headers: &HeaderMap) -> &str {
 /// would shell out to `nvidia-smi` several times a second under load.
 const BACKEND_PROBE_TTL: Duration = Duration::from_secs(5);
 
+/// What converts the PDFs this server accepts. The per-region ONNX
+/// pipeline exists only in `Legacy` mode: an olmocr host never loads the
+/// layout and table models (which sit on the GPU the VLM backend needs).
+pub enum ConverterBackend {
+    Legacy(Box<Processor>),
+    Olmocr,
+}
+
 pub struct ServerState {
-    pub processor: Processor,
+    pub converter: ConverterBackend,
     pub config: AppConfig,
     pub in_flight: Arc<AtomicUsize>,
     /// Unix millis of the most recent successful conversion. `0` = never.
@@ -65,6 +103,71 @@ pub struct ServerState {
     /// Last VLM-backend admission verdict and when it was taken.
     /// `None` until the first probe.
     pub backend_state: Arc<tokio::sync::Mutex<Option<(std::time::Instant, BackendState)>>>,
+    /// One permit per conversion the server will run at once
+    /// (`vlm_concurrency`). A request takes a permit before its upload is
+    /// read and holds it until the conversion ends; with none free it is
+    /// refused with 503. In olmocr mode this is the converter semaphore
+    /// that caps concurrent `olmocr` subprocesses and that `/readiness`
+    /// reports.
+    pub admission: Arc<tokio::sync::Semaphore>,
+}
+
+impl ServerState {
+    /// Validate the config and build exactly what its converter needs. Fails
+    /// (the server must not start) when the Legacy pipeline cannot be built.
+    pub fn new(config: AppConfig) -> anyhow::Result<Self> {
+        config.validate()?;
+        let converter = match config.converter {
+            ConverterMode::Legacy => {
+                ConverterBackend::Legacy(Box::new(Processor::new(config.clone())?))
+            }
+            ConverterMode::Olmocr => ConverterBackend::Olmocr,
+        };
+        let admission = Arc::new(tokio::sync::Semaphore::new(config.vlm_concurrency));
+        Ok(Self {
+            converter,
+            config,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            last_conversion_ms: Arc::new(AtomicU64::new(0)),
+            total_conversions: Arc::new(AtomicU64::new(0)),
+            backend_state: Arc::new(tokio::sync::Mutex::new(None)),
+            admission,
+        })
+    }
+
+    fn has_layout_detector(&self) -> bool {
+        matches!(&self.converter, ConverterBackend::Legacy(p) if p.has_layout_detector())
+    }
+
+    fn has_table_recognizer(&self) -> bool {
+        matches!(&self.converter, ConverterBackend::Legacy(p) if p.has_table_recognizer())
+    }
+
+    /// Why the layout / table models are not loaded (`None` when they are).
+    fn models_reason(&self) -> Option<String> {
+        match &self.converter {
+            ConverterBackend::Legacy(p) => p.layout_model_reason().map(str::to_string),
+            ConverterBackend::Olmocr => Some("not used (converter is olmocr)".to_string()),
+        }
+    }
+
+    /// `(total, available)` conversion slots as `/readiness` reports them.
+    ///
+    /// Legacy: the shared VLM-call semaphore (the real contended resource —
+    /// regions of every conversion queue on it), capped by the admission
+    /// semaphore so a host that cannot admit another upload does not
+    /// advertise a free slot. Olmocr: the admission semaphore, which is held
+    /// for the whole run of the `olmocr` subprocess.
+    fn slots(&self) -> (usize, usize) {
+        let admission = self.admission.available_permits();
+        match &self.converter {
+            ConverterBackend::Legacy(p) => (
+                p.effective_vlm_concurrency(),
+                p.vlm_sem().available_permits().min(admission),
+            ),
+            ConverterBackend::Olmocr => (self.config.vlm_concurrency, admission),
+        }
+    }
 }
 
 /// Return the cached backend verdict, re-probing when it is missing or
@@ -139,13 +242,18 @@ fn format_last_conv(slot: &AtomicU64) -> Option<String> {
 }
 
 pub fn app(state: Arc<ServerState>) -> Router {
+    app_with_body_limit(state, MAX_UPLOAD_BODY_BYTES)
+}
+
+/// [`app`] with an explicit request-body limit (the production value is
+/// [`MAX_UPLOAD_BODY_BYTES`]).
+pub fn app_with_body_limit(state: Arc<ServerState>, max_body_bytes: usize) -> Router {
     Router::new()
-        .route("/scribe", post(handle_scribe))
         .route("/scribe/stream", post(handle_scribe_stream))
         .route("/health", get(handle_health))
         .route("/readiness", get(handle_readiness))
         .route("/info", get(handle_info))
-        .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256MB
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
 
@@ -158,12 +266,13 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoRespon
     let info = hs_common::gpu::query_gpu_info_async().await;
     let backend = cached_backend_state(&state).await;
     let admits = backend.as_ref().is_none_or(|b| b.admits());
+    let models_reason = state.models_reason();
     let body = HealthResponse {
         status: if admits { "ok" } else { BACKEND_UNAVAILABLE }.into(),
-        layout_model: state.processor.has_layout_detector(),
-        table_model: state.processor.has_table_recognizer(),
-        layout_model_reason: state.processor.layout_model_reason().map(str::to_string),
-        table_model_reason: state.processor.table_model_reason().map(str::to_string),
+        layout_model: state.has_layout_detector(),
+        table_model: state.has_table_recognizer(),
+        layout_model_reason: models_reason.clone(),
+        table_model_reason: models_reason,
         version: env!("HS_VERSION").into(),
         gpu_name: info.name,
         gpu_utilization_pct: info.utilization_pct,
@@ -183,20 +292,16 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoRespon
 }
 
 async fn handle_readiness(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    // Report the EFFECTIVE capacity (the VLM semaphore size). The pool
-    // load-balancer relies on this number being truthful.
-    let total = state.processor.effective_vlm_concurrency();
+    // Report the EFFECTIVE capacity. The pool load-balancer relies on
+    // these numbers being truthful.
+    let (total, free) = state.slots();
     let admits = cached_backend_state(&state)
         .await
         .is_none_or(|b| b.admits());
     // Zero available slots is what `ServicePool::try_pick_once` already
     // treats as ineligible, so a closed gate parks the dispatcher
     // instead of feeding a backend that can only time out.
-    let available = if admits {
-        state.processor.vlm_sem().available_permits()
-    } else {
-        0
-    };
+    let available = if admits { free } else { 0 };
     let in_flight = state.in_flight.load(Ordering::Relaxed);
     let mut body = serde_json::json!({
         "ready": available > 0,
@@ -214,165 +319,189 @@ async fn handle_info(State(state): State<Arc<ServerState>>) -> impl IntoResponse
     axum::Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "capabilities": {
-            "layout": state.processor.has_layout_detector(),
-            "tables": state.processor.has_table_recognizer(),
+            "layout": state.has_layout_detector(),
+            "tables": state.has_table_recognizer(),
         }
     }))
 }
 
-/// Extract PDF bytes from a multipart upload.
+/// A refused upload, as the response to send.
+fn upload_refusal(status: StatusCode, body: impl Into<String>) -> Response {
+    (status, body.into()).into_response()
+}
+
+/// The refusal for a multipart read error. `MultipartError::status` carries
+/// the truth: 413 when the body limit was crossed, 400 for a malformed
+/// body — never "Missing 'pdf' field".
+fn multipart_refusal(e: axum::extract::multipart::MultipartError) -> Response {
+    upload_refusal(e.status(), e.body_text())
+}
+
+/// Stream the `pdf` field of a multipart upload into a temp file, once.
+///
+/// The body never sits in memory: each chunk goes to disk as it arrives
+/// (a 256 MiB PDF used to be buffered, copied with `to_vec`, and written
+/// out again). The first [`HEADER_PROBE_BYTES`] are held just long enough to
+/// apply the `%PDF` gate, so a body that is not a PDF is refused (415, with
+/// the failure code as the body) before anything else is written. The temp
+/// file keeps a `.pdf` suffix because the olmocr CLI picks inputs by it, and
+/// is deleted when the returned handle drops.
 #[allow(clippy::result_large_err)]
-async fn extract_pdf(mut multipart: Multipart) -> Result<Vec<u8>, Response> {
-    while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some("pdf") {
-            match field.bytes().await {
-                Ok(b) => return Ok(b.to_vec()),
-                Err(e) => {
-                    return Err((StatusCode::BAD_REQUEST, format!("{e}")).into_response());
-                }
+async fn receive_pdf(mut multipart: Multipart) -> Result<tempfile::NamedTempFile, Response> {
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => {
+                return Err(upload_refusal(
+                    StatusCode::BAD_REQUEST,
+                    "Missing 'pdf' field",
+                ))
             }
+            Err(e) => return Err(multipart_refusal(e)),
+        };
+        if field.name() != Some("pdf") {
+            continue;
         }
-    }
-    Err((StatusCode::BAD_REQUEST, "Missing 'pdf' field").into_response())
-}
 
-/// Gate the content-type before dispatching to the VLM. Paywall HTML
-/// renamed `.pdf`, truncated downloads, and encrypted binaries will never
-/// convert — the VLM would spend GPU time producing garbage or error out
-/// deep in the stack. Reject them at the door with HTTP 415 and a precise
-/// reason string so the caller (watch-events, MCP) can stamp
-/// `conversion_failed` and stop retrying. `%PDF` is the only acceptance
-/// criterion: `PDF-1.x` specifies the header exactly.
-#[allow(clippy::result_large_err)]
-fn verify_pdf_content(bytes: &[u8]) -> Result<(), Response> {
-    let head = &bytes[..bytes.len().min(4096)];
-    if head.starts_with(b"%PDF") {
-        return Ok(());
-    }
-    let reason = if hs_common::html::looks_like_html(head) {
-        "unsupported_content_type:html"
-    } else {
-        "unsupported_content_type:binary"
-    };
-    tracing::warn!(
-        reason,
-        bytes = bytes.len(),
-        "rejecting non-PDF body at /scribe gate"
-    );
-    Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, reason.to_string()).into_response())
-}
+        let io_fault = |what: &str, e: std::io::Error| {
+            tracing::error!(error = %e, "upload spool: {what}");
+            upload_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e}"))
+        };
+        let tmp = tempfile::Builder::new()
+            .prefix("hs-scribe-upload-")
+            .suffix(".pdf")
+            .tempfile()
+            .map_err(|e| io_fault("creating the upload file", e))?;
+        let mut file = tokio::fs::File::from_std(
+            tmp.reopen()
+                .map_err(|e| io_fault("opening the upload file", e))?,
+        );
 
-#[cfg(test)]
-mod verify_pdf_tests {
-    use super::verify_pdf_content;
-    use axum::http::StatusCode;
-
-    fn status_of(resp: &axum::response::Response) -> StatusCode {
-        resp.status()
-    }
-
-    #[test]
-    fn pdf_header_is_accepted() {
-        assert!(verify_pdf_content(b"%PDF-1.7\n...").is_ok());
-        assert!(verify_pdf_content(b"%PDF-1.4\n%random binary").is_ok());
-    }
-
-    #[test]
-    fn html_body_is_rejected_with_415_and_html_reason() {
-        let err = verify_pdf_content(b"<!DOCTYPE html><html><body>paywall</body></html>")
-            .expect_err("HTML must not be accepted");
-        assert_eq!(status_of(&err), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    }
-
-    #[test]
-    fn random_bytes_rejected_with_binary_reason() {
-        let err = verify_pdf_content(&[0u8, 1, 2, 3, 4, 5, 6, 7]).expect_err("binary must reject");
-        assert_eq!(status_of(&err), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    }
-
-    #[test]
-    fn empty_body_rejected() {
-        assert!(verify_pdf_content(&[]).is_err());
-    }
-}
-
-/// Write PDF bytes to a temp file and return the handle (keeps file alive).
-#[allow(clippy::result_large_err)]
-fn write_tmp_pdf(pdf_bytes: &[u8]) -> Result<tempfile::NamedTempFile, Response> {
-    let tmp = tempfile::NamedTempFile::new()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response())?;
-    std::fs::write(tmp.path(), pdf_bytes)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response())?;
-    Ok(tmp)
-}
-
-use hs_common::service::inflight::InFlightGuard;
-
-async fn handle_scribe(
-    State(state): State<Arc<ServerState>>,
-    headers: HeaderMap,
-    multipart: Multipart,
-) -> Response {
-    let _guard = InFlightGuard::new(&state.in_flight);
-
-    let pdf_bytes = match extract_pdf(multipart).await {
-        Ok(b) => b,
-        Err(resp) => return resp,
-    };
-
-    if let Err(resp) = verify_pdf_content(&pdf_bytes) {
-        return resp;
-    }
-
-    let tmp = match write_tmp_pdf(&pdf_bytes) {
-        Ok(t) => t,
-        Err(resp) => return resp,
-    };
-
-    let path = tmp.path().to_str().unwrap_or_default();
-    let (deadline, from_header) = resolve_deadline(&headers, state.config.convert_deadline_secs);
-    let stem = resolve_stem(&headers).to_string();
-    // Branch on the configured converter. `Legacy` runs the per-region
-    // OcrEngine pipeline (Processor::process_pdf). `Olmocr` shells out
-    // to the olmocr CLI which handles render + anchor + prompt + parse +
-    // assemble end-to-end.
-    let state_for_convert = state.clone();
-    let convert_fut = async move {
-        match state_for_convert.config.converter {
-            crate::config::ConverterMode::Legacy => {
-                state_for_convert.processor.process_pdf(path).await
-            }
-            crate::config::ConverterMode::Olmocr => {
-                crate::converter::olmocr_subprocess::convert(&pdf_bytes, &state_for_convert.config)
-                    .await
-            }
-        }
-    };
-    match tokio::time::timeout(deadline, convert_fut).await {
-        Ok(Ok(md)) => {
-            record_success(&state.last_conversion_ms, &state.total_conversions, &md);
-            (StatusCode::OK, md).into_response()
-        }
-        Ok(Err(e)) => {
-            tracing::error!(stem = %stem, "Processing failed: {e:#}");
-            tracing::debug!("Full error chain: {e:?}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
-        }
-        Err(_elapsed) => {
-            // tokio::time::timeout fired → inner future chain dropped → every
-            // in-flight Ollama request aborts, stage-1 spawn_blocking exits on
-            // the next send to a closed channel, VLM permit released.
-            tracing::error!(
-                stem = %stem,
-                deadline_secs = deadline.as_secs(),
-                from_header,
-                "convert deadline exceeded — aborting; slot released"
+        let refuse_header = |failure: ConvertFailure| {
+            tracing::warn!(
+                reason = failure.code().wire(),
+                "rejecting non-PDF body at the /scribe/stream gate"
             );
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                format!("convert deadline ({}s) exceeded", deadline.as_secs()),
+            upload_refusal(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                failure.code().wire().to_string(),
             )
-                .into_response()
+        };
+
+        let mut head: Vec<u8> = Vec::with_capacity(HEADER_PROBE_BYTES);
+        let mut head_checked = false;
+        let mut total: usize = 0;
+        loop {
+            let chunk = match field.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => return Err(multipart_refusal(e)),
+            };
+            total += chunk.len();
+            if total > MAX_PDF_BYTES {
+                return Err(upload_refusal(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("PDF exceeds the {MAX_PDF_BYTES}-byte limit"),
+                ));
+            }
+            if head_checked {
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| io_fault("writing the upload", e))?;
+                continue;
+            }
+            head.extend_from_slice(&chunk);
+            if head.len() >= HEADER_PROBE_BYTES {
+                check_header(&head).map_err(&refuse_header)?;
+                file.write_all(&head)
+                    .await
+                    .map_err(|e| io_fault("writing the upload", e))?;
+                head_checked = true;
+                head = Vec::new();
+            }
+        }
+        if !head_checked {
+            // The whole body is shorter than the probe window.
+            check_header(&head).map_err(&refuse_header)?;
+            file.write_all(&head)
+                .await
+                .map_err(|e| io_fault("writing the upload", e))?;
+        }
+        file.flush()
+            .await
+            .map_err(|e| io_fault("flushing the upload", e))?;
+        return Ok(tmp);
+    }
+}
+
+/// The failure code to put on the wire for a failed conversion: the code
+/// the failing stage attached, or the one implied by the streaming
+/// repetition detector's abort. `None` for everything else, which clients
+/// treat as transient.
+fn wire_failure_code(err: &anyhow::Error) -> Option<FailureCode> {
+    failure_code(err).or_else(|| {
+        err.chain()
+            .any(|e| e.is::<RepetitionLoopError>())
+            .then_some(FailureCode::VlmRepetitionLoop)
+    })
+}
+
+fn ndjson(line: &StreamLine) -> Option<String> {
+    serde_json::to_string(line)
+        .ok()
+        .map(|json| format!("{json}\n"))
+}
+
+/// Emit a failed conversion: the typed code as a `FAILURE_STAGE` progress
+/// event (when the failure has one), then the human message as the
+/// `Error` line the stream has always ended with.
+async fn send_failure(
+    tx: &tokio::sync::mpsc::Sender<Result<String, std::io::Error>>,
+    message: String,
+    code: Option<FailureCode>,
+) {
+    if let Some(code) = code {
+        if let Some(line) = ndjson(&StreamLine::Progress(ProgressEvent {
+            stage: FAILURE_STAGE.into(),
+            page: 0,
+            total_pages: 0,
+            message: code.wire().to_string(),
+        })) {
+            let _ = tx.send(Ok(line)).await;
+        }
+    }
+    if let Some(line) = ndjson(&StreamLine::Error(message)) {
+        let _ = tx.send(Ok(line)).await;
+    }
+}
+
+type ConvertOutcome = (String, Vec<Vec<String>>, Vec<crate::diag::PageDiagRecord>);
+
+/// Run the configured converter over the spooled PDF.
+async fn convert_pdf(
+    state: &ServerState,
+    path: &std::path::Path,
+    on_progress: impl Fn(ProgressEvent) + Send + Sync + 'static,
+) -> anyhow::Result<ConvertOutcome> {
+    match &state.converter {
+        // Legacy streams per-page progress events natively.
+        ConverterBackend::Legacy(processor) => processor
+            .process_pdf_with_progress(&path.to_string_lossy(), on_progress)
+            .await
+            .map(|r| (r.markdown, r.per_page_region_classes, r.per_page_diags)),
+        // olmocr produces the markdown as one bundle, so the stream emits a
+        // single Result line at the end (with empty per-page metadata —
+        // olmocr doesn't surface per-page region classes or diags). Its
+        // page count comes from the file: the tally olmocr prints is only
+        // meaningful against it.
+        ConverterBackend::Olmocr => {
+            let counted = path.to_path_buf();
+            let pages =
+                tokio::task::spawn_blocking(move || crate::pdf_meta::count_pages_in_file(&counted))
+                    .await??;
+            crate::converter::olmocr_subprocess::convert(path, pages, &state.config)
+                .await
+                .map(|md| (md, Vec::new(), Vec::new()))
         }
     }
 }
@@ -382,62 +511,63 @@ async fn handle_scribe_stream(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    let pdf_bytes = match extract_pdf(multipart).await {
-        Ok(b) => b,
-        Err(resp) => return resp,
+    // A bad deadline header is refused before a byte of the upload is read.
+    let (deadline, from_header) = match resolve_deadline(
+        headers
+            .get(CONVERT_DEADLINE_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        state.config.convert_deadline_secs,
+        state.config.max_convert_deadline_secs,
+    ) {
+        Ok(resolved) => resolved,
+        Err(BadDeadline(why)) => return upload_refusal(StatusCode::BAD_REQUEST, why),
     };
-
-    if let Err(resp) = verify_pdf_content(&pdf_bytes) {
-        return resp;
+    if headers.contains_key(CONVERT_DEADLINE_HEADER) && !from_header {
+        // Present but not valid UTF-8: `to_str` failed above.
+        return upload_refusal(
+            StatusCode::BAD_REQUEST,
+            format!("{CONVERT_DEADLINE_HEADER} is not valid text"),
+        );
     }
+    let stem = resolve_stem(&headers).to_string();
 
-    let tmp = match write_tmp_pdf(&pdf_bytes) {
-        Ok(t) => t,
-        Err(resp) => return resp,
+    // Admission comes before the upload is read: a server at capacity must
+    // not first spool 256 MiB it cannot use.
+    let permit = match Arc::clone(&state.admission).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::warn!(stem = %stem, "converter at capacity — refusing upload");
+            let mut resp = upload_refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "converter at capacity; retry later",
+            );
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+            return resp;
+        }
     };
-
     let in_flight_guard = InFlightGuard::new(&state.in_flight);
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
-    let path = tmp.path().to_string_lossy().to_string();
+    let tmp = match receive_pdf(multipart).await {
+        Ok(tmp) => tmp,
+        Err(resp) => return resp,
+    };
 
-    let (deadline, from_header) = resolve_deadline(&headers, state.config.convert_deadline_secs);
-    let stem = resolve_stem(&headers).to_string();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
+
     tokio::spawn(async move {
-        let _tmp = tmp; // keep temp file alive for the duration of processing
+        let _tmp = tmp; // keep the spooled PDF alive for the duration of processing
         let _guard = in_flight_guard;
+        let _permit = permit;
 
         let tx_progress = tx.clone();
-        let on_progress = move |event: crate::client::ProgressEvent| {
-            let line = StreamLine::Progress(event);
-            if let Ok(json) = serde_json::to_string(&line) {
-                let _ = tx_progress.try_send(Ok(format!("{json}\n")));
+        let on_progress = move |event: ProgressEvent| {
+            if let Some(line) = ndjson(&StreamLine::Progress(event)) {
+                let _ = tx_progress.try_send(Ok(line));
             }
         };
 
-        // Branch on the configured converter. Legacy streams per-page
-        // progress events natively; olmocr produces the markdown as one
-        // bundle so the stream emits a single Result line at the end
-        // (with empty per-page metadata — olmocr doesn't surface
-        // per-page region classes or diags).
-        let state_for_convert = state.clone();
-        let convert_fut = async move {
-            match state_for_convert.config.converter {
-                crate::config::ConverterMode::Legacy => state_for_convert
-                    .processor
-                    .process_pdf_with_progress(&path, on_progress)
-                    .await
-                    .map(|r| (r.markdown, r.per_page_region_classes, r.per_page_diags)),
-                crate::config::ConverterMode::Olmocr => {
-                    crate::converter::olmocr_subprocess::convert(
-                        &pdf_bytes,
-                        &state_for_convert.config,
-                    )
-                    .await
-                    .map(|md| (md, Vec::new(), Vec::new()))
-                }
-            }
-        };
+        let convert_fut = convert_pdf(&state, _tmp.path(), on_progress);
         match tokio::time::timeout(deadline, convert_fut).await {
             Ok(Ok((markdown, per_page_region_classes, per_page_diags))) => {
                 record_success(
@@ -450,32 +580,31 @@ async fn handle_scribe_stream(
                     per_page_region_classes,
                     per_page_diags,
                 };
-                if let Ok(json) = serde_json::to_string(&line) {
-                    let _ = tx.send(Ok(format!("{json}\n"))).await;
+                if let Some(line) = ndjson(&line) {
+                    let _ = tx.send(Ok(line)).await;
                 }
             }
             Ok(Err(e)) => {
                 tracing::error!(stem = %stem, "Processing failed: {e:#}");
                 tracing::debug!("Full error chain: {e:?}");
-                let line = StreamLine::Error(format!("{e:#}"));
-                if let Ok(json) = serde_json::to_string(&line) {
-                    let _ = tx.send(Ok(format!("{json}\n"))).await;
-                }
+                send_failure(&tx, format!("{e:#}"), wire_failure_code(&e)).await;
             }
             Err(_elapsed) => {
+                // tokio::time::timeout fired → inner future chain dropped → every
+                // in-flight VLM request aborts, stage-1 spawn_blocking exits on
+                // the next send to a closed channel, VLM permit released.
                 tracing::error!(
                     stem = %stem,
                     deadline_secs = deadline.as_secs(),
                     from_header,
                     "convert deadline exceeded — aborting stream; slot released"
                 );
-                let line = StreamLine::Error(format!(
-                    "convert deadline ({}s) exceeded",
-                    deadline.as_secs()
-                ));
-                if let Ok(json) = serde_json::to_string(&line) {
-                    let _ = tx.send(Ok(format!("{json}\n"))).await;
-                }
+                send_failure(
+                    &tx,
+                    format!("convert deadline ({}s) exceeded", deadline.as_secs()),
+                    None,
+                )
+                .await;
             }
         }
     });
@@ -536,5 +665,75 @@ mod tests {
         let s = format_last_conv(&slot).expect("set");
         assert!(s.starts_with("2023-11-14T"), "got: {s}");
         assert!(s.ends_with('Z'), "got: {s}");
+    }
+
+    #[test]
+    fn deadline_defaults_when_the_header_is_absent() {
+        assert_eq!(
+            resolve_deadline(None, 900, 7200),
+            Ok((Duration::from_secs(900), false))
+        );
+    }
+
+    #[test]
+    fn deadline_header_wins_up_to_the_server_ceiling() {
+        assert_eq!(
+            resolve_deadline(Some("3600"), 900, 7200),
+            Ok((Duration::from_secs(3600), true))
+        );
+        assert_eq!(
+            resolve_deadline(Some(" 120 "), 900, 7200),
+            Ok((Duration::from_secs(120), true))
+        );
+        // Above the ceiling: clamped, not honored and not refused.
+        assert_eq!(
+            resolve_deadline(Some("86400"), 900, 7200),
+            Ok((Duration::from_secs(7200), true))
+        );
+        assert_eq!(
+            resolve_deadline(Some("18446744073709551615"), 900, 7200),
+            Ok((Duration::from_secs(7200), true))
+        );
+    }
+
+    #[test]
+    fn a_deadline_header_that_is_not_a_positive_integer_is_refused_not_ignored() {
+        for bad in [
+            "0",
+            "-5",
+            "",
+            "abc",
+            "1.5",
+            "1e3",
+            "99999999999999999999999",
+        ] {
+            assert!(
+                resolve_deadline(Some(bad), 900, 7200).is_err(),
+                "{bad:?} must not silently become the default"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_failures_go_on_the_wire_and_untyped_ones_do_not() {
+        let typed =
+            ConvertFailure::err(FailureCode::PdfParseError, "broken").context("converting upload");
+        assert_eq!(wire_failure_code(&typed), Some(FailureCode::PdfParseError));
+
+        let looped = anyhow::Error::new(RepetitionLoopError {
+            reason: crate::ocr::LoopReason::Bigram,
+            partial_output: String::new(),
+            bytes_at_abort: 10,
+        })
+        .context("full-page VLM failed on page 3");
+        assert_eq!(
+            wire_failure_code(&looped),
+            Some(FailureCode::VlmRepetitionLoop)
+        );
+
+        assert_eq!(
+            wire_failure_code(&anyhow::anyhow!("connection refused")),
+            None
+        );
     }
 }

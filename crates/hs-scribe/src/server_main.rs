@@ -1,10 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 
 use hs_scribe::config::AppConfig;
-use hs_scribe::pipeline::processor::Processor;
 use hs_scribe::server::{app, ServerState};
 
 #[derive(Parser)]
@@ -58,15 +56,11 @@ async fn async_main() -> Result<()> {
         config.model,
         config.vlm_concurrency
     );
-    let processor = Processor::new(config.clone())?;
-    let state = Arc::new(ServerState {
-        processor,
-        config,
-        in_flight: Arc::new(AtomicUsize::new(0)),
-        last_conversion_ms: Arc::new(AtomicU64::new(0)),
-        total_conversions: Arc::new(AtomicU64::new(0)),
-        backend_state: Arc::new(tokio::sync::Mutex::new(None)),
-    });
+    // `ServerState::new` validates the effective config (a zero concurrency
+    // would hang every conversion) and builds only what the configured
+    // converter uses: the ONNX pipeline for Legacy, nothing for olmocr. It
+    // fails the start if the Legacy pipeline cannot be built.
+    let state = Arc::new(ServerState::new(config)?);
 
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("Listening on {addr}");

@@ -1,3 +1,4 @@
+use crate::classify::{ConvertFailure, FailureCode};
 use crate::client::ProgressEvent;
 use crate::config::{AppConfig, PipelineMode};
 use crate::models::layout::{BBox, LayoutDetector};
@@ -10,13 +11,30 @@ use crate::pipeline::markdown_generator::{assemble_page_markdown, join_pages};
 use crate::pipeline::pdf_parser::PageData;
 use crate::pipeline::PdfParser;
 use crate::utils::deduplication::{deduplicate_boxes, filter_contained_regions};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use hs_common::hardware_profile::HardwareProfile;
 use image::DynamicImage;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+/// The number of pages to convert, or the permanent PDF fault that makes
+/// the document unconvertible. pdfium addresses pages with a `u16`, so a
+/// document of more than 65 536 pages used to be walked as
+/// `0..total as u16` and silently convert only `total mod 65536` of them.
+fn checked_page_count(count: usize) -> Result<usize> {
+    if count == 0 || count > crate::pdf_meta::MAX_PDF_PAGES {
+        return Err(ConvertFailure::err(
+            FailureCode::PdfParseError,
+            format!(
+                "PDF has {count} pages; the renderer converts documents of 1..={} pages",
+                crate::pdf_meta::MAX_PDF_PAGES
+            ),
+        ));
+    }
+    Ok(count)
+}
 
 /// A single region's OCR output with its layout classification.
 #[derive(Debug, Clone)]
@@ -66,6 +84,10 @@ struct PreparedPage {
     /// `execute_vlm_for_page`. `None` only on the empty-page early
     /// return — every other path computes and records a verdict.
     column_split_shadow: Option<crate::diag::ColumnSplitShadow>,
+    /// Regions (text crops and whole tables) dropped from this page
+    /// because they could not be processed. Carried into the page's diag
+    /// record; the QC gate refuses a conversion with any.
+    skipped_regions: u32,
 }
 
 /// Round-robin pool of ONNX detectors. Each detector holds an `ort::Session`
@@ -95,12 +117,26 @@ impl<T> DetectorPool<T> {
     }
 }
 
+/// What the Legacy converter does with a page. A per-region processor owns
+/// both ONNX pools or does not exist — there is no half-loaded state and
+/// no fallback from one mode to the other at runtime.
+enum Pipeline {
+    /// `pipeline_mode: full_page`, an explicit operator choice: the whole
+    /// page goes to the VLM, no ONNX models are loaded.
+    FullPage,
+    PerRegion {
+        layout: Arc<DetectorPool<LayoutDetector>>,
+        table: Arc<DetectorPool<TableStructureRecognizer>>,
+    },
+}
+
+/// Reason `/health` reports for the layout and table models when they are
+/// not loaded: the operator selected full-page mode.
+const MODELS_DISABLED_REASON: &str = "disabled (pipeline_mode != per_region)";
+
 pub struct Processor {
     ocr: Arc<OcrEngine>,
-    layout_detectors: Option<Arc<DetectorPool<LayoutDetector>>>,
-    layout_model_reason: Option<String>,
-    table_recognizers: Option<Arc<DetectorPool<TableStructureRecognizer>>>,
-    table_model_reason: Option<String>,
+    pipeline: Pipeline,
     /// Shared VLM concurrency semaphore — one per Processor, reused across
     /// every convert call. Size = the effective cap (see
     /// `effective_vlm_concurrency`). Server-side callers consume the same
@@ -113,40 +149,33 @@ pub struct Processor {
 }
 
 impl Processor {
+    /// Build the Legacy converter. In `per_region` mode this loads the
+    /// layout and table ONNX pools and FAILS if either cannot be loaded (a
+    /// missing file, a CUDA provider that will not register, a model whose
+    /// shapes are wrong): the server must not come up healthy in a mode
+    /// that produces different output than the one configured. Nothing here
+    /// is needed by the olmocr converter, which therefore never builds one.
     pub fn new(config: AppConfig) -> Result<Self> {
+        config.validate()?;
         let ocr = Arc::new(OcrEngine::from_config(&config)?);
 
-        let pool_size = HardwareProfile::detect().class.detector_pool_size();
-
-        let (layout_detectors, layout_model_reason) =
-            if config.pipeline_mode == PipelineMode::PerRegion {
-                build_layout_pool(&config, pool_size)
-            } else {
-                (
-                    None,
-                    Some("disabled (pipeline_mode != per_region)".to_string()),
-                )
-            };
-
-        let (table_recognizers, table_model_reason) =
-            if config.pipeline_mode == PipelineMode::PerRegion {
-                build_table_pool(&config, pool_size)
-            } else {
-                (
-                    None,
-                    Some("disabled (pipeline_mode != per_region)".to_string()),
-                )
-            };
+        let pipeline = match config.pipeline_mode {
+            PipelineMode::PerRegion => {
+                let pool_size = HardwareProfile::detect().class.detector_pool_size();
+                Pipeline::PerRegion {
+                    layout: build_layout_pool(&config, pool_size)?,
+                    table: build_table_pool(&config, pool_size)?,
+                }
+            }
+            PipelineMode::FullPage => Pipeline::FullPage,
+        };
 
         let effective_vlm_concurrency = config.vlm_concurrency;
         let vlm_sem = Arc::new(tokio::sync::Semaphore::new(effective_vlm_concurrency));
 
         Ok(Self {
             ocr,
-            layout_detectors,
-            layout_model_reason,
-            table_recognizers,
-            table_model_reason,
+            pipeline,
             vlm_sem,
             effective_vlm_concurrency,
             config,
@@ -159,12 +188,17 @@ impl Processor {
         self.effective_vlm_concurrency
     }
 
+    /// Why the layout model is not loaded; `None` when it is.
     pub fn layout_model_reason(&self) -> Option<&str> {
-        self.layout_model_reason.as_deref()
+        match self.pipeline {
+            Pipeline::FullPage => Some(MODELS_DISABLED_REASON),
+            Pipeline::PerRegion { .. } => None,
+        }
     }
 
+    /// Why the table model is not loaded; `None` when it is.
     pub fn table_model_reason(&self) -> Option<&str> {
-        self.table_model_reason.as_deref()
+        self.layout_model_reason()
     }
 
     pub fn ocr(&self) -> Arc<OcrEngine> {
@@ -178,17 +212,12 @@ impl Processor {
         Arc::clone(&self.vlm_sem)
     }
 
-    /// Is this processor running in per-region mode (i.e., has a layout detector pool)?
-    fn is_per_region(&self) -> bool {
-        self.layout_detectors.is_some()
-    }
-
     pub fn has_layout_detector(&self) -> bool {
-        self.layout_detectors.is_some()
+        matches!(self.pipeline, Pipeline::PerRegion { .. })
     }
 
     pub fn has_table_recognizer(&self) -> bool {
-        self.table_recognizers.is_some()
+        self.has_layout_detector()
     }
 
     pub async fn process_image(&self, image: &DynamicImage) -> Result<String> {
@@ -196,29 +225,33 @@ impl Processor {
     }
 
     pub async fn process_image_full(&self, image: &DynamicImage) -> Result<ProcessedPage> {
-        if self.is_per_region() {
-            self.process_image_regions_full(image).await
-        } else {
-            let downscaled = maybe_downscale(image, self.config.max_image_dim);
-            let image_bytes = encode_jpeg(&downscaled)?;
-            let text = self.ocr.recognize(&image_bytes).await?;
-            Ok(ProcessedPage {
-                markdown: text.clone(),
-                regions: vec![RegionResult {
-                    class_name: "text".into(),
-                    text,
-                }],
-            })
+        match &self.pipeline {
+            Pipeline::PerRegion { layout, table } => {
+                self.process_image_regions_full(image, layout, table).await
+            }
+            Pipeline::FullPage => {
+                let downscaled = maybe_downscale(image, self.config.max_image_dim);
+                let image_bytes = encode_jpeg(&downscaled)?;
+                let text = self.ocr.recognize(&image_bytes).await?;
+                Ok(ProcessedPage {
+                    markdown: text.clone(),
+                    regions: vec![RegionResult {
+                        class_name: "text".into(),
+                        text,
+                    }],
+                })
+            }
         }
     }
 
-    async fn process_image_regions_full(&self, image: &DynamicImage) -> Result<ProcessedPage> {
+    async fn process_image_regions_full(
+        &self,
+        image: &DynamicImage,
+        layout: &DetectorPool<LayoutDetector>,
+        table: &DetectorPool<TableStructureRecognizer>,
+    ) -> Result<ProcessedPage> {
         let bboxes = {
-            let pool = self
-                .layout_detectors
-                .as_ref()
-                .expect("per-region requires layout_detectors");
-            let mut det = pool.acquire()?;
+            let mut det = layout.acquire()?;
             det.detect(image)?
         };
 
@@ -254,9 +287,7 @@ impl Processor {
         let mut table_bboxes = Vec::new();
         let mut other_bboxes = Vec::new();
         for bbox in bboxes {
-            if RegionType::from_class(&bbox.class_name) == RegionType::Table
-                && self.table_recognizers.is_some()
-            {
+            if RegionType::from_class(&bbox.class_name) == RegionType::Table {
                 table_bboxes.push(bbox);
             } else {
                 other_bboxes.push(bbox);
@@ -347,7 +378,7 @@ impl Processor {
                 );
                 continue;
             };
-            let html = self.recognize_table_html(&crop).await?;
+            let html = self.recognize_table_html(table, &crop).await?;
             regions.push((bbox, html));
         }
 
@@ -374,13 +405,13 @@ impl Processor {
     }
 
     /// Recognize table structure with SLANet-Plus, OCR each cell with VLM, return HTML.
-    async fn recognize_table_html(&self, table_image: &DynamicImage) -> Result<String> {
+    async fn recognize_table_html(
+        &self,
+        table: &DetectorPool<TableStructureRecognizer>,
+        table_image: &DynamicImage,
+    ) -> Result<String> {
         let structure = {
-            let pool = self
-                .table_recognizers
-                .as_ref()
-                .expect("table_recognizers required");
-            let mut rec = pool.acquire()?;
+            let mut rec = table.acquire()?;
             rec.recognize(table_image)?
         };
 
@@ -439,6 +470,13 @@ impl Processor {
         Ok(build_html_from_structure(&structure, &cell_texts))
     }
 
+    /// Convert the PDF at `pdf_path` to markdown, one page of raster resident
+    /// at a time. This is the ONE conversion path of the Legacy converter
+    /// (the server's `/scribe/stream`); every failure of a page — a VLM
+    /// error, a JPEG encode error — fails the conversion instead of
+    /// becoming an empty page, so a backend outage mid-book cannot yield a
+    /// gapped "successful" markdown. Regions the per-region pipeline has to
+    /// drop are counted in the page diag records for the QC gate.
     pub async fn process_pdf_with_progress<F>(
         &self,
         pdf_path: &str,
@@ -456,10 +494,11 @@ impl Processor {
             message: "Parsing PDF...".into(),
         });
 
-        let total = {
+        let page_count = {
             let pdf_parser = PdfParser::new()?;
-            pdf_parser.page_count(pdf_path)? as u64
+            checked_page_count(pdf_parser.page_count(pdf_path)?)?
         };
+        let total = page_count as u64;
 
         on_progress(ProgressEvent {
             stage: "parse".into(),
@@ -468,139 +507,83 @@ impl Processor {
             message: format!("Parsed {total} pages"),
         });
 
-        if !self.is_per_region() {
-            let ocr = Arc::clone(&self.ocr);
-            let max_dim = self.config.max_image_dim;
-            let parallel = self.config.parallel;
-            let completed = Arc::new(AtomicU64::new(0));
+        let max_render_pixels = self.config.max_render_pixels;
 
-            // Stage 1: render pages one at a time on a blocking thread into a
-            // small bounded channel — at most a couple of rendered pages are
-            // resident, so a large book no longer materialises its whole raster
-            // set up front (the all-pages-in-RAM OOM that froze the host).
-            let pdf_path_owned = pdf_path.to_string();
-            let render_dpi = self.config.dpi;
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, PageData)>(2);
-            let render = tokio::task::spawn_blocking(move || {
-                let parser = PdfParser::new()?;
-                let document = parser.open(&pdf_path_owned)?;
-                for idx in 0..total as u16 {
-                    let page = PdfParser::render_page(&document, idx, render_dpi)?;
-                    if tx.blocking_send((idx as usize, page)).is_err() {
-                        break;
+        let (layout, table) = match &self.pipeline {
+            Pipeline::FullPage => {
+                let max_dim = self.config.max_image_dim;
+                let parallel = self.config.parallel;
+
+                // Stage 1: render pages one at a time on a blocking thread into a
+                // small bounded channel — at most a couple of rendered pages are
+                // resident, so a large book no longer materialises its whole raster
+                // set up front (the all-pages-in-RAM OOM that froze the host).
+                let pdf_path_owned = pdf_path.to_string();
+                let render_dpi = self.config.dpi;
+                let (tx, rx) = tokio::sync::mpsc::channel::<(usize, PageData)>(2);
+                let render = tokio::task::spawn_blocking(move || {
+                    let parser = PdfParser::new()?;
+                    let document = parser.open(&pdf_path_owned)?;
+                    for idx in 0..page_count {
+                        let idx = u16::try_from(idx)?;
+                        let page =
+                            PdfParser::render_page(&document, idx, render_dpi, max_render_pixels)?;
+                        if tx.blocking_send((idx as usize, page)).is_err() {
+                            break;
+                        }
                     }
-                }
-                Ok::<_, anyhow::Error>(())
-            });
+                    Ok::<_, anyhow::Error>(())
+                });
 
-            // Stage 2: full-page OCR, bounded to `parallel` concurrent VLM calls.
-            let page_sem = Arc::new(tokio::sync::Semaphore::new(parallel.max(1)));
-            let mut tasks = tokio::task::JoinSet::new();
-            while let Some((i, page)) = rx.recv().await {
-                let permit = Arc::clone(&page_sem)
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("page semaphore closed mid-paper: {e}"))?;
-                let ocr = Arc::clone(&ocr);
-                let on_progress = Arc::clone(&on_progress);
-                let completed = Arc::clone(&completed);
-                tasks.spawn(async move {
-                    let _permit = permit;
-                    on_progress(ProgressEvent {
-                        stage: "vlm".into(),
-                        page: i as u64,
-                        total_pages: total,
-                        message: format!("Starting OCR page {}/{total}", i + 1),
-                    });
-                    let downscaled = maybe_downscale(&page.image, max_dim);
-                    let text = match encode_jpeg(&downscaled) {
-                        Ok(image_bytes) => {
-                            tracing::info!(
-                                "Processing page {}/{} ({}x{}, {} bytes JPEG)",
-                                i + 1,
-                                total,
-                                page.image.width(),
-                                page.image.height(),
-                                image_bytes.len()
-                            );
-                            match ocr.recognize(&image_bytes).await {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        page = i + 1,
-                                        "full-page VLM failed — emitting empty page (paper continues)"
-                                    );
-                                    String::new()
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                page = i + 1,
-                                "full-page JPEG encode failed — emitting empty page (paper continues)"
-                            );
-                            String::new()
-                        }
-                    };
-                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    on_progress(ProgressEvent {
-                        stage: "vlm".into(),
-                        page: done,
-                        total_pages: total,
-                        message: format!("OCR page {done}/{total}"),
-                    });
-                    (i, text)
+                // Stage 2: full-page OCR, bounded to `parallel` concurrent VLM calls.
+                let markdowns = recognize_full_pages(
+                    Arc::clone(&self.ocr),
+                    rx,
+                    total,
+                    max_dim,
+                    parallel,
+                    Arc::clone(&on_progress),
+                )
+                .await?;
+                render.await??;
+
+                // FullPage mode bypasses layout detection — no per-page region
+                // class info exists. Empty class lists tell QC "not bibliography",
+                // which means strict default ceiling everywhere — the safer choice
+                // when layout context is absent.
+                let markdown = join_pages(&markdowns);
+                let per_page_region_classes = vec![Vec::new(); markdowns.len()];
+                // FullPage mode bypasses prepare_page so we don't have layout
+                // metadata. Emit minimal diag rows so downstream JSONL alignment
+                // (one record per page) still holds.
+                let backend_name = self.ocr.backend_name().to_string();
+                let dpi = self.config.dpi;
+                let per_page_diags: Vec<crate::diag::PageDiagRecord> = markdowns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, md)| crate::diag::PageDiagRecord {
+                        page_index: i,
+                        dpi,
+                        routing_path: "full-page".to_string(),
+                        backend: backend_name.clone(),
+                        raw_vlm_output_len: md.len(),
+                        raw_vlm_output_first_1k: crate::diag::truncate_at_char_boundary(md, 1024),
+                        output_byte_count: md.len(),
+                        ..Default::default()
+                    })
+                    .collect();
+                return Ok(crate::client::ConversionResult {
+                    markdown,
+                    per_page_region_classes,
+                    per_page_diags,
                 });
             }
-
-            let mut collected: Vec<(usize, String)> = Vec::with_capacity(total as usize);
-            while let Some(res) = tasks.join_next().await {
-                collected.push(res?);
-            }
-            render.await??;
-            collected.sort_by_key(|(i, _)| *i);
-            let markdowns: Vec<String> = collected.into_iter().map(|(_, md)| md).collect();
-
-            // FullPage mode bypasses layout detection — no per-page region
-            // class info exists. Empty class lists tell QC "not bibliography",
-            // which means strict default ceiling everywhere — the safer choice
-            // when layout context is absent.
-            let markdown = join_pages(&markdowns);
-            let per_page_region_classes = vec![Vec::new(); markdowns.len()];
-            // FullPage mode bypasses prepare_page so we don't have layout
-            // metadata. Emit minimal diag rows so downstream JSONL alignment
-            // (one record per page) still holds.
-            let backend_name = self.ocr.backend_name().to_string();
-            let dpi = self.config.dpi;
-            let per_page_diags: Vec<crate::diag::PageDiagRecord> = markdowns
-                .iter()
-                .enumerate()
-                .map(|(i, md)| crate::diag::PageDiagRecord {
-                    page_index: i,
-                    dpi,
-                    routing_path: "full-page".to_string(),
-                    backend: backend_name.clone(),
-                    raw_vlm_output_len: md.len(),
-                    raw_vlm_output_first_1k: crate::diag::truncate_at_char_boundary(md, 1024),
-                    output_byte_count: md.len(),
-                    ..Default::default()
-                })
-                .collect();
-            return Ok(crate::client::ConversionResult {
-                markdown,
-                per_page_region_classes,
-                per_page_diags,
-            });
-        }
+            Pipeline::PerRegion { layout, table } => (Arc::clone(layout), Arc::clone(table)),
+        };
 
         // Per-region mode: 2-stage async pipeline
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<PreparedPage>(3);
+        let (tx, rx) = tokio::sync::mpsc::channel::<PreparedPage>(3);
         let vlm_sem = Arc::clone(&self.vlm_sem);
-
-        let layout = self.layout_detectors.clone();
-        let table = self.table_recognizers.clone();
         let on_progress_s1 = Arc::clone(&on_progress);
 
         // Stage 1 renders each page just before it detects layout and drops it
@@ -611,7 +594,8 @@ impl Processor {
         let stage1 = tokio::task::spawn_blocking(move || {
             let parser = PdfParser::new()?;
             let document = parser.open(&pdf_path_owned)?;
-            for idx in 0..total as u16 {
+            for idx in 0..page_count {
+                let idx = u16::try_from(idx)?;
                 let page_no = idx as usize;
                 on_progress_s1(ProgressEvent {
                     stage: "layout".into(),
@@ -619,7 +603,7 @@ impl Processor {
                     total_pages: total,
                     message: format!("Detecting layout page {}/{total}", page_no + 1),
                 });
-                let page = PdfParser::render_page(&document, idx, render_dpi)?;
+                let page = PdfParser::render_page(&document, idx, render_dpi, max_render_pixels)?;
                 tracing::info!(
                     "Preparing page {}/{} ({}x{}, per-region)",
                     page_no + 1,
@@ -645,59 +629,17 @@ impl Processor {
         let ocr = Arc::clone(&self.ocr);
         let region_parallel = self.config.region_parallel;
         let dpi = self.config.dpi;
-        let vlm_completed = Arc::new(AtomicU64::new(0));
-        let mut tasks = tokio::task::JoinSet::new();
-
-        // Per-paper page-fanout cap. Without this the JoinSet below would
-        // spawn one task per page as fast as stage-1 produces them, and a
-        // single 50-page paper × `region_parallel` regions could put 100+
-        // concurrent VLM calls against llama-server's small slot pool —
-        // every new request evicts another slot's 50–64 MB prompt cache,
-        // which is what manifests as `prompt cache update took 32993 ms`
-        // and 1.55 t/s eval. Cap pages-in-flight per paper so the
-        // worst-case fanout stays inside the slot pool's capacity. Tune
-        // via `HS_SCRIBE_PAGE_PARALLEL`; default 2 in `AppConfig`.
-        let page_sem = Arc::new(tokio::sync::Semaphore::new(self.config.page_parallel));
-
-        while let Some(prepared) = rx.recv().await {
-            let page_permit = Arc::clone(&page_sem)
-                .acquire_owned()
-                .await
-                .map_err(|e| anyhow::anyhow!("page semaphore closed mid-paper: {e}"))?;
-            let ocr = Arc::clone(&ocr);
-            let sem = Arc::clone(&vlm_sem);
-            let on_progress = Arc::clone(&on_progress);
-            let vlm_completed = Arc::clone(&vlm_completed);
-            tasks.spawn(async move {
-                let _page_permit = page_permit; // released when this page's VLM finishes
-                let done = vlm_completed.fetch_add(1, Ordering::Relaxed) + 1;
-                let result = execute_vlm_for_page(
-                    prepared,
-                    ocr,
-                    sem,
-                    region_parallel,
-                    Arc::clone(&on_progress),
-                    done,
-                    total,
-                    dpi,
-                )
-                .await;
-                on_progress(ProgressEvent {
-                    stage: "vlm".into(),
-                    page: done,
-                    total_pages: total,
-                    message: format!("Completed page {done}/{total}"),
-                });
-                result
-            });
-        }
-
-        let mut results: Vec<(usize, String, Vec<String>, crate::diag::PageDiagRecord)> =
-            Vec::with_capacity(total as usize);
-        while let Some(res) = tasks.join_next().await {
-            results.push(res??);
-        }
-        results.sort_by_key(|(idx, _, _, _)| *idx);
+        let results = execute_prepared_pages(
+            ocr,
+            vlm_sem,
+            rx,
+            total,
+            region_parallel,
+            dpi,
+            self.config.page_parallel,
+            Arc::clone(&on_progress),
+        )
+        .await?;
 
         stage1.await??;
 
@@ -722,226 +664,222 @@ impl Processor {
             per_page_diags,
         })
     }
-
-    pub async fn process_pdf(&self, pdf_path: &str) -> Result<String> {
-        let total = {
-            let pdf_parser = PdfParser::new()?;
-            pdf_parser.page_count(pdf_path)?
-        };
-
-        if !self.is_per_region() {
-            // Full-page mode: pages can be processed in parallel with downscaling
-            let ocr = Arc::clone(&self.ocr);
-            let max_dim = self.config.max_image_dim;
-            let parallel = self.config.parallel;
-            // Stream-render pages through a small bounded channel (one page of
-            // raster resident at a time) and OCR them bounded to `parallel`.
-            let pdf_path_owned = pdf_path.to_string();
-            let render_dpi = self.config.dpi;
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, PageData)>(2);
-            let render = tokio::task::spawn_blocking(move || {
-                let parser = PdfParser::new()?;
-                let document = parser.open(&pdf_path_owned)?;
-                for idx in 0..total as u16 {
-                    let page = PdfParser::render_page(&document, idx, render_dpi)?;
-                    if tx.blocking_send((idx as usize, page)).is_err() {
-                        break;
-                    }
-                }
-                Ok::<_, anyhow::Error>(())
-            });
-
-            let page_sem = Arc::new(tokio::sync::Semaphore::new(parallel.max(1)));
-            let mut tasks = tokio::task::JoinSet::new();
-            while let Some((i, page)) = rx.recv().await {
-                let permit = Arc::clone(&page_sem)
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("page semaphore closed mid-paper: {e}"))?;
-                let ocr = Arc::clone(&ocr);
-                tasks.spawn(async move {
-                    let _permit = permit;
-                    let downscaled = maybe_downscale(&page.image, max_dim);
-                    let text = match encode_jpeg(&downscaled) {
-                        Ok(image_bytes) => {
-                            tracing::info!(
-                                "Processing page {}/{} ({}x{}, {} bytes JPEG)",
-                                i + 1,
-                                total,
-                                page.image.width(),
-                                page.image.height(),
-                                image_bytes.len()
-                            );
-                            match ocr.recognize(&image_bytes).await {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        page = i + 1,
-                                        "full-page VLM failed — emitting empty page (paper continues)"
-                                    );
-                                    String::new()
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                page = i + 1,
-                                "full-page JPEG encode failed — emitting empty page (paper continues)"
-                            );
-                            String::new()
-                        }
-                    };
-                    (i, text)
-                });
-            }
-
-            let mut collected: Vec<(usize, String)> = Vec::with_capacity(total);
-            while let Some(res) = tasks.join_next().await {
-                collected.push(res?);
-            }
-            render.await??;
-            collected.sort_by_key(|(i, _)| *i);
-            let markdowns: Vec<String> = collected.into_iter().map(|(_, md)| md).collect();
-
-            return Ok(join_pages(&markdowns));
-        }
-
-        // Per-region mode: 2-stage async pipeline
-        // Stage 1 (CPU): layout detection, cropping, JPEG encoding — pool-gated
-        // Stage 2 (VLM): HTTP inference — concurrent across pages
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<PreparedPage>(3);
-        let vlm_sem = Arc::clone(&self.vlm_sem);
-
-        let layout = self.layout_detectors.clone();
-        let table = self.table_recognizers.clone();
-
-        let pdf_path_owned = pdf_path.to_string();
-        let render_dpi = self.config.dpi;
-        let stage1 = tokio::task::spawn_blocking(move || {
-            let parser = PdfParser::new()?;
-            let document = parser.open(&pdf_path_owned)?;
-            for idx in 0..total as u16 {
-                let page_no = idx as usize;
-                let page = PdfParser::render_page(&document, idx, render_dpi)?;
-                tracing::info!(
-                    "Preparing page {}/{} ({}x{}, per-region)",
-                    page_no + 1,
-                    total,
-                    page.image.width(),
-                    page.image.height(),
-                );
-                let prepared = prepare_page(page_no, &page.image, &layout, &table)?;
-                if tx.blocking_send(prepared).is_err() {
-                    break;
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        });
-
-        // Stage 2: VLM inference (concurrent across pages)
-        let ocr = Arc::clone(&self.ocr);
-        let region_parallel = self.config.region_parallel;
-        let dpi = self.config.dpi;
-        let mut tasks = tokio::task::JoinSet::new();
-
-        while let Some(prepared) = rx.recv().await {
-            let ocr = Arc::clone(&ocr);
-            let sem = Arc::clone(&vlm_sem);
-            let noop: Arc<dyn Fn(ProgressEvent) + Send + Sync> = Arc::new(|_| {});
-            tasks.spawn(async move {
-                execute_vlm_for_page(prepared, ocr, sem, region_parallel, noop, 0, 0, dpi).await
-            });
-        }
-
-        // Collect results, sort by page index. process_pdf only returns
-        // markdown — region classes and diag records (the tail tuple
-        // elements) are collected by execute_vlm_for_page but dropped here.
-        // Callers that need them (event_watch's per-page QC, --diag JSONL)
-        // use process_pdf_with_progress.
-        let mut results: Vec<(usize, String, Vec<String>, crate::diag::PageDiagRecord)> =
-            Vec::with_capacity(total);
-        while let Some(res) = tasks.join_next().await {
-            results.push(res??);
-        }
-        results.sort_by_key(|(idx, _, _, _)| *idx);
-
-        stage1.await??;
-        Ok(join_pages(
-            &results
-                .into_iter()
-                .map(|(_, md, _, _)| md)
-                .collect::<Vec<_>>(),
-        ))
-    }
 }
 
+/// Full-page stage 2: OCR each rendered page, at most `parallel` VLM calls
+/// at once, and return the pages' markdown in page order. A page whose JPEG
+/// encode or VLM call fails fails the whole conversion — it is never turned
+/// into an empty page — and it does so as soon as it is noticed, not after
+/// the rest of the book has been OCR'd against a backend that is down.
+async fn recognize_full_pages(
+    ocr: Arc<OcrEngine>,
+    mut rx: tokio::sync::mpsc::Receiver<(usize, PageData)>,
+    total: u64,
+    max_dim: u32,
+    parallel: usize,
+    on_progress: Arc<dyn Fn(ProgressEvent) + Send + Sync>,
+) -> Result<Vec<String>> {
+    let completed = Arc::new(AtomicU64::new(0));
+    let page_sem = Arc::new(tokio::sync::Semaphore::new(parallel));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut collected: Vec<(usize, String)> = Vec::with_capacity(total as usize);
+    while let Some((i, page)) = rx.recv().await {
+        while let Some(done) = tasks.try_join_next() {
+            collected.push(done??);
+        }
+        let permit = Arc::clone(&page_sem)
+            .acquire_owned()
+            .await
+            .map_err(|e| anyhow::anyhow!("page semaphore closed mid-paper: {e}"))?;
+        let ocr = Arc::clone(&ocr);
+        let on_progress = Arc::clone(&on_progress);
+        let completed = Arc::clone(&completed);
+        tasks.spawn(async move {
+            let _permit = permit;
+            on_progress(ProgressEvent {
+                stage: "vlm".into(),
+                page: i as u64,
+                total_pages: total,
+                message: format!("Starting OCR page {}/{total}", i + 1),
+            });
+            let downscaled = maybe_downscale(&page.image, max_dim);
+            let image_bytes = encode_jpeg(&downscaled)
+                .with_context(|| format!("full-page JPEG encode failed on page {}", i + 1))?;
+            tracing::info!(
+                "Processing page {}/{} ({}x{}, {} bytes JPEG)",
+                i + 1,
+                total,
+                page.image.width(),
+                page.image.height(),
+                image_bytes.len()
+            );
+            let text = ocr
+                .recognize(&image_bytes)
+                .await
+                .with_context(|| format!("full-page VLM failed on page {}", i + 1))?;
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            on_progress(ProgressEvent {
+                stage: "vlm".into(),
+                page: done,
+                total_pages: total,
+                message: format!("OCR page {done}/{total}"),
+            });
+            Ok::<_, anyhow::Error>((i, text))
+        });
+    }
+    while let Some(res) = tasks.join_next().await {
+        collected.push(res??);
+    }
+    collected.sort_by_key(|(i, _)| *i);
+    Ok(collected.into_iter().map(|(_, md)| md).collect())
+}
+
+type PageOutput = (usize, String, Vec<String>, crate::diag::PageDiagRecord);
+
+/// Per-region stage 2: run the VLM over each prepared page and return the
+/// pages' `(index, markdown, region classes, diag)` in page order.
+///
+/// Per-paper page-fanout cap: without `page_parallel` the JoinSet below
+/// would spawn one task per page as fast as stage 1 produces them, and a
+/// single 50-page paper × `region_parallel` regions could put 100+
+/// concurrent VLM calls against llama-server's small slot pool — every new
+/// request evicts another slot's 50–64 MB prompt cache, which is what
+/// manifests as `prompt cache update took 32993 ms` and 1.55 t/s eval. Cap
+/// pages-in-flight per paper so the worst-case fanout stays inside the slot
+/// pool's capacity. Tune via `HS_SCRIBE_PAGE_PARALLEL`; default 2 in
+/// `AppConfig`.
+///
+/// A page-fatal error ends the conversion as soon as it is noticed.
+#[allow(clippy::too_many_arguments)]
+async fn execute_prepared_pages(
+    ocr: Arc<OcrEngine>,
+    vlm_sem: Arc<tokio::sync::Semaphore>,
+    mut rx: tokio::sync::mpsc::Receiver<PreparedPage>,
+    total: u64,
+    region_parallel: usize,
+    dpi: u16,
+    page_parallel: usize,
+    on_progress: Arc<dyn Fn(ProgressEvent) + Send + Sync>,
+) -> Result<Vec<PageOutput>> {
+    let vlm_completed = Arc::new(AtomicU64::new(0));
+    let page_sem = Arc::new(tokio::sync::Semaphore::new(page_parallel));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut results: Vec<PageOutput> = Vec::with_capacity(total as usize);
+
+    while let Some(prepared) = rx.recv().await {
+        while let Some(done) = tasks.try_join_next() {
+            results.push(done??);
+        }
+        let page_permit = Arc::clone(&page_sem)
+            .acquire_owned()
+            .await
+            .map_err(|e| anyhow::anyhow!("page semaphore closed mid-paper: {e}"))?;
+        let ocr = Arc::clone(&ocr);
+        let sem = Arc::clone(&vlm_sem);
+        let on_progress = Arc::clone(&on_progress);
+        let vlm_completed = Arc::clone(&vlm_completed);
+        tasks.spawn(async move {
+            let _page_permit = page_permit; // released when this page's VLM finishes
+            let done = vlm_completed.fetch_add(1, Ordering::Relaxed) + 1;
+            let result = execute_vlm_for_page(
+                prepared,
+                ocr,
+                sem,
+                region_parallel,
+                Arc::clone(&on_progress),
+                done,
+                total,
+                dpi,
+            )
+            .await;
+            on_progress(ProgressEvent {
+                stage: "vlm".into(),
+                page: done,
+                total_pages: total,
+                message: format!("Completed page {done}/{total}"),
+            });
+            result
+        });
+    }
+
+    while let Some(res) = tasks.join_next().await {
+        results.push(res??);
+    }
+    results.sort_by_key(|(idx, _, _, _)| *idx);
+    Ok(results)
+}
+
+/// Load `pool_size` layout detectors, or say why the server cannot start.
+/// There is no partial pool and no degraded mode: per-region conversion
+/// needs the layout model, and a pipeline that quietly fell back to
+/// full-page VLM (the repetition-loop path this mode exists to avoid)
+/// would serve a healthy `/health` while producing the wrong thing.
 fn build_layout_pool(
     config: &AppConfig,
     pool_size: usize,
-) -> (Option<Arc<DetectorPool<LayoutDetector>>>, Option<String>) {
+) -> Result<Arc<DetectorPool<LayoutDetector>>> {
     let layout_path = config.resolved_layout_model_path();
     if !layout_path.exists() {
-        let reason = format!("model file not found at {}", layout_path.display());
-        tracing::warn!("{reason}. Falling back to FullPage mode.");
-        return (None, Some(reason));
+        anyhow::bail!(
+            "layout model not found at {} (pipeline_mode is per_region)",
+            layout_path.display()
+        );
     }
-
-    let path_str = layout_path.to_str().unwrap_or_default();
+    let path_str = layout_path
+        .to_str()
+        .context("layout model path is not valid UTF-8")?;
     let mut slots: Vec<LayoutDetector> = Vec::with_capacity(pool_size);
     for i in 0..pool_size {
-        match LayoutDetector::new(path_str, config.use_cuda) {
-            Ok(det) => slots.push(det),
-            Err(e) => {
-                // One path: any slot failure aborts the whole pool. No
-                // "at least one loaded" partial state to reason about.
-                let reason = format!("load failed on slot {i}/{pool_size}: {e}");
-                tracing::warn!(
-                    "Failed to load layout detector: {e}. Falling back to FullPage mode."
-                );
-                return (None, Some(reason));
-            }
-        }
+        slots.push(
+            LayoutDetector::new(path_str, config.use_cuda).with_context(|| {
+                format!(
+                    "loading layout detector {}/{pool_size} from {}",
+                    i + 1,
+                    layout_path.display()
+                )
+            })?,
+        );
     }
 
     tracing::info!(
         "Layout detector pool loaded from {} (N={pool_size})",
         layout_path.display()
     );
-    (Some(Arc::new(DetectorPool::new(slots))), None)
+    Ok(Arc::new(DetectorPool::new(slots)))
 }
 
+/// Load `pool_size` table-structure recognizers, or say why the server
+/// cannot start. Same rule as [`build_layout_pool`]: no "tables go to the
+/// VLM" degraded path.
 fn build_table_pool(
     config: &AppConfig,
     pool_size: usize,
-) -> (
-    Option<Arc<DetectorPool<TableStructureRecognizer>>>,
-    Option<String>,
-) {
+) -> Result<Arc<DetectorPool<TableStructureRecognizer>>> {
     let slanet_path = config.resolved_table_model_path();
     if !slanet_path.exists() {
-        let reason = format!("model file not found at {}", slanet_path.display());
-        tracing::info!("{reason}, tables go to VLM");
-        return (None, Some(reason));
+        anyhow::bail!(
+            "table structure model not found at {} (pipeline_mode is per_region)",
+            slanet_path.display()
+        );
     }
-
-    let path_str = slanet_path.to_str().unwrap_or_default();
+    let path_str = slanet_path
+        .to_str()
+        .context("table model path is not valid UTF-8")?;
     let mut slots: Vec<TableStructureRecognizer> = Vec::with_capacity(pool_size);
     for i in 0..pool_size {
-        match TableStructureRecognizer::new(path_str, config.use_cuda) {
-            Ok(r) => slots.push(r),
-            Err(e) => {
-                let reason = format!("load failed on slot {i}/{pool_size}: {e}");
-                tracing::warn!("Table structure recognizer not available: {e}");
-                return (None, Some(reason));
-            }
-        }
+        slots.push(
+            TableStructureRecognizer::new(path_str, config.use_cuda).with_context(|| {
+                format!(
+                    "loading table recognizer {}/{pool_size} from {}",
+                    i + 1,
+                    slanet_path.display()
+                )
+            })?,
+        );
     }
 
     tracing::info!("Table structure recognizer pool loaded (SLANet-Plus, N={pool_size})");
-    (Some(Arc::new(DetectorPool::new(slots))), None)
+    Ok(Arc::new(DetectorPool::new(slots)))
 }
 
 /// Downscale an image if its longest dimension exceeds max_dim.
@@ -964,14 +902,11 @@ fn maybe_downscale(image: &DynamicImage, max_dim: u32) -> DynamicImage {
 fn prepare_page(
     page_idx: usize,
     image: &DynamicImage,
-    layout: &Option<Arc<DetectorPool<LayoutDetector>>>,
-    table: &Option<Arc<DetectorPool<TableStructureRecognizer>>>,
+    layout: &DetectorPool<LayoutDetector>,
+    table: &DetectorPool<TableStructureRecognizer>,
 ) -> Result<PreparedPage> {
     let bboxes = {
-        let pool = layout
-            .as_ref()
-            .expect("per-region requires layout_detectors");
-        let mut det = pool.acquire()?;
+        let mut det = layout.acquire()?;
         det.detect(image)?
     };
 
@@ -999,6 +934,7 @@ fn prepare_page(
             text_regions: vec![],
             table_regions: vec![],
             column_split_shadow: None,
+            skipped_regions: 0,
         });
     }
 
@@ -1045,7 +981,7 @@ fn prepare_page(
     let mut table_bboxes = Vec::new();
     let mut other_bboxes = Vec::new();
     for bbox in bboxes {
-        if RegionType::from_class(&bbox.class_name) == RegionType::Table && table.is_some() {
+        if RegionType::from_class(&bbox.class_name) == RegionType::Table {
             table_bboxes.push(bbox);
         } else {
             other_bboxes.push(bbox);
@@ -1093,32 +1029,24 @@ fn prepare_page(
             jpeg_bytes,
         });
     }
-    if skipped_regions > 0 {
-        tracing::warn!(
-            skipped_regions,
-            kept_regions = text_regions.len(),
-            "page {} has skipped regions; page output will be partial",
-            page_idx + 1
-        );
-    }
-
     // Prepare table regions: SLANet structure + per-cell crop + JPEG
-    // encode. A 0-dim table crop drops the whole table; a 0-dim cell
-    // crop emits an empty Vec for that cell (SLANet's structure still
-    // needs one slot per cell so alignment is preserved).
+    // encode. A 0-dim table crop drops the whole table (counted as a
+    // skipped region); a 0-dim cell crop emits an empty Vec for that cell
+    // (SLANet's structure still needs one slot per cell so alignment is
+    // preserved).
     let mut table_regions = Vec::with_capacity(table_bboxes.len());
     for bbox in table_bboxes {
         let Some(crop) = crop_bbox(image, &bbox) else {
             tracing::warn!(
                 class = %bbox.class_name,
                 x1 = bbox.x1, y1 = bbox.y1, x2 = bbox.x2, y2 = bbox.y2,
-                "table crop 0-dim after clamp — skipping table (page continues)"
+                "table crop 0-dim after clamp — skipping table"
             );
+            skipped_regions += 1;
             continue;
         };
         let structure = {
-            let pool = table.as_ref().expect("table_recognizers required");
-            let mut rec = pool.acquire()?;
+            let mut rec = table.acquire()?;
             rec.recognize(&crop)?
         };
 
@@ -1170,6 +1098,18 @@ fn prepare_page(
         });
     }
 
+    if skipped_regions > 0 {
+        // These regions are missing from the page's markdown. The count
+        // travels to the client in the page's diag record and the QC gate
+        // refuses to record the conversion (`QcVerdict::RejectGapped`).
+        tracing::warn!(
+            skipped_regions,
+            kept_regions = text_regions.len() + table_regions.len(),
+            "page {} has skipped regions; the conversion will be rejected as gapped",
+            page_idx + 1
+        );
+    }
+
     Ok(PreparedPage {
         page_idx,
         region_classes,
@@ -1179,6 +1119,7 @@ fn prepare_page(
         text_regions,
         table_regions,
         column_split_shadow,
+        skipped_regions: skipped_regions as u32,
     })
 }
 
@@ -1209,6 +1150,7 @@ async fn execute_vlm_for_page(
         text_regions,
         table_regions,
         column_split_shadow,
+        skipped_regions,
     } = prepared;
 
     let total_regions = text_regions.len();
@@ -1441,6 +1383,7 @@ async fn execute_vlm_for_page(
         wall_clock_ms: started.elapsed().as_millis() as u64,
         column_split_shadow,
         repetition_aborted_regions: aborted_count,
+        skipped_regions,
     };
     Ok((page_idx, markdown, region_classes, diag))
 }
@@ -1588,5 +1531,155 @@ mod tests {
         // 1×1 encodes fine
         let tiny = img(1, 1);
         assert!(encode_jpeg(&tiny).is_ok());
+    }
+
+    #[test]
+    fn page_counts_beyond_what_pdfium_can_index_are_refused_not_truncated() {
+        // `0..total as u16` used to convert only `total mod 65536` pages.
+        assert_eq!(checked_page_count(1).unwrap(), 1);
+        assert_eq!(checked_page_count(65_536).unwrap(), 65_536);
+        for bad in [0usize, 65_537, 70_000, usize::MAX] {
+            let e = checked_page_count(bad).unwrap_err();
+            assert_eq!(
+                crate::classify::failure_code(&e),
+                Some(FailureCode::PdfParseError),
+                "{bad}"
+            );
+        }
+    }
+
+    /// A VLM stand-in on loopback: answers every request with `reply`.
+    async fn fake_vlm(reply: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 256 * 1024];
+                    let mut got = 0;
+                    // Read the whole (single-write) request before answering.
+                    while let Ok(Ok(n)) = tokio::time::timeout(
+                        std::time::Duration::from_millis(150),
+                        sock.read(&mut buf[got..]),
+                    )
+                    .await
+                    {
+                        if n == 0 {
+                            break;
+                        }
+                        got += n;
+                    }
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        url
+    }
+
+    fn sse_reply(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn full_page_run(vlm_url: &str, pages: usize) -> Result<Vec<String>> {
+        let config = AppConfig {
+            backend: crate::config::BackendChoice::OpenAi,
+            openai_url: vlm_url.to_string(),
+            pipeline_mode: PipelineMode::FullPage,
+            ..AppConfig::default()
+        };
+        let ocr = Arc::new(OcrEngine::from_config(&config)?);
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tokio::spawn(async move {
+            for idx in 0..pages {
+                let page = PageData {
+                    page_idx: idx,
+                    image: img(8, 8),
+                    width: 8.0,
+                    height: 8.0,
+                    text: None,
+                };
+                if tx.send((idx, page)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        recognize_full_pages(ocr, rx, pages as u64, 1800, 2, Arc::new(|_| {})).await
+    }
+
+    #[tokio::test]
+    async fn a_vlm_failure_on_a_full_page_fails_the_conversion_instead_of_an_empty_page() {
+        let url = fake_vlm(sse_reply("400 Bad Request", "{\"error\":\"bad\"}")).await;
+        let err = full_page_run(&url, 3).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("full-page VLM failed on page"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_vlm_stream_on_a_full_page_fails_the_conversion() {
+        // A clean EOF with no [DONE] / finish_reason=stop used to be a short success.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"half a pa\"}}]}\n\n";
+        let url = fake_vlm(sse_reply("200 OK", body)).await;
+        let err = full_page_run(&url, 2).await.unwrap_err();
+        assert_eq!(
+            crate::classify::failure_code(&err),
+            Some(FailureCode::VlmTransportError),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_vlm_answers_come_back_in_page_order() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"page text\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let url = fake_vlm(sse_reply("200 OK", body)).await;
+        let pages = full_page_run(&url, 4).await.unwrap();
+        assert_eq!(pages, vec!["page text"; 4]);
+    }
+
+    #[tokio::test]
+    async fn regions_the_pipeline_dropped_reach_the_page_diag_record() {
+        // No VLM call is made for a page with no text regions; the count
+        // prepare_page recorded must come out in the diag the QC gate reads.
+        let config = AppConfig::default();
+        let ocr = Arc::new(OcrEngine::from_config(&config).unwrap());
+        let prepared = PreparedPage {
+            page_idx: 4,
+            region_classes: vec![],
+            image_width: 10,
+            image_height: 10,
+            detection_order: vec![],
+            text_regions: vec![],
+            table_regions: vec![],
+            column_split_shadow: None,
+            skipped_regions: 2,
+        };
+        let (_, _, _, diag) = execute_vlm_for_page(
+            prepared,
+            ocr,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            1,
+            Arc::new(|_| {}),
+            1,
+            1,
+            200,
+        )
+        .await
+        .unwrap();
+        assert_eq!(diag.skipped_regions, 2);
+        let result = crate::client::ConversionResult {
+            per_page_diags: vec![diag],
+            ..Default::default()
+        };
+        assert_eq!(result.skipped_regions(), 2);
     }
 }
