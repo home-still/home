@@ -1,4 +1,3 @@
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,22 +6,19 @@ use hs_common::compose::ComposeCmd;
 use hs_common::global_args::GlobalArgs;
 use hs_common::reporter::Reporter;
 
-const GITHUB_API_LATEST: &str = "https://api.github.com/repos/home-still/home/releases/latest";
-const GITHUB_API_RELEASES: &str = "https://api.github.com/repos/home-still/home/releases";
+use crate::installer::{Installer, Prepared, Release};
 
-// ── GitHub API types ────────────────────────────────────────────
+/// How long the upgraded services get to answer `/health`.
+const HEALTH_WAIT_SECS: u64 = 90;
 
-#[derive(serde::Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
-    assets: Vec<GitHubAsset>,
-}
-
-#[derive(serde::Deserialize)]
-struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-}
+/// Companion binaries upgraded when already installed on this host. Each
+/// name is a release-asset prefix (see `.github/workflows/release.yaml`).
+const COMPANIONS: [&str; 4] = [
+    "hs-distill-server",
+    "hs-gateway",
+    "hs-mcp",
+    "hs-scribe-server",
+];
 
 // ── Entry point ─────────────────────────────────────────────────
 
@@ -37,10 +33,20 @@ pub async fn run(
     reporter.status("Current", &format!("hs {current}"));
 
     // Phase 1: fetch latest release (including pre-releases if --pre)
+    let target = crate::installer::detect_target()?;
+    let installer = Installer::new(crate::installer::DEFAULT_API_BASE, target)?;
+    reporter.status(
+        "Checking",
+        if include_pre {
+            "GitHub for latest release (including pre-releases)..."
+        } else {
+            "GitHub for latest release..."
+        },
+    );
     let release = if include_pre {
-        fetch_latest_release_including_pre(reporter).await?
+        installer.latest_release_including_pre().await?
     } else {
-        fetch_latest_release(reporter).await?
+        installer.latest_release().await?
     };
     let latest = parse_release_version(&release.tag_name)?;
 
@@ -76,50 +82,24 @@ pub async fn run(
         }
     }
 
-    // Phase 3: download and replace binaries
-    let target = detect_target()?;
+    // Phase 3: resolve every asset (and its checksum) before replacing any
+    // binary, then download and replace.
     reporter.status("Platform", target);
+    let plan = plan_installs(&installer, &release, reporter).await?;
 
-    let hs_installed = download_and_replace_binary(&release, "hs", target, reporter).await?;
-
-    // The binaries this run actually replaced; the restart phase is driven by
-    // this set, not by a fixed list of service names.
+    // The binaries this run replaced; the restart phase is driven by this
+    // set, not by a fixed list of service names.
     let mut replaced: Vec<PathBuf> = Vec::new();
-
-    if hs_installed {
-        reporter.status("Upgraded", &format!("hs → {latest}"));
-        replaced.push(install_path_for("hs")?);
+    for (prepared, path) in &plan.installs {
+        installer.install(prepared, path, reporter).await?;
+        reporter.status("Upgraded", &format!("{} → {latest}", prepared.binary));
+        replaced.push(path.clone());
     }
-
-    // Upgrade companion binaries if they're already installed. Each name
-    // must match a release-asset prefix (see `.github/workflows/release.yaml`)
-    // and the binary on disk gets located by `find_companion_binary` — we
-    // only swap binaries that are actually installed on this host, so a
-    // CLI-only client doesn't try to pull GPU server binaries.
-    for (name, finder) in [
-        (
-            "hs-distill-server",
-            find_companion_binary("hs-distill-server"),
-        ),
-        ("hs-gateway", find_companion_binary("hs-gateway")),
-        ("hs-mcp", find_companion_binary("hs-mcp")),
-        (
-            "hs-scribe-server",
-            find_companion_binary("hs-scribe-server"),
-        ),
-    ] {
-        if finder.is_some() {
-            let installed = download_and_replace_binary(&release, name, target, reporter).await?;
-            if installed {
-                reporter.status("Upgraded", &format!("{name} → {latest}"));
-                replaced.push(install_path_for(name)?);
-            } else {
-                reporter.status(
-                    "Skipped",
-                    &format!("{name} (no release asset for this platform)"),
-                );
-            }
-        }
+    if !plan.skipped.is_empty() {
+        reporter.warn(&format!(
+            "not upgraded (no release asset for {target}): {}",
+            plan.skipped.join(", ")
+        ));
     }
 
     // Phase 4: update Docker services
@@ -135,12 +115,55 @@ pub async fn run(
     crate::restart_cmd::after_upgrade(&replaced, reporter).await?;
 
     // Phase 6: health check
-    post_upgrade_health_check(reporter).await;
+    post_upgrade_health_check(reporter).await?;
 
+    let tail = if plan.skipped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Not upgraded (no asset for {target}): {}.",
+            plan.skipped.join(", ")
+        )
+    };
     reporter.finish(&format!(
-        "Upgraded to {latest}. Run `hs status` for full dashboard."
+        "Upgraded to {latest}. Run `hs status` for full dashboard.{tail}"
     ));
     Ok(())
+}
+
+struct InstallPlan {
+    /// Resolved, checksum-verified-in-advance binaries and where they go.
+    installs: Vec<(Prepared, PathBuf)>,
+    /// Installed companions the release publishes no asset for on this platform.
+    skipped: Vec<&'static str>,
+}
+
+/// `hs` is mandatory (missing asset = Err); a companion is planned only when
+/// installed on this host, and skipped loudly when the release has no asset.
+async fn plan_installs(
+    installer: &Installer,
+    release: &Release,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<InstallPlan> {
+    let hs = installer.prepare_required(release, "hs").await?;
+    let mut installs = vec![(hs, install_path_for("hs")?)];
+    let mut skipped = Vec::new();
+    for name in COMPANIONS {
+        let Some(path) = find_companion_binary(name) else {
+            continue;
+        };
+        match installer.prepare(release, name).await? {
+            Some(p) => installs.push((p, path)),
+            None => {
+                reporter.warn(&format!(
+                    "{name} is installed but the release has no asset for {}; leaving it at its current version",
+                    installer.target()
+                ));
+                skipped.push(name);
+            }
+        }
+    }
+    Ok(InstallPlan { installs, skipped })
 }
 
 // ── Version helpers ─────────────────────────────────────────────
@@ -166,185 +189,6 @@ fn current_version() -> semver::Version {
 fn parse_release_version(tag: &str) -> Result<semver::Version> {
     let raw = tag.strip_prefix('v').unwrap_or(tag);
     semver::Version::parse(raw).context("invalid version in release tag")
-}
-
-// ── Platform detection (compile-time) ───────��───────────────────
-
-fn detect_target() -> Result<&'static str> {
-    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-    {
-        return Ok("x86_64-apple-darwin");
-    }
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        return Ok("aarch64-apple-darwin");
-    }
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    {
-        return Ok("x86_64-unknown-linux-gnu");
-    }
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    {
-        return Ok("aarch64-unknown-linux-gnu");
-    }
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    {
-        return Ok("x86_64-pc-windows-msvc");
-    }
-    #[allow(unreachable_code)]
-    Err(anyhow::anyhow!("Unsupported platform for self-update"))
-}
-
-// ── GitHub API ──────────────────────────────────────────────────
-
-async fn fetch_latest_release(reporter: &Arc<dyn Reporter>) -> Result<GitHubRelease> {
-    reporter.status("Checking", "GitHub for latest release...");
-
-    let mut builder = reqwest::Client::builder()
-        .user_agent(format!("hs/{}", env!("HS_VERSION")))
-        .build()?
-        .get(GITHUB_API_LATEST);
-
-    // Support GITHUB_TOKEN for rate-limited environments
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        builder = builder.bearer_auth(token);
-    }
-
-    let resp = builder.send().await.context("Failed to reach GitHub API")?;
-
-    if resp.status() == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("GitHub API rate limit exceeded. Set GITHUB_TOKEN env var to authenticate.");
-    }
-    if !resp.status().is_success() {
-        anyhow::bail!("GitHub API returned {}", resp.status());
-    }
-
-    resp.json().await.context("Failed to parse release JSON")
-}
-
-/// Fetch the latest release including pre-releases (rc candidates).
-async fn fetch_latest_release_including_pre(reporter: &Arc<dyn Reporter>) -> Result<GitHubRelease> {
-    reporter.status(
-        "Checking",
-        "GitHub for latest release (including pre-releases)...",
-    );
-
-    let mut builder = reqwest::Client::builder()
-        .user_agent(format!("hs/{}", env!("HS_VERSION")))
-        .build()?
-        .get(format!("{GITHUB_API_RELEASES}?per_page=10"));
-
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        builder = builder.bearer_auth(token);
-    }
-
-    let resp = builder.send().await.context("Failed to reach GitHub API")?;
-
-    if resp.status() == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("GitHub API rate limit exceeded. Set GITHUB_TOKEN env var to authenticate.");
-    }
-    if !resp.status().is_success() {
-        anyhow::bail!("GitHub API returned {}", resp.status());
-    }
-
-    let mut releases: Vec<GitHubRelease> =
-        resp.json().await.context("Failed to parse releases JSON")?;
-
-    // Sort by semver descending (API order is by creation date, not version)
-    releases.sort_by(|a, b| {
-        let va = parse_release_version(&a.tag_name).unwrap_or(semver::Version::new(0, 0, 0));
-        let vb = parse_release_version(&b.tag_name).unwrap_or(semver::Version::new(0, 0, 0));
-        vb.cmp(&va)
-    });
-
-    releases
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No releases found"))
-}
-
-// ── Binary download & replacement ───────────────────────────────
-
-async fn download_and_replace_binary(
-    release: &GitHubRelease,
-    binary_name: &str,
-    target: &str,
-    reporter: &Arc<dyn Reporter>,
-) -> Result<bool> {
-    let archive_name = format!("{binary_name}-{}-{target}.tar.gz", release.tag_name);
-
-    let asset = match release.assets.iter().find(|a| a.name == archive_name) {
-        Some(a) => a,
-        None => return Ok(false), // no asset for this platform
-    };
-
-    reporter.status("Downloading", &archive_name);
-
-    let resp = reqwest::get(&asset.browser_download_url)
-        .await
-        .context("Download failed")?;
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "Download failed ({}): {}",
-            resp.status(),
-            asset.browser_download_url
-        );
-    }
-
-    let bytes = resp.bytes().await.context("Failed to read download")?;
-
-    // Extract binary from tar.gz
-    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
-    let mut archive = tar::Archive::new(decoder);
-
-    let mut binary_data: Option<Vec<u8>> = None;
-    for entry in archive.entries().context("Failed to read tar entries")? {
-        let mut entry = entry?;
-        let path = entry.path()?;
-        let file_name = path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or_default();
-        if file_name == binary_name {
-            let mut data = Vec::new();
-            entry.read_to_end(&mut data)?;
-            binary_data = Some(data);
-            break;
-        }
-    }
-
-    let binary_data = binary_data
-        .ok_or_else(|| anyhow::anyhow!("Binary '{binary_name}' not found in archive"))?;
-
-    // Determine install location
-    let install_path = install_path_for(binary_name)?;
-    let install_dir = install_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Invalid install path"))?;
-
-    // Write to temp file, then atomic rename
-    let tmp_path = install_dir.join(format!(".{binary_name}.upgrade.tmp"));
-
-    std::fs::write(&tmp_path, &binary_data)
-        .with_context(|| format!("Failed to write to {}", tmp_path.display()))?;
-
-    // Set executable permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    // Atomic rename
-    std::fs::rename(&tmp_path, &install_path).with_context(|| {
-        format!(
-            "Failed to replace {}. Check permissions on {}",
-            install_path.display(),
-            install_dir.display()
-        )
-    })?;
-
-    Ok(true)
 }
 
 fn install_path_for(binary_name: &str) -> Result<PathBuf> {
@@ -398,14 +242,11 @@ async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
         return Ok(());
     }
 
-    let compose = ComposeCmd::detect().await;
-    let compose = match compose {
-        Some(c) => c,
-        None => {
-            reporter.warn("Docker compose not found — skipping container updates");
-            return Ok(());
-        }
-    };
+    let compose = ComposeCmd::detect().await.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Docker services are configured on this host but no compose runtime was found"
+        )
+    })?;
 
     let compose_files: Vec<(&Path, &str)> = [
         (scribe_compose.as_path(), "scribe"),
@@ -415,82 +256,223 @@ async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
     .filter(|(p, _)| p.exists())
     .collect();
 
-    for (cf, name) in &compose_files {
-        let cf_str = cf.to_str().unwrap_or_default();
-        reporter.status("Pulling", &format!("new images for {name}..."));
-        let pull = compose.run_capture(&["-f", cf_str, "pull"]).await?;
-        if !pull.status.success() {
-            let stderr = String::from_utf8_lossy(&pull.stderr);
-            let errors = hs_common::compose::filter_compose_stderr(&stderr);
-            if !errors.is_empty() {
-                reporter.warn(&format!(
-                    "Failed to pull images for {name}: {}",
-                    errors.join("; ")
-                ));
-            } else {
-                reporter.warn(&format!("Failed to pull images for {name}"));
-            }
-            continue;
-        }
-
-        reporter.status("Stopping", &format!("{name} containers..."));
-        // down first to avoid podman pod conflicts on recreate
-        let _ = compose.run_capture(&["-f", cf_str, "down"]).await;
-
-        reporter.status("Starting", &format!("{name} containers..."));
-        let up = compose.run_capture(&["-f", cf_str, "up", "-d"]).await?;
-        if !up.status.success() {
-            let stderr = String::from_utf8_lossy(&up.stderr);
-            let errors = hs_common::compose::filter_compose_stderr(&stderr);
-            if !errors.is_empty() {
-                reporter.warn(&format!("Failed to restart {name}: {}", errors.join("; ")));
-            } else {
-                reporter.warn(&format!("Failed to restart {name} containers"));
-            }
-        }
+    for (cf, name) in compose_files {
+        upgrade_compose_service(&compose, cf, name, reporter).await?;
     }
-
     Ok(())
+}
+
+/// Run one compose command; a non-zero exit is an error carrying the
+/// actionable stderr lines.
+async fn compose_step(compose: &ComposeCmd, cf: &str, name: &str, args: &[&str]) -> Result<()> {
+    let mut full = vec!["-f", cf];
+    full.extend_from_slice(args);
+    let out = compose
+        .run_capture(&full)
+        .await
+        .with_context(|| format!("failed to run compose {} for {name}", args.join(" ")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let errors = hs_common::compose::filter_compose_stderr(&stderr);
+    anyhow::bail!(
+        "compose {} failed for {name} ({}){}{}",
+        args.join(" "),
+        out.status,
+        if errors.is_empty() { "" } else { ": " },
+        errors.join("; ")
+    )
+}
+
+/// pull → down → up -d for one compose file; any failing step fails the
+/// upgrade. (`down` first avoids podman pod conflicts on recreate.)
+async fn upgrade_compose_service(
+    compose: &ComposeCmd,
+    compose_file: &Path,
+    name: &str,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    let cf = compose_file
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 compose path {}", compose_file.display()))?;
+    reporter.status("Pulling", &format!("new images for {name}..."));
+    compose_step(compose, cf, name, &["pull"]).await?;
+    reporter.status("Stopping", &format!("{name} containers..."));
+    compose_step(compose, cf, name, &["down"]).await?;
+    reporter.status("Starting", &format!("{name} containers..."));
+    compose_step(compose, cf, name, &["up", "-d"]).await
 }
 
 // ── Post-upgrade health check ───────────────────────────────────
 
-async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) {
-    let http = match hs_common::http::http_client(std::time::Duration::from_secs(10)) {
-        Ok(c) => c,
-        Err(e) => {
-            reporter.warn(&format!(
-                "skipping post-upgrade health check: HTTP client build failed: {e}"
-            ));
-            return;
+/// The base URL of the service this host runs locally, taken from the
+/// configured server list: the first entry whose host is loopback.
+fn local_service_url<'a>(urls: impl IntoIterator<Item = &'a str>, service: &str) -> Result<String> {
+    let mut seen = Vec::new();
+    for raw in urls {
+        let url = reqwest::Url::parse(raw)
+            .with_context(|| format!("invalid {service} server URL `{raw}` in config"))?;
+        if matches!(
+            url.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        ) {
+            return Ok(raw.trim_end_matches('/').to_string());
         }
-    };
+        seen.push(raw.to_string());
+    }
+    anyhow::bail!(
+        "{service} runs in Docker on this host but no loopback {service} server is configured (configured: {})",
+        if seen.is_empty() { "none".to_string() } else { seen.join(", ") }
+    )
+}
 
-    // Give containers a moment to start
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+/// The distill server must be running on CUDA: assert it, never change it.
+async fn assert_distill_cuda(base_url: &str) -> Result<()> {
+    let health = hs_distill::client::DistillClient::new(base_url)?
+        .health()
+        .await
+        .with_context(|| format!("distill health probe failed at {base_url}"))?;
+    if !health.compute_device.eq_ignore_ascii_case("cuda") {
+        anyhow::bail!(
+            "distill at {base_url} reports compute_device `{}`, expected cuda",
+            health.compute_device
+        );
+    }
+    Ok(())
+}
 
-    let scribe_cfg2 = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
     let scribe_compose = hidden_dir().join("docker-compose.yml");
-    if scribe_cfg2.local_server && scribe_compose.exists() {
-        match http.get("http://localhost:7433/health").send().await {
-            Ok(resp) if resp.status().is_success() => {
-                reporter.status("Health", "scribe: OK");
-            }
-            _ => {
-                reporter.warn("scribe: not responding (may still be starting)");
-            }
+    if scribe_cfg.local_server && scribe_compose.exists() {
+        let url = local_service_url(scribe_cfg.servers.iter().map(|s| s.url.as_str()), "scribe")?;
+        hs_common::compose::wait_for_url(&format!("{url}/health"), HEALTH_WAIT_SECS, "scribe")
+            .await?;
+        reporter.status("Health", "scribe: OK");
+    }
+
+    if hidden_dir().join("docker-compose-distill.yml").exists() {
+        let cfg = hs_distill::config::DistillClientConfig::load()
+            .map_err(|e| anyhow::anyhow!("distill config: {e}"))?;
+        let url = local_service_url(cfg.servers.iter().map(String::as_str), "distill")?;
+        hs_common::compose::wait_for_url(&format!("{url}/health"), HEALTH_WAIT_SECS, "distill")
+            .await?;
+        assert_distill_cuda(&url).await?;
+        reporter.status("Health", "distill: OK (cuda)");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::installer::test_support::{serve, Route};
+    use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn reporter() -> Arc<dyn Reporter> {
+        Arc::new(hs_common::reporter::SilentReporter)
+    }
+
+    /// Stand-in compose binary: logs argv, exits 1 for the subcommand in `$FAIL`.
+    fn fake_compose(dir: &Path, fail_on: &str) -> ComposeCmd {
+        let bin = dir.join("fake-compose");
+        let log = dir.join("calls.log");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$3\" = \"{fail_on}\" ]; then echo boom >&2; exit 1; fi\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ComposeCmd {
+            bin: bin.to_string_lossy().into_owned(),
+            args_prefix: vec![],
         }
     }
 
-    let distill_compose = hidden_dir().join("docker-compose-distill.yml");
-    if distill_compose.exists() {
-        match http.get("http://localhost:7434/health").send().await {
-            Ok(resp) if resp.status().is_success() => {
-                reporter.status("Health", "distill: OK");
-            }
-            _ => {
-                reporter.warn("distill: not responding (may still be starting)");
-            }
+    #[tokio::test]
+    async fn compose_down_failure_fails_the_upgrade_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let compose = fake_compose(dir.path(), "down");
+        let cf = dir.path().join("docker-compose.yml");
+        std::fs::write(&cf, "services: {}\n").unwrap();
+        let err = upgrade_compose_service(&compose, &cf, "scribe", &reporter())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("down"), "{err:#}");
+        // `up -d` must not run after a failed `down`
+        let log = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+        assert!(!log.contains("up -d"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn compose_pull_and_up_failures_fail_too_and_success_runs_all_three() {
+        for fail in ["pull", "up"] {
+            let dir = tempfile::tempdir().unwrap();
+            let compose = fake_compose(dir.path(), fail);
+            let cf = dir.path().join("c.yml");
+            std::fs::write(&cf, "").unwrap();
+            assert!(
+                upgrade_compose_service(&compose, &cf, "distill", &reporter())
+                    .await
+                    .is_err()
+            );
         }
+        let dir = tempfile::tempdir().unwrap();
+        let compose = fake_compose(dir.path(), "none");
+        let cf = dir.path().join("c.yml");
+        std::fs::write(&cf, "").unwrap();
+        upgrade_compose_service(&compose, &cf, "distill", &reporter())
+            .await
+            .unwrap();
+        let log = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+        let verbs: Vec<&str> = log.lines().map(|l| l.split(' ').nth(2).unwrap()).collect();
+        assert_eq!(verbs, ["pull", "down", "up"]);
+    }
+
+    fn health_route(device: &str) -> HashMap<String, Route> {
+        HashMap::from([(
+            "/health".to_string(),
+            Route::ok(format!(
+                r#"{{"status":"ok","compute_device":"{device}","collection":"c"}}"#
+            )),
+        )])
+    }
+
+    #[tokio::test]
+    async fn distill_reporting_cpu_fails_the_cuda_assertion() {
+        let base = serve(health_route("Cpu")).await;
+        let err = assert_distill_cuda(&base).await.unwrap_err();
+        assert!(format!("{err:#}").contains("cuda"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn distill_reporting_cuda_passes_and_unreachable_distill_fails() {
+        let base = serve(health_route("Cuda")).await;
+        assert_distill_cuda(&base).await.unwrap();
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        assert!(assert_distill_cuda(&dead).await.is_err());
+    }
+
+    #[test]
+    fn health_urls_come_from_config_not_hardcoded_ports() {
+        let url = local_service_url(
+            [
+                "http://scribe-1.example.local:7433",
+                "http://localhost:9911/",
+            ],
+            "scribe",
+        )
+        .unwrap();
+        assert_eq!(url, "http://localhost:9911");
+        assert!(local_service_url(["http://scribe-1.example.local:7433"], "scribe").is_err());
+        assert!(local_service_url([], "distill").is_err());
     }
 }

@@ -10,6 +10,7 @@ mod cloud_cmd;
 pub mod daemon;
 mod distill_cmd;
 mod mcp_client;
+mod installer;
 mod mcp_cmd;
 mod migrate_cmd;
 mod openalex_cmd;

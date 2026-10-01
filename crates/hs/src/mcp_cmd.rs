@@ -1,14 +1,11 @@
 //! `hs mcp` subcommand — install/uninstall MCP server config for Claude & OpenCode clients.
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Subcommand, ValueEnum};
 use hs_common::reporter::Reporter;
-
-const GITHUB_API_RELEASES: &str = "https://api.github.com/repos/home-still/home/releases";
 
 #[derive(Clone, Debug, ValueEnum)]
 pub enum McpClient {
@@ -138,14 +135,38 @@ fn read_config(path: &PathBuf) -> Result<serde_json::Value> {
     }
 }
 
+/// Atomically replace `path` with `value`: same-directory unique temp file
+/// (create_new), fsync, the existing file's permission mode preserved (a new
+/// file is 0600: the stdio entry embeds `secrets.env` values), rename over
+/// the target. The temp file is removed on every error path.
 fn write_config(path: &PathBuf, value: &serde_json::Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Invalid config path {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    let text = serde_json::to_string_pretty(value)? + "\n";
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".mcp-config-")
+        .tempfile_in(parent) // create_new, 0600, removed on drop
+        .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
+    {
+        use std::io::Write as _;
+        tmp.write_all(text.as_bytes())
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        tmp.flush()?;
+        tmp.as_file().sync_all()?;
     }
-    let text = serde_json::to_string_pretty(value)?;
-    std::fs::write(path, text + "\n")
-        .with_context(|| format!("Failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(path) {
+        std::fs::set_permissions(tmp.path(), meta.permissions())
+            .with_context(|| format!("Failed to preserve permissions of {}", path.display()))?;
+    }
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("Failed to replace {}", path.display()))?;
     Ok(())
 }
 
@@ -312,34 +333,9 @@ async fn cmd_install(
 
 // ── Binary download ───────────────────────────────────────────
 
-fn detect_target() -> Result<&'static str> {
-    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-    {
-        return Ok("x86_64-apple-darwin");
-    }
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        return Ok("aarch64-apple-darwin");
-    }
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    {
-        return Ok("x86_64-unknown-linux-gnu");
-    }
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    {
-        return Ok("aarch64-unknown-linux-gnu");
-    }
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    {
-        return Ok("x86_64-pc-windows-msvc");
-    }
-    #[allow(unreachable_code)]
-    Err(anyhow::anyhow!("Unsupported platform"))
-}
-
-/// Download `hs-mcp` from the same release tag as the running `hs` binary.
+/// Install `hs-mcp` from the release tagged like the running `hs`, through
+/// the shared installer (checksum + version verified).
 async fn download_mcp_binary(reporter: &Arc<dyn Reporter>) -> Result<PathBuf> {
-    let target = detect_target()?;
     let version = env!("HS_VERSION");
     // Normalize version to tag format (e.g. "0.0.1-rc.173" → "v0.0.1-rc.173")
     let tag = if version.starts_with('v') {
@@ -347,100 +343,28 @@ async fn download_mcp_binary(reporter: &Arc<dyn Reporter>) -> Result<PathBuf> {
     } else {
         format!("v{version}")
     };
+    let target = crate::installer::detect_target()?;
+    let installer = crate::installer::Installer::new(crate::installer::DEFAULT_API_BASE, target)?;
+    let build_hint = format!("Try: HS_RELEASE_TAG={tag} cargo build --release -p hs-mcp");
 
-    // Fetch the release matching the current hs version
-    let http = reqwest::Client::builder()
-        .user_agent(format!("hs/{version}"))
-        .build()?;
-
-    let mut req = http.get(format!("{GITHUB_API_RELEASES}/tags/{tag}"));
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-
-    let resp = req.send().await.context("Failed to reach GitHub API")?;
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "Could not find release {tag} on GitHub ({}). \
-             Try: cargo build --release -p hs-mcp",
-            resp.status()
-        );
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Release {
-        assets: Vec<Asset>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Asset {
-        name: String,
-        browser_download_url: String,
-    }
-
-    let release: Release = resp.json().await.context("Invalid release JSON")?;
-    let archive_name = format!("hs-mcp-{tag}-{target}.tar.gz");
-
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == archive_name)
-        .ok_or_else(|| anyhow::anyhow!("No hs-mcp asset for {target} in release {tag}"))?;
-
-    reporter.status("Downloading", &archive_name);
-
-    let resp = reqwest::get(&asset.browser_download_url)
+    let release = installer
+        .release_by_tag(&tag)
         .await
-        .context("Download failed")?;
-    if !resp.status().is_success() {
-        anyhow::bail!("Download failed ({})", resp.status());
-    }
-
-    let bytes = resp.bytes().await.context("Failed to read download")?;
-
-    // Extract hs-mcp from tar.gz
-    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
-    let mut archive = tar::Archive::new(decoder);
-
-    let mut binary_data: Option<Vec<u8>> = None;
-    for entry in archive.entries().context("Failed to read tar entries")? {
-        let mut entry = entry?;
-        let path = entry.path()?;
-        let file_name = path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or_default();
-        if file_name == "hs-mcp" {
-            let mut data = Vec::new();
-            entry.read_to_end(&mut data)?;
-            binary_data = Some(data);
-            break;
-        }
-    }
-
-    let binary_data = binary_data.ok_or_else(|| anyhow::anyhow!("hs-mcp not found in archive"))?;
+        .with_context(|| format!("Could not find release {tag} on GitHub. {build_hint}"))?;
+    let prepared = installer
+        .prepare_required(&release, "hs-mcp")
+        .await
+        .with_context(|| build_hint.clone())?;
 
     // Install next to the running hs binary, falling back to ~/.local/bin
     let install_dir = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/bin"));
-
-    std::fs::create_dir_all(&install_dir)?;
-
     let install_path = install_dir.join("hs-mcp");
-    let tmp_path = install_dir.join(".hs-mcp.install.tmp");
-
-    std::fs::write(&tmp_path, &binary_data)
-        .with_context(|| format!("Failed to write to {}", tmp_path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    std::fs::rename(&tmp_path, &install_path)
-        .with_context(|| format!("Failed to install hs-mcp to {}", install_path.display()))?;
+    installer
+        .install(&prepared, &install_path, reporter)
+        .await?;
 
     reporter.status("Installed", &format!("hs-mcp → {}", install_path.display()));
     Ok(install_path)
@@ -485,4 +409,76 @@ async fn cmd_uninstall(client: McpClient, reporter: &Arc<dyn Reporter>) -> Resul
 
     reporter.finish("MCP server config removed.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn write_config_preserves_mode_roundtrips_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let value = serde_json::json!({"mcpServers": {"home-still": {"command": "/x/hs-mcp"}}});
+        write_config(&path, &value).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(read_config(&path).unwrap(), value);
+        assert_eq!(entries(dir.path()), vec!["claude.json"]);
+    }
+
+    #[test]
+    fn write_config_creates_new_file_private_and_creates_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/dir/config.json");
+        write_config(&path, &serde_json::json!({"a": 1})).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn failed_write_leaves_old_config_intact_and_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::write(&path, "OLD-CONTENT").unwrap();
+        // Directory not writable: temp creation fails before the target is touched.
+        // (Skipped as root, where mode bits do not restrict writes.)
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let res = write_config(&path, &serde_json::json!({"new": true}));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(res.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "OLD-CONTENT");
+        assert_eq!(entries(dir.path()), vec!["c.json"]);
+    }
+
+    #[test]
+    fn failed_rename_removes_temp_and_keeps_old_target() {
+        // Target is a non-empty directory: rename over it fails after the temp is written.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), "x").unwrap();
+        assert!(write_config(&path, &serde_json::json!({})).is_err());
+        assert_eq!(entries(dir.path()), vec!["c.json"]);
+        assert!(path.join("keep").exists());
+    }
 }

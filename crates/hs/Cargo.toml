@@ -38,6 +38,8 @@ semver = "1"
 flate2 = "1"
 tar = "0.4"
 epub = "2"
+zip = { version = "3", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+
