@@ -1575,7 +1575,7 @@ async fn cmd_hnsw_enable(
     server: Option<&str>,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    let servers = resolve_servers(server).await;
+    let servers = resolve_servers(server).await?;
     let client = DistillClient::new(&servers[0])?;
     hnsw_enable(&client, &servers[0], collection, yes, reporter).await
 }

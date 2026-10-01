@@ -731,6 +731,7 @@ mod tests {
 
     /// Load against a config file with `yaml` as its content (or none) under
     /// a hermetic environment.
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure type
     fn load_yaml(yaml: Option<&str>) -> anyhow::Result<Config> {
         let mut out = None;
         figment::Jail::expect_with(|jail| {

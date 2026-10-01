@@ -614,11 +614,10 @@ mod tests {
                 tls,
                 ..NatsConfig::default()
             };
-            let err = connect_options(&cfg)
-                .await
-                .err()
-                .expect("must fail")
-                .to_string();
+            let Err(err) = connect_options(&cfg).await else {
+                panic!("a missing configured file must fail");
+            };
+            let err = err.to_string();
             assert!(
                 err.contains(needle) && err.contains("/nonexistent/"),
                 "{err}"

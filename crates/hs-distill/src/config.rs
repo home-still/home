@@ -857,6 +857,7 @@ mod tests {
     // Through `from_file` against a temporary home directory, with the
     // process environment emptied and then set per test (figment's `Jail`).
 
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure type
     fn with_env<R>(vars: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
         let mut out = None;
         figment::Jail::expect_with(|jail| {

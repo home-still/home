@@ -124,10 +124,7 @@ impl Config {
     /// [`Self::load`] against already-read config files.
     pub fn load_from(system: &ConfigFile, user: &ConfigFile) -> Result<Self> {
         let project_dir = user.project_dir().map_err(config_error)?;
-        let mut defaults = Self::default();
-        defaults.project_dir = project_dir.clone();
-
-        let mut figment = Figment::new().merge(Serialized::default("personal", &defaults));
+        let mut figment = Figment::new().merge(Serialized::default("personal", Self::default()));
         for file in [system, user] {
             if let Some(section) = file.section_json("personal").map_err(config_error)? {
                 figment = figment.merge(Serialized::default("personal", section));
@@ -206,6 +203,7 @@ mod tests {
 
     /// Load against a config file with `yaml` as its content (or none) under
     /// a hermetic environment plus `vars`.
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure type
     fn load_yaml(yaml: Option<&str>, vars: &[(&str, &str)]) -> Result<Config> {
         let mut out = None;
         figment::Jail::expect_with(|jail| {
