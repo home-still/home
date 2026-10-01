@@ -256,8 +256,10 @@ mod tests {
         FakeServer::start(move |req| {
             let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
             match (req.method.as_str(), rpc["method"].as_str()) {
-                ("POST", Some("initialize")) => sse(json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
-                    .with_header("mcp-session-id", "sess-1"),
+                ("POST", Some("initialize")) => {
+                    sse(json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
+                        .with_header("mcp-session-id", "sess-1")
+                }
                 ("POST", Some("notifications/initialized")) => Response::raw(202, "text/plain", ""),
                 ("POST", Some("tools/call")) => tool_reply.clone(),
                 ("DELETE", _) => Response::raw(delete_status, "text/plain", ""),
@@ -379,12 +381,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_initialize_fails_with_its_status() {
-        let server = FakeServer::start(|_| Response::raw(401, "text/plain", "login required")).await;
+        let server =
+            FakeServer::start(|_| Response::raw(401, "text/plain", "login required")).await;
 
         let err = client(&server).await.err().expect("401 on initialize");
 
         let msg = format!("{err:#}");
-        assert!(msg.contains("401") && msg.contains("login required"), "{msg}");
+        assert!(
+            msg.contains("401") && msg.contains("login required"),
+            "{msg}"
+        );
     }
 
     /// RA-25 (client half): one session per `hs status` run was left behind.

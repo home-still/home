@@ -217,7 +217,7 @@ async fn serve_mcp(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let binary = find_mcp_binary().ok_or_else(|| {
         anyhow::anyhow!(
             "hs-mcp binary not found. Build with:\n  \
-             cargo build --release -p hs-mcp"
+             HS_RELEASE_TAG=<tag> cargo build --release -p hs-mcp"
         )
     })?;
 
@@ -225,16 +225,19 @@ async fn serve_mcp(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
 
     reporter.status("Start", &format!("hs-mcp --serve {addr}"));
 
-    // Spawn child and forward SIGTERM for graceful shutdown
+    // Ctrl+C / SIGTERM (e.g. `systemctl stop`) reach us as a graceful stop
+    // request, so the child can be told to shut down before `main` ends us.
+    let stop = crate::shutdown::cooperative();
+
     let mut child = tokio::process::Command::new(&binary)
         .args(["--serve", &addr])
         .spawn()
         .context("Failed to start hs-mcp")?;
 
-    // Wait for either child exit or Ctrl+C
+    // Wait for either child exit or a stop request
     let status = tokio::select! {
         status = child.wait() => status?,
-        _ = tokio::signal::ctrl_c() => {
+        _ = stop.wait() => {
             // Forward SIGTERM to the child for graceful shutdown
             #[cfg(unix)]
             if let Some(pid) = child.id() {
@@ -251,6 +254,12 @@ async fn serve_mcp(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
         }
     };
 
+    // An operator-requested stop is not a failure, whatever the child's
+    // status after SIGTERM looks like.
+    if stop.requested() {
+        reporter.finish("mcp server stopped");
+        return Ok(());
+    }
     if !status.success() {
         anyhow::bail!("hs-mcp exited with {status}");
     }

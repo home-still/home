@@ -571,14 +571,8 @@ async fn execute_rebuild(
          run `hs pipeline catch-up`)",
     )?;
 
-    let publish = publish_papers_ingested(
-        bus,
-        &inv.paper_keys,
-        "hs pipeline rebuild",
-        stop,
-        reporter,
-    )
-    .await;
+    let publish =
+        publish_papers_ingested(bus, &inv.paper_keys, "hs pipeline rebuild", stop, reporter).await;
 
     Ok(RebuildSummary {
         markdown_deleted,
@@ -1406,12 +1400,22 @@ mod tests {
     async fn seed(root: &std::path::Path, with_papers: bool) {
         let s = LocalFsStorage::new(root);
         if with_papers {
-            s.put("papers/ab/abcdef.pdf", b"%PDF-1".to_vec()).await.unwrap();
-            s.put("papers/cd/cdefgh.html", b"<html>x</html>".to_vec()).await.unwrap();
+            s.put("papers/ab/abcdef.pdf", b"%PDF-1".to_vec())
+                .await
+                .unwrap();
+            s.put("papers/cd/cdefgh.html", b"<html>x</html>".to_vec())
+                .await
+                .unwrap();
         }
-        s.put("markdown/ab/abcdef.md", b"# a".to_vec()).await.unwrap();
-        s.put("catalog/ab/abcdef.yaml", b"a: 1".to_vec()).await.unwrap();
-        s.put("catalog/cd/cdefgh.yaml", b"b: 1".to_vec()).await.unwrap();
+        s.put("markdown/ab/abcdef.md", b"# a".to_vec())
+            .await
+            .unwrap();
+        s.put("catalog/ab/abcdef.yaml", b"a: 1".to_vec())
+            .await
+            .unwrap();
+        s.put("catalog/cd/cdefgh.yaml", b"b: 1".to_vec())
+            .await
+            .unwrap();
     }
 
     fn storage_with(
@@ -1440,14 +1444,27 @@ mod tests {
         let server = distill(&log, 200).await;
         let client = DistillClient::new(&server.base).unwrap();
         let storage = storage_with(tmp.path(), &log, None);
-        let bus = LogBus { log: Arc::clone(&log), fail_publish_of: None };
+        let bus = LogBus {
+            log: Arc::clone(&log),
+            fail_publish_of: None,
+        };
 
         let inv = inventory(&storage, &client).await.unwrap();
         check_rebuild_inputs(&*storage, &inv).await.unwrap();
-        assert!(log.lock().is_empty(), "inventory and preflight delete nothing");
-        let summary = execute_rebuild(&*storage, &client, &bus, &inv, &Shutdown::new(), &reporter())
-            .await
-            .unwrap();
+        assert!(
+            log.lock().is_empty(),
+            "inventory and preflight delete nothing"
+        );
+        let summary = execute_rebuild(
+            &*storage,
+            &client,
+            &bus,
+            &inv,
+            &Shutdown::new(),
+            &reporter(),
+        )
+        .await
+        .unwrap();
 
         let events = log.lock().clone();
         let md = index_of(&events, "delete:markdown/ab/abcdef.md");
@@ -1456,9 +1473,15 @@ mod tests {
         let cat_last = index_of(&events, "delete:catalog/ab/abcdef.yaml")
             .max(index_of(&events, "delete:catalog/cd/cdefgh.yaml"));
         let reset = index_of(&events, "reset");
-        let first_publish = events.iter().position(|e| e.starts_with("publish:")).unwrap();
+        let first_publish = events
+            .iter()
+            .position(|e| e.starts_with("publish:"))
+            .unwrap();
         assert!(md < cat_first, "markdown before catalog: {events:?}");
-        assert!(cat_last < reset, "catalog before the Qdrant drop: {events:?}");
+        assert!(
+            cat_last < reset,
+            "catalog before the Qdrant drop: {events:?}"
+        );
         assert!(reset < first_publish, "drop before republish: {events:?}");
         assert_eq!(summary.markdown_deleted, 1);
         assert_eq!(summary.catalog_deleted, 2);
@@ -1478,23 +1501,39 @@ mod tests {
             let server = distill(&log, 200).await;
             let client = DistillClient::new(&server.base).unwrap();
             let storage = storage_with(tmp.path(), &log, Some(failing));
-            let bus = LogBus { log: Arc::clone(&log), fail_publish_of: None };
+            let bus = LogBus {
+                log: Arc::clone(&log),
+                fail_publish_of: None,
+            };
             let inv = inventory(&storage, &client).await.unwrap();
 
-            let err = execute_rebuild(&*storage, &client, &bus, &inv, &Shutdown::new(), &reporter())
-                .await
-                .err()
-                .unwrap_or_else(|| panic!("{failing}: a failed delete must fail the rebuild"));
+            let err = execute_rebuild(
+                &*storage,
+                &client,
+                &bus,
+                &inv,
+                &Shutdown::new(),
+                &reporter(),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{failing}: a failed delete must fail the rebuild"));
 
             let events = log.lock().clone();
-            assert!(!events.contains(&"reset".to_string()), "{failing}: {events:?}");
+            assert!(
+                !events.contains(&"reset".to_string()),
+                "{failing}: {events:?}"
+            );
             assert!(
                 !events.iter().any(|e| e.starts_with("publish:")),
                 "{failing}: {events:?}"
             );
             assert!(format!("{err:#}").contains("503"), "{failing}: {err:#}");
             assert!(
-                server.requests().iter().all(|r| r.path != "/collection/reset"),
+                server
+                    .requests()
+                    .iter()
+                    .all(|r| r.path != "/collection/reset"),
                 "{failing}: the collection must not have been reset"
             );
         }
@@ -1508,13 +1547,23 @@ mod tests {
         let server = distill(&log, 500).await;
         let client = DistillClient::new(&server.base).unwrap();
         let storage = storage_with(tmp.path(), &log, None);
-        let bus = LogBus { log: Arc::clone(&log), fail_publish_of: None };
+        let bus = LogBus {
+            log: Arc::clone(&log),
+            fail_publish_of: None,
+        };
         let inv = inventory(&storage, &client).await.unwrap();
 
-        let err = execute_rebuild(&*storage, &client, &bus, &inv, &Shutdown::new(), &reporter())
-            .await
-            .err()
-            .expect("reset failure must fail the rebuild");
+        let err = execute_rebuild(
+            &*storage,
+            &client,
+            &bus,
+            &inv,
+            &Shutdown::new(),
+            &reporter(),
+        )
+        .await
+        .err()
+        .expect("reset failure must fail the rebuild");
 
         assert!(format!("{err:#}").contains("catch-up"), "{err:#}");
         assert!(!log.lock().iter().any(|e| e.starts_with("publish:")));
@@ -1534,7 +1583,10 @@ mod tests {
             .await
             .expect_err("nothing to rebuild from");
 
-        assert!(format!("{err:#}").contains("no PDF/HTML sources"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("no PDF/HTML sources"),
+            "{err:#}"
+        );
         assert!(log.lock().is_empty(), "no delete and no reset");
     }
 
@@ -1571,12 +1623,24 @@ mod tests {
         };
         let inv = inventory(&storage, &client).await.unwrap();
 
-        let summary = execute_rebuild(&*storage, &client, &bus, &inv, &Shutdown::new(), &reporter())
-            .await
-            .unwrap();
+        let summary = execute_rebuild(
+            &*storage,
+            &client,
+            &bus,
+            &inv,
+            &Shutdown::new(),
+            &reporter(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(summary.publish.published, 1);
-        assert_eq!(summary.publish.errors.len(), 1, "{:?}", summary.publish.errors);
+        assert_eq!(
+            summary.publish.errors.len(),
+            1,
+            "{:?}",
+            summary.publish.errors
+        );
         assert!(fail_if_errors("pipeline rebuild", &summary.publish.errors, false).is_err());
         assert!(fail_if_errors("pipeline rebuild", &[], false).is_ok());
         assert!(
@@ -1593,7 +1657,10 @@ mod tests {
         let server = distill(&log, 200).await;
         let client = DistillClient::new(&server.base).unwrap();
         let storage = storage_with(tmp.path(), &log, None);
-        let bus = LogBus { log: Arc::clone(&log), fail_publish_of: None };
+        let bus = LogBus {
+            log: Arc::clone(&log),
+            fail_publish_of: None,
+        };
         let inv = inventory(&storage, &client).await.unwrap();
         let stop = Shutdown::new();
         stop.request();
@@ -1612,22 +1679,39 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = LocalFsStorage::new(tmp.path());
         // converted already
-        s.put("papers/ab/abcdef.pdf", b"%PDF".to_vec()).await.unwrap();
-        s.put("markdown/ab/abcdef.md", b"# done".to_vec()).await.unwrap();
+        s.put("papers/ab/abcdef.pdf", b"%PDF".to_vec())
+            .await
+            .unwrap();
+        s.put("markdown/ab/abcdef.md", b"# done".to_vec())
+            .await
+            .unwrap();
         // pending
-        s.put("papers/cd/cdefgh.pdf", b"%PDF".to_vec()).await.unwrap();
-        s.put("papers/ef/efghij.html", b"<html/>".to_vec()).await.unwrap();
+        s.put("papers/cd/cdefgh.pdf", b"%PDF".to_vec())
+            .await
+            .unwrap();
+        s.put("papers/ef/efghij.html", b"<html/>".to_vec())
+            .await
+            .unwrap();
         // never republished: empty source, quarantined, resource fork, unsupported ext
         s.put("papers/gh/ghijkl.pdf", Vec::new()).await.unwrap();
-        s.put("papers/.quarantine/ij/ijklmn.pdf", b"junk".to_vec()).await.unwrap();
-        s.put("papers/ab/._abcdef.pdf", b"fork".to_vec()).await.unwrap();
-        s.put("papers/kl/klmnop.epub", b"epub".to_vec()).await.unwrap();
+        s.put("papers/.quarantine/ij/ijklmn.pdf", b"junk".to_vec())
+            .await
+            .unwrap();
+        s.put("papers/ab/._abcdef.pdf", b"fork".to_vec())
+            .await
+            .unwrap();
+        s.put("papers/kl/klmnop.epub", b"epub".to_vec())
+            .await
+            .unwrap();
 
         let plan = plan_catch_up(&s).await.unwrap();
 
         let mut pending = plan.to_republish.clone();
         pending.sort();
-        assert_eq!(pending, vec!["papers/cd/cdefgh.pdf", "papers/ef/efghij.html"]);
+        assert_eq!(
+            pending,
+            vec!["papers/cd/cdefgh.pdf", "papers/ef/efghij.html"]
+        );
     }
 
     #[tokio::test]

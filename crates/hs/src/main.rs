@@ -9,8 +9,8 @@ mod cli;
 mod cloud_cmd;
 pub mod daemon;
 mod distill_cmd;
-mod mcp_client;
 mod installer;
+mod mcp_client;
 mod mcp_cmd;
 mod migrate_cmd;
 mod openalex_cmd;
@@ -22,9 +22,9 @@ mod scribe_inbox_install;
 mod scribe_pool;
 mod serve_cmd;
 mod shutdown;
+mod status_cmd;
 #[cfg(test)]
 mod test_http;
-mod status_cmd;
 mod upgrade_cmd;
 
 use cli::{Cli, TopCmd};

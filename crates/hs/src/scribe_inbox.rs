@@ -262,8 +262,15 @@ pub async fn sweep_inbox_once(
             report.interrupted = true;
             break;
         }
-        match handle_inbox_source(storage, bus, papers_prefix, &obj.key, obj.last_modified, now)
-            .await
+        match handle_inbox_source(
+            storage,
+            bus,
+            papers_prefix,
+            &obj.key,
+            obj.last_modified,
+            now,
+        )
+        .await
         {
             Ok(HandleOutcome::Committed(WriteOutcome::Relocated)) => report.relocated += 1,
             Ok(HandleOutcome::Committed(WriteOutcome::AlreadyAtTarget)) => {
@@ -481,7 +488,10 @@ mod tests {
     impl EventBus for RecordingBus {
         async fn publish(&self, subject: &str, payload: &[u8]) -> anyhow::Result<()> {
             let value = serde_json::from_slice(payload).expect("publish payload is JSON");
-            self.published.lock().await.push((subject.to_string(), value));
+            self.published
+                .lock()
+                .await
+                .push((subject.to_string(), value));
             Ok(())
         }
         async fn consume(&self, _spec: &ConsumerSpec) -> anyhow::Result<EventStream> {
@@ -659,7 +669,10 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(out, HandleOutcome::IgnoredStillWriting { age_secs: Some(_) }),
+            matches!(
+                out,
+                HandleOutcome::IgnoredStillWriting { age_secs: Some(_) }
+            ),
             "a 1s-old drop must be deferred, got {out:?}"
         );
         // Source still in place; target not written.
@@ -679,7 +692,10 @@ mod tests {
         let storage = LocalFsStorage::new(tmp.path());
         let bus = RecordingBus::default();
         storage
-            .put("papers/manually_downloaded/foo.pdf", b"maybe partial".to_vec())
+            .put(
+                "papers/manually_downloaded/foo.pdf",
+                b"maybe partial".to_vec(),
+            )
             .await
             .unwrap();
         let now = SystemTime::now();
@@ -785,7 +801,13 @@ mod tests {
         let bus = NoOpBus;
 
         // One relocatable PDF, one ignored .download, one already-at-target PDF.
-        put_settled(&storage, tmp.path(), "papers/manually_downloaded/a.pdf", b"a").await;
+        put_settled(
+            &storage,
+            tmp.path(),
+            "papers/manually_downloaded/a.pdf",
+            b"a",
+        )
+        .await;
         put_settled(
             &storage,
             tmp.path(),
@@ -793,7 +815,13 @@ mod tests {
             b"partial",
         )
         .await;
-        put_settled(&storage, tmp.path(), "papers/manually_downloaded/c.pdf", b"c").await;
+        put_settled(
+            &storage,
+            tmp.path(),
+            "papers/manually_downloaded/c.pdf",
+            b"c",
+        )
+        .await;
         storage
             .put("papers/c/c.pdf", b"prior-c".to_vec())
             .await
@@ -869,8 +897,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = LocalFsStorage::new(tmp.path());
         let bus = RecordingBus::default();
-        put_settled(&storage, tmp.path(), &format!("{INBOX}/.pdf"), b"empty stem").await;
-        put_settled(&storage, tmp.path(), &format!("{INBOX}/...pdf"), b"dots stem").await;
+        put_settled(
+            &storage,
+            tmp.path(),
+            &format!("{INBOX}/.pdf"),
+            b"empty stem",
+        )
+        .await;
+        put_settled(
+            &storage,
+            tmp.path(),
+            &format!("{INBOX}/...pdf"),
+            b"dots stem",
+        )
+        .await;
         put_settled(&storage, tmp.path(), &format!("{INBOX}/ok.pdf"), b"fine").await;
 
         let first = sweep_inbox_once(&storage, &bus, PAPERS, &Shutdown::new())

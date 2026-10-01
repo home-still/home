@@ -576,7 +576,7 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
     if find_distill_binary().is_none() {
         reporter.warn(
             "hs-distill-server binary not found. Build with:\n  \
-             cargo build --release -p hs-distill --features server,cuda\n  \
+             HS_RELEASE_TAG=<tag> cargo build --release -p hs-distill --features server,cuda\n  \
              (the `cuda` feature is required — the binary refuses to compile without it).",
         );
     } else {
@@ -646,7 +646,7 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let binary = find_distill_binary().ok_or_else(|| {
         anyhow::anyhow!(
             "hs-distill-server binary not found. Build with:\n  \
-             cargo build --release -p hs-distill --features server"
+             HS_RELEASE_TAG=<tag> cargo build --release -p hs-distill --features server,cuda"
         )
     })?;
 
@@ -841,7 +841,7 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
     let binary = find_distill_binary().ok_or_else(|| {
         anyhow::anyhow!(
             "hs-distill-server binary not found. Build with:\n  \
-             cargo build --release -p hs-distill --features server"
+             HS_RELEASE_TAG=<tag> cargo build --release -p hs-distill --features server,cuda"
         )
     })?;
 
@@ -1290,11 +1290,23 @@ async fn cmd_index_daemon(
         status.current_file = stem.to_string();
         write_index_status(&status);
 
-        // Skip if already indexed (unless --force)
-        if !force && client.doc_exists(stem).await.unwrap_or(false) {
-            status.indexed += 1;
-            write_index_status(&status);
-            continue;
+        // Skip if already indexed (unless --force). A failed probe is a
+        // failure of this file, not "not indexed".
+        if !force {
+            match client.doc_exists(stem).await {
+                Ok(true) => {
+                    status.indexed += 1;
+                    write_index_status(&status);
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    status.failed += 1;
+                    tracing::error!("{stem}: could not check whether it is indexed: {e}");
+                    write_index_status(&status);
+                    continue;
+                }
+            }
         }
 
         match client.index_file_with_progress(&path_str, |_| {}).await {
@@ -1326,6 +1338,13 @@ async fn cmd_index_daemon(
     write_index_status(&status);
 
     crate::daemon::remove_pid_file(&pid_path);
+    if status.failed > 0 {
+        anyhow::bail!(
+            "{} of {} file(s) failed to index (see the log)",
+            status.failed,
+            status.total_files
+        );
+    }
     Ok(())
 }
 
@@ -1972,19 +1991,31 @@ mod tests {
             markdown_path: Some("markdown/10/10.1_abc.md".into()),
             ..Default::default()
         };
-        let err = build_abstract_row("10.1_abc", &broken, &in_memory_openalex(), &storage, &client)
-            .await
-            .err()
-            .expect("a storage error is a row failure");
+        let err = build_abstract_row(
+            "10.1_abc",
+            &broken,
+            &in_memory_openalex(),
+            &storage,
+            &client,
+        )
+        .await
+        .err()
+        .expect("a storage error is a row failure");
         assert!(format!("{err:#}").contains("503"), "{err:#}");
 
         let missing = CatalogEntry {
             markdown_path: Some("markdown/10/never-written.md".into()),
             ..Default::default()
         };
-        let row = build_abstract_row("10.1_xyz", &missing, &in_memory_openalex(), &storage, &client)
-            .await
-            .unwrap();
+        let row = build_abstract_row(
+            "10.1_xyz",
+            &missing,
+            &in_memory_openalex(),
+            &storage,
+            &client,
+        )
+        .await
+        .unwrap();
         assert!(matches!(row, AbstractRow::NoAbstract));
     }
 

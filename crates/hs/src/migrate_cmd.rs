@@ -349,31 +349,37 @@ pub async fn run_move_root_orphans(
 
     // Ctrl+C: start nothing new (the iterator is only pulled as slots free
     // up); the moves already in flight finish.
-    let mut stream = stream::iter(candidates.into_iter().take_while(|_| !stop.requested()).map(|obj| {
-        let storage = Arc::clone(&storage);
-        let moved = Arc::clone(&moved);
-        let skipped = Arc::clone(&skipped);
-        let catalog_rewritten = Arc::clone(&catalog_rewritten);
-        let errors = Arc::clone(&errors);
-        async move {
-            let src = obj.key.clone();
-            let tgt = format!("papers/{src}");
-            match relocate_one(&*storage, &src, &tgt).await {
-                Ok(RelocateOutcome::Moved { catalog_updated }) => {
-                    moved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if catalog_updated {
-                        catalog_rewritten.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut stream = stream::iter(
+        candidates
+            .into_iter()
+            .take_while(|_| !stop.requested())
+            .map(|obj| {
+                let storage = Arc::clone(&storage);
+                let moved = Arc::clone(&moved);
+                let skipped = Arc::clone(&skipped);
+                let catalog_rewritten = Arc::clone(&catalog_rewritten);
+                let errors = Arc::clone(&errors);
+                async move {
+                    let src = obj.key.clone();
+                    let tgt = format!("papers/{src}");
+                    match relocate_one(&*storage, &src, &tgt).await {
+                        Ok(RelocateOutcome::Moved { catalog_updated }) => {
+                            moved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if catalog_updated {
+                                catalog_rewritten
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        Ok(RelocateOutcome::AlreadyAtTarget) => {
+                            skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            errors.lock().await.push(format!("{src}: {e}"));
+                        }
                     }
                 }
-                Ok(RelocateOutcome::AlreadyAtTarget) => {
-                    skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Err(e) => {
-                    errors.lock().await.push(format!("{src}: {e}"));
-                }
-            }
-        }
-    }))
+            }),
+    )
     .buffer_unordered(CONCURRENCY);
 
     let mut done = 0usize;
@@ -641,30 +647,35 @@ pub async fn run_quarantine_bad_content(
 
     // Ctrl+C: start nothing new (the iterator is only pulled as slots free
     // up); the inspections already in flight finish.
-    let mut stream = stream::iter(candidates.into_iter().take_while(|_| !stop.requested()).map(|obj| {
-        let storage = Arc::clone(&storage);
-        let bus = Arc::clone(&bus);
-        let healthy = Arc::clone(&healthy);
-        let renamed_html = Arc::clone(&renamed_html);
-        let quarantined = Arc::clone(&quarantined);
-        let errors = Arc::clone(&errors);
-        async move {
-            match inspect_and_quarantine(&*storage, &*bus, &obj.key, dry_run).await {
-                Ok(QuarantineOutcome::HealthyPdf) => {
-                    healthy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut stream = stream::iter(
+        candidates
+            .into_iter()
+            .take_while(|_| !stop.requested())
+            .map(|obj| {
+                let storage = Arc::clone(&storage);
+                let bus = Arc::clone(&bus);
+                let healthy = Arc::clone(&healthy);
+                let renamed_html = Arc::clone(&renamed_html);
+                let quarantined = Arc::clone(&quarantined);
+                let errors = Arc::clone(&errors);
+                async move {
+                    match inspect_and_quarantine(&*storage, &*bus, &obj.key, dry_run).await {
+                        Ok(QuarantineOutcome::HealthyPdf) => {
+                            healthy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Ok(QuarantineOutcome::RenamedToHtml) => {
+                            renamed_html.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Ok(QuarantineOutcome::Quarantined) => {
+                            quarantined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            errors.lock().await.push(format!("{}: {e}", obj.key));
+                        }
+                    }
                 }
-                Ok(QuarantineOutcome::RenamedToHtml) => {
-                    renamed_html.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Ok(QuarantineOutcome::Quarantined) => {
-                    quarantined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Err(e) => {
-                    errors.lock().await.push(format!("{}: {e}", obj.key));
-                }
-            }
-        }
-    }))
+            }),
+    )
     .buffer_unordered(CONCURRENCY);
 
     let mut done = 0usize;
@@ -875,7 +886,9 @@ async fn purge_local_html_rows(
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
-                    stats.errors.push(format!("papers/{stem}.{ext}: probe: {e}"));
+                    stats
+                        .errors
+                        .push(format!("papers/{stem}.{ext}: probe: {e}"));
                     continue;
                 }
             }
@@ -1858,8 +1871,14 @@ mod migration_safety_tests {
             std::fs::write(tmp.path().join(format!("{name}.pdf")), name).unwrap();
         }
 
-        let stats =
-            shard_directory("papers", tmp.path(), &["pdf"], &Shutdown::new(), &reporter()).unwrap();
+        let stats = shard_directory(
+            "papers",
+            tmp.path(),
+            &["pdf"],
+            &Shutdown::new(),
+            &reporter(),
+        )
+        .unwrap();
 
         assert!(stats.failures.is_empty(), "{:?}", stats.failures);
         assert_eq!(stats.moved, 4);
@@ -1880,7 +1899,8 @@ mod migration_safety_tests {
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("...pdf"), "x").unwrap();
 
-        let stats = shard_directory("papers", &dir, &["pdf"], &Shutdown::new(), &reporter()).unwrap();
+        let stats =
+            shard_directory("papers", &dir, &["pdf"], &Shutdown::new(), &reporter()).unwrap();
 
         assert_eq!(stats.moved, 0);
         assert_eq!(stats.failures.len(), 1, "{:?}", stats.failures);
@@ -1900,8 +1920,14 @@ mod migration_safety_tests {
         std::fs::write(tmp.path().join("ab/abcdef.pdf"), "old, the good one").unwrap();
         std::fs::write(tmp.path().join("abcdef.pdf"), "new, different").unwrap();
 
-        let stats =
-            shard_directory("papers", tmp.path(), &["pdf"], &Shutdown::new(), &reporter()).unwrap();
+        let stats = shard_directory(
+            "papers",
+            tmp.path(),
+            &["pdf"],
+            &Shutdown::new(),
+            &reporter(),
+        )
+        .unwrap();
 
         assert_eq!(stats.moved, 0);
         assert_eq!(stats.failures.len(), 1, "{:?}", stats.failures);
@@ -1923,8 +1949,14 @@ mod migration_safety_tests {
         std::fs::write(tmp.path().join("ab/abcdef.pdf"), "same").unwrap();
         std::fs::write(tmp.path().join("abcdef.pdf"), "same").unwrap();
 
-        let stats =
-            shard_directory("papers", tmp.path(), &["pdf"], &Shutdown::new(), &reporter()).unwrap();
+        let stats = shard_directory(
+            "papers",
+            tmp.path(),
+            &["pdf"],
+            &Shutdown::new(),
+            &reporter(),
+        )
+        .unwrap();
 
         assert!(stats.failures.is_empty(), "{:?}", stats.failures);
         assert_eq!(stats.duplicates, 1);

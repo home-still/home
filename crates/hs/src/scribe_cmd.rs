@@ -932,11 +932,12 @@ mod markdown_path_tests {
         let dir = outer.path().join("markdown");
         std::fs::create_dir(&dir).unwrap();
 
-        for name in ["...pdf"] {
-            let err = markdown_path_in(&dir, std::path::Path::new(name))
-                .expect_err("not a usable stem");
-            assert!(format!("{err:#}").contains("cannot name the output"), "{err:#}");
-        }
+        let err =
+            markdown_path_in(&dir, std::path::Path::new("...pdf")).expect_err("not a usable stem");
+        assert!(
+            format!("{err:#}").contains("cannot name the output"),
+            "{err:#}"
+        );
         // Nothing was created beside or above `dir`.
         assert_eq!(std::fs::read_dir(outer.path()).unwrap().count(), 1);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
@@ -950,7 +951,10 @@ mod markdown_path_tests {
 
         let err = markdown_path_in(&file_in_the_way, std::path::Path::new("paper.pdf"))
             .expect_err("a file cannot hold shard directories");
-        assert!(format!("{err:#}").contains("create output directory"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("create output directory"),
+            "{err:#}"
+        );
     }
 }
 
@@ -1022,8 +1026,8 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
     let binary = find_scribe_server_binary().ok_or_else(|| {
         anyhow::anyhow!(
             "hs-scribe-server binary not found. Build with:\n  \
-             cargo build --release -p hs-scribe --features server,cuda   (Linux with CUDA)\n  \
-             cargo build --release -p hs-scribe --features server         (macOS / CPU)"
+             HS_RELEASE_TAG=<tag> cargo build --release -p hs-scribe --features server,cuda   (Linux with CUDA)\n  \
+             HS_RELEASE_TAG=<tag> cargo build --release -p hs-scribe --features server         (macOS / CPU)"
         )
     })?;
 
