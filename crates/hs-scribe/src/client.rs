@@ -320,7 +320,7 @@ impl ScribeClient {
         if let Some(s) = stem {
             req = req.header(CONVERT_STEM_HEADER, s);
         }
-        let mut resp = req.send().await.context("Failed to send PDF")?;
+        let resp = req.send().await.context("Failed to send PDF")?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             anyhow::bail!(
@@ -336,42 +336,13 @@ impl ScribeClient {
             anyhow::bail!("Server error {status}: {body}");
         }
 
-        // Read chunks and parse NDJSON lines
-        let mut buf = Vec::new();
-        while let Some(bytes) = resp.chunk().await.context("Stream read error")? {
-            buf.extend_from_slice(&bytes);
-            // Process complete lines
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&line_bytes);
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<StreamLine>(line) {
-                    Ok(StreamLine::Progress(event)) => on_progress(event),
-                    Ok(StreamLine::Result {
-                        markdown,
-                        per_page_region_classes,
-                        per_page_diags,
-                    }) => {
-                        return Ok(ConversionResult {
-                            markdown,
-                            per_page_region_classes,
-                            per_page_diags,
-                        })
-                    }
-                    Ok(StreamLine::Error(msg)) => {
-                        anyhow::bail!("Server error: {msg}");
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse stream line: {e}");
-                    }
-                }
-            }
-        }
-
-        anyhow::bail!("Server closed connection without sending result")
+        // Same wire format as `StreamLine` above; the one shared NDJSON
+        // reader in hs-common fails on a malformed line instead of skipping it.
+        hs_common::service::protocol::read_ndjson_stream::<ProgressEvent, ConversionResult>(
+            resp,
+            on_progress,
+        )
+        .await
     }
 }
 
@@ -421,5 +392,40 @@ mod tests {
         assert_eq!(compute_convert_timeout(Some(1), &p).as_secs(), 30);
         assert_eq!(compute_convert_timeout(Some(500), &p).as_secs(), 200);
         assert_eq!(compute_convert_timeout(None, &p).as_secs(), 60);
+    }
+
+    /// The server serializes `StreamLine`; the client reads the same bytes
+    /// through hs-common's generic reader. The two must stay wire-identical.
+    #[test]
+    fn server_stream_lines_parse_as_the_shared_stream_line() {
+        use hs_common::service::protocol::StreamLine as Shared;
+
+        let progress = serde_json::to_string(&StreamLine::Progress(ProgressEvent {
+            stage: "ocr".into(),
+            page: 2,
+            total_pages: 9,
+            message: "page 2".into(),
+        }))
+        .unwrap();
+        let result = serde_json::to_string(&StreamLine::Result {
+            markdown: "# Müller".into(),
+            per_page_region_classes: vec![vec!["text".into()]],
+            per_page_diags: Vec::new(),
+        })
+        .unwrap();
+        let error = serde_json::to_string(&StreamLine::Error("boom".into())).unwrap();
+
+        let p: Shared<ProgressEvent, ConversionResult> = serde_json::from_str(&progress).unwrap();
+        assert!(matches!(p, Shared::Progress(e) if e.page == 2 && e.total_pages == 9));
+        let r: Shared<ProgressEvent, ConversionResult> = serde_json::from_str(&result).unwrap();
+        match r {
+            Shared::Result(c) => {
+                assert_eq!(c.markdown, "# Müller");
+                assert_eq!(c.per_page_region_classes, vec![vec!["text".to_string()]]);
+            }
+            other => panic!("expected result, got {other:?}"),
+        }
+        let e: Shared<ProgressEvent, ConversionResult> = serde_json::from_str(&error).unwrap();
+        assert!(matches!(e, Shared::Error(m) if m == "boom"));
     }
 }
