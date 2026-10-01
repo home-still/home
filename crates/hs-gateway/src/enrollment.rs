@@ -134,7 +134,11 @@ pub async fn handle_refresh(
             return (StatusCode::UNAUTHORIZED, "Not a refresh token").into_response();
         }
         Err(AuthError::Invalid) => {
-            return (StatusCode::UNAUTHORIZED, "Invalid refresh token").into_response();
+            return (
+                StatusCode::UNAUTHORIZED,
+                "Invalid refresh token — re-enroll with `hs cloud enroll`",
+            )
+                .into_response();
         }
     };
 

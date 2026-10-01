@@ -2,7 +2,7 @@
 //! real router driven in-process, and loopback fake backends.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ops::Deref;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -18,26 +18,35 @@ use crate::config::GatewayConfig;
 use crate::revocation::Revocations;
 use crate::state::GatewayState;
 
-static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+/// A wired `GatewayState` plus the temp directory holding its secret files;
+/// the directory is removed when the last clone is dropped. Derefs to
+/// `Arc<GatewayState>`.
+#[derive(Clone)]
+pub struct TestState {
+    state: Arc<GatewayState>,
+    _dir: Arc<tempfile::TempDir>,
+}
+
+impl Deref for TestState {
+    type Target = Arc<GatewayState>;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
 
 /// A state routed at the given `(service, backend_url)` pairs.
-pub async fn test_state(routes: &[(&str, &str)]) -> Arc<GatewayState> {
+pub async fn test_state(routes: &[(&str, &str)]) -> TestState {
     test_state_with(routes, "").await
 }
 
 /// Like [`test_state`], with extra `cloud.gateway` YAML lines (e.g.
 /// `"max_concurrent_proxy_requests: 1"`).
-pub async fn test_state_with(routes: &[(&str, &str)], extra: &str) -> Arc<GatewayState> {
-    let dir = std::env::temp_dir().join(format!(
-        "hs-gw-test-{}-{}",
-        std::process::id(),
-        NEXT_DIR.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+pub async fn test_state_with(routes: &[(&str, &str)], extra: &str) -> TestState {
+    let dir = tempfile::tempdir().unwrap();
 
     let mut yaml = format!(
         "cloud:\n  gateway:\n    listen: 127.0.0.1:0\n    secret_path: {}/cloud-secret.key\n",
-        dir.display()
+        dir.path().display()
     );
     for line in extra.lines() {
         yaml.push_str(&format!("    {line}\n"));
@@ -64,10 +73,10 @@ pub async fn test_state_with(routes: &[(&str, &str)], extra: &str) -> Arc<Gatewa
     )
     .unwrap();
 
-    // Everything the state needs is in memory now. (Revocation recreates its
-    // directory if a test revokes.)
-    std::fs::remove_dir_all(&dir).ok();
-    Arc::new(state)
+    TestState {
+        state: Arc::new(state),
+        _dir: Arc::new(dir),
+    }
 }
 
 /// Drive one request through the real router.

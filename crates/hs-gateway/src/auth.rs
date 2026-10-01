@@ -232,4 +232,31 @@ mod tests {
             Err(TokenError::InvalidSignature)
         );
     }
+
+    #[test]
+    fn a_configured_previous_secret_must_exist_and_be_valid() {
+        let dir = std::env::temp_dir().join(format!("hs-gw-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = dir.join("cloud-secret.key.prev");
+        let yaml = format!(
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:0\n    secret_path: {}/cloud-secret.key\n    previous_secret_path: {}\n    routes:\n      mcp: http://127.0.0.1:9\n",
+            dir.display(),
+            prev.display()
+        );
+        let config =
+            GatewayConfig::from_yaml(&yaml, std::path::Path::new("test-config.yaml")).unwrap();
+
+        // Missing and too-short previous secrets are startup errors.
+        assert!(SigningKeys::load(&config).is_err());
+        std::fs::write(&prev, b"short").unwrap();
+        assert!(SigningKeys::load(&config).is_err());
+
+        std::fs::write(&prev, [0x33u8; 32]).unwrap();
+        let keys = SigningKeys::load(&config).unwrap();
+        assert_eq!(keys.previous.as_deref(), Some(&[0x33u8; 32][..]));
+        // Loading again does not regenerate the current secret.
+        let again = SigningKeys::load(&config).unwrap();
+        assert_eq!(keys.current, again.current);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

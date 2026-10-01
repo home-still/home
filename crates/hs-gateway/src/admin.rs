@@ -203,7 +203,7 @@ pub async fn handle_admin_revoke(
     };
     let removed = state.registry.remove_owned_by(&req.subject).await;
     tracing::info!(
-        "revoked {} (removed {removed} registry entries)",
+        "revoked {:?} (removed {removed} registry entries)",
         req.subject
     );
 

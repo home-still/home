@@ -2316,6 +2316,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "subtle",
+ "tempfile",
  "tokio",
  "tower 0.5.3",
  "tracing",

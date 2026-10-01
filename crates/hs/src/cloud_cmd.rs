@@ -156,6 +156,18 @@ fn http_client() -> Result<reqwest::Client> {
         .build()?)
 }
 
+/// Client for the admin calls to this host's own gateway. It never goes
+/// through an HTTP proxy from the environment: the admin key must not leave
+/// the machine, and a proxy would also stamp the request with the forwarding
+/// headers the gateway's admin endpoints refuse.
+fn admin_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()?)
+}
+
 fn human_duration(secs: u64) -> String {
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     match (h, m, s) {
@@ -245,7 +257,7 @@ async fn cmd_invite(
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
     let (base, admin_key) = local_admin_target()?;
-    let body = request_invite(&http_client()?, &base, &admin_key, device_name, &scopes).await?;
+    let body = request_invite(&admin_client()?, &base, &admin_key, device_name, &scopes).await?;
 
     reporter.status("Enrollment code", &body.code);
     reporter.status("Scopes", &body.scopes.join(", "));
@@ -272,7 +284,7 @@ async fn cmd_revoke(subject: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
         registry_entries_removed: usize,
     }
 
-    let resp = http_client()?
+    let resp = admin_client()?
         .post(format!("{base}/cloud/admin/revoke"))
         .bearer_auth(&admin_key)
         .json(&serde_json::json!({ "subject": subject }))
@@ -575,7 +587,7 @@ mod tests {
         .await;
 
         let resp = request_invite(
-            &http_client().unwrap(),
+            &admin_client().unwrap(),
             &base,
             "the-admin-key",
             "laptop",
@@ -596,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn invite_surfaces_a_gateway_refusal() {
         let (base, _request) = one_shot_server("401 Unauthorized", "Invalid admin key").await;
-        let err = request_invite(&http_client().unwrap(), &base, "wrong", "laptop", &[])
+        let err = request_invite(&admin_client().unwrap(), &base, "wrong", "laptop", &[])
             .await
             .unwrap_err();
         let msg = format!("{err:#}");

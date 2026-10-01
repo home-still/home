@@ -232,7 +232,7 @@ mv cloud-secret.key cloud-secret.key.prev       # the old secret
 systemctl restart hs-gateway                    # creates a new cloud-secret.key
 ```
 
-New tokens are signed with the new secret; tokens signed with the previous one keep working. After the refresh TTL (7 days by default) has passed, remove `previous_secret_path` and delete the `.prev` file; anything still signed with it then stops working. Dropping the `.prev` file earlier is the "revoke everything" button: every device must re-enroll.
+New tokens are signed with the new secret; tokens signed with the previous one keep working. After the refresh TTL (7 days by default) has passed, remove `previous_secret_path` from the config, restart, and delete the `.prev` file. Removing `previous_secret_path` earlier is the "revoke everything" button: every token signed with the old secret stops working and every device must re-enroll. (The gateway refuses to start if `previous_secret_path` is set but the file is missing or too short.)
 
 ## Token format
 
