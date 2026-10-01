@@ -3559,7 +3559,7 @@ impl ServerHandler for HomeStillMcp {
 
 /// hs-mcp — MCP server for the home-still research pipeline
 #[derive(Parser)]
-#[command(name = "hs-mcp")]
+#[command(name = "hs-mcp", version = env!("HS_VERSION"))]
 struct Args {
     /// Run as HTTP/SSE server on this address (default: stdio mode)
     /// Example: --serve 127.0.0.1:7445
