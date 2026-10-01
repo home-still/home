@@ -468,6 +468,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_zero_chunk_index_is_stamped_as_a_skip_not_as_embedded() {
+        // The server answers Ok(0) for empty/stub/low-quality documents (and
+        // has already removed any earlier chunks); the catalog must say
+        // "skipped", never "embedded with 0 chunks".
+        let rig = rig(|| {
+            Reply::Json(
+                200,
+                r#"{"doc_id":"doc","chunks_indexed":0,"embedding_device":"Cuda"}"#.into(),
+            )
+        })
+        .await;
+        run(&rig, "markdown/do/doc.md")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let row = hs_common::catalog::read_catalog_entry_via(&rig.storage, "catalog", "doc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.embedding.is_none());
+        assert_eq!(row.embedding_skip.unwrap().reason, "zero_chunks_or_empty");
+    }
+
+    #[tokio::test]
     async fn a_lost_embedding_stamp_is_transient_so_the_event_is_redelivered() {
         // RA-87: the handler used to log the lost stamp and ACK.
         let rig = rig(|| Reply::Json(200, OK_INDEX.into())).await;

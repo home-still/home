@@ -41,6 +41,20 @@ pub trait Embedder: Send + Sync {
     fn slots(&self) -> usize;
 }
 
+/// Compare the configured embedding width with the one the model actually
+/// produced. A collection is created at the width the embedder reports, so
+/// a config that disagrees with the model is a mistake to surface at
+/// startup, not something to resolve silently in either direction.
+pub fn check_dimension(configured: usize, measured: usize) -> Result<(), DistillError> {
+    if configured == measured {
+        return Ok(());
+    }
+    Err(DistillError::Config(format!(
+        "embedding.dimension is {configured} but {MODEL_NAME} returned {measured}-wide vectors; \
+         fix embedding.dimension (the model fixes the width)"
+    )))
+}
+
 /// Run `embed` over `texts` in groups of `batch_size` rows and concatenate
 /// the results in order. Fails — rather than panics or silently drops
 /// rows — on a zero batch size or an `embed` that returns the wrong number
@@ -77,6 +91,15 @@ mod tests {
 
     fn texts(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("t{i}")).collect()
+    }
+
+    #[test]
+    fn a_dimension_that_disagrees_with_the_model_is_a_config_error() {
+        check_dimension(1024, 1024).unwrap();
+        let err = check_dimension(768, 1024).unwrap_err();
+        assert!(matches!(err, DistillError::Config(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("768") && msg.contains("1024"), "{msg}");
     }
 
     #[test]

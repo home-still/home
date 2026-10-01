@@ -583,4 +583,77 @@ mod tests {
             .unwrap();
         assert_eq!(exists["exists"], false);
     }
+
+    #[tokio::test]
+    async fn the_real_client_talks_to_the_real_router() {
+        // Wire compatibility: every DistillClient call against the axum app.
+        use crate::client::{DistillClient, SearchFilters};
+        use hs_common::service::protocol::ReadinessInfo;
+
+        let h = start().await;
+        let client = DistillClient::new(&h.base).unwrap();
+
+        let indexed = client
+            .index_content("markdown/ab/doc.md", &prose(8), None)
+            .await
+            .unwrap();
+        assert_eq!(indexed.doc_id, "doc");
+        assert!(indexed.chunks_indexed > 0);
+        assert_eq!(
+            client.doc_chunks("doc").await.unwrap(),
+            (true, u64::from(indexed.chunks_indexed))
+        );
+        assert_eq!(client.list_docs(10).await.unwrap(), ["doc"]);
+
+        let status = client.status().await.unwrap();
+        assert_eq!(status.documents_count, 1);
+        assert_eq!(status.points_count, u64::from(indexed.chunks_indexed));
+        assert!(!status.documents_count_truncated);
+
+        let ready = client.readiness().await.unwrap();
+        assert!(ready.is_ready());
+        assert_eq!(ready.available_slots(), 2);
+        assert_eq!(client.health().await.unwrap().embed_model, "bge-m3");
+
+        client
+            .search(
+                "query",
+                5,
+                SearchFilters {
+                    year: Some(">2000".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let err = client
+            .search(
+                "query",
+                5,
+                SearchFilters {
+                    year: Some("nonsense".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("400"), "{err:#}");
+
+        let unknown = client
+            .index_content_in("a.md", "text", None, Some("made_up"))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{unknown:#}").contains("unknown collection"),
+            "{unknown:#}"
+        );
+
+        assert_eq!(
+            client.delete_doc("doc").await.unwrap(),
+            u64::from(indexed.chunks_indexed)
+        );
+        assert_eq!(client.reset_collection().await.unwrap(), 0);
+        let report = client.scrub_interstitials(true).await.unwrap();
+        assert_eq!(report.matched, 0);
+    }
 }

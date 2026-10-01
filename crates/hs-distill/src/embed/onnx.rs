@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use super::pool::{is_idle, SlotError, SlotPool};
-use super::{embed_in_batches, ComputeDevice, Embedder, EmbedderHealth};
+use super::{check_dimension, embed_in_batches, ComputeDevice, Embedder, EmbedderHealth};
 use crate::adaptive_batch::{AdaptiveBatchController, AdaptiveConfig};
 use crate::config::{max_batch_rows, EmbeddingConfig};
 use crate::error::DistillError;
@@ -76,13 +76,7 @@ impl OnnxEmbedder {
         require_vram(config.vram_floor_mb)?;
         let mut first = build_text_embedding(config.max_length)?;
         let dimension = verify_cuda_probe(&mut first)?;
-        if dimension != config.dimension {
-            return Err(DistillError::Config(format!(
-                "embedding.dimension is {} but bge-m3 returned {dimension}-wide vectors; \
-                 a collection created at the configured width would reject every point",
-                config.dimension
-            )));
-        }
+        check_dimension(config.dimension, dimension)?;
 
         let mut rest = Vec::with_capacity(pool_size - 1);
         for _ in 1..pool_size {
