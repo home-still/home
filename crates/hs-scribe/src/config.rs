@@ -47,7 +47,7 @@ fn resolve_project_dir() -> PathBuf {
     home.join("home-still")
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendChoice {
     #[default]
     Ollama,
@@ -153,6 +153,13 @@ pub struct AppConfig {
     /// holding a VLM permit until the whole-convert deadline. Override via
     /// `HS_SCRIBE_VLM_IDLE_TIMEOUT_SECS`.
     pub vlm_idle_timeout_secs: u64,
+    /// Longest one Ollama generate call may take, in seconds. The Ollama
+    /// backend is non-streaming, so this bounds the whole generation (a
+    /// stalled Ollama otherwise pinned a VLM permit until the convert
+    /// deadline). Must be at least 1 and, with the Ollama backend, no more
+    /// than `max_convert_deadline_secs`. Override via
+    /// `HS_SCRIBE_OLLAMA_REQUEST_TIMEOUT_SECS`.
+    pub ollama_request_timeout_secs: u64,
     /// Which converter implements `/scribe`. Defaults to `Legacy` so
     /// existing deployments are unaffected; set `HS_SCRIBE_CONVERTER=olmocr`
     /// on hosts running the olmocr/vLLM scribe instance.
@@ -201,6 +208,7 @@ impl Default for AppConfig {
             max_image_dim: 1800,
             vlm_concurrency: class.vlm_concurrency(),
             vlm_idle_timeout_secs: 300,
+            ollama_request_timeout_secs: 600,
             converter: ConverterMode::default(),
             olmocr_endpoint: "http://localhost:8081/v1".into(),
             olmocr_model: "olmocr".into(),
@@ -231,6 +239,10 @@ impl AppConfig {
         for (name, value) in [
             ("vlm_concurrency", self.vlm_concurrency as u64),
             ("vlm_idle_timeout_secs", self.vlm_idle_timeout_secs),
+            (
+                "ollama_request_timeout_secs",
+                self.ollama_request_timeout_secs,
+            ),
             ("page_parallel", self.page_parallel as u64),
             ("region_parallel", self.region_parallel as u64),
             ("parallel", self.parallel as u64),
@@ -250,6 +262,16 @@ impl AppConfig {
                 "scribe config: `max_convert_deadline_secs` ({}) is below `convert_deadline_secs` ({})",
                 self.max_convert_deadline_secs,
                 self.convert_deadline_secs
+            );
+        }
+        if self.backend == BackendChoice::Ollama
+            && self.ollama_request_timeout_secs > self.max_convert_deadline_secs
+        {
+            anyhow::bail!(
+                "scribe config: `ollama_request_timeout_secs` ({}) exceeds `max_convert_deadline_secs` ({}): \
+                 a single request cannot outlive the longest conversion",
+                self.ollama_request_timeout_secs,
+                self.max_convert_deadline_secs
             );
         }
         if self.converter == ConverterMode::Olmocr {
@@ -697,7 +719,7 @@ mod tests {
     fn zero_concurrency_and_budgets_are_errors_not_hangs() {
         // Semaphore(0) never grants a permit and buffered(0) never polls.
         type Break = fn(&mut AppConfig);
-        let cases: [(&str, Break); 8] = [
+        let cases: [(&str, Break); 9] = [
             ("vlm_concurrency", |c| c.vlm_concurrency = 0),
             ("page_parallel", |c| c.page_parallel = 0),
             ("region_parallel", |c| c.region_parallel = 0),
@@ -705,6 +727,9 @@ mod tests {
             ("dpi", |c| c.dpi = 0),
             ("max_render_pixels", |c| c.max_render_pixels = 0),
             ("vlm_idle_timeout_secs", |c| c.vlm_idle_timeout_secs = 0),
+            ("ollama_request_timeout_secs", |c| {
+                c.ollama_request_timeout_secs = 0
+            }),
             ("convert_deadline_secs", |c| c.convert_deadline_secs = 0),
         ];
         for (key, break_it) in cases {
@@ -713,6 +738,26 @@ mod tests {
             let err = c.validate().unwrap_err().to_string();
             assert!(err.contains(key), "{key}: {err}");
         }
+    }
+
+    #[test]
+    fn an_ollama_request_cannot_outlive_the_longest_convert_deadline() {
+        let ollama = AppConfig {
+            backend: BackendChoice::Ollama,
+            ollama_request_timeout_secs: 7201,
+            ..AppConfig::default()
+        };
+        assert!(ollama
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("ollama_request_timeout_secs"));
+        // Irrelevant (and so not checked against the ceiling) for other backends.
+        let other = AppConfig {
+            backend: BackendChoice::OpenAi,
+            ..ollama
+        };
+        other.validate().unwrap();
     }
 
     #[test]

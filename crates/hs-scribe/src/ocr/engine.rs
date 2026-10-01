@@ -17,9 +17,11 @@ impl OcrEngine {
     pub fn from_config(config: &AppConfig) -> Result<Self> {
         let idle_timeout = Duration::from_secs(config.vlm_idle_timeout_secs);
         Ok(match config.backend {
-            BackendChoice::Ollama => {
-                OcrEngine::Ollama(OllamaBackend::new(&config.ollama_url, &config.model)?)
-            }
+            BackendChoice::Ollama => OcrEngine::Ollama(OllamaBackend::new(
+                &config.ollama_url,
+                &config.model,
+                Duration::from_secs(config.ollama_request_timeout_secs),
+            )?),
             BackendChoice::Cloud => OcrEngine::Cloud(CloudBackend::new(
                 &config.cloud_url,
                 config.cloud_api_key.clone(),

@@ -257,4 +257,92 @@ mod tests {
     fn a_cap_too_small_for_one_pixel_per_side_is_refused() {
         assert!(plan_render(612.0, 792.0, 200, 0).is_err());
     }
+
+    // ── pdfium-backed: skipped (loudly) when libpdfium cannot be bound ──
+    // CI needs libpdfium on the library path for these to run.
+
+    fn pdfium_or_skip(test: &str) -> Option<PdfParser> {
+        match PdfParser::new() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("SKIPPED {test}: libpdfium cannot be bound here ({e:#})");
+                None
+            }
+        }
+    }
+
+    /// A one-page PDF with the given MediaBox text, written to a temp file.
+    fn page_with_media_box(dir: &std::path::Path, media_box: &str) -> String {
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] >>"),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = vec![];
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        let path = dir.join("page.pdf");
+        std::fs::write(&path, out).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_maximal_media_box_renders_within_the_pixel_cap_not_at_gigapixels() {
+        let Some(parser) = pdfium_or_skip("a_maximal_media_box_renders_within_the_pixel_cap")
+        else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // 14400 pt square at 200 dpi would be 40 000 x 40 000 px (~6 GB).
+        let path = page_with_media_box(dir.path(), "0 0 14400 14400");
+        let doc = parser.open(&path).unwrap();
+        let cap = 1_000_000u64;
+        let page = PdfParser::render_page(&doc, 0, 200, cap).expect("renders at reduced dpi");
+        let px = u64::from(page.image.width()) * u64::from(page.image.height());
+        assert!(
+            px <= cap && px > cap / 2,
+            "rendered {px} px under a {cap} cap"
+        );
+    }
+
+    #[test]
+    fn an_absurd_media_box_is_an_error_or_stays_within_the_cap_never_an_allocation() {
+        let Some(parser) = pdfium_or_skip("an_absurd_media_box_is_an_error") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cap = 1_000_000u64;
+        for media_box in [
+            "0 0 1000000000 1000000000",
+            "0 0 99999999999999 5",
+            "0 0 14401 14401",
+        ] {
+            let path = page_with_media_box(dir.path(), media_box);
+            let Ok(doc) = parser.open(&path) else {
+                continue;
+            };
+            match PdfParser::render_page(&doc, 0, 200, cap) {
+                Err(e) => assert_eq!(
+                    crate::classify::failure_code(&e),
+                    Some(FailureCode::PdfParseError),
+                    "{media_box}: {e:#}"
+                ),
+                Ok(p) => {
+                    let px = u64::from(p.image.width()) * u64::from(p.image.height());
+                    assert!(px <= cap, "{media_box}: rendered {px} px");
+                }
+            }
+        }
+    }
 }

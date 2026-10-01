@@ -15,7 +15,7 @@ impl OllamaBackend {
     /// Construct a backend pointing at `url`. Returns `Err` if `url` is
     /// not a parseable URL or lacks a host component — no silent fallback
     /// to localhost (ONE PATH).
-    pub fn new(url: &str, model: &str) -> Result<Self> {
+    pub fn new(url: &str, model: &str, request_timeout: std::time::Duration) -> Result<Self> {
         if std::env::var("OLLAMA_NUM_PARALLEL").is_err() {
             tracing::warn!(
                 "OLLAMA_NUM_PARALLEL is not set. Set it to 2 when starting Ollama \
@@ -30,8 +30,17 @@ impl OllamaBackend {
         let port = parsed
             .port()
             .ok_or_else(|| anyhow::anyhow!("ollama URL has no explicit port: {url}"))?;
+        // `ollama-rs` has no timeout of its own, so it is handed a client
+        // built through hs-common's builder: connect and whole-request
+        // limits (the call is non-streaming, so the request limit is the
+        // generation limit).
+        let http = hs_common::http::client_builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(request_timeout)
+            .build()
+            .context("failed to build the Ollama HTTP client")?;
         Ok(Self {
-            client: Ollama::new(host, port),
+            client: Ollama::new_with_client(host, port, http),
             model: model.to_string(),
         })
     }
@@ -88,6 +97,7 @@ impl OllamaBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     fn expect_err(res: Result<OllamaBackend>) -> anyhow::Error {
         match res {
@@ -98,7 +108,7 @@ mod tests {
 
     #[test]
     fn rejects_non_url_input() {
-        let err = expect_err(OllamaBackend::new("not a url", "model"));
+        let err = expect_err(OllamaBackend::new("not a url", "model", TIMEOUT));
         assert!(
             format!("{err:#}").contains("invalid ollama URL"),
             "error should mention invalid URL, got {err:#}"
@@ -110,7 +120,7 @@ mod tests {
         // Scheme+host parses, but there's no explicit port — the previous
         // fallback path quietly rewrote this to 11434 and sent traffic to
         // the local Ollama. Refuse loudly instead.
-        let err = expect_err(OllamaBackend::new("http://remote-host/", "model"));
+        let err = expect_err(OllamaBackend::new("http://remote-host/", "model", TIMEOUT));
         assert!(
             format!("{err:#}").contains("no explicit port"),
             "error should mention missing port, got {err:#}"
@@ -119,8 +129,37 @@ mod tests {
 
     #[test]
     fn accepts_well_formed_url() {
-        let backend = OllamaBackend::new("http://127.0.0.1:11434", "gemma")
+        let backend = OllamaBackend::new("http://127.0.0.1:11434", "gemma", TIMEOUT)
             .expect("well-formed URL should parse");
         assert_eq!(backend.model, "gemma");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_ollama_fails_the_call_at_the_timeout_instead_of_hanging() {
+        // Accepts the connection and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let backend = OllamaBackend::new(
+            &format!("http://127.0.0.1:{port}"),
+            "m",
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let err = backend.recognize(b"jpeg").await.unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("Ollama VLM request failed"),
+            "{err:#}"
+        );
     }
 }

@@ -736,4 +736,184 @@ mod tests {
             None
         );
     }
+
+    // ── the real router over loopback, olmocr mode with a stand-in CLI ──
+
+    #[cfg(unix)]
+    mod http {
+        use super::*;
+        use crate::pdf_meta::tests::pdf_with_pages;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Rig {
+            base: String,
+            dir: tempfile::TempDir,
+        }
+
+        impl Rig {
+            /// The stand-in `olmocr` waits for `<dir>/release` to exist before
+            /// it writes its markdown and tally, so a test can hold a
+            /// conversion in flight.
+            async fn start(vlm_concurrency: usize, body_limit: usize) -> Rig {
+                let dir = tempfile::tempdir().unwrap();
+                let release = dir.path().join("release");
+                let script = dir.path().join("olmocr.sh");
+                let md = "Converted text that is long enough to be indexable. ".repeat(4);
+                std::fs::write(
+                    &script,
+                    format!(
+                        "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n\
+                         mkdir -p \"$1/markdown\" && printf '# T\\n\\n{md}' > \"$1/markdown/o.md\"\n\
+                         echo 'Completed pages: 2' >&2; echo 'Failed pages: 0' >&2\n",
+                        release.display()
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let config = AppConfig {
+                    converter: ConverterMode::Olmocr,
+                    olmocr_bin: script.to_string_lossy().into_owned(),
+                    vlm_concurrency,
+                    ..AppConfig::default()
+                };
+                let state = Arc::new(ServerState::new(config).unwrap());
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                tokio::spawn(async move {
+                    axum::serve(listener, app_with_body_limit(state, body_limit)).await
+                });
+                Rig { base, dir }
+            }
+
+            fn release(&self) {
+                std::fs::write(self.dir.path().join("release"), b"").unwrap();
+            }
+
+            async fn post(&self, field: &str, body: Vec<u8>) -> reqwest::Response {
+                let form = reqwest::multipart::Form::new().part(
+                    field.to_string(),
+                    reqwest::multipart::Part::bytes(body).file_name("in.pdf"),
+                );
+                reqwest::Client::new()
+                    .post(format!("{}/scribe/stream", self.base))
+                    .multipart(form)
+                    .send()
+                    .await
+                    .unwrap()
+            }
+
+            async fn readiness(&self) -> serde_json::Value {
+                reqwest::get(format!("{}/readiness", self.base))
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap()
+            }
+        }
+
+        #[tokio::test]
+        async fn a_body_over_the_limit_is_413_not_a_missing_field() {
+            let rig = Rig::start(1, 4096).await;
+            let mut oversized = pdf_with_pages(2);
+            oversized.resize(64 * 1024, b'\n'); // trailing bytes after %%EOF
+            let resp = rig.post("pdf", oversized).await;
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let body = resp.text().await.unwrap();
+            assert!(!body.contains("Missing 'pdf' field"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn bodies_that_are_not_pdfs_are_415_with_the_failure_code_as_body() {
+            let rig = Rig::start(1, MAX_UPLOAD_BODY_BYTES).await;
+            let resp = rig
+                .post("pdf", b"<!DOCTYPE html><html>log in</html>".to_vec())
+                .await;
+            assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(resp.text().await.unwrap(), "unsupported_content_type:html");
+            let resp = rig.post("pdf", vec![0u8, 1, 2, 3, 4, 5]).await;
+            assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(
+                resp.text().await.unwrap(),
+                "unsupported_content_type:binary"
+            );
+            // Large enough to cross the header-probe window.
+            let mut big = b"<html>".to_vec();
+            big.resize(HEADER_PROBE_BYTES * 3, b' ');
+            let resp = rig.post("pdf", big).await;
+            assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            // Nothing was admitted for any of them.
+            assert_eq!(rig.readiness().await["vlm_slots_available"], 1);
+        }
+
+        #[tokio::test]
+        async fn a_request_without_the_pdf_field_is_400() {
+            let rig = Rig::start(1, MAX_UPLOAD_BODY_BYTES).await;
+            let resp = rig.post("not_pdf", pdf_with_pages(1)).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(resp.text().await.unwrap().contains("Missing 'pdf' field"));
+        }
+
+        #[tokio::test]
+        async fn a_server_at_capacity_refuses_with_503_and_readiness_tracks_the_slot() {
+            let rig = Rig::start(1, MAX_UPLOAD_BODY_BYTES).await;
+            let idle = rig.readiness().await;
+            assert_eq!(idle["vlm_slots_total"], 1);
+            assert_eq!(idle["vlm_slots_available"], 1);
+            assert_eq!(idle["ready"], true);
+
+            // First conversion: admitted, held inside the stand-in CLI.
+            let first = {
+                let (base, body) = (rig.base.clone(), pdf_with_pages(2));
+                tokio::spawn(async move {
+                    let form = reqwest::multipart::Form::new().part(
+                        "pdf",
+                        reqwest::multipart::Part::bytes(body).file_name("in.pdf"),
+                    );
+                    reqwest::Client::new()
+                        .post(format!("{base}/scribe/stream"))
+                        .multipart(form)
+                        .send()
+                        .await
+                        .unwrap()
+                        .text()
+                        .await
+                        .unwrap()
+                })
+            };
+            let mut busy = None;
+            for _ in 0..200 {
+                let r = rig.readiness().await;
+                if r["vlm_slots_available"] == 0 {
+                    busy = Some(r);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let busy = busy.expect("the in-flight conversion must take the slot");
+            assert_eq!(busy["ready"], false);
+            assert_eq!(busy["in_flight_conversions"], 1);
+
+            // Second request: refused before its upload is read.
+            let refused = rig.post("pdf", pdf_with_pages(2)).await;
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(refused.headers().get(header::RETRY_AFTER).unwrap(), "5");
+
+            // Release: the first completes and the slot comes back.
+            rig.release();
+            let stream = first.await.unwrap();
+            assert!(stream.contains("\"result\""), "{stream}");
+            let mut recovered = false;
+            for _ in 0..100 {
+                let r = rig.readiness().await;
+                if r["vlm_slots_available"] == 1 && r["in_flight_conversions"] == 0 {
+                    assert_eq!(r["ready"], true);
+                    recovered = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(recovered, "the slot must be released after the conversion");
+        }
+    }
 }
