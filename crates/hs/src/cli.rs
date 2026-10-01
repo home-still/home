@@ -72,11 +72,6 @@ pub enum TopCmd {
         #[command(subcommand)]
         command: super::serve_cmd::ServeCmd,
     },
-    /// Manage the server fleet (list, add, remove, enable, disable)
-    Server {
-        #[command(subcommand)]
-        command: super::server_cmd::ServerCmd,
-    },
     /// Remote cloud access — enrollment, gateway management
     Cloud {
         #[command(subcommand)]

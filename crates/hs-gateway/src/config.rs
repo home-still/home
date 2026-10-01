@@ -34,9 +34,12 @@ pub struct GatewayConfig {
     #[serde(default = "default_refresh_ttl")]
     pub refresh_ttl_secs: u64,
 
-    /// Service routing: service name (`scribe`, `distill`, `mcp`) -> backend URL
-    /// e.g., { "scribe": "http://scribe.example.local:7433" }
-    pub routes: HashMap<String, String>,
+    /// Service routing: service name (`scribe`, `distill`, `mcp`) -> one backend
+    /// URL or a list of them (round-robin), e.g.
+    /// `scribe: [http://gpu-a.example.local:7433, http://gpu-b.example.local:7433]`.
+    /// The only source of backend addresses.
+    #[serde(deserialize_with = "one_or_many")]
+    pub routes: HashMap<String, Vec<String>>,
 
     /// Proxied requests allowed in flight at once; excess requests get 503.
     #[serde(default = "default_max_concurrent")]
@@ -58,6 +61,10 @@ pub struct GatewayConfig {
     /// Longest a single proxied request may take end to end.
     #[serde(default = "default_total_timeout")]
     pub backend_total_timeout_secs: u64,
+
+    /// How long an instance that refused a connection is skipped.
+    #[serde(default = "default_cooldown")]
+    pub backend_failure_cooldown_secs: u64,
 
     /// POSTs per minute allowed on each of `/cloud/enroll`, `/authorize`,
     /// `/token` and `/register`.
@@ -95,6 +102,31 @@ fn default_total_timeout() -> u64 {
 
 fn default_auth_rate() -> u32 {
     30
+}
+
+fn default_cooldown() -> u64 {
+    10
+}
+
+/// Accept `service: url` or `service: [url, …]`.
+fn one_or_many<'de, D>(d: D) -> Result<HashMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    let raw = HashMap::<String, OneOrMany>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| match v {
+            OneOrMany::One(u) => (k, vec![u]),
+            OneOrMany::Many(us) => (k, us),
+        })
+        .collect())
 }
 
 impl GatewayConfig {
@@ -143,7 +175,7 @@ impl GatewayConfig {
             bail!("`cloud.gateway.routes` is empty — the gateway would route nothing");
         }
         let mut routes = HashMap::new();
-        for (service, url) in &self.routes {
+        for (service, urls) in &self.routes {
             if !SERVICES.contains(&service.as_str()) {
                 bail!(
                     "`cloud.gateway.routes.{service}` is not a routable service \
@@ -151,9 +183,19 @@ impl GatewayConfig {
                     SERVICES.join(", ")
                 );
             }
-            let base = backend_url::normalize_route(url)
-                .map_err(|e| anyhow!("`cloud.gateway.routes.{service}` ({url}): {e}"))?;
-            routes.insert(service.clone(), base);
+            if urls.is_empty() {
+                bail!("`cloud.gateway.routes.{service}` is an empty list");
+            }
+            let mut bases = Vec::new();
+            for url in urls {
+                let base = backend_url::normalize_route(url)
+                    .map_err(|e| anyhow!("`cloud.gateway.routes.{service}` ({url}): {e}"))?;
+                if bases.contains(&base) {
+                    bail!("`cloud.gateway.routes.{service}` lists {base} twice");
+                }
+                bases.push(base);
+            }
+            routes.insert(service.clone(), bases);
         }
         self.routes = routes;
 
@@ -195,11 +237,6 @@ impl GatewayConfig {
     pub fn admin_key_path(&self) -> PathBuf {
         hs_common::auth::token::admin_key_path_for(&self.secret_path)
     }
-
-    /// Resolve a service name to its backend URL.
-    pub fn backend_for(&self, service: &str) -> Option<&str> {
-        self.routes.get(service).map(|s| s.as_str())
-    }
 }
 
 /// Validate the externally visible gateway URL: it is handed to OAuth clients
@@ -228,7 +265,7 @@ pub fn validate_gateway_url(raw: Option<&str>) -> anyhow::Result<String> {
     {
         bail!("gateway URL {raw:?} must be a bare origin (scheme://host[:port])");
     }
-    Ok(backend_url::canonical(&url))
+    Ok(backend_url::canonical_origin(&url))
 }
 
 #[cfg(test)]
@@ -269,7 +306,7 @@ mod tests {
         .expect("valid section");
 
         assert_eq!(config.listen, "127.0.0.1:7440");
-        assert_eq!(config.backend_for("mcp"), Some("http://127.0.0.1:7445"));
+        assert_eq!(config.routes["mcp"], ["http://127.0.0.1:7445"]);
         assert_eq!(config.routes.len(), 3);
         assert_eq!(config.token_ttl_secs, 14400);
         assert_eq!(
@@ -296,10 +333,42 @@ mod tests {
             Path::new(PATH),
         )
         .unwrap();
+        assert_eq!(config.routes["scribe"], ["http://big.example.local:7433"]);
+    }
+
+    #[test]
+    fn a_route_may_be_a_single_url_or_a_list() {
+        let config = GatewayConfig::from_yaml(
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe:\n        - http://gpu-a.example.local:7433\n        - http://gpu-b.example.local:7433/\n",
+            Path::new(PATH),
+        )
+        .unwrap();
+        assert_eq!(config.routes["mcp"], ["http://127.0.0.1:7445"]);
         assert_eq!(
-            config.backend_for("scribe"),
-            Some("http://big.example.local:7433")
+            config.routes["scribe"],
+            [
+                "http://gpu-a.example.local:7433",
+                "http://gpu-b.example.local:7433"
+            ]
         );
+    }
+
+    #[test]
+    fn empty_duplicate_and_malformed_route_lists_are_errors() {
+        for routes in [
+            "scribe: []",
+            "scribe: [http://a.example.local:1, http://a.example.local:1/]",
+            "scribe: [http://a.example.local:1, ftp://b]",
+            "scribe: 7433",
+        ] {
+            let yaml = format!(
+                "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      {routes}\n"
+            );
+            assert!(
+                GatewayConfig::from_yaml(&yaml, Path::new(PATH)).is_err(),
+                "{routes}"
+            );
+        }
     }
 
     #[test]

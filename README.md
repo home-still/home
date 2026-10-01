@@ -22,7 +22,6 @@ hs paper search "transformer attention mechanisms" # search across 6 providers
 hs paper download "neural nets" -n 25              # download PDFs (auto-starts scribe + distill)
 hs serve scribe                                    # run scribe service on this machine
 hs serve distill                                   # run distill service on this machine
-hs server list                                     # see all registered machines
 hs distill search "attention mechanism"            # semantic search
 hs status                                          # live pipeline dashboard
 ```
@@ -37,8 +36,7 @@ home-still is a four-phase academic research engine:
 | **Convert** | `hs scribe` | Convert PDFs to markdown using layout detection + VLM OCR | Working |
 | **Index** | `hs distill` | Chunk, embed, and index documents into Qdrant | Working |
 | **Search** | `hs distill search` | Semantic search across indexed documents | Working |
-| **Serve** | `hs serve` | Run a service on this machine (auto-init + gateway registration) | Working |
-| **Fleet** | `hs server` | Manage registered machines across the network | Working |
+| **Serve** | `hs serve` | Run a service on this machine (auto-init) | Working |
 | **Cloud** | `hs cloud` | Secure remote access via Cloudflare tunnel + OAuth2 | Working |
 
 ## Paper search
@@ -193,7 +191,7 @@ Refreshes every 3 seconds. Press `q` to quit.
 
 ## Service Deployment (Serve)
 
-Run a service on the current machine. Each `hs serve` command initializes the service if needed, starts it, and registers it with the gateway so other machines can discover it.
+Run a service on the current machine. Each `hs serve` command initializes the service if needed and starts it.
 
 ```sh
 hs serve scribe                   # run scribe (PDF conversion) on this machine
@@ -201,21 +199,11 @@ hs serve distill                  # run distill (embedding + search) on this mac
 hs serve mcp                      # run MCP server on this machine
 ```
 
-Services auto-initialize on first run (equivalent to `hs scribe init` / `hs distill init`), then register with the gateway for discovery by other nodes. Once registered, `hs paper download` on any machine can route conversions to this node.
+Services auto-initialize on first run (equivalent to `hs scribe init` / `hs distill init`). To make a node reachable through the gateway, add its URL to `cloud.gateway.routes` on the gateway host.
 
-## Fleet Management (Server)
+## Load balancing
 
-Manage the set of machines registered across the network.
-
-```sh
-hs server list                    # show all registered machines and their services
-hs server add gpu-box:7433        # register a new machine
-hs server remove gpu-box:7433     # unregister a machine
-hs server disable gpu-box:7433    # temporarily take a machine out of rotation
-hs server enable gpu-box:7433     # bring a disabled machine back online
-```
-
-Disabled servers remain in the config but are skipped during load balancing. Use `hs server list` to see status, health, and active service counts for each machine.
+The gateway is the single endpoint for off-network clients; it balances across the backends listed under `cloud.gateway.routes` (a single URL or a list per service; round-robin, with an instance that refuses connections skipped briefly). Add or remove a node by editing that list and restarting the gateway.
 
 ## Self-Update
 

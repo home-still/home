@@ -580,7 +580,7 @@ hs cloud enroll --gateway https://cloud.example.com
 # enter the enrollment code printed on `two` by `hs cloud invite --name big`
 ```
 
-The installed `hs-serve-*.service` units auto-register with the gateway (heartbeat loop inside `hs serve`). Once registered, the gateway routes `/scribe/*` and `/distill/*` to this host even when off-network clients connect through Cloudflare.
+The gateway does not discover `hs serve` nodes: list this host's URL (e.g. `http://<host>:7433`) under `cloud.gateway.routes.scribe` on `two` (a list when several hosts serve it).
 
 ### 6.4 DB host (`four`)
 
@@ -1022,18 +1022,8 @@ tail -n 50 ~/home-still/logs/distill-server.log | grep -i 'vram\|cuda\|provider'
 **From any client:**
 
 ```bash
-hs server list           # all registered services across the cluster
 hs status                # live TUI dashboard
 hs distill search "test query"
-```
-
-Expected output of `hs server list` on a healthy three-node cluster:
-
-```
-SERVICE   HOST    URL                       ENABLED  HEALTHY  AGE
-scribe    big     http://big:7433           true     true     12s
-distill   big     http://big:7434           true     true     14s
-mcp       two     http://127.0.0.1:7445     true     true     8s
 ```
 
 ## 10. Common operational tasks
@@ -1078,19 +1068,11 @@ hs serve scribe
 hs serve distill
 ```
 
-The new node auto-registers with the gateway and starts receiving load. `hs server list` from any host now shows it.
+Add the node's URL to the list for `scribe` / `distill` in `cloud.gateway.routes` on `two` and restart `hs-gateway`; it then receives its share of the load.
 
-### Disabling a node for maintenance
+### Taking a node out for maintenance
 
-```bash
-hs server disable <hostname>:7433     # take scribe out of rotation
-hs server disable <hostname>:7434     # take distill out of rotation
-# ...do the maintenance...
-hs server enable <hostname>:7433
-hs server enable <hostname>:7434
-```
-
-The disabled service stays in the registry but is skipped during load balancing.
+Remove its URL from `cloud.gateway.routes` (or just stop it: an instance that refuses connections is skipped for `backend_failure_cooldown_secs`, 10 s by default) and restart `hs-gateway`.
 
 ### Recovering a corrupted Qdrant collection
 

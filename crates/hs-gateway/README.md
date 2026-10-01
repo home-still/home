@@ -22,7 +22,7 @@ The gateway runs alongside your Cloudflare tunnel agent. It validates bearer tok
 - **Scope-based authorization** (scribe, distill, mcp — exact match, no wildcard)
 - **Revocation** of a device or OAuth client, and **signing-key rotation** with a grace period
 - **Dynamic Client Registration** (RFC 7591)
-- **Service routing** by URL path segment
+- **Service routing** by URL path segment, round-robin over one or several backends per service
 - Streaming proxy with a concurrency limit, request timeouts and a body-size cap
 
 ## Setup
@@ -48,7 +48,7 @@ cloud:
     secret_path: /home/<user>/.home-still/cloud-secret.key   # admin key + revocation list live beside it
     token_ttl_secs: 14400      # 4 hours
     refresh_ttl_secs: 604800   # 7 days
-    routes:                    # keys must be scribe, distill or mcp
+    routes:                    # keys: scribe, distill, mcp; a URL or a list of URLs
       scribe: http://gpu-server.example.local:7433
       distill: http://gpu-server.example.local:7434
       mcp: http://127.0.0.1:7445
@@ -127,7 +127,7 @@ The tokens issued by `/token` carry exactly the scopes of the enrollment code th
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/cloud/admin/invite` | POST | Create an enrollment code: `{"device_name": "...", "scopes": ["scribe", "distill", "mcp"]}`. Only those three scopes can be granted — never `*`. |
-| `/cloud/admin/revoke` | POST | Revoke every token issued to `{"subject": "<device name | oauth:client_id>"}` and drop its registry entries |
+| `/cloud/admin/revoke` | POST | Revoke every token issued to `{"subject": "<device name \| oauth:client_id>"}` |
 
 Authenticate with `Authorization: Bearer <contents of cloud-admin.key>`. The admin key is a separate secret from the token-signing secret; a signed token is never an admin credential. A request carrying any `CF-*`, `X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `True-Client-IP`, `CDN-Loop` or `Via` header is refused outright — a legitimate admin call is a direct connection from the CLI on the gateway host and has none. `hs cloud invite` and `hs cloud revoke` read the key from the file, so they only work on the gateway host.
 
@@ -147,43 +147,20 @@ The proxy streams request and response bodies. It strips hop-by-hop headers and 
 
 Unauthenticated requests return `401` with a `WWW-Authenticate` header pointing to the OAuth discovery endpoint, triggering the OAuth flow in Claude Desktop.
 
-### Service Registry (access token required)
+### Backends and load balancing
 
-Backend services register themselves at startup and maintain presence with periodic heartbeats. The proxy queries the registry before falling back to the static `routes` config, so registered services take priority.
+`cloud.gateway.routes` is the **only** source of backend addresses; there is no service registry and backends do not announce themselves. Each service takes one URL or a list. Requests round-robin across the list; an instance that refuses a connection is skipped for `backend_failure_cooldown_secs` (default 10) — passive health only, no heartbeats. If every instance is cooling down, requests still rotate through them.
 
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/registry/register` | POST | Server announces itself (token must have scope for the service type) |
-| `/registry/deregister` | DELETE | Server removes itself from the registry |
-| `/registry/heartbeat` | POST | Server sends periodic heartbeat (every 30s) |
-| `/registry/services` | GET | Client queries available servers |
-| `/registry/set-enabled` | POST | Enable or disable a server |
-
-**`GET /registry/services` response:**
-
-```json
-{
-  "services": [
-    {
-      "service_type": "scribe",
-      "url": "http://192.0.2.10:7433",
-      "device_name": "big",
-      "enabled": true,
-      "healthy": true,
-      "last_heartbeat_secs_ago": 12,
-      "metadata": {}
-    }
-  ]
-}
+```yaml
+routes:
+  scribe:
+    - http://gpu-a.example.local:7433
+    - http://gpu-b.example.local:7433
+  distill: http://gpu-a.example.local:7434
+  mcp: http://127.0.0.1:7445
 ```
 
-**Registration protocol:** Services use their existing cloud enrollment credentials (the access token minted from the refresh token obtained via `hs cloud enroll`). The token's scopes determine which service types the device may register.
-
-**Ownership.** An entry belongs to the device that registered it. Only that device may overwrite, heartbeat, enable/disable or deregister it (403 otherwise). To take an entry away from a device, `hs cloud revoke --name <device>`. A device may hold 16 entries; the registry holds 256.
-
-**Which URLs are accepted.** The announced URL must be `http(s)://<IP literal>:<port>` with no credentials, path, query or fragment. Private LAN addresses (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7) are allowed — that is where real servers live. Refused: loopback, unspecified, link-local (which covers the 169.254.169.254 cloud metadata endpoint), multicast, broadcast, the AWS IPv6 and Alibaba metadata addresses, and hostnames (a name cannot be checked without resolving it, and can be re-pointed after registration).
-
-**Dynamic routing:** When a proxied request arrives, the gateway first checks the service registry for a healthy, enabled instance of the service. If there is none, it uses the static `routes` entry from `config.yaml`.
+Startup fails if `routes` is empty, a key is not `scribe`/`distill`/`mcp`, a list is empty or repeats a URL, or a URL is not `http(s)://host[:port]` (no credentials, path, query or fragment). Loopback and private addresses are fine: routes are written by the operator. To add or remove a node, edit the list and restart the gateway.
 
 ## Enrolling devices
 
@@ -221,7 +198,7 @@ hs cloud revoke --name laptop            # a device
 hs cloud revoke --name oauth:hs-abc123   # an OAuth client (the subject is oauth:<client_id>)
 ```
 
-Every token issued to that subject up to now stops working at once (access and refresh), its registry entries are dropped, and the revocation survives gateway restarts (`cloud-revoked.json`, mode 0600, beside the signing secret). Enrolling again afterwards issues a fresh, working credential.
+Every token issued to that subject up to now stops working at once (access and refresh), and the revocation survives gateway restarts (`cloud-revoked.json`, mode 0600, beside the signing secret). Enrolling again afterwards issues a fresh, working credential.
 
 ## Rotating the signing secret
 
@@ -248,7 +225,7 @@ payload = {
 }
 ```
 
-`typ` is required. The proxy and the registry accept only `access` tokens; the refresh endpoints accept only `refresh` tokens.
+`typ` is required. The proxy accepts only `access` tokens; the refresh endpoints accept only `refresh` tokens.
 
 ## Build
 

@@ -55,8 +55,15 @@ pub async fn test_state_with(routes: &[(&str, &str)], extra: &str) -> TestState 
     if routes.is_empty() {
         yaml.push_str("      mcp: http://127.0.0.1:9\n");
     }
+    let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
     for (service, url) in routes {
-        yaml.push_str(&format!("      {service}: {url}\n"));
+        match grouped.iter_mut().find(|(s, _)| s == service) {
+            Some((_, urls)) => urls.push(url),
+            None => grouped.push((service, vec![url])),
+        }
+    }
+    for (service, urls) in grouped {
+        yaml.push_str(&format!("      {service}: [{}]\n", urls.join(", ")));
     }
 
     let config = GatewayConfig::from_yaml(&yaml, std::path::Path::new("test-config.yaml")).unwrap();

@@ -6,11 +6,11 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use crate::auth::SigningKeys;
+use crate::balancer::Balancer;
 use crate::config::GatewayConfig;
 use crate::enrollment::{self, EnrollmentStore};
 use crate::oauth::{self, AuthCodeStore, ClientStore};
 use crate::ratelimit::RateLimits;
-use crate::registry::ServiceRegistry;
 use crate::revocation::Revocations;
 
 /// Shared state for the gateway server.
@@ -28,8 +28,8 @@ pub struct GatewayState {
     pub auth_codes: AuthCodeStore,
     /// Dynamically registered OAuth clients
     pub oauth_clients: ClientStore,
-    /// Dynamic service registry (scribe, distill, mcp servers)
-    pub registry: ServiceRegistry,
+    /// Backend selection over the static `routes` (the only source of truth)
+    pub balancer: Balancer,
     pub rate_limits: RateLimits,
     /// One permit per proxied request in flight (held until the response body
     /// has been fully streamed or dropped).
@@ -37,8 +37,7 @@ pub struct GatewayState {
 }
 
 impl GatewayState {
-    /// Build the state. Must run inside a tokio runtime (the registry spawns
-    /// its reaper).
+    /// Build the state.
     pub fn new(
         config: GatewayConfig,
         keys: SigningKeys,
@@ -61,7 +60,10 @@ impl GatewayState {
             enrollments: enrollment::new_enrollment_store(),
             auth_codes: oauth::new_auth_code_store(),
             oauth_clients: oauth::new_client_store(),
-            registry: ServiceRegistry::new(),
+            balancer: Balancer::new(
+                &config.routes,
+                Duration::from_secs(config.backend_failure_cooldown_secs),
+            ),
             config,
             keys,
             admin_key,

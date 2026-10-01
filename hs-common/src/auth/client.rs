@@ -11,8 +11,8 @@ use super::token::TokenClaims;
 
 /// Stored credentials for a cloud-enrolled device.
 ///
-/// `Debug` is hand-written so the refresh token and Cloudflare Access secret
-/// never reach a log line through `{:?}`.
+/// `Debug` is hand-written so the refresh token never reaches a log line
+/// through `{:?}`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CloudCredentials {
     /// Gateway URL (e.g., "https://<gateway-domain>")
@@ -21,12 +21,6 @@ pub struct CloudCredentials {
     pub refresh_token: String,
     /// Device name used during enrollment
     pub device_name: String,
-    /// Cloudflare Access service token client ID (optional)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cf_access_client_id: Option<String>,
-    /// Cloudflare Access service token client secret (optional)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cf_access_client_secret: Option<String>,
 }
 
 impl std::fmt::Debug for CloudCredentials {
@@ -35,11 +29,6 @@ impl std::fmt::Debug for CloudCredentials {
             .field("gateway_url", &self.gateway_url)
             .field("refresh_token", &"<redacted>")
             .field("device_name", &self.device_name)
-            .field("cf_access_client_id", &self.cf_access_client_id)
-            .field(
-                "cf_access_client_secret",
-                &self.cf_access_client_secret.as_ref().map(|_| "<redacted>"),
-            )
             .finish()
     }
 }
@@ -185,20 +174,10 @@ impl AuthenticatedClient {
     async fn refresh_access_token(&self) -> anyhow::Result<String> {
         let url = format!("{}/cloud/refresh", self.credentials.gateway_url);
 
-        let mut req = self
+        let req = self
             .http
             .post(&url)
             .bearer_auth(&self.credentials.refresh_token);
-
-        // Add Cloudflare Access headers if available
-        if let (Some(ref id), Some(ref secret)) = (
-            &self.credentials.cf_access_client_id,
-            &self.credentials.cf_access_client_secret,
-        ) {
-            req = req
-                .header("CF-Access-Client-Id", id)
-                .header("CF-Access-Client-Secret", secret);
-        }
 
         let resp = req.send().await?;
 
@@ -225,7 +204,7 @@ impl AuthenticatedClient {
     }
 
     /// Attach a bearer token to `req` — fetched now, refreshed when within
-    /// 60 s of expiry — plus the Cloudflare Access headers when configured.
+    /// 60 s of expiry.
     /// Called at send time for every request, so a long-lived process never
     /// carries a stale token. A rejected refresh token is an `Err`
     /// ([`RefreshRejected`]); nothing retries.
@@ -234,16 +213,7 @@ impl AuthenticatedClient {
         req: reqwest::RequestBuilder,
     ) -> anyhow::Result<reqwest::RequestBuilder> {
         let token = self.get_access_token().await?;
-        let mut req = req.bearer_auth(token);
-        if let (Some(id), Some(secret)) = (
-            &self.credentials.cf_access_client_id,
-            &self.credentials.cf_access_client_secret,
-        ) {
-            req = req
-                .header("CF-Access-Client-Id", id)
-                .header("CF-Access-Client-Secret", secret);
-        }
-        Ok(req)
+        Ok(req.bearer_auth(token))
     }
 }
 
@@ -356,16 +326,13 @@ mod tests {
             gateway_url: "https://gateway.example.local".into(),
             refresh_token: "refresh-token-value".into(),
             device_name: "laptop".into(),
-            cf_access_client_id: Some("cf-id".into()),
-            cf_access_client_secret: Some("cf-secret-value".into()),
         }
     }
 
     #[test]
-    fn debug_redacts_refresh_token_and_cloudflare_secret() {
+    fn debug_redacts_refresh_token() {
         let shown = format!("{:?}", creds());
         assert!(!shown.contains("refresh-token-value"), "{shown}");
-        assert!(!shown.contains("cf-secret-value"), "{shown}");
         assert!(shown.contains("gateway.example.local"));
         assert!(shown.contains("laptop"));
     }

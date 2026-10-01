@@ -155,8 +155,5 @@ mod tests {
             assert!(limits.for_request(&Method::GET, path).is_none(), "{path}");
         }
         assert!(limits.for_request(&Method::POST, "/mcp").is_none());
-        assert!(limits
-            .for_request(&Method::POST, "/registry/register")
-            .is_none());
     }
 }

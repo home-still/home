@@ -169,11 +169,10 @@ pub struct AdminRevokeRequest {
 pub struct AdminRevokeResponse {
     subject: String,
     revoked_at: u64,
-    registry_entries_removed: usize,
 }
 
 /// POST /cloud/admin/revoke — invalidate every token issued to a subject up to
-/// now and drop its registry entries.
+/// now.
 pub async fn handle_admin_revoke(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -201,16 +200,11 @@ pub async fn handle_admin_revoke(
                 .into_response();
         }
     };
-    let removed = state.registry.remove_owned_by(&req.subject).await;
-    tracing::info!(
-        "revoked {:?} (removed {removed} registry entries)",
-        req.subject
-    );
+    tracing::info!("revoked {:?}", req.subject);
 
     Json(AdminRevokeResponse {
         subject: req.subject,
         revoked_at,
-        registry_entries_removed: removed,
     })
     .into_response()
 }

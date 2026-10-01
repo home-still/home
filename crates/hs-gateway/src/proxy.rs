@@ -1,6 +1,6 @@
 //! Reverse proxy — forward authenticated requests to LAN backend services.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::body::{Body, HttpBody};
@@ -14,9 +14,6 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::auth;
 use crate::state::GatewayState;
-
-/// Round-robin counter for load balancing across registry backends.
-static PROXY_RR: AtomicUsize = AtomicUsize::new(0);
 
 /// Generic proxy handler for service routes.
 ///
@@ -50,21 +47,15 @@ pub async fn proxy_handler(State(state): State<Arc<GatewayState>>, req: Request<
             .into_response();
     }
 
-    // Resolve backend: a healthy registry entry (round-robin) if there is one,
-    // otherwise the static route from the config.
-    let registry_urls = state.registry.healthy_services(service).await;
-    let backend_base = if !registry_urls.is_empty() {
-        let idx = PROXY_RR.fetch_add(1, Ordering::Relaxed) % registry_urls.len();
-        registry_urls[idx].clone()
-    } else if let Some(url) = state.config.backend_for(service) {
-        url.to_string()
-    } else {
+    // Resolve backend: round-robin over the configured route(s) for the service.
+    let Some(pick) = state.balancer.pick(service) else {
         return (
             StatusCode::BAD_GATEWAY,
             format!("No backend configured for service: {service}"),
         )
             .into_response();
     };
+    let backend_base = pick.url.clone();
 
     let permit = match state.proxy_permits.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -84,7 +75,7 @@ pub async fn proxy_handler(State(state): State<Arc<GatewayState>>, req: Request<
         .unwrap_or_else(|| req.uri().path());
     let backend_url = format!("{backend_base}{path_and_query}");
 
-    forward_request(&state, req, backend_url, permit).await
+    forward_request(&state, service, pick.index, req, backend_url, permit).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -218,6 +209,8 @@ type BodyError = Box<dyn std::error::Error + Send + Sync>;
 /// until the client has it all or goes away.
 async fn forward_request(
     state: &GatewayState,
+    service: &str,
+    index: usize,
     original: Request<Body>,
     backend_url: String,
     permit: OwnedSemaphorePermit,
@@ -266,6 +259,9 @@ async fn forward_request(
         Err(e) => {
             if too_large.load(Ordering::Relaxed) {
                 return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large").into_response();
+            }
+            if e.is_connect() {
+                state.balancer.mark_failed(service, index);
             }
             // The backend address is internal; log it, don't hand it to the client.
             tracing::error!("backend request to {backend_url} failed: {e}");
@@ -781,5 +777,64 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(state.proxy_permits.available_permits(), 1);
+    }
+
+    /// A backend that answers with its own name.
+    fn named_backend(name: &'static str) -> Router {
+        Router::new().fallback(any(move || async move { name }))
+    }
+
+    #[tokio::test]
+    async fn a_list_route_round_robins_across_its_instances() {
+        let a = spawn_backend(named_backend("a")).await;
+        let b = spawn_backend(named_backend("b")).await;
+        let state = test_state(&[("scribe", &a), ("scribe", &b)]).await;
+        let token = access(&state, &["scribe"]);
+
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let resp = call(
+                &state,
+                bearer_req(Method::GET, "/scribe/x", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            seen.push(crate::testutil::body_string(resp).await);
+        }
+        assert_eq!(seen.iter().filter(|s| *s == "a").count(), 3, "{seen:?}");
+        assert_eq!(seen.iter().filter(|s| *s == "b").count(), 3, "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn an_instance_that_refuses_connections_is_skipped_for_the_cooldown() {
+        let dead = unused_local_url().await;
+        let live = spawn_backend(named_backend("live")).await;
+        let state = test_state_with(
+            &[("scribe", &dead), ("scribe", &live)],
+            "backend_failure_cooldown_secs: 60",
+        )
+        .await;
+        let token = access(&state, &["scribe"]);
+        let get = || {
+            bearer_req(Method::GET, "/scribe/x", &token)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Within the first two requests the dead instance is tried once: 502.
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            statuses.push(call(&state, get()).await.status());
+        }
+        assert!(statuses.contains(&StatusCode::BAD_GATEWAY), "{statuses:?}");
+
+        // From then on every request goes to the live instance.
+        for _ in 0..6 {
+            let resp = call(&state, get()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(crate::testutil::body_string(resp).await, "live");
+        }
     }
 }

@@ -3,14 +3,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use hs_common::auth::client::AuthenticatedClient;
 use hs_common::reporter::Reporter;
 
 const DEFAULT_SCRIBE_PORT: u16 = 7433;
 const DEFAULT_DISTILL_PORT: u16 = 7434;
 const DEFAULT_MCP_PORT: u16 = 7445;
-
-const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 #[derive(Subcommand, Debug)]
 pub enum ServeCmd {
@@ -187,10 +184,6 @@ async fn serve_scribe(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
 
     reporter.status("Serve", &format!("scribe on port {port}"));
 
-    // Register with gateway (best-effort); auto-deregisters on drop
-    let my_url = format!("http://{}:{port}", local_ip_hint());
-    let _reg = RegistryGuard::try_register("scribe", &my_url, reporter).await;
-
     // Start server (foreground — blocks until shutdown)
     reporter.status("Start", "starting scribe server");
     let result = super::scribe_cmd::start_server_foreground(port, reporter).await;
@@ -208,10 +201,6 @@ async fn serve_distill(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     // Auto-init (idempotent)
     reporter.status("Init", "checking distill prerequisites");
     super::distill_cmd::ensure_init(reporter).await?;
-
-    // Register with gateway; auto-deregisters on drop
-    let my_url = format!("http://{}:{port}", local_ip_hint());
-    let _reg = RegistryGuard::try_register("distill", &my_url, reporter).await;
 
     // Start server (foreground — blocks until shutdown)
     reporter.status("Start", "starting distill server");
@@ -234,10 +223,6 @@ async fn serve_mcp(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     })?;
 
     let addr = format!("0.0.0.0:{port}");
-
-    // Register with gateway; auto-deregisters on drop
-    let my_url = format!("http://{}:{port}", local_ip_hint());
-    let _reg = RegistryGuard::try_register("mcp", &my_url, reporter).await;
 
     reporter.status("Start", &format!("hs-mcp --serve {addr}"));
 
@@ -525,7 +510,6 @@ async fn install_service(
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        let ip = local_ip_hint();
         let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
         let hs_path = hs_bin.display();
 
@@ -557,8 +541,7 @@ After=network.target
 Type=simple
 User={user}
 WorkingDirectory={home}
-{env_file_line}Environment=HS_ADVERTISE_IP={ip}
-Environment=FASTEMBED_CACHE_PATH={cache}
+{env_file_line}Environment=FASTEMBED_CACHE_PATH={cache}
 ExecStart={hs_path} serve {service_type} --port {port}
 Restart=always
 RestartSec=10
@@ -655,8 +638,6 @@ WantedBy=multi-user.target
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>HS_ADVERTISE_IP</key>
-        <string>{ip}</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 {secret_entries}    </dict>
@@ -827,234 +808,7 @@ fn check_system_service_conflict(service_type: &str) -> Result<()> {
     Ok(())
 }
 
-// ── Registry Integration ───────────────────────────────────────
-
-/// RAII guard for gateway registration. Aborts heartbeat and sends deregister on drop.
-struct RegistryGuard {
-    service_type: String,
-    url: String,
-    gateway_url: String,
-    auth: Arc<AuthenticatedClient>,
-    http: reqwest::Client,
-    heartbeat_handle: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for RegistryGuard {
-    fn drop(&mut self) {
-        self.heartbeat_handle.abort();
-
-        // Best-effort sync deregister — spawn a task since Drop can't be async
-        let http = self.http.clone();
-        let gateway_url = self.gateway_url.clone();
-        let auth = Arc::clone(&self.auth);
-        let body = serde_json::json!({
-            "service_type": self.service_type,
-            "url": self.url,
-        });
-        tokio::spawn(async move {
-            if let Ok(token) = auth.get_access_token().await {
-                let _ = http
-                    .delete(format!("{gateway_url}/registry/deregister"))
-                    .bearer_auth(&token)
-                    .json(&body)
-                    .send()
-                    .await;
-            }
-        });
-    }
-}
-
-impl RegistryGuard {
-    /// Try to register with the gateway. Returns None if not enrolled.
-    async fn try_register(
-        service_type: &str,
-        url: &str,
-        reporter: &Arc<dyn Reporter>,
-    ) -> Option<Self> {
-        let auth = match AuthenticatedClient::from_default_path() {
-            Ok(a) => Arc::new(a),
-            Err(_) => {
-                reporter.warn("Not enrolled with gateway — running in local-only mode");
-                return None;
-            }
-        };
-
-        let gateway_url = auth.gateway_url().to_string();
-        let token = match auth.get_access_token().await {
-            Ok(t) => t,
-            Err(e) => {
-                reporter.warn(&format!("Could not get gateway token: {e}"));
-                return None;
-            }
-        };
-
-        // Shared HTTP client for register, heartbeats, and deregister
-        let http = match hs_common::http::http_client(std::time::Duration::from_secs(10)) {
-            Ok(c) => c,
-            Err(e) => {
-                reporter.warn(&format!(
-                    "gateway registration skipped: HTTP client build failed: {e}"
-                ));
-                return None;
-            }
-        };
-
-        // Register
-        let body = serde_json::json!({
-            "service_type": service_type,
-            "url": url,
-            "metadata": {}
-        });
-
-        let resp = http
-            .post(format!("{gateway_url}/registry/register"))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                reporter.status(
-                    "Registry",
-                    &format!("registered as {service_type} at {url}"),
-                );
-            }
-            Ok(r) => {
-                reporter.warn(&format!("Registry registration failed ({})", r.status()));
-                return None;
-            }
-            Err(e) => {
-                reporter.warn(&format!("Gateway unreachable: {e}"));
-                return None;
-            }
-        }
-
-        // Start heartbeat loop with shared client and error logging
-        let hb_auth = Arc::clone(&auth);
-        let hb_http = http.clone();
-        let hb_type = service_type.to_string();
-        let hb_url = url.to_string();
-        let hb_gateway = gateway_url.clone();
-        let heartbeat_handle = tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-            let mut consecutive_failures = 0u32;
-            interval.tick().await; // skip first immediate tick
-            loop {
-                interval.tick().await;
-                let token = match hb_auth.get_access_token().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        consecutive_failures += 1;
-                        if consecutive_failures <= 3 {
-                            tracing::warn!("Heartbeat token refresh failed: {e}");
-                        }
-                        continue;
-                    }
-                };
-                let body = serde_json::json!({
-                    "service_type": hb_type,
-                    "url": hb_url,
-                });
-                match hb_http
-                    .post(format!("{hb_gateway}/registry/heartbeat"))
-                    .bearer_auth(&token)
-                    .json(&body)
-                    .send()
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => {
-                        consecutive_failures = 0;
-                    }
-                    Ok(r) => {
-                        consecutive_failures += 1;
-                        if consecutive_failures <= 3 {
-                            tracing::warn!("Heartbeat rejected: {}", r.status());
-                        }
-                    }
-                    Err(e) => {
-                        consecutive_failures += 1;
-                        if consecutive_failures <= 3 {
-                            tracing::warn!("Heartbeat failed: {e}");
-                        }
-                    }
-                }
-            }
-        });
-
-        Some(Self {
-            service_type: service_type.to_string(),
-            url: url.to_string(),
-            gateway_url,
-            auth,
-            http,
-            heartbeat_handle,
-        })
-    }
-}
-
 // ── Helpers ────────────────────────────────────────────────────
-
-/// Best-effort local IP detection for registration URL.
-/// Checks: HS_ADVERTISE_IP env var → platform-specific detection → 127.0.0.1.
-fn local_ip_hint() -> String {
-    // Allow explicit override via environment variable
-    if let Ok(ip) = std::env::var("HS_ADVERTISE_IP") {
-        if !ip.is_empty() {
-            return ip;
-        }
-    }
-
-    // Linux: `ip route get 1.1.1.1` — most reliable, returns the outbound source IP
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(output) = std::process::Command::new("ip")
-            .args(["route", "get", "1.1.1.1"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Output: "1.1.1.1 via 192.0.2.1 dev enp6s0 src 192.0.2.110 uid 1000"
-            if let Some(pos) = stdout.find("src ") {
-                let after_src = &stdout[pos + 4..];
-                if let Some(ip) = after_src.split_whitespace().next() {
-                    if !ip.starts_with("127.") {
-                        return ip.to_string();
-                    }
-                }
-            }
-        }
-        // Fallback: hostname -I
-        if let Ok(output) = std::process::Command::new("hostname").arg("-I").output() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(ip) = stdout.split_whitespace().next() {
-                if !ip.starts_with("127.") {
-                    return ip.to_string();
-                }
-            }
-        }
-    }
-
-    // macOS: `route get default` then `ipconfig getifaddr <iface>`
-    #[cfg(target_os = "macos")]
-    {
-        // Try en0 first (most common), then en1
-        for iface in &["en0", "en1"] {
-            if let Ok(output) = std::process::Command::new("ipconfig")
-                .args(["getifaddr", iface])
-                .output()
-            {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let ip = stdout.trim();
-                if !ip.is_empty() && !ip.starts_with("127.") {
-                    return ip.to_string();
-                }
-            }
-        }
-    }
-
-    "127.0.0.1".into()
-}
 
 pub(crate) fn find_mcp_binary() -> Option<PathBuf> {
     // Check ~/.local/bin (install script location)

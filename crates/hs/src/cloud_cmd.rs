@@ -279,11 +279,6 @@ async fn cmd_invite(
 async fn cmd_revoke(subject: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let (base, admin_key) = local_admin_target()?;
 
-    #[derive(serde::Deserialize)]
-    struct RevokeResponse {
-        registry_entries_removed: usize,
-    }
-
     let resp = admin_client()?
         .post(format!("{base}/cloud/admin/revoke"))
         .bearer_auth(&admin_key)
@@ -296,14 +291,10 @@ async fn cmd_revoke(subject: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
         let body = resp.text().await.unwrap_or_default();
         bail!("Failed to revoke ({status}): {body}");
     }
-    let body: RevokeResponse = resp.json().await.context("Invalid revoke response")?;
 
     reporter.status(
         "Revoked",
-        &format!(
-            "{subject} (dropped {} registry entries); re-enroll it with `hs cloud invite`",
-            body.registry_entries_removed
-        ),
+        &format!("{subject}; re-enroll it with `hs cloud invite`"),
     );
     Ok(())
 }
@@ -377,8 +368,6 @@ async fn cmd_enroll(gateway_url: &str, reporter: &Arc<dyn Reporter>) -> Result<(
         gateway_url,
         refresh_token: body.refresh_token,
         device_name: body.device_name.clone(),
-        cf_access_client_id: None,
-        cf_access_client_secret: None,
     };
 
     let cred_path = CloudCredentials::default_path();
@@ -408,10 +397,6 @@ async fn cmd_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let creds = CloudCredentials::load(&cred_path)?;
     reporter.status("Gateway", &creds.gateway_url);
     reporter.status("Device", &creds.device_name);
-
-    if creds.cf_access_client_id.is_some() {
-        reporter.status("CF Access", "configured");
-    }
 
     // Try to refresh token to check connectivity
     let auth_client = hs_common::auth::client::AuthenticatedClient::new(creds)?;

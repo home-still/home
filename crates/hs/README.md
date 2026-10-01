@@ -21,15 +21,9 @@ hs distill search  Semantic search across indexed documents
 hs distill server  Manage distill server (start/stop/ping)
 hs distill status  Show collection statistics
 
-hs serve scribe    Run scribe service on this machine (auto-init + register)
-hs serve distill   Run distill service on this machine (auto-init + register)
-hs serve mcp       Run MCP server on this machine (auto-init + register)
-
-hs server list     Show all registered machines and services
-hs server add      Register a new machine
-hs server remove   Unregister a machine
-hs server disable  Temporarily take a machine out of rotation
-hs server enable   Bring a disabled machine back online
+hs serve scribe    Run scribe service on this machine (auto-init)
+hs serve distill   Run distill service on this machine (auto-init)
+hs serve mcp       Run MCP server on this machine (auto-init)
 
 hs status          Live TUI dashboard (pipeline stats, service health)
 
@@ -67,8 +61,7 @@ src/
   scribe_cmd.rs    hs scribe subcommands
   distill_cmd.rs   hs distill subcommands
   cloud_cmd.rs     hs cloud subcommands
-  serve_cmd.rs     hs serve subcommands (auto-init + register)
-  server_cmd.rs    hs server subcommands (fleet management)
+  serve_cmd.rs     hs serve subcommands (auto-init)
   upgrade_cmd.rs   hs upgrade (self-update)
   status_cmd.rs    hs status (ratatui TUI dashboard)
   scribe_pool.rs   Load-balanced scribe client pool

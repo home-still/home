@@ -8,7 +8,7 @@ use axum::routing::{any, get, post};
 use axum::Router;
 
 use crate::state::GatewayState;
-use crate::{admin, enrollment, oauth, proxy, ratelimit, registry};
+use crate::{admin, enrollment, oauth, proxy, ratelimit};
 
 pub fn build_router(state: Arc<GatewayState>) -> Router {
     Router::new()
@@ -42,15 +42,6 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
             "/cloud/admin/revoke",
             post(admin::handle_admin_revoke).layer(DefaultBodyLimit::max(admin::MAX_ADMIN_BODY)),
         )
-        // Service registry
-        .route("/registry/register", post(registry::handle_register))
-        .route(
-            "/registry/deregister",
-            axum::routing::delete(registry::handle_deregister),
-        )
-        .route("/registry/heartbeat", post(registry::handle_heartbeat))
-        .route("/registry/services", get(registry::handle_services))
-        .route("/registry/set-enabled", post(registry::handle_set_enabled))
         // Authenticated proxy — catch all remaining paths
         .fallback(any(proxy::proxy_handler))
         .layer(middleware::from_fn_with_state(

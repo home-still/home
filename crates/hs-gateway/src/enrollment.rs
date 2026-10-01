@@ -72,7 +72,7 @@ pub struct EnrollResponse {
 ///
 /// The device name and scopes are whatever the administrator chose when the
 /// code was issued; the enrolling device does not get to pick its own identity
-/// (the registry's ownership checks key on it).
+/// (token ownership and revocation key on it).
 pub async fn handle_enroll(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<EnrollRequest>,

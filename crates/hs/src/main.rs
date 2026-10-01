@@ -20,7 +20,6 @@ mod scribe_inbox;
 mod scribe_inbox_install;
 mod scribe_pool;
 mod serve_cmd;
-mod server_cmd;
 mod status_cmd;
 mod upgrade_cmd;
 
@@ -111,7 +110,6 @@ fn main() -> ExitCode {
         TopCmd::Personal { .. } => |_| ExitCode::FAILURE,
         TopCmd::Config { .. } => |_| ExitCode::FAILURE,
         TopCmd::Serve { .. } => |_| ExitCode::FAILURE,
-        TopCmd::Server { .. } => |_| ExitCode::FAILURE,
         TopCmd::Scribe { .. } => |_| ExitCode::FAILURE,
         TopCmd::Distill { .. } => |_| ExitCode::FAILURE,
         TopCmd::Status => |_| ExitCode::FAILURE,
@@ -144,7 +142,6 @@ fn main() -> ExitCode {
                     .map_err(|e| anyhow::anyhow!(e)),
                 TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
                 TopCmd::Serve { command } => serve_cmd::dispatch(command, &reporter).await,
-                TopCmd::Server { command } => server_cmd::dispatch(command, &reporter).await,
                 TopCmd::Scribe { command } => scribe_cmd::dispatch(command, &reporter).await,
                 TopCmd::Distill { command } => {
                     distill_cmd::dispatch(command, &cli.global, &reporter).await
