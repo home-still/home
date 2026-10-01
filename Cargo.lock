@@ -2305,16 +2305,22 @@ dependencies = [
  "clap",
  "dirs",
  "figment",
+ "futures-util",
  "hs-common",
+ "parking_lot",
+ "percent-encoding",
  "rand 0.9.2",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "sha2",
+ "subtle",
  "tokio",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

@@ -1,20 +1,35 @@
-#![allow(dead_code)] // Gateway is WIP — unused code is for upcoming features
-
+use std::future::Future;
+use std::future::IntoFuture;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::routing::{any, get, post};
-use axum::Router;
+use anyhow::Context;
 use clap::Parser;
 
+mod admin;
+mod app;
+mod auth;
+mod backend_url;
 mod config;
 mod enrollment;
 mod oauth;
 mod proxy;
-pub mod registry;
+mod ratelimit;
+mod registry;
+mod revocation;
 mod state;
+mod store;
+#[cfg(test)]
+mod testutil;
 
+use auth::SigningKeys;
 use config::GatewayConfig;
+use revocation::Revocations;
 use state::GatewayState;
+
+/// How long in-flight requests get to finish after SIGTERM/SIGINT before the
+/// process exits anyway (a long scribe stream must not block a restart).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// hs-gateway — authenticated reverse proxy for home-still cloud access
 #[derive(Parser)]
@@ -24,7 +39,8 @@ struct Args {
     #[arg(long)]
     listen: Option<String>,
 
-    /// Override gateway URL (for enrollment responses)
+    /// Public https origin of this gateway, e.g. https://cloud.example.com.
+    /// Required: it is published in the OAuth metadata.
     #[arg(long)]
     gateway_url: Option<String>,
 }
@@ -36,91 +52,86 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let config = GatewayConfig::load()?;
-    let secret = config.load_or_create_secret()?;
+    let gateway_url = config::validate_gateway_url(args.gateway_url.as_deref())?;
+    let keys = SigningKeys::load(&config)?;
+    let admin_key = hs_common::auth::token::load_or_create_admin_key(&config.admin_key_path())?;
+    let revocations = Revocations::load(config.revocation_path())?;
 
     let listen = args.listen.unwrap_or_else(|| config.listen.clone());
-    let gateway_url = args
-        .gateway_url
-        .unwrap_or_else(|| format!("http://{listen}"));
 
-    tracing::info!("Starting gateway on {listen}");
+    tracing::info!("Starting gateway on {listen} (public URL {gateway_url})");
     tracing::info!("Routes: {:?}", config.routes.keys().collect::<Vec<_>>());
 
-    let state = Arc::new(GatewayState {
+    let state = Arc::new(GatewayState::new(
         config,
-        secret,
-        http: reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()?,
-        enrollments: enrollment::new_enrollment_store(),
+        keys,
+        admin_key,
+        revocations,
         gateway_url,
-        cf_access_client_id: None,     // TODO: load from config
-        cf_access_client_secret: None, // TODO: load from config
-        auth_codes: oauth::new_auth_code_store(),
-        oauth_clients: oauth::new_client_store(),
-        registry: registry::ServiceRegistry::new(),
-    });
+    )?);
+    let app = app::build_router(state);
 
-    let app = Router::new()
-        // OAuth 2.1 discovery endpoints
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(oauth::handle_protected_resource_metadata),
-        )
-        .route(
-            "/.well-known/oauth-authorization-server",
-            get(oauth::handle_auth_server_metadata),
-        )
-        // OAuth 2.1 authorization + token + registration
-        .route(
-            "/authorize",
-            get(oauth::handle_authorize_get).post(oauth::handle_authorize_post),
-        )
-        .route("/token", post(oauth::handle_token))
-        .route("/register", post(oauth::handle_register))
-        // Unauthenticated endpoints
-        .route("/health", get(handle_health))
-        .route("/cloud/enroll", post(enrollment::handle_enroll))
-        .route("/cloud/refresh", post(enrollment::handle_refresh))
-        // Admin: register enrollment codes (only accessible from localhost)
-        .route("/cloud/admin/invite", post(enrollment::handle_admin_invite))
-        // Service registry
-        .route("/registry/register", post(registry::handle_register))
-        .route(
-            "/registry/deregister",
-            axum::routing::delete(registry::handle_deregister),
-        )
-        .route("/registry/heartbeat", post(registry::handle_heartbeat))
-        .route("/registry/services", get(registry::handle_services))
-        .route("/registry/set-enabled", post(registry::handle_set_enabled))
-        // Authenticated proxy — catch all remaining paths
-        .fallback(any(proxy::proxy_handler))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("binding {listen}"))?;
     tracing::info!("Gateway listening on {listen}");
 
-    let result = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await;
+    let result = serve(listener, app).await;
 
     let _ = logging_handle.shutdown().await;
-    result?;
+    result
+}
+
+/// Serve until SIGINT/SIGTERM, then drain in-flight requests for at most
+/// [`SHUTDOWN_GRACE`].
+async fn serve(listener: tokio::net::TcpListener, app: axum::Router) -> anyhow::Result<()> {
+    let signal = shutdown_signal()?;
+    let (begin_drain, drain) = tokio::sync::oneshot::channel::<()>();
+
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = drain.await;
+        })
+        .into_future();
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => result?,
+        () = signal => {
+            tracing::info!("Shutting down gateway");
+            let _ = begin_drain.send(());
+            match tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await {
+                Ok(result) => result?,
+                Err(_) => tracing::warn!(
+                    "in-flight requests did not finish within {}s; exiting anyway",
+                    SHUTDOWN_GRACE.as_secs()
+                ),
+            }
+        }
+    }
     Ok(())
 }
 
-async fn handle_health() -> &'static str {
-    "ok"
+/// A future that resolves on SIGINT or SIGTERM. Handlers are installed before
+/// serving starts, so failing to install them is a startup error.
+#[cfg(unix)]
+fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+    })
 }
 
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C handler");
-    tracing::info!("Shutting down gateway");
+#[cfg(not(unix))]
+fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }
 
 async fn install_logging() -> hs_common::logging::LoggingHandle {

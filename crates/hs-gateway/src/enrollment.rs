@@ -1,52 +1,58 @@
 //! Device enrollment and token refresh endpoints.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use hs_common::auth::token::{self, TokenType};
 use serde::{Deserialize, Serialize};
 
-use hs_common::auth::token::{self, TokenClaims, TokenError};
-
+use crate::auth::{self, AuthError};
 use crate::state::GatewayState;
+use crate::store::{ExpiringStore, Full};
 
-/// A pending enrollment code with expiry.
+/// How long an enrollment code stays valid.
+pub const ENROLLMENT_TTL: Duration = Duration::from_secs(300);
+
+/// Most enrollment codes that may be outstanding at once.
+const MAX_PENDING_ENROLLMENTS: usize = 256;
+
+/// A pending enrollment: what the admin who issued the code decided.
 pub struct PendingEnrollment {
-    pub code: String,
     pub device_name: String,
     pub scopes: Vec<String>,
-    pub created_at: Instant,
 }
 
-/// Thread-safe store for pending enrollment codes.
-pub type EnrollmentStore = Arc<Mutex<HashMap<String, PendingEnrollment>>>;
+/// Pending enrollment codes, keyed by code. Single use, expiring, bounded.
+pub type EnrollmentStore = ExpiringStore<PendingEnrollment>;
 
 pub fn new_enrollment_store() -> EnrollmentStore {
-    Arc::new(Mutex::new(HashMap::new()))
+    ExpiringStore::new(ENROLLMENT_TTL, MAX_PENDING_ENROLLMENTS)
 }
 
-/// Register a new enrollment code (called from `hs cloud invite`).
+/// Register a new enrollment code (called from the admin invite endpoint).
 pub fn register_enrollment(
     store: &EnrollmentStore,
     device_name: &str,
     scopes: Vec<String>,
-) -> String {
+) -> Result<String, Full> {
     let code = token::generate_enrollment_code();
-    let enrollment = PendingEnrollment {
-        code: code.clone(),
-        device_name: device_name.into(),
-        scopes,
-        created_at: Instant::now(),
-    };
-    let mut guard = store.lock().unwrap();
-    // Clean up expired codes while we're here
-    guard.retain(|_, e| e.created_at.elapsed().as_secs() < 300);
-    guard.insert(code.clone(), enrollment);
-    code
+    store.insert(
+        code.clone(),
+        PendingEnrollment {
+            device_name: device_name.into(),
+            scopes,
+        },
+    )?;
+    Ok(code)
+}
+
+/// Normalize a code as typed by a human.
+pub fn normalize_code(input: &str) -> String {
+    input.trim().to_uppercase()
 }
 
 // ── HTTP Handlers ──────────────────────────────────────────────
@@ -54,129 +60,94 @@ pub fn register_enrollment(
 #[derive(Deserialize)]
 pub struct EnrollRequest {
     code: String,
-    device_name: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct EnrollResponse {
     refresh_token: String,
     device_name: String,
-    gateway_url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cf_access_client_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cf_access_client_secret: Option<String>,
 }
 
 /// POST /cloud/enroll — exchange an enrollment code for a refresh token.
+///
+/// The device name and scopes are whatever the administrator chose when the
+/// code was issued; the enrolling device does not get to pick its own identity
+/// (the registry's ownership checks key on it).
 pub async fn handle_enroll(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<EnrollRequest>,
-) -> impl IntoResponse {
-    let code = req.code.trim().to_uppercase();
-
-    // Look up and consume the enrollment code
-    let enrollment = {
-        let mut guard = state.enrollments.lock().unwrap();
-        guard.remove(&code)
+) -> Response {
+    let Some(enrollment) = state.enrollments.take(&normalize_code(&req.code)) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Invalid or expired enrollment code",
+        )
+            .into_response();
     };
 
-    let enrollment = match enrollment {
-        Some(e) => {
-            if e.created_at.elapsed().as_secs() > 300 {
-                return (StatusCode::GONE, "Enrollment code expired").into_response();
-            }
-            e
-        }
-        None => {
-            return (StatusCode::UNAUTHORIZED, "Invalid enrollment code").into_response();
-        }
-    };
-
-    let device_name = req
-        .device_name
-        .unwrap_or_else(|| enrollment.device_name.clone());
-
-    // Create a refresh token
-    let claims = TokenClaims {
-        sub: device_name.clone(),
-        iat: token::now_epoch(),
-        exp: token::now_epoch() + state.config.refresh_ttl_secs,
-        scope: enrollment.scopes,
-    };
-
-    let refresh_token = match token::create_token(&state.secret, &claims) {
+    let refresh_token = match auth::issue_token(
+        &state,
+        &enrollment.device_name,
+        &enrollment.scopes,
+        TokenType::Refresh,
+    ) {
         Ok(t) => t,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Token creation failed: {e}"),
-            )
-                .into_response();
+            tracing::error!("token creation failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed").into_response();
         }
     };
 
     Json(EnrollResponse {
         refresh_token,
-        device_name,
-        gateway_url: state.gateway_url.clone(),
-        cf_access_client_id: state.cf_access_client_id.clone(),
-        cf_access_client_secret: state.cf_access_client_secret.clone(),
+        device_name: enrollment.device_name,
     })
     .into_response()
 }
 
 /// POST /cloud/refresh — exchange a refresh token for an access token.
+/// Only refresh tokens are accepted: an access token cannot mint new tokens.
 pub async fn handle_refresh(
     State(state): State<Arc<GatewayState>>,
-    req: axum::http::Request<axum::body::Body>,
-) -> impl IntoResponse {
-    let auth_header = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-
-    let refresh_token = match auth_header {
-        Some(t) => t,
-        None => {
+    headers: HeaderMap,
+) -> Response {
+    let claims = match auth::authenticate(&state, &headers, TokenType::Refresh) {
+        Ok(c) => c,
+        Err(AuthError::Missing) => {
             return (StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response();
         }
-    };
-
-    // Validate refresh token
-    let claims = match token::validate_token(&state.secret, refresh_token, false) {
-        Ok(c) => c,
-        Err(TokenError::Expired) => {
+        Err(AuthError::Expired) => {
             return (
                 StatusCode::UNAUTHORIZED,
                 "Refresh token expired — re-enroll with `hs cloud enroll`",
             )
                 .into_response();
         }
-        Err(_) => {
+        Err(AuthError::Revoked) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "Refresh token revoked — re-enroll with `hs cloud enroll`",
+            )
+                .into_response();
+        }
+        Err(AuthError::WrongType) => {
+            return (StatusCode::UNAUTHORIZED, "Not a refresh token").into_response();
+        }
+        Err(AuthError::Invalid) => {
             return (StatusCode::UNAUTHORIZED, "Invalid refresh token").into_response();
         }
     };
 
-    // Issue a short-lived access token with the same scopes
-    let access_claims = TokenClaims {
-        sub: claims.sub,
-        iat: token::now_epoch(),
-        exp: token::now_epoch() + state.config.token_ttl_secs,
-        scope: claims.scope,
-    };
-
-    let access_token = match token::create_token(&state.secret, &access_claims) {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Token creation failed: {e}"),
-            )
-                .into_response();
-        }
-    };
+    // Issue a short-lived access token with the same subject and scopes.
+    let access_token =
+        match auth::issue_token(&state, &claims.sub, &claims.scope, TokenType::Access) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("token creation failed: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed")
+                    .into_response();
+            }
+        };
 
     #[derive(Serialize)]
     struct RefreshResponse {
@@ -186,60 +157,104 @@ pub async fn handle_refresh(
     Json(RefreshResponse { access_token }).into_response()
 }
 
-// ── Admin endpoints (localhost only) ───────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{bearer_headers, body_json, call, json_request, test_state};
+    use axum::http::Method;
 
-#[derive(Deserialize)]
-pub struct AdminInviteRequest {
-    device_name: String,
-    #[serde(default = "default_scopes")]
-    scopes: Vec<String>,
-}
+    #[tokio::test]
+    async fn enrolled_device_gets_the_identity_and_scopes_the_admin_chose() {
+        let state = test_state(&[]).await;
+        let code =
+            register_enrollment(&state.enrollments, "laptop", vec!["scribe".into()]).unwrap();
 
-fn default_scopes() -> Vec<String> {
-    vec!["scribe".into(), "distill".into(), "mcp".into()]
-}
+        // A device name in the request body is ignored.
+        let resp = call(
+            &state,
+            json_request(
+                Method::POST,
+                "/cloud/enroll",
+                &serde_json::json!({ "code": code.to_lowercase(), "device_name": "big" }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["device_name"], "laptop");
 
-#[derive(Serialize)]
-pub struct AdminInviteResponse {
-    code: String,
-    expires_in_secs: u64,
-}
-
-/// POST /cloud/admin/invite — create an enrollment code (admin, localhost only).
-pub async fn handle_admin_invite(
-    State(state): State<Arc<GatewayState>>,
-    req: axum::http::Request<axum::body::Body>,
-) -> impl IntoResponse {
-    // Only allow from localhost
-    let is_local = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip().is_loopback())
-        .unwrap_or(true); // if no ConnectInfo, assume behind reverse proxy (localhost)
-
-    if !is_local {
-        return (StatusCode::FORBIDDEN, "Admin endpoints are localhost-only").into_response();
+        let refresh = body["refresh_token"].as_str().unwrap();
+        let claims = auth::authenticate_token(&state, refresh, TokenType::Refresh).unwrap();
+        assert_eq!(claims.sub, "laptop");
+        assert_eq!(claims.scope, vec!["scribe".to_string()]);
     }
 
-    let body = match axum::body::to_bytes(req.into_body(), 4096).await {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid body").into_response(),
-    };
+    #[tokio::test]
+    async fn enrollment_code_is_single_use() {
+        let state = test_state(&[]).await;
+        let code = register_enrollment(&state.enrollments, "laptop", vec!["mcp".into()]).unwrap();
+        let req = || {
+            json_request(
+                Method::POST,
+                "/cloud/enroll",
+                &serde_json::json!({ "code": code }),
+            )
+        };
+        assert_eq!(call(&state, req()).await.status(), StatusCode::OK);
+        assert_eq!(call(&state, req()).await.status(), StatusCode::UNAUTHORIZED);
+    }
 
-    let invite_req: AdminInviteRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response(),
-    };
+    #[tokio::test]
+    async fn refresh_accepts_refresh_tokens_and_rejects_access_tokens() {
+        let state = test_state(&[]).await;
+        let scope = vec!["scribe".to_string(), "mcp".to_string()];
+        let refresh = auth::issue_token(&state, "laptop", &scope, TokenType::Refresh).unwrap();
+        let access = auth::issue_token(&state, "laptop", &scope, TokenType::Access).unwrap();
 
-    let code = register_enrollment(
-        &state.enrollments,
-        &invite_req.device_name,
-        invite_req.scopes,
-    );
+        let ok = call(
+            &state,
+            axum::http::Request::post("/cloud/refresh")
+                .header("authorization", format!("Bearer {refresh}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let minted = body_json(ok).await["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let claims =
+            auth::authenticate(&state, &bearer_headers(&minted), TokenType::Access).unwrap();
+        assert_eq!(claims.sub, "laptop");
+        assert_eq!(claims.scope, scope);
 
-    Json(AdminInviteResponse {
-        code,
-        expires_in_secs: 300,
-    })
-    .into_response()
+        // An access token must not be exchangeable for fresh tokens.
+        let denied = call(
+            &state,
+            axum::http::Request::post("/cloud/refresh")
+                .header("authorization", format!("Bearer {access}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_a_revoked_device() {
+        let state = test_state(&[]).await;
+        let refresh =
+            auth::issue_token(&state, "laptop", &["mcp".to_string()], TokenType::Refresh).unwrap();
+        state.revocations.revoke("laptop").unwrap();
+        let denied = call(
+            &state,
+            axum::http::Request::post("/cloud/refresh")
+                .header("authorization", format!("Bearer {refresh}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    }
 }

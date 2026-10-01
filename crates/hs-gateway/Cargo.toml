@@ -24,3 +24,12 @@ serde_yaml_ng = { workspace = true }
 rand = "0.9"
 sha2 = "0.10"
 base64 = "0.22"
+# Already in the dependency tree (reqwest/axum/hmac); direct edges only.
+url = "2"
+subtle = "2"
+futures-util = "0.3"
+percent-encoding = "2"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
