@@ -272,4 +272,137 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+
+    /// Open an authenticated MCP session and return its id.
+    async fn open_session(run: &Running) -> String {
+        let resp = post(run, Some(&format!("Bearer {SECRET}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let session = resp.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let _ = resp.text().await.unwrap();
+        let resp = run
+            .http
+            .post(format!("{}/mcp", run.base))
+            .header("Accept", "application/json, text/event-stream")
+            .header("Authorization", format!("Bearer {SECRET}"))
+            .header("mcp-session-id", &session)
+            .json(&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{}", resp.status());
+        session
+    }
+
+    /// One JSON-RPC request on `session`; the reply is the SSE frame that
+    /// carries the request's id.
+    async fn rpc(run: &Running, session: &str, request: serde_json::Value) -> serde_json::Value {
+        let resp = run
+            .http
+            .post(format!("{}/mcp", run.base))
+            .header("Accept", "application/json, text/event-stream")
+            .header("Authorization", format!("Bearer {SECRET}"))
+            .header("mcp-session-id", session)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        let text = resp.text().await.unwrap();
+        text.lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .filter_map(|d| serde_json::from_str::<serde_json::Value>(d.trim()).ok())
+            .find(|v| v.get("id") == request.get("id"))
+            .unwrap_or_else(|| panic!("no reply to {request} in {text}"))
+    }
+
+    fn call(id: u64, tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}
+        })
+    }
+
+    /// RA-4 / RA-27: a stem is untrusted client text that ends up inside
+    /// storage keys. Every stem-taking tool refuses a stem that could leave
+    /// its prefix, with JSON-RPC invalid-params, before any handler runs.
+    #[tokio::test]
+    async fn every_tool_that_takes_a_stem_rejects_a_path_like_stem() {
+        let run = start(Duration::from_secs(60)).await;
+        let session = open_session(&run).await;
+        let cases = [
+            ("catalog_read", "stem"),
+            ("markdown_read", "stem"),
+            ("scribe_convert", "stem"),
+            ("distill_index", "stem"),
+            ("distill_reindex", "stem"),
+            ("distill_exists", "doc_id"),
+            ("personal_read", "stem"),
+            ("personal_reindex", "stem"),
+        ];
+        let mut id = 10;
+        for (tool, field) in cases {
+            for bad in ["..", "../../etc/passwd", "a/b", "a\\b", "", "."] {
+                id += 1;
+                let reply = rpc(
+                    &run,
+                    &session,
+                    call(id, tool, serde_json::json!({ field: bad })),
+                )
+                .await;
+                assert_eq!(
+                    reply["error"]["code"], -32602,
+                    "{tool}({field}={bad:?}) must be invalid params, got {reply}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_good_stem_passes_the_boundary() {
+        let run = start(Duration::from_secs(60)).await;
+        let session = open_session(&run).await;
+        let reply = rpc(
+            &run,
+            &session,
+            call(2, "catalog_read", serde_json::json!({"stem": "Año"})),
+        )
+        .await;
+        assert!(reply.get("error").is_none(), "{reply}");
+        assert_eq!(
+            reply["result"]["isError"], true,
+            "no such entry is a tool error"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_uris_with_path_like_stems_are_invalid_params() {
+        let run = start(Duration::from_secs(60)).await;
+        let session = open_session(&run).await;
+        let mut id = 20;
+        for uri in [
+            "catalog:///..",
+            "catalog:///a/b",
+            "markdown:///..",
+            "markdown:///../x",
+            "markdown:///a/b/page/1",
+            "markdown:///",
+        ] {
+            id += 1;
+            let reply = rpc(
+                &run,
+                &session,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "method": "resources/read",
+                    "params": {"uri": uri}
+                }),
+            )
+            .await;
+            assert_eq!(reply["error"]["code"], -32602, "{uri}: {reply}");
+        }
+    }
 }

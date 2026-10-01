@@ -19,8 +19,10 @@ use rmcp::{
     service::RequestContext,
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
+use stem::Stem;
 
 mod http_app;
+mod stem;
 #[cfg(test)]
 mod testkit;
 #[cfg(test)]
@@ -137,7 +139,7 @@ struct OpenAlexAuthorsByTopicParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct CatalogReadParams {
     #[schemars(description = "Paper stem name (filename without extension)")]
-    stem: String,
+    stem: Stem,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -173,7 +175,7 @@ struct SystemStatusParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct MarkdownReadParams {
     #[schemars(description = "Paper stem name (filename without extension)")]
-    stem: String,
+    stem: Stem,
     #[schemars(description = "Specific page number (1-based). Omit for full document.")]
     page: Option<usize>,
 }
@@ -234,7 +236,7 @@ fn map_distill_search_hits(
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DistillExistsParams {
     #[schemars(description = "Document ID to check")]
-    doc_id: String,
+    doc_id: Stem,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -248,7 +250,7 @@ struct ScribeConvertParams {
     #[schemars(
         description = "Paper stem name (filename without extension) of a PDF in the papers directory"
     )]
-    stem: String,
+    stem: Stem,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -256,7 +258,7 @@ struct DistillIndexParams {
     #[schemars(
         description = "Paper stem name (filename without extension) of a markdown document to index"
     )]
-    stem: String,
+    stem: Stem,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -274,7 +276,7 @@ struct DistillReconcileParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DistillReindexParams {
     #[schemars(description = "Paper stem name (filename without extension) to re-index")]
-    stem: String,
+    stem: Stem,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -375,7 +377,7 @@ struct PersonalListParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PersonalReadParams {
     #[schemars(description = "Document stem (filename without extension)")]
-    stem: String,
+    stem: Stem,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -398,7 +400,7 @@ struct PersonalAddParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PersonalReindexParams {
     #[schemars(description = "Document stem to re-chunk and re-embed.")]
-    stem: String,
+    stem: Stem,
 }
 
 // ── OpenAlex DuckDB helpers ─────────────────────────────────────
@@ -3262,15 +3264,15 @@ struct ResearchPromptParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SummarizePromptParams {
     #[schemars(description = "Paper stem name to summarize")]
-    stem: String,
+    stem: Stem,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ComparePromptParams {
     #[schemars(description = "First paper stem name")]
-    stem_a: String,
+    stem_a: Stem,
     #[schemars(description = "Second paper stem name")]
-    stem_b: String,
+    stem_b: Stem,
 }
 
 #[prompt_router]
@@ -3374,46 +3376,50 @@ impl ServerHandler for HomeStillMcp {
         let mut resources = Vec::new();
 
         // Catalog entries via Storage
-        if let Ok(triples) =
-            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix).await
-        {
-            for (stem, _meta, cat) in triples {
-                let title = cat.title.unwrap_or_else(|| stem.clone());
-                resources.push(
-                    RawResource {
-                        uri: format!("catalog:///{stem}"),
-                        name: title,
-                        title: None,
-                        description: Some("Catalog entry with paper metadata".into()),
-                        mime_type: Some("application/yaml".into()),
-                        size: None,
-                        icons: None,
-                        meta: None,
-                    }
-                    .no_annotation(),
-                );
-            }
+        let triples =
+            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("catalog list failed: {e:#}"), None)
+                })?;
+        for (stem, _meta, cat) in triples {
+            let title = cat.title.unwrap_or_else(|| stem.clone());
+            resources.push(
+                RawResource {
+                    uri: format!("catalog:///{stem}"),
+                    name: title,
+                    title: None,
+                    description: Some("Catalog entry with paper metadata".into()),
+                    mime_type: Some("application/yaml".into()),
+                    size: None,
+                    icons: None,
+                    meta: None,
+                }
+                .no_annotation(),
+            );
         }
 
         // Markdown documents via Storage
-        if let Ok(metas) =
-            hs_common::markdown::list_markdown_meta_via(&*self.storage, &self.markdown_prefix).await
-        {
-            for (stem, obj) in metas {
-                resources.push(
-                    RawResource {
-                        uri: format!("markdown:///{stem}"),
-                        name: stem.clone(),
-                        title: None,
-                        description: Some("Converted markdown document".into()),
-                        mime_type: Some("text/markdown".into()),
-                        size: Some(obj.size as u32),
-                        icons: None,
-                        meta: None,
-                    }
-                    .no_annotation(),
-                );
-            }
+        let metas =
+            hs_common::markdown::list_markdown_meta_via(&*self.storage, &self.markdown_prefix)
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("markdown list failed: {e:#}"), None)
+                })?;
+        for (stem, obj) in metas {
+            resources.push(
+                RawResource {
+                    uri: format!("markdown:///{stem}"),
+                    name: stem.clone(),
+                    title: None,
+                    description: Some("Converted markdown document".into()),
+                    mime_type: Some("text/markdown".into()),
+                    size: Some(obj.size as u32),
+                    icons: None,
+                    meta: None,
+                }
+                .no_annotation(),
+            );
         }
 
         Ok(ListResourcesResult::with_all_items(resources))
@@ -3469,11 +3475,12 @@ impl ServerHandler for HomeStillMcp {
         let uri = &request.uri;
 
         if let Some(stem) = uri.strip_prefix("catalog:///") {
+            let stem = Stem::parse(stem).map_err(Stem::invalid_params)?;
             // Catalog resource via Storage
             let entry = hs_common::catalog::read_catalog_entry_via(
                 &*self.storage,
                 &self.catalog_prefix,
-                stem,
+                &stem,
             )
             .await
             .map_err(|e| ErrorData::internal_error(format!("catalog read: {e}"), None))?
@@ -3499,11 +3506,15 @@ impl ServerHandler for HomeStillMcp {
                 (rest, None)
             };
 
-            let content =
-                hs_common::markdown::read_markdown_via(&*self.storage, &self.markdown_prefix, stem)
-                    .await
-                    .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))?
-                    .ok_or_else(|| ErrorData::resource_not_found("markdown not found", None))?;
+            let stem = Stem::parse(stem).map_err(Stem::invalid_params)?;
+            let content = hs_common::markdown::read_markdown_via(
+                &*self.storage,
+                &self.markdown_prefix,
+                &stem,
+            )
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))?
+            .ok_or_else(|| ErrorData::resource_not_found("markdown not found", None))?;
 
             let text = if let Some(page) = page {
                 let pages: Vec<&str> = content.split("\n\n---\n\n").collect();

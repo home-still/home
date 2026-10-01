@@ -12,7 +12,7 @@ mod reindex {
 
     fn reindex(stem: &str) -> Parameters<DistillReindexParams> {
         Parameters(DistillReindexParams {
-            stem: stem.to_string(),
+            stem: crate::stem::Stem::parse(stem).unwrap(),
         })
     }
 
