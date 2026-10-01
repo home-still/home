@@ -1176,42 +1176,40 @@ mod backend_tier_tests {
 #[cfg(test)]
 mod classify_convert_failure_tests {
     use super::{classify_convert_failure, ConvertClassification};
+    use hs_scribe::classify::{ConvertFailure, FailureCode};
+
+    fn typed(code: FailureCode, message: &str) -> anyhow::Error {
+        ConvertFailure::err(code, message.to_string())
+            .context("scribe convert failed for papers/10/x.pdf")
+    }
 
     #[test]
-    fn vlm_repetition_loop_escalates_with_specific_reason() {
-        // Verbatim shape of the error event_watch.rs constructs at the
-        // RejectLoop arm. Classification must preserve the specific
-        // reason so the catalog stamp lands as `vlm_repetition_loop`
-        // (not the generic clobber) when the chain runs out of backends.
-        // VLM-class failure → Escalate so a different backend gets a
-        // shot before the chain stamps failure.
-        let err = anyhow::anyhow!(
-            "VLM repetition loop on papers/10/x.pdf (truncations=23, longest_run=9009B)"
-        );
-        match classify_convert_failure(&err) {
-            ConvertClassification::Escalate(r) => assert_eq!(r, "vlm_repetition_loop"),
-            other => panic!("expected Escalate, got {:?}", other.reason()),
+    fn backend_class_failures_escalate_with_their_specific_reason() {
+        // The catalog stamp must land as the specific reason (not the
+        // generic clobber) when the chain runs out of backends; VLM-class
+        // failures escalate so a different backend gets a shot first.
+        for (code, reason) in [
+            (FailureCode::VlmRepetitionLoop, "vlm_repetition_loop"),
+            (FailureCode::VlmTransportError, "vlm_transport_error"),
+            (FailureCode::OlmocrZeroPages, "olmocr_zero_pages"),
+            (
+                FailureCode::OlmocrIncompletePages,
+                "olmocr_incomplete_pages",
+            ),
+            (FailureCode::GappedConversion, "gapped_conversion"),
+        ] {
+            match classify_convert_failure(&typed(code, "x")) {
+                ConvertClassification::Escalate(r) => assert_eq!(r, reason),
+                other => panic!("expected Escalate for {reason}, got {:?}", other.reason()),
+            }
         }
     }
 
     #[test]
-    fn vlm_transport_error_escalates() {
-        // llama-server slot eviction mid-stream. Same VLM-class family
-        // as the repetition loop — escalate to next backend.
-        let err = anyhow::anyhow!(
-            "scribe convert failed: client error (SendRequest): connection closed before message completed"
-        );
-        match classify_convert_failure(&err) {
-            ConvertClassification::Escalate(r) => assert_eq!(r, "vlm_transport_error"),
-            other => panic!("expected Escalate, got {:?}", other.reason()),
-        }
-    }
-
-    #[test]
-    fn unrecognized_message_escalates_with_generic_reason() {
-        // Unknown failure → Escalate so the next backend gets a chance.
-        // If every backend rejects with the same unknown reason, the
-        // chain terminates naturally and stamps `permanent_convert_failure`.
+    fn untyped_failures_escalate_with_the_generic_reason() {
+        // Reached only for errors the handler marked Permanent without a
+        // code; the next backend gets a chance, and if every backend
+        // rejects the chain stamps `permanent_convert_failure`.
         let err = anyhow::anyhow!("scribe convert failed: some novel failure mode");
         match classify_convert_failure(&err) {
             ConvertClassification::Escalate(r) => assert_eq!(r, "permanent_convert_failure"),
@@ -1220,47 +1218,30 @@ mod classify_convert_failure_tests {
     }
 
     #[test]
-    fn olmocr_zero_pages_escalates() {
-        // The mcconnell shape: olmocr ran 45 min on a Cyrillic book with
-        // a clean text layer, then reported 0 completed pages. Must
-        // Escalate so GLM-OCR gets its shot — the original Permanent
-        // classification short-circuited the chain incorrectly.
-        let err =
-            anyhow::anyhow!("Server error: olmocr reported 0 completed pages (failed=0); content may need a different backend");
-        match classify_convert_failure(&err) {
-            ConvertClassification::Escalate(r) => assert_eq!(r, "olmocr_zero_pages"),
-            other => panic!("expected Escalate, got {:?}", other.reason()),
+    fn document_faults_stop_the_chain() {
+        for (code, reason) in [
+            (FailureCode::PdfParseError, "pdf_parse_error"),
+            (
+                FailureCode::UnsupportedContentTypeHtml,
+                "unsupported_content_type:html",
+            ),
+            (FailureCode::PaywallHtml, "paywall_html"),
+            (FailureCode::SourceMissing, "source_missing"),
+        ] {
+            match classify_convert_failure(&typed(code, "x")) {
+                ConvertClassification::Permanent(r) => assert_eq!(r, reason),
+                other => panic!("expected Permanent for {reason}, got {:?}", other.reason()),
+            }
         }
     }
 
     #[test]
-    fn pdf_parse_error_is_permanent() {
-        // FormatError is a hard PDF-parse problem; no VLM backend will
-        // succeed because the PDF itself is unreadable to scribe's
-        // parser. Stop the chain immediately, don't burn other backends'
-        // compute on a hopeless input.
-        let err = anyhow::anyhow!("scribe convert failed: FormatError on page 3");
-        match classify_convert_failure(&err) {
-            ConvertClassification::Permanent(r) => assert_eq!(r, "pdf_parse_error"),
-            other => panic!("expected Permanent, got {:?}", other.reason()),
-        }
-    }
-
-    #[test]
-    fn unsupported_content_type_is_permanent() {
-        let err = anyhow::anyhow!("scribe rejected: unsupported_content_type:html");
-        match classify_convert_failure(&err) {
-            ConvertClassification::Permanent(r) => assert_eq!(r, "unsupported_content_type:html"),
-            other => panic!("expected Permanent, got {:?}", other.reason()),
-        }
-    }
-
-    #[test]
-    fn paywall_is_permanent() {
-        let err = anyhow::anyhow!("paywall HTML detected on download");
-        match classify_convert_failure(&err) {
-            ConvertClassification::Permanent(r) => assert_eq!(r, "paywall_html"),
-            other => panic!("expected Permanent, got {:?}", other.reason()),
-        }
+    fn message_text_never_decides_the_verdict() {
+        // A stem or key that names a verdict must not be mistaken for one.
+        let err = anyhow::anyhow!("scribe convert failed for papers/pa/paywall-FormatError.pdf");
+        assert!(matches!(
+            classify_convert_failure(&err),
+            ConvertClassification::Escalate(r) if r == "permanent_convert_failure"
+        ));
     }
 }
