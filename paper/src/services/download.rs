@@ -2,8 +2,11 @@ use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 
+use crate::error::PaperError;
 use crate::models::{BatchDownloadResult, DownloadFailure, DownloadResult, Paper};
 use crate::ports::download_service::DownloadService;
+use crate::providers::url_guard;
+use crate::stem;
 
 pub enum DownloadEvent {
     Started {
@@ -37,12 +40,20 @@ pub enum DownloadEvent {
 
 pub type OnProgress = Arc<dyn Fn(DownloadEvent) + Send + Sync>;
 
+/// Download `papers` with at most `max_concurrent` in flight. Rejects
+/// `max_concurrent == 0`: `buffer_unordered(0)` never polls anything, so the
+/// batch would hang forever instead of failing.
 pub async fn download_batch(
     service: Arc<dyn DownloadService>,
     papers: Vec<Paper>,
     max_concurrent: usize,
     on_progress: Option<OnProgress>,
-) -> BatchDownloadResult {
+) -> Result<BatchDownloadResult, PaperError> {
+    if max_concurrent == 0 {
+        return Err(PaperError::InvalidInput(
+            "concurrency must be at least 1".to_string(),
+        ));
+    }
     let total = papers.len();
 
     let results: Vec<Result<DownloadResult, Box<(Paper, String)>>> =
@@ -122,12 +133,12 @@ pub async fn download_batch(
         }
     }
 
-    BatchDownloadResult {
+    Ok(BatchDownloadResult {
         succeeded,
         failed,
         total_requested: total,
         skipped,
-    }
+    })
 }
 
 #[allow(clippy::type_complexity)]
@@ -139,7 +150,11 @@ async fn download_single(
     on_progress: Option<&OnProgress>,
     index: usize,
 ) -> Result<DownloadResult, Box<(Paper, String)>> {
-    let filename = format!("{}.pdf", sanitize_filename(&paper.id));
+    let fail = |message: String| Box::new((paper.clone(), message));
+
+    // One storage identity per paper, shared with `download_by_doi`: a paper
+    // found by search and the same paper requested by DOI must land on one key.
+    let stem = stem::paper_stem(paper).map_err(|e| fail(e.to_string()))?;
     let title = paper.title.clone();
 
     let chunk_cb: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync>> = on_progress.map(|cb| {
@@ -157,37 +172,36 @@ async fn download_single(
 
     let progress_ref = chunk_cb.as_deref();
 
-    let mut last_err = None;
+    // Remote failures are collected so the final message names every
+    // attempt; a local failure (storage, invalid key) ends the paper at once
+    // with the real error — the next URL cannot fix a disk.
+    let mut attempts: Vec<String> = Vec::new();
 
     for url in &paper.download_urls {
-        match service.download_by_url(url, &filename, progress_ref).await {
-            Ok(dr) => {
-                let mut dr = dr;
+        match service.download_by_url(url, &stem, progress_ref).await {
+            Ok(mut dr) => {
                 dr.doi = paper.doi.clone();
                 return Ok(dr);
             }
-            Err(e) => last_err = Some(e),
+            Err(e) if e.is_local() => return Err(fail(e.to_string())),
+            Err(e) => attempts.push(format!("{}: {e}", url_guard::display_url(url))),
         }
     }
 
-    if let Some(ref doi) = paper.doi {
+    if let Some(doi) = &paper.doi {
         match service.download_by_doi(doi).await {
             Ok(mut dr) => {
                 dr.doi = paper.doi.clone();
                 return Ok(dr);
             }
-            Err(e) => last_err = Some(e),
+            Err(e) if e.is_local() => return Err(fail(e.to_string())),
+            Err(e) => attempts.push(format!("DOI {doi}: {e}")),
         }
     }
 
-    Err(Box::new((
-        paper.clone(),
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| format!("No download URL or DOI for paper {}", paper.id)),
-    )))
-}
-
-fn sanitize_filename(id: &str) -> String {
-    id.replace(['/', '\\', ':'], "_")
+    Err(fail(if attempts.is_empty() {
+        format!("No download URL or DOI for paper {}", paper.id)
+    } else {
+        attempts.join("\n")
+    }))
 }

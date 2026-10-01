@@ -3832,6 +3832,7 @@ dependencies = [
  "governor",
  "hs-common",
  "owo-colors",
+ "parking_lot",
  "reqwest",
  "roxmltree",
  "serde",

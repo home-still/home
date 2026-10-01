@@ -359,6 +359,13 @@ pub async fn run_download(
 
         let batch_result =
             download_batch(downloader, search_result.papers, concurrency, progress).await;
+        let batch_result = match batch_result {
+            Ok(r) => r,
+            Err(e) => {
+                overall.finish_and_clear();
+                return Err(e).context("Download failed");
+            }
+        };
 
         overall.finish_and_clear();
 
