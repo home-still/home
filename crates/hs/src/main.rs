@@ -20,6 +20,7 @@ mod scribe_inbox;
 mod scribe_inbox_install;
 mod scribe_pool;
 mod serve_cmd;
+mod shutdown;
 mod status_cmd;
 mod upgrade_cmd;
 
@@ -182,20 +183,40 @@ fn main() -> ExitCode {
                 TopCmd::Openalex { command } => openalex_cmd::dispatch(command).await,
             }
         };
+        tokio::pin!(work);
 
+        shutdown::install();
+        let stop = shutdown::global();
         let work_result = tokio::select! {
-            result = work => result,
-            _ = tokio::signal::ctrl_c() => {
-                // Restore terminal in case raw mode was enabled (e.g. watch attach)
-                let _ = crossterm::terminal::disable_raw_mode();
-                reporter.finish("");
-                Err(anyhow::anyhow!("interrupted"))
+            result = &mut work => result,
+            _ = stop.wait() => {
+                // A command that declared itself cooperative finishes the
+                // item it is on, prints its summary and returns; give it the
+                // grace period. Every other command is cancelled right away.
+                // A second Ctrl+C exits immediately either way (`shutdown`).
+                if stop.is_cooperative() {
+                    match tokio::time::timeout(shutdown::GRACE, &mut work).await {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "interrupted: the command did not stop within {}s",
+                            shutdown::GRACE.as_secs()
+                        )),
+                    }
+                } else {
+                    // Restore terminal in case raw mode was enabled (e.g. watch attach)
+                    let _ = crossterm::terminal::disable_raw_mode();
+                    reporter.finish("");
+                    Err(anyhow::anyhow!("interrupted"))
+                }
             }
         };
 
         let _ = logging_handle.shutdown().await;
         work_result
     });
+    // A worker stuck in a hung syscall (NFS) must not keep the process alive
+    // after the command has finished or been interrupted.
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -255,23 +276,18 @@ async fn handle_config(
 
             if !s3_secret.is_empty() {
                 let secrets_path = parent.join("secrets.env");
-                std::fs::write(&secrets_path, format!("HS_S3_SECRET_KEY={}\n", s3_secret))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &secrets_path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
-                }
+                write_private_file(
+                    &secrets_path,
+                    format!("HS_S3_SECRET_KEY={}\n", s3_secret).as_bytes(),
+                )?;
                 reporter.status("Created", &format!("{}", secrets_path.display()));
             }
 
             // Create project directory structure
             let project = hs_common::resolve_project_dir();
-            let _ = std::fs::create_dir_all(project.join("papers").join("manually_downloaded"));
-            let _ = std::fs::create_dir_all(project.join("markdown"));
-            let _ = std::fs::create_dir_all(project.join("catalog"));
+            std::fs::create_dir_all(project.join("papers").join("manually_downloaded"))?;
+            std::fs::create_dir_all(project.join("markdown"))?;
+            std::fs::create_dir_all(project.join("catalog"))?;
 
             Ok(())
         }
@@ -298,6 +314,33 @@ async fn handle_config(
     }
 }
 
+/// Write `contents` to `path` so the secret is never readable by anyone else:
+/// the file is created with mode 0600, and a pre-existing file is truncated
+/// and chmod'ed to 0600 BEFORE the secret is written into it.
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| anyhow::anyhow!("restrict {} to its owner: {e}", path.display()))?;
+    }
+    file.write_all(contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))
+}
+
 fn generate_config(email: &str, core_key: &str) -> String {
     let mut content = DEFAULT_CONFIG.to_string();
     if !email.is_empty() {
@@ -313,4 +356,45 @@ fn generate_config(email: &str, core_key: &str) -> String {
         );
     }
     content
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::write_private_file;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_new_secrets_file_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        write_private_file(&path, b"HS_S3_SECRET_KEY=s\n").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"HS_S3_SECRET_KEY=s\n");
+    }
+
+    /// `hs config init --force` over a world-readable secrets file: the new
+    /// secret must never sit in a file anyone else can read.
+    #[test]
+    fn an_existing_world_readable_file_is_restricted_before_the_secret_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        std::fs::write(&path, b"old contents that are longer than the new ones\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private_file(&path, b"HS_S3_SECRET_KEY=s\n").unwrap();
+
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"HS_S3_SECRET_KEY=s\n");
+    }
+
+    #[test]
+    fn failures_are_errors_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_parent = dir.path().join("no-such-dir").join("secrets.env");
+        assert!(write_private_file(&missing_parent, b"x").is_err());
+    }
 }

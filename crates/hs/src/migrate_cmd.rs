@@ -3,11 +3,18 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use hs_common::reporter::Reporter;
+use sha2::{Digest, Sha256};
+
+use crate::shutdown::Shutdown;
 
 /// Migrate flat file directories to 2-character prefix sharded layout.
 ///
 /// Moves files from `dir/stem.ext` to `dir/XX/stem.ext` where XX is the
-/// first 2 characters of the stem.
+/// leading prefix of the stem (see `hs_common::sharded_path`). Never
+/// overwrites: a flat file whose sharded twin already exists is removed only
+/// when the twin has identical content, and is reported as a failure
+/// otherwise. Exits non-zero if any file could not be migrated or the run was
+/// interrupted.
 pub async fn run_sharding(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
     let paper_cfg = paper::config::Config::load().unwrap_or_default();
@@ -18,7 +25,10 @@ pub async fn run_sharding(reporter: &Arc<dyn Reporter>) -> Result<()> {
         ("catalog", &scribe_cfg.catalog_dir, &["yaml"]),
     ];
 
+    let stop = crate::shutdown::cooperative();
     let mut total_moved = 0u64;
+    let mut failures: Vec<String> = Vec::new();
+    let mut interrupted = false;
 
     for (name, dir, extensions) in &dirs_to_migrate {
         if !dir.exists() {
@@ -26,76 +36,39 @@ pub async fn run_sharding(reporter: &Arc<dyn Reporter>) -> Result<()> {
             continue;
         }
 
-        let mut moved = 0u64;
-        let mut skipped = 0u64;
-        let entries: Vec<_> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let path = e.path();
-                let name = path
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or_default();
-                // Skip directories, macOS resource forks (._*), and non-matching extensions
-                !path.is_dir()
-                    && !name.starts_with("._")
-                    && path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| extensions.contains(&ext))
-            })
-            .collect();
-
-        let count = entries.len();
-        if count == 0 {
-            reporter.status("OK", &format!("{name}: already sharded (0 flat files)"));
-            continue;
+        let stats = shard_directory(name, dir, extensions, &stop, reporter)?;
+        reporter.status(
+            "OK",
+            &format!(
+                "{name}: migrated {}, already sharded twin removed {}, skipped {}, failed {}",
+                stats.moved,
+                stats.duplicates,
+                stats.skipped,
+                stats.failures.len()
+            ),
+        );
+        total_moved += stats.moved;
+        failures.extend(stats.failures);
+        if stats.interrupted {
+            interrupted = true;
+            break;
         }
+    }
 
-        reporter.status("Migrate", &format!("{name}: {count} files to shard..."));
-
-        for entry in entries {
-            let path = entry.path();
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or_default();
-
-            if stem.len() < 2 {
-                skipped += 1;
-                continue;
-            }
-
-            let target = hs_common::sharded_path(dir, stem, ext);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            match std::fs::rename(&path, &target) {
-                Ok(()) => moved += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // File vanished between scan and rename (NFS race)
-                    skipped += 1;
-                }
-                Err(e) => {
-                    reporter.warn(&format!("{name}: failed to move {}: {e}", path.display()));
-                    skipped += 1;
-                }
-            }
-        }
-
-        if skipped > 0 {
-            reporter.status(
-                "OK",
-                &format!("{name}: migrated {moved}, skipped {skipped}"),
-            );
-        } else {
-            reporter.status("OK", &format!("{name}: migrated {moved} files"));
-        }
-        total_moved += moved;
+    for failure in &failures {
+        reporter.warn(failure);
+    }
+    if interrupted {
+        anyhow::bail!(
+            "interrupted after migrating {total_moved} file(s); re-run to finish ({} failure(s) so far)",
+            failures.len()
+        );
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} file(s) could not be migrated (migrated {total_moved})",
+            failures.len()
+        );
     }
 
     if total_moved > 0 {
@@ -105,6 +78,159 @@ pub async fn run_sharding(reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ShardStats {
+    moved: u64,
+    /// Flat files removed because the sharded twin already had identical content.
+    duplicates: u64,
+    /// Not migrated by design (single-character stems) or vanished mid-run.
+    skipped: u64,
+    /// Files that could not be migrated (invalid name, collision, I/O error).
+    failures: Vec<String>,
+    interrupted: bool,
+}
+
+/// Shard the flat files directly under `dir` whose extension is in `extensions`.
+fn shard_directory(
+    name: &str,
+    dir: &Path,
+    extensions: &[&str],
+    stop: &Shutdown,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<ShardStats> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let file_name = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or_default();
+        // Skip directories, macOS resource forks (._*), and non-matching extensions
+        let wanted = !path.is_dir()
+            && !file_name.starts_with("._")
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| extensions.contains(&ext));
+        if wanted {
+            entries.push(path);
+        }
+    }
+
+    let mut stats = ShardStats::default();
+    if entries.is_empty() {
+        reporter.status("OK", &format!("{name}: already sharded (0 flat files)"));
+        return Ok(stats);
+    }
+    reporter.status(
+        "Migrate",
+        &format!("{name}: {} files to shard...", entries.len()),
+    );
+
+    for path in entries {
+        if stop.requested() {
+            stats.interrupted = true;
+            break;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+
+        // The stem becomes a path component under `dir`: a stem like `..`
+        // (from `...pdf`) must not be able to leave it.
+        if let Err(invalid) = hs_common::validate_stem(stem) {
+            stats.failures.push(format!(
+                "{name}: {}: not a usable stem: {invalid}",
+                path.display()
+            ));
+            continue;
+        }
+        if stem.len() < 2 {
+            stats.skipped += 1;
+            continue;
+        }
+
+        let target = hs_common::sharded_path(dir, stem, ext);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match move_without_clobbering(&path, &target) {
+            Ok(Moved::Moved) => stats.moved += 1,
+            Ok(Moved::DuplicateRemoved) => stats.duplicates += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File vanished between scan and move (NFS race)
+                stats.skipped += 1;
+            }
+            Err(e) => stats
+                .failures
+                .push(format!("{name}: {}: {e}", path.display())),
+        }
+    }
+    Ok(stats)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Moved {
+    Moved,
+    /// `target` already existed with identical content; the flat source was removed.
+    DuplicateRemoved,
+}
+
+/// Move `source` to `target` with create-new semantics: `target` is never
+/// replaced. The file is hard-linked into place (which fails atomically when
+/// `target` exists) and then the source name is removed; if `target` exists,
+/// the source is removed only when both files have identical content.
+/// `std::fs::rename` would silently overwrite `target`.
+fn move_without_clobbering(source: &Path, target: &Path) -> std::io::Result<Moved> {
+    match std::fs::hard_link(source, target) {
+        Ok(()) => {
+            std::fs::remove_file(source)?;
+            Ok(Moved::Moved)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if same_content(source, target)? {
+                std::fs::remove_file(source)?;
+                Ok(Moved::DuplicateRemoved)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{} already exists with different content; refusing to overwrite it",
+                        target.display()
+                    ),
+                ))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Byte-for-byte comparison, streamed so large PDFs are not held in memory.
+fn same_content(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read as _;
+
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 /// Decide whether a storage key is a root-level orphan needing relocation to
@@ -214,13 +340,16 @@ pub async fn run_move_root_orphans(
     }
 
     const CONCURRENCY: usize = 8;
+    let stop = crate::shutdown::cooperative();
     let moved = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let skipped = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let catalog_rewritten = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let errors: Arc<tokio::sync::Mutex<Vec<String>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-    let mut stream = stream::iter(candidates.into_iter().map(|obj| {
+    // Ctrl+C: start nothing new (the iterator is only pulled as slots free
+    // up); the moves already in flight finish.
+    let mut stream = stream::iter(candidates.into_iter().take_while(|_| !stop.requested()).map(|obj| {
         let storage = Arc::clone(&storage);
         let moved = Arc::clone(&moved);
         let skipped = Arc::clone(&skipped);
@@ -271,6 +400,13 @@ pub async fn run_move_root_orphans(
         reporter.warn(e);
     }
 
+    if stop.requested() {
+        anyhow::bail!(
+            "interrupted after {done} of {planned} file(s): moved={moved_n} skipped={skipped_n} \
+             errors={}; re-run to continue",
+            errs.len()
+        );
+    }
     if errs.is_empty() {
         reporter.finish(&format!(
             "Relocated {moved_n} (skipped {skipped_n}; catalog rows rewritten: {catalog_n})"
@@ -291,11 +427,20 @@ enum RelocateOutcome {
 }
 
 /// Move one object. Guarantees:
-/// - size-matching pre-existing target keys are treated as already-relocated
-///   (idempotent re-runs after a partial failure).
-/// - post-put HEAD verifies the bytes landed before the source is deleted.
+/// - a storage error while probing the target is an error, never "absent".
+/// - a pre-existing target is treated as already-relocated (idempotent
+///   re-runs after a partial failure) only when its CONTENT equals the
+///   source's; the same size with different bytes is a collision and nothing
+///   is written or deleted.
+/// - the target is read back and its SHA-256 compared with the source's
+///   before the source is deleted (a size check cannot tell a garbled write
+///   from a good one).
 /// - any catalog row at `catalog/{sharded_key(stem, "yaml")}` whose
 ///   `pdf_path` equals the old source key is rewritten inline.
+///
+/// The `Storage` trait has no conditional put, so a writer that creates
+/// `tgt` between the probe and the put would be overwritten: run this with
+/// the downloader/inbox quiet.
 async fn relocate_one(
     storage: &dyn hs_common::storage::Storage,
     src: &str,
@@ -307,6 +452,8 @@ async fn relocate_one(
     let (stem, _ext) = filename
         .rsplit_once('.')
         .ok_or_else(|| anyhow::anyhow!("source key has no extension: {src}"))?;
+    hs_common::validate_stem(stem)
+        .map_err(|e| anyhow::anyhow!("source key {src} has an unusable stem: {e}"))?;
     let stem = stem.to_string();
 
     let src_meta = storage
@@ -315,45 +462,62 @@ async fn relocate_one(
         .map_err(|e| anyhow::anyhow!("head src {src}: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("source vanished before move: {src}"))?;
 
-    // If the target already exists at the same size we assume a prior run
-    // completed the PUT but failed the DELETE; finish the job by removing
-    // the source. Different size is a real collision — fail loud.
-    if let Ok(Some(tgt_meta)) = storage.head(tgt).await {
-        if tgt_meta.size == src_meta.size {
-            storage
-                .delete(src)
-                .await
-                .map_err(|e| anyhow::anyhow!("delete src {src}: {e}"))?;
-            return Ok(RelocateOutcome::AlreadyAtTarget);
+    let tgt_meta = storage
+        .head(tgt)
+        .await
+        .map_err(|e| anyhow::anyhow!("head tgt {tgt}: {e}"))?;
+    if let Some(tgt_meta) = tgt_meta {
+        if tgt_meta.size != src_meta.size {
+            anyhow::bail!(
+                "target {tgt} already exists with size {} (source size {}); refusing to overwrite",
+                tgt_meta.size,
+                src_meta.size
+            );
         }
-        anyhow::bail!(
-            "target {tgt} already exists with size {} (source size {}); refusing to overwrite",
-            tgt_meta.size,
-            src_meta.size
-        );
+        // Equal size is not equal content, and deleting the source destroys
+        // the only other copy.
+        let src_bytes = storage
+            .get(src)
+            .await
+            .map_err(|e| anyhow::anyhow!("get src {src}: {e}"))?;
+        let tgt_bytes = storage
+            .get(tgt)
+            .await
+            .map_err(|e| anyhow::anyhow!("get tgt {tgt}: {e}"))?;
+        if src_bytes != tgt_bytes {
+            anyhow::bail!(
+                "target {tgt} already exists with different content (same size {}); \
+                 refusing to overwrite it or delete {src}",
+                src_meta.size
+            );
+        }
+        storage
+            .delete(src)
+            .await
+            .map_err(|e| anyhow::anyhow!("delete src {src}: {e}"))?;
+        return Ok(RelocateOutcome::AlreadyAtTarget);
     }
 
     let bytes = storage
         .get(src)
         .await
         .map_err(|e| anyhow::anyhow!("get src {src}: {e}"))?;
-    let src_size = bytes.len() as u64;
+    let digest = Sha256::digest(&bytes);
     storage
         .put(tgt, bytes)
         .await
         .map_err(|e| anyhow::anyhow!("put tgt {tgt}: {e}"))?;
 
-    let verify_meta = storage
-        .head(tgt)
+    let written = storage
+        .get(tgt)
         .await
-        .map_err(|e| anyhow::anyhow!("head tgt {tgt}: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("target missing after put: {tgt}"))?;
-    if verify_meta.size != src_size {
+        .map_err(|e| anyhow::anyhow!("read back tgt {tgt}: {e}"))?;
+    if Sha256::digest(&written) != digest {
         anyhow::bail!(
-            "post-put verify failed for {tgt}: expected {src_size} bytes, got {}",
-            verify_meta.size
+            "post-put verify failed for {tgt}: the stored bytes differ from {src}; source kept"
         );
     }
+    drop(written);
 
     // Rewrite catalog row's `pdf_path` if it still points at the bucket-root
     // key. `hs_common::catalog::read_catalog_entry_via` looks up by stem and
@@ -468,13 +632,16 @@ pub async fn run_quarantine_bad_content(
     );
 
     const CONCURRENCY: usize = 8;
+    let stop = crate::shutdown::cooperative();
     let healthy = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let renamed_html = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let quarantined = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let errors: Arc<tokio::sync::Mutex<Vec<String>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-    let mut stream = stream::iter(candidates.into_iter().map(|obj| {
+    // Ctrl+C: start nothing new (the iterator is only pulled as slots free
+    // up); the inspections already in flight finish.
+    let mut stream = stream::iter(candidates.into_iter().take_while(|_| !stop.requested()).map(|obj| {
         let storage = Arc::clone(&storage);
         let bus = Arc::clone(&bus);
         let healthy = Arc::clone(&healthy);
@@ -525,6 +692,13 @@ pub async fn run_quarantine_bad_content(
         reporter.warn(e);
     }
 
+    if stop.requested() {
+        anyhow::bail!(
+            "interrupted after {done} of {planned} object(s): healthy={h} html-rename={r} \
+             quarantined={q} errors={}; re-run to continue",
+            errs.len()
+        );
+    }
     let tag = if dry_run { "would" } else { "did" };
     if errs.is_empty() {
         reporter.finish(&format!(
@@ -686,17 +860,24 @@ async fn purge_local_html_rows(
         }
 
         let md_key = format!("markdown/{}", hs_common::sharded_key(&stem, "md"));
-        if storage.exists(&md_key).await.unwrap_or(false) {
-            match storage.delete(&md_key).await {
+        match storage.exists(&md_key).await {
+            Ok(true) => match storage.delete(&md_key).await {
                 Ok(()) => stats.deleted_markdown += 1,
                 Err(e) => stats.errors.push(format!("markdown/{stem}: {e}")),
-            }
+            },
+            Ok(false) => {}
+            Err(e) => stats.errors.push(format!("markdown/{stem}: probe: {e}")),
         }
 
         for ext in ["html", "htm"] {
             let key = format!("papers/{}", hs_common::sharded_key(&stem, ext));
-            if !storage.exists(&key).await.unwrap_or(false) {
-                continue;
+            match storage.exists(&key).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    stats.errors.push(format!("papers/{stem}.{ext}: probe: {e}"));
+                    continue;
+                }
             }
             match storage.delete(&key).await {
                 Ok(()) => stats.deleted_paper += 1,
@@ -1178,7 +1359,9 @@ fn needs_canonicalizing(stem: &str) -> bool {
     stem.starts_with("10.") && stem != stem.to_lowercase()
 }
 
-/// Live size of a single object, or `None` when it does not exist.
+/// Live size of a single object, or `None` when it does not exist. A storage
+/// error is an error: reading it as "absent" would make the caller treat the
+/// canonical slot as free and overwrite it.
 ///
 /// The scan-time snapshot cannot be trusted at write time: when two
 /// *different* non-canonical spellings share one canonical form (e.g.
@@ -1187,14 +1370,8 @@ fn needs_canonicalizing(stem: &str) -> bool {
 /// absent" and blindly overwrite it — keeping whichever happened to sort
 /// last rather than the better conversion, and detaching the catalog row
 /// from the markdown. Re-probing here collapses that race.
-async fn object_len(storage: &dyn hs_common::storage::Storage, key: &str) -> Option<u64> {
-    storage
-        .list(key)
-        .await
-        .ok()?
-        .into_iter()
-        .find(|m| m.key == key)
-        .map(|m| m.size)
+async fn object_len(storage: &dyn hs_common::storage::Storage, key: &str) -> Result<Option<u64>> {
+    Ok(storage.head(key).await?.map(|m| m.size))
 }
 
 /// Copy an object to a new key and delete the original. S3 has no rename.
@@ -1325,21 +1502,41 @@ pub async fn run_canonicalize_doi_stems(
     let servers = crate::distill_cmd::resolve_servers(server).await;
     let distill = hs_distill::client::DistillClient::new(&servers[0])?;
 
+    let stop = crate::shutdown::cooperative();
+    let mut interrupted = false;
+
     for snapshot in &variants {
+        if stop.requested() {
+            interrupted = true;
+            break;
+        }
         // Re-probe both sides rather than trusting the scan snapshot: an
         // earlier iteration of this same run may have moved an object onto
         // the canonical key. See `object_len`.
-        let v = CaseVariant {
-            md_len: object_len(
+        let probed = async {
+            let md_len = object_len(
                 &*storage,
                 &hs_common::markdown::markdown_storage_key(&snapshot.stem),
             )
-            .await,
-            canonical_md_len: object_len(
+            .await?;
+            let canonical_md_len = object_len(
                 &*storage,
                 &hs_common::markdown::markdown_storage_key(&snapshot.canonical),
             )
-            .await,
+            .await?;
+            Ok::<_, anyhow::Error>((md_len, canonical_md_len))
+        }
+        .await;
+        let (md_len, canonical_md_len) = match probed {
+            Ok(lens) => lens,
+            Err(e) => {
+                stats.errors.push(format!("probe {}: {e:#}", snapshot.stem));
+                continue;
+            }
+        };
+        let v = CaseVariant {
+            md_len,
+            canonical_md_len,
             stem: snapshot.stem.clone(),
             canonical: snapshot.canonical.clone(),
         };
@@ -1379,10 +1576,19 @@ pub async fn run_canonicalize_doi_stems(
         let from_md = hs_common::markdown::markdown_storage_key(&v.stem);
         let to_md = hs_common::markdown::markdown_storage_key(&v.canonical);
 
+        let from_md_exists = match storage.exists(&from_md).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                stats
+                    .errors
+                    .push(format!("probe markdown {}: {e:#}", v.stem));
+                continue;
+            }
+        };
         if !v.is_collision() || v.variant_wins() {
             // Promote this spelling's markdown onto the canonical key —
             // either it is the only copy, or it is the better one.
-            if storage.exists(&from_md).await.unwrap_or(false) {
+            if from_md_exists {
                 match move_object(&*storage, &from_md, &to_md).await {
                     Ok(()) => {
                         stats.moved_markdown += 1;
@@ -1396,7 +1602,7 @@ pub async fn run_canonicalize_doi_stems(
                     }
                 }
             }
-        } else if storage.exists(&from_md).await.unwrap_or(false) {
+        } else if from_md_exists {
             // Canonical holds the better conversion — discard this one.
             if let Err(e) = storage.delete(&from_md).await {
                 stats
@@ -1409,16 +1615,23 @@ pub async fn run_canonicalize_doi_stems(
         // never clobber an existing source with the loser's bytes.
         for ext in ["pdf", "html", "htm", "epub"] {
             let from = format!("papers/{}", hs_common::sharded_key(&v.stem, ext));
-            if !storage.exists(&from).await.unwrap_or(false) {
-                continue;
-            }
             let to = format!("papers/{}", hs_common::sharded_key(&v.canonical, ext));
-            let res = if storage.exists(&to).await.unwrap_or(false) {
-                storage.delete(&from).await
-            } else {
-                move_object(&*storage, &from, &to).await.map(|()| {
+            // A probe error is never "absent": reading it that way would let
+            // `move_object` overwrite the canonical source document.
+            let probed = async {
+                if !storage.exists(&from).await? {
+                    return Ok::<_, anyhow::Error>(None);
+                }
+                Ok(Some(storage.exists(&to).await?))
+            }
+            .await;
+            let res = match probed {
+                Ok(None) => continue,
+                Ok(Some(true)) => storage.delete(&from).await,
+                Ok(Some(false)) => move_object(&*storage, &from, &to).await.map(|()| {
                     stats.moved_paper += 1;
-                })
+                }),
+                Err(e) => Err(e),
             };
             if let Err(e) = res {
                 stats.errors.push(format!("papers {}.{ext}: {e}", v.stem));
@@ -1429,12 +1642,23 @@ pub async fn run_canonicalize_doi_stems(
         // canonical row is absent, then drop the variant row either way.
         match hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", &v.stem).await {
             Ok(Some(mut entry)) => {
-                let canonical_exists =
-                    hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", &v.canonical)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some();
+                let canonical_exists = match hs_common::catalog::read_catalog_entry_via(
+                    &*storage,
+                    "catalog",
+                    &v.canonical,
+                )
+                .await
+                {
+                    Ok(row) => row.is_some(),
+                    Err(e) => {
+                        // Unknown is not "absent": the variant row is deleted
+                        // below, so deciding blind could destroy the only copy.
+                        stats
+                            .errors
+                            .push(format!("read catalog {}: {e:#}", v.canonical));
+                        continue;
+                    }
+                };
                 // Write this row onto the canonical key when the canonical
                 // row is absent, and also when this spelling won a collision
                 // — its markdown was just promoted, so its provenance
@@ -1499,11 +1723,21 @@ pub async fn run_canonicalize_doi_stems(
                     .errors
                     .push(format!("purge canonical {}: {e}", v.canonical));
             }
-            let cat =
-                hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", &v.canonical)
-                    .await
-                    .ok()
-                    .flatten();
+            let cat = match hs_common::catalog::read_catalog_entry_via(
+                &*storage,
+                "catalog",
+                &v.canonical,
+            )
+            .await
+            {
+                Ok(cat) => cat,
+                Err(e) => {
+                    stats
+                        .errors
+                        .push(format!("read catalog {}: {e:#}", v.canonical));
+                    continue;
+                }
+            };
             if let Err(e) = distill
                 .index_from_storage_with_catalog(&*storage, &to_md, cat.as_ref())
                 .await
@@ -1530,6 +1764,12 @@ pub async fn run_canonicalize_doi_stems(
         stats.errors.len()
     ));
 
+    if interrupted {
+        anyhow::bail!(
+            "interrupted: canonicalize-doi-stems stopped early with {} error(s); re-run to continue",
+            stats.errors.len()
+        );
+    }
     if !stats.errors.is_empty() {
         anyhow::bail!(
             "canonicalize-doi-stems finished with {} error(s)",
@@ -1593,5 +1833,282 @@ mod canonicalize_tests {
         assert!(!variant(Some(22), Some(2581)).variant_wins());
         assert!(!variant(Some(500), Some(500)).variant_wins());
         assert!(!variant(None, Some(500)).variant_wins());
+    }
+}
+
+#[cfg(test)]
+mod migration_safety_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use hs_common::reporter::SilentReporter;
+    use hs_common::storage::{LocalFsStorage, ObjectMeta, Storage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn reporter() -> Arc<dyn Reporter> {
+        Arc::new(SilentReporter)
+    }
+
+    // ── `hs migrate sharding` (local directories) ──────────────────────
+
+    /// RA-4: names whose second byte is inside a multi-byte character.
+    #[test]
+    fn non_ascii_names_shard_without_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["Müller", "Año", "Cómo", "plain"] {
+            std::fs::write(tmp.path().join(format!("{name}.pdf")), name).unwrap();
+        }
+
+        let stats =
+            shard_directory("papers", tmp.path(), &["pdf"], &Shutdown::new(), &reporter()).unwrap();
+
+        assert!(stats.failures.is_empty(), "{:?}", stats.failures);
+        assert_eq!(stats.moved, 4);
+        for name in ["Müller", "Año", "Cómo", "plain"] {
+            assert!(!tmp.path().join(format!("{name}.pdf")).exists(), "{name}");
+            let sharded = hs_common::sharded_path(tmp.path(), name, "pdf");
+            assert_eq!(std::fs::read_to_string(&sharded).unwrap(), name);
+        }
+    }
+
+    /// `...pdf` has the stem `..`; `sharded_path` would join it onto the
+    /// directory and the move would leave it. It must be reported and left
+    /// where it is.
+    #[test]
+    fn a_dot_dot_stem_is_a_failure_not_a_path_escape() {
+        let outer = tempfile::tempdir().unwrap();
+        let dir = outer.path().join("papers");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("...pdf"), "x").unwrap();
+
+        let stats = shard_directory("papers", &dir, &["pdf"], &Shutdown::new(), &reporter()).unwrap();
+
+        assert_eq!(stats.moved, 0);
+        assert_eq!(stats.failures.len(), 1, "{:?}", stats.failures);
+        assert!(dir.join("...pdf").exists());
+        let outside: Vec<_> = std::fs::read_dir(outer.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(outside, vec![std::ffi::OsString::from("papers")]);
+    }
+
+    /// RA-36: `fs::rename` replaced an existing sharded file with the flat one.
+    #[test]
+    fn an_existing_sharded_twin_with_other_content_is_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("ab")).unwrap();
+        std::fs::write(tmp.path().join("ab/abcdef.pdf"), "old, the good one").unwrap();
+        std::fs::write(tmp.path().join("abcdef.pdf"), "new, different").unwrap();
+
+        let stats =
+            shard_directory("papers", tmp.path(), &["pdf"], &Shutdown::new(), &reporter()).unwrap();
+
+        assert_eq!(stats.moved, 0);
+        assert_eq!(stats.failures.len(), 1, "{:?}", stats.failures);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("ab/abcdef.pdf")).unwrap(),
+            "old, the good one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("abcdef.pdf")).unwrap(),
+            "new, different",
+            "the flat file is kept so nothing is lost"
+        );
+    }
+
+    #[test]
+    fn an_identical_sharded_twin_lets_the_flat_copy_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("ab")).unwrap();
+        std::fs::write(tmp.path().join("ab/abcdef.pdf"), "same").unwrap();
+        std::fs::write(tmp.path().join("abcdef.pdf"), "same").unwrap();
+
+        let stats =
+            shard_directory("papers", tmp.path(), &["pdf"], &Shutdown::new(), &reporter()).unwrap();
+
+        assert!(stats.failures.is_empty(), "{:?}", stats.failures);
+        assert_eq!(stats.duplicates, 1);
+        assert!(!tmp.path().join("abcdef.pdf").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("ab/abcdef.pdf")).unwrap(),
+            "same"
+        );
+    }
+
+    #[test]
+    fn a_requested_shutdown_stops_the_migration_and_leaves_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["aaaa", "bbbb", "cccc"] {
+            std::fs::write(tmp.path().join(format!("{name}.pdf")), name).unwrap();
+        }
+        let stop = Shutdown::new();
+        stop.request();
+
+        let stats = shard_directory("papers", tmp.path(), &["pdf"], &stop, &reporter()).unwrap();
+
+        assert!(stats.interrupted);
+        assert_eq!(stats.moved, 0);
+        assert!(tmp.path().join("aaaa.pdf").exists());
+    }
+
+    // ── `relocate_one` against a faulty backend ────────────────────────
+
+    /// LocalFs plus fault injection and write/delete counters.
+    struct FaultyStorage {
+        inner: LocalFsStorage,
+        /// `head` of this key fails with an I/O-style error.
+        fail_head_of: Option<&'static str>,
+        /// `put` stores the bytes with the first byte flipped (same size).
+        garble_puts: bool,
+        puts: AtomicUsize,
+        deletes: AtomicUsize,
+    }
+
+    impl FaultyStorage {
+        fn new(root: &std::path::Path) -> Self {
+            Self {
+                inner: LocalFsStorage::new(root),
+                fail_head_of: None,
+                garble_puts: false,
+                puts: AtomicUsize::new(0),
+                deletes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Storage for FaultyStorage {
+        async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, mut bytes: Vec<u8>) -> anyhow::Result<()> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            if self.garble_puts {
+                if let Some(first) = bytes.first_mut() {
+                    *first ^= 0xff;
+                }
+            }
+            self.inner.put(key, bytes).await
+        }
+        async fn head(&self, key: &str) -> anyhow::Result<Option<ObjectMeta>> {
+            if self.fail_head_of == Some(key) {
+                anyhow::bail!("503 Slow Down");
+            }
+            self.inner.head(key).await
+        }
+        async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A transient error probing the target used to read as "no target":
+    /// the move went ahead and overwrote whatever was there.
+    #[tokio::test]
+    async fn a_head_error_on_the_target_is_an_error_not_an_empty_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = FaultyStorage::new(tmp.path());
+        storage.fail_head_of = Some("papers/ab/abcdef.pdf");
+        storage
+            .inner
+            .put("ab/abcdef.pdf", b"source".to_vec())
+            .await
+            .unwrap();
+        storage
+            .inner
+            .put("papers/ab/abcdef.pdf", b"precious existing target".to_vec())
+            .await
+            .unwrap();
+
+        let err = relocate_one(&storage, "ab/abcdef.pdf", "papers/ab/abcdef.pdf")
+            .await
+            .expect_err("a failing head must abort the move");
+
+        assert!(format!("{err:#}").contains("503"), "{err:#}");
+        assert_eq!(storage.puts.load(Ordering::SeqCst), 0, "nothing written");
+        assert_eq!(storage.deletes.load(Ordering::SeqCst), 0, "nothing deleted");
+        assert_eq!(
+            storage.inner.get("papers/ab/abcdef.pdf").await.unwrap(),
+            b"precious existing target"
+        );
+        assert!(storage.inner.exists("ab/abcdef.pdf").await.unwrap());
+    }
+
+    /// Same length, different bytes: the old code called this "already
+    /// relocated" and deleted the source, losing the only copy of it.
+    #[tokio::test]
+    async fn same_size_different_content_keeps_both_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FaultyStorage::new(tmp.path());
+        storage
+            .inner
+            .put("ab/abcdef.pdf", b"AAAA-source".to_vec())
+            .await
+            .unwrap();
+        storage
+            .inner
+            .put("papers/ab/abcdef.pdf", b"BBBB-target".to_vec())
+            .await
+            .unwrap();
+
+        let err = relocate_one(&storage, "ab/abcdef.pdf", "papers/ab/abcdef.pdf")
+            .await
+            .expect_err("different content must not be treated as relocated");
+
+        assert!(format!("{err:#}").contains("different content"), "{err:#}");
+        assert_eq!(storage.deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            storage.inner.get("ab/abcdef.pdf").await.unwrap(),
+            b"AAAA-source"
+        );
+        assert_eq!(
+            storage.inner.get("papers/ab/abcdef.pdf").await.unwrap(),
+            b"BBBB-target"
+        );
+    }
+
+    /// A write that lands with the right length but wrong bytes passed the
+    /// old size-only verification and the source was deleted.
+    #[tokio::test]
+    async fn a_garbled_write_of_the_right_size_keeps_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = FaultyStorage::new(tmp.path());
+        storage.garble_puts = true;
+        storage
+            .inner
+            .put("ab/abcdef.pdf", b"the real bytes".to_vec())
+            .await
+            .unwrap();
+
+        let err = relocate_one(&storage, "ab/abcdef.pdf", "papers/ab/abcdef.pdf")
+            .await
+            .expect_err("content verification must catch the garbled write");
+
+        assert!(format!("{err:#}").contains("post-put verify"), "{err:#}");
+        assert_eq!(storage.deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            storage.inner.get("ab/abcdef.pdf").await.unwrap(),
+            b"the real bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identical_target_completes_the_interrupted_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FaultyStorage::new(tmp.path());
+        for key in ["ab/abcdef.pdf", "papers/ab/abcdef.pdf"] {
+            storage.inner.put(key, b"identical".to_vec()).await.unwrap();
+        }
+
+        let outcome = relocate_one(&storage, "ab/abcdef.pdf", "papers/ab/abcdef.pdf")
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, RelocateOutcome::AlreadyAtTarget));
+        assert!(!storage.inner.exists("ab/abcdef.pdf").await.unwrap());
+        assert_eq!(storage.puts.load(Ordering::SeqCst), 0);
     }
 }
