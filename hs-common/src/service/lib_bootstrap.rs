@@ -84,6 +84,22 @@ pub fn ensure_lib_paths_or_reexec() {
 #[cfg(not(unix))]
 pub fn ensure_lib_paths_or_reexec() {}
 
+/// Directories a deployment drops `libpdfium` into besides the system
+/// search path. [`ensure_lib_paths_or_reexec`] puts them on the loader path
+/// of the GPU servers (macOS); processes that cannot re-exec themselves
+/// (the `hs` CLI and its watchers) bind the library from these directories
+/// directly. Only directories under the home directory; empty without one.
+pub fn pdfium_drop_dirs() -> Vec<std::path::PathBuf> {
+    dirs::home_dir()
+        .map(|home| {
+            [".local/lib", ".home-still/dyld-libs"]
+                .iter()
+                .map(|rel| home.join(rel))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Name the pyke cache uses for this platform's directory.
 #[cfg(all(unix, target_os = "linux"))]
 fn pyke_platform_dir() -> String {
@@ -166,16 +182,11 @@ fn required_paths() -> Vec<String> {
     // macOS: scribe-server dlopens libpdfium.dylib. Two standard drop
     // locations are searched — whichever contains the dylib gets added.
     // Other dylibs bundled in the same dir ride along for free.
-    let mut out: Vec<String> = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        for rel in [".local/lib", ".home-still/dyld-libs"] {
-            let dir = home.join(rel);
-            if dir.join("libpdfium.dylib").exists() {
-                out.push(dir.to_string_lossy().into_owned());
-            }
-        }
-    }
-    out
+    pdfium_drop_dirs()
+        .into_iter()
+        .filter(|dir| dir.join("libpdfium.dylib").exists())
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .collect()
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]

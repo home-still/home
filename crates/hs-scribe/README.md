@@ -50,6 +50,11 @@ This single command handles everything:
 
 Use `hs scribe init --force` to regenerate everything, or `hs scribe init --check` for a dry-run status report.
 
+### Requirements of a scribe host
+
+- **`HS_BACKEND_TOKEN`.** `hs-scribe-server` refuses to start unless `HS_BACKEND_TOKEN` (≥ 32 visible ASCII bytes, e.g. `openssl rand -hex 32`; the same value as the gateway and every client host) is set — put it in `~/.home-still/secrets.env`, on every scribe host (the macOS launchd one included) and on every host that runs a scribe client (`hs`, `hs-mcp`). Every route except `GET /health` and `GET /readiness` requires `Authorization: Bearer <token>`; anything else, including a path no route serves, gets a 401 with a JSON body. `ScribeClient` sends the token automatically from the same variable. There is no unauthenticated mode: this is the endpoint that parses untrusted PDFs and drives the GPU.
+- **libpdfium.** Every PDF is counted by pdfium before it is dispatched or converted, on every converter (olmocr included), and the watcher (`hs scribe watch-events`) counts the PDFs it dispatches the same way. `hs-scribe-server` and the watcher refuse to start when libpdfium cannot be bound. It is looked up in `./`, then `~/.local/lib` and `~/.home-still/dyld-libs`, then the system library path. Container images bundle it. `hs` and `hs-mcp` hosts need it too for `hs scribe convert` and the `scribe_convert` tool on PDFs (those fail with the same error when it is missing).
+
 ### Platform behavior
 
 | Platform | VLM runs on | GPU acceleration |
@@ -240,7 +245,7 @@ Multi-arch images (amd64 + arm64) are published to GHCR on every release:
 ```sh
 docker pull ghcr.io/home-still/hs-scribe-server:latest
 docker run -p 7433:7433 -v ~/.local/share/home-still/models:/models:ro \
-  -e HS_BACKEND_TOKEN="$(openssl rand -hex 32)" \
+  -e HS_BACKEND_TOKEN="$HS_BACKEND_TOKEN" \
   -e HS_SCRIBE_OLLAMA_URL=http://host.docker.internal:11434 \
   ghcr.io/home-still/hs-scribe-server:latest
 ```
@@ -248,6 +253,8 @@ docker run -p 7433:7433 -v ~/.local/share/home-still/models:/models:ro \
 Or just use `hs scribe init` which handles all of this automatically.
 
 ### Health check
+
+`/health` and `/readiness` are the only routes that need no token.
 
 ```sh
 curl http://localhost:7433/health

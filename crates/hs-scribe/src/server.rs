@@ -12,10 +12,12 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Multipart, State},
     http::{header, HeaderMap, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
+use hs_common::auth::backend::BackendToken;
 use hs_common::service::inflight::InFlightGuard;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -241,24 +243,89 @@ fn format_last_conv(slot: &AtomicU64) -> Option<String> {
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
-pub fn app(state: Arc<ServerState>) -> Router {
-    app_with_body_limit(state, MAX_UPLOAD_BODY_BYTES)
+/// The router. This is the endpoint that parses hostile PDFs and drives the
+/// GPU, so it is closed by default: every request needs
+/// `Authorization: Bearer <HS_BACKEND_TOKEN>` — including paths no route
+/// serves — except the two probes in [`OPEN_PROBES`].
+pub fn app(state: Arc<ServerState>, token: BackendToken) -> Router {
+    app_with_body_limit(state, token, MAX_UPLOAD_BODY_BYTES)
 }
 
 /// [`app`] with an explicit request-body limit (the production value is
 /// [`MAX_UPLOAD_BODY_BYTES`]).
-pub fn app_with_body_limit(state: Arc<ServerState>, max_body_bytes: usize) -> Router {
-    Router::new()
-        .route("/scribe/stream", post(handle_scribe_stream))
-        .route("/health", get(handle_health))
-        .route("/readiness", get(handle_readiness))
-        .route("/info", get(handle_info))
-        .layer(DefaultBodyLimit::max(max_body_bytes))
-        .with_state(state)
-        // Outermost: a handler panic is a 500 and the server keeps serving.
-        .layer(axum::middleware::from_fn(
-            hs_common::panic_guard::http::catch_panic,
-        ))
+pub fn app_with_body_limit(
+    state: Arc<ServerState>,
+    token: BackendToken,
+    max_body_bytes: usize,
+) -> Router {
+    require_token_on_all_but_probes(
+        Router::new()
+            .route("/scribe/stream", post(handle_scribe_stream))
+            .route("/health", get(handle_health))
+            .route("/readiness", get(handle_readiness))
+            .route("/info", get(handle_info)),
+        token,
+    )
+    .layer(DefaultBodyLimit::max(max_body_bytes))
+    .with_state(state)
+    // Outermost: a handler panic is a 500 and the server keeps serving.
+    .layer(axum::middleware::from_fn(
+        hs_common::panic_guard::http::catch_panic,
+    ))
+}
+
+/// `GET` paths served without credentials: the liveness/readiness probes
+/// that pools, the gateway and `hs status` poll. Everything else — any route
+/// added later included — is behind the token.
+pub const OPEN_PROBES: [&str; 2] = ["/health", "/readiness"];
+
+/// Wrap `router` so that every request but a `GET` of an [`OPEN_PROBES`]
+/// path must carry the backend token. Fail-closed: a route added to the
+/// router is protected without anyone remembering to protect it.
+fn require_token_on_all_but_probes<S: Clone + Send + Sync + 'static>(
+    router: Router<S>,
+    token: BackendToken,
+) -> Router<S> {
+    router.layer(middleware::from_fn_with_state(token, require_token))
+}
+
+/// The backend secret the server requires, from `lookup` (the process
+/// environment in production). Unset or unusable is an error naming
+/// `HS_BACKEND_TOKEN` (never its value): the server refuses to start.
+pub fn backend_token(
+    lookup: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> anyhow::Result<BackendToken> {
+    BackendToken::from_lookup(lookup).map_err(|e| {
+        anyhow::anyhow!(
+            "hs-scribe-server requires a backend token: {e:#}. Put HS_BACKEND_TOKEN \
+             (>= 32 visible ASCII bytes, e.g. `openssl rand -hex 32`, the same value as the \
+             gateway and every client host) in ~/.home-still/secrets.env"
+        )
+    })
+}
+
+async fn require_token(
+    State(token): State<BackendToken>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let open =
+        request.method() == axum::http::Method::GET && OPEN_PROBES.contains(&request.uri().path());
+    if open {
+        return next.run(request).await;
+    }
+    match token.check_authorization(request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(why) => (
+            StatusCode::UNAUTHORIZED,
+            [
+                (header::WWW_AUTHENTICATE, "Bearer realm=\"hs-scribe\""),
+                (header::CONTENT_TYPE, "application/json"),
+            ],
+            serde_json::json!({ "error": format!("unauthorized: {why}") }).to_string(),
+        )
+            .into_response(),
+    }
 }
 
 /// `status` is `"ok"` only when the VLM backend can actually take work.
@@ -499,10 +566,7 @@ async fn convert_pdf(
         // page count comes from the file: the tally olmocr prints is only
         // meaningful against it.
         ConverterBackend::Olmocr => {
-            let counted = path.to_path_buf();
-            let pages =
-                tokio::task::spawn_blocking(move || crate::pdf_meta::count_pages_in_file(&counted))
-                    .await??;
+            let pages = crate::pdf_meta::count_pages_in_file(path).await?;
             crate::converter::olmocr_subprocess::convert(path, pages, &state.config)
                 .await
                 .map(|md| (md, Vec::new(), Vec::new()))
@@ -746,8 +810,29 @@ mod tests {
     #[cfg(unix)]
     mod http {
         use super::*;
-        use crate::pdf_meta::tests::pdf_with_pages;
+        use crate::pdf_meta::tests::{pdf_with_pages, skip_without_pdfium};
         use std::os::unix::fs::PermissionsExt;
+
+        pub(super) const TOKEN: &str = "scribe-test-backend-token-0123456789abcdef";
+
+        pub(super) fn token() -> BackendToken {
+            BackendToken::new(TOKEN).unwrap()
+        }
+
+        /// A client that sends the backend token, as every in-repo client does.
+        pub(super) fn authed_client() -> reqwest::Client {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {TOKEN}").parse().unwrap(),
+            );
+            hs_common::http::client_builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
+                .default_headers(headers)
+                .build()
+                .unwrap()
+        }
 
         struct Rig {
             base: String,
@@ -784,7 +869,7 @@ mod tests {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let base = format!("http://{}", listener.local_addr().unwrap());
                 tokio::spawn(async move {
-                    axum::serve(listener, app_with_body_limit(state, body_limit)).await
+                    axum::serve(listener, app_with_body_limit(state, token(), body_limit)).await
                 });
                 Rig { base, dir }
             }
@@ -798,7 +883,7 @@ mod tests {
                     field.to_string(),
                     reqwest::multipart::Part::bytes(body).file_name("in.pdf"),
                 );
-                reqwest::Client::new()
+                authed_client()
                     .post(format!("{}/scribe/stream", self.base))
                     .multipart(form)
                     .send()
@@ -860,6 +945,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_server_at_capacity_refuses_with_503_and_readiness_tracks_the_slot() {
+            skip_without_pdfium!("a_server_at_capacity_refuses_with_503");
             let rig = Rig::start(1, MAX_UPLOAD_BODY_BYTES).await;
             let idle = rig.readiness().await;
             assert_eq!(idle["vlm_slots_total"], 1);
@@ -874,7 +960,7 @@ mod tests {
                         "pdf",
                         reqwest::multipart::Part::bytes(body).file_name("in.pdf"),
                     );
-                    reqwest::Client::new()
+                    authed_client()
                         .post(format!("{base}/scribe/stream"))
                         .multipart(form)
                         .send()
@@ -918,6 +1004,217 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             assert!(recovered, "the slot must be released after the conversion");
+        }
+
+        // ── backend token (the RA-24/26 mechanism, review F4) ───────────
+
+        /// A server over a state that never converts anything: olmocr mode
+        /// with an unreachable backend, so no probe leaves loopback.
+        async fn bare_server() -> String {
+            let config = AppConfig {
+                converter: ConverterMode::Olmocr,
+                olmocr_endpoint: "http://127.0.0.1:1/v1".into(),
+                vlm_concurrency: 1,
+                ..AppConfig::default()
+            };
+            let state = Arc::new(ServerState::new(config).unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app(state, token())).await });
+            base
+        }
+
+        fn bearer_client(authorization: Option<&str>) -> reqwest::Client {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Some(value) = authorization {
+                headers.insert(reqwest::header::AUTHORIZATION, value.parse().unwrap());
+            }
+            hs_common::http::client_builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
+                .default_headers(headers)
+                .build()
+                .unwrap()
+        }
+
+        /// Every (method, path) a caller can try: both served routes, the
+        /// probes under a wrong method, and paths no route serves.
+        fn probes_of_the_surface() -> Vec<(&'static str, &'static str)> {
+            vec![
+                ("POST", "/scribe/stream"),
+                ("GET", "/scribe/stream"),
+                ("DELETE", "/scribe/stream"),
+                ("GET", "/info"),
+                ("POST", "/info"),
+                ("POST", "/health"),
+                ("POST", "/readiness"),
+                ("GET", "/health/"),
+                ("GET", "/nothing-serves-this"),
+            ]
+        }
+
+        async fn send(client: &reqwest::Client, method: &str, url: String) -> reqwest::Response {
+            client
+                .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), url)
+                .send()
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn every_request_but_a_probe_needs_the_token() {
+            let base = bare_server().await;
+            let wrong = format!("Bearer {}", "wrong-token-".repeat(4));
+            for authorization in [
+                None,
+                Some(wrong.as_str()),
+                Some("Basic dXNlcjpwYXNz"),
+                Some("Bearer"),
+            ] {
+                let client = bearer_client(authorization);
+                for (method, path) in probes_of_the_surface() {
+                    let resp = send(&client, method, format!("{base}{path}")).await;
+                    assert_eq!(
+                        resp.status(),
+                        StatusCode::UNAUTHORIZED,
+                        "{method} {path} with {authorization:?}"
+                    );
+                    assert!(resp.headers().contains_key(header::WWW_AUTHENTICATE));
+                    let text = resp.text().await.unwrap();
+                    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert!(
+                        body["error"].as_str().unwrap().starts_with("unauthorized"),
+                        "{text}"
+                    );
+                    assert!(!text.contains(TOKEN), "the secret must never be echoed");
+                }
+            }
+
+            // With the token every one of them gets past authentication.
+            let authed = authed_client();
+            for (method, path) in probes_of_the_surface() {
+                let resp = send(&authed, method, format!("{base}{path}")).await;
+                assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+            }
+            assert_eq!(
+                send(&authed, "GET", format!("{base}/info")).await.status(),
+                StatusCode::OK
+            );
+        }
+
+        #[tokio::test]
+        async fn the_probes_stay_open() {
+            let base = bare_server().await;
+            let anonymous = bearer_client(None);
+            for path in OPEN_PROBES {
+                let resp = send(&anonymous, "GET", format!("{base}{path}")).await;
+                assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+                // 200, or 503 `backend_unavailable` on /health (the olmocr
+                // backend here is deliberately unreachable): a verdict.
+                assert!(
+                    matches!(
+                        resp.status(),
+                        StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE
+                    ),
+                    "{path}: {}",
+                    resp.status()
+                );
+            }
+        }
+
+        /// The router is closed by default: a route added later is protected
+        /// without anyone remembering to protect it.
+        #[tokio::test]
+        async fn a_route_added_to_the_router_is_protected_by_default() {
+            let router = require_token_on_all_but_probes(
+                Router::<()>::new().route("/added-later", get(|| async { "secret work" })),
+                token(),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, router).await });
+
+            let resp = send(&bearer_client(None), "GET", format!("{base}/added-later")).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert!(!resp.text().await.unwrap().contains("secret work"));
+            let resp = send(&authed_client(), "GET", format!("{base}/added-later")).await;
+            assert_eq!(resp.text().await.unwrap(), "secret work");
+        }
+
+        #[tokio::test]
+        async fn an_unauthenticated_upload_is_refused_before_anything_is_admitted() {
+            let rig = Rig::start(1, MAX_UPLOAD_BODY_BYTES).await;
+            let form = reqwest::multipart::Form::new().part(
+                "pdf",
+                reqwest::multipart::Part::bytes(b"%PDF-1.4 anything".to_vec()).file_name("in.pdf"),
+            );
+            let resp = bearer_client(None)
+                .post(format!("{}/scribe/stream", rig.base))
+                .multipart(form)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let ready = rig.readiness().await;
+            assert_eq!(ready["vlm_slots_available"], 1);
+            assert_eq!(ready["in_flight_conversions"], 0);
+        }
+
+        #[tokio::test]
+        async fn the_scribe_client_authenticates_with_the_token_it_is_given() {
+            skip_without_pdfium!("the_scribe_client_authenticates_with_the_token_it_is_given");
+            let rig = Rig::start(1, MAX_UPLOAD_BODY_BYTES).await;
+            rig.release();
+            let http = |token: Option<BackendToken>| {
+                hs_common::auth::client::AuthedHttp::plain_with_backend_token(
+                    hs_common::http::client_builder().build().unwrap(),
+                    token,
+                )
+            };
+            let with = crate::client::ScribeClient::new_with_client(
+                &rig.base,
+                http(Some(token())),
+                Duration::from_secs(30),
+            );
+            let converted = with
+                .convert_with_progress(pdf_with_pages(2), None, Some("t"), |_| {})
+                .await
+                .expect("a client with the token converts");
+            assert!(converted.markdown.contains("Converted text"));
+
+            let without = crate::client::ScribeClient::new_with_client(
+                &rig.base,
+                http(None),
+                Duration::from_secs(30),
+            );
+            let err = without
+                .convert_with_progress(pdf_with_pages(2), None, Some("t"), |_| {})
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("401"), "{err:#}");
+            // A refusal of the credential says nothing about the document.
+            assert_eq!(
+                crate::classify::classify(&err),
+                crate::classify::FailureClass::Transient
+            );
+            // Probes, which pools and `hs status` send without a token, work.
+            assert!(without.readiness().await.is_ok());
+        }
+
+        #[test]
+        fn startup_refuses_a_missing_or_short_token_without_echoing_it() {
+            let unset = backend_token(|_| Err(std::env::VarError::NotPresent)).unwrap_err();
+            assert!(
+                format!("{unset:#}").contains("HS_BACKEND_TOKEN"),
+                "{unset:#}"
+            );
+            let short = backend_token(|_| Ok("sekrit-short".into())).unwrap_err();
+            let message = format!("{short:#}");
+            assert!(
+                message.contains("HS_BACKEND_TOKEN") && !message.contains("sekrit-short"),
+                "{message}"
+            );
+            backend_token(|_| Ok(TOKEN.into())).unwrap();
         }
     }
 }

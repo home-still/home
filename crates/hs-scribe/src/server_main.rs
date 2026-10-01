@@ -34,6 +34,21 @@ async fn async_main() -> Result<()> {
     let logging_handle = install_logging().await;
     let args = Args::parse();
 
+    // Every route but /health and /readiness requires this secret; there is
+    // no unauthenticated mode, and the server binds all interfaces by
+    // default. Checked first: a host without the token must not spend a
+    // model load discovering it.
+    let token = hs_scribe::server::backend_token(|name| std::env::var(name))?;
+
+    // libpdfium counts every PDF's pages (and renders them on Legacy hosts):
+    // the server does not start without it, on any converter.
+    hs_scribe::pdfium::require().map_err(|e| {
+        anyhow::anyhow!(
+            "hs-scribe-server requires libpdfium, which cannot be bound: {e:#}. Install it on the \
+             system library path, or drop it into ~/.local/lib or ~/.home-still/dyld-libs"
+        )
+    })?;
+
     // No fallback: a malformed `scribe_server:` section, a bad HS_SCRIBE_*
     // value or a setting the server cannot run with stops the start (before
     // anything heavy is initialised).
@@ -69,7 +84,7 @@ async fn async_main() -> Result<()> {
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("Listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let serve = axum::serve(listener, app(state));
+    let serve = axum::serve(listener, app(state, token));
     let result = serve.await;
 
     let _ = logging_handle.shutdown().await;

@@ -57,43 +57,9 @@ pub fn plan_render(
     })
 }
 
-pub struct PdfParser {
-    pdfium: Pdfium,
-}
+pub use crate::pdfium::PdfParser;
 
 impl PdfParser {
-    /// Bind to libpdfium the way `Pdfium::default()` does (a copy beside
-    /// the working directory first, then the system search path, which
-    /// `lib_bootstrap` points at the bundled copy) but report a missing
-    /// library as an error instead of panicking the request.
-    pub fn new() -> Result<Self> {
-        let bindings =
-            match Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./")) {
-                Ok(bindings) => bindings,
-                Err(PdfiumError::LoadLibraryError(_)) => Pdfium::bind_to_system_library()
-                    .map_err(|e| anyhow::anyhow!("libpdfium could not be loaded: {e:?}"))?,
-                Err(e) => anyhow::bail!("libpdfium could not be bound: {e:?}"),
-            };
-        Ok(Self {
-            pdfium: Pdfium::new(bindings),
-        })
-    }
-
-    /// Open a document, borrowing this parser. The returned document must not
-    /// outlive the parser (pdfium owns the library binding it borrows). Callers
-    /// hold both on one blocking thread and render pages lazily.
-    pub fn open<'a>(&'a self, path: &str) -> Result<PdfDocument<'a>> {
-        self.pdfium
-            .load_pdf_from_file(path, None)
-            .map_err(|e| document_error(e, path))
-    }
-
-    /// Page count without rasterizing anything — a cheap metadata read. Used to
-    /// size progress/order bookkeeping before the streaming render begins.
-    pub fn page_count(&self, path: &str) -> Result<usize> {
-        Ok(self.open(path)?.pages().len() as usize)
-    }
-
     /// Render a single page to a raster image at `dpi`, never larger than
     /// `max_pixels` (see [`plan_render`]). Streaming callers render one page,
     /// consume it, and drop it before rendering the next — so peak raster
@@ -106,7 +72,10 @@ impl PdfParser {
         dpi: u16,
         max_pixels: u64,
     ) -> Result<PageData> {
-        let page = document.pages().get(idx).map_err(|e| page_error(e, idx))?;
+        let page = document
+            .pages()
+            .get(idx)
+            .map_err(|e| crate::pdfium::page_error(e, idx))?;
 
         let (width_pts, height_pts) = (page.width().value, page.height().value);
         let size = plan_render(width_pts, height_pts, dpi, max_pixels)
@@ -126,42 +95,6 @@ impl PdfParser {
             height: height_pts,
             text: None,
         })
-    }
-}
-
-/// `true` when pdfium is saying "this document is broken / locked", as
-/// opposed to "I could not open the file" (a server fault).
-fn is_document_fault(e: &PdfiumError) -> bool {
-    matches!(
-        e,
-        PdfiumError::PdfiumLibraryInternalError(
-            PdfiumInternalError::FormatError
-                | PdfiumInternalError::PasswordError
-                | PdfiumInternalError::SecurityError
-                | PdfiumInternalError::PageError
-        )
-    )
-}
-
-fn document_error(e: PdfiumError, path: &str) -> anyhow::Error {
-    if is_document_fault(&e) {
-        ConvertFailure::err(
-            FailureCode::PdfParseError,
-            format!("PDF cannot be opened: {e:?}"),
-        )
-    } else {
-        anyhow::anyhow!("opening PDF {path}: {e:?}")
-    }
-}
-
-fn page_error(e: PdfiumError, idx: u16) -> anyhow::Error {
-    if is_document_fault(&e) {
-        ConvertFailure::err(
-            FailureCode::PdfParseError,
-            format!("page {idx} cannot be loaded: {e:?}"),
-        )
-    } else {
-        anyhow::anyhow!("loading page {idx}: {e:?}")
     }
 }
 

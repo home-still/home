@@ -364,6 +364,12 @@ pub(crate) async fn cmd_watch_events(
     use hs_scribe::config::ScribeConfig;
     use hs_scribe::event_watch::{convert_and_upload, run_subscriber};
 
+    // Every PDF the watcher dispatches is counted by pdfium first; a host
+    // without libpdfium must not subscribe, ack events and then refuse each
+    // one — it refuses to start instead.
+    hs_scribe::pdfium::require()
+        .context("the scribe watcher counts PDF pages with libpdfium, which cannot be bound")?;
+
     let cfg = ScribeConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage()?;
     let bus = cfg.build_event_bus().await?;
@@ -756,7 +762,8 @@ async fn cmd_convert(
         std::fs::read(&input).with_context(|| format!("Cannot read {}", input.display()))?;
     // Count before the bytes move into the converter — olmocr returns one
     // flat blob, so the source PDF is the only page-count ground truth.
-    let source_pages = hs_scribe::pdf_meta::count_pages(&pdf_bytes)
+    let source_pages = hs_scribe::pdf_meta::count_pages_in_file(&input)
+        .await
         .with_context(|| format!("{} cannot be converted", input.display()))?;
 
     let stage: Arc<Box<dyn hs_common::reporter::StageHandle>> =
@@ -1111,9 +1118,17 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
         // emit them, so olmocr-converted markdown would otherwise backfill
         // as `total_pages: 1` regardless of length.
         let source_pages = if pdf_exists {
-            std::fs::read(&pdf_path)
-                .ok()
-                .and_then(|b| hs_scribe::pdf_meta::count_pages(&b).ok())
+            match hs_scribe::pdf_meta::count_pages_in_file(&pdf_path).await {
+                Ok(pages) => Some(pages),
+                Err(e) => {
+                    tracing::warn!(
+                        pdf = %pdf_path.display(),
+                        error = %e,
+                        "cannot count the source PDF's pages; backfilling from the markdown alone"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };

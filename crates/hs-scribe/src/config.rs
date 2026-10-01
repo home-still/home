@@ -461,7 +461,7 @@ pub struct ScribeConfig {
     #[serde(default)]
     pub epub: crate::epub::EpubLimits,
     /// Page-count-aware timeout policy for PDF conversion. Each
-    /// dispatch reads the PDF page count (lopdf), feeds it into the
+    /// dispatch reads the PDF page count (pdfium), feeds it into the
     /// policy formula (`clamp(base + pages × per_page, floor, ceiling)`),
     /// and sends that deadline both as reqwest's per-request timeout
     /// and as the `X-Convert-Deadline-Secs` header. The server mirrors

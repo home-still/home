@@ -250,7 +250,7 @@ The gateway's public URL is **not** read from this file — it is the required `
 
 **Provision the backend token (required; do this on every host BEFORE upgrading the gateway)**
 
-The gateway sends `Authorization: Bearer $HS_BACKEND_TOKEN` on every request it forwards, replacing the caller's token, and backends (hs-mcp, and every other server that adopts it) answer 401 without it. The gateway refuses to start if the variable is unset or shorter than 32 bytes. Generate one value and put the **same** value in `~/.home-still/secrets.env` on the gateway host and on every backend host:
+The gateway sends `Authorization: Bearer $HS_BACKEND_TOKEN` on every request it forwards, replacing the caller's token, and backends (hs-mcp, hs-distill-server and hs-scribe-server) answer 401 without it. `hs-scribe-server` and `hs-distill-server` refuse to start without the variable, so it must be in place on every scribe host (the macOS launchd one included) and on every host that runs a client (`hs`, `hs-mcp`) before they are upgraded; only `GET /health` and `GET /readiness` stay open. The gateway refuses to start if the variable is unset or shorter than 32 bytes. Generate one value and put the **same** value in `~/.home-still/secrets.env` on the gateway host and on every backend host:
 
 ```bash
 openssl rand -hex 32          # run once; copy the output
@@ -921,7 +921,7 @@ This pattern keeps big_mac a pure Ollama-VLM worker — no shared-storage auth, 
 **Prereqs on the secondary host**
 
 1. `rustc` + `cargo` (rustup).
-2. For macOS: `libpdfium.dylib` (pdfium-render dlopens this at runtime, and macOS has no system pdfium). Drop the bblanchon prebuilt into `~/.local/lib/` or `~/.home-still/dyld-libs/`:
+2. `libpdfium` on every host that runs the scribe server or the watcher (`hs scribe watch-events`), on any converter — it counts the pages of every PDF, and both refuse to start without it. For macOS: `libpdfium.dylib` (pdfium-render dlopens this at runtime, and macOS has no system pdfium); `hs` and the server look in `~/.local/lib/` and `~/.home-still/dyld-libs/` themselves. Drop the bblanchon prebuilt into `~/.local/lib/` or `~/.home-still/dyld-libs/`:
    ```bash
    URL=$(curl -s https://api.github.com/repos/bblanchon/pdfium-binaries/releases/latest \
           | python3 -c 'import sys,json; d=json.load(sys.stdin); \

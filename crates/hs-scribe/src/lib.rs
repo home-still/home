@@ -7,6 +7,7 @@ pub mod epub;
 pub mod event_watch;
 pub mod html;
 pub mod pdf_meta;
+pub mod pdfium;
 pub mod postprocess;
 
 // Server-side modules (heavy deps: ONNX, pdfium, image, etc.)

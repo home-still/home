@@ -10,7 +10,7 @@ client = []
 server = [
     "dep:axum",
     "dep:tempfile",
-    "dep:pdfium-render",
+    "pdfium-render/image",
     "dep:ort",
     "dep:ndarray",
     "dep:image",
@@ -43,7 +43,10 @@ unicode-segmentation = "1"
 scraper = "0.22"
 chrono = { workspace = true }
 epub = "2"
-lopdf = { version = "0.33", default-features = false, features = ["pom_parser"] }
+# The one PDF parser (page counting and rendering): libpdfium, bound at
+# runtime. `thread_safe` serialises every pdfium call process-wide; the
+# `image` feature (rasterising) is enabled by `server` only.
+pdfium-render = { version = "0.8.35", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 bytes = "1"
 # The EPUB reader's own zip version (epub 2.x pins 3.x, deflate only): used to
 # measure an archive's real expanded size before any chapter is decompressed.
@@ -55,7 +58,6 @@ tempfile = { version = "3", optional = true }
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
 ], optional = true }
-pdfium-render = { version = "0.8.35", optional = true }
 image = { version = "0.25", optional = true }
 ort = { version = "=2.0.0-rc.11", features = ["ndarray"], optional = true }
 ndarray = { version = "0.17", optional = true }

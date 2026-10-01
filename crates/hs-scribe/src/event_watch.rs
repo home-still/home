@@ -187,41 +187,29 @@ pub async fn prepare_source(
     let bytes = bytes::Bytes::from(raw_bytes);
 
     let pdf_pages = if ext == "pdf" {
-        // lopdf parses the whole file (CPU-bound, up to 256 MiB of untrusted
-        // bytes): run it on the blocking pool so a 500-page book doesn't
-        // stall the subscriber event loop. `Bytes` clone — no byte copy.
-        // A failure is a verdict on the document, never "unknown pages": a
-        // PDF that cannot be parsed or counted is refused here, with the
-        // cause, instead of being dispatched under a fallback timeout.
-        let bytes_for_meta = bytes.clone();
-        let counted =
-            tokio::task::spawn_blocking(move || crate::pdf_meta::count_pages(&bytes_for_meta))
-                .await
-                .map_err(|join| {
-                    if join.is_panic() {
-                        permanent(
-                            FailureCode::PdfParseError,
-                            format!("PDF parser panicked on {}", event.key),
-                        )
-                    } else {
-                        HandlerError::Transient(anyhow::anyhow!(
-                            "page-count task for {} was cancelled: {join}",
-                            event.key
-                        ))
-                    }
-                })?;
-        match counted {
+        // pdfium reads the whole document (untrusted bytes, up to 256 MiB):
+        // `count_pages` runs it on the blocking pool under a wall-clock
+        // budget, from the shared `Bytes` (no byte copy). A failure that is
+        // a verdict on the document is refused here with its cause —
+        // never "unknown pages" dispatched under a fallback timeout —
+        // while a failure of the host (libpdfium missing, the counter
+        // busy behind a stuck parse) is retried.
+        match crate::pdf_meta::count_pages(bytes.clone()).await {
             Ok(pages) => Some(pages),
-            Err(failure) => {
+            Err(e) if crate::classify::failure_code(&e).is_some() => {
                 tracing::warn!(
                     key = %event.key,
-                    code = failure.code().wire(),
-                    error = %failure,
+                    code = crate::classify::failure_code(&e).map(|c| c.wire()),
+                    error = %e,
                     "PDF refused before dispatch"
                 );
                 return Err(HandlerError::Permanent(
-                    anyhow::Error::new(failure)
-                        .context(format!("{} cannot be converted", event.key)),
+                    e.context(format!("{} cannot be converted", event.key)),
+                ));
+            }
+            Err(e) => {
+                return Err(HandlerError::Transient(
+                    e.context(format!("counting the pages of {}", event.key)),
                 ));
             }
         }
@@ -812,7 +800,7 @@ where
 mod tests {
     use super::*;
     use crate::classify::{failure_code, FailureClass};
-    use crate::pdf_meta::tests::pdf_with_pages;
+    use crate::pdf_meta::tests::{pdf_with_pages, skip_without_pdfium};
     use hs_common::event_bus::{ConsumerSpec, Event, EventStream};
     use hs_common::storage::LocalFsStorage;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -930,6 +918,8 @@ mod tests {
             code_of(&html),
             ("permanent", Some(FailureCode::UnsupportedContentTypeHtml))
         );
+        // The structural verdict below is pdfium's.
+        skip_without_pdfium!("html_named_pdf_and_broken_pdfs: broken-PDF half");
         let broken = prepare_source(&st, &event("papers/ab/broken.pdf"))
             .await
             .err()
@@ -942,6 +932,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_valid_pdf_is_fetched_with_its_page_count() {
+        skip_without_pdfium!("a_valid_pdf_is_fetched_with_its_page_count");
         let (_d, st) = storage();
         st.put("papers/ab/ok.pdf", pdf_with_pages(3)).await.unwrap();
         match prepare_source(&st, &event("papers/ab/ok.pdf")).await {
@@ -994,6 +985,7 @@ mod tests {
     async fn a_stem_that_names_a_verdict_is_still_transient_when_the_server_is_down() {
         // The old substring table permanently failed any key containing
         // "paywall". A refused connection says nothing about the document.
+        skip_without_pdfium!("a_stem_that_names_a_verdict_is_still_transient");
         let (_d, st) = storage();
         st.put("papers/pa/paywall-economics.pdf", pdf_with_pages(2))
             .await
@@ -1197,7 +1189,10 @@ mod tests {
         use super::*;
         use crate::config::{AppConfig, ConverterMode};
         use crate::server::{app, ServerState};
+        use hs_common::auth::backend::BackendToken;
         use std::os::unix::fs::PermissionsExt;
+
+        const TOKEN: &str = "event-watch-served-token-0123456789abcdef";
 
         fn fake_olmocr(dir: &std::path::Path, tally: &str) -> std::path::PathBuf {
             let script = dir.join("olmocr.sh");
@@ -1226,10 +1221,18 @@ mod tests {
             let state = Arc::new(ServerState::new(config).unwrap());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move { axum::serve(listener, app(state)).await });
-            let client =
-                ScribeClient::new_with_timeout(&format!("http://{addr}"), Duration::from_secs(30))
-                    .unwrap();
+            let token = BackendToken::new(TOKEN).unwrap();
+            tokio::spawn(async move { axum::serve(listener, app(state, token)).await });
+            // The client authenticates exactly as production clients do.
+            let http = hs_common::auth::client::AuthedHttp::plain_with_backend_token(
+                hs_common::http::client_builder().build().unwrap(),
+                Some(BackendToken::new(TOKEN).unwrap()),
+            );
+            let client = ScribeClient::new_with_client(
+                &format!("http://{addr}"),
+                http,
+                Duration::from_secs(30),
+            );
             (dir, client)
         }
 
@@ -1243,6 +1246,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_conversion_is_stored_stamped_and_announced_and_a_lost_announcement_is_retried() {
+            skip_without_pdfium!("a_conversion_is_stored_stamped_and_announced");
             let (_srv, client) =
                 serve("echo 'Completed pages: 3' >&2; echo 'Failed pages: 0' >&2").await;
             let (_d, st) = storage();
@@ -1291,6 +1295,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_olmocr_run_with_failed_pages_escalates_and_stores_nothing() {
+            skip_without_pdfium!("an_olmocr_run_with_failed_pages_escalates");
             let (_srv, client) =
                 serve("echo 'Completed pages: 2' >&2; echo 'Failed pages: 1' >&2").await;
             let (_d, st) = storage();

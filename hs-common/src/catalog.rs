@@ -260,12 +260,13 @@ pub struct PageAccounting {
 ///   (see [`compute_page_offsets`]). Only backends that assemble output via
 ///   `join_pages` produce these; the olmocr subprocess returns one flat
 ///   blob, so this is 1 for a 52 KB, 14-page paper.
-/// - `source_pages`: the PDF's own page count, parsed by lopdf at ingest to
+/// - `source_pages`: the PDF's own page count, read by pdfium at ingest to
 ///   size the conversion timeout.
 ///
 /// Markdown structure wins when it exists, because it is self-consistent
-/// with the offsets and survives the lopdf miscounts documented on
-/// `timeout_policy.floor_secs`. Otherwise the source count is the only real
+/// with the offsets and survives a miscounting source (the retired lopdf
+/// counter undercounted a 282-page book as 8; see
+/// `timeout_policy.floor_secs`). Otherwise the source count is the only real
 /// information available — using `md_pages` there is what made every
 /// olmocr conversion report `1pg`.
 ///
@@ -1129,7 +1130,7 @@ mod page_accounting_tests {
     #[test]
     fn olmocr_flat_blob_reports_the_source_page_count() {
         // The rc.350 bug: olmocr returns one blob with no `\n\n---\n\n`
-        // separators, so a 14-page paper recorded `total_pages: 1`. lopdf
+        // separators, so a 14-page paper recorded `total_pages: 1`. The source
         // already knew the real count.
         let a = resolve_page_accounting(1, Some(14));
         assert_eq!(a.total_pages, 14);
@@ -1140,7 +1141,7 @@ mod page_accounting_tests {
 
     #[test]
     fn structured_markdown_wins_over_a_miscounting_source() {
-        // lopdf is known to undercount (a 282-page book reported as 8, per
+        // The retired lopdf counter undercounted (a 282-page book reported as 8, per
         // `timeout_policy.floor_secs`). When the backend emitted real page
         // structure, that structure is authoritative and its offsets stay.
         let a = resolve_page_accounting(282, Some(8));
