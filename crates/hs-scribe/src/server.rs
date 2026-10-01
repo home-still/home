@@ -255,6 +255,10 @@ pub fn app_with_body_limit(state: Arc<ServerState>, max_body_bytes: usize) -> Ro
         .route("/info", get(handle_info))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
+        // Outermost: a handler panic is a 500 and the server keeps serving.
+        .layer(axum::middleware::from_fn(
+            hs_common::panic_guard::http::catch_panic,
+        ))
 }
 
 /// `status` is `"ok"` only when the VLM backend can actually take work.

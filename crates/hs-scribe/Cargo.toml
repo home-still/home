@@ -36,7 +36,7 @@ tokio = { workspace = true }
 reqwest = { workspace = true, features = ["multipart", "stream"] }
 figment = { workspace = true }
 dirs = "6"
-hs-common = { workspace = true, features = ["service", "storage-s3", "events-nats", "logging", "catalog", "auth"] }
+hs-common = { workspace = true, features = ["service", "storage-s3", "events-nats", "logging", "catalog", "auth", "catch-panic"] }
 async-trait = "0.1"
 futures-util = "0.3"
 unicode-segmentation = "1"
@@ -74,3 +74,5 @@ required-features = ["server"]
 [dev-dependencies]
 tempfile = "3"
 serde_yaml_ng = "0.10"
+# `Jail`: tests that set environment variables run serialised and restore them.
+figment = { workspace = true, features = ["test"] }

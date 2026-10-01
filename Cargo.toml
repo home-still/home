@@ -39,5 +39,9 @@ flate2 = "1"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# `unwind`, not `abort`: a panic on untrusted input must cost one request or
+# one event, not the daemon. The catch layers (`hs_common::panic_guard`, the
+# scribe page-count `catch_unwind`, the embedder slot pool) only work with
+# unwinding; under `abort` they were dead code (RA-5).
+panic = "unwind"
 strip = "symbols"

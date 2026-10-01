@@ -153,7 +153,7 @@ Server discovery uses the gateway service registry when available, falling back 
 
 ### Server config (environment variables)
 
-Server-side settings use environment variables with the `HS_SCRIBE_` prefix. They can also be set in `~/.config/home-still/config.yaml`.
+Server-side settings use environment variables with the `HS_SCRIBE_` prefix (`HS_SCRIBE_VLM_CONCURRENCY` overrides `vlm_concurrency`). The same keys can be set, one level down, in the `scribe_server:` section of `~/.home-still/config.yaml` (the one config file every home-still binary reads); the environment wins over the file. The client side (`hs scribe …`) reads the `scribe:` section and the same `HS_SCRIBE_<KEY>` variables (`HS_SCRIBE_CONVERT_TIMEOUT_SECS` → `scribe.convert_timeout_secs`). A malformed section or an invalid value stops the server at start with the key named; nothing falls back to defaults.
 
 ### Core settings
 

@@ -45,9 +45,19 @@ struct Args {
     gateway_url: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let _ = hs_common::secrets::load_default_secrets();
+fn main() -> anyhow::Result<()> {
+    // Secrets are exported into the environment, which is only sound while
+    // this is the only thread: load them before the runtime (and its worker
+    // threads) exist, and refuse to start if they cannot be read. The
+    // backend token read in `async_main` depends on this having run.
+    hs_common::secrets::load_default_secrets().context("loading ~/.home-still/secrets.env")?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let logging_handle = install_logging().await;
 
     let args = Args::parse();
@@ -139,17 +149,16 @@ fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
 }
 
 async fn install_logging() -> hs_common::logging::LoggingHandle {
-    use hs_common::logging::{self, LoggingConfig, StderrOutput};
-    let (primary_storage, logs_yaml) = logging::load_config_sections();
-    let mut cfg = LoggingConfig::for_service("hs-gateway")
-        .with_stderr(StderrOutput::EnvFilter("info".into()));
-    logs_yaml.apply_to(&mut cfg).unwrap_or_else(|e| {
-        eprintln!("hs-gateway: {e}");
-        std::process::exit(2)
-    });
+    use hs_common::logging::{self, StderrOutput};
+    const SERVICE: &str = "hs-gateway";
+    let sections = logging::load_config_sections()
+        .unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));
+    let cfg = sections
+        .logging_config(SERVICE, StderrOutput::EnvFilter("info".into()))
+        .unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));
     let mut handle = logging::init(cfg);
     handle
-        .start_shipping(primary_storage.as_ref(), &logs_yaml.bucket)
+        .start_shipping(sections.storage.as_ref(), &sections.logs.bucket)
         .await;
     handle
 }

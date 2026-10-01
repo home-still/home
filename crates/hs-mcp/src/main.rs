@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use hs_common::event_bus::{EventBus, NoOpBus};
+use hs_common::event_bus::EventBus;
 use hs_common::storage::Storage;
 use rmcp::{
     handler::server::{
@@ -587,9 +587,9 @@ fn duckdb_value_to_json(v: duckdb::types::Value) -> serde_json::Value {
 struct HomeStillMcp {
     // Primary read-path handle: Storage trait (local fs or Garage/S3).
     storage: Arc<dyn Storage>,
-    // Event bus for cross-service notifications (scribe.completed, …). Falls
-    // back to NoOpBus if the NATS config is absent or the broker is down at
-    // init; publishes become silent no-ops in that case.
+    // Event bus for cross-service notifications (scribe.completed,
+    // papers.ingested, …). Required: `HomeStillMcp::new` fails if the config
+    // has no usable `events:` section or the broker is unreachable.
     events: Arc<dyn EventBus>,
     catalog_prefix: String,
     markdown_prefix: String,
@@ -681,15 +681,19 @@ impl Drop for ProgressHeartbeat {
 
 impl HomeStillMcp {
     async fn new() -> anyhow::Result<Self> {
-        let distill_cfg = hs_distill::config::DistillClientConfig::load().unwrap_or_default();
-        let scribe_cfg = hs_scribe::config::ScribeConfig::load().unwrap_or_default();
+        // One read of ~/.home-still/config.yaml. A missing file is an empty
+        // config; a malformed file or section stops the server with the
+        // section named: nothing here substitutes defaults for it.
+        let file = hs_common::config_file::ConfigFile::load()?;
+        let distill_cfg = hs_distill::config::DistillClientConfig::from_file(&file)?;
+        let scribe_cfg = hs_scribe::config::ScribeConfig::from_file(&file)?;
 
         // Storage backend: honor the `storage:` section in
-        // ~/.home-still/config.yaml. Missing or malformed config is fatal —
+        // ~/.home-still/config.yaml. A missing section is fatal —
         // we do not fall back to LocalFsStorage at project_dir because that
         // masks typos and serves unrelated data silently (ONE PATH).
-        let storage_cfg = hs_common::logging::load_config_sections()
-            .0
+        let storage_cfg = file
+            .section::<hs_common::storage::StorageConfig>("storage")?
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "hs-mcp requires a `storage:` section in ~/.home-still/config.yaml \
@@ -704,16 +708,16 @@ impl HomeStillMcp {
             .await
             .map_err(|e| anyhow::anyhow!("storage ensure_ready failed: {e:#}"))?;
 
-        // Event bus: reuse the events section already parsed into ScribeConfig.
-        // Any failure (missing config, broker down, feature not compiled)
-        // degrades to NoOpBus so the MCP server still starts.
-        let events: Arc<dyn EventBus> = match scribe_cfg.build_event_bus().await {
-            Ok(bus) => bus,
-            Err(e) => {
-                tracing::warn!("event bus init failed ({e:#}); using NoOpBus");
-                Arc::new(NoOpBus)
-            }
-        };
+        // Event bus: `paper_download` and `scribe_convert` publish
+        // `papers.ingested` / `scribe.completed`, so this server cannot run
+        // without one. A missing `events:` section, an unreachable broker or
+        // a build without NATS stops the start; the previous fallback to a
+        // bus that drops every publish reported success for downloads nobody
+        // would ever convert.
+        let events: Arc<dyn EventBus> = scribe_cfg
+            .build_event_bus()
+            .await
+            .map_err(|e| e.context("hs-mcp needs the event bus (`events:` in ~/.home-still/config.yaml)"))?;
 
         // Config is the sole source of server URLs. To route through the
         // gateway, set the gateway URL explicitly in config (e.g.
@@ -721,6 +725,8 @@ impl HomeStillMcp {
         // hs-mcp only needs URLs (health fanout + ScribeClient::new). The
         // per-server backend metadata in `ScribeServerEntry` is consumed
         // by the scribe-chain dispatcher in `cmd_watch_events`, not here.
+        // No server configured is a valid state for the server as a whole
+        // (paper search needs none); the tools that need one say so.
         let scribe_servers: Vec<String> =
             scribe_cfg.servers.iter().map(|e| e.url.clone()).collect();
         let distill_servers = distill_cfg.servers.clone();
@@ -3599,9 +3605,20 @@ impl Transport {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let _ = hs_common::secrets::load_default_secrets();
+fn main() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    // Secrets are exported into the environment, which is only sound while
+    // this is the only thread: load them before the runtime (and its worker
+    // threads) exist, and refuse to start if they cannot be read. The
+    // backend token resolved in `async_main` depends on this having run.
+    hs_common::secrets::load_default_secrets().context("loading ~/.home-still/secrets.env")?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let args = Args::parse();
     let transport = Transport::resolve(&args, |name| std::env::var(name))?;
 
@@ -3653,21 +3670,20 @@ fn resolve_provider_arg(s: Option<&str>) -> Result<paper::cli::ProviderArg, Stri
 }
 
 async fn install_logging(is_sse: bool) -> hs_common::logging::LoggingHandle {
-    use hs_common::logging::{self, LoggingConfig, StderrOutput};
-    let (primary_storage, logs_yaml) = logging::load_config_sections();
+    use hs_common::logging::{self, StderrOutput};
     let (service, stderr) = if is_sse {
         ("hs-mcp-sse", StderrOutput::EnvFilter("info".into()))
     } else {
         ("hs-mcp-stdio", StderrOutput::Disabled)
     };
-    let mut cfg = LoggingConfig::for_service(service).with_stderr(stderr);
-    logs_yaml.apply_to(&mut cfg).unwrap_or_else(|e| {
-        eprintln!("{service}: {e}");
-        std::process::exit(2)
-    });
+    let sections = logging::load_config_sections()
+        .unwrap_or_else(|e| logging::exit_on_config_error(service, e));
+    let cfg = sections
+        .logging_config(service, stderr)
+        .unwrap_or_else(|e| logging::exit_on_config_error(service, e));
     let mut handle = logging::init(cfg);
     handle
-        .start_shipping(primary_storage.as_ref(), &logs_yaml.bucket)
+        .start_shipping(sections.storage.as_ref(), &sections.logs.bucket)
         .await;
     handle
 }

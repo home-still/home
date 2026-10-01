@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::sync::Arc;
 
@@ -20,6 +20,10 @@ fn main() -> Result<()> {
     // (Linux) and pdfium (macOS) load from our bundled directories
     // instead of the system default.
     hs_common::service::lib_bootstrap::ensure_lib_paths_or_reexec();
+    // Secrets are exported into the environment, which is only sound while
+    // this is the only thread: load them before the runtime (and its worker
+    // threads) exist, and refuse to start if they cannot be read.
+    hs_common::secrets::load_default_secrets().context("loading ~/.home-still/secrets.env")?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -27,7 +31,6 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    let _ = hs_common::secrets::load_default_secrets();
     let logging_handle = install_logging().await;
     // libonnxruntime defaults to "warning" verbosity, which floods the log with
     // shape-inference noise (logical_and_0.tmp_0.0, fill_constant_27.tmp_0.0)
@@ -39,10 +42,9 @@ async fn async_main() -> Result<()> {
     }
     let args = Args::parse();
 
-    let config = AppConfig::load().unwrap_or_else(|e| {
-        tracing::warn!("Config load error: {e}, using defaults");
-        AppConfig::default()
-    });
+    // No fallback: a malformed `scribe_server:` section, a bad HS_SCRIBE_*
+    // value or a setting the server cannot run with stops the start.
+    let config = AppConfig::load().context("loading the scribe server configuration")?;
 
     let backend_url = match config.backend {
         hs_scribe::config::BackendChoice::OpenAi => &config.openai_url,
@@ -74,17 +76,16 @@ async fn async_main() -> Result<()> {
 }
 
 async fn install_logging() -> hs_common::logging::LoggingHandle {
-    use hs_common::logging::{self, LoggingConfig, StderrOutput};
-    let (primary_storage, logs_yaml) = logging::load_config_sections();
-    let mut cfg = LoggingConfig::for_service("hs-scribe-server")
-        .with_stderr(StderrOutput::EnvFilter("info".into()));
-    logs_yaml.apply_to(&mut cfg).unwrap_or_else(|e| {
-        eprintln!("hs-scribe-server: {e}");
-        std::process::exit(2)
-    });
+    use hs_common::logging::{self, StderrOutput};
+    const SERVICE: &str = "hs-scribe-server";
+    let sections =
+        logging::load_config_sections().unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));
+    let cfg = sections
+        .logging_config(SERVICE, StderrOutput::EnvFilter("info".into()))
+        .unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));
     let mut handle = logging::init(cfg);
     handle
-        .start_shipping(primary_storage.as_ref(), &logs_yaml.bucket)
+        .start_shipping(sections.storage.as_ref(), &sections.logs.bucket)
         .await;
     handle
 }

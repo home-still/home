@@ -39,7 +39,7 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 figment = { workspace = true }
-hs-common = { workspace = true, features = ["service", "catalog", "storage-s3", "events-nats", "logging", "auth"] }
+hs-common = { workspace = true, features = ["service", "catalog", "storage-s3", "events-nats", "logging", "auth", "catch-panic"] }
 async-trait = { workspace = true }
 futures-util = "0.3"
 chrono = { workspace = true }
@@ -61,3 +61,5 @@ tracing-subscriber = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = "3"
 serde_yaml_ng = "0.10"
+# `Jail`: tests that set environment variables run serialised and restore them.
+figment = { workspace = true, features = ["test"] }

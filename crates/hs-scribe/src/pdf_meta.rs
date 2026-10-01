@@ -11,8 +11,8 @@
 //! a typed [`ConvertFailure`]. lopdf parses the whole file, including
 //! untrusted bytes up to [`MAX_PDF_BYTES`], so the parse runs under
 //! `catch_unwind` and a panic is reported as a failure of the document.
-//! `catch_unwind` only helps under `panic = "unwind"`; with the release
-//! profile's `panic = "abort"` a lopdf panic still ends the process.
+//! This relies on the release profile's `panic = "unwind"` (workspace
+//! `Cargo.toml`); under `panic = "abort"` a lopdf panic would end the process.
 
 use crate::classify::{ConvertFailure, FailureCode};
 

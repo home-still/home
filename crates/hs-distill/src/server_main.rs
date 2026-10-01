@@ -10,7 +10,7 @@ compile_error!(
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use hs_distill::api::DistillServerState;
 use hs_distill::collection::CollectionSpec;
@@ -36,6 +36,11 @@ fn main() -> Result<()> {
     // platform's dynamic-lib search path augmented so ort's CUDA provider
     // (Linux) loads from our bundled directories.
     hs_common::service::lib_bootstrap::ensure_lib_paths_or_reexec();
+    // Secrets are exported into the environment, which is only sound while
+    // this is the only thread: load them before the runtime (and its worker
+    // threads) exist, and refuse to start if they cannot be read. The
+    // backend token read below depends on this having run.
+    hs_common::secrets::load_default_secrets().context("loading ~/.home-still/secrets.env")?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -43,14 +48,13 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    let _ = hs_common::secrets::load_default_secrets();
     let logging_handle = install_logging().await;
     let args = Args::parse();
 
-    let config = DistillServerConfig::load().unwrap_or_else(|e| {
-        tracing::warn!("Config load error: {e}, using defaults");
-        DistillServerConfig::default()
-    });
+    // No fallback: a malformed `distill_server:` section or a bad
+    // HS_DISTILL_* value stops the start instead of running on defaults.
+    let config =
+        DistillServerConfig::load().context("loading the distill server configuration")?;
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid distill_server config: {e}"))?;
@@ -109,17 +113,16 @@ async fn async_main() -> Result<()> {
 }
 
 async fn install_logging() -> hs_common::logging::LoggingHandle {
-    use hs_common::logging::{self, LoggingConfig, StderrOutput};
-    let (primary_storage, logs_yaml) = logging::load_config_sections();
-    let mut cfg = LoggingConfig::for_service("hs-distill-server")
-        .with_stderr(StderrOutput::EnvFilter("info".into()));
-    logs_yaml.apply_to(&mut cfg).unwrap_or_else(|e| {
-        eprintln!("hs-distill-server: {e}");
-        std::process::exit(2)
-    });
+    use hs_common::logging::{self, StderrOutput};
+    const SERVICE: &str = "hs-distill-server";
+    let sections =
+        logging::load_config_sections().unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));
+    let cfg = sections
+        .logging_config(SERVICE, StderrOutput::EnvFilter("info".into()))
+        .unwrap_or_else(|e| logging::exit_on_config_error(SERVICE, e));
     let mut handle = logging::init(cfg);
     handle
-        .start_shipping(primary_storage.as_ref(), &logs_yaml.bucket)
+        .start_shipping(sections.storage.as_ref(), &sections.logs.bucket)
         .await;
     handle
 }

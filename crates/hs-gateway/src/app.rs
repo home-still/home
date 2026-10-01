@@ -49,6 +49,8 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
             ratelimit::limit,
         ))
         .with_state(state)
+        // Outermost: a handler panic is a 500 and the server keeps serving.
+        .layer(middleware::from_fn(hs_common::panic_guard::http::catch_panic))
 }
 
 async fn handle_health() -> &'static str {

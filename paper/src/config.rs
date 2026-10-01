@@ -2,15 +2,19 @@ use crate::error::PaperError;
 use crate::resilience::config::ResilienceConfig;
 use anyhow::Context;
 use figment::{
-    providers::{Env, Format, Yaml},
+    providers::{Env, Serialized},
     Figment,
 };
+use hs_common::config_file::{env_key_path, unknown_env_names, ConfigError, ConfigFile};
 use hs_common::event_bus::{EventBus, EventBusConfig};
 use hs_common::storage::{Storage, StorageConfig};
 use hs_common::CONFIG_REL_PATH;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// The system-wide config file, merged under the user's.
+const SYSTEM_CONFIG_PATH: &str = "/etc/home-still/config.yaml";
 
 /// Prefix of the environment variables that override config keys.
 const ENV_PREFIX: &str = "HOME_STILL_";
@@ -30,55 +34,21 @@ fn known_keys() -> anyhow::Result<serde_json::Value> {
     );
     root.insert(
         "events".into(),
-        serde_json::to_value(EventBusConfig::default()).context("serialize events defaults")?,
+        serde_json::to_value(EventBusConfig::noop()).context("serialize events defaults")?,
     );
     Ok(serde_json::Value::Object(root))
 }
 
-/// `PAPER_DOWNLOAD_TIMEOUT_SECS` (an env name without its prefix) →
-/// `paper.download.timeout_secs`, by finding the way to group the
-/// `_`-separated words into keys that exists in `tree`. `None` when no
-/// grouping names a leaf.
-fn env_key_path(tree: &serde_json::Value, name: &str) -> Option<String> {
-    fn walk(node: &serde_json::Value, words: &[&str], path: &mut Vec<String>) -> bool {
-        let Some(object) = node.as_object() else {
-            return words.is_empty();
-        };
-        if words.is_empty() {
-            return false;
-        }
-        for take in 1..=words.len() {
-            let key = words[..take].join("_");
-            if let Some(child) = object.get(&key) {
-                path.push(key);
-                if walk(child, &words[take..], path) {
-                    return true;
-                }
-                path.pop();
-            }
-        }
-        false
-    }
-
-    let lowered = name.to_ascii_lowercase();
-    let words: Vec<&str> = lowered.split('_').collect();
-    let mut path = Vec::new();
-    walk(tree, &words, &mut path).then(|| path.join("."))
-}
 
 /// A `HOME_STILL_PAPER_*` variable that matches no `paper.*` key is a typo
 /// that would otherwise be silently ignored.
 fn reject_unknown_paper_env(tree: &serde_json::Value) -> anyhow::Result<()> {
-    let section = format!("{ENV_PREFIX}PAPER_");
-    let mut unknown: Vec<String> = std::env::vars_os()
-        .filter_map(|(name, _)| name.into_string().ok())
-        .filter(|name| name.to_ascii_uppercase().starts_with(&section))
-        .filter(|name| {
-            name.get(ENV_PREFIX.len()..)
-                .is_some_and(|key| env_key_path(tree, key).is_none())
-        })
-        .collect();
-    unknown.sort();
+    let unknown = unknown_env_names(
+        ENV_PREFIX,
+        &format!("{ENV_PREFIX}PAPER_"),
+        tree,
+        std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+    );
     if unknown.is_empty() {
         return Ok(());
     }
@@ -113,23 +83,28 @@ pub struct Config {
     #[serde(skip)]
     pub storage: StorageConfig,
 
-    /// Event bus (noop or NATS). Loaded from top-level `events:` section.
+    /// Event bus (noop or NATS). Loaded from the top-level `events:`
+    /// section; `None` when the config has none, in which case components
+    /// that publish events refuse to start ([`Config::build_event_bus`]).
     #[serde(skip)]
-    pub events: EventBusConfig,
+    pub events: Option<EventBusConfig>,
 }
 
 impl Default for Config {
+    /// The documented built-in defaults, rooted at `~/home-still`. Loading
+    /// ([`Config::load`]) roots them at `home.project_dir` and never falls
+    /// back to this value.
     fn default() -> Self {
         Self {
             resilience: ResilienceConfig::default(),
-            download_path: hs_common::resolve_project_dir().join("papers"),
+            download_path: hs_common::default_project_dir().join("papers"),
             cache_path: dirs::home_dir()
                 .map(|h| h.join(hs_common::HIDDEN_DIR).join("cache"))
                 .unwrap_or_else(|| PathBuf::from("./cache")),
             providers: ProvidersConfig::default(),
             download: DownloadConfig::default(),
             storage: StorageConfig::default(),
-            events: EventBusConfig::default(),
+            events: None,
         }
     }
 }
@@ -150,17 +125,28 @@ impl Config {
     /// against the known key tree instead; see [`env_key_path`]. A
     /// `HOME_STILL_PAPER_*` variable that names no key is an error.
     pub fn load() -> anyhow::Result<Self> {
-        let mut figment = Figment::new();
+        let home = dirs::home_dir().ok_or(ConfigError::NoHomeDir)?;
+        let user = ConfigFile::load_in(&home)?;
+        let system = ConfigFile::load_at(Path::new(SYSTEM_CONFIG_PATH), &home)?;
+        Self::load_from(&system, &user)
+    }
 
-        let system_path = PathBuf::from("/etc/home-still/config.yaml");
-        if system_path.exists() {
-            figment = figment.merge(Yaml::file(&system_path));
-        }
-
-        if let Some(home) = dirs::home_dir() {
-            let user_path = home.join(CONFIG_REL_PATH);
-            if user_path.exists() {
-                figment = figment.merge(Yaml::file(&user_path));
+    /// [`Self::load`] against already-read config files: the system file
+    /// under the user file under the environment. A file or section that is
+    /// present but malformed is an error naming it; an absent `storage:`
+    /// section is the documented local-filesystem default, an absent
+    /// `events:` section is `None` (see [`Self::build_event_bus`]).
+    pub fn load_from(system: &ConfigFile, user: &ConfigFile) -> anyhow::Result<Self> {
+        // The default for the one key that depends on `home.project_dir`.
+        let mut figment = Figment::new().merge(Serialized::default(
+            "paper.download_path",
+            user.project_dir()?.join("papers"),
+        ));
+        for file in [system, user] {
+            for section in ["paper", "storage", "events"] {
+                if let Some(value) = file.section_json(section)? {
+                    figment = figment.merge(Serialized::default(section, value));
+                }
             }
         }
 
@@ -172,23 +158,35 @@ impl Config {
                 .filter_map(move |key| env_key_path(&env_keys, key.as_str()).map(Into::into)),
         );
 
-        let mut config: Config = figment.clone().focus("paper").extract().context(format!(
-            "Failed to parse config ({}).  Run: hs config init",
-            Config::config_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| CONFIG_REL_PATH.into())
-        ))?;
-
-        config.storage = figment
+        let shown = user.path().display();
+        let mut config: Config = figment
             .clone()
-            .focus("storage")
-            .extract::<StorageConfig>()
-            .unwrap_or_default();
+            .focus("paper")
+            .extract()
+            .with_context(|| format!("Failed to parse config ({shown}).  Run: hs config init"))?;
 
-        config.events = figment
-            .focus("events")
-            .extract::<EventBusConfig>()
-            .unwrap_or_default();
+        config.storage = if figment.contains("storage") {
+            figment
+                .clone()
+                .focus("storage")
+                .extract::<StorageConfig>()
+                .with_context(|| format!("{shown}: invalid `storage` section"))?
+        } else {
+            StorageConfig::default()
+        };
+
+        config.events = if figment.contains("events") {
+            let events = figment
+                .focus("events")
+                .extract::<EventBusConfig>()
+                .with_context(|| format!("{shown}: invalid `events` section"))?;
+            events
+                .validate()
+                .map_err(|e| anyhow::anyhow!("{shown}: invalid `events` section: {e}"))?;
+            Some(events)
+        } else {
+            None
+        };
 
         config.download_path = expand_tilde(&config.download_path);
         config.cache_path = expand_tilde(&config.cache_path);
@@ -210,9 +208,10 @@ impl Config {
         self.storage.build()
     }
 
-    /// Build the configured event bus.
+    /// Build the configured event bus. A config without an `events:` section
+    /// has none: this is an error, never a bus that drops everything.
     pub async fn build_event_bus(&self) -> anyhow::Result<Arc<dyn EventBus>> {
-        self.events.build().await
+        EventBusConfig::build_required(self.events.as_ref()).await
     }
 }
 
@@ -728,5 +727,75 @@ mod tests {
         assert_eq!(path("PAPER_DOWNLOAD"), None, "a section is not a value");
         assert_eq!(path("PAPER_NOPE"), None);
         assert_eq!(path("COLOR"), None);
+    }
+
+    // ── Config file sections (RA-6, RA-7) ──────────────────────────────
+
+    /// Load against a config file with `yaml` as its content (or none) under
+    /// a hermetic environment.
+    fn load_yaml(yaml: Option<&str>) -> anyhow::Result<Config> {
+        let mut out = None;
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let home = jail.directory().to_path_buf();
+            if let Some(yaml) = yaml {
+                let path = home.join(CONFIG_REL_PATH);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, yaml).unwrap();
+            }
+            let user = ConfigFile::load_in(&home).unwrap();
+            let system = ConfigFile::load_at(Path::new("/nonexistent/config.yaml"), &home).unwrap();
+            out = Some(Config::load_from(&system, &user));
+            Ok(())
+        });
+        out.expect("closure ran")
+    }
+
+    #[test]
+    fn a_malformed_storage_or_events_section_is_an_error_not_the_defaults() {
+        // Each used to be replaced by `unwrap_or_default()`: downloads went
+        // to the local default and events to a bus that drops everything.
+        for (yaml, section) in [
+            ("storage:\n  backend: carrier-pigeon\n", "storage"),
+            ("storage: [1, 2]\n", "storage"),
+            ("events:\n  backend: carrier-pigeon\n", "events"),
+            ("events:\n  nats:\n    url: nats://x:4222\n", "events"),
+            ("events:\n  backend: nats\n  nats:\n    user: only-a-user\n", "events"),
+            ("paper:\n  download:\n    timeout_secs: soon\n", "paper"),
+        ] {
+            let err = format!("{:#}", load_yaml(Some(yaml)).expect_err(yaml));
+            assert!(err.contains(section), "{yaml}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_absent_events_section_is_no_bus_and_refuses_to_build_one() {
+        let config = load_yaml(Some("storage:\n  backend: local\n")).unwrap();
+        assert!(config.events.is_none());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(config.build_event_bus())
+            .err()
+            .expect("no bus may be invented")
+            .to_string();
+        assert!(err.contains("events.backend"), "{err}");
+
+        let config = load_yaml(Some("events:\n  backend: noop\n")).unwrap();
+        assert!(rt.block_on(config.build_event_bus()).is_ok());
+    }
+
+    #[test]
+    fn the_default_download_path_follows_home_project_dir_and_an_explicit_one_wins() {
+        let config = load_yaml(Some("home:\n  project_dir: /srv/hs\n")).unwrap();
+        assert_eq!(config.download_path, PathBuf::from("/srv/hs/papers"));
+        let config = load_yaml(Some(
+            "home:\n  project_dir: /srv/hs\npaper:\n  download_path: /elsewhere/papers\n",
+        ))
+        .unwrap();
+        assert_eq!(config.download_path, PathBuf::from("/elsewhere/papers"));
+        // A broken `home` section is not "the default project dir".
+        assert!(load_yaml(Some("home:\n  project_dir: [a]\n")).is_err());
     }
 }

@@ -1,12 +1,13 @@
 use figment::{
-    providers::{Env, Format, Serialized, Yaml},
+    providers::{Env, Serialized},
     Figment,
 };
+use hs_common::config_file::{ConfigError, ConfigFile};
 use hs_common::event_bus::{EventBus, EventBusConfig};
 use hs_common::hardware_profile::HardwareProfile;
 use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Default ceiling on the pixels of one rendered PDF page
@@ -17,34 +18,45 @@ use std::sync::Arc;
 /// plus the image copy made from it.
 pub const DEFAULT_MAX_RENDER_PIXELS: u64 = 36_000_000;
 
-/// Resolve project_dir from ~/.home-still/config.yaml or default to ~/home-still.
-fn resolve_project_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
-    let config_path = home.join(".home-still/config.yaml");
-    if let Ok(contents) = std::fs::read_to_string(&config_path) {
-        let mut in_home = false;
-        for line in contents.lines() {
-            let t = line.trim();
-            if t.starts_with('#') || t.is_empty() {
-                continue;
-            }
-            if !line.starts_with(' ') && !line.starts_with('\t') {
-                in_home = t.starts_with("home:");
-            }
-            if in_home {
-                if let Some(val) = t.strip_prefix("project_dir:") {
-                    let val = val.trim().trim_matches('"').trim_matches('\'');
-                    if !val.is_empty() {
-                        if let Some(rest) = val.strip_prefix("~/") {
-                            return home.join(rest);
-                        }
-                        return PathBuf::from(val);
-                    }
-                }
-            }
-        }
+/// Section of `~/.home-still/config.yaml` holding the scribe SERVER's
+/// settings ([`AppConfig`]); the client's live under `scribe:`
+/// ([`ScribeConfig`]). Mirrors `distill_server:` / `distill:`.
+pub const SERVER_SECTION: &str = "scribe_server";
+
+/// Section of `~/.home-still/config.yaml` holding the client's settings.
+pub const CLIENT_SECTION: &str = "scribe";
+
+/// `HS_SCRIBE_<KEY>` overrides `<section>.<key>` for every scalar key of
+/// the section's struct (`HS_SCRIBE_VLM_CONCURRENCY` →
+/// `scribe_server.vlm_concurrency`, `HS_SCRIBE_CONVERT_TIMEOUT_SECS` →
+/// `scribe.convert_timeout_secs`). The two structs have disjoint keys, so
+/// one prefix serves both; a name that is no key of the struct being
+/// loaded is ignored (`HS_SCRIBE_DIAG_DIR` and friends are read directly).
+fn env_overrides(section: &'static str) -> Env {
+    Env::prefixed("HS_SCRIBE_").map(move |key| format!("{section}.{key}").into())
+}
+
+/// Layer `defaults`, the `section` of the config file and the `HS_SCRIBE_*`
+/// environment (later wins) and extract `T`. A section that is present but
+/// does not fit `T` is an error naming the file, the section and the key.
+fn extract_section<T>(
+    file: &ConfigFile,
+    section: &'static str,
+    defaults: &T,
+) -> Result<T, ConfigError>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+{
+    let invalid = |e: figment::Error| ConfigError::section(file.path(), section, e);
+    let mut figment = Figment::from(Serialized::default(section, defaults));
+    if let Some(from_file) = file.section_json(section)? {
+        figment = figment.merge(Serialized::default(section, from_file));
     }
-    home.join("home-still")
+    figment
+        .merge(env_overrides(section))
+        .focus(section)
+        .extract()
+        .map_err(invalid)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,16 +231,21 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn load() -> Result<Self, Box<figment::Error>> {
-        let config_path = dirs::config_dir()
-            .map(|d| d.join("home-still").join("config.yaml"))
-            .unwrap_or_default();
+    /// The scribe server's effective settings: the documented defaults,
+    /// then the `scribe_server:` section of `~/.home-still/config.yaml`,
+    /// then `HS_SCRIBE_*` environment variables. Any problem (unreadable or
+    /// malformed file or section, a bad env value, a value the server cannot
+    /// run with) is an `Err`; the server refuses to start on it.
+    pub fn load() -> anyhow::Result<Self> {
+        Ok(Self::from_file(&ConfigFile::load()?)?)
+    }
 
-        Figment::from(Serialized::defaults(AppConfig::default()))
-            .merge(Yaml::file(config_path).nested())
-            .merge(Env::prefixed("HS_SCRIBE_"))
-            .extract()
-            .map_err(Box::new)
+    /// [`Self::load`] against an already-read config file.
+    pub fn from_file(file: &ConfigFile) -> Result<Self, ConfigError> {
+        let cfg: Self = extract_section(file, SERVER_SECTION, &Self::default())?;
+        cfg.validate()
+            .map_err(|e| ConfigError::section(file.path(), SERVER_SECTION, format!("{e:#}")))?;
+        Ok(cfg)
     }
 
     /// Reject settings that would hang or panic the server: a zero
@@ -455,9 +472,11 @@ pub struct ScribeConfig {
     /// Storage backend (loaded from top-level `storage:` section, not `scribe.storage`).
     #[serde(skip)]
     pub storage: StorageConfig,
-    /// Event bus (loaded from top-level `events:` section).
+    /// Event bus (loaded from the top-level `events:` section). `None` when
+    /// the config has no such section; components that publish or consume
+    /// events then refuse to start ([`ScribeConfig::build_event_bus`]).
     #[serde(skip)]
-    pub events: EventBusConfig,
+    pub events: Option<EventBusConfig>,
 }
 
 fn default_inbox_poll_interval_secs() -> u64 {
@@ -524,72 +543,70 @@ impl Default for TimeoutPolicy {
 }
 
 impl Default for ScribeConfig {
+    /// The documented built-in defaults, rooted at `~/home-still`. Loading
+    /// (`ScribeConfig::load`) roots them at the configured
+    /// `home.project_dir` instead and never falls back to this value.
     fn default() -> Self {
+        Self::with_project_dir(&hs_common::default_project_dir())
+    }
+}
+
+impl ScribeConfig {
+    /// Defaults with the directories rooted at `project` (`home.project_dir`).
+    /// `servers` is empty: there is no default server to guess at.
+    pub fn with_project_dir(project: &Path) -> Self {
         Self {
-            output_dir: resolve_project_dir().join("markdown"),
-            watch_dir: resolve_project_dir().join("papers"),
-            corrupted_dir: resolve_project_dir().join("corrupted"),
-            catalog_dir: resolve_project_dir().join("catalog"),
-            servers: vec![ScribeServerEntry {
-                url: "http://localhost:7433".into(),
-                backend: default_backend(),
-                concurrency: default_concurrency(),
-            }],
+            output_dir: project.join("markdown"),
+            watch_dir: project.join("papers"),
+            corrupted_dir: project.join("corrupted"),
+            catalog_dir: project.join("catalog"),
+            servers: Vec::new(),
             local_server: true,
             inbox_poll_interval_secs: default_inbox_poll_interval_secs(),
             convert_timeout_secs: default_convert_timeout_secs(),
             timeout_policy: TimeoutPolicy::default(),
             epub: crate::epub::EpubLimits::default(),
             storage: StorageConfig::default(),
-            events: EventBusConfig::default(),
+            events: None,
         }
     }
-}
 
-impl ScribeConfig {
-    pub fn load() -> Result<Self, Box<figment::Error>> {
-        let config_path = dirs::home_dir()
-            .map(|d| d.join(".home-still").join("config.yaml"))
-            .unwrap_or_default();
+    /// The client's effective settings: the documented defaults (rooted at
+    /// `home.project_dir`), then the `scribe:` section of
+    /// `~/.home-still/config.yaml`, then `HS_SCRIBE_*` environment variables
+    /// (`HS_SCRIBE_CONVERT_TIMEOUT_SECS` → `scribe.convert_timeout_secs`).
+    /// `storage:` and `events:` are read from their own sections.
+    ///
+    /// A missing config file is a valid, empty config. A file or section that
+    /// is present but malformed is an `Err` naming it; nothing here
+    /// substitutes defaults for a failed load.
+    pub fn load() -> anyhow::Result<Self> {
+        Ok(Self::from_file(&ConfigFile::load()?)?)
+    }
 
-        // Nest defaults under "scribe" key so they merge correctly with YAML
-        let defaults = serde_json::json!({
-            "scribe": {
-                "output_dir": ScribeConfig::default().output_dir,
-                "watch_dir": ScribeConfig::default().watch_dir,
-                "corrupted_dir": ScribeConfig::default().corrupted_dir,
-                "catalog_dir": ScribeConfig::default().catalog_dir,
-                "servers": ScribeConfig::default().servers,
-                "local_server": true,
-                "inbox_poll_interval_secs": default_inbox_poll_interval_secs(),
-                "convert_timeout_secs": default_convert_timeout_secs(),
-            }
-        });
-        let figment = Figment::from(Serialized::defaults(defaults))
-            .merge(Yaml::file(&config_path))
-            .merge(Env::prefixed("HS_SCRIBE_"));
-
-        let storage = figment
-            .clone()
-            .focus("storage")
-            .extract::<StorageConfig>()
-            .unwrap_or_default();
-
-        let events = figment
-            .clone()
-            .focus("events")
-            .extract::<EventBusConfig>()
-            .unwrap_or_default();
-
-        let mut cfg = figment
-            .focus("scribe")
-            .extract::<ScribeConfig>()
-            .unwrap_or_default();
-        cfg.storage = storage;
-        cfg.events = events;
+    /// [`Self::load`] against an already-read config file.
+    pub fn from_file(file: &ConfigFile) -> Result<Self, ConfigError> {
+        let defaults = Self::with_project_dir(&file.project_dir()?);
+        let mut cfg: Self = extract_section(file, CLIENT_SECTION, &defaults)?;
+        cfg.storage = file.section("storage")?.unwrap_or_default();
+        cfg.events = EventBusConfig::from_file(file)?;
         cfg.validate()
-            .map_err(|e| Box::new(figment::Error::from(format!("{e:#}"))))?;
+            .map_err(|e| ConfigError::section(file.path(), CLIENT_SECTION, format!("{e:#}")))?;
         Ok(cfg)
+    }
+
+    /// The configured scribe servers, or an error telling the operator how
+    /// to configure one. Commands that talk to a scribe server call this
+    /// instead of guessing a `localhost` address.
+    pub fn require_servers(&self) -> anyhow::Result<&[ScribeServerEntry]> {
+        if self.servers.is_empty() {
+            anyhow::bail!(
+                "no scribe server is configured: set `scribe.servers` in {} \
+                 (for example `servers: [http://<host>:7433]`; `hs config init` writes a template)",
+                hs_common::CONFIG_REL_PATH
+            );
+        }
+        Ok(&self.servers)
     }
 
     /// Reject values that would panic or hang the dispatcher: a deadline
@@ -620,9 +637,10 @@ impl ScribeConfig {
         self.storage.build()
     }
 
-    /// Build the configured event bus.
+    /// Build the configured event bus. A config without an `events:` section
+    /// has none: this is an error, never a bus that drops everything.
     pub async fn build_event_bus(&self) -> anyhow::Result<Arc<dyn EventBus>> {
-        self.events.build().await
+        EventBusConfig::build_required(self.events.as_ref()).await
     }
 }
 
@@ -783,7 +801,11 @@ mod tests {
     #[test]
     fn a_backend_tier_with_zero_concurrency_is_refused() {
         let mut c = ScribeConfig::default();
-        c.servers[0].concurrency = 0;
+        c.servers.push(ScribeServerEntry {
+            url: "http://host-a.example:7433".into(),
+            backend: default_backend(),
+            concurrency: 0,
+        });
         assert!(c
             .validate()
             .unwrap_err()
@@ -810,5 +832,152 @@ mod tests {
         c.validate().unwrap();
         c.olmocr_bin = "  ".into();
         assert!(c.validate().is_err());
+    }
+
+    // ── Loading (RA-6, RA-97) ──────────────────────────────────────────
+    //
+    // These go through `from_file` against a temporary home directory, with
+    // the process environment emptied and then set per test (figment's
+    // `Jail`, which serialises tests that touch the environment).
+
+    fn with_env<R>(vars: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
+        let mut out = None;
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            for (k, v) in vars {
+                jail.set_env(k, v);
+            }
+            out = Some(f());
+            Ok(())
+        });
+        out.expect("closure ran")
+    }
+
+    fn home_with(yaml: Option<&str>) -> (tempfile::TempDir, ConfigFile) {
+        let home = tempfile::tempdir().unwrap();
+        if let Some(yaml) = yaml {
+            let path = home.path().join(hs_common::CONFIG_REL_PATH);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, yaml).unwrap();
+        }
+        let file = ConfigFile::load_in(home.path()).unwrap();
+        (home, file)
+    }
+
+    #[test]
+    fn no_config_file_gives_documented_defaults_with_no_server_and_no_bus() {
+        let (home, file) = home_with(None);
+        let cfg = with_env(&[], || ScribeConfig::from_file(&file)).unwrap();
+        assert!(cfg.servers.is_empty(), "no server is guessed");
+        assert!(cfg.events.is_none(), "no bus is guessed");
+        assert_eq!(cfg.output_dir, home.path().join("home-still/markdown"));
+        assert_eq!(cfg.convert_timeout_secs, 900);
+        let err = cfg.require_servers().unwrap_err().to_string();
+        assert!(err.contains("scribe.servers"), "{err}");
+        // The server side needs no file at all.
+        with_env(&[], || AppConfig::from_file(&file)).unwrap();
+    }
+
+    #[test]
+    fn the_scribe_section_and_the_project_dir_are_honoured() {
+        let (_home, file) = home_with(Some(
+            "home:\n  project_dir: /srv/hs\nscribe:\n  convert_timeout_secs: 1234\n  servers:\n    - http://host-a.example:7433\n    - url: http://host-b.example:7435\n      backend: olmocr\n      concurrency: 2\nevents:\n  backend: nats\n",
+        ));
+        let cfg = with_env(&[], || ScribeConfig::from_file(&file)).unwrap();
+        assert_eq!(cfg.convert_timeout_secs, 1234);
+        assert_eq!(cfg.output_dir, PathBuf::from("/srv/hs/markdown"));
+        let urls: Vec<_> = cfg.servers.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(urls, ["http://host-a.example:7433", "http://host-b.example:7435"]);
+        assert_eq!(cfg.servers[1].backend, "olmocr");
+        assert_eq!(cfg.servers[1].concurrency, 2);
+        assert_eq!(
+            cfg.events.as_ref().map(|e| e.backend.clone()),
+            Some(hs_common::event_bus::EventsBackend::Nats)
+        );
+        assert_eq!(cfg.require_servers().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_documented_env_override_reaches_the_client_config() {
+        // `HS_SCRIBE_CONVERT_TIMEOUT_SECS` is documented on the field; the
+        // loader used to merge the variable at the root and then read the
+        // `scribe` key, so it never applied.
+        let (_home, file) = home_with(Some("scribe:\n  convert_timeout_secs: 1234\n"));
+        let cfg = with_env(&[("HS_SCRIBE_CONVERT_TIMEOUT_SECS", "77")], || {
+            ScribeConfig::from_file(&file)
+        })
+        .unwrap();
+        assert_eq!(cfg.convert_timeout_secs, 77, "env beats the file");
+        let cfg = with_env(&[], || ScribeConfig::from_file(&file)).unwrap();
+        assert_eq!(cfg.convert_timeout_secs, 1234);
+        // A value that is not a number is an error, not the default.
+        let err = with_env(&[("HS_SCRIBE_CONVERT_TIMEOUT_SECS", "soon")], || {
+            ScribeConfig::from_file(&file)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.to_ascii_lowercase().contains("convert_timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_section_is_an_error_naming_it_never_the_defaults() {
+        for (yaml, section) in [
+            ("scribe:\n  convert_timeout_secs: soon\n", "scribe"),
+            ("scribe:\n  servers: not-a-list\n", "scribe"),
+            ("scribe:\n  timeout_policy:\n    floor_secs: 4000\n    ceiling_secs: 3600\n", "scribe"),
+            ("storage:\n  backend: carrier-pigeon\n", "storage"),
+            ("events:\n  backend: carrier-pigeon\n", "events"),
+            ("events:\n  nats: {url: nats://x:4222}\n", "events"),
+            ("home:\n  project_dir: [a, b]\n", "home"),
+        ] {
+            let (_home, file) = home_with(Some(yaml));
+            let err = with_env(&[], || ScribeConfig::from_file(&file))
+                .expect_err(yaml)
+                .to_string();
+            assert!(err.contains(&format!("`{section}`")), "{yaml}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_server_config_reads_scribe_server_and_env_wins() {
+        let (_home, file) = home_with(Some(
+            "scribe:\n  vlm_concurrency: 99\nscribe_server:\n  vlm_concurrency: 9\n  backend: OpenAi\n  openai_url: http://llm.example:8080\n",
+        ));
+        let cfg = with_env(&[], || AppConfig::from_file(&file)).unwrap();
+        assert_eq!(cfg.vlm_concurrency, 9, "the scribe: section is the client's");
+        assert_eq!(cfg.backend, BackendChoice::OpenAi);
+        assert_eq!(cfg.openai_url, "http://llm.example:8080");
+
+        let cfg = with_env(
+            &[("HS_SCRIBE_VLM_CONCURRENCY", "3"), ("HS_SCRIBE_CONVERTER", "olmocr")],
+            || AppConfig::from_file(&file),
+        )
+        .unwrap();
+        assert_eq!(cfg.vlm_concurrency, 3);
+        assert_eq!(cfg.converter, ConverterMode::Olmocr);
+        assert_eq!(cfg.backend, BackendChoice::OpenAi, "untouched keys keep the file's value");
+    }
+
+    #[test]
+    fn a_bad_server_setting_stops_the_load_wherever_it_comes_from() {
+        let (_home, ok) = home_with(Some("scribe_server:\n  vlm_concurrency: 9\n"));
+        for (vars, what) in [
+            (vec![("HS_SCRIBE_VLM_CONCURRENCY", "many")], "env value of the wrong type"),
+            (vec![("HS_SCRIBE_VLM_CONCURRENCY", "0")], "env value the server cannot run with"),
+            (vec![("HS_SCRIBE_BACKEND", "sglang")], "env backend that does not exist"),
+        ] {
+            let err = with_env(&vars, || AppConfig::from_file(&ok)).expect_err(what);
+            assert!(err.to_string().contains("scribe_server"), "{what}: {err}");
+        }
+        for yaml in [
+            "scribe_server:\n  vlm_concurrency: 0\n",
+            "scribe_server:\n  vlm_concurrency: lots\n",
+            "scribe_server:\n  backend: sglang\n",
+            "scribe_server: 7\n",
+        ] {
+            let (_home, file) = home_with(Some(yaml));
+            let err = with_env(&[], || AppConfig::from_file(&file)).expect_err(yaml);
+            assert!(err.to_string().contains("`scribe_server`"), "{yaml}: {err}");
+        }
     }
 }

@@ -47,6 +47,10 @@ pub fn app(state: Arc<DistillServerState>, token: BackendToken) -> Router {
         .merge(protected)
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
+        // Outermost: a handler panic is a 500 and the server keeps serving.
+        .layer(axum::middleware::from_fn(
+            hs_common::panic_guard::http::catch_panic,
+        ))
 }
 
 /// The backend secret the server requires, from `lookup` (the process

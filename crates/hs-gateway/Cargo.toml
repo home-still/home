@@ -8,7 +8,7 @@ name = "hs-gateway"
 path = "src/main.rs"
 
 [dependencies]
-hs-common = { workspace = true, features = ["auth", "service", "storage-s3", "logging"] }
+hs-common = { workspace = true, features = ["auth", "service", "storage-s3", "logging", "catch-panic"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }

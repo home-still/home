@@ -242,7 +242,15 @@ where
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let handler = Arc::new(handler);
 
-    while let Some(event) = stream.next().await {
+    let mut delivery_error = None;
+    while let Some(next) = stream.next().await {
+        let event = match next {
+            Ok(event) => event,
+            Err(e) => {
+                delivery_error = Some(e);
+                break;
+            }
+        };
         let parsed: CompletedEvent = match serde_json::from_slice(&event.payload) {
             Ok(p) => p,
             Err(e) => {
@@ -268,7 +276,30 @@ where
             let _permit = permit;
             let key = parsed.key.clone();
             tracing::info!(key = %key, "distill received completed event");
-            match handler(parsed).await {
+            // A handler that panics terminates its event: a panic is a bug
+            // this input triggers, redelivery would hit it again (up to
+            // `max_deliver` times, each `ack_wait` apart), and without the
+            // guard the event sat un-acked until `ack_wait` expired. The
+            // guard wraps the call too, so a panic before the handler's
+            // first await is caught as well.
+            let result =
+                match hs_common::panic_guard::catch_panic(async move { handler(parsed).await })
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(panic) => {
+                        tracing::error!(
+                            key = %key,
+                            panic = %panic,
+                            "distill handler PANICKED — terminating this event (will not redeliver)"
+                        );
+                        if let Err(e) = event.term().await {
+                            tracing::warn!(key = %key, error = %e, "term after panic failed");
+                        }
+                        return;
+                    }
+                };
+            match result {
                 Ok(()) => {
                     if let Err(e) = event.ack().await {
                         tracing::warn!(key = %key, error = %e, "ack failed");
@@ -302,16 +333,23 @@ where
         });
     }
 
-    // The stream only ends when the broker dropped the consumer or the
-    // connection (a competing watcher deleting the durable, a broker
-    // restart). Consumption has stopped, so this is a failure — returning
-    // Ok would let the process exit 0 and stay down. Let handlers that are
-    // already running finish their ack/nak first.
+    // The stream ends (or yields a delivery error) when the broker dropped
+    // the consumer or the connection (a competing watcher deleting the
+    // durable, a broker restart, missed heartbeats). Consumption has
+    // stopped, so this is a failure — returning Ok would let the process
+    // exit 0 and stay down. Let handlers that are already running finish
+    // their ack/nak first.
     let _ = sem.acquire_many(concurrency as u32).await;
-    Err(anyhow::anyhow!(
-        "event stream ended: the consumer or broker connection for {} is gone",
-        specs::SCRIBE_COMPLETED.subject
-    ))
+    Err(match delivery_error {
+        Some(e) => e.context(format!(
+            "event delivery for {} failed: the consumer is no longer receiving",
+            specs::SCRIBE_COMPLETED.subject
+        )),
+        None => anyhow::anyhow!(
+            "event stream ended: the consumer or broker connection for {} is gone",
+            specs::SCRIBE_COMPLETED.subject
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -379,6 +417,8 @@ mod tests {
         published: Mutex<Vec<(String, Vec<u8>)>>,
         fail_publish: AtomicBool,
         events: Mutex<Vec<Event>>,
+        /// When set, the stream yields this delivery error after the events.
+        then_fail: Mutex<Option<String>>,
     }
 
     #[async_trait]
@@ -394,7 +434,12 @@ mod tests {
         }
         async fn consume(&self, _spec: &ConsumerSpec) -> anyhow::Result<EventStream> {
             let events = std::mem::take(&mut *self.events.lock());
-            Ok(Box::pin(futures_util::stream::iter(events)))
+            let failure = self.then_fail.lock().take();
+            let items = events
+                .into_iter()
+                .map(Ok)
+                .chain(failure.map(|m| Err(anyhow::anyhow!(m))));
+            Ok(Box::pin(futures_util::stream::iter(items)))
         }
     }
 
@@ -673,5 +718,65 @@ mod tests {
         let (result, seen) = subscribe(events, 1).await;
         assert!(result.is_err());
         assert_eq!(seen, ["good"]);
+    }
+
+    #[tokio::test]
+    async fn a_delivery_error_is_reported_with_its_cause_after_running_handlers_finish() {
+        let bus = Arc::new(FakeBus::default());
+        *bus.events.lock() = vec![completed("a"), completed("b")];
+        *bus.then_fail.lock() = Some("missed idle heartbeat".into());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_handler = seen.clone();
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
+        let err = run_subscriber(bus, storage, 2, move |e| {
+            let seen = seen_in_handler.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                seen.lock().push(e.key);
+                Ok(())
+            }
+        })
+        .await
+        .expect_err("a delivery error must fail the subscriber");
+        let shown = format!("{err:#}");
+        assert!(shown.contains("missed idle heartbeat"), "{shown}");
+        assert!(!shown.contains("event stream ended"), "{shown}");
+        let mut seen = seen.lock().clone();
+        seen.sort();
+        assert_eq!(seen, ["a", "b"], "no handler may be cut off");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_handler_terminates_its_event_and_the_subscriber_keeps_running() {
+        use hs_common::event_bus::Settlement;
+        let bus = Arc::new(FakeBus::default());
+        let (good_a, a_log) = Event::recording("scribe.completed", br#"{"key":"a"}"#.to_vec());
+        let (poison, poison_log) =
+            Event::recording("scribe.completed", br#"{"key":"poison"}"#.to_vec());
+        let (good_b, b_log) = Event::recording("scribe.completed", br#"{"key":"b"}"#.to_vec());
+        *bus.events.lock() = vec![good_a, poison, good_b];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_handler = seen.clone();
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
+        // Concurrency 1: the permit the panicking task held must be released
+        // or the event after it would never be dispatched.
+        let result = run_subscriber(bus, storage, 1, move |e| {
+            let seen = seen_in_handler.clone();
+            async move {
+                if e.key == "poison" {
+                    panic!("chunker exploded on {}", e.key);
+                }
+                seen.lock().push(e.key);
+                Ok(())
+            }
+        })
+        .await;
+        assert!(result.unwrap_err().to_string().contains("event stream ended"));
+        assert_eq!(poison_log.decisions(), [Settlement::Term]);
+        assert_eq!(a_log.decisions(), [Settlement::Ack]);
+        assert_eq!(b_log.decisions(), [Settlement::Ack]);
+        let mut seen = seen.lock().clone();
+        seen.sort();
+        assert_eq!(seen, ["a", "b"]);
     }
 }

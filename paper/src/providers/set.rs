@@ -163,7 +163,7 @@ impl ProviderSet {
 
     /// Providers consulted, in order, to find a PDF URL for a DOI:
     /// Semantic Scholar, Europe PMC, CORE (only with an API key), OpenAlex,
-    /// CrossRef. Pass to `PaperDownloader::new` / `with_event_bus`.
+    /// CrossRef. Pass to `PaperDownloader::with_event_bus`.
     pub fn download_resolvers(&self) -> Vec<Arc<dyn PaperProvider>> {
         let mut resolvers = vec![self.semantic_scholar.clone(), self.europe_pmc.clone()];
         if self.core_has_key {

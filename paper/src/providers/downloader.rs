@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use hs_common::event_bus::{EventBus, NoOpBus};
+use hs_common::event_bus::EventBus;
 use hs_common::storage::Storage;
 use reqwest::{header, Client};
 use serde::de::DeserializeOwned;
@@ -131,14 +131,6 @@ pub struct PaperDownloader {
 }
 
 impl PaperDownloader {
-    pub fn new(
-        storage: Arc<dyn Storage>,
-        config: &DownloadConfig,
-        resolvers: Vec<Arc<dyn PaperProvider>>,
-    ) -> Result<Self, PaperError> {
-        Self::with_event_bus(storage, Arc::new(NoOpBus), config, resolvers)
-    }
-
     pub fn with_event_bus(
         storage: Arc<dyn Storage>,
         events: Arc<dyn EventBus>,

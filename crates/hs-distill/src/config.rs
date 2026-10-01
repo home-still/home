@@ -1,10 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use figment::{
-    providers::{Env, Format, Serialized, Yaml},
-    Figment,
-};
+use figment::{providers::{Env, Serialized}, Figment};
+use hs_common::config_file::{ConfigError, ConfigFile};
 use hs_common::event_bus::{EventBus, EventBusConfig};
 use hs_common::hardware_profile::HardwareProfile;
 use hs_common::storage::{Storage, StorageConfig};
@@ -87,9 +85,50 @@ pub struct DistillServerConfig {
     pub ollama_timeout_secs: u64,
 }
 
+/// Section of `~/.home-still/config.yaml` holding the distill SERVER's
+/// settings ([`DistillServerConfig`]).
+pub const SERVER_SECTION: &str = "distill_server";
+
+/// Section holding the client's settings ([`DistillClientConfig`]).
+pub const CLIENT_SECTION: &str = "distill";
+
+/// Layer `defaults`, the `section` of the config file and the `HS_DISTILL_*`
+/// environment (later wins; `HS_DISTILL_<KEY>` overrides `<section>.<key>`
+/// for the section's top-level keys) and extract `T`. A section that is
+/// present but does not fit `T` is an error naming the file, the section
+/// and the key.
+fn extract_section<T>(
+    file: &ConfigFile,
+    section: &'static str,
+    defaults: &T,
+) -> Result<T, ConfigError>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+{
+    let mut figment = Figment::from(Serialized::default(section, defaults));
+    if let Some(from_file) = file.section_json(section)? {
+        figment = figment.merge(Serialized::default(section, from_file));
+    }
+    figment
+        .merge(Env::prefixed("HS_DISTILL_").map(move |key| format!("{section}.{key}").into()))
+        .focus(section)
+        .extract()
+        .map_err(|e| ConfigError::section(file.path(), section, e))
+}
+
 impl Default for DistillServerConfig {
+    /// The documented built-in defaults, rooted at `~/home-still`. Loading
+    /// ([`DistillServerConfig::load`]) roots them at the configured
+    /// `home.project_dir` and never falls back to this value.
     fn default() -> Self {
-        let project = hs_common::resolve_project_dir();
+        Self::with_project_dir(&hs_common::default_project_dir())
+    }
+}
+
+impl DistillServerConfig {
+    /// Defaults with the Qdrant data directory under `project`
+    /// (`home.project_dir`).
+    pub fn with_project_dir(project: &std::path::Path) -> Self {
         Self {
             host: "0.0.0.0".into(),
             port: 7434,
@@ -112,24 +151,28 @@ impl Default for DistillServerConfig {
             ollama_timeout_secs: 120,
         }
     }
-}
 
-impl DistillServerConfig {
-    pub fn load() -> Result<Self, Box<figment::Error>> {
-        let home = dirs::home_dir().unwrap_or_default();
-        let config_path = home.join(hs_common::CONFIG_REL_PATH);
+    /// The server's effective settings: the documented defaults, then the
+    /// `distill_server:` section of `~/.home-still/config.yaml`, then
+    /// `HS_DISTILL_*` environment variables. Any problem (unreadable or
+    /// malformed file or section, a bad env value) is an `Err`; the server
+    /// refuses to start on it. A missing file is a valid, empty config.
+    pub fn load() -> anyhow::Result<Self> {
+        Ok(Self::from_file(&ConfigFile::load()?)?)
+    }
 
-        let figment = Figment::from(Serialized::defaults(Self::default()))
-            .merge(Yaml::file(&config_path).nested())
-            .merge(Env::prefixed("HS_DISTILL_"))
-            .select("distill_server");
-        for key in removed_keys_present(&figment) {
-            tracing::warn!(
-                key = %format!("distill_server.{key}"),
-                "config key no longer exists and is ignored; remove it"
-            );
+    /// [`Self::load`] against an already-read config file.
+    pub fn from_file(file: &ConfigFile) -> Result<Self, ConfigError> {
+        let defaults = Self::with_project_dir(&file.project_dir()?);
+        if let Some(section) = file.section_json(SERVER_SECTION)? {
+            for key in removed_keys_present(&section) {
+                tracing::warn!(
+                    key = %format!("{SERVER_SECTION}.{key}"),
+                    "config key no longer exists and is ignored; remove it"
+                );
+            }
         }
-        figment.extract().map_err(Box::new)
+        extract_section(file, SERVER_SECTION, &defaults)
     }
 
     /// Reject configurations the server cannot run correctly. Call after
@@ -217,11 +260,16 @@ pub fn validate_collection_name(name: &str) -> Result<(), DistillError> {
     }
 }
 
-fn removed_keys_present(figment: &Figment) -> Vec<&'static str> {
+/// The [`REMOVED_KEYS`] (dotted paths) still set in `section`.
+fn removed_keys_present(section: &serde_json::Value) -> Vec<&'static str> {
     REMOVED_KEYS
         .iter()
         .copied()
-        .filter(|key| figment.contains(key))
+        .filter(|key| {
+            key.split('.')
+                .try_fold(section, |node, part| node.get(part))
+                .is_some()
+        })
         .collect()
 }
 
@@ -451,6 +499,8 @@ impl EmbeddingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DistillClientConfig {
+    /// Distill servers. Empty by default: there is no server to guess at;
+    /// commands that need one call [`Self::require_servers`].
     pub servers: Vec<String>,
     pub markdown_dir: PathBuf,
     pub catalog_dir: PathBuf,
@@ -468,22 +518,48 @@ pub struct DistillClientConfig {
     pub index_timeout_secs: u64,
     #[serde(skip)]
     pub storage: StorageConfig,
+    /// Event bus (top-level `events:` section); `None` when the config has
+    /// none, in which case components that publish or consume events refuse
+    /// to start ([`Self::build_event_bus`]).
     #[serde(skip)]
-    pub events: EventBusConfig,
+    pub events: Option<EventBusConfig>,
 }
 
 impl Default for DistillClientConfig {
+    /// The documented built-in defaults, rooted at `~/home-still`. Loading
+    /// ([`DistillClientConfig::load`]) roots them at `home.project_dir` and
+    /// never falls back to this value.
     fn default() -> Self {
-        let project = hs_common::resolve_project_dir();
+        Self::with_project_dir(&hs_common::default_project_dir())
+    }
+}
+
+impl DistillClientConfig {
+    /// Defaults with the directories under `project` (`home.project_dir`).
+    pub fn with_project_dir(project: &std::path::Path) -> Self {
         Self {
-            servers: vec!["http://localhost:7434".into()],
+            servers: Vec::new(),
             markdown_dir: project.join("markdown"),
             catalog_dir: project.join("catalog"),
             concurrency: None,
             index_timeout_secs: crate::client::DEFAULT_INDEX_TIMEOUT.as_secs(),
             storage: StorageConfig::default(),
-            events: EventBusConfig::default(),
+            events: None,
         }
+    }
+
+    /// The configured distill servers, or an error telling the operator how
+    /// to configure one. Commands that talk to a distill server call this
+    /// instead of guessing a `localhost` address.
+    pub fn require_servers(&self) -> anyhow::Result<&[String]> {
+        if self.servers.is_empty() {
+            anyhow::bail!(
+                "no distill server is configured: set `distill.servers` in {} \
+                 (for example `servers: [http://<host>:7434]`; `hs config init` writes a template)",
+                hs_common::CONFIG_REL_PATH
+            );
+        }
+        Ok(&self.servers)
     }
 }
 
@@ -496,34 +572,25 @@ impl DistillClientConfig {
             profile.class.distill_concurrency(profile.cpu_count)
         })
     }
-}
 
-impl DistillClientConfig {
-    pub fn load() -> Result<Self, Box<figment::Error>> {
-        let home = dirs::home_dir().unwrap_or_default();
-        let config_path = home.join(hs_common::CONFIG_REL_PATH);
+    /// The client's effective settings: the documented defaults (rooted at
+    /// `home.project_dir`), then the `distill:` section of
+    /// `~/.home-still/config.yaml`, then `HS_DISTILL_*` environment
+    /// variables. `storage:` and `events:` are read from their own sections.
+    /// A missing file is a valid, empty config; a file or section that is
+    /// present but malformed is an `Err` naming it.
+    pub fn load() -> anyhow::Result<Self> {
+        Ok(Self::from_file(&ConfigFile::load()?)?)
+    }
 
-        let figment = Figment::from(Serialized::defaults(Self::default()))
-            .merge(Yaml::file(&config_path).nested())
-            .merge(Env::prefixed("HS_DISTILL_"));
-
-        let storage = figment
-            .clone()
-            .select("storage")
-            .extract::<StorageConfig>()
-            .unwrap_or_default();
-
-        let events = figment
-            .clone()
-            .select("events")
-            .extract::<EventBusConfig>()
-            .unwrap_or_default();
-
-        let mut cfg: DistillClientConfig = figment.select("distill").extract().map_err(Box::new)?;
-        cfg.storage = storage;
-        cfg.events = events;
+    /// [`Self::load`] against an already-read config file.
+    pub fn from_file(file: &ConfigFile) -> Result<Self, ConfigError> {
+        let defaults = Self::with_project_dir(&file.project_dir()?);
+        let mut cfg: Self = extract_section(file, CLIENT_SECTION, &defaults)?;
+        cfg.storage = file.section("storage")?.unwrap_or_default();
+        cfg.events = EventBusConfig::from_file(file)?;
         cfg.validate()
-            .map_err(|e| Box::new(figment::Error::from(e.to_string())))?;
+            .map_err(|e| ConfigError::section(file.path(), CLIENT_SECTION, e))?;
         Ok(cfg)
     }
 
@@ -542,11 +609,12 @@ impl DistillClientConfig {
                 "distill.concurrency must be at least 1 (omit it for the hardware default)".into(),
             ));
         }
-        if matches!(
-            self.events.backend,
-            hs_common::event_bus::EventsBackend::Nats
-        ) {
-            let ack_wait = self.events.nats.ack_wait_secs;
+        if let Some(events) = self
+            .events
+            .as_ref()
+            .filter(|e| e.backend == hs_common::event_bus::EventsBackend::Nats)
+        {
+            let ack_wait = events.nats.ack_wait_secs;
             if self.index_timeout_secs + Self::ACK_WAIT_HEADROOM_SECS > ack_wait {
                 return Err(DistillError::Config(format!(
                     "distill.index_timeout_secs ({}) + {} s headroom exceeds events.nats.ack_wait_secs \
@@ -569,9 +637,10 @@ impl DistillClientConfig {
         self.storage.build()
     }
 
-    /// Build the configured event bus.
+    /// Build the configured event bus. A config without an `events:` section
+    /// has none: this is an error, never a bus that drops everything.
     pub async fn build_event_bus(&self) -> anyhow::Result<Arc<dyn EventBus>> {
-        self.events.build().await
+        EventBusConfig::build_required(self.events.as_ref()).await
     }
 }
 
@@ -780,20 +849,81 @@ mod tests {
         );
     }
 
+    // ── Loading (RA-6) ─────────────────────────────────────────────────
+    //
+    // Through `from_file` against a temporary home directory, with the
+    // process environment emptied and then set per test (figment's `Jail`).
+
+    fn with_env<R>(vars: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
+        let mut out = None;
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            for (k, v) in vars {
+                jail.set_env(k, v);
+            }
+            out = Some(f());
+            Ok(())
+        });
+        out.expect("closure ran")
+    }
+
+    fn home_with(yaml: Option<&str>) -> (tempfile::TempDir, ConfigFile) {
+        let home = tempfile::tempdir().unwrap();
+        if let Some(yaml) = yaml {
+            let path = home.path().join(hs_common::CONFIG_REL_PATH);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, yaml).unwrap();
+        }
+        let file = ConfigFile::load_in(home.path()).unwrap();
+        (home, file)
+    }
+
     #[test]
     fn yaml_collections_replace_the_default_list_and_host_port_are_read() {
-        let yaml = "distill_server:\n  host: 127.0.0.1\n  port: 7444\n  collections: [only_this]\n";
-        let loaded: DistillServerConfig =
-            Figment::from(Serialized::defaults(DistillServerConfig::default()))
-                .merge(Yaml::string(yaml).nested())
-                .select("distill_server")
-                .extract()
-                .unwrap();
+        let (_home, file) = home_with(Some(
+            "distill_server:\n  host: 127.0.0.1\n  port: 7444\n  collections: [only_this]\n",
+        ));
+        let loaded = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();
         assert_eq!(loaded.collections, ["only_this"]);
         assert_eq!((loaded.host.as_str(), loaded.port), ("127.0.0.1", 7444));
         loaded.validate().unwrap();
         let served: Vec<_> = loaded.served_collections().collect();
         assert_eq!(served, ["academic_papers", "only_this"]);
+    }
+
+    #[test]
+    fn env_overrides_the_file_and_the_project_dir_moves_the_data_dir() {
+        let (_home, file) = home_with(Some(
+            "home:\n  project_dir: /srv/hs\ndistill_server:\n  port: 7444\n",
+        ));
+        let loaded = with_env(&[("HS_DISTILL_PORT", "7555")], || {
+            DistillServerConfig::from_file(&file)
+        })
+        .unwrap();
+        assert_eq!(loaded.port, 7555);
+        assert_eq!(loaded.qdrant_data_dir, std::path::PathBuf::from("/srv/hs/data/qdrant"));
+    }
+
+    #[test]
+    fn a_malformed_section_or_env_value_is_an_error_never_the_defaults() {
+        for yaml in [
+            "distill_server:\n  port: not-a-port\n",
+            "distill_server:\n  embedding:\n    compute_device: cpu\n",
+            "distill_server: [1, 2]\n",
+        ] {
+            let (_home, file) = home_with(Some(yaml));
+            let err = with_env(&[], || DistillServerConfig::from_file(&file))
+                .expect_err(yaml)
+                .to_string();
+            assert!(err.contains("`distill_server`"), "{yaml}: {err}");
+        }
+        let (_home, ok) = home_with(None);
+        let err = with_env(&[("HS_DISTILL_PORT", "http")], || {
+            DistillServerConfig::from_file(&ok)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("distill_server") && err.to_ascii_lowercase().contains("port"), "{err}");
     }
 
     #[test]
@@ -818,20 +948,19 @@ mod tests {
     #[test]
     fn removed_keys_are_reported_not_silently_accepted() {
         let yaml = "distill_server:\n  embedding:\n    model: bge-m3\n    sparse_enabled: true\n    dimension: 1024\n";
-        let fig = Figment::from(Serialized::defaults(DistillServerConfig::default()))
-            .merge(Yaml::string(yaml).nested())
-            .select("distill_server");
+        let (_home, file) = home_with(Some(yaml));
+        let section = file.section_json(SERVER_SECTION).unwrap().unwrap();
         assert_eq!(
-            removed_keys_present(&fig),
+            removed_keys_present(&section),
             ["embedding.model", "embedding.sparse_enabled"]
         );
         // Still loads: the keys were already inert.
-        let loaded: DistillServerConfig = fig.extract().unwrap();
+        let loaded = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();
         assert_eq!(loaded.embedding.dimension, 1024);
 
-        let clean = Figment::from(Serialized::defaults(DistillServerConfig::default()))
-            .select("distill_server");
-        assert!(removed_keys_present(&clean).is_empty());
+        let (_home, clean) = home_with(Some("distill_server:\n  port: 7434\n"));
+        let section = clean.section_json(SERVER_SECTION).unwrap().unwrap();
+        assert!(removed_keys_present(&section).is_empty());
     }
 
     // ── Client config ──────────────────────────────────────────────────
@@ -839,13 +968,48 @@ mod tests {
     fn nats_client_config(index_timeout_secs: u64, ack_wait_secs: u64) -> DistillClientConfig {
         let mut events = EventBusConfig {
             backend: hs_common::event_bus::EventsBackend::Nats,
-            ..EventBusConfig::default()
+            nats: hs_common::event_bus::config::NatsYaml::default(),
         };
         events.nats.ack_wait_secs = ack_wait_secs;
         DistillClientConfig {
             index_timeout_secs,
-            events,
+            events: Some(events),
             ..DistillClientConfig::default()
+        }
+    }
+
+    #[test]
+    fn the_client_has_no_default_server_and_no_default_bus() {
+        let (_home, file) = home_with(None);
+        let cfg = with_env(&[], || DistillClientConfig::from_file(&file)).unwrap();
+        assert!(cfg.servers.is_empty());
+        assert!(cfg.events.is_none());
+        let err = cfg.require_servers().unwrap_err().to_string();
+        assert!(err.contains("distill.servers"), "{err}");
+
+        let (_home, file) = home_with(Some(
+            "distill:\n  servers: [http://host-a.example:7434]\n  index_timeout_secs: 600\nevents:\n  backend: noop\n",
+        ));
+        let cfg = with_env(&[], || DistillClientConfig::from_file(&file)).unwrap();
+        assert_eq!(cfg.require_servers().unwrap(), ["http://host-a.example:7434"]);
+        assert_eq!(cfg.index_timeout_secs, 600);
+        assert!(cfg.events.is_some());
+    }
+
+    #[test]
+    fn a_malformed_client_section_is_an_error_naming_it() {
+        for (yaml, section) in [
+            ("distill:\n  servers: not-a-list\n", "distill"),
+            ("distill:\n  index_timeout_secs: 0\n", "distill"),
+            ("storage:\n  backend: carrier-pigeon\n", "storage"),
+            ("events:\n  backend: carrier-pigeon\n", "events"),
+            ("events:\n  backend: nats\n  nats:\n    ack_wait_secs: 100\n", "distill"),
+        ] {
+            let (_home, file) = home_with(Some(yaml));
+            let err = with_env(&[], || DistillClientConfig::from_file(&file))
+                .expect_err(yaml)
+                .to_string();
+            assert!(err.contains(&format!("`{section}`")), "{yaml}: {err}");
         }
     }
 
@@ -853,7 +1017,10 @@ mod tests {
     fn default_client_config_is_valid_against_the_default_ack_wait() {
         let mut c = DistillClientConfig::default();
         c.validate().unwrap();
-        c.events.backend = hs_common::event_bus::EventsBackend::Nats;
+        c.events = Some(hs_common::event_bus::EventBusConfig {
+            backend: hs_common::event_bus::EventsBackend::Nats,
+            nats: hs_common::event_bus::config::NatsYaml::default(),
+        });
         c.validate()
             .expect("1800 s index timeout fits the 7200 s ack_wait");
         assert_eq!(c.index_timeout(), crate::client::DEFAULT_INDEX_TIMEOUT);
