@@ -5,20 +5,24 @@
 //! 1. **Local OpenAlex catalog** — `works.abstract_text` looked up by DOI.
 //!    Plain reconstructed text (parser already inverted the
 //!    `abstract_inverted_index` at ingest), highest quality.
-//! 2. **VLM-converted markdown** — heuristic extraction of an `Abstract`
+//! 2. **Catalog-stored abstract** — captured from whichever provider served
+//!    the paper at download time.
+//! 3. **VLM-converted markdown** — heuristic extraction of an `Abstract`
 //!    section from the converted paper. Coverage is partial: scribe's
 //!    `markdown_generator` emits "abstract"-classified regions as plain
 //!    paragraphs, so `## Abstract` only appears when the PDF's layout
 //!    triggered the `paragraph_title` classifier on the heading line.
 //!    Empirical hit rate on the existing corpus: ~24% `## Abstract`,
 //!    ~46% bare `Abstract`-on-its-own-line.
-//! 3. **Title only** — last resort so every downloaded paper makes it into
-//!    the abstracts index. Caller is responsible for falling through to
-//!    this when neither (1) nor (2) yielded usable text.
+//!
+//! A paper none of them yields a usable abstract for is not embedded: the
+//! collection holds abstracts, and a title-only vector would be a degraded
+//! substitute that search could not tell apart from a real hit. The caller
+//! skips such papers and says so.
 //!
 //! Coalesce is deterministic at index time (not a runtime fallback). The
-//! chosen source is stamped into the Qdrant payload and the catalog so
-//! downstream code can filter by provenance.
+//! chosen source is stamped into the catalog so downstream code can filter
+//! by provenance.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,8 +34,7 @@ use serde::{Deserialize, Serialize};
 pub const MIN_ABSTRACT_CHARS: usize = 100;
 
 /// Provenance of the abstract used for one paper's embedding. Serialized
-/// form is what gets stamped into `CatalogEntry::abstract_embed.source`
-/// and the Qdrant payload's `source` field.
+/// form is what gets stamped into `CatalogEntry::abstract_embed.source`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AbstractSource {
@@ -45,8 +48,6 @@ pub enum AbstractSource {
     Catalog,
     /// Extracted from the converted markdown's Abstract section.
     Markdown,
-    /// No usable abstract from either source — embed the title alone.
-    TitleOnly,
 }
 
 impl AbstractSource {
@@ -55,31 +56,27 @@ impl AbstractSource {
             AbstractSource::Openalex => "openalex",
             AbstractSource::Catalog => "catalog",
             AbstractSource::Markdown => "markdown",
-            AbstractSource::TitleOnly => "title_only",
         }
     }
 }
 
-/// Result of running the coalesce. `abstract_text` is `None` only when
-/// `source == TitleOnly` (the caller embeds just the title in that case).
+/// A usable abstract and where it came from.
 #[derive(Debug, Clone)]
 pub struct CoalescedAbstract {
     pub source: AbstractSource,
-    pub abstract_text: Option<String>,
+    pub abstract_text: String,
 }
 
 impl CoalescedAbstract {
     pub fn abstract_chars(&self) -> u32 {
-        self.abstract_text
-            .as_deref()
-            .map(|s| s.chars().count() as u32)
-            .unwrap_or(0)
+        self.abstract_text.chars().count() as u32
     }
 }
 
 /// Pick the best of (openalex catalog abstract, catalog-stored abstract,
-/// markdown-extracted abstract, title-only). Each candidate must be
-/// `>= MIN_ABSTRACT_CHARS` to be accepted; otherwise we fall through.
+/// markdown-extracted abstract), or `None` when none is usable. Each
+/// candidate must be `>= MIN_ABSTRACT_CHARS` to be accepted; otherwise we
+/// fall through.
 ///
 /// Inputs are pre-fetched so this function stays IO-free and testable.
 /// The caller (in the `hs distill abstracts build` flow) does the DOI
@@ -93,55 +90,44 @@ impl CoalescedAbstract {
 ///    (1) when OpenAlex was the provider, but also covers DOIs/papers not
 ///    in the local snapshot (Crossref, Semantic Scholar, arxiv...).
 /// 3. `Markdown` — heuristic extraction from VLM-converted PDF.
-/// 4. `TitleOnly` — last resort.
 pub fn coalesce_abstract(
     openalex_abstract: Option<String>,
     catalog_abstract: Option<String>,
     markdown_body: Option<&str>,
-) -> CoalescedAbstract {
+) -> Option<CoalescedAbstract> {
     if let Some(text) = openalex_abstract.filter(|s| s.trim().chars().count() >= MIN_ABSTRACT_CHARS)
     {
-        return CoalescedAbstract {
+        return Some(CoalescedAbstract {
             source: AbstractSource::Openalex,
-            abstract_text: Some(text.trim().to_string()),
-        };
+            abstract_text: text.trim().to_string(),
+        });
     }
 
     if let Some(text) = catalog_abstract.filter(|s| s.trim().chars().count() >= MIN_ABSTRACT_CHARS)
     {
-        return CoalescedAbstract {
+        return Some(CoalescedAbstract {
             source: AbstractSource::Catalog,
-            abstract_text: Some(text.trim().to_string()),
-        };
+            abstract_text: text.trim().to_string(),
+        });
     }
 
-    if let Some(body) = markdown_body {
-        if let Some(extracted) =
-            extract_markdown_abstract(body).filter(|s| s.chars().count() >= MIN_ABSTRACT_CHARS)
-        {
-            return CoalescedAbstract {
-                source: AbstractSource::Markdown,
-                abstract_text: Some(extracted),
-            };
-        }
-    }
-
-    CoalescedAbstract {
-        source: AbstractSource::TitleOnly,
-        abstract_text: None,
-    }
+    markdown_body
+        .and_then(extract_markdown_abstract)
+        .filter(|s| s.chars().count() >= MIN_ABSTRACT_CHARS)
+        .map(|extracted| CoalescedAbstract {
+            source: AbstractSource::Markdown,
+            abstract_text: extracted,
+        })
 }
 
-/// Build the embedding input string from a coalesce result. The title is
-/// always included as a prefix — standard practice for paper-level
-/// embeddings (SPECTER/SciNCL pretrain on `title [SEP] abstract`), and
-/// also the only signal we have for the `TitleOnly` source.
+/// Build the embedding input string from a coalesce result: the title as a
+/// prefix — standard practice for paper-level embeddings (SPECTER/SciNCL
+/// pretrain on `title [SEP] abstract`) — then the abstract.
 pub fn build_embed_input(title: Option<&str>, coalesced: &CoalescedAbstract) -> String {
     let title = title.unwrap_or("").trim();
-    match coalesced.abstract_text.as_deref() {
-        Some(abs) => format!("{title}\n\n{abs}").trim_start().to_string(),
-        None => title.to_string(),
-    }
+    format!("{title}\n\n{}", coalesced.abstract_text)
+        .trim_start()
+        .to_string()
 }
 
 /// Extract an abstract section from a converted-markdown paper.
@@ -186,18 +172,11 @@ pub fn extract_markdown_abstract(md: &str) -> Option<String> {
         .expect("SECTION_BREAK regex")
     });
 
-    // Round byte indices down to the nearest UTF-8 char boundary. The
-    // abstracts pipeline saw a crash on a Springer paper containing an
-    // em-dash (`–`, 3-byte UTF-8) right at the 4096-byte mark — `&str[..N]`
-    // panics when N lands inside a multi-byte char. `str::floor_char_boundary`
-    // is still nightly-only as of Rust 1.95, so do it by hand.
-    fn floor_boundary(s: &str, idx: usize) -> usize {
-        let mut i = idx.min(s.len());
-        while i > 0 && !s.is_char_boundary(i) {
-            i -= 1;
-        }
-        i
-    }
+    // Every byte offset taken from `md` is first floored to a UTF-8 char
+    // boundary: `&str[..N]` panics when N lands inside a multi-byte char (a
+    // Springer paper with an em-dash at byte 4096 crashed the abstracts
+    // pipeline), and the head/cap lengths below are plain byte counts.
+    use crate::text::floor_char_boundary as floor_boundary;
 
     let head_len = floor_boundary(md, md.len().min(8192));
     let head = &md[..head_len];
@@ -296,8 +275,9 @@ mod tests {
             Some("Catalog-stored abstract from a different provider that should not win because OpenAlex is present and authoritative.".to_string()),
             Some("## Abstract\nDifferent markdown content here that is also more than one hundred characters long."),
         );
+        let r = r.unwrap();
         assert_eq!(r.source, AbstractSource::Openalex);
-        assert!(r.abstract_text.as_ref().unwrap().contains("OpenAlex"));
+        assert!(r.abstract_text.contains("OpenAlex"));
     }
 
     #[test]
@@ -308,12 +288,9 @@ mod tests {
             Some("Catalog-stored abstract from Semantic Scholar — plenty long for the minimum-chars threshold used by the coalesce.".to_string()),
             Some("## Abstract\nMarkdown-derived would win if catalog were missing but the catalog tier sits above markdown."),
         );
+        let r = r.unwrap();
         assert_eq!(r.source, AbstractSource::Catalog);
-        assert!(r
-            .abstract_text
-            .as_ref()
-            .unwrap()
-            .starts_with("Catalog-stored"));
+        assert!(r.abstract_text.starts_with("Catalog-stored"));
     }
 
     #[test]
@@ -323,8 +300,9 @@ mod tests {
             None,
             Some("## Abstract\nMarkdown-derived abstract content that is plenty long for the minimum threshold check used by the coalesce.\n\n## Methods\nbody"),
         );
+        let r = r.unwrap();
         assert_eq!(r.source, AbstractSource::Markdown);
-        assert!(r.abstract_text.as_ref().unwrap().starts_with("Markdown"));
+        assert!(r.abstract_text.starts_with("Markdown"));
     }
 
     #[test]
@@ -335,11 +313,13 @@ mod tests {
         let cjk_100: String = "数".repeat(MIN_ABSTRACT_CHARS); // 100 chars, ~300 bytes
         let latin_100: String = "a".repeat(MIN_ABSTRACT_CHARS); // 100 chars, 100 bytes
         assert_eq!(
-            coalesce_abstract(Some(cjk_100), None, None).source,
+            coalesce_abstract(Some(cjk_100), None, None).unwrap().source,
             AbstractSource::Openalex
         );
         assert_eq!(
-            coalesce_abstract(Some(latin_100), None, None).source,
+            coalesce_abstract(Some(latin_100), None, None)
+                .unwrap()
+                .source,
             AbstractSource::Openalex
         );
 
@@ -347,44 +327,83 @@ mod tests {
         // (~297 bytes) would have wrongly passed a byte gate.
         let cjk_99: String = "数".repeat(MIN_ABSTRACT_CHARS - 1);
         let latin_99: String = "a".repeat(MIN_ABSTRACT_CHARS - 1);
-        assert_eq!(
-            coalesce_abstract(Some(cjk_99), None, None).source,
-            AbstractSource::TitleOnly
-        );
-        assert_eq!(
-            coalesce_abstract(Some(latin_99), None, None).source,
-            AbstractSource::TitleOnly
-        );
+        assert!(coalesce_abstract(Some(cjk_99), None, None).is_none());
+        assert!(coalesce_abstract(Some(latin_99), None, None).is_none());
     }
 
     #[test]
-    fn coalesce_falls_through_to_title_only() {
+    fn no_usable_abstract_yields_nothing_not_a_title_only_stand_in() {
         let r = coalesce_abstract(
             Some("too short".to_string()),
             Some("also short".to_string()),
             Some("no abstract marker here"),
         );
-        assert_eq!(r.source, AbstractSource::TitleOnly);
-        assert!(r.abstract_text.is_none());
+        assert!(r.is_none());
+        assert!(coalesce_abstract(None, None, None).is_none());
+    }
+
+    #[test]
+    fn a_too_short_markdown_abstract_is_not_accepted() {
+        let md = "## Abstract\nSee PDF.\n\n## Introduction\nbody";
+        assert!(coalesce_abstract(None, None, Some(md)).is_none());
     }
 
     #[test]
     fn build_embed_input_includes_title_and_abstract() {
         let r = CoalescedAbstract {
             source: AbstractSource::Openalex,
-            abstract_text: Some("This is the abstract.".to_string()),
+            abstract_text: "This is the abstract.".to_string(),
         };
         let s = build_embed_input(Some("Paper Title"), &r);
         assert_eq!(s, "Paper Title\n\nThis is the abstract.");
     }
 
     #[test]
-    fn build_embed_input_title_only() {
+    fn build_embed_input_without_a_title_is_the_abstract_alone() {
         let r = CoalescedAbstract {
-            source: AbstractSource::TitleOnly,
-            abstract_text: None,
+            source: AbstractSource::Catalog,
+            abstract_text: "Only the abstract.".to_string(),
         };
-        let s = build_embed_input(Some("Just a Title"), &r);
-        assert_eq!(s, "Just a Title");
+        assert_eq!(build_embed_input(None, &r), "Only the abstract.");
+        assert_eq!(build_embed_input(Some("  "), &r), "Only the abstract.");
+    }
+
+    #[test]
+    fn abstract_chars_counts_characters() {
+        let r = CoalescedAbstract {
+            source: AbstractSource::Markdown,
+            abstract_text: "数据 abc".to_string(),
+        };
+        assert_eq!(r.abstract_chars(), 6);
+    }
+
+    // ── char-boundary safety of the byte-offset slicing ────────────────
+
+    #[test]
+    fn multibyte_char_straddling_the_8kb_head_window_does_not_panic() {
+        // Byte 8192 falls inside a 3-byte char; the marker sits before it.
+        let md = format!("## Abstract\n{}€ and more text", "a".repeat(8192 - 12 - 1));
+        assert!(md.len() > 8192 && !md.is_char_boundary(8192));
+        let got = extract_markdown_abstract(&md).unwrap();
+        assert!(got.starts_with("aaa"));
+    }
+
+    #[test]
+    fn marker_after_a_multibyte_char_at_the_head_window_is_ignored_not_a_panic() {
+        // The marker lies wholly past the head window; nothing is found.
+        let md = format!("{}€\nAbstract\n{}", "a".repeat(8191), "text ".repeat(40));
+        assert!(!md.is_char_boundary(8192));
+        assert!(extract_markdown_abstract(&md).is_none());
+    }
+
+    #[test]
+    fn multibyte_text_before_and_inside_the_abstract_is_sliced_on_boundaries() {
+        let md = format!(
+            "Ünïcödé Títle — naïve façade\n\nAbstract\n{}\n\nIntroduction\nbody",
+            "数据分析表明模型稳定。".repeat(20)
+        );
+        let got = extract_markdown_abstract(&md).unwrap();
+        assert!(got.starts_with("数据"));
+        assert!(!got.contains("body"));
     }
 }

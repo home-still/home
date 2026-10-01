@@ -102,8 +102,8 @@ pub enum DistillCmd {
     /// (not per-chunk) embedding of `{title}\n\n{abstract}` for high-
     /// precision semantic search over papers' core arguments. Distinct
     /// from `academic_papers` (per-chunk body text). Abstract source is
-    /// `openalex` (DOI lookup) > `markdown` (`## Abstract` extraction) >
-    /// `title_only` last resort.
+    /// `openalex` (DOI lookup) > `catalog` (provider abstract) > `markdown`
+    /// (`## Abstract` extraction); a paper with none of them is skipped.
     #[command(subcommand)]
     Abstracts(AbstractsCmd),
 }
@@ -131,6 +131,6 @@ pub enum AbstractsCmd {
         server: Option<String>,
     },
     /// Report coverage: total catalog entries vs. abstract_embed stamps
-    /// broken down by source (openalex / markdown / title_only).
+    /// broken down by source (openalex / catalog / markdown).
     Status,
 }

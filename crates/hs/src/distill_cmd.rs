@@ -221,8 +221,8 @@ fn open_openalex_readonly_for_cli() -> Result<duckdb::Connection> {
 
 /// Build the `paper_abstracts` Qdrant collection from every catalog entry.
 ///
-/// Per the abstracts plan: coalesce (OpenAlex DuckDB, then markdown
-/// `## Abstract`, then title-only), embed `title + abstract` via the
+/// Per the abstracts plan: coalesce (OpenAlex DuckDB, then the catalog's
+/// provider abstract, then markdown `## Abstract`), embed `title + abstract` via the
 /// existing /distill route targeting `collection_name="paper_abstracts"`,
 /// then stamp the catalog so reconcile runs are idempotent.
 async fn cmd_abstracts_build(
@@ -255,7 +255,7 @@ async fn cmd_abstracts_build(
     let mut count_openalex = 0u32;
     let mut count_catalog = 0u32;
     let mut count_markdown = 0u32;
-    let mut count_title_only = 0u32;
+    let mut count_no_abstract = 0u32;
     let mut count_skipped = 0u32;
     let mut count_errored = 0u32;
 
@@ -277,10 +277,8 @@ async fn cmd_abstracts_build(
             .as_deref()
             .and_then(|doi| lookup_work_abstract_by_doi(&oa_conn, doi).ok().flatten());
         let openalex_abstract = oa_row.as_ref().and_then(|w| w.abstract_text.clone());
-        // Title coalesce: catalog > OpenAlex > stem. Falling back to the
-        // stem guarantees the embed_input is never empty, so every paper
-        // makes it into the `paper_abstracts` collection. The stem is a
-        // degraded signal for pure-DOI filenames but a useful one for
+        // Title coalesce: catalog > OpenAlex > stem. The stem is a degraded
+        // signal for pure-DOI filenames but a useful one for
         // author_year_topic personal-corpus naming.
         let title = entry
             .title
@@ -320,11 +318,18 @@ async fn cmd_abstracts_build(
             None
         };
 
-        let coalesced = coalesce_abstract(
+        // No usable abstract from any source: skip the paper. A title-only
+        // vector would be a degraded stand-in indistinguishable from a real
+        // abstract hit in search results.
+        let Some(coalesced) = coalesce_abstract(
             openalex_abstract,
             catalog_abstract,
             markdown_text.as_deref(),
-        );
+        ) else {
+            tracing::debug!("{stem}: no usable abstract — not embedded");
+            count_no_abstract += 1;
+            continue;
+        };
         let abstract_chars = coalesced.abstract_chars();
         let embed_input = build_embed_input(Some(&title), &coalesced);
 
@@ -352,7 +357,6 @@ async fn cmd_abstracts_build(
                     AbstractSource::Openalex => count_openalex += 1,
                     AbstractSource::Catalog => count_catalog += 1,
                     AbstractSource::Markdown => count_markdown += 1,
-                    AbstractSource::TitleOnly => count_title_only += 1,
                 }
             }
             Ok(_) => {
@@ -371,7 +375,7 @@ async fn cmd_abstracts_build(
     }
 
     reporter.finish(&format!(
-        "abstracts indexed: openalex={count_openalex} catalog={count_catalog} markdown={count_markdown} title_only={count_title_only} skipped={count_skipped} errors={count_errored}"
+        "abstracts indexed: openalex={count_openalex} catalog={count_catalog} markdown={count_markdown} no_abstract={count_no_abstract} skipped={count_skipped} errors={count_errored}"
     ));
     Ok(())
 }
