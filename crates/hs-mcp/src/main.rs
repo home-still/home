@@ -463,7 +463,39 @@ fn is_openalex_corpus_ready(conn: &duckdb::Connection) -> bool {
         [],
         |row| row.get(0),
     );
-    matches!(result, Ok(n) if n > 0)
+    match result {
+        Ok(n) => n > 0,
+        // A missing table is the expected "older DB" answer; say so rather
+        // than hiding whichever error this really was.
+        Err(e) => {
+            tracing::warn!("openalex readiness probe failed: {e}");
+            false
+        }
+    }
+}
+
+/// Split a service answer into the value and the reason it is missing, so a
+/// status tool reports why a service is down instead of a bare `null`.
+fn split_result<T, E: std::fmt::Display>(r: Result<T, E>) -> (Option<T>, Option<String>) {
+    match r {
+        Ok(v) => (Some(v), None),
+        Err(e) => (None, Some(format!("{e:#}"))),
+    }
+}
+
+/// A private read-only handle for one request. The shared connection is
+/// locked only long enough to clone it, so a slow query (a BM25 search) never
+/// blocks the others; a poisoned lock or a failed clone is an error that
+/// names its cause.
+fn openalex_request_conn(
+    shared: &std::sync::Mutex<duckdb::Connection>,
+) -> Result<duckdb::Connection, String> {
+    let guard = shared
+        .lock()
+        .map_err(|_| "the openalex DB handle is poisoned by an earlier panic".to_string())?;
+    guard
+        .try_clone()
+        .map_err(|e| format!("opening a request handle on the openalex DB failed: {e}"))
 }
 
 /// Run an OpenAlex SQL query inside spawn_blocking, return rows serialized as
@@ -474,18 +506,15 @@ async fn run_openalex_query_json(
     sql: &str,
     params: Vec<duckdb::types::Value>,
 ) -> Result<String, String> {
-    let conn_arc = server
+    let shared = server
         .openalex_db
         .as_ref()
-        .ok_or_else(openalex_unavailable_error)?
-        .clone();
+        .ok_or_else(openalex_unavailable_error)?;
+    let conn = openalex_request_conn(shared)?;
     let sql = sql.to_string();
     tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let conn = conn_arc
-            .lock()
-            .map_err(|_| "openalex DB mutex poisoned".to_string())?;
         let rows_json = collect_rows_json(&conn, &sql, duckdb::params_from_iter(params.iter()))?;
-        Ok(serde_json::to_string_pretty(&rows_json).unwrap_or_default())
+        to_json(&rows_json)
     })
     .await
     .map_err(|e| format!("join: {e}"))?
@@ -761,13 +790,13 @@ impl HomeStillMcp {
         // gate evaluates once at server startup; Phase 6 of the migration
         // restarts hs-serve-mcp, which re-evaluates against the now-set
         // sentinel and re-exposes the tools.
-        let openalex_corpus_ready = openalex_db
-            .as_ref()
-            .map(|arc| {
-                let conn = arc.lock().unwrap();
+        let openalex_corpus_ready = match openalex_db.as_ref() {
+            Some(shared) => {
+                let conn = openalex_request_conn(shared).map_err(|e| anyhow::anyhow!(e))?;
                 is_openalex_corpus_ready(&conn)
-            })
-            .unwrap_or(false);
+            }
+            None => false,
+        };
 
         let mut tool_router = Self::tool_router();
         if !openalex_corpus_ready {
@@ -1335,7 +1364,7 @@ impl HomeStillMcp {
             })
             .collect();
 
-        Ok(serde_json::to_string_pretty(&entries).unwrap_or_default())
+        to_json(&entries)
     }
 
     #[tool(
@@ -1455,7 +1484,7 @@ impl HomeStillMcp {
         let limit = p.limit.unwrap_or(30);
         events.truncate(limit);
 
-        Ok(serde_json::to_string_pretty(&events).unwrap_or_default())
+        to_json(&events)
     }
 
     #[tool(
@@ -1479,7 +1508,7 @@ impl HomeStillMcp {
         .await
         .map_err(|e| e.to_string())?
         {
-            Some(entry) => Ok(serde_json::to_string_pretty(&entry).unwrap_or_default()),
+            Some(entry) => to_json(&entry),
             None => Err(format!("No catalog entry found for '{}'", p.stem)),
         }
     }
@@ -1686,7 +1715,7 @@ impl HomeStillMcp {
             .map(|r| serde_json::json!({ "stem": r.stem, "source_ext": r.source_ext }))
             .collect();
 
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        to_json(&serde_json::json!({
             "dry_run": true,
             "requested_apply_ignored": client_wanted_apply,
             "disk_no_catalog": {
@@ -1729,7 +1758,6 @@ impl HomeStillMcp {
                 "samples": stuck_samples,
             },
         }))
-        .unwrap_or_default())
     }
 
     #[tool(
@@ -1796,7 +1824,7 @@ impl HomeStillMcp {
 
         // rc.306 P0-6: apply path is CLI-only. MCP emits the report and stops.
         let _ = dry_run_forced;
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        to_json(&serde_json::json!({
             "dry_run": true,
             "mcp_forced_dry_run": true,
             "apply_hint": "use `hs catalog dedupe-url-encoded --apply` (CLI-only) for the write path",
@@ -1804,7 +1832,6 @@ impl HomeStillMcp {
             "would_delete_encoded_rows": total,
             "samples": samples,
         }))
-        .unwrap_or_default())
     }
 
     // ── Markdown Tools ─────────────────────────────────────────
@@ -1850,7 +1877,7 @@ impl HomeStillMcp {
             }));
         }
 
-        Ok(serde_json::to_string_pretty(&entries).unwrap_or_default())
+        to_json(&entries)
     }
 
     #[tool(
@@ -1936,13 +1963,12 @@ impl HomeStillMcp {
         let samples: Vec<String> = take.iter().take(10).map(|(s, _)| s.clone()).collect();
 
         if p.dry_run {
-            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            return to_json(&serde_json::json!({
                 "dry_run": true,
                 "candidates": total,
                 "would_backfill": take.len(),
                 "samples": samples,
-            }))
-            .unwrap_or_default());
+            }));
         }
 
         // Metadata fan-in through the same shared providers every tool uses.
@@ -2012,7 +2038,7 @@ impl HomeStillMcp {
             }
         }
 
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        to_json(&serde_json::json!({
             "dry_run": false,
             "candidates": total,
             "backfilled": backfilled,
@@ -2020,7 +2046,6 @@ impl HomeStillMcp {
             "samples": samples,
             "errors": errors,
         }))
-        .unwrap_or_default())
     }
 
     // ── Scribe Tools ───────────────────────────────────────────
@@ -2040,14 +2065,15 @@ impl HomeStillMcp {
             .map_err(|e| e.to_string())?
             .ok_or("No scribe server configured")?;
 
-        let health = client.health().await.ok();
-        let readiness = client.readiness().await.ok();
+        let (health, health_error) = split_result(client.health().await);
+        let (readiness, readiness_error) = split_result(client.readiness().await);
 
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        to_json(&serde_json::json!({
             "health": health,
+            "health_error": health_error,
             "readiness": readiness,
+            "readiness_error": readiness_error,
         }))
-        .unwrap_or_default())
     }
 
     #[tool(
@@ -2104,7 +2130,7 @@ impl HomeStillMcp {
             Ok(hits) => {
                 let include_text = p.include_text.unwrap_or(true);
                 let out = map_distill_search_hits(hits, include_text);
-                Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
+                to_json(&out)
             }
             Err(e) => Err(format!("Search failed: {e}")),
         }
@@ -2146,7 +2172,7 @@ impl HomeStillMcp {
             Ok(hits) => {
                 let include_text = p.include_text.unwrap_or(true);
                 let out = map_distill_search_hits(hits, include_text);
-                Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
+                to_json(&out)
             }
             Err(e) => Err(format!("abstract_search failed: {e}")),
         }
@@ -2167,14 +2193,15 @@ impl HomeStillMcp {
             .map_err(|e| e.to_string())?
             .ok_or("No distill server configured")?;
 
-        let health = client.health().await.ok();
-        let status = client.status().await.ok();
+        let (health, health_error) = split_result(client.health().await);
+        let (status, status_error) = split_result(client.status().await);
 
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        to_json(&serde_json::json!({
             "health": health,
+            "health_error": health_error,
             "status": status,
+            "status_error": status_error,
         }))
-        .unwrap_or_default())
     }
 
     #[tool(
@@ -2196,11 +2223,10 @@ impl HomeStillMcp {
             .ok_or("No distill server configured")?;
 
         match client.doc_exists(&p.doc_id).await {
-            Ok(exists) => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            Ok(exists) => to_json(&serde_json::json!({
                 "doc_id": p.doc_id,
                 "indexed": exists,
-            }))
-            .unwrap_or_default()),
+            })),
             Err(e) => Err(format!("Check failed: {e}")),
         }
     }
@@ -2296,7 +2322,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Scan every markdown object for VLM repetition artifacts and report doc_ids whose cleanup truncation count exceeds `threshold` (default 20). Read-only — reports only, does not purge or delete. Pair with `distill_purge` to remediate poisoned docs.",
+        description = "Scan every markdown object for VLM repetition artifacts and report doc_ids whose cleanup truncation count exceeds `threshold` (default 20). Read-only — reports only, does not purge or delete; remediate flagged documents with the CLI (`hs distill purge <doc_id>` or a re-index). An unreadable or non-UTF-8 object is an error, never skipped.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2329,15 +2355,13 @@ impl HomeStillMcp {
             let bytes = match self.storage.get(&obj.key).await {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!("skip {}: get failed: {e}", obj.key);
-                    continue;
+                    return Err(format!("reading {} failed: {e:#}", obj.key));
                 }
             };
             let original = match String::from_utf8(bytes) {
                 Ok(s) => s,
-                Err(_) => {
-                    tracing::warn!("skip {}: not UTF-8", obj.key);
-                    continue;
+                Err(e) => {
+                    return Err(format!("{} is not valid UTF-8: {e}", obj.key));
                 }
             };
             let (cleaned, breakdown) = hs_scribe::postprocess::clean_repetitions(&original);
@@ -2363,13 +2387,12 @@ impl HomeStillMcp {
             }));
         }
 
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        to_json(&serde_json::json!({
             "scanned": scanned,
             "threshold": threshold,
             "flagged_count": flagged.len(),
             "flagged": flagged,
         }))
-        .unwrap_or_default())
     }
 
     #[tool(
@@ -2447,13 +2470,12 @@ impl HomeStillMcp {
         let sample: Vec<String> = take.iter().take(10).map(|s| (*s).clone()).collect();
 
         if p.dry_run {
-            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            return to_json(&serde_json::json!({
                 "candidates": total,
                 "would_index": take.len(),
                 "samples": sample,
                 "dry_run": true,
-            }))
-            .unwrap_or_default());
+            }));
         }
 
         let client = self
@@ -2546,7 +2568,7 @@ impl HomeStillMcp {
                 })
             })
             .collect();
-        Ok(serde_json::to_string_pretty(&json).unwrap_or_default())
+        to_json(&json)
     }
 
     #[tool(
@@ -2580,7 +2602,7 @@ impl HomeStillMcp {
                 })
             })
             .collect();
-        Ok(serde_json::to_string_pretty(&json).unwrap_or_default())
+        to_json(&json)
     }
 
     #[tool(
@@ -2624,14 +2646,13 @@ impl HomeStillMcp {
         let outcome = personal::services::ingest::ingest(&cfg, &path, opts)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        to_json(&serde_json::json!({
             "stem": outcome.stem,
             "title": outcome.title,
             "category": outcome.category,
             "chunks_indexed": outcome.chunk_count,
             "source_file": p.filename,
         }))
-        .unwrap_or_default())
     }
 
     #[tool(
@@ -2651,11 +2672,10 @@ impl HomeStillMcp {
         let chunks = personal::services::catalog::reindex(&cfg, &p.stem)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        to_json(&serde_json::json!({
             "stem": p.stem,
             "chunks_indexed": chunks,
         }))
-        .unwrap_or_default())
     }
 
     // ── System Tools ───────────────────────────────────────────
@@ -2675,7 +2695,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let include_repaired = p.include_repaired.unwrap_or(false);
         let snap = self.build_status_snapshot(20, include_repaired).await;
-        Ok(serde_json::to_string_pretty(&snap).unwrap_or_default())
+        to_json(&snap)
     }
 
     // ── OpenAlex (local DuckDB) Tools ────────────────────────────
@@ -2716,9 +2736,9 @@ impl HomeStillMcp {
             SELECT openalex_id, doi, title, publication_year, cited_by_count, bm25
             FROM ranked
             WHERE bm25 IS NOT NULL
-              AND publication_year >= COALESCE(?, 0)
-              AND publication_year <= COALESCE(?, 9999)
-              AND cited_by_count >= COALESCE(?, 0)
+              AND (CAST(? AS BIGINT) IS NULL OR publication_year >= CAST(? AS BIGINT))
+              AND (CAST(? AS BIGINT) IS NULL OR publication_year <= CAST(? AS BIGINT))
+              AND (CAST(? AS BIGINT) IS NULL OR cited_by_count >= CAST(? AS BIGINT))
             {order_by}
             LIMIT ?;
             "#
@@ -2729,7 +2749,10 @@ impl HomeStillMcp {
             vec![
                 duckdb::types::Value::Text(p.query),
                 opt_value(p.year_from.map(i64::from)),
+                opt_value(p.year_from.map(i64::from)),
                 opt_value(p.year_to.map(i64::from)),
+                opt_value(p.year_to.map(i64::from)),
+                opt_value(p.min_citations.map(i64::from)),
                 opt_value(p.min_citations.map(i64::from)),
                 duckdb::types::Value::BigInt(limit),
             ],
@@ -2750,31 +2773,34 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<OpenAlexGetParams>,
     ) -> Result<String, String> {
-        let conn_arc = self
-            .openalex_db
-            .as_ref()
-            .ok_or_else(openalex_unavailable_error)?
-            .clone();
+        let conn = openalex_request_conn(
+            self.openalex_db
+                .as_ref()
+                .ok_or_else(openalex_unavailable_error)?,
+        )?;
         let id = p.id_or_doi.clone();
+        // An OpenAlex id and a DOI can never be confused, so each goes to the
+        // one indexed column that holds it (the shared classification also
+        // normalizes the DOI on the query side).
+        let (column, key) = match openalex_ingest::lookup::classify(&p.id_or_doi) {
+            openalex_ingest::lookup::Key::OpenAlexId(k) => ("openalex_id", k),
+            openalex_ingest::lookup::Key::Doi(k) => ("doi", k),
+        };
         let result: Result<serde_json::Value, String> = tokio::task::spawn_blocking(move || {
-            let conn = conn_arc
-                .lock()
-                .map_err(|_| "openalex DB mutex poisoned".to_string())?;
-
             // Work row
             let work = {
                 let mut stmt = conn
-                    .prepare(
+                    .prepare(&format!(
                         "SELECT openalex_id, doi, title, abstract_text, publication_year,
                                 publication_date, language, type, cited_by_count, is_retracted,
                                 is_oa, oa_url, primary_source_id
                          FROM works
-                         WHERE openalex_id = ? OR doi = ?
-                         LIMIT 1",
-                    )
+                         WHERE {column} = ?
+                         LIMIT 1"
+                    ))
                     .map_err(|e| format!("prepare: {e}"))?;
                 let mut rows = stmt
-                    .query(duckdb::params![id, id])
+                    .query(duckdb::params![key])
                     .map_err(|e| format!("query: {e}"))?;
                 let cols: Vec<String> = rows
                     .as_ref()
@@ -2829,7 +2855,7 @@ impl HomeStillMcp {
         .map_err(|e| format!("join: {e}"))?;
 
         let v = result?;
-        Ok(serde_json::to_string_pretty(&v).unwrap_or_default())
+        to_json(&v)
     }
 
     #[tool(
@@ -2886,7 +2912,7 @@ impl HomeStillMcp {
              FROM work_references wr
              LEFT JOIN works w ON w.openalex_id = wr.work_id
              WHERE wr.referenced_work_id = ?
-               AND w.publication_year >= COALESCE(?, 0)
+               AND (CAST(? AS BIGINT) IS NULL OR w.publication_year >= CAST(? AS BIGINT))
              {order_by}
              LIMIT ?"
         );
@@ -2895,6 +2921,7 @@ impl HomeStillMcp {
             &sql,
             vec![
                 duckdb::types::Value::Text(p.openalex_id),
+                opt_value(p.year_from.map(i64::from)),
                 opt_value(p.year_from.map(i64::from)),
                 duckdb::types::Value::BigInt(limit),
             ],
@@ -2962,7 +2989,9 @@ impl HomeStillMcp {
                     continue;
                 }
             };
-            let health = client.health().await.ok();
+            let health_res = client.health().await;
+            let health_err = health_res.as_ref().err().map(|e| format!("{e:#}"));
+            let health = health_res.ok();
             let readiness = client.readiness().await.ok();
             let status = client.status().await.ok();
 
@@ -2988,7 +3017,7 @@ impl HomeStillMcp {
                 .unwrap_or_default();
             let in_flight = readiness.as_ref().map(|r| r.in_flight as u64).unwrap_or(0);
             let activity = if !healthy {
-                "unhealthy".to_string()
+                format!("unhealthy: {}", health_err.as_deref().unwrap_or("unknown"))
             } else if in_flight > 0 {
                 format!("{in_flight} embedding")
             } else {
@@ -3041,7 +3070,9 @@ impl HomeStillMcp {
                     continue;
                 }
             };
-            let health = client.health().await.ok();
+            let health_res = client.health().await;
+            let health_err = health_res.as_ref().err().map(|e| format!("{e:#}"));
+            let health = health_res.ok();
             let readiness = client.readiness().await.ok();
 
             // A scribe whose VLM backend can't take work answers 503
@@ -3065,7 +3096,10 @@ impl HomeStillMcp {
             let activity = if backend_unavailable {
                 "backend unavailable".to_string()
             } else if !healthy {
-                "unhealthy".to_string()
+                format!(
+                    "unhealthy: {}",
+                    health_err.as_deref().unwrap_or("status not ok")
+                )
             } else if in_flight > 0 {
                 format!("{in_flight} converting")
             } else {

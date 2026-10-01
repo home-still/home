@@ -45,7 +45,9 @@ hs serve mcp
 
 ### Streamable HTTP / SSE (remote)
 
-For manual remote access via the cloud gateway:
+For manual remote access via the cloud gateway. The HTTP transport **requires** a shared backend token: set `HS_BACKEND_TOKEN` (at least 32 bytes, e.g. `openssl rand -hex 32`) in the environment or in `~/.home-still/secrets.env`; `hs-mcp --serve` refuses to start without it, and every request (any path) must carry `Authorization: Bearer <token>` or gets a 401 with a JSON-RPC error body. The gateway and any other client of this port must send the same secret (`AuthedHttp::plain` in `hs-common` does when the variable is set). Stdio mode needs no token. Idle sessions are dropped after `--session-idle-timeout-secs` (default 3600); clients should `DELETE` their session when done. Tools that run longer than that without progress keep their session alive by sending progress notifications when the caller supplied a progress token.
+
+Notes on tool behavior: `paper_search` always returns `{"papers": [...], "provider_failures": [...]}`; `scribe_convert` takes a stem and converts the stored PDF/HTML/EPUB through the same functions the scribe watcher uses (existing markdown is re-announced, not converted again); `distill_reindex` replaces vectors in place and never deletes first. Every stem argument is validated (no `/`, `\`, `..`, NUL, empty) and rejected as invalid params.
 
 ```sh
 hs-mcp --serve 127.0.0.1:7445

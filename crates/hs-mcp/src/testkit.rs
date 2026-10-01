@@ -225,6 +225,42 @@ pub fn server_with_bus(storage: Arc<dyn Storage>, bus: Arc<RecordingBus>) -> Hom
     .unwrap()
 }
 
+/// A server over a synthetic OpenAlex DuckDB (a file in `dir`, never the real
+/// corpus) holding a handful of works. The readiness sentinel is set so the
+/// `openalex_*` tools stay exposed.
+pub fn server_with_openalex(dir: &std::path::Path) -> HomeStillMcp {
+    let conn = duckdb::Connection::open(dir.join("openalex.duckdb")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE _corpus_state(component VARCHAR);
+         INSERT INTO _corpus_state VALUES ('openalex_works');
+         CREATE TABLE works(openalex_id VARCHAR, doi VARCHAR, title VARCHAR, abstract_text VARCHAR,
+             publication_year INTEGER, publication_date VARCHAR, language VARCHAR, type VARCHAR,
+             cited_by_count BIGINT, is_retracted BOOLEAN, is_oa BOOLEAN, oa_url VARCHAR,
+             primary_source_id VARCHAR);
+         INSERT INTO works VALUES
+           ('W1', '10.1234/abc', 'Old paper', NULL, 1999, NULL, 'en', 'article', 5, false, false, NULL, NULL),
+           ('W2', '10.1234/new', 'New paper', NULL, 2020, NULL, 'en', 'article', 9, false, false, NULL, NULL),
+           ('W3', NULL, 'Undated paper', NULL, NULL, NULL, 'en', 'article', NULL, false, false, NULL, NULL),
+           ('W9', '10.1234/cited', 'Cited work', NULL, 1990, NULL, 'en', 'article', 3, false, false, NULL, NULL);
+         CREATE TABLE work_references(work_id VARCHAR, referenced_work_id VARCHAR);
+         INSERT INTO work_references VALUES ('W1','W9'), ('W2','W9'), ('W3','W9');
+         CREATE TABLE work_authorships(work_id VARCHAR, author_id VARCHAR, author_position VARCHAR,
+             raw_affiliation_string VARCHAR, institution_id VARCHAR);
+         CREATE TABLE authors(openalex_id VARCHAR, display_name VARCHAR, cited_by_count BIGINT);
+         CREATE TABLE work_topics(work_id VARCHAR, topic_id VARCHAR, score DOUBLE);
+         CREATE TABLE topics(openalex_id VARCHAR, display_name VARCHAR);",
+    )
+    .unwrap();
+    let mut d = deps(
+        FaultyStorage::new(),
+        Arc::new(NoOpBus),
+        Vec::new(),
+        Vec::new(),
+    );
+    d.openalex_db = Some(Arc::new(Mutex::new(conn)));
+    HomeStillMcp::from_deps(d).unwrap()
+}
+
 /// Put a markdown document (and optionally a catalog row) into `storage`.
 pub async fn seed_markdown(storage: &dyn Storage, stem: &str, body: &str) {
     storage

@@ -315,3 +315,88 @@ mod convert {
         assert_eq!(bus.published.lock().unwrap().len(), 1);
     }
 }
+
+mod openalex {
+    use super::*;
+    use crate::testkit::server_with_openalex;
+    use crate::{OpenAlexCitationsParams, OpenAlexGetParams};
+
+    fn ids(out: &str) -> Vec<String> {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(out).unwrap();
+        let mut ids: Vec<String> = rows
+            .iter()
+            .map(|r| r["openalex_id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn citations(year_from: Option<u16>) -> Parameters<OpenAlexCitationsParams> {
+        Parameters(OpenAlexCitationsParams {
+            openalex_id: "W9".into(),
+            limit: None,
+            year_from,
+            sort: None,
+        })
+    }
+
+    /// RA-107: `publication_year >= COALESCE(?, 0)` dropped works with no year
+    /// even when no year filter was given.
+    #[tokio::test]
+    async fn no_year_filter_keeps_works_without_a_year() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = server_with_openalex(dir.path());
+
+        let all = mcp.openalex_citations(citations(None)).await.unwrap();
+        assert_eq!(ids(&all), ["W1", "W2", "W3"]);
+
+        let recent = mcp.openalex_citations(citations(Some(2000))).await.unwrap();
+        assert_eq!(ids(&recent), ["W2"], "a real filter still filters");
+    }
+
+    #[tokio::test]
+    async fn get_resolves_ids_and_normalizes_dois_on_the_query_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = server_with_openalex(dir.path());
+        for query in [
+            "W1",
+            "https://openalex.org/W1",
+            "10.1234/ABC",
+            "https://doi.org/10.1234/abc",
+        ] {
+            let out = mcp
+                .openalex_get(Parameters(OpenAlexGetParams {
+                    id_or_doi: query.into(),
+                }))
+                .await
+                .unwrap();
+            let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(out["openalex_id"], "W1", "{query}");
+        }
+        let missing = mcp
+            .openalex_get(Parameters(OpenAlexGetParams {
+                id_or_doi: "10.9999/none".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(missing.contains("not_found"), "{missing}");
+    }
+
+    /// Requests do not share one locked connection: a handle held by a slow
+    /// request does not stop the next one.
+    #[tokio::test]
+    async fn a_held_request_handle_does_not_block_other_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = server_with_openalex(dir.path());
+        let shared = mcp.openalex_db.as_ref().unwrap();
+        let _slow = crate::openalex_request_conn(shared).unwrap();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mcp.openalex_citations(citations(None)),
+        )
+        .await
+        .expect("must not wait for the other handle")
+        .unwrap();
+        assert_eq!(ids(&out).len(), 3);
+    }
+}

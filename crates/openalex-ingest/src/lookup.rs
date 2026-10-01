@@ -55,12 +55,12 @@ const BY_DOI_SQL: &str = "SELECT openalex_id, doi, title, abstract_text, publica
 /// the one column that holds it. A single `openalex_id = ? OR doi = ?`
 /// predicate cannot use either index and scans all of `works`.
 #[derive(Debug, PartialEq, Eq)]
-enum Key {
+pub enum Key {
     OpenAlexId(String),
     Doi(String),
 }
 
-fn classify(id_or_doi: &str) -> Key {
+pub fn classify(id_or_doi: &str) -> Key {
     let trimmed = id_or_doi.trim();
     let bare = strip_openalex_id(trimmed);
     if parse_work_id_u64(bare).is_some() {
