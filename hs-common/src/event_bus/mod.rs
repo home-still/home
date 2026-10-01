@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(feature = "events-nats")]
@@ -26,10 +27,31 @@ pub struct Event {
 enum AckHandle {
     /// No-op (tests / legacy publishers). ack/nak/term return Ok.
     None,
+    /// Records the decision for a test to read back ([`Event::recording`]).
+    Recording(Arc<Mutex<Vec<Settlement>>>),
     /// Boxed to keep `Event` small — `jetstream::Message` carries the
     /// full received payload and metadata (~400 B).
     #[cfg(feature = "events-nats")]
     JetStream(Box<async_nats::jetstream::Message>),
+}
+
+/// What a subscriber decided for one event: see [`Event::recording`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settlement {
+    Ack,
+    Nak(Option<Duration>),
+    Term,
+}
+
+/// Read-back side of [`Event::recording`].
+#[derive(Debug, Clone, Default)]
+pub struct SettlementLog(Arc<Mutex<Vec<Settlement>>>);
+
+impl SettlementLog {
+    /// Every decision made so far, in order.
+    pub fn decisions(&self) -> Vec<Settlement> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 impl std::fmt::Debug for Event {
@@ -52,11 +74,36 @@ impl Event {
         }
     }
 
+    /// Build an event whose ack/nak/term decision is recorded in the returned
+    /// log instead of sent anywhere. For tests of subscriber loops: it lets a
+    /// test assert *what was decided* for an event (for example that a
+    /// handler panic terminated it) without a broker.
+    pub fn recording(
+        subject: impl Into<String>,
+        payload: impl Into<Vec<u8>>,
+    ) -> (Self, SettlementLog) {
+        let log = SettlementLog::default();
+        let event = Self {
+            subject: subject.into(),
+            payload: payload.into(),
+            handle: AckHandle::Recording(log.0.clone()),
+        };
+        (event, log)
+    }
+
+    fn record(log: &Mutex<Vec<Settlement>>, decision: Settlement) {
+        log.lock().unwrap_or_else(|e| e.into_inner()).push(decision);
+    }
+
     /// Acknowledge successful processing. For JetStream, removes the
     /// message from the work queue. For non-durable buses, no-op.
     pub async fn ack(&self) -> anyhow::Result<()> {
         match &self.handle {
             AckHandle::None => Ok(()),
+            AckHandle::Recording(log) => {
+                Self::record(log, Settlement::Ack);
+                Ok(())
+            }
             #[cfg(feature = "events-nats")]
             AckHandle::JetStream(m) => m
                 .ack()
@@ -71,6 +118,10 @@ impl Event {
     pub async fn nak(&self, delay: Option<Duration>) -> anyhow::Result<()> {
         match &self.handle {
             AckHandle::None => Ok(()),
+            AckHandle::Recording(log) => {
+                Self::record(log, Settlement::Nak(delay));
+                Ok(())
+            }
             #[cfg(feature = "events-nats")]
             AckHandle::JetStream(m) => m
                 .ack_with(async_nats::jetstream::AckKind::Nak(delay))
@@ -85,6 +136,10 @@ impl Event {
     pub async fn term(&self) -> anyhow::Result<()> {
         match &self.handle {
             AckHandle::None => Ok(()),
+            AckHandle::Recording(log) => {
+                Self::record(log, Settlement::Term);
+                Ok(())
+            }
             #[cfg(feature = "events-nats")]
             AckHandle::JetStream(m) => m
                 .ack_with(async_nats::jetstream::AckKind::Term)
@@ -110,7 +165,13 @@ impl Event {
     }
 }
 
-pub type EventStream = Pin<Box<dyn Stream<Item = Event> + Send>>;
+/// What [`EventBus::consume`] yields. An `Err` item means delivery is
+/// broken (the consumer was deleted, the connection dropped, the broker
+/// answered with an error) and is the last item: the subscriber must stop,
+/// finish the handlers it already started, and fail, so its supervisor
+/// restarts it on a fresh consumer. `None` (the stream ending without an
+/// error) also means consumption has stopped.
+pub type EventStream = Pin<Box<dyn Stream<Item = anyhow::Result<Event>> + Send>>;
 
 /// Identifier of a logical subscribe target. A subject selector plus a
 /// durable consumer name. Multiple processes sharing the same
@@ -137,12 +198,16 @@ pub trait EventBus: Send + Sync {
     async fn publish(&self, subject: &str, payload: &[u8]) -> anyhow::Result<()>;
 
     /// Pull-consume messages matching `spec`. Each yielded [`Event`]
-    /// must be explicitly acked/naked/termed by the caller.
+    /// must be explicitly acked/naked/termed by the caller. See
+    /// [`EventStream`] for how delivery failures are reported.
     async fn consume(&self, spec: &ConsumerSpec) -> anyhow::Result<EventStream>;
 }
 
-/// A bus that silently drops publishes and produces no events. Useful as a
-/// default during migration and in tests.
+/// A bus that drops every publish and delivers nothing, selected by an
+/// explicit `events.backend: noop` (and by tests). It is never a default:
+/// see [`EventBusConfig::build_required`]. Publishing is accepted and
+/// discarded on purpose; consuming is refused, because a consumer on a bus
+/// that never delivers would run forever doing nothing.
 pub struct NoOpBus;
 
 #[async_trait]
@@ -151,8 +216,12 @@ impl EventBus for NoOpBus {
         Ok(())
     }
 
-    async fn consume(&self, _spec: &ConsumerSpec) -> anyhow::Result<EventStream> {
-        Ok(Box::pin(futures::stream::pending()))
+    async fn consume(&self, spec: &ConsumerSpec) -> anyhow::Result<EventStream> {
+        anyhow::bail!(
+            "events.backend is `noop`: it never delivers {}; set events.backend to `nats` to \
+             consume events",
+            spec.subject
+        )
     }
 }
 
@@ -178,17 +247,20 @@ pub mod specs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
     use std::time::Duration;
 
     #[tokio::test]
-    async fn noop_publish_ok_consume_pending() {
+    async fn noop_accepts_publishes_and_refuses_to_be_consumed() {
         let bus = NoOpBus;
         bus.publish("x.y", b"hi").await.unwrap();
 
-        let mut stream = bus.consume(&specs::PAPERS_INGESTED).await.unwrap();
-        let got = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
-        assert!(got.is_err(), "NoOpBus consume should never yield");
+        let err = bus
+            .consume(&specs::PAPERS_INGESTED)
+            .await
+            .err()
+            .expect("a consumer on the noop bus must fail, not idle")
+            .to_string();
+        assert!(err.contains("papers.ingested"), "{err}");
     }
 
     #[tokio::test]

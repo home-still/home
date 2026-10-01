@@ -30,15 +30,11 @@ gpu-async = [
 service = [
     "http",
     "gpu-async",
-    "dep:serde",
-    "dep:serde_json",
     "dep:async-trait",
     "dep:futures",
     "dep:tracing",
 ]
 catalog = [
-    "dep:serde",
-    "dep:serde_yaml_ng",
     "dep:chrono",
 ]
 compose = [
@@ -51,8 +47,6 @@ auth = [
     "dep:sha2",
     "dep:base64",
     "dep:rand",
-    "dep:serde",
-    "dep:serde_json",
     "dep:tokio",
     "dep:http",
     "dep:subtle",
@@ -61,8 +55,6 @@ storage = [
     "dep:anyhow",
     "dep:async-trait",
     "dep:tokio",
-    "dep:serde",
-    "dep:serde_yaml_ng",
     "dep:futures",
     "dep:chrono",
     "dep:gethostname",
@@ -85,14 +77,19 @@ events = [
     "dep:async-trait",
     "dep:tokio",
     "dep:futures",
-    "dep:serde",
-    "dep:serde_json",
     "dep:tracing",
 ]
 events-nats = [
     "events",
     "dep:async-nats",
     "dep:bytes",
+]
+# `panic_guard::catch_panic` plus the axum middleware that turns a handler
+# panic into a 500 (RA-5). The async helper alone needs only `events`.
+catch-panic = [
+    "dep:axum",
+    "dep:futures",
+    "dep:tracing",
 ]
 logging = [
     "storage",
@@ -102,7 +99,6 @@ logging = [
     "dep:gethostname",
     "dep:uuid",
     "dep:chrono",
-    "dep:serde_json",
     "dep:anyhow",
     "dep:tokio",
     "tokio/sync",
@@ -123,8 +119,9 @@ dirs = "6"
 
 # service feature deps
 reqwest = { version = "0.12", features = ["json", "multipart"], default-features = false, optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
 async-trait = { version = "0.1", optional = true }
 anyhow = { version = "1", optional = true }
 futures = { version = "0.3", optional = true }
@@ -134,7 +131,6 @@ tracing = { version = "0.1", optional = true }
 tokio = { workspace = true, optional = true }
 
 # catalog feature deps
-serde_yaml_ng = { version = "0.10", optional = true }
 chrono = { version = "0.4", optional = true }
 
 # auth feature deps
@@ -153,6 +149,9 @@ url = { version = "2", optional = true }
 # events feature deps
 async-nats = { version = "0.47", optional = true }
 
+# catch-panic feature deps
+axum = { workspace = true, optional = true }
+
 # logging feature deps
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 tracing-appender = { version = "0.2", optional = true }
@@ -163,3 +162,4 @@ uuid = { workspace = true, optional = true }
 tempfile = "3"
 tokio = { workspace = true }
 tracing = "0.1"
+tower = { version = "0.5", features = ["util"] }

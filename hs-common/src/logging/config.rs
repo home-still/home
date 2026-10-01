@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,9 @@ impl Default for SpoolCaps {
 pub struct LoggingConfig {
     pub service_name: String,
     pub hostname: String,
+    /// The directory logs live under (`home.log_dir`); the spool is below
+    /// it and, with a local `storage:`, so is the archive.
+    pub log_dir: PathBuf,
     pub spool_dir: PathBuf,
     pub rotate_max_bytes: u64,
     pub rotate_interval: Duration,
@@ -74,14 +77,18 @@ pub struct LoggingConfig {
 }
 
 impl LoggingConfig {
-    pub fn for_service(name: impl Into<String>) -> Self {
+    /// `log_dir` is the effective `home.log_dir` (see
+    /// [`crate::config_file::ConfigFile::log_dir`]); this never reads the
+    /// config file itself, so it cannot hide a broken one.
+    pub fn for_service(name: impl Into<String>, log_dir: &Path) -> Self {
         let service_name = name.into();
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
-        let spool_dir = crate::resolve_log_dir().join("spool").join(&service_name);
+        let spool_dir = log_dir.join("spool").join(&service_name);
         let s3_key_prefix = format!("{service_name}/{hostname}/");
         Self {
             service_name,
             hostname,
+            log_dir: log_dir.to_path_buf(),
             spool_dir,
             rotate_max_bytes: DEFAULT_ROTATE_MAX_BYTES,
             rotate_interval: Duration::from_secs(DEFAULT_ROTATE_INTERVAL_SECS),
@@ -195,7 +202,7 @@ mod tests {
 
     #[test]
     fn zero_ship_interval_is_rejected_and_leaves_the_config_untouched() {
-        let mut cfg = LoggingConfig::for_service("t");
+        let mut cfg = LoggingConfig::for_service("t", Path::new("/nonexistent-logs"));
         let before = cfg.ship_interval;
         let yaml = LogsYaml {
             ship_interval_secs: Some(0),
@@ -240,14 +247,14 @@ mod tests {
                 },
             ),
         ] {
-            let mut cfg = LoggingConfig::for_service("t");
+            let mut cfg = LoggingConfig::for_service("t", Path::new("/nonexistent-logs"));
             assert_eq!(yaml.apply_to(&mut cfg).unwrap_err().key, key);
         }
     }
 
     #[test]
     fn valid_overrides_apply_and_defaults_are_bounded() {
-        let mut cfg = LoggingConfig::for_service("t");
+        let mut cfg = LoggingConfig::for_service("t", Path::new("/nonexistent-logs"));
         assert!(cfg.spool_caps.max_bytes > 0 && !cfg.spool_caps.max_age.is_zero());
         let yaml = LogsYaml {
             ship_interval_secs: Some(5),

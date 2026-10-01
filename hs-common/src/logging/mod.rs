@@ -35,6 +35,8 @@ pub struct LoggingHandle {
     spool_caps: SpoolCaps,
     s3_key_prefix: String,
     delete_on_ship_success: bool,
+    /// `home.log_dir`: where a local `storage:` keeps the log archive.
+    log_dir: std::path::PathBuf,
 
     rotate_shutdown: watch::Sender<bool>,
     rotate_join: Option<JoinHandle<()>>,
@@ -116,6 +118,7 @@ pub fn init(cfg: LoggingConfig) -> LoggingHandle {
         spool_caps: cfg.spool_caps,
         s3_key_prefix: cfg.s3_key_prefix,
         delete_on_ship_success: cfg.delete_on_ship_success,
+        log_dir: cfg.log_dir,
         rotate_shutdown,
         rotate_join: None,
         shipper_shutdown: None,
@@ -186,7 +189,7 @@ impl LoggingHandle {
             );
             return;
         };
-        let storage = match build_logs_storage(primary, logs_bucket).await {
+        let storage = match build_logs_storage(primary, logs_bucket, &self.log_dir).await {
             Ok(storage) => storage,
             Err(e) => {
                 tracing::warn!(
@@ -254,12 +257,10 @@ impl Drop for LoggingHandle {
 pub async fn build_logs_storage(
     primary: &StorageConfig,
     logs_bucket: &str,
+    log_dir: &std::path::Path,
 ) -> anyhow::Result<Arc<dyn Storage>> {
     let storage: Arc<dyn Storage> = match primary.backend {
-        Backend::Local => {
-            let archive_root = crate::resolve_log_dir().join("archive");
-            Arc::new(LocalFsStorage::new(archive_root))
-        }
+        Backend::Local => Arc::new(LocalFsStorage::new(log_dir.join("archive"))),
         Backend::S3 => {
             let mut cfg = primary.clone();
             cfg.s3.bucket = logs_bucket.to_string();
@@ -270,31 +271,73 @@ pub async fn build_logs_storage(
     Ok(storage)
 }
 
-/// Read the `storage:` and `logs:` sections from `~/.home-still/config.yaml`.
-/// Returns defaults on any error — this is only used for logging setup, so we
-/// never want parsing failures to crash a binary. Callers can combine the
-/// result with [`build_logs_storage`] and [`LogsYaml::apply_to`].
-pub fn load_config_sections() -> (Option<StorageConfig>, LogsYaml) {
-    let config_path = match dirs::home_dir() {
-        Some(h) => h.join(crate::CONFIG_REL_PATH),
-        None => return (None, LogsYaml::default()),
-    };
-    let contents = match std::fs::read_to_string(&config_path) {
-        Ok(c) => c,
-        Err(_) => return (None, LogsYaml::default()),
-    };
-    let doc: serde_yaml_ng::Value = match serde_yaml_ng::from_str(&contents) {
-        Ok(v) => v,
-        Err(_) => return (None, LogsYaml::default()),
-    };
-    let storage = doc
-        .get("storage")
-        .and_then(|v| serde_yaml_ng::from_value::<StorageConfig>(v.clone()).ok());
-    let logs = doc
-        .get("logs")
-        .and_then(|v| serde_yaml_ng::from_value::<LogsYaml>(v.clone()).ok())
-        .unwrap_or_default();
-    (storage, logs)
+/// What logging setup needs from `~/.home-still/config.yaml`.
+#[derive(Debug)]
+pub struct ConfigSections {
+    /// The `storage:` section, if the file has one. Without it closed log
+    /// files stay in the local spool ([`LoggingHandle::start_shipping`] says
+    /// so in the log).
+    pub storage: Option<StorageConfig>,
+    /// The `logs:` section, or its documented defaults when absent.
+    pub logs: LogsYaml,
+    /// `home.log_dir`, or `<home.project_dir>/logs`.
+    pub log_dir: std::path::PathBuf,
+}
+
+/// Read the `storage:` and `logs:` sections and the log directory from
+/// `~/.home-still/config.yaml`.
+///
+/// An absent file or section yields the documented defaults. A file or
+/// section that is present but malformed is an `Err` naming it: every
+/// binary calls this before its logger exists, so the caller prints the
+/// error and exits instead of starting on settings nobody wrote.
+pub fn load_config_sections() -> Result<ConfigSections, crate::config_file::ConfigError> {
+    sections_of(&crate::config_file::ConfigFile::load()?)
+}
+
+/// [`load_config_sections`] for an already-loaded file.
+pub fn sections_of(
+    file: &crate::config_file::ConfigFile,
+) -> Result<ConfigSections, crate::config_file::ConfigError> {
+    Ok(ConfigSections {
+        storage: file.section("storage")?,
+        logs: file.section("logs")?.unwrap_or_default(),
+        log_dir: file.log_dir()?,
+    })
+}
+
+impl ConfigSections {
+    /// The sections for a command that must run when the config file is
+    /// missing or broken (`hs config init` / `hs config path` exist to
+    /// create and locate it): no `storage:`, default `logs:`, the default
+    /// log directory. Only those commands use this; everything else calls
+    /// [`load_config_sections`] and refuses to run on a malformed file.
+    pub fn without_config_file() -> Self {
+        Self {
+            storage: None,
+            logs: LogsYaml::default(),
+            log_dir: crate::default_project_dir().join("logs"),
+        }
+    }
+
+    /// The `LoggingConfig` for `service` with the `logs:` overrides applied.
+    pub fn logging_config(
+        &self,
+        service: &str,
+        stderr: StderrOutput,
+    ) -> Result<LoggingConfig, InvalidLogsConfig> {
+        let mut cfg = LoggingConfig::for_service(service, &self.log_dir).with_stderr(stderr);
+        self.logs.apply_to(&mut cfg)?;
+        Ok(cfg)
+    }
+}
+
+/// Report a configuration error found while setting up logging and exit with
+/// status 2. Every binary calls this before its logger exists, so the only
+/// channel left is stderr (the journal, for a supervised service).
+pub fn exit_on_config_error(service: &str, error: impl std::fmt::Display) -> ! {
+    eprintln!("{service}: {error}");
+    std::process::exit(2)
 }
 
 #[cfg(test)]
@@ -312,8 +355,8 @@ mod tests {
         let blocked = tmp.path().join("blocked");
         std::fs::write(&blocked, b"").expect("write blocker file");
 
-        let cfg =
-            LoggingConfig::for_service("hs-logging-test").with_spool_dir(blocked.join("spool"));
+        let cfg = LoggingConfig::for_service("hs-logging-test", tmp.path())
+            .with_spool_dir(blocked.join("spool"));
         let handle = init(cfg);
 
         assert!(!handle.has_spool());
@@ -324,7 +367,7 @@ mod tests {
     async fn writable_spool_dir_is_opened() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let spool_dir = tmp.path().join("spool");
-        let cfg = LoggingConfig::for_service("hs-logging-test")
+        let cfg = LoggingConfig::for_service("hs-logging-test", tmp.path())
             .with_spool_dir(spool_dir.clone())
             .with_stderr(StderrOutput::Disabled);
         let handle = init(cfg);
@@ -373,7 +416,7 @@ mod tests {
 
     fn quiet_handle(tmp: &std::path::Path) -> LoggingHandle {
         init(
-            LoggingConfig::for_service("hs-logging-test")
+            LoggingConfig::for_service("hs-logging-test", tmp)
                 .with_spool_dir(tmp.join("spool"))
                 .with_stderr(StderrOutput::Disabled),
         )
@@ -427,7 +470,7 @@ mod tests {
         let blocked = tmp.path().join("blocked");
         std::fs::write(&blocked, b"").unwrap();
         let mut handle = init(
-            LoggingConfig::for_service("hs-logging-test")
+            LoggingConfig::for_service("hs-logging-test", tmp.path())
                 .with_spool_dir(blocked.join("spool"))
                 .with_stderr(StderrOutput::Disabled),
         );
@@ -435,5 +478,60 @@ mod tests {
         assert!(cap.text().contains("no spool directory"), "{}", cap.text());
         assert!(handle.rotate_join.is_none());
         handle.shutdown().await.unwrap();
+    }
+
+    fn home_with(config: Option<&str>) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        if let Some(text) = config {
+            let path = home.path().join(crate::CONFIG_REL_PATH);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        home
+    }
+
+    fn sections(home: &tempfile::TempDir) -> Result<ConfigSections, crate::config_file::ConfigError> {
+        sections_of(&crate::config_file::ConfigFile::load_in(home.path())?)
+    }
+
+    #[test]
+    fn an_absent_file_or_section_gives_the_documented_defaults() {
+        for config in [None, Some("scribe: {}\n")] {
+            let home = home_with(config);
+            let s = sections(&home).unwrap();
+            assert!(s.storage.is_none());
+            assert_eq!(s.logs.bucket, "logs");
+            assert_eq!(s.log_dir, home.path().join("home-still").join("logs"));
+        }
+    }
+
+    #[test]
+    fn a_malformed_storage_or_logs_section_is_an_error_naming_it() {
+        // Each of these used to be swallowed and replaced by "no storage,
+        // default logs", so a typo silently turned log shipping off.
+        for (yaml, section) in [
+            ("storage:\n  backend: carrier-pigeon\n", "storage"),
+            ("storage: [1, 2]\n", "storage"),
+            ("logs:\n  ship_interval_secs: soon\n", "logs"),
+            ("logs: 7\n", "logs"),
+        ] {
+            let home = home_with(Some(yaml));
+            let err = sections(&home).unwrap_err().to_string();
+            assert!(err.contains(&format!("`{section}`")), "{yaml}: {err}");
+            assert!(err.contains("config.yaml"), "{yaml}: {err}");
+        }
+        let home = home_with(Some("storage: {backend: local\n"));
+        assert!(sections(&home).is_err(), "unparsable YAML");
+    }
+
+    #[test]
+    fn log_dir_follows_the_home_section() {
+        let home = home_with(Some(
+            "home:\n  project_dir: /srv/hs\nstorage:\n  backend: local\nlogs:\n  bucket: audit\n",
+        ));
+        let s = sections(&home).unwrap();
+        assert_eq!(s.log_dir, std::path::PathBuf::from("/srv/hs/logs"));
+        assert_eq!(s.logs.bucket, "audit");
+        assert_eq!(s.storage.unwrap().backend, Backend::Local);
     }
 }
