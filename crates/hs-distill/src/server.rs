@@ -13,10 +13,12 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use hs_common::auth::backend::BackendToken;
 use serde::Deserialize;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -24,21 +26,68 @@ pub use crate::api::DistillServerState;
 use crate::api::{ApiError, ErrorKind, IndexRequest, SearchRequest};
 use crate::client::{DistillProgress, DistillStreamLine};
 
-pub fn app(state: Arc<DistillServerState>) -> Router {
-    Router::new()
+/// The router. `GET /health` and `GET /readiness` are open (probes and
+/// pools); every other route requires `Authorization: Bearer <token>`.
+pub fn app(state: Arc<DistillServerState>, token: BackendToken) -> Router {
+    let protected = Router::new()
         .route("/distill", post(handle_distill))
         .route("/distill/stream", post(handle_distill_stream))
         .route("/search", post(handle_search))
-        .route("/health", get(handle_health))
-        .route("/readiness", get(handle_readiness))
         .route("/status", get(handle_status))
         .route("/exists/{doc_id}", get(handle_exists))
         .route("/doc/{doc_id}", axum::routing::delete(handle_delete_doc))
         .route("/docs", get(handle_list_docs))
         .route("/collection/reset", post(handle_reset_collection))
+        .route("/collection/hnsw", post(handle_enable_hnsw))
         .route("/scrub-interstitials", post(handle_scrub_interstitials))
+        .route_layer(middleware::from_fn_with_state(token, require_token));
+    Router::new()
+        .route("/health", get(handle_health))
+        .route("/readiness", get(handle_readiness))
+        .merge(protected)
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
+}
+
+/// The backend secret the server requires, from `lookup` (the process
+/// environment in production). Unset or unusable is an error naming
+/// `HS_BACKEND_TOKEN` (never its value): the server refuses to start.
+pub fn backend_token(
+    lookup: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> anyhow::Result<BackendToken> {
+    BackendToken::from_lookup(lookup).map_err(|e| {
+        anyhow::anyhow!(
+            "hs-distill-server requires a backend token: {e:#}. Put HS_BACKEND_TOKEN \
+             (>= 32 visible ASCII bytes, e.g. `openssl rand -hex 32`, the same value as the \
+             gateway and clients) in ~/.home-still/secrets.env"
+        )
+    })
+}
+
+async fn require_token(
+    State(token): State<BackendToken>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    match token.check_authorization(request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(why) => (
+            StatusCode::UNAUTHORIZED,
+            [
+                (header::WWW_AUTHENTICATE, "Bearer realm=\"hs-distill\""),
+                (header::CONTENT_TYPE, "application/json"),
+            ],
+            serde_json::json!({ "error": format!("unauthorized: {why}") }).to_string(),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_enable_hnsw(
+    State(state): State<Arc<DistillServerState>>,
+    Query(q): Query<CollectionQuery>,
+) -> Response {
+    reply(state.enable_hnsw(q.collection.as_deref()).await)
 }
 
 fn error_response(e: ApiError) -> Response {
@@ -228,6 +277,30 @@ mod tests {
     use hs_common::service::protocol::StreamLine;
 
     /// A real axum server on an ephemeral loopback port, over fakes.
+    const TOKEN: &str = "test-backend-token-0123456789abcdef";
+
+    fn token() -> BackendToken {
+        BackendToken::new(TOKEN).unwrap()
+    }
+
+    /// Loopback client with explicit connect/total timeouts; `bearer` sets
+    /// the Authorization header on every request.
+    fn http_client(bearer: Option<&str>) -> reqwest::Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(b) = bearer {
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {b}").parse().unwrap(),
+            );
+        }
+        hs_common::http::client_builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
+            .default_headers(headers)
+            .build()
+            .unwrap()
+    }
+
     struct Harness {
         base: String,
         http: reqwest::Client,
@@ -246,11 +319,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app(state)).await.unwrap();
+            axum::serve(listener, app(state, token())).await.unwrap();
         });
         Harness {
             base: format!("http://{addr}"),
-            http: reqwest::Client::new(),
+            http: http_client(Some(TOKEN)),
             embedder,
             store,
         }
@@ -591,7 +664,13 @@ mod tests {
         use hs_common::service::protocol::ReadinessInfo;
 
         let h = start().await;
-        let client = DistillClient::new(&h.base).unwrap();
+        let client = DistillClient::new_with_client(
+            &h.base,
+            hs_common::auth::client::AuthedHttp::plain_with_backend_token(
+                http_client(None),
+                Some(token()),
+            ),
+        );
 
         let indexed = client
             .index_content("markdown/ab/doc.md", &prose(8), None)
@@ -655,5 +734,141 @@ mod tests {
         assert_eq!(client.reset_collection().await.unwrap(), 0);
         let report = client.scrub_interstitials(true).await.unwrap();
         assert_eq!(report.matched, 0);
+    }
+
+    // ── RA-26: backend bearer token ────────────────────────────────────
+
+    /// (method, path) of every protected route.
+    fn protected_routes() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("POST", "/distill"),
+            ("POST", "/distill/stream"),
+            ("POST", "/search"),
+            ("GET", "/status"),
+            ("GET", "/exists/d"),
+            ("DELETE", "/doc/d"),
+            ("GET", "/docs"),
+            ("POST", "/collection/reset"),
+            ("POST", "/collection/hnsw"),
+            ("POST", "/scrub-interstitials"),
+        ]
+    }
+
+    async fn send(c: &reqwest::Client, method: &str, url: String) -> reqwest::Response {
+        let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        c.request(m, url)
+            .json(&serde_json::json!({"path":"a.md","content":prose(4),"query":"q"}))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_route_but_the_probes_needs_the_token() {
+        let h = start().await;
+        for bearer in [None, Some("wrong-token-wrong-token-wrong-token-xx")] {
+            let c = http_client(bearer);
+            for (method, path) in protected_routes() {
+                let resp = send(&c, method, h.url(path)).await;
+                assert_eq!(resp.status(), 401, "{method} {path} bearer={bearer:?}");
+                assert!(resp.headers().contains_key(header::WWW_AUTHENTICATE));
+                let body: serde_json::Value = resp.json().await.unwrap();
+                let msg = body["error"].as_str().unwrap();
+                assert!(msg.starts_with("unauthorized"), "{msg}");
+                assert!(!msg.contains(TOKEN));
+            }
+        }
+        assert_eq!(h.store.ops(), [], "nothing may run unauthenticated");
+        assert_eq!(h.embedder.calls(), 0);
+
+        let open = http_client(None);
+        for path in ["/health", "/readiness"] {
+            let r = open.get(h.url(path)).send().await.unwrap();
+            assert_eq!(r.status(), 200, "{path} must stay open");
+        }
+        // With the token every protected route gets past auth.
+        for (method, path) in protected_routes() {
+            let r = send(&h.http, method, h.url(path)).await;
+            assert_ne!(r.status(), 401, "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn enable_hnsw_submits_once_then_reports_a_no_op() {
+        let h = start().await;
+        let first: serde_json::Value = h
+            .http
+            .post(h.url("/collection/hnsw?collection=paper_abstracts"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(first["submitted"], true);
+        assert_eq!(first["collection"], "paper_abstracts");
+        assert_eq!(first["max_indexing_threads"], 4);
+        let again: serde_json::Value = h
+            .http
+            .post(h.url("/collection/hnsw?collection=paper_abstracts"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(again["submitted"], false);
+        assert_eq!(
+            h.store.ops(),
+            [crate::testutil::Op::EnableHnsw {
+                collection: "paper_abstracts".into(),
+                threads: 4
+            }]
+        );
+        let unknown = h
+            .http
+            .post(h.url("/collection/hnsw?collection=made_up"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn the_client_enables_hnsw_with_the_token() {
+        let h = start().await;
+        let client = crate::client::DistillClient::new_with_client(
+            &h.base,
+            hs_common::auth::client::AuthedHttp::plain_with_backend_token(
+                http_client(None),
+                Some(token()),
+            ),
+        );
+        let r = client.enable_hnsw(None).await.unwrap();
+        assert!(r.submitted);
+        assert_eq!(r.collection, "academic_papers");
+
+        let anon = crate::client::DistillClient::new_with_client(
+            &h.base,
+            hs_common::auth::client::AuthedHttp::plain_with_backend_token(http_client(None), None),
+        );
+        let err = anon.enable_hnsw(None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
+    }
+
+    #[test]
+    fn startup_refuses_a_missing_or_short_token_without_echoing_it() {
+        let unset = backend_token(|_| Err(std::env::VarError::NotPresent)).unwrap_err();
+        assert!(
+            format!("{unset:#}").contains("HS_BACKEND_TOKEN"),
+            "{unset:#}"
+        );
+        let short = backend_token(|_| Ok("sekrit-short".into())).unwrap_err();
+        let msg = format!("{short:#}");
+        assert!(
+            msg.contains("HS_BACKEND_TOKEN") && !msg.contains("sekrit-short"),
+            "{msg}"
+        );
+        backend_token(|_| Ok(TOKEN.into())).unwrap();
     }
 }

@@ -469,6 +469,24 @@ impl DistillClient {
         Ok(data.deleted_points)
     }
 
+    /// Ask the server to enable HNSW on a collection (default collection when
+    /// `None`) with its configured parameters. Returns at once; Qdrant builds
+    /// the graph in the background. Idempotent.
+    pub async fn enable_hnsw(&self, collection: Option<&str>) -> Result<crate::store::HnswEnable> {
+        let mut url = format!("{}/collection/hnsw", self.server_url);
+        if let Some(c) = collection {
+            url.push_str(&format!("?collection={c}"));
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .context("Failed to reach distill server")?;
+        json_or_server_error(resp, "enable_hnsw").await
+    }
+
     /// Scan every point in the collection for chunks whose `chunk_text`
     /// matches a known anti-bot / cookie-banner interstitial signature.
     /// When `dry_run` is true, returns counts and samples without

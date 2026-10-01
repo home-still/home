@@ -239,6 +239,10 @@ pub struct HnswConfig {
     pub ef_construct: u64,
     /// Candidates considered per query.
     pub search_ef: u64,
+    /// Threads Qdrant may use to build the graph when HNSW is enabled on an
+    /// existing collection (`POST /collection/hnsw`). Bounded so the index
+    /// build cannot starve the other tenants of a shared host.
+    pub max_indexing_threads: u64,
 }
 
 impl Default for HnswConfig {
@@ -249,6 +253,7 @@ impl Default for HnswConfig {
             m: 16,
             ef_construct: 100,
             search_ef: 128,
+            max_indexing_threads: 4,
         }
     }
 }
@@ -265,6 +270,12 @@ impl HnswConfig {
             return Err(DistillError::Config(format!(
                 "hnsw.ef_construct must be between hnsw.m ({}) and 1024 (got {})",
                 self.m, self.ef_construct
+            )));
+        }
+        if !(1..=64).contains(&self.max_indexing_threads) {
+            return Err(DistillError::Config(format!(
+                "hnsw.max_indexing_threads must be 1..=64 (got {})",
+                self.max_indexing_threads
             )));
         }
         if !(1..=4096).contains(&self.search_ef) {
@@ -713,9 +724,12 @@ mod tests {
                 ..HnswConfig::default()
             },
             HnswConfig {
-                m: 16,
                 ef_construct: 8,
-                search_ef: 128,
+                ..HnswConfig::default()
+            },
+            HnswConfig {
+                max_indexing_threads: 0,
+                ..HnswConfig::default()
             },
             HnswConfig {
                 search_ef: 0,

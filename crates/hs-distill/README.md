@@ -55,6 +55,7 @@ All fields have defaults and are optional. The server refuses to start on an inv
 | `embedding.pool_size` | `1` | Model copies; at least 1 |
 | `hnsw.m` / `hnsw.ef_construct` | `16` / `100` | HNSW graph of **new** collections (`m: 0` is rejected) |
 | `hnsw.search_ef` | `128` | Candidates considered per query |
+| `hnsw.max_indexing_threads` | `4` | Index-build threads used by `POST /collection/hnsw` (1..=64) |
 | `chunk_max_tokens` | `1000` | Max tokens per chunk |
 | `chunk_overlap` | `100` | Token overlap between chunks (must be smaller than `chunk_max_tokens`) |
 | `llm_metadata` | `false` | Extract keywords/topics with Ollama (`ollama_url` incl. port, `metadata_model`, `ollama_timeout_secs: 120`); a failed call fails that document |
@@ -173,7 +174,10 @@ Each markdown file goes through:
 | `/distill/stream` | POST | Index with NDJSON streaming progress. `content` is required |
 | `/search` | POST | Semantic search with optional filters. `limit` defaults to 10 and is clamped to 200; an unparseable `year` filter is a 400 |
 | `/exists/{doc_id}`, `/docs` | GET | Per-document chunk count; distinct doc ids (`limit` up to 1,000,000, larger is a 400; `truncated` flags a partial list) |
-| `/doc/{doc_id}`, `/collection/reset`, `/scrub-interstitials` | DELETE / POST | Destructive maintenance. **Unauthenticated** (RA-26 auth pending): do not expose the port beyond trusted hosts |
+| `/doc/{doc_id}`, `/collection/reset`, `/scrub-interstitials` | DELETE / POST | Destructive maintenance |
+| `/collection/hnsw?collection=<name>` | POST | Enable HNSW on an existing collection with `hnsw.m`/`ef_construct`, capped at `hnsw.max_indexing_threads` (default 4). Returns immediately (Qdrant builds the graph in the background); a no-op that says so when already enabled. Never run at startup — use `hs distill hnsw enable --collection <name>` in a maintenance window |
+
+**Authentication.** `hs-distill-server` refuses to start unless `HS_BACKEND_TOKEN` (≥ 32 visible ASCII bytes, e.g. `openssl rand -hex 32`; the same value as the gateway and every client host) is set — put it in `~/.home-still/secrets.env`. Every route except `GET /health` and `GET /readiness` requires `Authorization: Bearer <token>` and answers 401 (JSON body) otherwise. `DistillClient` sends it automatically from the same variable.
 
 Client errors (bad input, unknown collection) are HTTP 400; a missing dependency is 503; anything else is 500.
 

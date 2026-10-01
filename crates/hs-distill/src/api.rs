@@ -393,6 +393,20 @@ impl DistillServerState {
         Ok((collection, deleted))
     }
 
+    /// Submit the configured HNSW parameters to a served collection (see
+    /// `VectorStore::enable_hnsw`). Returns immediately; never called at
+    /// startup.
+    pub async fn enable_hnsw(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<crate::store::HnswEnable, ApiError> {
+        let collection = self.resolve_collection(collection)?;
+        Ok(self
+            .store
+            .enable_hnsw(&collection, &self.config.hnsw)
+            .await?)
+    }
+
     pub async fn scrub_interstitials(
         &self,
         dry_run: bool,

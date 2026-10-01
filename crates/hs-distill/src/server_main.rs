@@ -54,6 +54,9 @@ async fn async_main() -> Result<()> {
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid distill_server config: {e}"))?;
+    // Every route but /health and /readiness requires this secret; there is
+    // no unauthenticated mode.
+    let token = server::backend_token(|name| std::env::var(name))?;
 
     // Build the embedder on the configured device. There is no fallback:
     // if CUDA is unavailable or the model does not land on the GPU,
@@ -98,7 +101,7 @@ async fn async_main() -> Result<()> {
     tracing::info!("Listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let result = axum::serve(listener, server::app(state)).await;
+    let result = axum::serve(listener, server::app(state, token)).await;
 
     let _ = logging_handle.shutdown().await;
     result?;

@@ -7,16 +7,17 @@ use qdrant_client::qdrant::{
     self, vectors_config, Condition, CountPointsBuilder, CreateCollectionBuilder,
     CreateFieldIndexCollectionBuilder, DeletePointsBuilder, Distance, FacetCountsBuilder,
     FieldType, Filter, HnswConfigDiffBuilder, PayloadSchemaType, PointId, PointStruct,
-    QueryPointsBuilder, Range, ScrollPointsBuilder, SearchParamsBuilder, UpsertPointsBuilder,
-    VectorParamsBuilder,
+    QueryPointsBuilder, Range, ScrollPointsBuilder, SearchParamsBuilder, UpdateCollectionBuilder,
+    UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use uuid::Uuid;
 
 use crate::client::SearchHit;
 use crate::collection::{plan_collection, CollectionSpec, FieldKind, Observed, SchemaPlan};
+use crate::config::HnswConfig;
 use crate::error::DistillError;
-use crate::store::{DocIds, SearchFilter, VectorStore, YearFilter};
+use crate::store::{hnsw_matches, DocIds, HnswEnable, SearchFilter, VectorStore, YearFilter};
 use crate::types::{EmbeddedChunk, ScrubReport, ScrubbedChunk};
 
 const NAMESPACE_UUID: Uuid = Uuid::from_bytes([
@@ -121,9 +122,9 @@ pub async fn ensure_collection(
             "HNSW is DISABLED on this collection (hnsw m = 0): every search is a brute-force \
              scan of all vectors and hnsw_ef never applies. It was created with m=0 and nothing \
              ever enabled the index. Enabling it makes Qdrant build the graph over the whole \
-             corpus (heavy CPU/IO), so it is not done automatically: schedule it \
-             (update_collection hnsw_config.m={}) or rebuild the collection",
-            spec.hnsw_m
+             corpus (heavy CPU/IO), so it is not done automatically: run \
+             `hs distill hnsw enable --collection {collection_name}` in a maintenance window, \
+             or rebuild the collection"
         );
     }
 
@@ -149,6 +150,26 @@ fn field_kind(data_type: i32) -> Option<FieldKind> {
         PayloadSchemaType::Text => Some(FieldKind::Text),
         _ => None,
     }
+}
+
+/// Effective (m, ef_construct) of a collection: vector-level override first,
+/// else the collection-level config.
+fn observe_hnsw(info: &qdrant::CollectionInfo) -> (Option<u64>, Option<u64>) {
+    let config = info.config.as_ref();
+    let vector = config
+        .and_then(|c| c.params.as_ref())
+        .and_then(|p| p.vectors_config.as_ref())
+        .and_then(|v| match v.config.as_ref()? {
+            vectors_config::Config::Params(p) => p.hnsw_config.as_ref(),
+            vectors_config::Config::ParamsMap(_) => None,
+        });
+    let coll = config.and_then(|c| c.hnsw_config.as_ref());
+    (
+        vector.and_then(|h| h.m).or(coll.and_then(|h| h.m)),
+        vector
+            .and_then(|h| h.ef_construct)
+            .or(coll.and_then(|h| h.ef_construct)),
+    )
 }
 
 /// Reduce a live `CollectionInfo` to the facts [`plan_collection`] checks.
@@ -458,6 +479,59 @@ impl VectorStore for QdrantStore {
 
     async fn reset(&self, collection: &str, spec: &CollectionSpec) -> Result<u64, DistillError> {
         reset_collection(&self.client, collection, spec).await
+    }
+
+    async fn enable_hnsw(
+        &self,
+        collection: &str,
+        hnsw: &HnswConfig,
+    ) -> Result<HnswEnable, DistillError> {
+        let info = self
+            .client
+            .collection_info(collection)
+            .await
+            .map_err(|e| qerr("Failed to read collection info", e))?
+            .result
+            .ok_or_else(|| {
+                DistillError::Qdrant(format!("Qdrant returned no info for '{collection}'"))
+            })?;
+        let (m, ef) = observe_hnsw(&info);
+        if hnsw_matches(m, ef, hnsw) {
+            return Ok(HnswEnable {
+                collection: collection.into(),
+                submitted: false,
+                m: hnsw.m,
+                ef_construct: hnsw.ef_construct,
+                max_indexing_threads: 0,
+                message: "HNSW already enabled with these parameters; nothing changed".into(),
+            });
+        }
+        self.client
+            .update_collection(
+                UpdateCollectionBuilder::new(collection).hnsw_config(
+                    HnswConfigDiffBuilder::default()
+                        .m(hnsw.m)
+                        .ef_construct(hnsw.ef_construct)
+                        .max_indexing_threads(hnsw.max_indexing_threads),
+                ),
+            )
+            .await
+            .map_err(|e| qerr("Failed to update collection HNSW config", e))?;
+        tracing::warn!(
+            collection,
+            m = hnsw.m,
+            ef_construct = hnsw.ef_construct,
+            max_indexing_threads = hnsw.max_indexing_threads,
+            "HNSW update submitted; Qdrant builds the graph in the background"
+        );
+        Ok(HnswEnable {
+            collection: collection.into(),
+            submitted: true,
+            m: hnsw.m,
+            ef_construct: hnsw.ef_construct,
+            max_indexing_threads: hnsw.max_indexing_threads,
+            message: "HNSW update submitted; Qdrant builds the graph in the background (search stays available, brute force until each segment is indexed)".into(),
+        })
     }
 
     async fn scrub_interstitials(

@@ -67,6 +67,32 @@ impl SearchFilter {
     }
 }
 
+/// What `enable_hnsw` did for one collection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HnswEnable {
+    pub collection: String,
+    /// An update was sent to Qdrant. False: the collection already had these
+    /// parameters and nothing was changed.
+    pub submitted: bool,
+    pub m: u64,
+    pub ef_construct: u64,
+    /// Cap on index-building threads included in the update (0 when
+    /// nothing was submitted).
+    pub max_indexing_threads: u64,
+    /// The graph builds in the background after this returns.
+    pub message: String,
+}
+
+/// Does a collection with (`m`, `ef_construct`) already match the wanted
+/// HNSW parameters? Unknown (`None`) never matches.
+pub fn hnsw_matches(
+    m: Option<u64>,
+    ef_construct: Option<u64>,
+    want: &crate::config::HnswConfig,
+) -> bool {
+    m == Some(want.m) && ef_construct == Some(want.ef_construct)
+}
+
 /// Distinct document ids of a collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocIds {
@@ -108,6 +134,15 @@ pub trait VectorStore: Send + Sync {
 
     /// Up to `limit` distinct document ids, flagging whether more exist.
     async fn doc_ids(&self, collection: &str, limit: u64) -> Result<DocIds, DistillError>;
+
+    /// Submit `hnsw` (m, ef_construct, bounded indexing threads) to an
+    /// existing collection and return immediately; Qdrant builds the graph
+    /// in the background. A no-op when the collection already matches.
+    async fn enable_hnsw(
+        &self,
+        collection: &str,
+        hnsw: &crate::config::HnswConfig,
+    ) -> Result<HnswEnable, DistillError>;
 
     /// Drop and recreate the collection; returns the prior point count.
     async fn reset(&self, collection: &str, spec: &CollectionSpec) -> Result<u64, DistillError>;

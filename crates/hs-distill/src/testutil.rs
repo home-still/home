@@ -207,6 +207,10 @@ pub(crate) enum Op {
     Reset {
         collection: String,
     },
+    EnableHnsw {
+        collection: String,
+        threads: u64,
+    },
     Scrub {
         collection: String,
         dry_run: bool,
@@ -225,6 +229,8 @@ pub(crate) struct StoreState {
     pub fail_delete: bool,
     pub down: bool,
     pub canned_hits: Vec<SearchHit>,
+    /// Collections whose HNSW already matches the configured parameters.
+    pub hnsw_enabled: BTreeSet<String>,
     /// Every chunk ever upserted, in order.
     pub upserted: Vec<EmbeddedChunk>,
 }
@@ -354,6 +360,33 @@ impl VectorStore for FakeStore {
         let truncated = ids.len() as u64 > limit;
         ids.truncate(limit as usize);
         Ok(DocIds { ids, truncated })
+    }
+
+    async fn enable_hnsw(
+        &self,
+        collection: &str,
+        hnsw: &crate::config::HnswConfig,
+    ) -> Result<crate::store::HnswEnable, DistillError> {
+        let mut st = self.state.lock();
+        let already = !st.hnsw_enabled.insert(collection.to_string());
+        if !already {
+            st.ops.push(Op::EnableHnsw {
+                collection: collection.into(),
+                threads: hnsw.max_indexing_threads,
+            });
+        }
+        Ok(crate::store::HnswEnable {
+            collection: collection.into(),
+            submitted: !already,
+            m: hnsw.m,
+            ef_construct: hnsw.ef_construct,
+            max_indexing_threads: if already {
+                0
+            } else {
+                hnsw.max_indexing_threads
+            },
+            message: String::new(),
+        })
     }
 
     async fn reset(&self, collection: &str, _spec: &CollectionSpec) -> Result<u64, DistillError> {
