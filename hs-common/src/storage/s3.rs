@@ -18,7 +18,8 @@ pub struct S3Storage {
     region: String,
 }
 
-#[derive(Debug, Clone)]
+/// `Debug` is hand-written so the credentials never reach a log line.
+#[derive(Clone)]
 pub struct S3Config {
     pub endpoint: String,
     pub bucket: String,
@@ -26,6 +27,19 @@ pub struct S3Config {
     pub secret_key: String,
     pub region: String,
     pub allow_http: bool,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .field("region", &self.region)
+            .field("allow_http", &self.allow_http)
+            .finish()
+    }
 }
 
 impl S3Storage {
