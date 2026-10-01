@@ -405,7 +405,7 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
-    use crate::auth::token::{create_token, now_epoch, TokenClaims};
+    use crate::auth::token::{create_token, now_epoch, TokenClaims, TokenType};
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -418,6 +418,7 @@ mod tests {
                 iat: now,
                 exp: now + ttl,
                 scope: vec!["scribe".into()],
+                typ: TokenType::Access,
             },
         )
         .unwrap()
