@@ -61,13 +61,22 @@ pub(crate) async fn ship_once(
             Some(n) => n.to_string(),
             None => continue,
         };
-        let now = Utc::now();
+        // Date the object by when the file was rotated (encoded in its name),
+        // not by the day a retry finally succeeded: logs held back by a storage
+        // outage must land under the day they were written.
+        let when = match spool::closed_at(&path, || None) {
+            Some(t) => t,
+            None => match tokio::fs::metadata(&path).await.and_then(|m| m.modified()) {
+                Ok(t) => t.into(),
+                Err(_) => Utc::now(),
+            },
+        };
         let key = format!(
             "{prefix}{year:04}/{month:02}/{day:02}/{filename}",
             prefix = key_prefix,
-            year = now.year(),
-            month = now.month(),
-            day = now.day(),
+            year = when.year(),
+            month = when.month(),
+            day = when.day(),
             filename = filename,
         );
         match storage.put(&key, bytes).await {
@@ -115,7 +124,7 @@ mod tests {
         writer.flush().unwrap();
         spool.rotate_now().unwrap();
 
-        ship_once(spool_tmp.path(), storage.as_ref(), "hs-test/big/", true).await;
+        ship_once(spool_tmp.path(), storage.as_ref(), "hs-test/host-a/", true).await;
 
         // spool dir should now only have current.jsonl (empty)
         let leftover = spool::list_closed(spool_tmp.path()).await.unwrap();
@@ -125,7 +134,7 @@ mod tests {
         );
 
         // Storage should have exactly one object under the prefix.
-        let listed = storage.list("hs-test/big/").await.unwrap();
+        let listed = storage.list("hs-test/host-a/").await.unwrap();
         assert_eq!(listed.len(), 1, "expected 1 shipped object, got {listed:?}");
         let content = storage.get(&listed[0].key).await.unwrap();
         let text = String::from_utf8(content).unwrap();
@@ -168,13 +177,35 @@ mod tests {
         writer.flush().unwrap();
         spool.rotate_now().unwrap();
 
-        ship_once(spool_tmp.path(), storage.as_ref(), "hs-test/big/", true).await;
+        ship_once(spool_tmp.path(), storage.as_ref(), "hs-test/host-a/", true).await;
 
         let leftover = spool::list_closed(spool_tmp.path()).await.unwrap();
         assert_eq!(
             leftover.len(),
             1,
             "file should remain in spool on PUT failure"
+        );
+    }
+
+    /// RA-80: a file rotated on an earlier day is keyed under that day even
+    /// if the retry that finally ships it happens later.
+    #[tokio::test]
+    async fn held_back_files_are_keyed_by_rotation_day() {
+        let spool_tmp = tempfile::tempdir().unwrap();
+        let storage_tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(storage_tmp.path().to_path_buf());
+        // 2020-01-02T03:04:05Z
+        let name = "1577934245000-3f1c0f7e-0000-4000-8000-000000000000.jsonl";
+        std::fs::write(spool_tmp.path().join(name), b"{\"n\":1}\n").unwrap();
+
+        ship_once(spool_tmp.path(), &storage, "hs-test/host-a/", true).await;
+
+        let listed = storage.list("hs-test/host-a/").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].key,
+            format!("hs-test/host-a/2020/01/02/{name}"),
+            "keyed by the day it was written, not the day it shipped"
         );
     }
 }

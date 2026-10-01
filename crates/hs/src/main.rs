@@ -67,7 +67,10 @@ fn init_logging(
         }
     };
     let mut cfg = LoggingConfig::for_service(service).with_stderr(stderr_output);
-    logs_yaml.apply_to(&mut cfg);
+    logs_yaml.apply_to(&mut cfg).unwrap_or_else(|e| {
+        eprintln!("{service}: {e}");
+        std::process::exit(2)
+    });
 
     let handle = logging::init(cfg);
 
@@ -127,13 +130,9 @@ fn main() -> ExitCode {
     let result = rt.block_on(async move {
         let reporter = reporter_for_closure;
         let mut logging_handle = logging_handle;
-        if let Some(primary_cfg) = primary_storage_cfg {
-            if let Ok(storage) =
-                hs_common::logging::build_logs_storage(&primary_cfg, &logs_bucket).await
-            {
-                let _ = logging_handle.spawn_shipper(storage);
-            }
-        }
+        logging_handle
+            .start_shipping(primary_storage_cfg.as_ref(), &logs_bucket)
+            .await;
 
         let work = async {
             match cli.command {

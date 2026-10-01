@@ -8,7 +8,7 @@ pub mod config;
 pub mod shipper;
 pub mod spool;
 
-pub use config::{LoggingConfig, LogsYaml, StderrOutput};
+pub use config::{InvalidLogsConfig, LoggingConfig, LogsYaml, SpoolCaps, StderrOutput};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +32,7 @@ pub struct LoggingHandle {
     rotate_max_bytes: u64,
     rotate_interval: Duration,
     ship_interval: Duration,
+    spool_caps: SpoolCaps,
     s3_key_prefix: String,
     delete_on_ship_success: bool,
 
@@ -112,6 +113,7 @@ pub fn init(cfg: LoggingConfig) -> LoggingHandle {
         rotate_max_bytes: cfg.rotate_max_bytes,
         rotate_interval: cfg.rotate_interval,
         ship_interval: cfg.ship_interval,
+        spool_caps: cfg.spool_caps,
         s3_key_prefix: cfg.s3_key_prefix,
         delete_on_ship_success: cfg.delete_on_ship_success,
         rotate_shutdown,
@@ -123,6 +125,24 @@ pub fn init(cfg: LoggingConfig) -> LoggingHandle {
 }
 
 impl LoggingHandle {
+    /// Run the spool janitor: rotation by size/age plus the byte/age caps on
+    /// closed files. Needed whether or not anything ships the files, or an
+    /// unshipped spool grows without bound. Idempotent.
+    fn ensure_rotator(&mut self) {
+        let Some(spool) = self.spool.clone() else {
+            return;
+        };
+        if self.rotate_join.is_none() {
+            self.rotate_join = Some(tokio::spawn(spool::run_rotate_controller(
+                spool,
+                self.rotate_max_bytes,
+                self.rotate_interval,
+                self.spool_caps,
+                self.rotate_shutdown.subscribe(),
+            )));
+        }
+    }
+
     /// Spawn the rotate controller + shipper onto the current tokio runtime.
     /// Idempotent per task — calling twice spawns only the tasks that aren't
     /// already running.
@@ -131,14 +151,7 @@ impl LoggingHandle {
         let Some(spool) = self.spool.clone() else {
             return Ok(());
         };
-        if self.rotate_join.is_none() {
-            self.rotate_join = Some(tokio::spawn(spool::run_rotate_controller(
-                spool.clone(),
-                self.rotate_max_bytes,
-                self.rotate_interval,
-                self.rotate_shutdown.subscribe(),
-            )));
-        }
+        self.ensure_rotator();
         if self.shipper_join.is_none() {
             let (tx, rx) = watch::channel(false);
             let join = tokio::spawn(shipper::run_shipper(
@@ -153,6 +166,40 @@ impl LoggingHandle {
             self.shipper_join = Some(join);
         }
         Ok(())
+    }
+
+    /// Start shipping spooled logs to the archive storage derived from the
+    /// primary `storage:` config, or say once, in the log itself, why that
+    /// is not happening. Logging must never fail a process, so a missing or
+    /// broken storage config degrades to "spool on local disk, capped" —
+    /// visibly, not silently. Call once after [`init`].
+    pub async fn start_shipping(&mut self, primary: Option<&StorageConfig>, logs_bucket: &str) {
+        if self.spool.is_none() {
+            tracing::warn!("log shipping disabled: no spool directory (logging to stderr only)");
+            return;
+        }
+        self.ensure_rotator();
+        let Some(primary) = primary else {
+            tracing::warn!(
+                "log shipping disabled: no usable `storage:` section in the config file; \
+                 closed log files stay in the local spool (capped)"
+            );
+            return;
+        };
+        let storage = match build_logs_storage(primary, logs_bucket).await {
+            Ok(storage) => storage,
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "log shipping disabled: cannot open the log archive storage; \
+                     closed log files stay in the local spool (capped)"
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.spawn_shipper(storage) {
+            tracing::warn!(error = %format!("{e:#}"), "log shipping disabled: shipper failed to start");
+        }
     }
 
     /// Whether a spool dir was opened (`false` = degraded, stderr-only mode).
@@ -284,5 +331,109 @@ mod tests {
         assert!(handle.has_spool());
         assert!(spool_dir.join(spool::CURRENT_FILE).exists());
         handle.shutdown().await.expect("shutdown is infallible");
+    }
+
+    /// `MakeWriter` that records everything the subscriber prints.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            let mut buf = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            let buf = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+    }
+
+    fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+        let cap = Captured::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .finish();
+        (cap, tracing::subscriber::set_default(sub))
+    }
+
+    fn quiet_handle(tmp: &std::path::Path) -> LoggingHandle {
+        init(
+            LoggingConfig::for_service("hs-logging-test")
+                .with_spool_dir(tmp.join("spool"))
+                .with_stderr(StderrOutput::Disabled),
+        )
+    }
+
+    /// RA-80: no usable `storage:` section used to disable shipping with no
+    /// word to anyone; it now says so once, and the spool is still bounded.
+    #[tokio::test]
+    async fn missing_storage_config_logs_once_and_still_runs_the_janitor() {
+        let (cap, _guard) = capture();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut handle = quiet_handle(tmp.path());
+
+        handle.start_shipping(None, "logs").await;
+
+        let text = cap.text();
+        assert_eq!(text.matches("log shipping disabled").count(), 1, "{text}");
+        assert!(text.contains("no usable `storage:`"), "{text}");
+        assert!(handle.shipper_join.is_none(), "nothing should ship");
+        assert!(handle.rotate_join.is_some(), "spool must still be capped");
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unbuildable_archive_storage_logs_the_cause() {
+        let (cap, _guard) = capture();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut handle = quiet_handle(tmp.path());
+        // S3 with no endpoint/credentials: rejected before any network I/O.
+        let primary = StorageConfig {
+            backend: Backend::S3,
+            ..StorageConfig::default()
+        };
+
+        handle.start_shipping(Some(&primary), "logs").await;
+
+        let text = cap.text();
+        assert_eq!(text.matches("log shipping disabled").count(), 1, "{text}");
+        assert!(
+            text.contains("cannot open the log archive storage"),
+            "{text}"
+        );
+        assert!(handle.shipper_join.is_none());
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn without_a_spool_dir_the_degraded_mode_is_announced() {
+        let (cap, _guard) = capture();
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = tmp.path().join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let mut handle = init(
+            LoggingConfig::for_service("hs-logging-test")
+                .with_spool_dir(blocked.join("spool"))
+                .with_stderr(StderrOutput::Disabled),
+        );
+        handle.start_shipping(None, "logs").await;
+        assert!(cap.text().contains("no spool directory"), "{}", cap.text());
+        assert!(handle.rotate_join.is_none());
+        handle.shutdown().await.unwrap();
     }
 }

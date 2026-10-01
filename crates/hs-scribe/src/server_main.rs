@@ -84,12 +84,13 @@ async fn install_logging() -> hs_common::logging::LoggingHandle {
     let (primary_storage, logs_yaml) = logging::load_config_sections();
     let mut cfg = LoggingConfig::for_service("hs-scribe-server")
         .with_stderr(StderrOutput::EnvFilter("info".into()));
-    logs_yaml.apply_to(&mut cfg);
+    logs_yaml.apply_to(&mut cfg).unwrap_or_else(|e| {
+        eprintln!("hs-scribe-server: {e}");
+        std::process::exit(2)
+    });
     let mut handle = logging::init(cfg);
-    if let Some(storage_cfg) = primary_storage {
-        if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket).await {
-            let _ = handle.spawn_shipper(storage);
-        }
-    }
+    handle
+        .start_shipping(primary_storage.as_ref(), &logs_yaml.bucket)
+        .await;
     handle
 }

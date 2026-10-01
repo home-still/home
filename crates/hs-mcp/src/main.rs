@@ -3636,13 +3636,14 @@ async fn install_logging(is_sse: bool) -> hs_common::logging::LoggingHandle {
         ("hs-mcp-stdio", StderrOutput::Disabled)
     };
     let mut cfg = LoggingConfig::for_service(service).with_stderr(stderr);
-    logs_yaml.apply_to(&mut cfg);
+    logs_yaml.apply_to(&mut cfg).unwrap_or_else(|e| {
+        eprintln!("{service}: {e}");
+        std::process::exit(2)
+    });
     let mut handle = logging::init(cfg);
-    if let Some(storage_cfg) = primary_storage {
-        if let Ok(storage) = logging::build_logs_storage(&storage_cfg, &logs_yaml.bucket).await {
-            let _ = handle.spawn_shipper(storage);
-        }
-    }
+    handle
+        .start_shipping(primary_storage.as_ref(), &logs_yaml.bucket)
+        .await;
     handle
 }
 
