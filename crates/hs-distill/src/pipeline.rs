@@ -197,7 +197,7 @@ pub async fn index_document(
         ..Default::default()
     };
 
-    let chunks = chunk_markdown(&markdown, &meta, &page_offsets, &chunker_config);
+    let chunks = chunk_markdown(&markdown, &meta, &page_offsets, &chunker_config)?;
 
     // Filter out low-quality chunks (repetition loops, garbled text, etc.)
     // Short-form collections bypass the filter — their single-chunk

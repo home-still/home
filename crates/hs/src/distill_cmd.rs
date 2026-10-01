@@ -1387,7 +1387,8 @@ async fn cmd_diagnose(stem: &str, verbose: bool, reporter: &Arc<dyn Reporter>) -
         overlap_tokens: server_cfg.chunk_overlap,
         ..Default::default()
     };
-    let chunks = chunk_markdown(&markdown, &doc_meta, &page_offsets, &chunker_config);
+    let chunks = chunk_markdown(&markdown, &doc_meta, &page_offsets, &chunker_config)
+        .context("chunking markdown (check distill_server.chunk_max_tokens / chunk_overlap)")?;
     reporter.status(
         "Chunked",
         &format!("{} chunk(s) before filter", chunks.len()),
