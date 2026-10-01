@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use hs_common::reporter::Reporter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +40,7 @@ struct ServiceUnit {
 /// daemon, and the compose containers. Called by `hs restart`.
 pub async fn run(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let binaries = installed_binaries();
-    let (mut restarted, mut failures) = restart_units(&binaries, reporter).await;
+    let (mut restarted, mut failures) = restart_units(&binaries, reporter).await?;
 
     match restart_index_daemon(reporter).await {
         Ok(true) => restarted += 1,
@@ -48,7 +48,9 @@ pub async fn run(reporter: &Arc<dyn Reporter>) -> Result<()> {
         Err(e) => failures.push(format!("distill indexer: {e:#}")),
     }
 
-    restarted += restart_compose_services(reporter).await?;
+    let (compose_restarted, compose_failures) = restart_compose_services(reporter).await?;
+    restarted += compose_restarted;
+    failures.extend(compose_failures);
 
     finish(restarted, failures, reporter)
 }
@@ -56,7 +58,7 @@ pub async fn run(reporter: &Arc<dyn Reporter>) -> Result<()> {
 /// Restart only the units running one of `replaced`. Called by `hs upgrade`
 /// once the new binaries are on disk.
 pub async fn after_upgrade(replaced: &[PathBuf], reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let (mut restarted, mut failures) = restart_units(replaced, reporter).await;
+    let (mut restarted, mut failures) = restart_units(replaced, reporter).await?;
 
     // The index daemon is started as a child of `hs`, so only a replaced `hs`
     // changes what it would exec.
@@ -114,11 +116,20 @@ fn installed_binaries() -> Vec<PathBuf> {
     binaries
 }
 
-async fn restart_units(binaries: &[PathBuf], reporter: &Arc<dyn Reporter>) -> (u32, Vec<String>) {
-    let mut units = discover_system_units().await;
-    units.extend(discover_user_units(reporter).await);
+async fn restart_units(
+    binaries: &[PathBuf],
+    reporter: &Arc<dyn Reporter>,
+) -> Result<(u32, Vec<String>)> {
+    let mut units = discover_system_units()
+        .await
+        .context("discovering system units")?;
+    units.extend(
+        discover_user_units()
+            .await
+            .context("discovering user units")?,
+    );
     #[cfg(target_os = "macos")]
-    units.extend(discover_launchd_units());
+    units.extend(discover_launchd_units().context("discovering launchd jobs")?);
 
     let mut restarted = 0u32;
     let mut failures = Vec::new();
@@ -154,7 +165,7 @@ async fn restart_units(binaries: &[PathBuf], reporter: &Arc<dyn Reporter>) -> (u
         }
     }
 
-    (restarted, failures)
+    Ok((restarted, failures))
 }
 
 /// Units that must be bounced for `binaries`: running a replaced binary and
@@ -167,33 +178,121 @@ fn select_units(units: Vec<ServiceUnit>, binaries: &[PathBuf]) -> Vec<ServiceUni
 }
 
 #[cfg(target_os = "linux")]
-async fn discover_system_units() -> Vec<ServiceUnit> {
-    discover_systemd_units(false).await.unwrap_or_default()
+async fn discover_system_units() -> Result<Vec<ServiceUnit>> {
+    discover_systemd_units(false).await
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn discover_system_units() -> Vec<ServiceUnit> {
-    Vec::new()
+async fn discover_system_units() -> Result<Vec<ServiceUnit>> {
+    Ok(Vec::new())
 }
 
 #[cfg(target_os = "linux")]
-async fn discover_user_units(reporter: &Arc<dyn Reporter>) -> Vec<ServiceUnit> {
-    match discover_systemd_units(true).await {
-        Some(units) => units,
-        None => {
-            reporter.warn("systemctl --user unavailable: user units not discovered");
-            Vec::new()
-        }
+async fn discover_user_units() -> Result<Vec<ServiceUnit>> {
+    discover_systemd_units(true).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn discover_user_units() -> Result<Vec<ServiceUnit>> {
+    Ok(Vec::new())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemctl_label(user_scope: bool) -> &'static str {
+    if user_scope {
+        "systemctl --user"
+    } else {
+        "systemctl"
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-async fn discover_user_units(_reporter: &Arc<dyn Reporter>) -> Vec<ServiceUnit> {
-    Vec::new()
+/// Unit names from `systemctl list-units` output. A host without a
+/// `systemctl` binary has no systemd and so no units; every other failure
+/// (non-zero exit, spawn error) is an error — an empty answer there would let
+/// the restart phase report "nothing to restart" with the old code running.
+#[cfg(any(target_os = "linux", test))]
+fn interpret_list_units(
+    run: std::io::Result<std::process::Output>,
+    user_scope: bool,
+) -> Result<Vec<String>> {
+    let label = systemctl_label(user_scope);
+    let output = match run {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => bail!("`{label} list-units` could not run: {e}"),
+    };
+    if !output.status.success() {
+        bail!(
+            "`{label} list-units` exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            // `--all` marks failed/not-found units with a leading "●"/"*".
+            line.split_whitespace()
+                .find(|col| col.ends_with(".service"))
+        })
+        .map(str::to_string)
+        .collect())
+}
+
+/// Build the unit from `systemctl show` output for a unit that was listed.
+/// `Ok(None)`: an empty `ExecStart=` — the unit has no main command and cannot
+/// be running our binary. `Err`: the show failed or its output is missing or
+/// garbled for a unit we were told exists.
+#[cfg(any(target_os = "linux", test))]
+fn interpret_show_unit(
+    user_scope: bool,
+    name: &str,
+    run: std::io::Result<std::process::Output>,
+) -> Result<Option<ServiceUnit>> {
+    let label = systemctl_label(user_scope);
+    let output = run.map_err(|e| anyhow::anyhow!("{name}: `{label} show` could not run: {e}"))?;
+    if !output.status.success() {
+        bail!(
+            "{name}: `{label} show` exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(exec_start) = property(&stdout, "ExecStart") else {
+        bail!("{name}: `{label} show` output has no ExecStart property");
+    };
+    if exec_start.trim().is_empty() {
+        return Ok(None);
+    }
+    let Some(exec_path) = parse_exec_start_path(exec_start) else {
+        bail!("{name}: cannot parse a binary path from ExecStart={exec_start:?}");
+    };
+    let Some(active_state) = property(&stdout, "ActiveState") else {
+        bail!("{name}: `{label} show` output has no ActiveState property");
+    };
+
+    Ok(Some(ServiceUnit {
+        scope: if user_scope {
+            UnitScope::User
+        } else {
+            UnitScope::System
+        },
+        name: name.to_string(),
+        exec_path,
+        exec_argv: parse_exec_start_argv(exec_start).unwrap_or_default(),
+        active: active_state == "active",
+        enabled: matches!(
+            property(&stdout, "UnitFileState"),
+            Some("enabled") | Some("static")
+        ),
+        oneshot: property(&stdout, "Type") == Some("oneshot"),
+    }))
 }
 
 #[cfg(target_os = "linux")]
-async fn discover_systemd_units(user_scope: bool) -> Option<Vec<ServiceUnit>> {
+async fn discover_systemd_units(user_scope: bool) -> Result<Vec<ServiceUnit>> {
     let mut list = systemctl(user_scope);
     list.args([
         "list-units",
@@ -203,65 +302,28 @@ async fn discover_systemd_units(user_scope: bool) -> Option<Vec<ServiceUnit>> {
         "hs-*",
         "home-still*",
     ]);
-    let output = list.output().await.ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let names: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|name| name.ends_with(".service"))
-        .map(str::to_string)
-        .collect();
+    let names = interpret_list_units(list.output().await, user_scope)?;
 
     let mut units = Vec::with_capacity(names.len());
     for name in names {
-        if let Some(unit) = show_systemd_unit(user_scope, &name).await {
+        let mut show = systemctl(user_scope);
+        show.args([
+            "show",
+            &name,
+            "-p",
+            "ExecStart",
+            "-p",
+            "ActiveState",
+            "-p",
+            "UnitFileState",
+            "-p",
+            "Type",
+        ]);
+        if let Some(unit) = interpret_show_unit(user_scope, &name, show.output().await)? {
             units.push(unit);
         }
     }
-    Some(units)
-}
-
-#[cfg(target_os = "linux")]
-async fn show_systemd_unit(user_scope: bool, name: &str) -> Option<ServiceUnit> {
-    let mut cmd = systemctl(user_scope);
-    cmd.args([
-        "show",
-        name,
-        "-p",
-        "ExecStart",
-        "-p",
-        "ActiveState",
-        "-p",
-        "UnitFileState",
-        "-p",
-        "Type",
-    ]);
-    let output = cmd.output().await.ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let exec_start = property(&stdout, "ExecStart")?;
-    Some(ServiceUnit {
-        scope: if user_scope {
-            UnitScope::User
-        } else {
-            UnitScope::System
-        },
-        name: name.to_string(),
-        exec_path: parse_exec_start_path(exec_start)?,
-        exec_argv: parse_exec_start_argv(exec_start).unwrap_or_default(),
-        active: property(&stdout, "ActiveState") == Some("active"),
-        enabled: matches!(
-            property(&stdout, "UnitFileState"),
-            Some("enabled") | Some("static")
-        ),
-        oneshot: property(&stdout, "Type") == Some("oneshot"),
-    })
+    Ok(units)
 }
 
 #[cfg(target_os = "linux")]
@@ -274,29 +336,37 @@ fn systemctl(user_scope: bool) -> tokio::process::Command {
 }
 
 #[cfg(target_os = "macos")]
-fn discover_launchd_units() -> Vec<ServiceUnit> {
-    let Ok(output) = std::process::Command::new("launchctl").arg("list").output() else {
-        return Vec::new();
-    };
+fn discover_launchd_units() -> Result<Vec<ServiceUnit>> {
+    let output = std::process::Command::new("launchctl")
+        .arg("list")
+        .output()
+        .context("`launchctl list` could not run")?;
+    if !output.status.success() {
+        bail!(
+            "`launchctl list` exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let agents = dirs::home_dir()
+        .context("no home directory to locate ~/Library/LaunchAgents")?
+        .join("Library/LaunchAgents");
 
-    home_still_launchd_entries(&String::from_utf8_lossy(&output.stdout))
+    let jobs = launchd_jobs(&String::from_utf8_lossy(&output.stdout), |label| {
+        std::fs::read_to_string(agents.join(format!("{label}.plist")))
+    })?;
+    Ok(jobs
         .into_iter()
-        .filter_map(|(pid, label)| {
-            let plist = dirs::home_dir()?
-                .join("Library/LaunchAgents")
-                .join(format!("{label}.plist"));
-            let exec_path = parse_plist_program_path(&std::fs::read_to_string(plist).ok()?)?;
-            Some(ServiceUnit {
-                scope: UnitScope::Launchd,
-                name: label,
-                exec_path,
-                exec_argv: String::new(),
-                active: pid.is_some(),
-                enabled: false,
-                oneshot: false,
-            })
+        .map(|job| ServiceUnit {
+            scope: UnitScope::Launchd,
+            name: job.label,
+            exec_path: job.exec_path,
+            exec_argv: String::new(),
+            active: job.active,
+            enabled: false,
+            oneshot: false,
         })
-        .collect()
+        .collect())
 }
 
 // ── Restart + verify ───────────────────────────────────────────
@@ -356,7 +426,7 @@ async fn restart_systemd_unit(unit: &ServiceUnit) -> Result<(), String> {
 /// How long a just-restarted unit is given to settle before its verification
 /// is called a failure. `systemctl restart` returns as soon as the new process
 /// is forked, and `/proc/<pid>/exe` is unreadable for a moment inside
-/// `execve` — measured on `big` at ~20 ms.
+/// `execve` — measured at ~20 ms.
 const VERIFY_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const VERIFY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -588,6 +658,7 @@ fn parse_launchctl_list(stdout: &str) -> Vec<(Option<u32>, i32, String)> {
         .collect()
 }
 
+/// Program path (first `ProgramArguments` string) of a launchd plist.
 #[cfg(any(target_os = "macos", test))]
 fn parse_plist_program_path(plist: &str) -> Option<PathBuf> {
     let array = plist.split("<key>ProgramArguments</key>").nth(1)?;
@@ -600,6 +671,40 @@ fn parse_plist_program_path(plist: &str) -> Option<PathBuf> {
     Some(PathBuf::from(value))
 }
 
+/// A home-still launchd job and the binary its plist runs.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+struct LaunchdJob {
+    label: String,
+    active: bool,
+    exec_path: PathBuf,
+}
+
+/// Resolve every home-still label in `launchctl list` output to its plist's
+/// program. A label whose plist cannot be read or parsed is an error, not a
+/// skipped unit: a running job we cannot identify might be running the old
+/// binary.
+#[cfg(any(target_os = "macos", test))]
+fn launchd_jobs(
+    list_stdout: &str,
+    read_plist: impl Fn(&str) -> std::io::Result<String>,
+) -> Result<Vec<LaunchdJob>> {
+    let mut jobs = Vec::new();
+    for (pid, label) in home_still_launchd_entries(list_stdout) {
+        let plist = read_plist(&label)
+            .map_err(|e| anyhow::anyhow!("{label}: cannot read its launchd plist: {e}"))?;
+        let exec_path = parse_plist_program_path(&plist).ok_or_else(|| {
+            anyhow::anyhow!("{label}: launchd plist has no parsable ProgramArguments[0]")
+        })?;
+        jobs.push(LaunchdJob {
+            label,
+            active: pid.is_some(),
+            exec_path,
+        });
+    }
+    Ok(jobs)
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn parse_launchd_print_pid(stdout: &str) -> Option<u32> {
     stdout
@@ -610,6 +715,9 @@ fn parse_launchd_print_pid(stdout: &str) -> Option<u32> {
 
 // ── Distill index daemon ───────────────────────────────────────
 
+/// Outcome of the index-daemon restart: `Ok(true)` restarted. A daemon that
+/// was running and could not be brought back is an error — the old one was
+/// already killed, so "nothing to do" would hide an outage.
 async fn restart_index_daemon(reporter: &Arc<dyn Reporter>) -> Result<bool> {
     let pid_path = dirs::home_dir()
         .unwrap_or_default()
@@ -632,7 +740,7 @@ async fn restart_index_daemon(reporter: &Arc<dyn Reporter>) -> Result<bool> {
                     if !crate::daemon::is_process_alive(pid) {
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 if crate::daemon::is_process_alive(pid) {
                     unsafe {
@@ -643,7 +751,12 @@ async fn restart_index_daemon(reporter: &Arc<dyn Reporter>) -> Result<bool> {
             crate::daemon::remove_pid_file(&pid_path);
 
             // Re-spawn
-            crate::distill_cmd::ensure_index_running().await;
+            if !crate::distill_cmd::ensure_index_running().await? {
+                bail!(
+                    "the old indexer (PID {pid}) was stopped but a new one was not started: \
+                     distill server binary missing or server unreachable"
+                );
+            }
             reporter.status("OK", "distill indexer restarted");
             Ok(true)
         }
@@ -653,7 +766,32 @@ async fn restart_index_daemon(reporter: &Arc<dyn Reporter>) -> Result<bool> {
 
 // ── Docker compose containers ──────────────────────────────────
 
-async fn restart_compose_services(reporter: &Arc<dyn Reporter>) -> Result<u32> {
+/// Decide whether one `compose restart` succeeded. The exit status is the
+/// verdict; filtered stderr only supplies the explanation. A non-zero exit
+/// with nothing left after filtering is still a failure.
+fn classify_compose_restart(
+    name: &str,
+    success: bool,
+    code: Option<i32>,
+    stderr: &str,
+) -> Result<(), String> {
+    if success {
+        return Ok(());
+    }
+    let errors = hs_common::compose::filter_compose_stderr(stderr);
+    if errors.is_empty() {
+        Err(format!(
+            "{name} containers: `compose restart` exited {code:?}: {}",
+            stderr.trim()
+        ))
+    } else {
+        Err(format!("{name} containers: {}", errors.join("; ")))
+    }
+}
+
+/// Restart the compose stacks that exist on this host. Returns the number
+/// restarted and the per-stack failures; no compose files at all is `(0, [])`.
+async fn restart_compose_services(reporter: &Arc<dyn Reporter>) -> Result<(u32, Vec<String>)> {
     use hs_common::compose::ComposeCmd;
 
     let hidden = dirs::home_dir()
@@ -674,40 +812,44 @@ async fn restart_compose_services(reporter: &Arc<dyn Reporter>) -> Result<u32> {
         .collect();
 
     if active.is_empty() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
-    let compose = match ComposeCmd::detect().await {
-        Some(c) => c,
-        None => return Ok(0),
+    let Some(compose) = ComposeCmd::detect().await else {
+        bail!(
+            "compose files exist ({}) but neither `docker compose` nor `docker-compose` is available",
+            active
+                .iter()
+                .map(|(_, p)| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     };
 
-    let mut count = 0u32;
+    let mut restarted = 0u32;
+    let mut failures = Vec::new();
     for (name, path) in &active {
         let cf = path.to_string_lossy().to_string();
         reporter.status("Restart", &format!("{name} containers"));
-        let output = compose.run_capture(&["-f", &cf, "restart"]).await;
-        match output {
-            Ok(o) if o.status.success() => {
+        let verdict = match compose.run_capture(&["-f", &cf, "restart"]).await {
+            Ok(o) => classify_compose_restart(
+                name,
+                o.status.success(),
+                o.status.code(),
+                &String::from_utf8_lossy(&o.stderr),
+            ),
+            Err(e) => Err(format!("{name} containers: could not run compose: {e:#}")),
+        };
+        match verdict {
+            Ok(()) => {
                 reporter.status("OK", &format!("{name} containers restarted"));
+                restarted += 1;
             }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let errors = hs_common::compose::filter_compose_stderr(&stderr);
-                if errors.is_empty() {
-                    reporter.status("OK", &format!("{name} containers restarted"));
-                } else {
-                    reporter.warn(&format!("{name}: {}", errors.join("; ")));
-                }
-            }
-            Err(e) => {
-                reporter.warn(&format!("{name}: {e}"));
-            }
+            Err(failure) => failures.push(failure),
         }
-        count += 1;
     }
 
-    Ok(count)
+    Ok((restarted, failures))
 }
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -816,7 +958,7 @@ async fn sudo_can_restart(service_name: &str) -> bool {
 mod tests {
     use super::*;
 
-    const HS: &str = "/home/ladvien/.local/bin/hs";
+    const HS: &str = "/home/user/.local/bin/hs";
 
     fn unit(scope: UnitScope, name: &str, exec: &str) -> ServiceUnit {
         ServiceUnit {
@@ -832,8 +974,8 @@ mod tests {
 
     #[test]
     fn parse_exec_start_path_picks_path() {
-        let big = "{ path=/home/ladvien/.local/bin/hs ; \
-                   argv[]=/home/ladvien/.local/bin/hs serve scribe --port 7435 ; \
+        let big = "{ path=/home/user/.local/bin/hs ; \
+                   argv[]=/home/user/.local/bin/hs serve scribe --port 7435 ; \
                    ignore_errors=no ; start_time=[Wed 2026-09-16 06:48:59 CDT] ; \
                    stop_time=[n/a] ; pid=973 ; code=(null) ; status=0/0 }";
         assert_eq!(parse_exec_start_path(big), Some(PathBuf::from(HS)));
@@ -846,18 +988,18 @@ mod tests {
 
     #[test]
     fn parse_exec_start_argv_and_port() {
-        let big = "{ path=/home/ladvien/.local/bin/hs ; \
-                   argv[]=/home/ladvien/.local/bin/hs serve scribe --port 7435 ; \
+        let big = "{ path=/home/user/.local/bin/hs ; \
+                   argv[]=/home/user/.local/bin/hs serve scribe --port 7435 ; \
                    ignore_errors=no ; }";
         let argv = parse_exec_start_argv(big).expect("argv");
-        assert_eq!(argv, "/home/ladvien/.local/bin/hs serve scribe --port 7435");
+        assert_eq!(argv, "/home/user/.local/bin/hs serve scribe --port 7435");
         assert_eq!(parse_serve_port(&argv), Some(7435));
 
         // Someone else's server: not ours to probe.
         assert_eq!(parse_serve_port("/usr/bin/vllm serve --port 8081"), None);
         // The watcher daemons bind nothing.
         assert_eq!(
-            parse_serve_port("/home/ladvien/.local/bin/hs distill watch-events"),
+            parse_serve_port("/home/user/.local/bin/hs distill watch-events"),
             None
         );
     }
@@ -865,7 +1007,7 @@ mod tests {
     #[test]
     fn matches_replaced_requires_exact_binary() {
         let installed = PathBuf::from(HS);
-        let dev = PathBuf::from("/home/ladvien/home-still/target/release/hs");
+        let dev = PathBuf::from("/home/user/home-still/target/release/hs");
 
         assert!(matches_replaced(
             &unit(UnitScope::System, "hs-serve-mcp.service", HS),
@@ -876,7 +1018,7 @@ mod tests {
             &unit(
                 UnitScope::System,
                 "hs-distill-watch.service",
-                "/home/ladvien/home-still/target/release/hs"
+                "/home/user/home-still/target/release/hs"
             ),
             &[installed]
         ));
@@ -884,7 +1026,7 @@ mod tests {
             &unit(
                 UnitScope::System,
                 "hs-distill-watch.service",
-                "/home/ladvien/home-still/target/release/hs"
+                "/home/user/home-still/target/release/hs"
             ),
             &[dev]
         ));
@@ -913,7 +1055,7 @@ mod tests {
     <string>com.home-still.scribe</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/rebekahbrittain/.local/bin/hs</string>
+        <string>/Users/user/.local/bin/hs</string>
         <string>serve</string>
         <string>scribe</string>
     </array>
@@ -923,7 +1065,7 @@ mod tests {
 </plist>"#;
         assert_eq!(
             parse_plist_program_path(plist),
-            Some(PathBuf::from("/Users/rebekahbrittain/.local/bin/hs"))
+            Some(PathBuf::from("/Users/user/.local/bin/hs"))
         );
         assert_eq!(parse_plist_program_path("<plist></plist>"), None);
     }
@@ -961,7 +1103,7 @@ mod tests {
 
     #[test]
     fn cgroup_match_uses_the_full_unit_name() {
-        // Real cgroup lines from `big`.
+        // Real cgroup lines from a production host.
         assert!(cgroup_is_under_unit(
             "0::/home.slice/home-still.slice/hs-serve-distill.service\n",
             "hs-serve-distill.service"
@@ -1028,5 +1170,142 @@ mod tests {
         let selected = select_units(vec![reconcile, long_running], &binaries);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "hs-serve-mcp.service");
+    }
+
+    // ── RA-65: discovery failures are errors ──────────────────
+
+    #[cfg(unix)]
+    fn output(code: i32, stdout: &str, stderr: &str) -> std::io::Result<std::process::Output> {
+        use std::os::unix::process::ExitStatusExt;
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_units_nonzero_exit_is_an_error() {
+        let err = interpret_list_units(output(1, "", "Failed to connect to bus"), true)
+            .expect_err("a failing systemctl must not read as zero units");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("systemctl --user"), "{msg}");
+        assert!(msg.contains("Failed to connect to bus"), "{msg}");
+    }
+
+    #[test]
+    fn list_units_without_systemctl_is_zero_units() {
+        let missing = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(
+            interpret_list_units(missing, false).unwrap(),
+            Vec::<String>::new()
+        );
+
+        let denied = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(interpret_list_units(denied, false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_units_extracts_service_names_including_failed_rows() {
+        let listed = "  hs-serve-mcp.service      loaded active running Home-Still mcp\n\
+                      ● hs-serve-scribe.service   loaded failed failed  Home-Still scribe\n";
+        assert_eq!(
+            interpret_list_units(output(0, listed, ""), false).unwrap(),
+            vec!["hs-serve-mcp.service", "hs-serve-scribe.service"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_unit_parses_a_listed_unit() {
+        let show = format!(
+            "ExecStart={{ path={HS} ; argv[]={HS} serve mcp --port 7445 ; ignore_errors=no }}\n\
+             ActiveState=active\nUnitFileState=enabled\nType=simple\n"
+        );
+        let unit = interpret_show_unit(false, "hs-serve-mcp.service", output(0, &show, ""))
+            .unwrap()
+            .expect("unit");
+        assert_eq!(unit.exec_path, PathBuf::from(HS));
+        assert!(unit.active && unit.enabled && !unit.oneshot);
+        assert_eq!(unit.scope, UnitScope::System);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_unit_empty_exec_start_is_skipped_not_failed() {
+        let show = "ExecStart=\nActiveState=inactive\nUnitFileState=static\nType=oneshot\n";
+        assert_eq!(
+            interpret_show_unit(true, "hs-x.service", output(0, show, "")).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_unit_malformed_or_failed_output_is_an_error() {
+        // Listed unit whose show output lacks ExecStart entirely.
+        let e = interpret_show_unit(false, "hs-a.service", output(0, "ActiveState=active\n", ""))
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("hs-a.service"));
+        // ExecStart present but no parsable path (previously: unit silently skipped).
+        let e = interpret_show_unit(
+            false,
+            "hs-b.service",
+            output(0, "ExecStart=garbage\nActiveState=active\n", ""),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("hs-b.service"));
+        // Missing ActiveState.
+        let show = format!("ExecStart={{ path={HS} ; argv[]={HS} }}\n");
+        assert!(interpret_show_unit(false, "hs-c.service", output(0, &show, "")).is_err());
+        // systemctl show itself failed.
+        let e = interpret_show_unit(false, "hs-d.service", output(1, "", "boom")).unwrap_err();
+        assert!(format!("{e:#}").contains("boom"));
+    }
+
+    #[test]
+    fn launchd_unreadable_or_unparsable_plist_is_an_error() {
+        let listed = "PID\tStatus\tLabel\n1340\t0\tcom.home-still.scribe\n7\t0\tcom.apple.other\n";
+        let good =
+            "<key>ProgramArguments</key><array><string>/Users/user/.local/bin/hs</string></array>";
+
+        let jobs = launchd_jobs(listed, |_| Ok(good.to_string())).unwrap();
+        assert_eq!(
+            jobs,
+            vec![LaunchdJob {
+                label: "com.home-still.scribe".to_string(),
+                active: true,
+                exec_path: PathBuf::from("/Users/user/.local/bin/hs"),
+            }]
+        );
+
+        let missing = launchd_jobs(listed, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert!(format!("{missing:#}").contains("com.home-still.scribe"));
+
+        let garbled = launchd_jobs(listed, |_| Ok("<plist></plist>".to_string())).unwrap_err();
+        assert!(format!("{garbled:#}").contains("com.home-still.scribe"));
+    }
+
+    // ── RA-66: compose exit status is the verdict ─────────────
+
+    #[test]
+    fn compose_nonzero_with_empty_stderr_is_a_failure() {
+        assert!(classify_compose_restart("distill", true, Some(0), "").is_ok());
+
+        let err = classify_compose_restart("distill", false, Some(1), "").unwrap_err();
+        assert!(err.contains("distill"), "{err}");
+
+        // Stderr that is pure podman banner noise filters to nothing: still a failure.
+        let noise = ">>>> Executing external compose provider \"podman-compose\"\n";
+        assert!(classify_compose_restart("distill", false, Some(1), noise).is_err());
+
+        let err = classify_compose_restart("distill", false, Some(1), "Error: no such service")
+            .unwrap_err();
+        assert!(err.contains("no such service"), "{err}");
     }
 }

@@ -11,7 +11,7 @@ const DEFAULT_MCP_PORT: u16 = 7445;
 
 #[derive(Subcommand, Debug)]
 pub enum ServeCmd {
-    /// Run a scribe server (auto-init, foreground, registers with gateway)
+    /// Run a scribe server (auto-init, foreground)
     Scribe {
         /// Action: start (background), stop, or omit for foreground
         action: Option<ServeAction>,
@@ -25,7 +25,7 @@ pub enum ServeCmd {
         #[arg(long, conflicts_with = "install")]
         uninstall: bool,
     },
-    /// Run a distill server (auto-init, foreground, registers with gateway)
+    /// Run a distill server (auto-init, foreground)
     Distill {
         /// Action: start (background), stop, or omit for foreground
         action: Option<ServeAction>,
@@ -39,7 +39,7 @@ pub enum ServeCmd {
         #[arg(long, conflicts_with = "install")]
         uninstall: bool,
     },
-    /// Run an MCP server (foreground, registers with gateway)
+    /// Run an MCP server (foreground)
     Mcp {
         /// Port to listen on
         #[arg(long, default_value_t = DEFAULT_MCP_PORT)]
@@ -187,7 +187,6 @@ async fn serve_scribe(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     // Start server (foreground — blocks until shutdown)
     reporter.status("Start", "starting scribe server");
     let result = super::scribe_cmd::start_server_foreground(port, reporter).await;
-    // _reg drops here → heartbeat aborted, deregister sent
 
     reporter.finish("scribe server stopped");
     result
@@ -291,9 +290,12 @@ async fn install_user_service(
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
+        #[cfg(target_os = "macos")]
         let hs_path = hs_bin.display().to_string();
+        #[cfg(target_os = "linux")]
         let home_dir =
             dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+        #[cfg(target_os = "linux")]
         let secrets_path = home_dir.join(".home-still").join("secrets.env");
 
         #[cfg(target_os = "linux")]
@@ -302,28 +304,12 @@ async fn install_user_service(
             std::fs::create_dir_all(&unit_dir)?;
             let unit_path = unit_dir.join(format!("hs-{service_name}.service"));
 
-            let env_file_line = if secrets_path.exists() {
-                format!("EnvironmentFile=-{}\n", secrets_path.display())
-            } else {
-                String::new()
-            };
-            let exec_spaced = exec_args.join(" ");
-            let unit = format!(
-                r#"[Unit]
-Description={description}
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory={home}
-{env_file_line}ExecStart={hs_path} {exec_spaced}
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-"#,
-                home = home_dir.display(),
+            let unit = render_user_unit(
+                description,
+                &home_dir,
+                &hs_bin,
+                exec_args,
+                secrets_path.exists().then_some(secrets_path.as_path()),
             );
 
             reporter.status("Install", &format!("{}", unit_path.display()));
@@ -358,64 +344,10 @@ WantedBy=default.target
         {
             let _ = description;
             let label = format!("com.home-still.{service_name}");
-            let plist_dir = home_dir.join("Library/LaunchAgents");
-            std::fs::create_dir_all(&plist_dir)?;
-            let plist_path = plist_dir.join(format!("{label}.plist"));
-
-            let exec_joined = exec_args
-                .iter()
-                .map(|a| format!("<string>{a}</string>"))
-                .collect::<Vec<_>>()
-                .join("\n        ");
-
-            let mut secret_entries = String::new();
-            if let Ok(contents) = std::fs::read_to_string(&secrets_path) {
-                for line in contents.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    if let Some((k, v)) = line.split_once('=') {
-                        let v = v.trim_matches('"').trim_matches('\'');
-                        secret_entries.push_str(&format!(
-                            "        <key>{k}</key>\n        <string>{v}</string>\n"
-                        ));
-                    }
-                }
-            }
-
-            let plist = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://schemas.apple.com/dtds/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{hs_path}</string>
-        {exec_joined}
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-{secret_entries}    </dict>
-    <key>KeepAlive</key>
-    <true/>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/hs-{service_name}.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/hs-{service_name}.log</string>
-</dict>
-</plist>
-"#
-            );
-
+            let mut program_args = vec![hs_path.clone()];
+            program_args.extend(exec_args.iter().map(|a| a.to_string()));
+            let (plist_path, log_path) = write_launchd_agent(&label, service_name, &program_args)?;
             reporter.status("Install", &format!("{}", plist_path.display()));
-            std::fs::write(&plist_path, &plist)?;
 
             let _ = tokio::process::Command::new("launchctl")
                 .args(["unload", &plist_path.to_string_lossy()])
@@ -431,9 +363,10 @@ WantedBy=default.target
 
             reporter.finish(&format!(
                 "Installed and started {label}\n\
-             View logs: tail -f /tmp/hs-{service_name}.log\n\
+             View logs: tail -f {}\n\
              Stop:      launchctl unload {}\n\
              Remove:    rm {}",
+                log_path.display(),
                 plist_path.display(),
                 plist_path.display()
             ));
@@ -495,6 +428,296 @@ async fn uninstall_user_service(service_name: &str, reporter: &Arc<dyn Reporter>
     }
 }
 
+// ── Unit / plist generation ────────────────────────────────────
+//
+// Generators and writers are separate from the `sudo` / `systemctl` /
+// `launchctl` calls so they can be exercised without touching the host.
+
+/// The user a system unit runs as: `$USER`, else `id -un`. There is no
+/// default — a unit running as the wrong account is worse than no unit.
+#[cfg(any(target_os = "linux", test))]
+fn resolve_user(
+    env_user: Option<String>,
+    id_un: impl FnOnce() -> Option<String>,
+) -> Result<String> {
+    let user = env_user
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .or_else(|| {
+            id_un()
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+        })
+        .context("cannot determine the current user: $USER is unset and `id -un` failed")?;
+    // `User=` is one unit-file line: refuse anything that could break out of it.
+    if !user
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        anyhow::bail!("refusing to write User={user:?} into a systemd unit");
+    }
+    Ok(user)
+}
+
+#[cfg(target_os = "linux")]
+fn current_user() -> Result<String> {
+    resolve_user(std::env::var("USER").ok(), || {
+        let out = std::process::Command::new("id").arg("-un").output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+}
+
+/// Text of the root-installed `/etc/systemd/system/hs-serve-<kind>.service`.
+#[cfg(any(target_os = "linux", test))]
+fn render_system_unit(
+    service_type: &str,
+    port: u16,
+    user: &str,
+    home: &std::path::Path,
+    hs_bin: &std::path::Path,
+    fastembed_cache: &std::path::Path,
+    secrets_env: Option<&std::path::Path>,
+) -> String {
+    let env_file_line = secrets_env
+        .map(|p| format!("EnvironmentFile=-{}\n", p.display()))
+        .unwrap_or_default();
+    format!(
+        r#"[Unit]
+Description=Home-Still {service_type} server
+After=network.target
+
+[Service]
+Type=simple
+User={user}
+WorkingDirectory={home}
+{env_file_line}Environment=FASTEMBED_CACHE_PATH={cache}
+ExecStart={hs_path} serve {service_type} --port {port}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        home = home.display(),
+        cache = fastembed_cache.display(),
+        hs_path = hs_bin.display(),
+    )
+}
+
+/// Text of the per-user `hs-<name>.service` that runs a watch-events daemon.
+/// Those commands exit non-zero when their event stream ends, which
+/// `Restart=always` turns into a restart after `RestartSec`.
+#[cfg(any(target_os = "linux", test))]
+fn render_user_unit(
+    description: &str,
+    home: &std::path::Path,
+    hs_bin: &std::path::Path,
+    exec_args: &[&str],
+    secrets_env: Option<&std::path::Path>,
+) -> String {
+    let env_file_line = secrets_env
+        .map(|p| format!("EnvironmentFile=-{}\n", p.display()))
+        .unwrap_or_default();
+    format!(
+        r#"[Unit]
+Description={description}
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={home}
+{env_file_line}ExecStart={hs_path} {exec_spaced}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"#,
+        home = home.display(),
+        hs_path = hs_bin.display(),
+        exec_spaced = exec_args.join(" "),
+    )
+}
+
+/// Install `contents` at `dest` as root without staging it in a
+/// world-writable directory: the text goes to `sudo tee` on stdin, so there
+/// is no predictable temp path to race or symlink.
+#[cfg(target_os = "linux")]
+async fn sudo_write_file(dest: &str, contents: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new("sudo")
+        .args(["tee", dest])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .context("sudo tee could not run")?;
+    let mut stdin = child.stdin.take().context("sudo tee has no stdin")?;
+    stdin
+        .write_all(contents.as_bytes())
+        .await
+        .with_context(|| format!("writing {dest} via sudo tee"))?;
+    drop(stdin);
+    let status = child.wait().await?;
+    if !status.success() {
+        anyhow::bail!("Failed to install {dest} (sudo tee exited {status})");
+    }
+    Ok(())
+}
+
+/// Escape the five XML-significant characters of a plist `<string>`/`<key>`.
+#[cfg(any(target_os = "macos", test))]
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `KEY=value` lines of a `secrets.env`, comments and blanks dropped,
+/// one layer of surrounding quotes removed.
+#[cfg(any(target_os = "macos", test))]
+fn parse_secrets_env(contents: &str) -> Vec<(String, String)> {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .map(|(k, v)| {
+            (
+                k.trim().to_string(),
+                v.trim_matches('"').trim_matches('\'').to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Text of a KeepAlive LaunchAgent. Every interpolated value is XML-escaped.
+/// `KeepAlive` restarts the job on any exit (including the non-zero exit of
+/// a finished event stream), `ThrottleInterval` is the minimum gap.
+#[cfg(any(target_os = "macos", test))]
+fn render_launchd_plist(
+    label: &str,
+    program_args: &[String],
+    secrets: &[(String, String)],
+    log_path: &std::path::Path,
+) -> String {
+    let args = program_args
+        .iter()
+        .map(|a| format!("        <string>{}</string>\n", xml_escape(a)))
+        .collect::<String>();
+    let env = secrets
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "        <key>{}</key>\n        <string>{}</string>\n",
+                xml_escape(k),
+                xml_escape(v)
+            )
+        })
+        .collect::<String>();
+    let log = xml_escape(&log_path.to_string_lossy());
+    let label = xml_escape(label);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://schemas.apple.com/dtds/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+{args}    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+{env}    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// `~/Library/Logs/home-still/hs-<name>.log`.
+#[cfg(any(target_os = "macos", test))]
+fn launchd_log_path(home: &std::path::Path, name: &str) -> PathBuf {
+    home.join("Library/Logs/home-still")
+        .join(format!("hs-{name}.log"))
+}
+
+/// Write `contents` to `path` atomically with mode 0600 (the plist carries
+/// secrets): created owner-only in the destination directory, then renamed
+/// into place, so no moment exists where it is world-readable.
+#[cfg(any(target_os = "macos", test))]
+fn write_private_file(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .context("plist path has no parent directory")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating a private temp file in {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    tmp.write_all(contents.as_bytes())?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Generate and write `~/Library/LaunchAgents/<label>.plist` (0600), creating
+/// the per-user log directory. Returns the plist and log paths.
+#[cfg(target_os = "macos")]
+fn write_launchd_agent(
+    label: &str,
+    log_name: &str,
+    program_args: &[String],
+) -> Result<(PathBuf, PathBuf)> {
+    let home = dirs::home_dir().context("Cannot find home directory")?;
+    let plist_dir = home.join("Library/LaunchAgents");
+    let plist_path = plist_dir.join(format!("{label}.plist"));
+    let log_path = launchd_log_path(&home, log_name);
+    std::fs::create_dir_all(&plist_dir)?;
+    std::fs::create_dir_all(log_path.parent().context("log path has no parent")?)?;
+
+    let secrets_path = home.join(".home-still").join("secrets.env");
+    let secrets = match std::fs::read_to_string(&secrets_path) {
+        Ok(contents) => parse_secrets_env(&contents),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", secrets_path.display())),
+    };
+
+    let plist = render_launchd_plist(label, program_args, &secrets, &log_path);
+    write_private_file(&plist_path, &plist)?;
+    Ok((plist_path, log_path))
+}
+
 // ── Service Installation ───────────────────────────────────────
 
 async fn install_service(
@@ -511,63 +734,34 @@ async fn install_service(
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let hs_bin = std::env::current_exe().context("Cannot find hs binary path")?;
+        #[cfg(target_os = "macos")]
         let hs_path = hs_bin.display();
 
         #[cfg(target_os = "linux")]
         {
-            let user = std::env::var("USER").unwrap_or_else(|_| "ladvien".into());
+            let user = current_user()?;
             let service_name = format!("hs-serve-{service_type}");
             let unit_path = format!("/etc/systemd/system/{service_name}.service");
 
-            let home_dir = dirs::home_dir().unwrap_or_default();
+            let home_dir = dirs::home_dir().context("Cannot find home directory")?;
             let fastembed_cache = hs_bin
                 .parent()
                 .unwrap_or(home_dir.as_path())
                 .join(".fastembed_cache");
 
             let secrets_path = home_dir.join(".home-still").join("secrets.env");
-            let env_file_line = if secrets_path.exists() {
-                format!("EnvironmentFile=-{}\n", secrets_path.display())
-            } else {
-                String::new()
-            };
-
-            let unit = format!(
-                r#"[Unit]
-Description=Home-Still {service_type} server
-After=network.target
-
-[Service]
-Type=simple
-User={user}
-WorkingDirectory={home}
-{env_file_line}Environment=FASTEMBED_CACHE_PATH={cache}
-ExecStart={hs_path} serve {service_type} --port {port}
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-"#,
-                home = home_dir.display(),
-                cache = fastembed_cache.display(),
+            let unit = render_system_unit(
+                service_type,
+                port,
+                &user,
+                &home_dir,
+                &hs_bin,
+                &fastembed_cache,
+                secrets_path.exists().then_some(secrets_path.as_path()),
             );
 
             reporter.status("Install", &format!("writing {unit_path}"));
-
-            // Write unit file (needs sudo)
-            let tmp = format!("/tmp/{service_name}.service");
-            std::fs::write(&tmp, &unit).context("Failed to write temp unit file")?;
-
-            let status = tokio::process::Command::new("sudo")
-                .args(["cp", &tmp, &unit_path])
-                .status()
-                .await
-                .context("sudo cp failed")?;
-            if !status.success() {
-                anyhow::bail!("Failed to install systemd unit (sudo cp)");
-            }
-            let _ = std::fs::remove_file(&tmp);
+            sudo_write_file(&unit_path, &unit).await?;
 
             reporter.status("Enable", &format!("{service_name}.service"));
             let status = tokio::process::Command::new("sudo")
@@ -597,65 +791,15 @@ WantedBy=multi-user.target
         #[cfg(target_os = "macos")]
         {
             let label = format!("com.home-still.{service_type}");
-            let home_dir =
-                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
-            let plist_dir = home_dir.join("Library/LaunchAgents");
-            let plist_path = plist_dir.join(format!("{label}.plist"));
-
-            std::fs::create_dir_all(&plist_dir)?;
-
-            let mut secret_entries = String::new();
-            let secrets_path = home_dir.join(".home-still").join("secrets.env");
-            if let Ok(contents) = std::fs::read_to_string(&secrets_path) {
-                for line in contents.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    if let Some((k, v)) = line.split_once('=') {
-                        let v = v.trim_matches('"').trim_matches('\'');
-                        secret_entries.push_str(&format!(
-                            "        <key>{k}</key>\n        <string>{v}</string>\n"
-                        ));
-                    }
-                }
-            }
-
-            let plist = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://schemas.apple.com/dtds/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{hs_path}</string>
-        <string>serve</string>
-        <string>{service_type}</string>
-        <string>--port</string>
-        <string>{port}</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-{secret_entries}    </dict>
-    <key>KeepAlive</key>
-    <true/>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/hs-{service_type}.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/hs-{service_type}.log</string>
-</dict>
-</plist>
-"#
-            );
-
+            let program_args = vec![
+                hs_path.to_string(),
+                "serve".to_string(),
+                service_type.to_string(),
+                "--port".to_string(),
+                port.to_string(),
+            ];
+            let (plist_path, log_path) = write_launchd_agent(&label, service_type, &program_args)?;
             reporter.status("Install", &format!("{}", plist_path.display()));
-            std::fs::write(&plist_path, &plist)?;
 
             reporter.status("Load", &label);
             // Unload first in case it's already loaded (ignore errors)
@@ -674,9 +818,10 @@ WantedBy=multi-user.target
 
             reporter.finish(&format!(
                 "Installed and started {label}\n\
-             View logs: tail -f /tmp/hs-{service_type}.log\n\
+             View logs: tail -f {}\n\
              Stop:      launchctl unload {}\n\
              Remove:    rm {}",
+                log_path.display(),
                 plist_path.display(),
                 plist_path.display()
             ));
@@ -836,4 +981,163 @@ pub(crate) fn find_mcp_binary() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn restart_policy(unit: &str) -> (String, u32) {
+        let value = |key: &str| {
+            unit.lines()
+                .find_map(|l| l.strip_prefix(key))
+                .unwrap_or_else(|| panic!("unit has no {key}"))
+                .trim()
+                .to_string()
+        };
+        (
+            value("Restart="),
+            value("RestartSec=").parse().expect("RestartSec seconds"),
+        )
+    }
+
+    /// A process that exits 1 (the watch-events "event stream ended" error)
+    /// must be restarted, and not in a hot loop.
+    fn assert_restarts_on_exit_1(unit: &str) {
+        let (restart, sec) = restart_policy(unit);
+        assert!(
+            matches!(restart.as_str(), "always" | "on-failure"),
+            "Restart={restart} does not restart on exit status 1"
+        );
+        assert!(sec >= 1, "RestartSec={sec} allows a hot restart loop");
+    }
+
+    #[test]
+    fn resolve_user_has_no_default() {
+        assert!(resolve_user(None, || None).is_err());
+        assert!(resolve_user(Some("  ".into()), || None).is_err());
+        assert_eq!(
+            resolve_user(None, || Some("alice\n".into())).unwrap(),
+            "alice"
+        );
+        assert_eq!(
+            resolve_user(Some("bob".into()), || panic!("id must not run")).unwrap(),
+            "bob"
+        );
+        // Anything that could add a unit-file line is refused.
+        assert!(resolve_user(Some("bob\nExecStartPre=/bin/sh".into()), || None).is_err());
+    }
+
+    #[test]
+    fn system_unit_names_the_given_user_and_restarts_on_failure() {
+        let unit = render_system_unit(
+            "scribe",
+            7433,
+            "alice",
+            Path::new("/home/user"),
+            Path::new("/home/user/.local/bin/hs"),
+            Path::new("/home/user/.local/bin/.fastembed_cache"),
+            Some(Path::new("/home/user/.home-still/secrets.env")),
+        );
+        assert!(unit.lines().any(|l| l == "User=alice"));
+        assert!(unit.contains("ExecStart=/home/user/.local/bin/hs serve scribe --port 7433"));
+        assert_restarts_on_exit_1(&unit);
+    }
+
+    #[test]
+    fn user_unit_for_watch_daemons_restarts_on_failure() {
+        let unit = render_user_unit(
+            "watch",
+            Path::new("/home/user"),
+            Path::new("/home/user/.local/bin/hs"),
+            &["scribe", "watch-events"],
+            None,
+        );
+        assert!(unit.contains("ExecStart=/home/user/.local/bin/hs scribe watch-events"));
+        assert_restarts_on_exit_1(&unit);
+    }
+
+    /// Minimal inverse of `xml_escape` for the round-trip check.
+    fn xml_unescape(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    }
+
+    #[test]
+    fn plist_escapes_secret_values_and_cannot_be_injected() {
+        let nasty = "p&ss<w>\"o'rd\n</string><key>Evil</key><string>x";
+        let plist = render_launchd_plist(
+            "com.home-still.scribe",
+            &["/home/user/.local/bin/hs".into(), "a<b".into()],
+            &[("TOKEN".into(), nasty.into())],
+            Path::new("/home/user/Library/Logs/home-still/hs-scribe.log"),
+        );
+
+        // Structure is intact: nothing from the value became markup.
+        assert!(!plist.contains("<key>Evil</key>"));
+        assert_eq!(plist.matches("<key>").count(), 10);
+        // The text between the TOKEN key and its closing tag round-trips.
+        let after = plist
+            .split("<key>TOKEN</key>\n        <string>")
+            .nth(1)
+            .unwrap();
+        let escaped = after.split("</string>").next().unwrap();
+        assert!(!escaped.contains('<') && !escaped.contains('>'));
+        assert!(escaped
+            .replace("&amp;", "")
+            .replace("&lt;", "")
+            .replace("&gt;", "")
+            .replace("&quot;", "")
+            .replace("&apos;", "")
+            .find('&')
+            .is_none());
+        assert_eq!(xml_unescape(escaped), nasty);
+    }
+
+    #[test]
+    fn plist_restarts_and_logs_to_user_log_dir() {
+        let log = launchd_log_path(Path::new("/Users/user"), "scribe");
+        assert_eq!(
+            log,
+            Path::new("/Users/user/Library/Logs/home-still/hs-scribe.log")
+        );
+        let plist = render_launchd_plist("com.home-still.scribe", &["hs".into()], &[], &log);
+        assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
+        assert!(!plist.contains("/tmp/"));
+    }
+
+    #[test]
+    fn secrets_env_parsing_strips_quotes_and_comments() {
+        assert_eq!(
+            parse_secrets_env("# c\n\nA=\"x y\"\nB='z'\nC=a=b\n"),
+            vec![
+                ("A".to_string(), "x y".to_string()),
+                ("B".to_string(), "z".to_string()),
+                ("C".to_string(), "a=b".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn written_plist_is_mode_0600_and_replaces_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("com.home-still.scribe.plist");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private_file(&path, "secret").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // No staging file left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }

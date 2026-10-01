@@ -572,7 +572,7 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
                 if !crate::daemon::is_process_alive(pid) {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             #[cfg(unix)]
             if crate::daemon::is_process_alive(pid) {
@@ -685,7 +685,7 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     reporter.status("Distill", &format!("OK (PID {pid})"));
 
     // Auto-start index daemon to process any pending documents
-    if ensure_index_running().await {
+    if ensure_index_running().await? {
         reporter.status("Pipeline", "index daemon started");
     }
 
@@ -711,7 +711,7 @@ pub async fn cmd_server_stop(reporter: &Arc<dyn Reporter>) -> Result<()> {
                     if !crate::daemon::is_process_alive(pid) {
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 if crate::daemon::is_process_alive(pid) {
                     unsafe {
@@ -852,8 +852,12 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
                 .map(|r| r.status().is_success())
                 .unwrap_or(false)
             {
-                if ensure_index_running().await {
-                    tracing::info!("Auto-started index daemon after distill server ready");
+                match ensure_index_running().await {
+                    Ok(true) => {
+                        tracing::info!("Auto-started index daemon after distill server ready")
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::error!("Failed to start index daemon: {e:#}"),
                 }
                 return;
             }
@@ -881,52 +885,42 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
 
 /// Ensure the index daemon is running. Spawns it if not already active.
 /// Used by the pipeline auto-trigger: scribe watch → distill index.
-/// Skips if distill server is not reachable (avoids spawning a daemon that
-/// will immediately fail its health check).
-pub async fn ensure_index_running() -> bool {
+///
+/// `Ok(true)`: a daemon is running (already, or just spawned). `Ok(false)`:
+/// not started because its prerequisites are absent (no distill server
+/// binary, server unreachable) — the caller decides whether that matters.
+/// `Err`: the prerequisites were present but the daemon could not be spawned.
+pub async fn ensure_index_running() -> Result<bool> {
     let pid_path = index_pid_path();
     if let Some(pid) = crate::daemon::read_pid(&pid_path) {
         if crate::daemon::is_process_alive(pid) {
-            return true; // already running
+            return Ok(true); // already running
         }
         crate::daemon::remove_pid_file(&pid_path);
     }
 
-    // Quick check: is the distill server binary available?
     if find_distill_binary().is_none() {
         tracing::debug!("Skipping auto-index: hs-distill-server binary not found");
-        return false;
+        return Ok(false);
     }
 
-    // Quick check: is the distill server reachable? Uses HTTP health check
-    // so it works for both local and remote servers (e.g. big_mac → big).
+    // Uses an HTTP health check so it works for both local and remote
+    // servers (e.g. big_mac → big).
     let server_url = DistillClientConfig::load()
         .ok()
         .and_then(|cfg| cfg.servers.into_iter().next())
         .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-    let client = match DistillClient::new(&server_url) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::debug!("Skipping auto-index: DistillClient build failed: {e}");
-            return false;
-        }
-    };
+    let client = DistillClient::new(&server_url)
+        .with_context(|| format!("building distill client for {server_url}"))?;
     if client.health().await.is_err() {
         tracing::debug!("Skipping auto-index: distill server not reachable at {server_url}");
-        return false;
+        return Ok(false);
     }
 
     // Spawn index daemon with defaults (no specific files, no force)
-    match spawn_index_daemon(&None, None, false) {
-        Ok(pid) => {
-            tracing::info!("Auto-started index daemon (PID {pid})");
-            true
-        }
-        Err(e) => {
-            tracing::warn!("Failed to auto-start index daemon: {e}");
-            false
-        }
-    }
+    let pid = spawn_index_daemon(&None, None, false).context("spawning index daemon")?;
+    tracing::info!("Auto-started index daemon (PID {pid})");
+    Ok(true)
 }
 
 async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {
