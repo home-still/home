@@ -248,12 +248,10 @@ Remote machine              Cloudflare Edge              Gateway host          L
 On your tunnel host:
 
 ```sh
-hs cloud init                # generate signing secret
+hs cloud init                # generate the signing secret and the admin key (both mode 0600)
 
 # Edit ~/.home-still/config.yaml:
 cloud:
-  role: gateway
-  gateway_url: https://cloud.example.com
   gateway:
     listen: 127.0.0.1:7440
     routes:
@@ -261,6 +259,8 @@ cloud:
       distill: http://gpu-server:7434
       mcp: http://127.0.0.1:7445
 ```
+
+The gateway's public URL is not read from this file: it is the required `--gateway-url` flag (an `https://` origin; startup fails otherwise).
 
 Add an ingress rule to your cloudflared config:
 

@@ -171,7 +171,7 @@ Run as: `bash`
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/home-still/home/main/docs/install.sh | sh
-hs cloud init   # generates ~/.home-still/cloud-secret.key
+hs cloud init   # generates ~/.home-still/cloud-secret.key and cloud-admin.key (both mode 0600)
 ```
 
 **Configure the gateway**
@@ -180,8 +180,6 @@ Edit `~/.home-still/config.yaml`:
 
 ```yaml
 cloud:
-  role: gateway
-  gateway_url: https://cloud.example.com
   gateway:
     listen: 127.0.0.1:7440
     secret_path: /home/<your-user>/.home-still/cloud-secret.key
@@ -192,6 +190,8 @@ cloud:
       distill: http://big:7434
       mcp:     http://127.0.0.1:7445
 ```
+
+The gateway's public URL is **not** read from this file — it is the required `--gateway-url https://…` flag below. Startup fails if it is missing or not `https://`. `hs cloud invite` / `hs cloud revoke` only work on this host: they authenticate with `cloud-admin.key`.
 
 **Run as systemd services**
 
