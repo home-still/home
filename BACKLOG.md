@@ -901,14 +901,14 @@ Conventions: IDs `RA-n` are sequential across the whole section. Severity is the
 > **RESOLVED 2026-10-01 (RA-1 … RA-117).** Fixed on branch `robustness/ra`, tip `ef207f88af84`
 > (ten workstreams plus review-driven rounds). Closure audit (independent re-check of every
 > item at the tip: code location, regression test, original-failure-pattern grep) is in
-> `/tmp/ra-audit/closure.md`. Counts: **84 fixed, 26 fixed-with-residual, 4 needs-decision, 3 moot** (0 open, 0 partial). Each bullet
+> `docs/robustness-audit-2026-10-01-closure.md`. Counts: **84 fixed, 26 fixed-with-residual, 4 needs-decision, 3 moot** (0 open, 0 partial). Each bullet
 > below carries a status suffix.
 > - **fixed (84):** RA-1, RA-3…4, RA-9…10, RA-13, RA-15…17, RA-20…23, RA-25, RA-27…31, RA-33…34, RA-37…38, RA-42…48, RA-50…55, RA-57…60, RA-62…67, RA-69…72, RA-75, RA-77…81, RA-83…85, RA-87…94, RA-96…101, RA-103…107, RA-109…112, RA-115…116
 > - **fixed-with-residual (26):** RA-2, RA-5…8, RA-11…12, RA-14, RA-18, RA-24, RA-26, RA-32, RA-35, RA-39…41, RA-49, RA-56, RA-73…74, RA-82, RA-86, RA-95, RA-102, RA-108, RA-114: closed in code, an operational step or accepted limit remains (see the suffix and `### Operational follow-ups`)
 > - **needs-decision (4):** RA-36, RA-61, RA-113, RA-117: owner decision outstanding (RA-OPS-D1…D9)
 > - **moot (3):** RA-19, RA-68, RA-76: obsoleted by deleting the gateway dynamic registry (`cloud.gateway.routes` is the one backend resolver)
 >
-> **Not yet covered:** the integration re-verification at this tip (which includes the R1–R6 round) was still running when this was written, and no adversarial review has examined the R1–R6 fixes. **Deployment prerequisites** (token provisioning, re-enrollment, `--gateway-url`, libpdfium, config that is now required/validated, rollout order) are in `docs/deployment.md` § "Upgrade prerequisites (robustness release)"; the remaining operator steps are listed under `### Operational follow-ups (not code)` and new observed-not-fixed findings under `### Observed, not fixed (new findings)` at the end of this section.
+> **Status:** the release-binary integration run (gates a-i, five release binaries, verify-binaries pass/fail checks, hostile-input and token/config smoke) PASSED at tip `ef207f88af84`. Three adversarial review rounds found and drove fixes for all P0/P1 issues; the round-4 fixes (R1–R6) were gated and smoke-tested but NOT adversarially reviewed. Nothing involving live NATS, GPU distill, real VLM, the Legacy converter, macOS/Windows/aarch64, docker, real S3/Qdrant or the full OAuth flow could be tested (see the docs file). **Deployment prerequisites** (token provisioning, re-enrollment, `--gateway-url`, libpdfium, config that is now required/validated, rollout order) are in `docs/deployment.md` § "Upgrade prerequisites (robustness release)"; the remaining operator steps are listed under `### Operational follow-ups (not code)` and new observed-not-fixed findings under `### Observed, not fixed (new findings)` at the end of this section.
 
 ### P0
 
