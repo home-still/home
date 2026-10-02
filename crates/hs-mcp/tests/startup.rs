@@ -151,12 +151,11 @@ fn an_unreachable_broker_does_not_stop_the_server_from_starting() {
             storage_section(&root)
         ),
     );
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    };
+    // Port 0, read back from the server's log: a port chosen by the test and
+    // released before the server binds it can be taken in between (seen under
+    // load as `Address already in use`, or as a connection to another process).
     let mut child = Command::new(env!("CARGO_BIN_EXE_hs-mcp"))
-        .args(["--serve", &format!("127.0.0.1:{port}")])
+        .args(["--serve", "127.0.0.1:0"])
         .env_clear()
         .env("HOME", home.path())
         .stderr(std::process::Stdio::piped())
@@ -164,32 +163,42 @@ fn an_unreachable_broker_does_not_stop_the_server_from_starting() {
         .spawn()
         .unwrap();
 
-    let started = std::time::Instant::now();
-    let mut answer = None;
-    while started.elapsed() < std::time::Duration::from_secs(30) {
-        if let Ok(Some(status)) = child.try_wait() {
-            let mut err = String::new();
-            if let Some(mut s) = child.stderr.take() {
-                let _ = s.read_to_string(&mut err);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    let log = std::thread::spawn(move || {
+        let mut seen = String::new();
+        for line in std::io::BufRead::lines(std::io::BufReader::new(stderr)).map_while(Result::ok) {
+            if let Some(addr) = line.split("MCP server listening on ").nth(1) {
+                let _ = tx.send(addr.trim().to_string());
             }
-            panic!("the server exited ({status}) with the broker down: {err}");
+            seen.push_str(&line);
+            seen.push('\n');
         }
-        if let Ok(mut conn) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-            conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            conn.write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
-                .unwrap();
-            let mut head = String::new();
-            let _ = conn.read_to_string(&mut head);
-            answer = Some(head);
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+        seen
+    });
+    // Disconnected (the server exited, closing stderr) or timed out.
+    let Ok(addr) = rx.recv_timeout(std::time::Duration::from_secs(30)) else {
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        panic!(
+            "the server never started listening ({status}) with the broker down: {}",
+            log.join().unwrap()
+        );
+    };
+
+    let mut conn = std::net::TcpStream::connect(&addr).unwrap();
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    conn.write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut answer = String::new();
+    conn.read_to_string(&mut answer).unwrap();
+    let still_running = child.try_wait().unwrap().is_none();
     let _ = child.kill();
     let _ = child.wait();
+    let log = log.join().unwrap();
+    assert!(still_running, "the server exited after answering: {log}");
     // Up, and answering (unauthenticated requests get 401): the broker is
     // only needed once a tool publishes.
-    let answer = answer.expect("the server never started listening");
-    assert!(answer.starts_with("HTTP/1.1 401"), "{answer}");
+    assert!(answer.starts_with("HTTP/1.1 401"), "{answer}\n{log}");
 }

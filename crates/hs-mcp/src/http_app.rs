@@ -99,7 +99,9 @@ fn unauthorized(why: BackendAuthError) -> Response {
 /// Serve `router` on `addr` until ctrl-c.
 pub async fn serve(addr: &str, router: Router) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("MCP server listening on {addr}");
+    // The bound address, not the requested one: `--serve host:0` reports the
+    // port the kernel chose.
+    tracing::info!("MCP server listening on {}", listener.local_addr()?);
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
