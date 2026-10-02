@@ -963,12 +963,7 @@ mod tests {
             .state
             .prepare_index(index_req(Some("d.md"), Some(&prose(6)), None))
             .unwrap();
-        let err = h
-            .state
-            .run_index(job, |_| {})
-            .await
-            .err()
-            .expect("must fail");
+        let err = h.state.run_index(job, |_| {}).await.expect_err("must fail");
         assert_eq!(err.kind, ErrorKind::Panicked);
         assert!(
             err.message.starts_with(PANIC_CODE) && err.message.contains("d"),
