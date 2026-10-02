@@ -374,7 +374,7 @@ impl DistillClient {
 
         hs_common::service::protocol::read_ndjson_stream(resp, on_progress)
             .await
-            .map_err(|e| type_stream_error(e))
+            .map_err(type_stream_error)
     }
 
     /// Search indexed documents.
