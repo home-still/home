@@ -339,16 +339,12 @@ async fn blocking<T: Send + 'static>(
     })
 }
 
-/// The wall-clock budget of an HTML or EPUB conversion is
-/// `scribe.epub.html.max_convert_secs` (default 60 s). Expiry raises the
-/// conversion's cancellation flag, which the HTML parser checks every 4 KiB,
-/// so the blocking thread stops with the handler's wait instead of burning a
-/// core for a document nobody waits for. The document is refused for good.
 /// [`blocking`] under a wall-clock `budget`; running past it is a permanent
 /// failure with `code`. The closure gets a cancellation flag which is raised
 /// when the budget expires: a conversion that checks it (the HTML parser does,
 /// between chunks) stops on its own, so the blocking thread does not keep
-/// burning a core for a document nobody is waiting for.
+/// burning a core for a document nobody is waiting for. Callers pass
+/// `scribe.epub.html.max_convert_secs` (default 60 s) as the budget.
 async fn blocking_within<T: Send + 'static>(
     what: &'static str,
     key: &str,

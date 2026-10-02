@@ -151,6 +151,7 @@ fn start_watchdog() {
 
 /// A pooled ONNX detector's lock was poisoned by a panic: its session is in
 /// an unknown state and every later page routed to it would fail.
+#[cfg(feature = "server")]
 pub(crate) fn fault_detector_poisoned() {
     DETECTOR_POISONED.store(true, Ordering::SeqCst);
     tracing::error!(
