@@ -1340,7 +1340,7 @@ mod tests {
         let handled = Arc::new(AtomicUsize::new(0));
         let handled_in = handled.clone();
         let started = std::time::Instant::now();
-        let result = run_subscriber(bus, storage, 2, move |_event| {
+        let result = run_subscriber(bus, storage, 2, Duration::from_secs(30), move |_event| {
             let url = url.clone();
             let handled = handled_in.clone();
             async move {

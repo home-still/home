@@ -615,7 +615,7 @@ mod tests {
         let seen2 = seen.clone();
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run_subscriber(bus, storage, 1, move |_| {
+            run_subscriber(bus, storage, 1, Duration::from_secs(30), move |_| {
                 let seen = seen2.clone();
                 async move {
                     seen.fetch_add(1, Ordering::SeqCst);
