@@ -111,9 +111,15 @@ impl<T> DetectorPool<T> {
 
     fn acquire(&self) -> Result<MutexGuard<'_, T>> {
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
-        self.slots[idx]
-            .lock()
-            .map_err(|e| anyhow::anyhow!("DetectorPool lock poisoned: {e}"))
+        self.slots[idx].lock().map_err(|e| {
+            // A panic unwound through inference while the session was
+            // borrowed: it is in an unknown state and stays poisoned for
+            // the life of the process. Like pdfium's poisoned lock this is
+            // not recoverable in-process: health goes red and the process
+            // exits so its supervisor restarts it.
+            crate::pdfium::fault_detector_poisoned();
+            anyhow::anyhow!("DetectorPool lock poisoned: {e}; the process is restarting")
+        })
     }
 }
 
@@ -500,7 +506,9 @@ impl Processor {
         let page_count = {
             let path = pdf_path.to_string();
             let counted = tokio::task::spawn_blocking(move || {
-                crate::pdfium::with_parser(|parser| parser.page_count(&path))
+                crate::pdfium::with_parser(|parser| {
+                    crate::pdfium::guarded_call(|| parser.page_count(&path))
+                })
             })
             .await??;
             checked_page_count(counted)?
@@ -530,15 +538,18 @@ impl Processor {
                 let (tx, rx) = tokio::sync::mpsc::channel::<(usize, PageData)>(2);
                 let render = tokio::task::spawn_blocking(move || {
                     crate::pdfium::with_parser(|parser| {
-                        let document = parser.open(&pdf_path_owned)?;
+                        let document =
+                            crate::pdfium::guarded_call(|| parser.open(&pdf_path_owned))?;
                         for idx in 0..page_count {
                             let idx = u16::try_from(idx)?;
-                            let page = PdfParser::render_page(
-                                &document,
-                                idx,
-                                render_dpi,
-                                max_render_pixels,
-                            )?;
+                            let page = crate::pdfium::guarded_call(|| {
+                                PdfParser::render_page(
+                                    &document,
+                                    idx,
+                                    render_dpi,
+                                    max_render_pixels,
+                                )
+                            })?;
                             if tx.blocking_send((idx as usize, page)).is_err() {
                                 break;
                             }
@@ -605,7 +616,7 @@ impl Processor {
         let render_dpi = self.config.dpi;
         let stage1 = tokio::task::spawn_blocking(move || {
             crate::pdfium::with_parser(|parser| {
-                let document = parser.open(&pdf_path_owned)?;
+                let document = crate::pdfium::guarded_call(|| parser.open(&pdf_path_owned))?;
                 for idx in 0..page_count {
                     let idx = u16::try_from(idx)?;
                     let page_no = idx as usize;
@@ -615,8 +626,9 @@ impl Processor {
                         total_pages: total,
                         message: format!("Detecting layout page {}/{total}", page_no + 1),
                     });
-                    let page =
-                        PdfParser::render_page(&document, idx, render_dpi, max_render_pixels)?;
+                    let page = crate::pdfium::guarded_call(|| {
+                        PdfParser::render_page(&document, idx, render_dpi, max_render_pixels)
+                    })?;
                     tracing::info!(
                         "Preparing page {}/{} ({}x{}, per-region)",
                         page_no + 1,
@@ -1695,5 +1707,41 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(result.skipped_regions(), 2);
+    }
+
+    const POOL_CHILD_ENV: &str = "HS_SCRIBE_POOL_FAULT_CHILD";
+
+    #[test]
+    fn pool_child_entry() {
+        if std::env::var(POOL_CHILD_ENV).is_err() {
+            return;
+        }
+        crate::pdfium::install_fault_exit(std::time::Duration::from_millis(500));
+        let pool = std::sync::Arc::new(DetectorPool::new(vec![1u8]));
+        assert!(pool.acquire().is_ok());
+        let poisoner = std::sync::Arc::clone(&pool);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.acquire().unwrap();
+            panic!("panic inside inference");
+        })
+        .join();
+        println!("RESULT acquire-ok {}", pool.acquire().is_ok());
+        println!("RESULT healthy {}", crate::pdfium::healthy().is_ok());
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        println!("RESULT survived");
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn a_poisoned_detector_slot_turns_health_red_and_exits_non_zero() {
+        let (code, stdout) = crate::child_proc::run_expecting_exit(
+            "pipeline::processor::tests::pool_child_entry",
+            POOL_CHILD_ENV,
+            "1",
+        );
+        assert!(stdout.contains("RESULT acquire-ok false"), "{stdout}");
+        assert!(stdout.contains("RESULT healthy false"), "{stdout}");
+        assert!(!stdout.contains("RESULT survived"), "{stdout}");
+        assert_eq!(code, Some(crate::pdfium::FAULT_EXIT_CODE), "{stdout}");
     }
 }

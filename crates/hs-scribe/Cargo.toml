@@ -55,6 +55,7 @@ xml = "1"
 ego-tree = "0.10"
 html5ever = "0.29"
 percent-encoding = "2"
+libc = "0.2"
 
 # Server Only
 axum = { version = "0.8", optional = true, features = ["multipart"] }

@@ -166,7 +166,7 @@ scribe:
     max_total_bytes: 268435456  # bytes inflated plus bytes produced by one conversion (256 MiB)
 ```
 
-Every HTML parse (HTML sources and EPUB chapters) is bounded by `scribe.epub.html.{max_input_bytes (16 MiB), max_nesting (512), max_nodes (1000000)}`: html5ever is driven in 4 KiB steps through a sink that measures the real tree, and parsing stops inside the parse when a bound is crossed or the conversion's wall-clock budget (600 s) expires.
+Every HTML parse (HTML sources and EPUB chapters) is bounded by `scribe.epub.html.{max_input_bytes (16 MiB), max_nesting (512), max_nodes (1000000, attributes count as one node each), max_attributes_per_element (1024), max_attributes (1000000), max_convert_secs (60)}`; nesting is also measured on the finished tree, because html5ever moves subtrees after attaching them: html5ever is driven in 4 KiB steps through a sink that measures the real tree, and parsing stops inside the parse when a bound is crossed or the conversion's wall-clock budget expires.
 
 Each chapter is read once however often the spine lists it, only the entries the reader needs are decompressed, and package XML nested more than 64 elements deep, or a chapter nested more than 512 elements deep, is refused. Exceeding a limit fails that book; nothing is truncated.
 

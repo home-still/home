@@ -339,14 +339,11 @@ async fn blocking<T: Send + 'static>(
     })
 }
 
-/// How long an HTML or EPUB conversion may keep a blocking thread before the
-/// document is refused. The nesting and byte limits bound the work of any
-/// document the parsers accept, so this is the last guard, not the usual
-/// bound: a healthy conversion takes well under a second to a few seconds. A
-/// blocking thread cannot be interrupted — it finishes in the background —
-/// so the budget bounds how long the *handler* waits, and a document that
-/// exceeds it is refused for good rather than retried onto another thread.
-const PARSE_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(600);
+/// The wall-clock budget of an HTML or EPUB conversion is
+/// `scribe.epub.html.max_convert_secs` (default 60 s). Expiry raises the
+/// conversion's cancellation flag, which the HTML parser checks every 4 KiB,
+/// so the blocking thread stops with the handler's wait instead of burning a
+/// core for a document nobody waits for. The document is refused for good.
 
 /// [`blocking`] under a wall-clock `budget`; running past it is a permanent
 /// failure with `code`. The closure gets a cancellation flag which is raised
@@ -529,7 +526,7 @@ pub async fn convert_and_upload(
             let converted = blocking_within(
                 "HTML conversion",
                 &event.key,
-                PARSE_WALL_CLOCK_BUDGET,
+                Duration::from_secs(limits.html.max_convert_secs),
                 FailureCode::HtmlParseError,
                 move |cancel| {
                     let html = std::str::from_utf8(&bytes).map_err(|e| {
@@ -567,7 +564,7 @@ pub async fn convert_and_upload(
             let converted = blocking_within(
                 "EPUB conversion",
                 &event.key,
-                PARSE_WALL_CLOCK_BUDGET,
+                Duration::from_secs(limits.html.max_convert_secs),
                 FailureCode::EpubParseError,
                 move |cancel| crate::epub::convert_epub_to_markdown_with(&bytes, &limits, cancel),
             )
@@ -718,6 +715,76 @@ pub async fn convert_and_upload(
 /// let the process exit 0 and stay down. Handlers already running get
 /// `drain_timeout` to finish their ack/nak; the ones still running after it
 /// are abandoned, named in an ERROR log, and redelivered after `ack_wait`.
+/// Start-up check of the shared backend token: one authenticated request per
+/// scribe server *before* any event is pulled. A server that rejects the
+/// token stops the watcher here, naming `HS_BACKEND_TOKEN`; a server that
+/// cannot be reached (or answers anything else) says nothing about the
+/// credential and is only logged, because the watcher is meant to wait out a
+/// server that is still starting.
+pub async fn preflight_token(servers: &[String], convert_timeout: Duration) -> Result<()> {
+    for url in servers {
+        let client = crate::client::ScribeClient::new_with_timeout(url, convert_timeout)?;
+        match client.preflight().await {
+            Ok(()) => tracing::info!(server = %url, "scribe token preflight ok"),
+            Err(e) if crate::client::is_backend_unauthorized(&e) => {
+                tracing::error!(
+                    server = %url,
+                    "FATAL CONFIGURATION: the scribe server rejected HS_BACKEND_TOKEN at start-up; \
+                     no event was pulled"
+                );
+                return Err(e);
+            }
+            Err(e) => tracing::warn!(
+                server = %url,
+                error = %format!("{e:#}"),
+                "scribe token preflight could not reach the server; continuing"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Most buffered events handed back on shutdown, and the longest the
+/// hand-back may take.
+const MAX_UNSTARTED_NAKS: usize = 256;
+const UNSTARTED_NAK_BUDGET: Duration = Duration::from_secs(5);
+
+/// NAK (immediate redelivery) `held` plus whatever the consumer has already
+/// buffered for this process, bounded in count and time, and log the number.
+async fn nak_unstarted(
+    stream: &mut hs_common::event_bus::EventStream,
+    mut held: Vec<hs_common::event_bus::Event>,
+) {
+    let deadline = tokio::time::Instant::now() + UNSTARTED_NAK_BUDGET;
+    while held.len() < MAX_UNSTARTED_NAKS {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let wait = left.min(Duration::from_millis(200));
+        if wait.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(wait, stream.next()).await {
+            Ok(Some(Ok(event))) => held.push(event),
+            _ => break,
+        }
+    }
+    if held.is_empty() {
+        return;
+    }
+    let total = held.len();
+    let mut failed = 0usize;
+    for event in held {
+        if tokio::time::Instant::now() >= deadline || event.nak(None).await.is_err() {
+            failed += 1;
+        }
+    }
+    tracing::warn!(
+        returned = total - failed,
+        not_returned = failed,
+        "shutting down: events pulled but never started were handed back for immediate \
+         redelivery (any not returned reappear after ack_wait)"
+    );
+}
+
 pub async fn run_subscriber<F, Fut>(
     bus: Arc<dyn EventBus>,
     _storage: Arc<dyn Storage>,
@@ -749,6 +816,8 @@ where
     // our token) reports it here; the loop stops consuming at once.
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<anyhow::Error>();
     let mut fatal: Option<anyhow::Error> = None;
+    // Events pulled from the broker whose handler never started.
+    let mut unstarted: Vec<hs_common::event_bus::Event> = Vec::new();
     loop {
         let next = tokio::select! {
             next = stream.next() => next,
@@ -780,11 +849,19 @@ where
             }
         };
 
-        let permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow::anyhow!("scribe worker semaphore closed"))?;
+        // Waiting for a slot is also a point where a fatal error must be
+        // seen: the event in hand has not started, and goes back unstarted.
+        let permit = tokio::select! {
+            biased;
+            Some(e) = fatal_rx.recv() => {
+                fatal = Some(e);
+                unstarted.push(event);
+                break;
+            }
+            permit = sem.clone().acquire_owned() => {
+                permit.map_err(|_| anyhow::anyhow!("scribe worker semaphore closed"))?
+            }
+        };
         let handler = Arc::clone(&handler);
         let fatal_tx = fatal_tx.clone();
         let tracked = in_flight.track(parsed.key.clone());
@@ -863,6 +940,12 @@ where
             }
         });
     }
+
+    // Give back what was pulled and never started, so the broker redelivers
+    // it now instead of after `ack_wait` (hours). Only an orderly exit can do
+    // this: a crash or the pdfium exit-70 leaves such events invisible until
+    // `ack_wait` expires.
+    nak_unstarted(&mut stream, unstarted).await;
 
     // Let handlers that are already running finish their ack/nak, within
     // the drain timeout.
@@ -1279,6 +1362,11 @@ mod tests {
 
     /// A server that answers every request with `status` and an empty body.
     async fn fixed_status_server(status: u16) -> String {
+        fixed_response_server(status, "").await
+    }
+
+    /// [`fixed_status_server`] with `extra` response headers (CRLF-terminated).
+    async fn fixed_response_server(status: u16, extra: &'static str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1292,7 +1380,7 @@ mod tests {
                     let _ = sock.read(&mut buf).await;
                     let _ = sock
                         .write_all(
-                            format!("HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            format!("HTTP/1.1 {status} X\r\n{extra}content-length: 0\r\nconnection: close\r\n\r\n")
                                 .as_bytes(),
                         )
                         .await;
@@ -1302,34 +1390,111 @@ mod tests {
         url
     }
 
+    const SCRIBE_REALM: &str = "www-authenticate: Bearer realm=\"hs-scribe\"\r\n";
+
     #[tokio::test]
-    async fn a_rejected_token_is_a_typed_error_not_an_untyped_transient() {
-        for status in [401u16, 403] {
-            let url = fixed_status_server(status).await;
-            let client = ScribeClient::new_with_timeout(&url, Duration::from_secs(5)).unwrap();
-            let err = client
+    async fn only_the_scribe_servers_own_401_is_a_rejected_token() {
+        async fn convert_err(url: &str) -> anyhow::Error {
+            let client = ScribeClient::new_with_timeout(url, Duration::from_secs(5)).unwrap();
+            client
                 .convert_with_progress(pdf_with_pages(1), None, Some("s"), |_| {})
                 .await
-                .unwrap_err();
-            assert!(
-                crate::client::is_backend_unauthorized(&err),
-                "{status}: {err:#}"
-            );
-            assert!(format!("{err:#}").contains("HS_BACKEND_TOKEN"), "{err:#}");
+                .unwrap_err()
         }
-        // Any other failure is not the credential's.
-        let url = fixed_status_server(500).await;
-        let client = ScribeClient::new_with_timeout(&url, Duration::from_secs(5)).unwrap();
-        let err = client
-            .convert_with_progress(pdf_with_pages(1), None, Some("s"), |_| {})
+        // The server's 401 (with its realm): typed, names the variable.
+        let url = fixed_response_server(401, SCRIBE_REALM).await;
+        let err = convert_err(&url).await;
+        assert!(crate::client::is_backend_unauthorized(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("HS_BACKEND_TOKEN"), "{err:#}");
+        // A bare 401 (a proxy / WAF), a 401 for another realm, a 403 and a
+        // 500 are ordinary failures: retried, never fatal.
+        for url in [
+            fixed_status_server(401).await,
+            fixed_response_server(401, "www-authenticate: Basic realm=\"corp-proxy\"\r\n").await,
+            fixed_status_server(403).await,
+            fixed_status_server(500).await,
+        ] {
+            let err = convert_err(&url).await;
+            assert!(
+                !crate::client::is_backend_unauthorized(&err),
+                "{url}: {err:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_start_up_preflight_stops_on_a_rejected_token_and_waits_out_a_dead_server() {
+        let t = Duration::from_secs(5);
+        let rejected = fixed_response_server(401, SCRIBE_REALM).await;
+        let ok = fixed_status_server(200).await;
+        let err = preflight_token(&[ok.clone(), rejected], t)
             .await
             .unwrap_err();
-        assert!(!crate::client::is_backend_unauthorized(&err));
+        assert!(crate::client::is_backend_unauthorized(&err), "{err:#}");
+        preflight_token(&[ok, "http://127.0.0.1:1".to_string()], t)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_preflight_catches_a_wrong_token_and_nothing_else() {
+        let client =
+            |url: &str| ScribeClient::new_with_timeout(url, Duration::from_secs(5)).unwrap();
+        let rejected = fixed_response_server(401, SCRIBE_REALM).await;
+        let err = client(&rejected).preflight().await.unwrap_err();
+        assert!(crate::client::is_backend_unauthorized(&err), "{err:#}");
+        assert!(client(&fixed_status_server(200).await)
+            .preflight()
+            .await
+            .is_ok());
+        // Not the credential's business: a proxy's 401, a 404 route, a dead host.
+        assert!(client(&fixed_status_server(401).await)
+            .preflight()
+            .await
+            .is_ok());
+        assert!(client(&fixed_status_server(404).await)
+            .preflight()
+            .await
+            .is_ok());
+        let dead = client("http://127.0.0.1:1").preflight().await.unwrap_err();
+        assert!(!crate::client::is_backend_unauthorized(&dead));
+    }
+
+    /// The real server's rejection is exactly what the client keys on.
+    #[cfg(all(feature = "server", unix))]
+    #[tokio::test]
+    async fn the_real_servers_401_carries_the_realm_the_client_keys_on() {
+        let resp = {
+            let config = crate::config::AppConfig {
+                converter: crate::config::ConverterMode::Olmocr,
+                ..crate::config::AppConfig::default()
+            };
+            let state = Arc::new(crate::server::ServerState::new(config).unwrap());
+            let token =
+                hs_common::auth::backend::BackendToken::new("realm-test-token-0123456789abcdef-xx")
+                    .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(
+                async move { axum::serve(listener, crate::server::app(state, token)).await },
+            );
+            let anonymous = ScribeClient::new_with_client(
+                &format!("http://{addr}"),
+                hs_common::auth::client::AuthedHttp::plain_with_backend_token(
+                    hs_common::http::client_builder().build().unwrap(),
+                    None,
+                ),
+                Duration::from_secs(5),
+            );
+            anonymous.preflight().await
+        };
+        let err = resp.unwrap_err();
+        assert!(crate::client::is_backend_unauthorized(&err), "{err:#}");
     }
 
     #[tokio::test]
     async fn the_watcher_stops_with_an_error_when_the_backend_rejects_its_token() {
-        let url = fixed_status_server(401).await;
+        let url = fixed_response_server(401, SCRIBE_REALM).await;
         let (_d, st) = storage();
         st.put("papers/ab/one.pdf", pdf_with_pages(1))
             .await
@@ -1359,6 +1524,52 @@ mod tests {
         assert_eq!(handled.load(Ordering::SeqCst), 1);
         // It stopped at once; it did not wait for the stream to end or retry.
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn events_pulled_but_never_started_are_handed_back_on_a_fatal_exit() {
+        use hs_common::event_bus::Settlement;
+        let mut logs = Vec::new();
+        let mut events = Vec::new();
+        for i in 0..4 {
+            let (event, log) = Event::recording(
+                "papers.ingested",
+                format!(r#"{{"key":"papers/ab/doc{i}.pdf"}}"#).into_bytes(),
+            );
+            events.push(event);
+            logs.push(log);
+        }
+        let bus = Arc::new(FakeBus::default());
+        *bus.to_consume.lock().unwrap() = events;
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
+        let handled = Arc::new(AtomicUsize::new(0));
+        let handled_in = handled.clone();
+        let result = run_subscriber(bus, storage, 1, Duration::from_secs(5), move |_e| {
+            let handled = handled_in.clone();
+            async move {
+                handled.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Err(HandlerError::Transient(anyhow::Error::new(
+                    crate::client::BackendUnauthorized {
+                        server: "http://s".into(),
+                        status: 401,
+                    },
+                )))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            handled.load(Ordering::SeqCst),
+            1,
+            "only the first event started"
+        );
+        // The one that ran is given back with the usual backoff; the three
+        // that never started are given back for immediate redelivery.
+        assert_eq!(logs[0].decisions(), [Settlement::Nak(Some(NAK_BACKOFF))]);
+        for log in &logs[1..] {
+            assert_eq!(log.decisions(), [Settlement::Nak(None)]);
+        }
     }
 
     #[tokio::test]

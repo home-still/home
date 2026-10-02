@@ -27,6 +27,8 @@ use crate::pdfium::with_parser;
 use anyhow::Result;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -156,9 +158,12 @@ async fn bounded<T: Send + 'static>(
              inside the PDF parser"
         ),
     };
+    let done = Arc::new(AtomicBool::new(false));
+    let job_done = Arc::clone(&done);
     let job = tokio::task::spawn_blocking(move || {
         let _held = permit;
         let result = work();
+        job_done.store(true, Ordering::SeqCst);
         crate::pdfium::clear_wedged();
         result
     });
@@ -172,7 +177,15 @@ async fn bounded<T: Send + 'static>(
         }
         Ok(Err(join)) => Err(anyhow::anyhow!("the page-count task was cancelled: {join}")),
         Err(_) => {
-            on_budget_expiry(work_budget);
+            // The call may finish between the timer and the flag: raise the
+            // flag only for a call still running, and take it back if the
+            // call finished while it was being raised.
+            if !done.load(Ordering::SeqCst) {
+                on_budget_expiry(work_budget);
+                if done.load(Ordering::SeqCst) {
+                    crate::pdfium::clear_wedged();
+                }
+            }
             Err(ConvertFailure::err(
                 FailureCode::PdfParseError,
                 format!("the PDF parser did not finish within {work_budget:?}"),
@@ -797,6 +810,19 @@ pub(crate) mod tests {
                     );
                     println!("RESULT healthy-now {:?}", crate::pdfium::healthy().is_ok());
                 }
+                "render-wedge" | "render-slow" => {
+                    // The Legacy render path: one pdfium call under the watchdog.
+                    crate::pdfium::set_call_budget(Duration::from_millis(200));
+                    let hold = if mode == "render-wedge" { 30_000 } else { 600 };
+                    tokio::task::spawn_blocking(move || {
+                        crate::pdfium::guarded_call(|| {
+                            std::thread::sleep(Duration::from_millis(hold))
+                        })
+                    })
+                    .await
+                    .unwrap();
+                    println!("RESULT healthy-now {:?}", crate::pdfium::healthy().is_ok());
+                }
                 other => panic!("unknown mode {other}"),
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -856,6 +882,51 @@ pub(crate) mod tests {
             !lines.iter().any(|l| l.starts_with("survived-grace")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn a_wedged_render_call_turns_health_red_and_exits_non_zero() {
+        let (code, lines) = fault_child("render-wedge");
+        assert_eq!(code, Some(crate::pdfium::FAULT_EXIT_CODE), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("survived-grace")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_slow_render_call_that_returns_within_the_grace_period_does_not_end_the_process() {
+        let (code, lines) = fault_child("render-slow");
+        assert_eq!(code, Some(0), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "healthy-now true"), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "survived-grace Ok(())"),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_that_finishes_exactly_at_its_budget_never_leaves_the_flag_raised() {
+        // The race: the timer fires, the call returns, then the flag is set.
+        // Finishing in the same instant as the budget, many times, must leave
+        // pdfium healthy (a stale flag would exit the process for nothing).
+        static LOCAL_GATE: Semaphore = Semaphore::const_new(1);
+        for _ in 0..40 {
+            let _ = bounded(
+                &LOCAL_GATE,
+                Duration::from_secs(5),
+                Duration::from_millis(5),
+                crate::pdfium::fault_wedged,
+                || {
+                    std::thread::sleep(Duration::from_millis(5));
+                    Ok(1u32)
+                },
+            )
+            .await;
+            // Let the job's own clear run, then check.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(crate::pdfium::healthy().is_ok(), "stale wedge flag");
+        }
     }
 
     #[test]

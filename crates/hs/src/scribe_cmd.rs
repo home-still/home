@@ -455,6 +455,10 @@ pub(crate) async fn cmd_watch_events(
         ceiling_secs = timeout_policy.ceiling_secs,
         "starting event-bus watcher with tiered least-loaded pool dispatch"
     );
+    // A wrong or missing HS_BACKEND_TOKEN stops the watcher here, before a
+    // single event is pulled (and so before any delivery is burned).
+    let server_urls: Vec<String> = labelled_servers.iter().map(|(u, _, _)| u.clone()).collect();
+    hs_scribe::event_watch::preflight_token(&server_urls, convert_timeout).await?;
     run_subscriber(bus.clone(), storage.clone(), concurrency, drain_timeout, move |event| {
         let storage = storage_for_handler.clone();
         let bus = bus_for_handler.clone();

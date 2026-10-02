@@ -2315,6 +2315,7 @@ dependencies = [
  "hs-common",
  "html5ever",
  "image",
+ "libc",
  "ndarray",
  "ollama-rs",
  "openssl",

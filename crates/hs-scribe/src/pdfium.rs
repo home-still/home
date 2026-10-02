@@ -86,6 +86,79 @@ macro_rules! count_raw {
 pub const FAULT_EXIT_CODE: i32 = 70;
 
 static POISONED: AtomicBool = AtomicBool::new(false);
+static DETECTOR_POISONED: AtomicBool = AtomicBool::new(false);
+/// Start of the pdfium call now in flight on the render path, in ms since
+/// [`epoch`]; 0 = none. pdfium serialises its callers, so at most one.
+static CALL_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+static CALL_BUDGET_MS: AtomicU64 = AtomicU64::new(DEFAULT_CALL_BUDGET.as_millis() as u64);
+static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// How long one pdfium call on the render path (open a document, render a
+/// page) may run before the process is declared wedged. A healthy call takes
+/// well under a second; a page of a book at 200 dpi a few seconds.
+pub const DEFAULT_CALL_BUDGET: Duration = Duration::from_secs(120);
+
+fn epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+fn now_ms() -> u64 {
+    epoch().elapsed().as_millis() as u64 + 1
+}
+
+/// Override the per-call budget (tests).
+pub fn set_call_budget(budget: Duration) {
+    CALL_BUDGET_MS.store(budget.as_millis().max(1) as u64, Ordering::SeqCst);
+}
+
+/// Run one pdfium call of the render path under the watchdog: if it has not
+/// returned within the call budget, health goes red and the process exits
+/// after the grace period (see [`install_fault_exit`]). The page-count path
+/// has its own budget in `pdf_meta::bounded`; this is the same accounting for
+/// the Legacy converter, which holds pdfium's lock for a whole conversion.
+pub fn guarded_call<T>(call: impl FnOnce() -> T) -> T {
+    CALL_STARTED_MS.store(now_ms(), Ordering::SeqCst);
+    let result = call();
+    CALL_STARTED_MS.store(0, Ordering::SeqCst);
+    clear_wedged();
+    result
+}
+
+/// Poll the in-flight call; spawned once by [`install_fault_exit`].
+fn start_watchdog() {
+    if WATCHDOG_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let started = CALL_STARTED_MS.load(Ordering::SeqCst);
+        let budget = CALL_BUDGET_MS.load(Ordering::SeqCst);
+        if started != 0
+            && !WEDGED.load(Ordering::SeqCst)
+            && now_ms().saturating_sub(started) > budget
+        {
+            // The call may return between the check and the flag; re-check
+            // after setting so a call that just finished never leaves the
+            // flag raised.
+            fault_wedged(Duration::from_millis(budget));
+            if CALL_STARTED_MS.load(Ordering::SeqCst) != started {
+                clear_wedged();
+            }
+        }
+    });
+}
+
+/// A pooled ONNX detector's lock was poisoned by a panic: its session is in
+/// an unknown state and every later page routed to it would fail.
+pub(crate) fn fault_detector_poisoned() {
+    DETECTOR_POISONED.store(true, Ordering::SeqCst);
+    tracing::error!(
+        "a layout/table detector lock is poisoned (a panic unwound through ONNX inference); \
+         every later page routed to it would fail — the process must restart"
+    );
+    arm_exit();
+}
 static WEDGED: AtomicBool = AtomicBool::new(false);
 /// Milliseconds a faulted process lingers (health red) before it exits; 0 =
 /// no exit (library default; the server and the watcher install one).
@@ -98,11 +171,14 @@ static EXIT_GRACE_MS: AtomicU64 = AtomicU64::new(0);
 /// never recovers: exit is the only recovery.
 pub fn install_fault_exit(grace: Duration) {
     EXIT_GRACE_MS.store(grace.as_millis().max(1) as u64, Ordering::SeqCst);
+    start_watchdog();
 }
 
 /// `Err(reason)` while pdfium is poisoned or a call is stuck inside it.
 pub fn healthy() -> Result<(), &'static str> {
-    if POISONED.load(Ordering::SeqCst) {
+    if DETECTOR_POISONED.load(Ordering::SeqCst) {
+        Err("a layout/table detector lock is poisoned by a panic; restart required")
+    } else if POISONED.load(Ordering::SeqCst) {
         Err("pdfium's process-wide lock is poisoned by a panic; restart required")
     } else if WEDGED.load(Ordering::SeqCst) {
         Err("a pdfium call has not returned within its budget")
@@ -145,6 +221,14 @@ fn arm_exit() {
         std::thread::sleep(Duration::from_millis(grace));
         if let Err(reason) = healthy() {
             eprintln!("FATAL: {reason}; exiting so the supervisor restarts this process");
+            // `_exit`, not `exit`: a wedged thread may hold a lock that
+            // libpdfium's static destructors (run by `exit`) would wait on
+            // for ever, and the supervisor would never see the process end.
+            #[cfg(unix)]
+            unsafe {
+                libc::_exit(FAULT_EXIT_CODE)
+            }
+            #[cfg(not(unix))]
             std::process::exit(FAULT_EXIT_CODE);
         }
     });

@@ -206,7 +206,31 @@ impl ReadinessInfo for ReadinessResponse {
     }
 }
 
-/// The scribe server refused this client's credential (401/403): the shared
+/// The `WWW-Authenticate` realm the scribe server's token middleware sends
+/// with its 401 (`server::require_token`). It is what tells that answer apart
+/// from a proxy's or WAF's own 401.
+pub const TOKEN_REALM: &str = "hs-scribe";
+
+/// `Some` only for a 401 that carries the scribe server's own realm. A 403,
+/// or a 401 from anything in front of the server, is an ordinary failure.
+fn token_rejection(server: &str, resp: &reqwest::Response) -> Option<BackendUnauthorized> {
+    if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    let realm = format!("realm=\"{TOKEN_REALM}\"");
+    resp.headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.contains(&realm))
+        .then(|| BackendUnauthorized {
+            server: server.to_string(),
+            status: 401,
+        })
+}
+
+/// The scribe server refused this client's credential (401 with the
+/// server's own realm): the shared
 /// `HS_BACKEND_TOKEN` is missing or wrong on this host. Retrying cannot help
 /// and says nothing about the document, so the watcher treats it as a fatal
 /// configuration error ([`is_backend_unauthorized`]).
@@ -298,6 +322,26 @@ impl ScribeClient {
             .await
             .context("Failed to reach server")?;
         resp.json().await.context("Invalid health response")
+    }
+
+    /// One authenticated, side-effect-free request (`GET /info`, a protected
+    /// route; the open probes would not notice a wrong token). `Err` carrying
+    /// [`BackendUnauthorized`] means the token is missing or wrong; any other
+    /// outcome says nothing about the credential and is `Ok` or an ordinary
+    /// error the caller may treat as "server not reachable yet".
+    pub async fn preflight(&self) -> Result<()> {
+        let url = format!("{}/info", self.server_url);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .context("Failed to reach server")?;
+        if let Some(rejected) = token_rejection(&self.server_url, &resp) {
+            return Err(anyhow::Error::new(rejected));
+        }
+        Ok(())
     }
 
     pub async fn readiness(&self) -> Result<ReadinessResponse> {
@@ -396,14 +440,8 @@ impl ScribeClient {
             );
         }
 
-        if matches!(
-            resp.status(),
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) {
-            return Err(anyhow::Error::new(BackendUnauthorized {
-                server: self.server_url.clone(),
-                status: resp.status().as_u16(),
-            }));
+        if let Some(rejected) = token_rejection(&self.server_url, &resp) {
+            return Err(anyhow::Error::new(rejected));
         }
 
         if !resp.status().is_success() {

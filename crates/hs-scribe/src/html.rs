@@ -35,8 +35,17 @@ pub struct HtmlLimits {
     pub max_input_bytes: usize,
     /// Deepest element nesting the parsed tree may reach.
     pub max_nesting: usize,
-    /// Most nodes (elements, text, comments) the tree may hold.
+    /// Most nodes the tree may hold. Every attribute is charged here too (as
+    /// one node each): a document of 16 MiB of attributes costs far more
+    /// memory than its node count suggests.
     pub max_nodes: usize,
+    /// Most attributes on any one element.
+    pub max_attributes_per_element: usize,
+    /// Most attributes in the whole document.
+    pub max_attributes: usize,
+    /// Wall-clock budget for one conversion (one HTML source, or a whole
+    /// EPUB), in seconds. Parsing stops itself when it expires.
+    pub max_convert_secs: u64,
 }
 
 impl Default for HtmlLimits {
@@ -45,13 +54,28 @@ impl Default for HtmlLimits {
             max_input_bytes: 16 * 1024 * 1024,
             max_nesting: 512,
             max_nodes: 1_000_000,
+            max_attributes_per_element: 1_024,
+            max_attributes: 1_000_000,
+            // Measured (`a_book_length_document_parses_well_inside_the_budget`):
+            // 8 MiB of book-like HTML parses and converts in ~4 s on a DEBUG
+            // build (release is several times faster), so even the 16 MiB
+            // input cap finishes in ~8 s there. 60 s leaves headroom for a
+            // loaded host and is the real bound on costs no counter can see
+            // (a tag with k attributes costs O(k^2) inside the tokenizer).
+            max_convert_secs: 60,
         }
     }
 }
 
 impl HtmlLimits {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.max_input_bytes == 0 || self.max_nesting == 0 || self.max_nodes == 0 {
+        if self.max_input_bytes == 0
+            || self.max_nesting == 0
+            || self.max_nodes == 0
+            || self.max_attributes_per_element == 0
+            || self.max_attributes == 0
+            || self.max_convert_secs == 0
+        {
             anyhow::bail!("html limits must all be at least 1: {self:?}");
         }
         Ok(())
@@ -66,12 +90,14 @@ const CHUNK_BYTES: usize = 4096;
 enum Stop {
     TooDeep,
     TooManyNodes,
+    TooManyAttributes,
 }
 
 /// State shared between the sink (inside the parser) and the driver loop.
 struct Shared {
     stop: Cell<Option<Stop>>,
     nodes: Cell<usize>,
+    attributes: Cell<usize>,
 }
 
 /// scraper's tree sink, rebuilt over a tree this module can measure while it
@@ -82,10 +108,28 @@ struct BoundedSink {
     quirks: Cell<QuirksMode>,
     max_nesting: usize,
     max_nodes: usize,
+    max_attributes_per_element: usize,
+    max_attributes: usize,
     shared: Rc<Shared>,
 }
 
 impl BoundedSink {
+    fn count_attributes(&self, count: usize) {
+        let total = self.shared.attributes.get().saturating_add(count);
+        self.shared.attributes.set(total);
+        if (count > self.max_attributes_per_element || total > self.max_attributes)
+            && self.shared.stop.get().is_none()
+        {
+            self.shared.stop.set(Some(Stop::TooManyAttributes));
+        }
+        // Charged to the node budget as well, one node per attribute.
+        let n = self.shared.nodes.get().saturating_add(count);
+        self.shared.nodes.set(n);
+        if n > self.max_nodes && self.shared.stop.get().is_none() {
+            self.shared.stop.set(Some(Stop::TooManyNodes));
+        }
+    }
+
     fn count_node(&self) {
         let n = self.shared.nodes.get() + 1;
         self.shared.nodes.set(n);
@@ -163,6 +207,7 @@ impl TreeSink for BoundedSink {
         _flags: ElementFlags,
     ) -> NodeId {
         self.count_node();
+        self.count_attributes(attrs.len());
         let template = name.expanded() == expanded_name!(html "template");
         let mut tree = self.tree.borrow_mut();
         let mut node = tree.orphan(Node::Element(Element::new(name, attrs)));
@@ -323,12 +368,15 @@ fn parse_bounded(
     let shared = Rc::new(Shared {
         stop: Cell::new(None),
         nodes: Cell::new(0),
+        attributes: Cell::new(0),
     });
     let sink = BoundedSink {
         tree: RefCell::new(Tree::new(Node::Document)),
         quirks: Cell::new(QuirksMode::NoQuirks),
         max_nesting: limits.max_nesting,
         max_nodes: limits.max_nodes,
+        max_attributes_per_element: limits.max_attributes_per_element,
+        max_attributes: limits.max_attributes,
         shared: Rc::clone(&shared),
     };
     let mut parser = html5ever::parse_document(sink, ParseOpts::default());
@@ -357,10 +405,45 @@ fn parse_bounded(
                     limits.max_nodes
                 )))
             }
+            Some(Stop::TooManyAttributes) => {
+                return Err(refuse(format!(
+                    "HTML has more than {} attributes on one element or {} in total",
+                    limits.max_attributes_per_element, limits.max_attributes
+                )))
+            }
             None => {}
         }
     }
-    Ok(parser.finish())
+    let doc = parser.finish();
+    // The sink saw each node as it was attached, but html5ever also moves
+    // whole subtrees (the adoption agency), which makes them deeper without
+    // any attach point showing it. The bound is only real if it is measured
+    // on the finished tree.
+    let depth = max_element_depth(&doc);
+    if depth > limits.max_nesting {
+        return Err(refuse(format!(
+            "HTML elements nest {depth} levels deep (limit {})",
+            limits.max_nesting
+        )));
+    }
+    Ok(doc)
+}
+
+/// Greatest number of elements on any root-to-leaf path, by one iterative
+/// pass over the tree's traversal edges (no recursion, O(nodes)).
+fn max_element_depth(doc: &Html) -> usize {
+    let (mut depth, mut max) = (0usize, 0usize);
+    for edge in doc.tree.root().traverse() {
+        match edge {
+            Edge::Open(node) if node.value().is_element() => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            Edge::Close(node) if node.value().is_element() => depth -= 1,
+            _ => {}
+        }
+    }
+    max
 }
 
 /// Convert an HTML academic paper to markdown.
@@ -850,6 +933,7 @@ mod tests {
             max_input_bytes: 1_000,
             max_nesting: 5,
             max_nodes: 50,
+            ..HtmlLimits::default()
         };
         let deep = nested("div", 10);
         assert!(convert_html_to_markdown(&deep, &tight, &flag).is_err());
@@ -898,6 +982,126 @@ mod tests {
             "{:?} vs {:?}",
             started.elapsed(),
             full
+        );
+    }
+
+    /// The reviewer's 235-byte unit: the adoption agency reparents subtrees,
+    /// so the finished tree gets far deeper than any attach point showed.
+    const ADOPTION_UNIT: &str = "</table><desc><object><script></font><nobr><template>x<i><dd></foreignObject></tr><math></h1>xxx</script></li><colgroup a=1></script></option><span><foreignObject></template><mi></i><button>x<svg></math></dd><li><math><svg>";
+
+    #[test]
+    fn the_depth_bound_holds_on_the_finished_tree_not_just_at_attach_points() {
+        let doc = ADOPTION_UNIT.repeat(2_000);
+        let tight = HtmlLimits {
+            max_nesting: 64,
+            ..HtmlLimits::default()
+        };
+        let err = convert_html_to_markdown(&doc, &tight, &AtomicBool::new(false)).unwrap_err();
+        assert!(err.to_string().contains("levels deep"), "{err}");
+        // The measure itself: more than the bound, as the review found.
+        let tree = parse_bounded(
+            &doc,
+            &HtmlLimits {
+                max_nesting: 100_000,
+                ..HtmlLimits::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(
+            max_element_depth(&tree) > 1_000,
+            "{}",
+            max_element_depth(&tree)
+        );
+        // And a document within the bound still converts.
+        assert!(convert_html_to_markdown(
+            &doc[..ADOPTION_UNIT.len() * 2],
+            &HtmlLimits::default(),
+            &AtomicBool::new(false)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn attributes_are_counted_and_charged_to_the_node_budget() {
+        let flag = AtomicBool::new(false);
+        let many = |k: usize| {
+            let attrs: String = (0..k).map(|i| format!(" a{i}=1")).collect();
+            format!("<html><body><div{attrs}>x</div></body></html>")
+        };
+        // Per element.
+        let per_element = HtmlLimits {
+            max_attributes_per_element: 100,
+            ..HtmlLimits::default()
+        };
+        assert!(convert_html_to_markdown(&many(100), &per_element, &flag).is_ok());
+        assert!(convert_html_to_markdown(&many(101), &per_element, &flag).is_err());
+        // In total, across many elements each under the per-element cap.
+        let total = HtmlLimits {
+            max_attributes: 500,
+            ..HtmlLimits::default()
+        };
+        let spread = format!(
+            "<html><body>{}</body></html>",
+            "<p a=1 b=2 c=3 d=4 e=5>x</p>".repeat(101)
+        );
+        assert!(convert_html_to_markdown(&spread, &total, &flag).is_err());
+        // Charged to max_nodes: 60 attributes alone exceed a 50-node budget.
+        let nodes = HtmlLimits {
+            max_nodes: 50,
+            ..HtmlLimits::default()
+        };
+        assert!(convert_html_to_markdown(&many(60), &nodes, &flag).is_err());
+    }
+
+    #[test]
+    fn a_tag_with_a_hundred_thousand_attributes_is_stopped_by_the_wall_clock_not_hours() {
+        // k distinct attributes on one tag cost O(k^2) inside the tokenizer
+        // and no counter can see it before the tag ends (25k attributes took
+        // 11 s, 200k took 720 s on a debug build). The cancellation flag is
+        // the bound: raised after a short budget, the parse returns within
+        // one 4 KiB chunk.
+        let attrs: String = (0..400_000).map(|i| format!(" a{i}=1")).collect();
+        let doc = format!("<html><body><div{attrs}>x</div></body></html>");
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let raiser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let err = convert_html_to_markdown(&doc, &HtmlLimits::default(), &cancel).unwrap_err();
+        raiser.join().unwrap();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_book_length_document_parses_well_inside_the_budget() {
+        // ~8 MiB of ordinary prose with links, emphasis and a table every
+        // so often: what a long book chapter looks like.
+        let mut doc = String::from("<html><body><article>");
+        while doc.len() < 8 * 1024 * 1024 {
+            doc.push_str("<h2>Section</h2><p>Lorem ipsum <em>dolor</em> sit amet, <a href=\"https://example.org/a?b=c\">consectetur</a> adipiscing elit.</p><table><tr><td>1</td><td>2</td></tr></table>");
+        }
+        doc.push_str("</article></body></html>");
+        let started = std::time::Instant::now();
+        let md = convert_html_to_markdown(&doc, &HtmlLimits::default(), &AtomicBool::new(false))
+            .unwrap();
+        let took = started.elapsed();
+        eprintln!(
+            "BOOK-LENGTH: {} MiB parsed+converted in {took:?} (debug build)",
+            doc.len() >> 20
+        );
+        assert!(md.contains("Lorem ipsum"));
+        assert!(
+            took.as_secs() < HtmlLimits::default().max_convert_secs / 2,
+            "{took:?} against a {} s budget",
+            HtmlLimits::default().max_convert_secs
         );
     }
 }
