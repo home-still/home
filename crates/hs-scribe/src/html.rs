@@ -88,9 +88,9 @@ const CHUNK_BYTES: usize = 4096;
 
 #[derive(Clone, Copy)]
 enum Stop {
-    TooDeep,
-    TooManyNodes,
-    TooManyAttributes,
+    Depth,
+    Nodes,
+    Attributes,
 }
 
 /// State shared between the sink (inside the parser) and the driver loop.
@@ -120,13 +120,13 @@ impl BoundedSink {
         if (count > self.max_attributes_per_element || total > self.max_attributes)
             && self.shared.stop.get().is_none()
         {
-            self.shared.stop.set(Some(Stop::TooManyAttributes));
+            self.shared.stop.set(Some(Stop::Attributes));
         }
         // Charged to the node budget as well, one node per attribute.
         let n = self.shared.nodes.get().saturating_add(count);
         self.shared.nodes.set(n);
         if n > self.max_nodes && self.shared.stop.get().is_none() {
-            self.shared.stop.set(Some(Stop::TooManyNodes));
+            self.shared.stop.set(Some(Stop::Nodes));
         }
     }
 
@@ -134,7 +134,7 @@ impl BoundedSink {
         let n = self.shared.nodes.get() + 1;
         self.shared.nodes.set(n);
         if n > self.max_nodes && self.shared.stop.get().is_none() {
-            self.shared.stop.set(Some(Stop::TooManyNodes));
+            self.shared.stop.set(Some(Stop::Nodes));
         }
     }
 
@@ -147,7 +147,7 @@ impl BoundedSink {
         let tree = self.tree.borrow();
         let Some(node) = tree.get(parent) else { return };
         if node.ancestors().take(self.max_nesting).count() >= self.max_nesting {
-            self.shared.stop.set(Some(Stop::TooDeep));
+            self.shared.stop.set(Some(Stop::Depth));
         }
     }
 
@@ -393,19 +393,19 @@ fn parse_bounded(
         parser.process(StrTendril::from_slice(chunk));
         rest = tail;
         match shared.stop.get() {
-            Some(Stop::TooDeep) => {
+            Some(Stop::Depth) => {
                 return Err(refuse(format!(
                     "HTML elements nest more than {} levels deep",
                     limits.max_nesting
                 )))
             }
-            Some(Stop::TooManyNodes) => {
+            Some(Stop::Nodes) => {
                 return Err(refuse(format!(
                     "HTML holds more than {} nodes",
                     limits.max_nodes
                 )))
             }
-            Some(Stop::TooManyAttributes) => {
+            Some(Stop::Attributes) => {
                 return Err(refuse(format!(
                     "HTML has more than {} attributes on one element or {} in total",
                     limits.max_attributes_per_element, limits.max_attributes

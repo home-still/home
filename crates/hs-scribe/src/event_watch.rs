@@ -344,7 +344,6 @@ async fn blocking<T: Send + 'static>(
 /// conversion's cancellation flag, which the HTML parser checks every 4 KiB,
 /// so the blocking thread stops with the handler's wait instead of burning a
 /// core for a document nobody waits for. The document is refused for good.
-
 /// [`blocking`] under a wall-clock `budget`; running past it is a permanent
 /// failure with `code`. The closure gets a cancellation flag which is raised
 /// when the budget expires: a conversion that checks it (the HTML parser does,
