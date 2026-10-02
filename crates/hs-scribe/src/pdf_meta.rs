@@ -395,24 +395,9 @@ pub(crate) mod tests {
             std::fs::write(&path, bytes).unwrap();
             paths.push(path.display().to_string());
         }
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "pdf_meta::tests::child_entry",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD_ENV, paths.join("\n"))
-            .output()
-            .expect("spawn the child test binary");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success(),
-            "the child process died ({:?}) counting a hostile PDF: {}",
-            out.status,
-            stderr.lines().rev().take(4).collect::<Vec<_>>().join(" | ")
-        );
+        let child =
+            crate::child_proc::run("pdf_meta::tests::child_entry", CHILD_ENV, &paths.join("\n"));
+        let stdout = child.stdout;
         let mut outcomes = Vec::new();
         let mut peak = 0;
         for line in stdout.lines() {

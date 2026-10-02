@@ -156,6 +156,18 @@ With multiple servers, `hs scribe convert` and `hs scribe watch` automatically l
 
 Server discovery uses the gateway service registry when available, falling back to the configured server list.
 
+EPUBs (the watcher, `hs scribe inbox` and `hs personal add` all read them through one bounded reader) are limited by:
+
+```yaml
+scribe:
+  epub:
+    max_entries: 10000          # entries in the archive
+    max_entry_bytes: 67108864   # any one entry, after decompression (64 MiB)
+    max_total_bytes: 268435456  # bytes inflated plus bytes produced by one conversion (256 MiB)
+```
+
+Each chapter is read once however often the spine lists it, only the entries the reader needs are decompressed, and package XML nested more than 64 elements deep, or a chapter nested more than 512 elements deep, is refused. Exceeding a limit fails that book; nothing is truncated.
+
 ### Server config (environment variables)
 
 Server-side settings use environment variables with the `HS_SCRIBE_` prefix (`HS_SCRIBE_VLM_CONCURRENCY` overrides `vlm_concurrency`). The same keys can be set, one level down, in the `scribe_server:` section of `~/.home-still/config.yaml` (the one config file every home-still binary reads); the environment wins over the file. The client side (`hs scribe …`) reads the `scribe:` section and the same `HS_SCRIBE_<KEY>` variables (`HS_SCRIBE_CONVERT_TIMEOUT_SECS` → `scribe.convert_timeout_secs`). A malformed section or an invalid value stops the server at start with the key named; nothing falls back to defaults.

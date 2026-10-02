@@ -42,15 +42,18 @@ futures-util = "0.3"
 unicode-segmentation = "1"
 scraper = "0.22"
 chrono = { workspace = true }
-epub = "2"
 # The one PDF parser (page counting and rendering): libpdfium, bound at
 # runtime. `thread_safe` serialises every pdfium call process-wide; the
 # `image` feature (rasterising) is enabled by `server` only.
 pdfium-render = { version = "0.8.35", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 bytes = "1"
-# The EPUB reader's own zip version (epub 2.x pins 3.x, deflate only): used to
-# measure an archive's real expanded size before any chapter is decompressed.
+# The EPUB reader (src/epub.rs): zip entries read under byte caps, package XML
+# streamed as events (no tree), chapter markup walked by an iterative walker
+# over scraper's tree (ego-tree is its traversal API).
 zip = { version = "3.0.0", default-features = false, features = ["deflate"] }
+xml = "1"
+ego-tree = "0.10"
+percent-encoding = "2"
 
 # Server Only
 axum = { version = "0.8", optional = true, features = ["multipart"] }

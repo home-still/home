@@ -676,34 +676,6 @@ pub(crate) async fn cmd_watch_events(
 
 // ── Convert ─────────────────────────────────────────────────────
 
-/// Unpack an EPUB archive's spine to a single HTML string, concatenating
-/// each chapter's XHTML in reading order. Used by `scribe_inbox` to turn
-/// EPUB drops into HTML so the downstream html-parser path converts them
-/// — the scribe VLM pipeline is PDF-only.
-pub fn epub_bytes_to_html(bytes: Vec<u8>) -> Result<String> {
-    use std::io::Cursor;
-    // The same entry-count / expanded-size caps the converter applies: an
-    // inbox drop is untrusted zip bytes too.
-    hs_scribe::epub::check_archive(&bytes, &hs_scribe::epub::EpubLimits::default())?;
-    let mut doc = epub::doc::EpubDoc::from_reader(Cursor::new(bytes))
-        .context("failed to open EPUB archive")?;
-    let mut out = String::new();
-    loop {
-        if let Some((content, _mime)) = doc.get_current_str() {
-            if !content.trim().is_empty() {
-                if !out.is_empty() {
-                    out.push_str("\n\n");
-                }
-                out.push_str(&content);
-            }
-        }
-        if !doc.go_next() {
-            break;
-        }
-    }
-    Ok(out)
-}
-
 async fn cmd_convert(
     input: PathBuf,
     out_file: Option<PathBuf>,

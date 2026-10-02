@@ -339,6 +339,33 @@ async fn blocking<T: Send + 'static>(
     })
 }
 
+/// How long an HTML or EPUB conversion may keep a blocking thread before the
+/// document is refused. The nesting and byte limits bound the work of any
+/// document the parsers accept, so this is the last guard, not the usual
+/// bound: a healthy conversion takes well under a second to a few seconds. A
+/// blocking thread cannot be interrupted — it finishes in the background —
+/// so the budget bounds how long the *handler* waits, and a document that
+/// exceeds it is refused for good rather than retried onto another thread.
+const PARSE_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(600);
+
+/// [`blocking`] under a wall-clock `budget`; running past it is a permanent
+/// failure with `code`.
+async fn blocking_within<T: Send + 'static>(
+    what: &'static str,
+    key: &str,
+    budget: Duration,
+    code: FailureCode,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, HandlerError> {
+    match tokio::time::timeout(budget, blocking(what, key, f)).await {
+        Ok(result) => result,
+        Err(_) => Err(permanent(
+            code,
+            format!("{what} of {key} did not finish within {budget:?}"),
+        )),
+    }
+}
+
 /// Given a prepared source, dispatch to the converter for its file type
 /// (PDF → scribe VLM, HTML → parser, EPUB → parser), and put the
 /// markdown back under `markdown/{shard}/{stem}.md`. Publishes
@@ -490,29 +517,35 @@ pub async fn convert_and_upload(
         "html" | "htm" => {
             let bytes = source.bytes.clone();
             let key = event.key.clone();
-            let converted = blocking("HTML conversion", &event.key, move || {
-                let html = std::str::from_utf8(&bytes).map_err(|e| {
-                    ConvertFailure::new(
-                        FailureCode::HtmlNotUtf8,
-                        format!("HTML at {key} is not valid UTF-8: {e}"),
-                    )
-                })?;
-                // Reject paywall / loading-stub / landing-page HTML before we
-                // spend time extracting markdown that would just be stamped
-                // `embedding_skip: zero_chunks_or_empty` downstream. Mirrors
-                // the check the downloader runs at ingress — putting it here
-                // too catches HTMLs that entered via any other path
-                // (scribe_inbox, bulk import, etc.).
-                if hs_common::html::is_paywall_html(html) {
-                    return Err(ConvertFailure::new(
-                        FailureCode::PaywallHtml,
-                        format!(
-                            "{key} looks like a paywall/loading-stub HTML; refusing to convert"
-                        ),
-                    ));
-                }
-                Ok(crate::html::convert_html_to_markdown(html))
-            })
+            let converted = blocking_within(
+                "HTML conversion",
+                &event.key,
+                PARSE_WALL_CLOCK_BUDGET,
+                FailureCode::HtmlParseError,
+                move || {
+                    let html = std::str::from_utf8(&bytes).map_err(|e| {
+                        ConvertFailure::new(
+                            FailureCode::HtmlNotUtf8,
+                            format!("HTML at {key} is not valid UTF-8: {e}"),
+                        )
+                    })?;
+                    // Reject paywall / loading-stub / landing-page HTML before we
+                    // spend time extracting markdown that would just be stamped
+                    // `embedding_skip: zero_chunks_or_empty` downstream. Mirrors
+                    // the check the downloader runs at ingress — putting it here
+                    // too catches HTMLs that entered via any other path
+                    // (scribe_inbox, bulk import, etc.).
+                    if hs_common::html::is_paywall_html(html) {
+                        return Err(ConvertFailure::new(
+                            FailureCode::PaywallHtml,
+                            format!(
+                                "{key} looks like a paywall/loading-stub HTML; refusing to convert"
+                            ),
+                        ));
+                    }
+                    crate::html::convert_html_to_markdown(html)
+                },
+            )
             .await?;
             (
                 converted.map_err(|f| HandlerError::Permanent(anyhow::Error::new(f)))?,
@@ -522,9 +555,13 @@ pub async fn convert_and_upload(
         "epub" => {
             let bytes = source.bytes.clone();
             let limits = epub_limits.clone();
-            let converted = blocking("EPUB conversion", &event.key, move || {
-                crate::epub::convert_epub_to_markdown_with(&bytes, &limits)
-            })
+            let converted = blocking_within(
+                "EPUB conversion",
+                &event.key,
+                PARSE_WALL_CLOCK_BUDGET,
+                FailureCode::EpubParseError,
+                move || crate::epub::convert_epub_to_markdown_with(&bytes, &limits),
+            )
             .await?;
             let md = converted.map_err(|e| {
                 permanent(
@@ -1062,6 +1099,85 @@ mod tests {
             .await
             .unwrap());
         assert!(bus.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn html_nested_past_the_bound_is_permanent_and_nothing_is_stored_or_announced() {
+        // 20 000 nested <div>s aborted a 2 MiB-stack thread in the recursive
+        // walker; the conversion now refuses the document before parsing it.
+        let (_d, st) = storage();
+        let prose = "A real paragraph of article text that is long enough to look like content. "
+            .repeat(80);
+        let deep = format!(
+            "<html><body><article><p>{prose}</p>{}{prose}{}</article></body></html>",
+            "<div>".repeat(20_000),
+            "</div>".repeat(20_000)
+        );
+        st.put("papers/ab/deep.html", deep.into_bytes())
+            .await
+            .unwrap();
+        let Ok(SourcePrep::Fetched(src)) = prepare_source(&st, &event("papers/ab/deep.html")).await
+        else {
+            panic!("fetch");
+        };
+        let client =
+            ScribeClient::new_with_timeout("http://127.0.0.1:1", Duration::from_secs(5)).unwrap();
+        let bus = FakeBus::default();
+        let err = convert_and_upload(
+            &st,
+            &client,
+            &bus,
+            &event("papers/ab/deep.html"),
+            &TimeoutPolicy::default(),
+            &EpubLimits::default(),
+            &src,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            code_of(&err),
+            ("permanent", Some(FailureCode::HtmlParseError)),
+            "{err}"
+        );
+        assert!(!st
+            .exists(&hs_common::markdown::markdown_storage_key("deep"))
+            .await
+            .unwrap());
+        assert!(bus.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_conversion_past_its_wall_clock_budget_is_refused_for_good() {
+        let started = std::time::Instant::now();
+        let err = blocking_within(
+            "HTML conversion",
+            "papers/ab/slow.html",
+            Duration::from_millis(50),
+            FailureCode::HtmlParseError,
+            || std::thread::sleep(Duration::from_millis(1500)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            code_of(&err),
+            ("permanent", Some(FailureCode::HtmlParseError)),
+            "{err}"
+        );
+        // The handler stopped waiting at the budget, not when the thread did.
+        assert!(started.elapsed() < Duration::from_millis(1000));
+        // Within budget, the result comes through untouched.
+        let ok = blocking_within(
+            "HTML conversion",
+            "papers/ab/fast.html",
+            Duration::from_secs(5),
+            FailureCode::HtmlParseError,
+            || 7,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok, 7);
     }
 
     async fn subscribe(

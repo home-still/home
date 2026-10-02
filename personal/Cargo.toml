@@ -31,3 +31,4 @@ tempfile = "3"
 mockito = "1"
 # `Jail`: tests that set environment variables run serialised and restore them.
 figment = { workspace = true, features = ["test"] }
+zip = { version = "3", default-features = false, features = ["deflate"] }

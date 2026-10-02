@@ -1,4 +1,6 @@
 pub mod backend_probe;
+#[cfg(test)]
+pub(crate) mod child_proc;
 pub mod classify;
 pub mod client;
 pub mod config;

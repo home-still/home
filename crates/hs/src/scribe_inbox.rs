@@ -6,7 +6,8 @@
 //!   or defer it.
 //! - Skip files whose mtime is < 5s old (a browser download that's still
 //!   writing will fire a `notify` event before the content is complete).
-//! - Convert EPUB → HTML *in memory* via `crate::scribe_cmd::epub_bytes_to_html`
+//! - Convert EPUB → HTML *in memory* via `hs_scribe::epub::convert_epub_to_html_with`
+//!   under the configured `scribe.epub.*` limits
 //!   before handing bytes to the commit primitive. The extension on the
 //!   target key is flipped from `.epub` to `.html` so the server-side
 //!   event-bus subscriber (`hs-scribe/src/event_watch.rs:63`, which only
@@ -21,9 +22,10 @@ use hs_common::event_bus::EventBus;
 use hs_common::inbox::{write_target_and_publish, WriteOutcome};
 use hs_common::reporter::Reporter;
 use hs_common::storage::Storage;
+use hs_scribe::epub::EpubLimits;
 use sha2::{Digest, Sha256};
 
-use crate::scribe_cmd::{epub_bytes_to_html, InboxAction};
+use crate::scribe_cmd::InboxAction;
 use crate::shutdown::Shutdown;
 
 /// Files newer than this are assumed to still be written (browser
@@ -83,6 +85,7 @@ pub async fn handle_inbox_source(
     storage: &dyn Storage,
     bus: &dyn EventBus,
     papers_prefix: &str,
+    epub_limits: &EpubLimits,
     source_key: &str,
     source_mtime: Option<SystemTime>,
     now: SystemTime,
@@ -171,8 +174,13 @@ pub async fn handle_inbox_source(
     // Format-specific transform. EPUB is the only branch that changes
     // bytes *and* target extension; everything else is passthrough.
     let (bytes, target_ext) = if ext == "epub" {
-        let html = epub_bytes_to_html(raw)
-            .map_err(|e| anyhow::anyhow!("epub unpack {source_key}: {e}"))?;
+        let limits = epub_limits.clone();
+        let html = tokio::task::spawn_blocking(move || {
+            hs_scribe::epub::convert_epub_to_html_with(&raw, &limits)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("epub unpack {source_key}: {e}"))?
+        .map_err(|e| anyhow::anyhow!("epub unpack {source_key}: {e:#}"))?;
         (html.into_bytes(), "html")
     } else {
         (raw, ext.as_str())
@@ -240,6 +248,7 @@ pub async fn sweep_inbox_once(
     storage: &dyn Storage,
     bus: &dyn EventBus,
     papers_prefix: &str,
+    epub_limits: &EpubLimits,
     stop: &Shutdown,
 ) -> anyhow::Result<SweepReport> {
     let inbox_prefix = format!(
@@ -266,6 +275,7 @@ pub async fn sweep_inbox_once(
             storage,
             bus,
             papers_prefix,
+            epub_limits,
             &obj.key,
             obj.last_modified,
             now,
@@ -321,7 +331,7 @@ async fn cmd_sweep(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let bus = cfg.build_event_bus().await?;
 
     reporter.status("Sweep", "scanning papers/manually_downloaded/");
-    let report = sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX, &stop).await?;
+    let report = sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX, &cfg.epub, &stop).await?;
     log_report(reporter, &report);
     if !report.errors.is_empty() {
         anyhow::bail!("sweep completed with {} error(s)", report.errors.len());
@@ -372,7 +382,7 @@ async fn cmd_run(reporter: &Arc<dyn Reporter>, _daemon_child: bool) -> Result<()
     {
         tracing::warn!(error = %e, "initial heartbeat write failed");
     }
-    match sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX, &stop).await {
+    match sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX, &cfg.epub, &stop).await {
         Ok(r) => {
             log_report(reporter, &r);
             last_sweep = Some((r.found as u64, r.relocated, r.errors.len() as u64));
@@ -410,7 +420,7 @@ async fn cmd_run(reporter: &Arc<dyn Reporter>, _daemon_child: bool) -> Result<()
         {
             tracing::warn!(error = %e, "heartbeat write failed; sweep will still run");
         }
-        match sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX, &stop).await {
+        match sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX, &cfg.epub, &stop).await {
             Ok(r) => {
                 if r.relocated > 0 || !r.errors.is_empty() || !r.rejected.is_empty() {
                     log_report(reporter, &r);
@@ -555,6 +565,7 @@ mod tests {
             &storage,
             &bus,
             PAPERS,
+            &EpubLimits::default(),
             "papers/manually_downloaded/foo.pdf",
             long_ago(),
             just_now(),
@@ -588,6 +599,7 @@ mod tests {
             &storage,
             &bus,
             PAPERS,
+            &EpubLimits::default(),
             "papers/manually_downloaded/book.epub",
             long_ago(),
             just_now(),
@@ -610,6 +622,137 @@ mod tests {
         assert!(!storage.exists("papers/bo/book.html").await.unwrap());
     }
 
+    /// A minimal EPUB: one manifest item per `(file, xhtml)` and a spine of
+    /// the given indexes (repeats allowed).
+    fn epub_of(chapters: &[(&str, String)], spine: &[usize]) -> Vec<u8> {
+        use std::io::Write;
+        let mut opf = String::from(
+            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest>"#,
+        );
+        for (i, (file, _)) in chapters.iter().enumerate() {
+            opf.push_str(&format!(
+                r#"<item id="c{i}" href="{file}" media-type="application/xhtml+xml"/>"#
+            ));
+        }
+        opf.push_str("</manifest><spine>");
+        for i in spine {
+            opf.push_str(&format!(r#"<itemref idref="c{i}"/>"#));
+        }
+        opf.push_str("</spine></package>");
+        let container = r#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let mut entries: Vec<(&str, &[u8])> = vec![
+            ("META-INF/container.xml", container.as_bytes()),
+            ("content.opf", opf.as_bytes()),
+        ];
+        entries.extend(chapters.iter().map(|(f, x)| (*f, x.as_bytes())));
+        for (name, body) in entries {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    async fn drop_epub(storage: &LocalFsStorage, bytes: Vec<u8>) {
+        storage
+            .put("papers/manually_downloaded/book.epub", bytes)
+            .await
+            .unwrap();
+    }
+
+    async fn inbox_epub(
+        storage: &LocalFsStorage,
+        limits: &EpubLimits,
+    ) -> anyhow::Result<HandleOutcome> {
+        handle_inbox_source(
+            storage,
+            &NoOpBus,
+            PAPERS,
+            limits,
+            "papers/manually_downloaded/book.epub",
+            long_ago(),
+            just_now(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_valid_epub_is_unpacked_to_one_html_document_in_spine_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        drop_epub(
+            &storage,
+            epub_of(
+                &[
+                    ("a.xhtml", "<html><body><h1>Alpha</h1></body></html>".into()),
+                    ("b.xhtml", "<html><body><h1>Bravo</h1></body></html>".into()),
+                ],
+                &[1, 0],
+            ),
+        )
+        .await;
+
+        let out = inbox_epub(&storage, &EpubLimits::default()).await.unwrap();
+
+        assert_eq!(out, HandleOutcome::Committed(WriteOutcome::Relocated));
+        let html = String::from_utf8(storage.get("papers/bo/book.html").await.unwrap()).unwrap();
+        assert!(
+            html.find("Bravo").unwrap() < html.find("Alpha").unwrap(),
+            "{html}"
+        );
+        assert!(!storage
+            .exists("papers/manually_downloaded/book.epub")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_chapter_the_spine_repeats_is_unpacked_once_by_the_inbox_too() {
+        // The inbox had its own copy of the chapter loop: 200 itemrefs to a
+        // 1 MB chapter made 200 MB of HTML from a ~7 KB drop.
+        let mut chapter = String::from("<html><body>");
+        while chapter.len() < 1_000_000 {
+            chapter.push_str("<p>lorem ipsum dolor sit amet consectetur</p>");
+        }
+        chapter.push_str("</body></html>");
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        drop_epub(&storage, epub_of(&[("a.xhtml", chapter)], &[0; 200])).await;
+
+        let out = inbox_epub(&storage, &EpubLimits::default()).await.unwrap();
+
+        assert_eq!(out, HandleOutcome::Committed(WriteOutcome::Relocated));
+        let html = storage.get("papers/bo/book.html").await.unwrap();
+        assert!(html.len() < 2_000_000, "{} bytes", html.len());
+    }
+
+    #[tokio::test]
+    async fn the_configured_epub_limits_are_the_inbox_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let chapter = format!("<html><body>{}</body></html>", "<p>text</p>".repeat(1000));
+        drop_epub(&storage, epub_of(&[("a.xhtml", chapter)], &[0])).await;
+
+        // The same drop converts under the defaults and is refused under a
+        // configured ceiling it exceeds; nothing is written, the source stays.
+        let tight = EpubLimits {
+            max_entries: 100,
+            max_entry_bytes: 4_096,
+            max_total_bytes: 8_192,
+        };
+        let err = inbox_epub(&storage, &tight).await.unwrap_err();
+        assert!(format!("{err:#}").contains("limit"), "{err:#}");
+        assert!(storage
+            .exists("papers/manually_downloaded/book.epub")
+            .await
+            .unwrap());
+        assert!(!storage.exists("papers/bo/book.html").await.unwrap());
+        inbox_epub(&storage, &EpubLimits::default()).await.unwrap();
+        assert!(storage.exists("papers/bo/book.html").await.unwrap());
+    }
+
     #[tokio::test]
     async fn download_extension_ignored() {
         let tmp = tempfile::tempdir().unwrap();
@@ -627,6 +770,7 @@ mod tests {
             &storage,
             &bus,
             PAPERS,
+            &EpubLimits::default(),
             "papers/manually_downloaded/in-progress.pdf.download",
             long_ago(),
             just_now(),
@@ -661,6 +805,7 @@ mod tests {
             &storage,
             &bus,
             PAPERS,
+            &EpubLimits::default(),
             "papers/manually_downloaded/foo.pdf",
             Some(fresh),
             now,
@@ -705,6 +850,7 @@ mod tests {
                 &storage,
                 &bus,
                 PAPERS,
+                &EpubLimits::default(),
                 "papers/manually_downloaded/foo.pdf",
                 mtime,
                 now,
@@ -736,9 +882,15 @@ mod tests {
             .unwrap();
         settle(tmp.path(), "papers/manually_downloaded/foo.pdf");
 
-        let report = sweep_inbox_once(&storage, &bus, PAPERS, &Shutdown::new())
-            .await
-            .unwrap();
+        let report = sweep_inbox_once(
+            &storage,
+            &bus,
+            PAPERS,
+            &EpubLimits::default(),
+            &Shutdown::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.relocated, 0);
         assert_eq!(report.ignored_still_writing, 1);
@@ -759,6 +911,7 @@ mod tests {
             &storage,
             &bus,
             PAPERS,
+            &EpubLimits::default(),
             "papers/ab/already-sharded.pdf",
             long_ago(),
             just_now(),
@@ -779,6 +932,7 @@ mod tests {
             &storage,
             &bus,
             PAPERS,
+            &EpubLimits::default(),
             "papers/manually_downloaded/._foo.pdf",
             long_ago(),
             just_now(),
@@ -827,9 +981,15 @@ mod tests {
             .await
             .unwrap();
 
-        let report = sweep_inbox_once(&storage, &bus, PAPERS, &Shutdown::new())
-            .await
-            .unwrap();
+        let report = sweep_inbox_once(
+            &storage,
+            &bus,
+            PAPERS,
+            &EpubLimits::default(),
+            &Shutdown::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.found, 3);
         assert_eq!(report.relocated, 1, "a.pdf should be relocated");
@@ -860,9 +1020,15 @@ mod tests {
             .await;
         }
 
-        let report = sweep_inbox_once(&storage, &bus, PAPERS, &Shutdown::new())
-            .await
-            .unwrap();
+        let report = sweep_inbox_once(
+            &storage,
+            &bus,
+            PAPERS,
+            &EpubLimits::default(),
+            &Shutdown::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.rejected.is_empty(), "{:?}", report.rejected);
@@ -922,9 +1088,15 @@ mod tests {
         .await;
         put_settled(&storage, tmp.path(), &format!("{INBOX}/ok.pdf"), b"fine").await;
 
-        let first = sweep_inbox_once(&storage, &bus, PAPERS, &Shutdown::new())
-            .await
-            .unwrap();
+        let first = sweep_inbox_once(
+            &storage,
+            &bus,
+            PAPERS,
+            &EpubLimits::default(),
+            &Shutdown::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(first.errors.is_empty(), "{:?}", first.errors);
         assert_eq!(first.rejected.len(), 3, "{:?}", first.rejected);
@@ -959,9 +1131,15 @@ mod tests {
         assert_eq!(bus.published.lock().await.len(), 1);
         assert!(storage.list(&format!("{INBOX}/")).await.unwrap().is_empty());
 
-        let second = sweep_inbox_once(&storage, &bus, PAPERS, &Shutdown::new())
-            .await
-            .unwrap();
+        let second = sweep_inbox_once(
+            &storage,
+            &bus,
+            PAPERS,
+            &EpubLimits::default(),
+            &Shutdown::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(second.found, 0);
         assert!(second.rejected.is_empty() && second.errors.is_empty());
         assert_eq!(
@@ -987,6 +1165,7 @@ mod tests {
                 &storage,
                 &bus,
                 PAPERS,
+                &EpubLimits::default(),
                 &format!("{INBOX}/.pdf"),
                 long_ago(),
                 just_now(),
@@ -1022,6 +1201,7 @@ mod tests {
             &storage,
             &bus,
             PAPERS,
+            &EpubLimits::default(),
             &format!("{INBOX}/.pdf"),
             Some(now),
             now,
@@ -1048,7 +1228,7 @@ mod tests {
         let stop = Shutdown::new();
         stop.request();
 
-        let report = sweep_inbox_once(&storage, &bus, PAPERS, &stop)
+        let report = sweep_inbox_once(&storage, &bus, PAPERS, &EpubLimits::default(), &stop)
             .await
             .unwrap();
 

@@ -55,6 +55,9 @@ pub enum FailureCode {
     /// The EPUB archive cannot be opened, or exceeds the size caps.
     EpubParseError,
     HtmlNotUtf8,
+    /// HTML the converter refuses to parse: elements nested deeper than
+    /// `html::MAX_HTML_NESTING`, or a conversion that did not finish in time.
+    HtmlParseError,
     UnsupportedExtension,
     /// The source object does not exist in storage.
     SourceMissing,
@@ -97,6 +100,7 @@ impl FailureCode {
             Self::PdfParseError => "pdf_parse_error",
             Self::EpubParseError => "epub_parse_error",
             Self::HtmlNotUtf8 => "html_not_utf8",
+            Self::HtmlParseError => "html_parse_error",
             Self::UnsupportedExtension => "unsupported_extension",
             Self::SourceMissing => "source_missing",
             Self::MissingExtension => "missing_extension",
@@ -112,13 +116,14 @@ impl FailureCode {
         }
     }
 
-    const ALL: [FailureCode; 18] = [
+    const ALL: [FailureCode; 19] = [
         Self::UnsupportedContentTypeHtml,
         Self::UnsupportedContentTypeBinary,
         Self::PaywallHtml,
         Self::PdfParseError,
         Self::EpubParseError,
         Self::HtmlNotUtf8,
+        Self::HtmlParseError,
         Self::UnsupportedExtension,
         Self::SourceMissing,
         Self::MissingExtension,
@@ -149,6 +154,7 @@ impl FailureCode {
             | Self::PdfParseError
             | Self::EpubParseError
             | Self::HtmlNotUtf8
+            | Self::HtmlParseError
             | Self::UnsupportedExtension
             | Self::SourceMissing
             | Self::MissingExtension
@@ -260,6 +266,7 @@ mod tests {
             (FailureCode::PdfParseError, "pdf_parse_error"),
             (FailureCode::EpubParseError, "epub_parse_error"),
             (FailureCode::HtmlNotUtf8, "html_not_utf8"),
+            (FailureCode::HtmlParseError, "html_parse_error"),
             (FailureCode::UnsupportedExtension, "unsupported_extension"),
             (FailureCode::SourceMissing, "source_missing"),
             (FailureCode::MissingExtension, "missing_extension"),
