@@ -1,0 +1,315 @@
+name: Release preflight (no publish)
+
+on:
+  push:
+    branches: ["preflight/rc360"]
+
+# Nothing is writable by default. Each job below asks for exactly what it
+# needs: only `release` may write contents and only the docker jobs may write
+# packages; the jobs that compile code hold neither.
+permissions: {}
+
+# One run per tag, and never cancel one half-way: a cancelled run leaves a tag
+# with some of its artifacts published and some not.
+concurrency:
+  group: preflight-rc360
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TOOL: hs
+  CRATE: hs
+  IMAGE: ghcr.io/home-still/hs-scribe-server
+  # The version every binary built here reports (build-support/version.rs
+  # derives HS_VERSION from it). A tag that is not vMAJOR.MINOR.PATCH[-PRE]
+  # fails the build; nothing falls back to `git describe` or Cargo.toml.
+  HS_RELEASE_TAG: v0.0.1-rc.360
+  # Pinned: these are installed into the jobs that compile what we publish.
+  ZIG_VERSION: "0.16.0"            # PyPI `ziglang`
+  CARGO_ZIGBUILD_VERSION: "0.23.4" # crates.io `cargo-zigbuild`
+
+
+jobs:
+  # The same fmt / clippy / test gates every push to main passes (ci.yaml is a
+  # reusable workflow), run on the tagged commit. Nothing builds or publishes
+  # unless they are green.
+  gate:
+    name: Gate (ci.yaml)
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yaml
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: gate
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 is arm64: this x86_64 binary is cross-compiled and cannot
+          # be executed here (run_native: false), so it is verified by file
+          # type + version marker only.
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+            run_native: false
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+            build_scribe: true
+            run_native: true
+          # ubuntu-24.04, not ubuntu-latest: the runner image fixes the glibc
+          # the x86_64 binaries require, and a floating image raises it
+          # silently on GitHub's schedule.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            archive: tar.gz
+            build_scribe: true
+            build_distill: true
+            run_native: true
+          # Cross-built on an x86_64 runner against glibc 2.28 by zigbuild;
+          # not executed here (run_native: false).
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            archive: tar.gz
+            use_zigbuild: true
+            run_native: false
+          - target: x86_64-pc-windows-msvc
+            # Pinned to windows-2022 (VS2022 MSVC). GitHub repointed BOTH
+            # `windows-latest` AND `windows-2025` to the VS2026 image
+            # (`windows-2025-vs2026`), whose MSVC removed
+            # `stdext::checked_array_iterator` — which DuckDB's vendored `fmt`
+            # still uses, so libduckdb-sys won't compile (broke rc.336 + rc.337).
+            # windows-2022 is a distinct OS image that still ships VS2022.
+            runner: windows-2022
+            archive: zip
+            run_native: true
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild + zig (ARM64 Linux only)
+        if: matrix.use_zigbuild
+        run: |
+          pip3 install --break-system-packages "ziglang==${ZIG_VERSION}"
+          cargo install --locked cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}"
+
+      - name: Build CLI (zigbuild)
+        if: matrix.use_zigbuild
+        run: >
+          cargo zigbuild --locked --release
+          --target ${{ matrix.target }}.2.28
+          -p ${{ env.CRATE }}
+
+      - name: Build CLI (native)
+        if: ${{ !matrix.use_zigbuild }}
+        run: >
+          cargo build --locked --release
+          --target ${{ matrix.target }}
+          -p ${{ env.CRATE }}
+
+      - name: Build scribe server (native)
+        if: matrix.build_scribe
+        run: >
+          cargo build --locked --release
+          --target ${{ matrix.target }}
+          -p hs-scribe --features server --bin hs-scribe-server
+
+      - name: Build distill server (native)
+        if: matrix.build_distill
+        run: >
+          cargo build --locked --release
+          --target ${{ matrix.target }}
+          -p hs-distill --features cuda --bin hs-distill-server
+
+      # Gateway and MCP server are published for the tar.gz targets only; the
+      # Windows leg ships just `hs` (zip), so it does not build them.
+      - name: Build gateway (zigbuild)
+        if: matrix.use_zigbuild
+        run: >
+          cargo zigbuild --locked --release
+          --target ${{ matrix.target }}.2.28
+          -p hs-gateway
+
+      - name: Build gateway (native)
+        if: ${{ !matrix.use_zigbuild && matrix.archive == 'tar.gz' }}
+        run: >
+          cargo build --locked --release
+          --target ${{ matrix.target }}
+          -p hs-gateway
+
+      - name: Build MCP server (zigbuild)
+        if: matrix.use_zigbuild
+        run: >
+          cargo zigbuild --locked --release
+          --target ${{ matrix.target }}.2.28
+          -p hs-mcp
+
+      - name: Build MCP server (native)
+        if: ${{ !matrix.use_zigbuild && matrix.archive == 'tar.gz' }}
+        run: >
+          cargo build --locked --release
+          --target ${{ matrix.target }}
+          -p hs-mcp
+
+      # Every release asset goes through dist/: one archive per binary plus its
+      # .sha256, named <binary>-<tag>-<target>.tar.gz|zip (hs upgrade and
+      # docs/install.sh download by exactly these names).
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILD_SCRIBE: ${{ matrix.build_scribe }}
+          BUILD_DISTILL: ${{ matrix.build_distill }}
+        run: |
+          set -euo pipefail
+          mkdir dist
+          pack() { # <binary>
+            local asset="$1-v0.0.1-rc.360-${TARGET}.tar.gz"
+            tar -czf "dist/$asset" -C "target/${TARGET}/release" "$1"
+            (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
+          }
+          pack "$TOOL"
+          pack hs-gateway
+          pack hs-mcp
+          if [ "$BUILD_SCRIBE" = true ]; then pack hs-scribe-server; fi
+          if [ "$BUILD_DISTILL" = true ]; then pack hs-distill-server; fi
+          ls -l dist
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          $asset = "${env:TOOL}-v0.0.1-rc.360-${env:TARGET}.zip"
+          Compress-Archive `
+            -Path "target\${env:TARGET}\release\${env:TOOL}.exe" `
+            -DestinationPath "dist\$asset"
+          $hash = (Get-FileHash "dist\$asset" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $asset" | Out-File -Encoding ascii "dist\$asset.sha256"
+          Get-ChildItem dist
+
+      # Verify what is about to be published, not what the build step claims:
+      # extract each archive and check the binary's architecture and baked
+      # version against the tag (see .github/scripts/verify-binaries.sh).
+      #   * hs, hs-gateway, hs-mcp have a clap --version: executed natively
+      #     when this runner can run the target (run_native).
+      #   * the scribe/distill servers have no --version flag: version
+      #     marker only.
+      #   * cross-built targets (aarch64-linux, x86_64-darwin): version
+      #     marker + `file` architecture only.
+      - name: Verify packaged binaries (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          RUN_NATIVE: ${{ matrix.run_native }}
+          BUILD_SCRIBE: ${{ matrix.build_scribe }}
+          BUILD_DISTILL: ${{ matrix.build_distill }}
+        run: |
+          set -euo pipefail
+          verify() { # <binary> [--run]
+            local dir; dir=$(mktemp -d)
+            tar -xzf "dist/$1-v0.0.1-rc.360-${TARGET}.tar.gz" -C "$dir"
+            bash .github/scripts/verify-binaries.sh --tag "v0.0.1-rc.360" --target "$TARGET" \
+              --dir "$dir" ${2:+"$2"} "$1"
+          }
+          run=
+          if [ "$RUN_NATIVE" = true ]; then run=--run; fi
+          verify "$TOOL" "$run"
+          verify hs-gateway "$run"
+          verify hs-mcp "$run"
+          if [ "$BUILD_SCRIBE" = true ]; then verify hs-scribe-server; fi
+          if [ "$BUILD_DISTILL" = true ]; then verify hs-distill-server; fi
+
+      - name: Extract packaged binary (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: Expand-Archive -Path "dist\${env:TOOL}-v0.0.1-rc.360-${env:TARGET}.zip" -DestinationPath verify-win
+
+      - name: Verify packaged binary (Windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash .github/scripts/verify-binaries.sh --tag "v0.0.1-rc.360" --target "$TARGET" --dir verify-win --run "$TOOL"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+
+  # One Dockerfile for both architectures, each built natively on its own
+  # runner from the tagged source (no separate pre-built-binary path).
+  docker:
+    name: Docker (${{ matrix.arch }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      # Build and load first; the image is pushed only after its binary has
+      # been checked against the tag.
+      - uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
+        with:
+          context: .
+          file: crates/hs-scribe/docker/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          build-args: HS_RELEASE_TAG=v0.0.1-rc.360
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:v0.0.1-rc.360-${{ matrix.arch }}
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
+      - name: Verify the image (architecture + baked version == tag)
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}:v0.0.1-rc.360-${ARCH}"
+          found=$(docker image inspect --format '{{.Architecture}}' "$ref")
+          [ "$found" = "$ARCH" ] || { echo "image is $found, expected $ARCH" >&2; exit 1; }
+          docker run --rm --entrypoint grep "$ref" -a -F -q -- "hs-version-marker:0.0.1-rc.360:end" /usr/local/bin/hs-scribe-server
+      - name: Push
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: echo preflight-not-pushing
+
