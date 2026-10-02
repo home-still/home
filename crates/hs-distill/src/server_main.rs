@@ -31,7 +31,10 @@ struct Args {
     port: Option<u16>,
 }
 
+include!("../../../build-support/version_marker.rs");
+
 fn main() -> Result<()> {
+    keep_version_marker();
     // Must run before ANY dlopen or tokio init — re-execs self with the
     // platform's dynamic-lib search path augmented so ort's CUDA provider
     // (Linux) loads from our bundled directories.

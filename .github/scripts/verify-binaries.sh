@@ -8,10 +8,13 @@
 # For every binary:
 #   1. architecture  - `file` must report the target's CPU/format (skipped for
 #                      Windows, where the --run below is the proof);
-#   2. embedded text - the tag's version string must occur in the binary. This
-#                      works for binaries the runner cannot execute (cross-built
-#                      aarch64-linux, x86_64-apple-darwin) and for servers that
-#                      have no --version flag;
+#   2. version marker - the binary must contain the framed marker
+#                      `hs-version-marker:<version>:end` (build-support/
+#                      version_marker.rs, included by all five binaries). A bare
+#                      version string is NOT searched for: it is compiled into
+#                      immediates and is not greppable. The marker works for
+#                      binaries the runner cannot execute (cross-built targets)
+#                      and for servers that have no --version flag;
 #   3. --run         - additionally execute `<binary> --version` and require its
 #                      last word to equal the version exactly. Pass --run only
 #                      for binaries that have a clap `--version` and only when
@@ -60,8 +63,8 @@ for bin in "${bins[@]}"; do
     die "$bin: no architecture check exists for $target, so --run is required"
   fi
 
-  grep -a -F -q -- "$version" "$path" \
-    || die "$bin does not contain version '$version' (stale or wrongly built binary)"
+  grep -a -F -q -- "hs-version-marker:${version}:end" "$path" \
+    || die "$bin does not contain the version marker for '$version' (stale or wrongly built binary)"
 
   if $run; then
     out=$("$path" --version) || die "$bin --version exited non-zero"
@@ -69,6 +72,6 @@ for bin in "${bins[@]}"; do
     [ "$last" = "$version" ] || die "$bin --version printed '$out', expected version '$version'"
     echo "verify-binaries: ok  $target  $bin  ($out)"
   else
-    echo "verify-binaries: ok  $target  $bin  (arch + embedded version $version; not executed)"
+    echo "verify-binaries: ok  $target  $bin  (arch + version marker $version; not executed)"
   fi
 done

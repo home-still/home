@@ -3605,7 +3605,10 @@ impl Transport {
     }
 }
 
+include!("../../../build-support/version_marker.rs");
+
 fn main() -> anyhow::Result<()> {
+    keep_version_marker();
     use anyhow::Context as _;
     // Secrets are exported into the environment, which is only sound while
     // this is the only thread: load them before the runtime (and its worker

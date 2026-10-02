@@ -90,7 +90,10 @@ fn init_logging(
     (handle, sections.storage, sections.logs.bucket)
 }
 
+include!("../../../build-support/version_marker.rs");
+
 fn main() -> ExitCode {
+    keep_version_marker();
     let cli = Cli::parse();
     // Secrets are exported into the environment before the tokio runtime
     // (and its worker threads) exist; an unreadable secrets.env is fatal.

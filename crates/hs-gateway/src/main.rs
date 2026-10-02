@@ -45,7 +45,10 @@ struct Args {
     gateway_url: Option<String>,
 }
 
+include!("../../../build-support/version_marker.rs");
+
 fn main() -> anyhow::Result<()> {
+    keep_version_marker();
     // Secrets are exported into the environment, which is only sound while
     // this is the only thread: load them before the runtime (and its worker
     // threads) exist, and refuse to start if they cannot be read. The

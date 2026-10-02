@@ -51,7 +51,7 @@ jobs:
         include:
           # macos-14 is arm64: this x86_64 binary is cross-compiled and cannot
           # be executed here (run_native: false), so it is verified by file
-          # type + embedded version string only.
+          # type + version marker only.
           - target: x86_64-apple-darwin
             runner: macos-14
             archive: tar.gz
@@ -211,10 +211,10 @@ jobs:
       # version against the tag (see .github/scripts/verify-binaries.sh).
       #   * hs, hs-gateway, hs-mcp have a clap --version: executed natively
       #     when this runner can run the target (run_native).
-      #   * the scribe/distill servers have no --version flag: embedded
-      #     version string only.
-      #   * cross-built targets (aarch64-linux, x86_64-darwin): embedded
-      #     version string + `file` architecture only.
+      #   * the scribe/distill servers have no --version flag: version
+      #     marker only.
+      #   * cross-built targets (aarch64-linux, x86_64-darwin): version
+      #     marker + `file` architecture only.
       - name: Verify packaged binaries (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -330,7 +330,7 @@ jobs:
           ref="${IMAGE}:${GITHUB_REF_NAME}-${ARCH}"
           found=$(docker image inspect --format '{{.Architecture}}' "$ref")
           [ "$found" = "$ARCH" ] || { echo "image is $found, expected $ARCH" >&2; exit 1; }
-          docker run --rm --entrypoint grep "$ref" -a -F -q -- "${GITHUB_REF_NAME#v}" /usr/local/bin/hs-scribe-server
+          docker run --rm --entrypoint grep "$ref" -a -F -q -- "hs-version-marker:${GITHUB_REF_NAME#v}:end" /usr/local/bin/hs-scribe-server
       - name: Push
         env:
           ARCH: ${{ matrix.arch }}

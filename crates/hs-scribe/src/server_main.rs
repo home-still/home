@@ -14,7 +14,10 @@ struct Args {
     port: u16,
 }
 
+include!("../../../build-support/version_marker.rs");
+
 fn main() -> Result<()> {
+    keep_version_marker();
     // Must run before ANY dlopen or tokio init — re-execs self with the
     // platform's dynamic-lib search path augmented so ort's CUDA provider
     // (Linux) and pdfium (macOS) load from our bundled directories
