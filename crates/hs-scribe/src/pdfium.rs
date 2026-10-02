@@ -91,7 +91,7 @@ fn library_candidates() -> Vec<PathBuf> {
     candidates.extend(
         hs_common::service::lib_bootstrap::pdfium_drop_dirs()
             .iter()
-            .map(|dir| Pdfium::pdfium_platform_library_name_at_path(dir)),
+            .map(Pdfium::pdfium_platform_library_name_at_path),
     );
     candidates
 }

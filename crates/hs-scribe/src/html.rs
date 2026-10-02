@@ -632,7 +632,7 @@ mod nesting {
                     // Foreign "any other end tag": pop to the nearest open
                     // element of that name within the foreign region.
                     let region = self.modes.last().map_or(0, |m| m.0);
-                    if let Some(i) = self.find(&is_target, 0) {
+                    if let Some(i) = self.find(is_target, 0) {
                         if i >= region {
                             self.truncate(i);
                         }
