@@ -494,9 +494,16 @@ impl Processor {
             message: "Parsing PDF...".into(),
         });
 
+        // pdfium takes a process-wide lock: never wait for it on an async
+        // worker (another conversion's render thread may hold it for its
+        // whole run).
         let page_count = {
-            let pdf_parser = PdfParser::new()?;
-            checked_page_count(pdf_parser.page_count(pdf_path)?)?
+            let path = pdf_path.to_string();
+            let counted = tokio::task::spawn_blocking(move || {
+                crate::pdfium::with_parser(|parser| parser.page_count(&path))
+            })
+            .await??;
+            checked_page_count(counted)?
         };
         let total = page_count as u64;
 
@@ -522,17 +529,22 @@ impl Processor {
                 let render_dpi = self.config.dpi;
                 let (tx, rx) = tokio::sync::mpsc::channel::<(usize, PageData)>(2);
                 let render = tokio::task::spawn_blocking(move || {
-                    let parser = PdfParser::new()?;
-                    let document = parser.open(&pdf_path_owned)?;
-                    for idx in 0..page_count {
-                        let idx = u16::try_from(idx)?;
-                        let page =
-                            PdfParser::render_page(&document, idx, render_dpi, max_render_pixels)?;
-                        if tx.blocking_send((idx as usize, page)).is_err() {
-                            break;
+                    crate::pdfium::with_parser(|parser| {
+                        let document = parser.open(&pdf_path_owned)?;
+                        for idx in 0..page_count {
+                            let idx = u16::try_from(idx)?;
+                            let page = PdfParser::render_page(
+                                &document,
+                                idx,
+                                render_dpi,
+                                max_render_pixels,
+                            )?;
+                            if tx.blocking_send((idx as usize, page)).is_err() {
+                                break;
+                            }
                         }
-                    }
-                    Ok::<_, anyhow::Error>(())
+                        Ok::<_, anyhow::Error>(())
+                    })
                 });
 
                 // Stage 2: full-page OCR, bounded to `parallel` concurrent VLM calls.
@@ -592,37 +604,39 @@ impl Processor {
         let pdf_path_owned = pdf_path.to_string();
         let render_dpi = self.config.dpi;
         let stage1 = tokio::task::spawn_blocking(move || {
-            let parser = PdfParser::new()?;
-            let document = parser.open(&pdf_path_owned)?;
-            for idx in 0..page_count {
-                let idx = u16::try_from(idx)?;
-                let page_no = idx as usize;
-                on_progress_s1(ProgressEvent {
-                    stage: "layout".into(),
-                    page: idx as u64,
-                    total_pages: total,
-                    message: format!("Detecting layout page {}/{total}", page_no + 1),
-                });
-                let page = PdfParser::render_page(&document, idx, render_dpi, max_render_pixels)?;
-                tracing::info!(
-                    "Preparing page {}/{} ({}x{}, per-region)",
-                    page_no + 1,
-                    total,
-                    page.image.width(),
-                    page.image.height(),
-                );
-                let prepared = prepare_page(page_no, &page.image, &layout, &table)?;
-                on_progress_s1(ProgressEvent {
-                    stage: "layout".into(),
-                    page: (page_no + 1) as u64,
-                    total_pages: total,
-                    message: format!("Layout done page {}/{total}", page_no + 1),
-                });
-                if tx.blocking_send(prepared).is_err() {
-                    break;
+            crate::pdfium::with_parser(|parser| {
+                let document = parser.open(&pdf_path_owned)?;
+                for idx in 0..page_count {
+                    let idx = u16::try_from(idx)?;
+                    let page_no = idx as usize;
+                    on_progress_s1(ProgressEvent {
+                        stage: "layout".into(),
+                        page: idx as u64,
+                        total_pages: total,
+                        message: format!("Detecting layout page {}/{total}", page_no + 1),
+                    });
+                    let page =
+                        PdfParser::render_page(&document, idx, render_dpi, max_render_pixels)?;
+                    tracing::info!(
+                        "Preparing page {}/{} ({}x{}, per-region)",
+                        page_no + 1,
+                        total,
+                        page.image.width(),
+                        page.image.height(),
+                    );
+                    let prepared = prepare_page(page_no, &page.image, &layout, &table)?;
+                    on_progress_s1(ProgressEvent {
+                        stage: "layout".into(),
+                        page: (page_no + 1) as u64,
+                        total_pages: total,
+                        message: format!("Layout done page {}/{total}", page_no + 1),
+                    });
+                    if tx.blocking_send(prepared).is_err() {
+                        break;
+                    }
                 }
-            }
-            Ok::<_, anyhow::Error>(())
+                Ok::<_, anyhow::Error>(())
+            })
         });
 
         // Stage 2: VLM inference

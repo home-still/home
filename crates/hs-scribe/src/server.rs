@@ -336,10 +336,18 @@ async fn require_token(
 async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let info = hs_common::gpu::query_gpu_info_async().await;
     let backend = cached_backend_state(&state).await;
-    let admits = backend.as_ref().is_none_or(|b| b.admits());
+    let pdfium_fault = crate::pdfium::healthy().err();
+    let admits = backend.as_ref().is_none_or(|b| b.admits()) && pdfium_fault.is_none();
     let models_reason = state.models_reason();
     let body = HealthResponse {
-        status: if admits { "ok" } else { BACKEND_UNAVAILABLE }.into(),
+        status: if pdfium_fault.is_some() {
+            "pdfium_fault"
+        } else if admits {
+            "ok"
+        } else {
+            BACKEND_UNAVAILABLE
+        }
+        .into(),
         layout_model: state.has_layout_detector(),
         table_model: state.has_table_recognizer(),
         layout_model_reason: models_reason.clone(),
@@ -368,7 +376,8 @@ async fn handle_readiness(State(state): State<Arc<ServerState>>) -> impl IntoRes
     let (total, free) = state.slots();
     let admits = cached_backend_state(&state)
         .await
-        .is_none_or(|b| b.admits());
+        .is_none_or(|b| b.admits())
+        && crate::pdfium::healthy().is_ok();
     // Zero available slots is what `ServicePool::try_pick_once` already
     // treats as ineligible, so a closed gate parks the dispatcher
     // instead of feeding a backend that can only time out.
@@ -574,6 +583,29 @@ async fn convert_pdf(
     }
 }
 
+/// Run a conversion so that a panic in it is a typed, permanent failure on
+/// the wire instead of a dropped connection the client retries.
+async fn guarded_conversion<T>(
+    stem: &str,
+    conversion: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match hs_common::panic_guard::catch_panic(conversion).await {
+        Ok(result) => result,
+        Err(panic) => {
+            tracing::error!(
+                route = "/scribe/stream",
+                stem = %stem,
+                panic = %panic,
+                "conversion task PANICKED — failing this document permanently"
+            );
+            Err(ConvertFailure::err(
+                FailureCode::ConversionPanicked,
+                format!("the scribe server panicked converting this document: {panic}"),
+            ))
+        }
+    }
+}
+
 async fn handle_scribe_stream(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -635,7 +667,10 @@ async fn handle_scribe_stream(
             }
         };
 
-        let convert_fut = convert_pdf(&state, _tmp.path(), on_progress);
+        // The spawned task is outside every middleware: a panic here would
+        // end the task, drop `tx` and leave the client an untyped
+        // "connection closed" it retries. Catch it, say so, and type it.
+        let convert_fut = guarded_conversion(&stem, convert_pdf(&state, _tmp.path(), on_progress));
         match tokio::time::timeout(deadline, convert_fut).await {
             Ok(Ok((markdown, per_page_region_classes, per_page_diags))) => {
                 record_success(
@@ -782,6 +817,21 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_panic_in_the_conversion_task_is_a_typed_permanent_failure() {
+        let err = guarded_conversion::<()>("doc", async { panic!("index out of bounds") })
+            .await
+            .unwrap_err();
+        let code = wire_failure_code(&err);
+        assert_eq!(code, Some(FailureCode::ConversionPanicked), "{err:#}");
+        assert!(matches!(
+            crate::classify::classify(&err),
+            crate::classify::FailureClass::Permanent(_)
+        ));
+        // A normal result passes through untouched.
+        assert_eq!(guarded_conversion("doc", async { Ok(3) }).await.unwrap(), 3);
+    }
+
     #[test]
     fn typed_failures_go_on_the_wire_and_untyped_ones_do_not() {
         let typed =
@@ -862,6 +912,9 @@ mod tests {
                 let config = AppConfig {
                     converter: ConverterMode::Olmocr,
                     olmocr_bin: script.to_string_lossy().into_owned(),
+                    // Independent of how much VRAM other tenants of the
+                    // host hold right now.
+                    vram_headroom_mb: 0,
                     vlm_concurrency,
                     ..AppConfig::default()
                 };

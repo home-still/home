@@ -85,6 +85,9 @@ pub enum FailureCode {
     /// olmocr reported failed pages, or fewer completed pages than the
     /// source has.
     OlmocrIncompletePages,
+    /// The server panicked while converting this document. A panic on the
+    /// same bytes repeats, so it is never retried.
+    ConversionPanicked,
     /// Part of the document could not be processed (regions the pipeline
     /// had to skip), so the markdown has holes.
     GappedConversion,
@@ -113,10 +116,11 @@ impl FailureCode {
             Self::OlmocrZeroPages => "olmocr_zero_pages",
             Self::OlmocrIncompletePages => "olmocr_incomplete_pages",
             Self::GappedConversion => "gapped_conversion",
+            Self::ConversionPanicked => "conversion_panicked",
         }
     }
 
-    const ALL: [FailureCode; 19] = [
+    const ALL: [FailureCode; 20] = [
         Self::UnsupportedContentTypeHtml,
         Self::UnsupportedContentTypeBinary,
         Self::PaywallHtml,
@@ -136,6 +140,7 @@ impl FailureCode {
         Self::OlmocrZeroPages,
         Self::OlmocrIncompletePages,
         Self::GappedConversion,
+        Self::ConversionPanicked,
     ];
 
     /// Parse a wire token. Exact match only: an unknown token is not a
@@ -159,6 +164,7 @@ impl FailureCode {
             | Self::SourceMissing
             | Self::MissingExtension
             | Self::InvalidKey
+            | Self::ConversionPanicked
             | Self::EmptyConversion => FailureClass::Permanent(token),
             Self::EmptyVlmConversion
             | Self::VlmRepetitionLoop
@@ -272,6 +278,7 @@ mod tests {
             (FailureCode::MissingExtension, "missing_extension"),
             (FailureCode::InvalidKey, "invalid_key"),
             (FailureCode::EmptyConversion, "empty_conversion"),
+            (FailureCode::ConversionPanicked, "conversion_panicked"),
         ] {
             assert_eq!(
                 classify(&ConvertFailure::err(code, "x")),

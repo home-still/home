@@ -54,6 +54,10 @@ async fn async_main() -> Result<()> {
         )
     })?;
 
+    // A poisoned pdfium lock or a pdfium call that never returns cannot be
+    // recovered in-process: health goes red, then the process exits.
+    hs_scribe::pdfium::install_fault_exit(std::time::Duration::from_secs(10));
+
     // libonnxruntime defaults to "warning" verbosity, which floods the log with
     // shape-inference noise (logical_and_0.tmp_0.0, fill_constant_27.tmp_0.0)
     // for every page. The only API in ort 2.0.0-rc.11 to silence this on the

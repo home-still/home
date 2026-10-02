@@ -369,6 +369,7 @@ pub(crate) async fn cmd_watch_events(
     // one — it refuses to start instead.
     hs_scribe::pdfium::require()
         .context("the scribe watcher counts PDF pages with libpdfium, which cannot be bound")?;
+    hs_scribe::pdfium::install_fault_exit(std::time::Duration::from_secs(10));
 
     let cfg = ScribeConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage()?;

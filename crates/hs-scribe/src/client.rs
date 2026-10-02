@@ -206,6 +206,34 @@ impl ReadinessInfo for ReadinessResponse {
     }
 }
 
+/// The scribe server refused this client's credential (401/403): the shared
+/// `HS_BACKEND_TOKEN` is missing or wrong on this host. Retrying cannot help
+/// and says nothing about the document, so the watcher treats it as a fatal
+/// configuration error ([`is_backend_unauthorized`]).
+#[derive(Debug)]
+pub struct BackendUnauthorized {
+    pub server: String,
+    pub status: u16,
+}
+
+impl std::fmt::Display for BackendUnauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "scribe server {} answered {}: HS_BACKEND_TOKEN is missing or wrong on this host \
+             (set the same value as the server in ~/.home-still/secrets.env)",
+            self.server, self.status
+        )
+    }
+}
+
+impl std::error::Error for BackendUnauthorized {}
+
+/// `true` when `err` carries a [`BackendUnauthorized`] anywhere in its chain.
+pub fn is_backend_unauthorized(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<BackendUnauthorized>())
+}
+
 pub struct ScribeClient {
     http: AuthedHttp,
     server_url: String,
@@ -366,6 +394,16 @@ impl ScribeClient {
                  streaming; run `hs upgrade` on that host",
                 self.server_url
             );
+        }
+
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            return Err(anyhow::Error::new(BackendUnauthorized {
+                server: self.server_url.clone(),
+                status: resp.status().as_u16(),
+            }));
         }
 
         if !resp.status().is_success() {

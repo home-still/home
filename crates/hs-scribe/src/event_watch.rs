@@ -733,7 +733,19 @@ where
     let handler = Arc::new(handler);
 
     let mut delivery_error = None;
-    while let Some(next) = stream.next().await {
+    // A handler that meets a fatal configuration error (the backend refuses
+    // our token) reports it here; the loop stops consuming at once.
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<anyhow::Error>();
+    let mut fatal: Option<anyhow::Error> = None;
+    loop {
+        let next = tokio::select! {
+            next = stream.next() => next,
+            Some(e) = fatal_rx.recv() => {
+                fatal = Some(e);
+                break;
+            }
+        };
+        let Some(next) = next else { break };
         let event = match next {
             Ok(event) => event,
             Err(e) => {
@@ -762,6 +774,7 @@ where
             .await
             .map_err(|_| anyhow::anyhow!("scribe worker semaphore closed"))?;
         let handler = Arc::clone(&handler);
+        let fatal_tx = fatal_tx.clone();
         tokio::spawn(async move {
             let _permit = permit; // drop at scope end releases the slot
             let key = parsed.key.clone();
@@ -790,6 +803,24 @@ where
                     if let Err(e) = event.ack().await {
                         tracing::warn!(key = %key, error = %e, "ack failed");
                     }
+                }
+                Err(err) if crate::client::is_backend_unauthorized(err.as_error()) => {
+                    // Not a verdict on the document, and retrying cannot
+                    // help: give the event back untouched, then stop the
+                    // whole watcher loudly so the supervisor restarts it.
+                    tracing::error!(
+                        key = %key,
+                        error = %err.as_error(),
+                        "FATAL CONFIGURATION: the scribe server rejected HS_BACKEND_TOKEN; \
+                         the watcher is stopping"
+                    );
+                    if let Err(e) = event.nak(Some(NAK_BACKOFF)).await {
+                        tracing::warn!(key = %key, error = %e, "nak failed");
+                    }
+                    let _ = fatal_tx.send(anyhow::anyhow!(
+                        "HS_BACKEND_TOKEN rejected by the scribe server: {}",
+                        err.as_error()
+                    ));
                 }
                 Err(err) => {
                     let is_perm = matches!(err, HandlerError::Permanent(_));
@@ -821,6 +852,13 @@ where
 
     // Let handlers that are already running finish their ack/nak first.
     let _ = sem.acquire_many(concurrency as u32).await;
+    if let Some(e) = fatal {
+        return Err(e);
+    }
+    // A fatal error raised by a handler that was still running is fatal too.
+    if let Ok(e) = fatal_rx.try_recv() {
+        return Err(e);
+    }
     Err(match delivery_error {
         Some(e) => e.context(format!(
             "event delivery for {} failed: the consumer is no longer receiving",
@@ -1207,6 +1245,90 @@ mod tests {
             "papers.ingested",
             format!(r#"{{"key":"{key}"}}"#).into_bytes(),
         )
+    }
+
+    /// A server that answers every request with `status` and an empty body.
+    async fn fixed_status_server(status: u16) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            format!("HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_a_typed_error_not_an_untyped_transient() {
+        for status in [401u16, 403] {
+            let url = fixed_status_server(status).await;
+            let client = ScribeClient::new_with_timeout(&url, Duration::from_secs(5)).unwrap();
+            let err = client
+                .convert_with_progress(pdf_with_pages(1), None, Some("s"), |_| {})
+                .await
+                .unwrap_err();
+            assert!(
+                crate::client::is_backend_unauthorized(&err),
+                "{status}: {err:#}"
+            );
+            assert!(format!("{err:#}").contains("HS_BACKEND_TOKEN"), "{err:#}");
+        }
+        // Any other failure is not the credential's.
+        let url = fixed_status_server(500).await;
+        let client = ScribeClient::new_with_timeout(&url, Duration::from_secs(5)).unwrap();
+        let err = client
+            .convert_with_progress(pdf_with_pages(1), None, Some("s"), |_| {})
+            .await
+            .unwrap_err();
+        assert!(!crate::client::is_backend_unauthorized(&err));
+    }
+
+    #[tokio::test]
+    async fn the_watcher_stops_with_an_error_when_the_backend_rejects_its_token() {
+        let url = fixed_status_server(401).await;
+        let (_d, st) = storage();
+        st.put("papers/ab/one.pdf", pdf_with_pages(1))
+            .await
+            .unwrap();
+        let bus = Arc::new(FakeBus::default());
+        *bus.to_consume.lock().unwrap() = vec![ingested("papers/ab/one.pdf")];
+        let storage: Arc<dyn Storage> = Arc::new(st);
+        let handled = Arc::new(AtomicUsize::new(0));
+        let handled_in = handled.clone();
+        let started = std::time::Instant::now();
+        let result = run_subscriber(bus, storage, 2, move |_event| {
+            let url = url.clone();
+            let handled = handled_in.clone();
+            async move {
+                handled.fetch_add(1, Ordering::SeqCst);
+                let client = ScribeClient::new_with_timeout(&url, Duration::from_secs(5)).unwrap();
+                client
+                    .convert_with_progress(pdf_with_pages(1), None, Some("one"), |_| {})
+                    .await
+                    .map(|_| ())
+                    .map_err(HandlerError::Transient)
+            }
+        })
+        .await;
+        let err = result.expect_err("a rejected token must end the watcher");
+        assert!(format!("{err:#}").contains("HS_BACKEND_TOKEN"), "{err:#}");
+        assert_eq!(handled.load(Ordering::SeqCst), 1);
+        // It stopped at once; it did not wait for the stream to end or retry.
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]

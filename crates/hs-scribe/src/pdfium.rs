@@ -21,7 +21,10 @@
 use crate::classify::{ConvertFailure, FailureCode};
 use anyhow::Result;
 use pdfium_render::prelude::*;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Most pages a document may have. The renderer addresses pages with a
 /// `u16` (and `PdfPages::len()` is a `u16` cast of pdfium's page count), so
@@ -77,6 +80,96 @@ macro_rules! count_raw {
         }
         Ok(count as u32)
     }};
+}
+
+/// Exit status of a process that stopped because pdfium is unusable.
+pub const FAULT_EXIT_CODE: i32 = 70;
+
+static POISONED: AtomicBool = AtomicBool::new(false);
+static WEDGED: AtomicBool = AtomicBool::new(false);
+/// Milliseconds a faulted process lingers (health red) before it exits; 0 =
+/// no exit (library default; the server and the watcher install one).
+static EXIT_GRACE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Make a pdfium fault end the process: after `grace` (during which
+/// `/health` is red) the process exits with [`FAULT_EXIT_CODE`] so its
+/// supervisor restarts it. A native call stuck inside pdfium cannot be
+/// cancelled or killed from within the process, and a poisoned pdfium lock
+/// never recovers: exit is the only recovery.
+pub fn install_fault_exit(grace: Duration) {
+    EXIT_GRACE_MS.store(grace.as_millis().max(1) as u64, Ordering::SeqCst);
+}
+
+/// `Err(reason)` while pdfium is poisoned or a call is stuck inside it.
+pub fn healthy() -> Result<(), &'static str> {
+    if POISONED.load(Ordering::SeqCst) {
+        Err("pdfium's process-wide lock is poisoned by a panic; restart required")
+    } else if WEDGED.load(Ordering::SeqCst) {
+        Err("a pdfium call has not returned within its budget")
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn fault_poisoned() {
+    POISONED.store(true, Ordering::SeqCst);
+    tracing::error!(
+        "pdfium's process-wide lock is poisoned (a panic unwound while a PdfParser was alive); \
+         every later PDF would fail — the process must restart"
+    );
+    arm_exit();
+}
+
+pub(crate) fn fault_wedged(budget: Duration) {
+    WEDGED.store(true, Ordering::SeqCst);
+    tracing::error!(
+        budget_secs = budget.as_secs(),
+        "a pdfium call exceeded its budget and has not returned; it cannot be killed in-process \
+         — the process restarts unless it returns within the grace period"
+    );
+    arm_exit();
+}
+
+/// The stuck call returned after all.
+pub(crate) fn clear_wedged() {
+    WEDGED.store(false, Ordering::SeqCst);
+}
+
+fn arm_exit() {
+    let grace = EXIT_GRACE_MS.load(Ordering::SeqCst);
+    if grace == 0 {
+        return;
+    }
+    // Detached on purpose: it must outlive a wedged runtime.
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(grace));
+        if let Err(reason) = healthy() {
+            eprintln!("FATAL: {reason}; exiting so the supervisor restarts this process");
+            std::process::exit(FAULT_EXIT_CODE);
+        }
+    });
+}
+
+/// Run `f` with a parser, never letting a panic unwind through a live
+/// `PdfParser`: pdfium-render keeps its process-wide lock in the `Pdfium`
+/// instance, and dropping that instance *while unwinding* poisons the lock
+/// for the life of the process. The panic is caught, the parser dropped, and
+/// the unwind resumed afterwards. A panic out of `PdfParser::new` is that
+/// poisoned lock itself: recorded, health goes red, the process exits.
+pub fn with_parser<T>(f: impl FnOnce(&PdfParser) -> Result<T>) -> Result<T> {
+    let parser = match catch_unwind(PdfParser::new) {
+        Ok(created) => created?,
+        Err(_) => {
+            fault_poisoned();
+            anyhow::bail!("pdfium's process-wide lock is poisoned; the process is restarting");
+        }
+    };
+    let outcome = catch_unwind(AssertUnwindSafe(|| f(&parser)));
+    drop(parser);
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => resume_unwind(payload),
+    }
 }
 
 pub struct PdfParser {
@@ -179,7 +272,7 @@ impl PdfParser {
 /// Start-up check of every host that runs the scribe server or a watcher:
 /// libpdfium must bind. The error says where it was looked for.
 pub fn require() -> Result<()> {
-    PdfParser::new().map(drop)
+    with_parser(|_| Ok(()))
 }
 
 /// `true` when pdfium is saying "this document is broken / locked", as

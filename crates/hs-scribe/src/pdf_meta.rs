@@ -23,7 +23,7 @@
 //! document.
 
 use crate::classify::{ConvertFailure, FailureCode};
-use crate::pdfium::PdfParser;
+use crate::pdfium::with_parser;
 use anyhow::Result;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
@@ -92,9 +92,13 @@ pub async fn count_pages(bytes: Bytes) -> Result<u32> {
     if bytes.len() > MAX_PDF_BYTES {
         return Err(too_big(bytes.len() as u64));
     }
-    bounded(&GATE, COUNT_QUEUE_TIMEOUT, COUNT_WORK_TIMEOUT, move || {
-        PdfParser::new()?.count_pages_in_bytes(&bytes)
-    })
+    bounded(
+        &GATE,
+        COUNT_QUEUE_TIMEOUT,
+        COUNT_WORK_TIMEOUT,
+        crate::pdfium::fault_wedged,
+        move || with_parser(|parser| parser.count_pages_in_bytes(&bytes)),
+    )
     .await
 }
 
@@ -104,24 +108,33 @@ pub async fn count_pages(bytes: Bytes) -> Result<u32> {
 /// typed [`ConvertFailure`].
 pub async fn count_pages_in_file(path: &Path) -> Result<u32> {
     let path: PathBuf = path.to_path_buf();
-    bounded(&GATE, COUNT_QUEUE_TIMEOUT, COUNT_WORK_TIMEOUT, move || {
-        use std::io::Read;
-        let file = std::fs::File::open(&path)
-            .map_err(|e| anyhow::anyhow!("reading {} to count its pages: {e}", path.display()))?;
-        let len = file
-            .metadata()
-            .map_err(|e| anyhow::anyhow!("stat {}: {e}", path.display()))?
-            .len();
-        if len > MAX_PDF_BYTES as u64 {
-            return Err(too_big(len));
-        }
-        let mut head = Vec::with_capacity(HEADER_PROBE_BYTES);
-        file.take(HEADER_PROBE_BYTES as u64)
-            .read_to_end(&mut head)
-            .map_err(|e| anyhow::anyhow!("reading {} to count its pages: {e}", path.display()))?;
-        check_header(&head)?;
-        PdfParser::new()?.count_pages_in_file(&path)
-    })
+    bounded(
+        &GATE,
+        COUNT_QUEUE_TIMEOUT,
+        COUNT_WORK_TIMEOUT,
+        crate::pdfium::fault_wedged,
+        move || {
+            use std::io::Read;
+            let file = std::fs::File::open(&path).map_err(|e| {
+                anyhow::anyhow!("reading {} to count its pages: {e}", path.display())
+            })?;
+            let len = file
+                .metadata()
+                .map_err(|e| anyhow::anyhow!("stat {}: {e}", path.display()))?
+                .len();
+            if len > MAX_PDF_BYTES as u64 {
+                return Err(too_big(len));
+            }
+            let mut head = Vec::with_capacity(HEADER_PROBE_BYTES);
+            file.take(HEADER_PROBE_BYTES as u64)
+                .read_to_end(&mut head)
+                .map_err(|e| {
+                    anyhow::anyhow!("reading {} to count its pages: {e}", path.display())
+                })?;
+            check_header(&head)?;
+            with_parser(|parser| parser.count_pages_in_file(&path))
+        },
+    )
     .await
 }
 
@@ -132,6 +145,7 @@ async fn bounded<T: Send + 'static>(
     gate: &'static Semaphore,
     queue_wait: Duration,
     work_budget: Duration,
+    on_budget_expiry: fn(Duration),
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let permit = match tokio::time::timeout(queue_wait, gate.acquire()).await {
@@ -144,19 +158,26 @@ async fn bounded<T: Send + 'static>(
     };
     let job = tokio::task::spawn_blocking(move || {
         let _held = permit;
-        work()
+        let result = work();
+        crate::pdfium::clear_wedged();
+        result
     });
     match tokio::time::timeout(work_budget, job).await {
         Ok(Ok(result)) => result,
-        Ok(Err(join)) if join.is_panic() => Err(ConvertFailure::err(
-            FailureCode::PdfParseError,
-            format!("the PDF parser panicked: {join}"),
-        )),
+        // A panic is a fault of this host's code, never a verdict on the
+        // document: untyped (retried, never stamped `conversion_failed`).
+        Ok(Err(join)) if join.is_panic() => {
+            tracing::error!(error = %join, "the PDF page counter PANICKED");
+            Err(anyhow::anyhow!("the PDF page counter panicked: {join}"))
+        }
         Ok(Err(join)) => Err(anyhow::anyhow!("the page-count task was cancelled: {join}")),
-        Err(_) => Err(ConvertFailure::err(
-            FailureCode::PdfParseError,
-            format!("the PDF parser did not finish within {work_budget:?}"),
-        )),
+        Err(_) => {
+            on_budget_expiry(work_budget);
+            Err(ConvertFailure::err(
+                FailureCode::PdfParseError,
+                format!("the PDF parser did not finish within {work_budget:?}"),
+            ))
+        }
     }
 }
 
@@ -316,7 +337,7 @@ pub(crate) mod tests {
     pub(crate) fn pdfium_available() -> bool {
         // Dropped at once: a parser held on this thread would make the
         // counting job (another thread) wait for it forever.
-        match PdfParser::new().map(drop) {
+        match crate::pdfium::require() {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("libpdfium cannot be bound here: {e:#}");
@@ -632,6 +653,7 @@ pub(crate) mod tests {
             &LOCAL_GATE,
             Duration::from_secs(5),
             Duration::from_millis(100),
+            |_| {},
             move || {
                 // Stands in for a pdfium call that does not return.
                 let _ = hold.recv_timeout(Duration::from_secs(30));
@@ -652,6 +674,7 @@ pub(crate) mod tests {
             &LOCAL_GATE,
             Duration::from_millis(100),
             Duration::from_secs(5),
+            |_| {},
             || Ok(2u32),
         )
         .await
@@ -665,6 +688,7 @@ pub(crate) mod tests {
             &LOCAL_GATE,
             Duration::from_secs(5),
             Duration::from_secs(5),
+            |_| {},
             || Ok(3u32),
         )
         .await
@@ -673,32 +697,175 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_panic_in_the_parser_is_a_verdict_on_the_document() {
+    async fn a_panic_is_never_a_verdict_on_the_document() {
         static LOCAL_GATE: Semaphore = Semaphore::const_new(1);
         let err = bounded(
             &LOCAL_GATE,
             Duration::from_secs(5),
             Duration::from_secs(5),
+            |_| {},
             || -> Result<u32> { panic!("index out of bounds in xref") },
         )
         .await
         .unwrap_err();
-        assert_eq!(
-            failure_code(&err),
-            Some(FailureCode::PdfParseError),
-            "{err:#}"
-        );
+        // Untyped: the watcher retries it and never stamps conversion_failed.
+        assert_eq!(failure_code(&err), None, "{err:#}");
+        assert_eq!(classify(&err), FailureClass::Transient);
         // The gate is released by the unwinding thread.
         assert_eq!(
             bounded(
                 &LOCAL_GATE,
                 Duration::from_secs(5),
                 Duration::from_secs(5),
+                |_| {},
                 || Ok(1u32)
             )
             .await
             .unwrap(),
             1
+        );
+    }
+
+    // ── pdfium faults, in a child process (they end the process) ────
+
+    const FAULT_ENV: &str = "HS_SCRIBE_PDF_FAULT_CHILD";
+
+    /// Child entry. `panic-with-parser`: a panic while a parser is alive
+    /// (through `with_parser`) must leave pdfium usable. `poison`: the raw
+    /// hazard — a panic unwinding through a live `PdfParser` — must turn
+    /// into red health and a process exit. `wedge`: a call past its budget
+    /// must do the same. `recover`: a call that returns within the grace
+    /// period must not.
+    #[test]
+    fn fault_child_entry() {
+        let Ok(mode) = std::env::var(FAULT_ENV) else {
+            return;
+        };
+        crate::pdfium::install_fault_exit(Duration::from_millis(700));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pdf = Bytes::from(pdf_with_pages(1));
+        rt.block_on(async {
+            let one =
+                |pdf: Bytes| async move { count_pages(pdf).await.map_err(|e| format!("{e:#}")) };
+            println!("RESULT before {:?}", one(pdf.clone()).await);
+            match mode.as_str() {
+                "panic-with-parser" => {
+                    let joined = tokio::task::spawn_blocking(|| {
+                        crate::pdfium::with_parser(|_| -> Result<()> {
+                            panic!("host code panicked")
+                        })
+                    })
+                    .await;
+                    println!("RESULT panicked {}", joined.unwrap_err().is_panic());
+                    println!("RESULT after {:?}", one(pdf.clone()).await);
+                    println!("RESULT healthy {:?}", crate::pdfium::healthy());
+                }
+                "poison" => {
+                    let joined = std::thread::spawn(|| {
+                        let _parser = crate::pdfium::PdfParser::new().unwrap();
+                        panic!("host code panicked with a live parser");
+                    })
+                    .join();
+                    println!("RESULT panicked {}", joined.is_err());
+                    let after = count_pages(pdf.clone()).await;
+                    println!(
+                        "RESULT after typed={:?}",
+                        after.as_ref().err().and_then(failure_code)
+                    );
+                    println!("RESULT healthy {:?}", crate::pdfium::healthy().is_ok());
+                }
+                "wedge" | "recover" => {
+                    static GATE: Semaphore = Semaphore::const_new(1);
+                    let hold = if mode == "wedge" { 30_000 } else { 300 };
+                    let r = bounded(
+                        &GATE,
+                        Duration::from_secs(5),
+                        Duration::from_millis(100),
+                        crate::pdfium::fault_wedged,
+                        move || {
+                            std::thread::sleep(Duration::from_millis(hold));
+                            Ok(1u32)
+                        },
+                    )
+                    .await;
+                    println!(
+                        "RESULT refused {:?}",
+                        r.err().and_then(|e| failure_code(&e))
+                    );
+                    println!("RESULT healthy-now {:?}", crate::pdfium::healthy().is_ok());
+                }
+                other => panic!("unknown mode {other}"),
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            println!("RESULT survived-grace {:?}", crate::pdfium::healthy());
+        });
+        std::process::exit(0);
+    }
+
+    fn fault_child(mode: &str) -> (Option<i32>, Vec<String>) {
+        let (code, stdout) = crate::child_proc::run_expecting_exit(
+            "pdf_meta::tests::fault_child_entry",
+            FAULT_ENV,
+            mode,
+        );
+        let lines = stdout
+            .lines()
+            .filter_map(|l| l.find("RESULT ").map(|at| l[at + 7..].to_string()))
+            .collect();
+        (code, lines)
+    }
+
+    #[test]
+    fn a_panic_while_a_parser_is_alive_does_not_poison_pdfium() {
+        skip_without_pdfium!("a_panic_while_a_parser_is_alive_does_not_poison_pdfium");
+        let (code, lines) = fault_child("panic-with-parser");
+        assert_eq!(code, Some(0), "{lines:?}");
+        assert_eq!(lines[0], "before Ok(1)");
+        assert_eq!(lines[1], "panicked true");
+        // Before the fix this was an Err on every call, for ever.
+        assert_eq!(lines[2], "after Ok(1)", "{lines:?}");
+        assert_eq!(lines[3], "healthy Ok(())");
+    }
+
+    #[test]
+    fn a_poisoned_pdfium_lock_turns_health_red_and_exits_non_zero() {
+        skip_without_pdfium!("a_poisoned_pdfium_lock_turns_health_red_and_exits_non_zero");
+        let (code, lines) = fault_child("poison");
+        assert_eq!(lines[0], "before Ok(1)");
+        assert_eq!(lines[1], "panicked true");
+        // Never a verdict about the document...
+        assert_eq!(lines[2], "after typed=None", "{lines:?}");
+        // ...health is red, and the process exits before the grace sleep ends.
+        assert_eq!(lines[3], "healthy false");
+        assert_eq!(code, Some(crate::pdfium::FAULT_EXIT_CODE), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("survived-grace")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_wedged_pdfium_call_turns_health_red_and_exits_non_zero() {
+        let (code, lines) = fault_child("wedge");
+        assert_eq!(code, Some(crate::pdfium::FAULT_EXIT_CODE), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "healthy-now false"), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("survived-grace")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_slow_pdfium_call_that_returns_within_the_grace_period_does_not_end_the_process() {
+        let (code, lines) = fault_child("recover");
+        assert_eq!(code, Some(0), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "healthy-now false"), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "survived-grace Ok(())"),
+            "{lines:?}"
         );
     }
 }

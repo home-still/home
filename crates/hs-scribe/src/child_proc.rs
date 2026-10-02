@@ -33,6 +33,24 @@ pub(crate) fn run(test_path: &str, env_key: &str, env_value: &str) -> Child {
     Child { stdout }
 }
 
+/// Like [`run`] but for a child that is expected to die by its own hand:
+/// returns its exit code (`None` = killed by a signal) and stdout.
+pub(crate) fn run_expecting_exit(
+    test_path: &str,
+    env_key: &str,
+    env_value: &str,
+) -> (Option<i32>, String) {
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", test_path, "--nocapture", "--test-threads=1"])
+        .env(env_key, env_value)
+        .output()
+        .expect("spawn the child test binary");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
 impl Child {
     /// The lines the child reported, each prefixed `RESULT ` (libtest prints
     /// `test <name> ... ` without a newline, so the first one shares its line
