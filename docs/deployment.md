@@ -180,7 +180,7 @@ All ports below are LAN-only **except** the gateway, which exits the LAN through
 
 (Cross-check against the "Network ports" table in the root README — they should agree.)
 
-A LAN firewall rule that only permits traffic *between* `192.168.1.0/24` hosts is enough. The tunnel host is the only one that needs outbound 443 to `*.cloudflare.com`.
+A LAN firewall rule that only permits traffic *between* `192.0.2.0/24` hosts is enough. The tunnel host is the only one that needs outbound 443 to `*.cloudflare.com`.
 
 ## 6. Per-host setup recipes
 
@@ -322,9 +322,9 @@ You have two paths. Pick one (or run both during a migration).
 Run as: `sudo bash`
 
 ```bash
-# T7 USB SSD assumed at /mnt/codex_fs (ext4 or xfs)
-sudo mkdir -p /mnt/codex_fs/home-still/{papers,markdown,catalog,logs}
-sudo chown -R 1000:1000 /mnt/codex_fs/home-still
+# T7 USB SSD assumed at /mnt/share (ext4 or xfs)
+sudo mkdir -p /mnt/share/home-still/{papers,markdown,catalog,logs}
+sudo chown -R 1000:1000 /mnt/share/home-still
 ```
 
 > **Important:** never run `chown -R` from a parent directory that has foreign mounts nested inside (e.g. `~/mnt`, `/Volumes`, `/mnt`). Recurse only inside the directory you actually own.
@@ -334,7 +334,7 @@ sudo chown -R 1000:1000 /mnt/codex_fs/home-still
 Edit `/etc/exports`:
 
 ```
-/mnt/codex_fs/home-still   192.168.1.0/24(rw,async,no_subtree_check,all_squash,anonuid=1000,anongid=1000)
+/mnt/share/home-still   192.0.2.0/24(rw,async,no_subtree_check,all_squash,anonuid=1000,anongid=1000)
 ```
 
 The `async` flag is critical — without it, every write blocks on disk and a USB SSD will crawl. (Symptom: jukebox errors, Mac Finder hangs. See the root README's NFS troubleshooting section.)
@@ -381,8 +381,8 @@ Write `/etc/garage.toml`:
 
 ```toml
 metadata_dir          = "/var/lib/garage/meta"
-data_dir              = "/mnt/codex_fs/garage/data"
-metadata_snapshots_dir = "/mnt/codex_fs/garage/snapshots"
+data_dir              = "/mnt/share/garage/data"
+metadata_snapshots_dir = "/mnt/share/garage/snapshots"
 
 # SQLite is the safer engine for a Pi without a UPS — LMDB can corrupt on
 # unclean shutdown. SQLite WAL recovers automatically.
@@ -434,7 +434,7 @@ LimitNOFILE=42000
 WantedBy=multi-user.target
 EOF
 
-sudo mkdir -p /mnt/codex_fs/garage/{data,snapshots}
+sudo mkdir -p /mnt/share/garage/{data,snapshots}
 sudo systemctl daemon-reload
 sudo systemctl enable --now garage
 sudo journalctl -u garage -f
@@ -516,11 +516,11 @@ echo 'export LD_LIBRARY_PATH=/opt/cuda/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
 For NFS:
 
 ```bash
-sudo mkdir -p /mnt/codex_fs
-echo 'three:/mnt/codex_fs/home-still  /mnt/codex_fs  nfs4  rw,async,vers=4,_netdev  0  0' \
+sudo mkdir -p /mnt/share
+echo '<nas-host>:/mnt/share/home-still  /mnt/share  nfs4  rw,async,vers=4,_netdev  0  0' \
   | sudo tee -a /etc/fstab
-sudo mount /mnt/codex_fs
-ls /mnt/codex_fs/home-still
+sudo mount /mnt/share
+ls /mnt/share/home-still
 ```
 
 For Garage S3, configure the `hs` storage backend instead (see step below) — `big` does not need a filesystem mount when using S3.
@@ -538,8 +538,8 @@ Edit `~/.home-still/config.yaml` — set `home.project_dir` to the NFS mount pat
 
 ```yaml
 home:
-  project_dir: /mnt/codex_fs/home-still   # for NFS
-  log_dir: /mnt/codex_fs/home-still/logs
+  project_dir: /mnt/share/home-still   # for NFS
+  log_dir: /mnt/share/home-still/logs
 
 storage:
   backend: local                          # or s3 — see below
@@ -563,8 +563,8 @@ distill_server:
   collection_name: academic_papers
 
 scribe:
-  output_dir: /mnt/codex_fs/home-still/markdown
-  watch_dir: /mnt/codex_fs/home-still/papers
+  output_dir: /mnt/share/home-still/markdown
+  watch_dir: /mnt/share/home-still/papers
   servers:
     - http://localhost:7433
   local_server: true                    # this host runs scribe
@@ -582,7 +582,7 @@ set -Ux HS_S3_SECRET_KEY 7d37...
 Five supervised units run on this host. All are installed by `hs serve <name> --install`, which drops the systemd unit (Linux) or LaunchAgent (macOS), enables it, and starts it immediately.
 
 ```bash
-# System services (require sudo, run under the `ladvien` user):
+# System services (require sudo, run under the `<user>` user):
 hs serve scribe --install       # hs-serve-scribe.service   (native bare binary)
 hs serve distill --install      # hs-serve-distill.service  (native bare binary, CUDA)
 hs serve mcp --install          # hs-serve-mcp.service      (optional — only if hosting MCP over HTTP)
@@ -694,7 +694,7 @@ Edit `/etc/postgresql/17/main/pg_hba.conf`:
 
 ```
 # IPv4 local connections (LAN only):
-host    all   all   192.168.1.0/24   scram-sha-256
+host    all   all   192.0.2.0/24   scram-sha-256
 ```
 
 Reload:
@@ -733,8 +733,8 @@ sudo tee /etc/cron.hourly/pgdump > /dev/null <<'EOF'
 #!/bin/bash
 set -eu
 TS=$(date +%Y%m%d-%H%M)
-sudo -u postgres pg_dump home_still | gzip > /mnt/codex_fs/home-still/backups/postgres/home_still-$TS.sql.gz
-find /mnt/codex_fs/home-still/backups/postgres -name 'home_still-*.sql.gz' -mtime +14 -delete
+sudo -u postgres pg_dump home_still | gzip > /mnt/share/home-still/backups/postgres/home_still-$TS.sql.gz
+find /mnt/share/home-still/backups/postgres -name 'home_still-*.sql.gz' -mtime +14 -delete
 EOF
 sudo chmod +x /etc/cron.hourly/pgdump
 ```
@@ -793,12 +793,12 @@ hs config init
 For NFS on macOS — large block sizes are critical (default is too small and Finder will hang):
 
 ```bash
-sudo mkdir -p /Volumes/codex_fs
+sudo mkdir -p /Volumes/share
 sudo mount_nfs -o resvport,rw,rsize=1048576,wsize=1048576,nolocks \
-    three:/mnt/codex_fs /Volumes/codex_fs
+    <nas-host>:/mnt/share /Volumes/share
 
 # Disable Spotlight indexing to keep Finder responsive:
-sudo mdutil -i off /Volumes/codex_fs
+sudo mdutil -i off /Volumes/share
 ```
 
 For Garage S3 on macOS via `rclone nfsmount` (no FUSE / kext needed):
@@ -843,7 +843,7 @@ Edit `~/.home-still/config.yaml`:
 
 ```yaml
 home:
-  project_dir: /Volumes/codex_fs/home-still   # or ~/mnt/papers for Garage
+  project_dir: /Volumes/share/home-still   # or ~/mnt/papers for Garage
 
 scribe:
   servers:
@@ -1005,7 +1005,7 @@ Both work. Pick based on what you actually need.
 1. Stand up Garage on `three` alongside NFS (both can run on the same host — different ports, different data dirs).
 2. One-shot copy with rclone (run on `three`):
    ```bash
-   rclone copy /mnt/codex_fs/home-still garage:home-still \
+   rclone copy /mnt/share/home-still garage:home-still \
        --transfers 2 --checkers 8 --progress --fast-list --check-first \
        --log-file /tmp/migration.log --log-level INFO
    ```
@@ -1065,7 +1065,7 @@ For NFS:
 
 ```bash
 showmount -e localhost
-ls /mnt/codex_fs/home-still/{papers,markdown,catalog} | head
+ls /mnt/share/home-still/{papers,markdown,catalog} | head
 ```
 
 For Garage:
@@ -1168,11 +1168,11 @@ Indexing is content-addressed (xxhash + UUID v5 from the doc stem), so re-runnin
 
 ### Postgres backup and restore
 
-The hourly `pg_dump` cron from step 6.4 writes to `/mnt/codex_fs/home-still/backups/postgres/`. To restore:
+The hourly `pg_dump` cron from step 6.4 writes to `/mnt/share/home-still/backups/postgres/`. To restore:
 
 ```bash
 # On four:
-gunzip -c /mnt/codex_fs/home-still/backups/postgres/home_still-YYYYMMDD-HHMM.sql.gz \
+gunzip -c /mnt/share/home-still/backups/postgres/home_still-YYYYMMDD-HHMM.sql.gz \
   | sudo -u postgres psql -d home_still
 ```
 
@@ -1204,7 +1204,7 @@ See the root README's "Mac Known Issues and Fixes" section for the full recipe. 
 
 - Make sure `/etc/exports` on `three` uses `async`, not `sync`.
 - Remount on Mac with `rsize=1048576,wsize=1048576,nolocks`.
-- `sudo mdutil -i off /Volumes/codex_fs` to stop Spotlight from indexing the share.
+- `sudo mdutil -i off /Volumes/share` to stop Spotlight from indexing the share.
 - For `markdown/`, use `ls` not Finder for large directory listings.
 
 ### Garage SIGILL on Pi

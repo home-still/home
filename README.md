@@ -429,28 +429,28 @@ When accessing the shared NFS mount from macOS, you may see:
 1. **NFS export was `sync`** (every write blocks on disk — bad for USB-attached SSDs).
    On the server, edit `/etc/exports`:
    ```
-   /mnt/codex_fs 192.168.1.0/24(rw,async,no_subtree_check,all_squash,anonuid=1000,anongid=1000)
+   /mnt/share 192.0.2.0/24(rw,async,no_subtree_check,all_squash,anonuid=1000,anongid=1000)
    ```
    Then `sudo exportfs -ra`.
 
 2. **macOS default NFS mount options are too small.** Remount with 1 MB blocks:
    ```sh
-   sudo umount -f /Volumes/codex_fs
-   sudo mkdir -p /Volumes/codex_fs
+   sudo umount -f /Volumes/share
+   sudo mkdir -p /Volumes/share
    sudo mount_nfs -o resvport,rw,rsize=1048576,wsize=1048576,nolocks \
-       <server-ip>:/<export-path> /Volumes/codex_fs
+       <server-ip>:/<export-path> /Volumes/share
    ```
 
 3. **Spotlight indexing the NFS share** causes Finder to read every file. Disable it:
    ```sh
-   sudo mdutil -i off /Volumes/codex_fs
+   sudo mdutil -i off /Volumes/share
    ```
 
 4. **Stale macOS NFS client cache** after a previous jukebox storm. A fresh remount (step 2) clears it.
 
 5. **Orphaned `.tmp*` files in `markdown/`** from crashed writes. Clean them on the server:
    ```sh
-   ssh <nfs-server> "rm -f /mnt/codex_fs/home-still/markdown/.tmp* /mnt/codex_fs/home-still/markdown/._.tmp*"
+   ssh <nfs-server> "rm -f /mnt/share/home-still/markdown/.tmp* /mnt/share/home-still/markdown/._.tmp*"
    ```
 
 ### Finder still hangs on `markdown/` even after the fixes above
@@ -458,7 +458,7 @@ When accessing the shared NFS mount from macOS, you may see:
 Finder does extra work beyond `ls` (preview generation, folder size calculation, Quick Look). For a folder with 150+ sharded subdirectories containing thousands of `.md` files, this can be unresponsive even when the underlying NFS is healthy.
 
 **Workarounds:**
-- Use the CLI: `ls /Volumes/codex_fs/home-still/markdown/` is always fast
+- Use the CLI: `ls /Volumes/share/home-still/markdown/` is always fast
 - In Finder, View → Show View Options → uncheck **"Calculate all sizes"** and **"Show icon preview"**
 - Use List view (cmd+2) instead of Icon or Column view
 - Navigate directly to a shard subdirectory (cmd+shift+G, paste a path) rather than the top-level `markdown/`
@@ -469,9 +469,9 @@ This is a macOS Finder limitation with large NFS-mounted directory trees, not a 
 
 Air (macOS) and big (Linux) mount the same NFS export, but macOS NFSv3 client is much chattier than Linux NFSv4. If Air's mount is in a bad state:
 ```sh
-sudo umount -f /Volumes/codex_fs
-sudo mkdir -p /Volumes/codex_fs
-sudo mount_nfs -o resvport,rw,rsize=1048576,wsize=1048576,nolocks <server>:/<export> /Volumes/codex_fs
+sudo umount -f /Volumes/share
+sudo mkdir -p /Volumes/share
+sudo mount_nfs -o resvport,rw,rsize=1048576,wsize=1048576,nolocks <server>:/<export> /Volumes/share
 ```
 
 ### `hs upgrade` restarts watcher on a client node that shouldn't run it
