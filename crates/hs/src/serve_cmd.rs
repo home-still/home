@@ -678,7 +678,7 @@ fn launchd_log_path(home: &std::path::Path, name: &str) -> PathBuf {
 /// Write `contents` to `path` atomically with mode 0600 (the plist carries
 /// secrets): created owner-only in the destination directory, then renamed
 /// into place, so no moment exists where it is world-readable.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn write_private_file(path: &std::path::Path, contents: &str) -> Result<()> {
     use std::io::Write;
 

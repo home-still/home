@@ -243,7 +243,7 @@ fn interpret_list_units(
 /// `Ok(None)`: an empty `ExecStart=` — the unit has no main command and cannot
 /// be running our binary. `Err`: the show failed or its output is missing or
 /// garbled for a unit we were told exists.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn interpret_show_unit(
     user_scope: bool,
     name: &str,
