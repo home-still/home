@@ -504,6 +504,9 @@ pub(crate) async fn cmd_watch_events(
     let concurrency = cfg.resolved_concurrency();
     tracing::info!(%server_url, concurrency, "starting distill event-bus watcher");
 
+    // A rejected HS_BACKEND_TOKEN stops the watcher here, before it pulls an event.
+    hs_distill::event_watch::preflight(&distill).await?;
+
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
     run_subscriber(

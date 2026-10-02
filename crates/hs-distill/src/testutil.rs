@@ -18,6 +18,8 @@ pub(crate) struct Recorded {
 pub(crate) enum Reply {
     /// Respond with this status and JSON body.
     Json(u16, String),
+    /// Like `Json`, plus one extra response header.
+    JsonWithHeader(u16, String, &'static str, &'static str),
     /// Accept the request and never answer.
     Hang,
 }
@@ -56,10 +58,15 @@ pub(crate) async fn serve(reply: impl Fn(&Recorded) -> Reply + Send + Sync + 'st
                     return;
                 };
                 recorded.lock().push(req.clone());
-                match reply(&req) {
-                    Reply::Json(status, body) => {
+                let r = reply(&req);
+                let extra = match &r {
+                    Reply::JsonWithHeader(_, _, k, v) => format!("{k}: {v}\r\n"),
+                    _ => String::new(),
+                };
+                match r {
+                    Reply::Json(status, body) | Reply::JsonWithHeader(status, body, ..) => {
                         let resp = format!(
-                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n{extra}\
                              content-length: {}\r\nconnection: close\r\n\r\n{body}",
                             body.len()
                         );

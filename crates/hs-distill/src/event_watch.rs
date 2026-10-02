@@ -174,8 +174,21 @@ pub async fn index_and_publish(
     {
         Ok(r) => r,
         Err(e) => {
-            // Stamp the failure so the reconciler can find it later.
             tracing::error!(stem = %stem, key = %event.key, error = %e, "distill index failed");
+            let classified = classify(e.context(format!("distill index failed for {}", event.key)));
+            // Rejected credentials are a configuration error, not a verdict
+            // on this document: stamp nothing.
+            if matches!(classified, HandlerError::Fatal(_)) {
+                return Err(classified);
+            }
+            let e = match &classified {
+                HandlerError::Permanent(e)
+                | HandlerError::Transient(e)
+                | HandlerError::Fatal(e) => {
+                    format!("{e:#}")
+                }
+            };
+            // Stamp the failure so the reconciler can find it later.
             let reason = format!("embed_failed: {e}");
             if let Err(stamp_err) = write_with_retry("embed_failed stamp", stem, || {
                 hs_common::catalog::update_embedding_skip_via(storage, "catalog", stem, &reason)
@@ -188,9 +201,7 @@ pub async fn index_and_publish(
             // or a slow VRAM recovery shouldn't throw away the event.
             // JetStream's max_deliver bounds the retry count; a truly
             // broken markdown will eventually TERM on its own.
-            return Err(classify(
-                e.context(format!("distill index failed for {}", event.key)),
-            ));
+            return Err(classified);
         }
     };
 
@@ -227,6 +238,32 @@ pub async fn index_and_publish(
     Ok(())
 }
 
+/// NAK a received-but-not-started event, bounded and logged.
+async fn nak_unstarted(event: &hs_common::event_bus::Event, delay: Option<Duration>) {
+    match tokio::time::timeout(Duration::from_secs(5), event.nak(delay)).await {
+        Ok(Ok(())) => tracing::info!("returned an unstarted event to the broker"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "nak of an unstarted event failed"),
+        Err(_) => tracing::warn!("nak of an unstarted event timed out"),
+    }
+}
+
+async fn orderly_stop(
+    sem: &Arc<tokio::sync::Semaphore>,
+    concurrency: usize,
+    drain_timeout: Duration,
+    in_flight: &hs_common::event_bus::InFlight,
+) {
+    tracing::info!("shutdown requested: draining running handlers");
+    let abandoned =
+        hs_common::event_bus::drain_in_flight(sem, concurrency, drain_timeout, in_flight).await;
+    if !abandoned.is_empty() {
+        tracing::error!(
+            abandoned = abandoned.len(),
+            "handlers still running after the drain timeout; their events are redelivered after ack_wait"
+        );
+    }
+}
+
 fn fatal_stop(cause: anyhow::Error) -> anyhow::Error {
     cause.context(
         "fatal configuration error: the distill server rejected HS_BACKEND_TOKEN \
@@ -234,11 +271,44 @@ fn fatal_stop(cause: anyhow::Error) -> anyhow::Error {
     )
 }
 
+/// Start-up check, run before [`run_subscriber`] pulls any event: one cheap
+/// authenticated, side-effect-free request (`/status`). A server that
+/// rejects our `HS_BACKEND_TOKEN` stops the watcher here, with nothing
+/// consumed. Any other failure (server down, slow) is only warned about: the
+/// per-event handling already copes with an unavailable server.
+pub async fn preflight(distill: &DistillClient) -> Result<()> {
+    match distill.status().await {
+        Ok(_) => Ok(()),
+        Err(e) if e.chain().any(|c| c.is::<crate::client::Unauthorized>()) => Err(fatal_stop(e)),
+        Err(e) => {
+            tracing::warn!(error = %e, "distill preflight request failed; continuing");
+            Ok(())
+        }
+    }
+}
+
+/// Resolves on SIGTERM or ctrl-c.
+async fn termination_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 /// Pull-consume `scribe.completed` and dispatch each event to
 /// `handler`. See the parallel scribe `run_subscriber` for ack policy.
+/// Returns `Ok(())` only on an orderly stop (SIGTERM / ctrl-c).
 pub async fn run_subscriber<F, Fut>(
     bus: Arc<dyn EventBus>,
-    _storage: Arc<dyn Storage>,
+    storage: Arc<dyn Storage>,
     concurrency: usize,
     drain_timeout: std::time::Duration,
     handler: F,
@@ -247,6 +317,38 @@ where
     F: Fn(CompletedEvent) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<(), HandlerError>> + Send + 'static,
 {
+    run_subscriber_until(
+        bus,
+        storage,
+        concurrency,
+        drain_timeout,
+        handler,
+        termination_signal(),
+    )
+    .await
+}
+
+/// [`run_subscriber`] with an explicit shutdown trigger.
+///
+/// Events are pulled one at a time and the held one waits for a free
+/// permit. On every exit path the held, not-yet-started event is NAKed
+/// (immediately on an orderly stop, after [`NAK_BACKOFF`] on a fatal error)
+/// so the broker redelivers it promptly instead of after `ack_wait`. Events
+/// the broker has buffered for us but we never pulled cannot be NAKed here;
+/// they were never delivered to this process.
+pub async fn run_subscriber_until<F, Fut>(
+    bus: Arc<dyn EventBus>,
+    _storage: Arc<dyn Storage>,
+    concurrency: usize,
+    drain_timeout: std::time::Duration,
+    handler: F,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()>
+where
+    F: Fn(CompletedEvent) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<(), HandlerError>> + Send + 'static,
+{
+    tokio::pin!(shutdown);
     let mut stream = bus.consume(&specs::SCRIBE_COMPLETED).await?;
     let concurrency = concurrency.max(1);
     tracing::info!(
@@ -265,6 +367,10 @@ where
         let next = tokio::select! {
             biased;
             Some(fatal) = fatal_rx.recv() => return Err(fatal_stop(fatal)),
+            _ = &mut shutdown => {
+                orderly_stop(&sem, concurrency, drain_timeout, &in_flight).await;
+                return Ok(());
+            }
             next = stream.next() => match next {
                 Some(n) => n,
                 None => break,
@@ -295,12 +401,22 @@ where
         let permit = tokio::select! {
             biased;
             Some(fatal) = fatal_rx.recv() => {
-                // Not yet started: hand the event back untouched.
-                let _ = event.nak(None).await;
+                // Not yet started: hand the event back, delayed so the same
+                // event is not first in line the instant the watcher restarts.
+                nak_unstarted(&event, Some(NAK_BACKOFF)).await;
                 return Err(fatal_stop(fatal));
             }
-            permit = sem.clone().acquire_owned() => {
-                permit.map_err(|_| anyhow::anyhow!("distill worker semaphore closed"))?
+            _ = &mut shutdown => {
+                nak_unstarted(&event, None).await;
+                orderly_stop(&sem, concurrency, drain_timeout, &in_flight).await;
+                return Ok(());
+            }
+            permit = sem.clone().acquire_owned() => match permit {
+                Ok(p) => p,
+                Err(_) => {
+                    nak_unstarted(&event, None).await;
+                    return Err(anyhow::anyhow!("distill worker semaphore closed"));
+                }
             }
         };
         let handler = Arc::clone(&handler);
@@ -347,8 +463,9 @@ where
                         "distill server rejected our credentials: HS_BACKEND_TOKEN is missing or \
                          does not match the server's — stopping the watcher"
                     );
-                    // Leave the event for the next, correctly configured run.
-                    if let Err(ne) = event.nak(None).await {
+                    // Leave the event for the next, correctly configured run,
+                    // delayed so it is not first in line on every restart.
+                    if let Err(ne) = event.nak(Some(NAK_BACKOFF)).await {
                         tracing::warn!(key = %key, error = %ne, "nak failed");
                     }
                     let _ = fatal_tx.send(e);
@@ -477,6 +594,8 @@ mod tests {
         events: Mutex<Vec<Event>>,
         /// When set, the stream yields this delivery error after the events.
         then_fail: Mutex<Option<String>>,
+        /// Keep the stream open (pending) after the events instead of ending it.
+        keep_open: AtomicBool,
     }
 
     #[async_trait]
@@ -497,7 +616,12 @@ mod tests {
                 .into_iter()
                 .map(Ok)
                 .chain(failure.map(|m| Err(anyhow::anyhow!(m))));
-            Ok(Box::pin(futures_util::stream::iter(items)))
+            let items = futures_util::stream::iter(items);
+            if self.keep_open.load(Ordering::SeqCst) {
+                Ok(Box::pin(items.chain(futures_util::stream::pending())))
+            } else {
+                Ok(Box::pin(items))
+            }
         }
     }
 
@@ -566,16 +690,87 @@ mod tests {
         // A plain 500 without the code stays transient.
         rig.client = DistillClient::new(&server.url()).unwrap();
         assert_eq!(kind_of(run(&rig, "markdown/do/doc.md").await), "transient");
+        // A 401 naming the distill realm is a configuration error; a bare
+        // 401 or any 403 (proxy/gateway) is an ordinary transient failure.
+        let auth = serve(|_| {
+            Reply::JsonWithHeader(
+                401,
+                "unauthorized".into(),
+                "www-authenticate",
+                "Bearer realm=\"hs-distill\"",
+            )
+        })
+        .await;
+        rig.client = DistillClient::new(&auth.url()).unwrap();
+        assert_eq!(kind_of(run(&rig, "markdown/do/doc.md").await), "fatal");
+        assert!(rig.bus.published.lock().is_empty());
         for status in [401u16, 403] {
-            let auth = serve(move |_| Reply::Json(status, "unauthorized".into())).await;
-            rig.client = DistillClient::new(&auth.url()).unwrap();
+            let proxy = serve(move |_| Reply::Json(status, "denied".into())).await;
+            rig.client = DistillClient::new(&proxy.url()).unwrap();
             assert_eq!(
                 kind_of(run(&rig, "markdown/do/doc.md").await),
-                "fatal",
+                "transient",
                 "{status}"
             );
-            assert!(rig.bus.published.lock().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_credentials_stamp_nothing_on_the_catalog() {
+        let rig0 = rig(|| Reply::Json(200, OK_INDEX.into())).await;
+        let auth = serve(|_| {
+            Reply::JsonWithHeader(
+                401,
+                "unauthorized".into(),
+                "www-authenticate",
+                "Bearer realm=\"hs-distill\"",
+            )
+        })
+        .await;
+        let mut rig = rig0;
+        rig.client = DistillClient::new(&auth.url()).unwrap();
+        assert_eq!(kind_of(run(&rig, "markdown/do/doc.md").await), "fatal");
+        assert!(
+            hs_common::catalog::read_catalog_entry_via(&rig.storage, "catalog", "doc")
+                .await
+                .unwrap()
+                .is_none(),
+            "a configuration error is not a verdict on the document"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_stops_on_rejected_credentials_only() {
+        let auth = serve(|_| {
+            Reply::JsonWithHeader(
+                401,
+                "no".into(),
+                "www-authenticate",
+                "Bearer realm=\"hs-distill\"",
+            )
+        })
+        .await;
+        let err = preflight(&DistillClient::new(&auth.url()).unwrap())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("HS_BACKEND_TOKEN"), "{err:#}");
+        assert_eq!(auth.recorded().len(), 1);
+        assert!(auth.recorded()[0].request_line.starts_with("GET /status"));
+
+        let down = serve(|_| Reply::Json(503, "starting".into())).await;
+        preflight(&DistillClient::new(&down.url()).unwrap())
+            .await
+            .unwrap();
+        let ok = serve(|_| {
+            Reply::Json(
+                200,
+                r#"{"collection":"c","points_count":0,"compute_device":"Cuda"}"#.into(),
+            )
+        })
+        .await;
+        preflight(&DistillClient::new(&ok.url()).unwrap())
+            .await
+            .unwrap();
     }
 
     /// Raw loopback server answering 500 with the panic header.
@@ -969,5 +1164,88 @@ mod tests {
         // the broker to redeliver after ack_wait.
         assert_eq!(quick_log.decisions(), [Settlement::Ack]);
         assert!(stuck_log.decisions().is_empty());
+    }
+
+    // ── R4: unstarted events go back to the broker ─────────────────────
+
+    use hs_common::event_bus::Settlement;
+
+    /// concurrency 1: event "a" occupies the only permit (blocked), event "b"
+    /// is pulled and waits for a permit. `trigger` then ends the run.
+    async fn held_event_scenario(fatal_on_a: bool) -> (anyhow::Result<()>, Vec<Settlement>) {
+        let bus = Arc::new(FakeBus::default());
+        bus.keep_open.store(true, Ordering::SeqCst);
+        let (ea, _la) = Event::recording("scribe.completed", br#"{"key":"a"}"#.to_vec());
+        let (eb, log_b) = Event::recording("scribe.completed", br#"{"key":"b"}"#.to_vec());
+        *bus.events.lock() = vec![ea, eb];
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started2 = started.clone();
+        let stop_tx = Mutex::new(Some(stop_tx));
+        let run = tokio::spawn(run_subscriber_until(
+            bus,
+            storage,
+            1,
+            Duration::from_millis(200),
+            move |e| {
+                let started = started2.clone();
+                async move {
+                    assert_eq!(e.key, "a", "b must never start");
+                    started.notify_one();
+                    if fatal_on_a {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Err(HandlerError::Fatal(anyhow::anyhow!("rejected")))
+                    } else {
+                        std::future::pending::<()>().await;
+                        Ok(())
+                    }
+                }
+            },
+            async move {
+                let _ = stop_rx.await;
+            },
+        ));
+        started.notified().await;
+        tokio::time::sleep(Duration::from_millis(100)).await; // b is now held
+        if !fatal_on_a {
+            if let Some(tx) = stop_tx.lock().take() {
+                let _ = tx.send(());
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("must not hang")
+            .unwrap();
+        (result, log_b.decisions())
+    }
+
+    #[tokio::test]
+    async fn an_orderly_stop_naks_the_held_event_immediately_and_returns_ok() {
+        let (result, b) = held_event_scenario(false).await;
+        result.expect("an orderly stop is not an error");
+        assert_eq!(b, [Settlement::Nak(None)]);
+    }
+
+    #[tokio::test]
+    async fn a_fatal_error_naks_the_held_event_with_a_delay() {
+        let (result, b) = held_event_scenario(true).await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("HS_BACKEND_TOKEN"));
+        assert_eq!(b, [Settlement::Nak(Some(NAK_BACKOFF))]);
+    }
+
+    #[tokio::test]
+    async fn the_fatal_event_itself_is_naked_with_a_delay() {
+        let bus = Arc::new(FakeBus::default());
+        bus.keep_open.store(true, Ordering::SeqCst);
+        let (ea, log_a) = Event::recording("scribe.completed", br#"{"key":"a"}"#.to_vec());
+        *bus.events.lock() = vec![ea];
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
+        let r = run_subscriber(bus, storage, 1, Duration::from_secs(5), |_| async {
+            Err(HandlerError::Fatal(anyhow::anyhow!("rejected")))
+        })
+        .await;
+        assert!(r.is_err());
+        assert_eq!(log_a.decisions(), [Settlement::Nak(Some(NAK_BACKOFF))]);
     }
 }
