@@ -30,7 +30,9 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 uuid = { version = "1", features = ["v4", "v5"] }
 fastembed = "5"
 chrono = { version = "0.4", features = ["serde"] }
-duckdb = { version = "1", features = ["bundled"] }
+# `json` links the extension statically: `read_json` and the JSON column type
+# must not depend on DuckDB downloading an extension at runtime.
+duckdb = { version = "1", features = ["bundled", "json"] }
 parquet = "58"
 arrow = "58"
 flate2 = "1"

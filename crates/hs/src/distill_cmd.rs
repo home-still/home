@@ -1102,8 +1102,12 @@ fn write_index_status_to(path: &Path, status: &IndexStatus) -> std::io::Result<(
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(&json)?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    // `std::fs::rename`, not `persist`: on Windows it retries with a
+    // POSIX-semantics rename when a reader holds the target open, where
+    // tempfile's bare `MoveFileExW` fails with access denied. The `TempPath`
+    // drop removes the temp file if the rename failed.
+    let tmp = tmp.into_temp_path();
+    std::fs::rename(&tmp, path)
 }
 
 /// Spawn the index daemon as a background process.
