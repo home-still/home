@@ -909,9 +909,23 @@ mod tests {
                 )
                 .unwrap();
                 std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                // Stand-in llama-swap: the admission gate probes `<endpoint>/running`,
+                // so the rig must not depend on whatever backend the host runs.
+                let swap = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let swap_endpoint = format!("http://{}/v1", swap.local_addr().unwrap());
+                tokio::spawn(async move {
+                    let running = axum::Router::new().route(
+                        "/running",
+                        axum::routing::get(|| async {
+                            axum::Json(serde_json::json!({ "running": [] }))
+                        }),
+                    );
+                    axum::serve(swap, running).await
+                });
                 let config = AppConfig {
                     converter: ConverterMode::Olmocr,
                     olmocr_bin: script.to_string_lossy().into_owned(),
+                    olmocr_endpoint: swap_endpoint,
                     // Independent of how much VRAM other tenants of the
                     // host hold right now.
                     vram_headroom_mb: 0,
