@@ -997,7 +997,7 @@ mod tests {
         async fn publish(&self, subject: &str, payload: &[u8]) -> anyhow::Result<()> {
             if self
                 .fail_next_publishes
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 anyhow::bail!("broker unreachable");

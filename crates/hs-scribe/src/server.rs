@@ -492,7 +492,7 @@ async fn receive_pdf(mut multipart: Multipart) -> Result<tempfile::NamedTempFile
             }
             head.extend_from_slice(&chunk);
             if head.len() >= HEADER_PROBE_BYTES {
-                check_header(&head).map_err(&refuse_header)?;
+                check_header(&head).map_err(refuse_header)?;
                 file.write_all(&head)
                     .await
                     .map_err(|e| io_fault("writing the upload", e))?;
@@ -502,7 +502,7 @@ async fn receive_pdf(mut multipart: Multipart) -> Result<tempfile::NamedTempFile
         }
         if !head_checked {
             // The whole body is shorter than the probe window.
-            check_header(&head).map_err(&refuse_header)?;
+            check_header(&head).map_err(refuse_header)?;
             file.write_all(&head)
                 .await
                 .map_err(|e| io_fault("writing the upload", e))?;

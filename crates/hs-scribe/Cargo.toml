@@ -37,7 +37,7 @@ reqwest = { workspace = true, features = ["multipart", "stream"] }
 figment = { workspace = true }
 dirs = "6"
 hs-common = { workspace = true, features = ["service", "storage-s3", "events-nats", "logging", "catalog", "auth", "catch-panic"] }
-async-trait = "0.1"
+async-trait = "0.1.92"
 futures-util = "0.3"
 unicode-segmentation = "1"
 scraper = "0.22"
