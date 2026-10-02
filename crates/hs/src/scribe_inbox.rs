@@ -741,6 +741,7 @@ mod tests {
             max_entries: 100,
             max_entry_bytes: 4_096,
             max_total_bytes: 8_192,
+            ..EpubLimits::default()
         };
         let err = inbox_epub(&storage, &tight).await.unwrap_err();
         assert!(format!("{err:#}").contains("limit"), "{err:#}");

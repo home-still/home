@@ -43,6 +43,9 @@ pub struct EpubLimits {
     pub max_entry_bytes: u64,
     /// Most bytes one conversion may inflate plus produce, in total.
     pub max_total_bytes: u64,
+    /// Bounds on every HTML parse (HTML sources and EPUB chapters alike):
+    /// `scribe.epub.html.{max_input_bytes,max_nesting,max_nodes}`.
+    pub html: crate::html::HtmlLimits,
 }
 
 impl Default for EpubLimits {
@@ -51,6 +54,7 @@ impl Default for EpubLimits {
             max_entries: 10_000,
             max_entry_bytes: 64 * 1024 * 1024,
             max_total_bytes: 256 * 1024 * 1024,
+            html: crate::html::HtmlLimits::default(),
         }
     }
 }
@@ -67,7 +71,7 @@ impl EpubLimits {
                 self.max_total_bytes
             );
         }
-        Ok(())
+        self.html.validate()
     }
 }
 
@@ -392,10 +396,14 @@ fn read_chapters(
 /// Convert an EPUB archive's bytes to markdown, chapters in spine order,
 /// each through the shared HTML walker so the two paths produce
 /// structurally compatible markdown. Everything is bounded by `limits`.
-pub fn convert_epub_to_markdown_with(bytes: &[u8], limits: &EpubLimits) -> Result<String> {
+pub fn convert_epub_to_markdown_with(
+    bytes: &[u8],
+    limits: &EpubLimits,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<String> {
     let mut out = String::new();
     read_chapters(bytes, limits, |xhtml, budget| {
-        let md = crate::html::convert_html_to_markdown(xhtml)?;
+        let md = crate::html::convert_html_to_markdown(xhtml, &limits.html, cancel)?;
         if !md.trim().is_empty() {
             let separator = if out.is_empty() { 0 } else { 2 };
             budget.charge((separator + md.len()) as u64)?;
@@ -431,6 +439,8 @@ pub fn convert_epub_to_html_with(bytes: &[u8], limits: &EpubLimits) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
@@ -516,6 +526,7 @@ mod tests {
             max_entries: 8,
             max_entry_bytes: 1 << 20,
             max_total_bytes: 3 << 20,
+            html: crate::html::HtmlLimits::default(),
         }
     }
 
@@ -532,7 +543,7 @@ mod tests {
             // Reading order differs from manifest order.
             &["c2", "c0", "c1"],
         );
-        let md = convert_epub_to_markdown_with(&book, &EpubLimits::default()).unwrap();
+        let md = convert_epub_to_markdown_with(&book, &EpubLimits::default(), &NEVER).unwrap();
         let at = |needle: &str| {
             md.find(needle)
                 .unwrap_or_else(|| panic!("{needle} in {md}"))
@@ -571,7 +582,8 @@ mod tests {
         entries.push(("Text/a.xhtml", chapter("Alpha", 1)));
         entries.push(("OEBPS/My Chapter.xhtml", chapter("Bravo", 1)));
         entries.push(("OEBPS/c.xhtml", chapter("Charlie", 1)));
-        let md = convert_epub_to_markdown_with(&zip_of(&entries), &EpubLimits::default()).unwrap();
+        let md = convert_epub_to_markdown_with(&zip_of(&entries), &EpubLimits::default(), &NEVER)
+            .unwrap();
         for title in ["Alpha", "Bravo", "Charlie"] {
             assert!(
                 md.contains(&format!("# {title}")),
@@ -590,7 +602,8 @@ mod tests {
             ),
         ];
         entries.push(("OEBPS/a.xhtml", chapter("Alpha", 1)));
-        let md = convert_epub_to_markdown_with(&zip_of(&entries), &EpubLimits::default()).unwrap();
+        let md = convert_epub_to_markdown_with(&zip_of(&entries), &EpubLimits::default(), &NEVER)
+            .unwrap();
         assert!(md.contains("# Alpha"), "{md}");
     }
 
@@ -613,7 +626,7 @@ mod tests {
             "{} (chapter {chapter_bytes})",
             book.len()
         );
-        let md = convert_epub_to_markdown_with(&book, &EpubLimits::default()).unwrap();
+        let md = convert_epub_to_markdown_with(&book, &EpubLimits::default(), &NEVER).unwrap();
         assert!(
             md.len() < 2_000_000,
             "one chapter's worth of markdown, got {}",
@@ -670,6 +683,7 @@ mod tests {
             max_entries: 100,
             max_entry_bytes: 2 << 20,
             max_total_bytes: 3 << 20,
+            html: crate::html::HtmlLimits::default(),
         };
         let err = convert_epub_to_html_with(&book, &limits).unwrap_err();
         assert!(err.to_string().contains("total limit"), "{err:#}");
@@ -687,7 +701,7 @@ mod tests {
             bomb.len()
         );
         let started = std::time::Instant::now();
-        let err = convert_epub_to_markdown_with(&bomb, &small()).unwrap_err();
+        let err = convert_epub_to_markdown_with(&bomb, &small(), &NEVER).unwrap_err();
         assert!(err.to_string().contains("per-entry limit"), "{err:#}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
@@ -749,7 +763,7 @@ mod tests {
             .iter()
             .map(|(n, d)| (n.as_str(), d.clone()))
             .collect();
-        let err = convert_epub_to_markdown_with(&zip_of(&refs), &small()).unwrap_err();
+        let err = convert_epub_to_markdown_with(&zip_of(&refs), &small(), &NEVER).unwrap_err();
         assert!(err.to_string().contains("9 entries"), "{err:#}");
     }
 
@@ -764,17 +778,17 @@ mod tests {
             ],
             &["c0"],
         );
-        let md = convert_epub_to_markdown_with(&book, &small()).unwrap();
+        let md = convert_epub_to_markdown_with(&book, &small(), &NEVER).unwrap();
         assert!(md.contains("# Alpha"));
     }
 
     #[test]
     fn a_non_zip_is_an_error_not_a_panic() {
-        assert!(convert_epub_to_markdown_with(b"not a zip at all", &small()).is_err());
-        assert!(convert_epub_to_markdown_with(b"", &small()).is_err());
+        assert!(convert_epub_to_markdown_with(b"not a zip at all", &small(), &NEVER).is_err());
+        assert!(convert_epub_to_markdown_with(b"", &small(), &NEVER).is_err());
         // A zip that is not an EPUB.
         let z = zip_of(&[("readme.txt", b"hello".to_vec())]);
-        assert!(convert_epub_to_markdown_with(&z, &small()).is_err());
+        assert!(convert_epub_to_markdown_with(&z, &small(), &NEVER).is_err());
     }
 
     #[test]
@@ -819,7 +833,9 @@ mod tests {
             let bytes = std::fs::read(file).unwrap();
             let outcome = std::thread::Builder::new()
                 .stack_size(2 << 20)
-                .spawn(move || convert_epub_to_markdown_with(&bytes, &EpubLimits::default()))
+                .spawn(move || {
+                    convert_epub_to_markdown_with(&bytes, &EpubLimits::default(), &NEVER)
+                })
                 .unwrap()
                 .join()
                 .unwrap();

@@ -1,44 +1,383 @@
 //! HTML → markdown for the HTML ingest path and for EPUB chapters.
 //!
-//! The markup is untrusted (provider downloads, EPUB archives), and two
-//! things scale with how deeply it nests: the walk over the parsed tree and
-//! html5ever's own tree construction. The walk is iterative, so no document
-//! can overflow a stack with it. Tree construction is not recursive but it
-//! is quadratic in the nesting depth (every start tag re-checks the open
-//! elements: 100 000 nested `<div>` take ~20 s, a million take most of an
-//! hour, and nothing can interrupt the parse), so [`convert_html_to_markdown`]
-//! refuses a document whose elements nest more than [`MAX_HTML_NESTING`]
-//! deep *before* any tree is built. Real documents nest a few dozen levels.
+//! The markup is untrusted (provider downloads, EPUB archives), and cost
+//! grows with how deeply it nests (html5ever's tree construction is
+//! quadratic in the open-element depth: 100 000 nested `<div>` take 21 s and
+//! nothing can interrupt the call) and with how many nodes it builds (a DOM
+//! costs ~22x the input). The bounds therefore sit on what the parser
+//! *actually builds*, not on a guess about what it will build: html5ever is
+//! driven in small chunks through a [`BoundedSink`] that counts nodes and
+//! measures the real depth of every node it attaches, and parsing stops
+//! between chunks — inside the parse — the moment a bound is crossed or the
+//! caller's cancellation flag is raised. The walk over the finished tree is
+//! iterative, so no document can overflow a stack with it.
 
 use crate::classify::{ConvertFailure, FailureCode};
 use ego_tree::iter::Edge;
+use ego_tree::{NodeId, Tree};
+use html5ever::tendril::{StrTendril, TendrilSink};
+use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
+use html5ever::{expanded_name, local_name, namespace_url, ns, Attribute, ParseOpts, QualName};
+use scraper::node::{Comment, Element, Text};
 use scraper::{ElementRef, Html, Node, Selector};
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::cell::{Cell, Ref, RefCell};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Deepest element nesting the converter accepts. Parsing cost grows with
-/// the square of the depth, and this bounds it to a few seconds on any
-/// document the byte-size limits let through.
-pub const MAX_HTML_NESTING: usize = 512;
+/// Bounds on one HTML conversion. Exceeding any of them fails the document
+/// (nothing is truncated).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HtmlLimits {
+    /// Largest markup accepted, in bytes.
+    pub max_input_bytes: usize,
+    /// Deepest element nesting the parsed tree may reach.
+    pub max_nesting: usize,
+    /// Most nodes (elements, text, comments) the tree may hold.
+    pub max_nodes: usize,
+}
+
+impl Default for HtmlLimits {
+    fn default() -> Self {
+        Self {
+            max_input_bytes: 16 * 1024 * 1024,
+            max_nesting: 512,
+            max_nodes: 1_000_000,
+        }
+    }
+}
+
+impl HtmlLimits {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.max_input_bytes == 0 || self.max_nesting == 0 || self.max_nodes == 0 {
+            anyhow::bail!("html limits must all be at least 1: {self:?}");
+        }
+        Ok(())
+    }
+}
+
+/// Markup fed to the parser per step; the check between steps is where a
+/// bound or a cancellation stops the parse.
+const CHUNK_BYTES: usize = 4096;
+
+#[derive(Clone, Copy)]
+enum Stop {
+    TooDeep,
+    TooManyNodes,
+}
+
+/// State shared between the sink (inside the parser) and the driver loop.
+struct Shared {
+    stop: Cell<Option<Stop>>,
+    nodes: Cell<usize>,
+}
+
+/// scraper's tree sink, rebuilt over a tree this module can measure while it
+/// grows. Dropped as unread: doctypes, comment text, processing instructions
+/// and the attributes of a repeated `<html>`/`<body>`.
+struct BoundedSink {
+    tree: RefCell<Tree<Node>>,
+    quirks: Cell<QuirksMode>,
+    max_nesting: usize,
+    max_nodes: usize,
+    shared: Rc<Shared>,
+}
+
+impl BoundedSink {
+    fn count_node(&self) {
+        let n = self.shared.nodes.get() + 1;
+        self.shared.nodes.set(n);
+        if n > self.max_nodes && self.shared.stop.get().is_none() {
+            self.shared.stop.set(Some(Stop::TooManyNodes));
+        }
+    }
+
+    /// Note the depth reached by attaching something under `parent`. The
+    /// walk up costs at most `max_nesting` steps: a longer chain is a stop.
+    fn check_depth_under(&self, parent: NodeId) {
+        if self.shared.stop.get().is_some() {
+            return;
+        }
+        let tree = self.tree.borrow();
+        let Some(node) = tree.get(parent) else { return };
+        if node.ancestors().take(self.max_nesting).count() >= self.max_nesting {
+            self.shared.stop.set(Some(Stop::TooDeep));
+        }
+    }
+
+    fn empty_comment(&self) -> NodeId {
+        self.count_node();
+        self.tree
+            .borrow_mut()
+            .orphan(Node::Comment(Comment {
+                comment: StrTendril::new(),
+            }))
+            .id()
+    }
+}
+
+impl TreeSink for BoundedSink {
+    type Output = Html;
+    type Handle = NodeId;
+    type ElemName<'a> = Ref<'a, QualName>;
+
+    fn finish(self) -> Html {
+        let mut html = Html::new_document();
+        html.tree = self.tree.into_inner();
+        html.quirks_mode = self.quirks.get();
+        html
+    }
+
+    fn parse_error(&self, _msg: Cow<'static, str>) {}
+
+    fn set_quirks_mode(&self, mode: QuirksMode) {
+        self.quirks.set(mode);
+    }
+
+    fn get_document(&self) -> NodeId {
+        self.tree.borrow().root().id()
+    }
+
+    fn same_node(&self, x: &NodeId, y: &NodeId) -> bool {
+        x == y
+    }
+
+    fn elem_name<'a>(&'a self, target: &NodeId) -> Ref<'a, QualName> {
+        Ref::map(self.tree.borrow(), |tree| {
+            &tree
+                .get(*target)
+                .unwrap()
+                .value()
+                .as_element()
+                .unwrap()
+                .name
+        })
+    }
+
+    fn create_element(
+        &self,
+        name: QualName,
+        attrs: Vec<Attribute>,
+        _flags: ElementFlags,
+    ) -> NodeId {
+        self.count_node();
+        let template = name.expanded() == expanded_name!(html "template");
+        let mut tree = self.tree.borrow_mut();
+        let mut node = tree.orphan(Node::Element(Element::new(name, attrs)));
+        if template {
+            node.append(Node::Fragment);
+        }
+        node.id()
+    }
+
+    fn create_comment(&self, _text: StrTendril) -> NodeId {
+        self.empty_comment()
+    }
+
+    fn create_pi(&self, _target: StrTendril, _data: StrTendril) -> NodeId {
+        self.empty_comment()
+    }
+
+    fn append_doctype_to_document(&self, _: StrTendril, _: StrTendril, _: StrTendril) {}
+
+    fn append(&self, parent: &NodeId, child: NodeOrText<NodeId>) {
+        self.check_depth_under(*parent);
+        let new_text_node = {
+            let mut tree = self.tree.borrow_mut();
+            let mut parent = tree.get_mut(*parent).unwrap();
+            match child {
+                NodeOrText::AppendNode(id) => {
+                    parent.append_id(id);
+                    false
+                }
+                NodeOrText::AppendText(text) => {
+                    let merged = parent.last_child().is_some_and(|mut n| match n.value() {
+                        Node::Text(t) => {
+                            t.text.push_tendril(&text);
+                            true
+                        }
+                        _ => false,
+                    });
+                    if !merged {
+                        parent.append(Node::Text(Text { text }));
+                    }
+                    !merged
+                }
+            }
+        };
+        if new_text_node {
+            self.count_node();
+        }
+    }
+
+    fn append_before_sibling(&self, sibling: &NodeId, new_node: NodeOrText<NodeId>) {
+        let parent = self
+            .tree
+            .borrow()
+            .get(*sibling)
+            .and_then(|n| n.parent().map(|p| p.id()));
+        if let Some(parent) = parent {
+            self.check_depth_under(parent);
+        }
+        let new_text_node = {
+            let mut tree = self.tree.borrow_mut();
+            if let NodeOrText::AppendNode(id) = new_node {
+                tree.get_mut(id).unwrap().detach();
+            }
+            let mut sibling = tree.get_mut(*sibling).unwrap();
+            if sibling.parent().is_none() {
+                false
+            } else {
+                match new_node {
+                    NodeOrText::AppendNode(id) => {
+                        sibling.insert_id_before(id);
+                        false
+                    }
+                    NodeOrText::AppendText(text) => {
+                        let merged = sibling.prev_sibling().is_some_and(|mut n| match n.value() {
+                            Node::Text(t) => {
+                                t.text.push_tendril(&text);
+                                true
+                            }
+                            _ => false,
+                        });
+                        if !merged {
+                            sibling.insert_before(Node::Text(Text { text }));
+                        }
+                        !merged
+                    }
+                }
+            }
+        };
+        if new_text_node {
+            self.count_node();
+        }
+    }
+
+    fn append_based_on_parent_node(
+        &self,
+        element: &NodeId,
+        prev_element: &NodeId,
+        child: NodeOrText<NodeId>,
+    ) {
+        let has_parent = self
+            .tree
+            .borrow()
+            .get(*element)
+            .is_some_and(|n| n.parent().is_some());
+        if has_parent {
+            self.append_before_sibling(element, child);
+        } else {
+            self.append(prev_element, child);
+        }
+    }
+
+    fn remove_from_parent(&self, target: &NodeId) {
+        self.tree.borrow_mut().get_mut(*target).unwrap().detach();
+    }
+
+    fn reparent_children(&self, node: &NodeId, new_parent: &NodeId) {
+        self.check_depth_under(*new_parent);
+        self.tree
+            .borrow_mut()
+            .get_mut(*new_parent)
+            .unwrap()
+            .reparent_from_id_append(*node);
+    }
+
+    fn add_attrs_if_missing(&self, _target: &NodeId, _attrs: Vec<Attribute>) {}
+
+    fn get_template_contents(&self, target: &NodeId) -> NodeId {
+        self.tree
+            .borrow()
+            .get(*target)
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .id()
+    }
+
+    fn mark_script_already_started(&self, _node: &NodeId) {}
+}
+
+fn refuse(message: String) -> ConvertFailure {
+    ConvertFailure::new(FailureCode::HtmlParseError, message)
+}
+
+/// Parse `html` under `limits`, in [`CHUNK_BYTES`] steps, stopping inside the
+/// parse when a bound is crossed or `cancel` is raised.
+fn parse_bounded(
+    html: &str,
+    limits: &HtmlLimits,
+    cancel: &AtomicBool,
+) -> Result<Html, ConvertFailure> {
+    if html.len() > limits.max_input_bytes {
+        return Err(refuse(format!(
+            "HTML is {} bytes, over the limit of {}",
+            html.len(),
+            limits.max_input_bytes
+        )));
+    }
+    let shared = Rc::new(Shared {
+        stop: Cell::new(None),
+        nodes: Cell::new(0),
+    });
+    let sink = BoundedSink {
+        tree: RefCell::new(Tree::new(Node::Document)),
+        quirks: Cell::new(QuirksMode::NoQuirks),
+        max_nesting: limits.max_nesting,
+        max_nodes: limits.max_nodes,
+        shared: Rc::clone(&shared),
+    };
+    let mut parser = html5ever::parse_document(sink, ParseOpts::default());
+    let mut rest = html;
+    while !rest.is_empty() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(refuse("HTML conversion was cancelled".to_string()));
+        }
+        let mut end = CHUNK_BYTES.min(rest.len());
+        while !rest.is_char_boundary(end) {
+            end += 1;
+        }
+        let (chunk, tail) = rest.split_at(end);
+        parser.process(StrTendril::from_slice(chunk));
+        rest = tail;
+        match shared.stop.get() {
+            Some(Stop::TooDeep) => {
+                return Err(refuse(format!(
+                    "HTML elements nest more than {} levels deep",
+                    limits.max_nesting
+                )))
+            }
+            Some(Stop::TooManyNodes) => {
+                return Err(refuse(format!(
+                    "HTML holds more than {} nodes",
+                    limits.max_nodes
+                )))
+            }
+            None => {}
+        }
+    }
+    Ok(parser.finish())
+}
 
 /// Convert an HTML academic paper to markdown.
 /// Extracts the article body from PMC/PubMed-style HTML, preserving structure.
-/// A document nested deeper than [`MAX_HTML_NESTING`] is refused with a typed
-/// [`FailureCode::HtmlParseError`].
-pub fn convert_html_to_markdown(html: &str) -> Result<String, ConvertFailure> {
-    let depth = nesting::max_open_elements(html.as_bytes(), MAX_HTML_NESTING);
-    if depth > MAX_HTML_NESTING {
-        return Err(ConvertFailure::new(
-            FailureCode::HtmlParseError,
-            format!("HTML elements nest more than {MAX_HTML_NESTING} levels deep"),
-        ));
-    }
-    Ok(convert_unbounded(html))
+/// A document that exceeds `limits`, or a conversion `cancel` stops, is
+/// refused with a typed [`FailureCode::HtmlParseError`].
+pub fn convert_html_to_markdown(
+    html: &str,
+    limits: &HtmlLimits,
+    cancel: &AtomicBool,
+) -> Result<String, ConvertFailure> {
+    let doc = parse_bounded(html, limits, cancel)?;
+    Ok(markdown_of(&doc))
 }
 
-/// Parse and walk with no nesting gate: [`convert_html_to_markdown`] after
-/// its check.
-fn convert_unbounded(html: &str) -> String {
-    let doc = Html::parse_document(html);
-    let Some(root) = article_root(&doc) else {
+fn markdown_of(doc: &Html) -> String {
+    let Some(root) = article_root(doc) else {
         return doc.root_element().text().collect::<Vec<_>>().join(" ");
     };
     let mut md = String::new();
@@ -130,6 +469,8 @@ fn walk_html_node(element: &ElementRef, md: &mut String) {
                             md.push_str(t);
                         }
                     }
+                    // `<template>` contents are inert: never part of the text.
+                    Node::Fragment => dropped = Some(node.id()),
                     Node::Element(el) => {
                         let tag = el.name();
                         if is_dropped(tag) {
@@ -161,734 +502,12 @@ fn walk_html_node(element: &ElementRef, md: &mut String) {
     }
 }
 
-/// A byte scan of markup for the deepest stack of open elements html5ever
-/// would build, run before anything is parsed.
-///
-/// It is not a second HTML parser: it tokenizes tags (comments, quoted
-/// attribute values, raw-text elements) and keeps a stack of names, applying
-/// the tree builder's rules for *popping* — implied end tags, scope-limited
-/// end tags, the end of foreign content — only where they are exact, and
-/// leaving an element open whenever unsure. Where the real parser's mode is
-/// uncertain (an MathML `annotation-xml`, a `<font>` inside foreign content)
-/// the scan assumes neither mode's shortcuts: no raw-text skipping, no
-/// self-closing elements, no breakout. Its error is therefore meant to be an
-/// over-estimate of the real depth, and sloppy-markup idioms (`<p>` after
-/// `<p>`, `<li>` after `<li>`, unclosed table cells, repeated
-/// `<html><body>` of concatenated documents) are handled exactly so that
-/// real pages are not refused.
-///
-/// The one known source of under-counting is html5ever's re-opening of
-/// formatting elements (`<b>`, `<i>`, `<font>`, ...) that a block closed
-/// while they were open: the copies are made without a start tag. They are
-/// bounded by the number of formatting start tags in the document, so the
-/// real depth never exceeds the scan plus that count — at most about twice
-/// the limit for any document the scan accepts. An under-estimate costs
-/// only CPU (the walk is iterative and html5ever's construction is not
-/// recursive), never a crash.
-mod nesting {
-    const SPECIAL: u32 = 1 << 0;
-    const FORMATTING: u32 = 1 << 1;
-    /// Stops the default scope (applet, caption, html, table, td, th,
-    /// marquee, object, template and the foreign integration points).
-    const BOUNDARY: u32 = 1 << 2;
-    /// ol, ul: also stop the list-item scope.
-    const LIST_BOUNDARY: u32 = 1 << 3;
-    /// button: also stops the button scope.
-    const BUTTON_BOUNDARY: u32 = 1 << 4;
-    /// html, table, template: stop the table scope.
-    const TABLE_BOUNDARY: u32 = 1 << 5;
-    const VOID: u32 = 1 << 6;
-    /// A start tag that closes an open `<p>`.
-    const CLOSES_P: u32 = 1 << 9;
-    const HEADING: u32 = 1 << 10;
-    /// Table parts, by rank (td/th 3 > tr 2 > the rest 1).
-    const CELL: u32 = 1 << 11;
-    const ROW: u32 = 1 << 12;
-    const SECTION: u32 = 1 << 13;
-    /// Elements whose content is text, not markup, in HTML context.
-    const RAW_TEXT: u32 = 1 << 14;
-    const OPTION_LIKE: u32 = 1 << 15;
-    const DD_DT: u32 = 1 << 16;
-    const LI: u32 = 1 << 17;
-    /// End tags that never pop (the insertion modes keep these open).
-    const STAYS_OPEN: u32 = 1 << 18;
-    /// A start tag ignored when this element is already open.
-    const SINGLETON: u32 = 1 << 19;
-    /// `form`: its end tag removes the form pointer, not what is above it.
-    const FORM: u32 = 1 << 21;
-    const SELECT: u32 = 1 << 20;
-
-    /// Longest element name classified; a longer name is generic.
-    const NAME_BUF: usize = 24;
-
-    fn lowered<'b>(name: &[u8], buf: &'b mut [u8; NAME_BUF]) -> Option<&'b str> {
-        if name.len() > NAME_BUF {
-            return None;
-        }
-        for (b, c) in buf.iter_mut().zip(name) {
-            *b = c.to_ascii_lowercase();
-        }
-        std::str::from_utf8(&buf[..name.len()]).ok()
-    }
-
-    fn class_of(name: &[u8]) -> u32 {
-        let mut buf = [0u8; NAME_BUF];
-        let Some(lower) = lowered(name, &mut buf) else {
-            return 0;
-        };
-        match lower {
-            "address" | "article" | "aside" | "blockquote" | "center" | "details" | "dialog"
-            | "dir" | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "header"
-            | "hgroup" | "main" | "menu" | "nav" | "search" | "section" | "summary" | "div"
-            | "pre" | "listing" | "p" => SPECIAL | CLOSES_P,
-            "form" => SPECIAL | CLOSES_P | FORM,
-            "xmp" => SPECIAL | CLOSES_P | RAW_TEXT,
-            "ol" | "ul" => SPECIAL | CLOSES_P | LIST_BOUNDARY,
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => SPECIAL | CLOSES_P | HEADING,
-            "li" => SPECIAL | LI,
-            "dd" | "dt" => SPECIAL | DD_DT,
-            "button" => SPECIAL | BUTTON_BOUNDARY,
-            "table" => SPECIAL | BOUNDARY | TABLE_BOUNDARY,
-            "td" | "th" => SPECIAL | BOUNDARY | CELL,
-            "tr" => SPECIAL | ROW,
-            "tbody" | "thead" | "tfoot" | "colgroup" => SPECIAL | SECTION,
-            "caption" => SPECIAL | BOUNDARY | SECTION,
-            "template" => SPECIAL | BOUNDARY | TABLE_BOUNDARY,
-            "html" => SPECIAL | BOUNDARY | TABLE_BOUNDARY | STAYS_OPEN | SINGLETON,
-            "body" => SPECIAL | STAYS_OPEN | SINGLETON,
-            "applet" | "marquee" | "object" => SPECIAL | BOUNDARY,
-            "select" => SPECIAL | SELECT,
-            "script" | "style" | "noscript" | "noframes" | "noembed" | "iframe" | "plaintext"
-            | "textarea" | "title" => SPECIAL | RAW_TEXT,
-            "optgroup" | "option" => SPECIAL | OPTION_LIKE,
-            // Void elements, and the ones the tree builder ignores or replaces
-            // wholesale outside their own insertion modes (`head` after the
-            // head, `frameset` in a body): never pushed, so no end tag can
-            // pop real elements through a stand-in for them.
-            "area" | "base" | "basefont" | "bgsound" | "br" | "col" | "embed" | "hr" | "img"
-            | "image" | "input" | "keygen" | "link" | "meta" | "param" | "source" | "track"
-            | "wbr" | "head" | "frameset" | "frame" => VOID,
-            "a" | "b" | "big" | "code" | "em" | "font" | "i" | "nobr" | "s" | "small"
-            | "strike" | "strong" | "tt" | "u" => FORMATTING,
-            _ => 0,
-        }
-    }
-
-    /// HTML elements that end foreign content when they start inside it.
-    /// (`font` only does so with a `color`, `face` or `size` attribute: it is
-    /// handled separately, as ambiguous.)
-    fn breaks_out_of_foreign(name: &[u8]) -> bool {
-        let mut buf = [0u8; NAME_BUF];
-        lowered(name, &mut buf).is_some_and(|lower| {
-            matches!(
-                lower,
-                "b" | "big"
-                    | "blockquote"
-                    | "body"
-                    | "br"
-                    | "center"
-                    | "code"
-                    | "dd"
-                    | "div"
-                    | "dl"
-                    | "dt"
-                    | "em"
-                    | "embed"
-                    | "h1"
-                    | "h2"
-                    | "h3"
-                    | "h4"
-                    | "h5"
-                    | "h6"
-                    | "head"
-                    | "hr"
-                    | "i"
-                    | "img"
-                    | "li"
-                    | "listing"
-                    | "menu"
-                    | "meta"
-                    | "nobr"
-                    | "ol"
-                    | "p"
-                    | "pre"
-                    | "ruby"
-                    | "s"
-                    | "small"
-                    | "span"
-                    | "strong"
-                    | "strike"
-                    | "sub"
-                    | "sup"
-                    | "table"
-                    | "tt"
-                    | "u"
-                    | "ul"
-                    | "var"
-            )
-        })
-    }
-
-    /// SVG / MathML leaf elements that are routinely written `<x/>` and are
-    /// really self-closing in foreign content. Nothing else is trusted to
-    /// close itself: in an HTML context the slash is ignored.
-    fn is_foreign_leaf(name: &[u8]) -> bool {
-        let mut buf = [0u8; NAME_BUF];
-        lowered(name, &mut buf).is_some_and(|lower| {
-            matches!(
-                lower,
-                "path"
-                    | "circle"
-                    | "rect"
-                    | "line"
-                    | "polyline"
-                    | "polygon"
-                    | "ellipse"
-                    | "use"
-                    | "stop"
-                    | "set"
-                    | "animate"
-                    | "animatemotion"
-                    | "animatetransform"
-                    | "mspace"
-                    | "mprescripts"
-                    | "none"
-                    | "mglyph"
-                    | "malignmark"
-            ) || (lower.len() > 2 && lower.starts_with("fe"))
-        })
-    }
-
-    /// How the real parser reads the content of the innermost open element
-    /// that decides it.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Mode {
-        Html,
-        Svg,
-        Math,
-        /// Could be foreign or HTML (MathML `annotation-xml`, SVG-looking
-        /// `font`): assume neither.
-        Ambiguous,
-    }
-
-    struct Open {
-        start: usize,
-        end: usize,
-        class: u32,
-    }
-
-    struct Scan<'a> {
-        html: &'a [u8],
-        stack: Vec<Open>,
-        max: usize,
-        /// (index in `stack` of the element that set the mode, the mode of
-        /// its content), innermost last.
-        modes: Vec<(usize, Mode)>,
-        /// Open HTML `select` elements: their content ignores most tags.
-        selects: usize,
-    }
-
-    fn named(html: &[u8], o: &Open, name: &[u8]) -> bool {
-        html[o.start..o.end].eq_ignore_ascii_case(name)
-    }
-
-    impl<'a> Scan<'a> {
-        fn mode(&self) -> Mode {
-            self.modes.last().map_or(Mode::Html, |m| m.1)
-        }
-
-        fn push(&mut self, start: usize, end: usize, class: u32, content_mode: Option<Mode>) {
-            if let Some(mode) = content_mode {
-                self.modes.push((self.stack.len(), mode));
-            }
-            if class & SELECT != 0 {
-                self.selects += 1;
-            }
-            self.stack.push(Open { start, end, class });
-            self.max = self.max.max(self.stack.len());
-        }
-
-        fn pop(&mut self) {
-            if let Some(o) = self.stack.pop() {
-                if o.class & SELECT != 0 {
-                    self.selects = self.selects.saturating_sub(1);
-                }
-                while self.modes.last().is_some_and(|m| m.0 >= self.stack.len()) {
-                    self.modes.pop();
-                }
-            }
-        }
-
-        /// Pop until `len` elements remain.
-        fn truncate(&mut self, len: usize) {
-            while self.stack.len() > len {
-                self.pop();
-            }
-        }
-
-        /// Index of the topmost element satisfying `is_target`, looking down
-        /// from the top and giving up at the first element whose class meets
-        /// `stops` (the target itself is tested first, as html5ever's scope
-        /// checks do).
-        fn find(&self, is_target: impl Fn(&Open) -> bool, stops: u32) -> Option<usize> {
-            for (i, o) in self.stack.iter().enumerate().rev() {
-                if is_target(o) {
-                    return Some(i);
-                }
-                if o.class & stops != 0 {
-                    return None;
-                }
-            }
-            None
-        }
-
-        /// html5ever's "pop until X has been popped" after a scope check.
-        fn close(&mut self, is_target: impl Fn(&Open) -> bool, stops: u32) {
-            if let Some(i) = self.find(is_target, stops) {
-                self.truncate(i);
-            }
-        }
-
-        fn is_open(&self, name: &[u8]) -> bool {
-            self.stack.iter().any(|o| named(self.html, o, name))
-        }
-
-        fn start_tag(&mut self, start: usize, end: usize, self_closing: bool) {
-            let html = self.html;
-            let name = &html[start..end];
-            let class = class_of(name);
-            match self.mode() {
-                Mode::Html => self.start_html(start, end, name, class, self_closing),
-                Mode::Svg | Mode::Math => {
-                    if breaks_out_of_foreign(name) {
-                        // The parser pops the foreign elements — all of the
-                        // innermost foreign region — and reprocesses the tag as HTML.
-                        if let Some(&(root, _)) = self.modes.last() {
-                            self.truncate(root);
-                        }
-                        self.start_tag(start, end, self_closing);
-                    } else if name.eq_ignore_ascii_case(b"font") {
-                        // A breakout only with certain attributes: either
-                        // reading is possible.
-                        self.push(start, end, class, Some(Mode::Ambiguous));
-                    } else if self_closing && is_foreign_leaf(name) {
-                        // A genuine self-closing foreign element.
-                    } else {
-                        let content = self.foreign_content_mode(name);
-                        // Integration points stop the default scope.
-                        let class = if content.is_some() {
-                            class | BOUNDARY
-                        } else {
-                            class
-                        };
-                        self.push(start, end, class, content);
-                    }
-                }
-                Mode::Ambiguous => self.push(start, end, class, None),
-            }
-        }
-
-        /// The mode inside a foreign element that changes it (an HTML
-        /// integration point, MathML `annotation-xml`).
-        fn foreign_content_mode(&self, name: &[u8]) -> Option<Mode> {
-            let mut buf = [0u8; NAME_BUF];
-            let lower = lowered(name, &mut buf)?;
-            match (self.mode(), lower) {
-                (Mode::Svg, "foreignobject" | "desc" | "title") => Some(Mode::Html),
-                (Mode::Math, "mi" | "mo" | "mn" | "ms" | "mtext") => Some(Mode::Html),
-                (Mode::Math, "annotation-xml") => Some(Mode::Ambiguous),
-                _ => None,
-            }
-        }
-
-        fn start_html(
-            &mut self,
-            start: usize,
-            end: usize,
-            name: &[u8],
-            class: u32,
-            self_closing: bool,
-        ) {
-            let html = self.html;
-            if class & VOID != 0 {
-                return;
-            }
-            // A second `<html>` / `<body>` / `<head>` merges into the open one.
-            if class & SINGLETON != 0 && self.is_open(name) {
-                return;
-            }
-            // Start tags that implicitly close what is open — exact rules only.
-            if class & CLOSES_P != 0 {
-                self.close(|o| named(html, o, b"p"), BOUNDARY | BUTTON_BOUNDARY);
-            }
-            if class & HEADING != 0 && self.stack.last().is_some_and(|t| t.class & HEADING != 0) {
-                self.pop();
-            }
-            if class & (LI | DD_DT) != 0 {
-                self.close_list_item(class & (LI | DD_DT));
-            }
-            if class & OPTION_LIKE != 0
-                && self
-                    .stack
-                    .last()
-                    .is_some_and(|t| t.class & OPTION_LIKE != 0 && named(html, t, b"option"))
-            {
-                self.pop();
-            }
-            // A table part outside a table (or template) is ignored by the
-            // tree builder: it must not stand in the stack, or its end tag
-            // would pop real elements through it.
-            if class & (CELL | ROW | SECTION) != 0
-                && !self
-                    .stack
-                    .iter()
-                    .any(|o| named(html, o, b"table") || named(html, o, b"template"))
-            {
-                return;
-            }
-            self.close_table_parts(class);
-
-            if name.eq_ignore_ascii_case(b"svg") || name.eq_ignore_ascii_case(b"math") {
-                // Foreign elements honour `/>`.
-                if self_closing {
-                    return;
-                }
-                let kind = if name.eq_ignore_ascii_case(b"svg") {
-                    Mode::Svg
-                } else {
-                    Mode::Math
-                };
-                self.push(start, end, class, Some(kind));
-            } else {
-                // HTML ignores the slash of a "self-closing" element.
-                self.push(start, end, class, None);
-            }
-        }
-
-        /// The tree builder's loop for `<li>`/`<dd>`/`<dt>`: close the open
-        /// item of the same family, stopping at a special element that is
-        /// not address/div/p.
-        fn close_list_item(&mut self, family: u32) {
-            let html = self.html;
-            let mut found = None;
-            for (i, o) in self.stack.iter().enumerate().rev() {
-                if o.class & family != 0 {
-                    found = Some(i);
-                    break;
-                }
-                if o.class & SPECIAL != 0
-                    && !(named(html, o, b"address")
-                        || named(html, o, b"div")
-                        || named(html, o, b"p"))
-                {
-                    break;
-                }
-            }
-            if let Some(i) = found {
-                self.truncate(i);
-            }
-        }
-
-        /// A table part's start tag closes the parts it cannot sit in: only
-        /// the consecutive ones on top of the stack.
-        fn close_table_parts(&mut self, class: u32) {
-            fn rank(c: u32) -> u8 {
-                if c & CELL != 0 {
-                    3
-                } else if c & ROW != 0 {
-                    2
-                } else if c & SECTION != 0 {
-                    1
-                } else {
-                    0
-                }
-            }
-            let r = rank(class);
-            if r == 0 {
-                return;
-            }
-            while self
-                .stack
-                .last()
-                .is_some_and(|top| rank(top.class) >= r && top.class & (CELL | ROW | SECTION) != 0)
-            {
-                self.pop();
-            }
-        }
-
-        fn end_tag(&mut self, start: usize, end: usize) {
-            let html = self.html;
-            let name = &html[start..end];
-            let class = class_of(name);
-            let is_target = move |o: &Open| {
-                if class & HEADING != 0 {
-                    o.class & HEADING != 0
-                } else {
-                    named(html, o, name)
-                }
-            };
-            match self.mode() {
-                Mode::Svg | Mode::Math => {
-                    // Foreign "any other end tag": pop to the nearest open
-                    // element of that name within the foreign region.
-                    let region = self.modes.last().map_or(0, |m| m.0);
-                    if let Some(i) = self.find(is_target, 0) {
-                        if i >= region {
-                            self.truncate(i);
-                        }
-                    }
-                    return;
-                }
-                Mode::Ambiguous => return,
-                Mode::Html => {}
-            }
-            if class & (VOID | STAYS_OPEN) != 0 {
-                return;
-            }
-            // Inside `select` the tree builder ignores every end tag but
-            // these.
-            if self.selects > 0
-                && !(name.eq_ignore_ascii_case(b"select")
-                    || name.eq_ignore_ascii_case(b"option")
-                    || name.eq_ignore_ascii_case(b"optgroup")
-                    || name.eq_ignore_ascii_case(b"template"))
-            {
-                return;
-            }
-            if class & FORM != 0 {
-                // `</form>` removes the form pointer's element from the stack
-                // without popping what is above it: close only when the
-                // form is the current node.
-                if self.stack.last().is_some_and(|t| t.class & FORM != 0) {
-                    self.pop();
-                }
-                return;
-            }
-            if class & (CELL | ROW | SECTION) != 0 || name.eq_ignore_ascii_case(b"table") {
-                // Table scope: html, table, template.
-                self.close(is_target, TABLE_BOUNDARY);
-            } else if class & FORMATTING != 0 {
-                // The adoption agency algorithm: pop only across elements
-                // that are not special; leave everything open otherwise.
-                self.close(is_target, BOUNDARY | SPECIAL);
-            } else if class & SPECIAL != 0 {
-                let mut stops = BOUNDARY;
-                if class & LI != 0 {
-                    stops |= LIST_BOUNDARY;
-                }
-                if name.eq_ignore_ascii_case(b"p") {
-                    stops |= BUTTON_BOUNDARY;
-                }
-                self.close(is_target, stops);
-            } else {
-                // Any other end tag: pop across non-special elements only.
-                self.close(is_target, SPECIAL);
-            }
-        }
-    }
-
-    fn is_tag_name_end(b: u8) -> bool {
-        b.is_ascii_whitespace() || b == b'/' || b == b'>'
-    }
-
-    fn name_end(html: &[u8], name_start: usize) -> usize {
-        name_start
-            + html[name_start..]
-                .iter()
-                .position(|&b| is_tag_name_end(b))
-                .unwrap_or(html.len() - name_start)
-    }
-
-    /// Greatest number of simultaneously open elements, scanning `html` until
-    /// it exceeds `limit` (then the value is above `limit`, which is all the
-    /// caller needs).
-    pub fn max_open_elements(html: &[u8], limit: usize) -> usize {
-        let mut scan = Scan {
-            html,
-            stack: Vec::new(),
-            max: 0,
-            modes: Vec::new(),
-            selects: 0,
-        };
-        let mut i = 0usize;
-        while i < html.len() {
-            let Some(rel) = html[i..].iter().position(|&b| b == b'<') else {
-                break;
-            };
-            i += rel;
-            match html.get(i + 1).copied() {
-                Some(b'!') => {
-                    if html[i + 1..].starts_with(b"!--") {
-                        // A comment runs to `-->` / `--!>` (or an abrupt `>` /
-                        // `->` right after the opener) or to the end of input.
-                        let body_start = (i + 4).min(html.len());
-                        match comment_end(&html[body_start..]) {
-                            Some(at) => i = body_start + at,
-                            None => break,
-                        }
-                    } else {
-                        // DOCTYPE, `<![CDATA[` outside foreign content: up to `>`.
-                        i = skip_past_gt(html, i + 2);
-                    }
-                }
-                Some(b'?') => i = skip_past_gt(html, i + 2),
-                Some(b'/') => {
-                    let name_start = i + 2;
-                    if html.get(name_start).is_some_and(u8::is_ascii_alphabetic) {
-                        let end = name_end(html, name_start);
-                        let (after, _, _) = skip_tag_body(html, end);
-                        scan.end_tag(name_start, end);
-                        i = after;
-                    } else {
-                        i += 1;
-                    }
-                }
-                Some(c) if c.is_ascii_alphabetic() => {
-                    let name_start = i + 1;
-                    let end = name_end(html, name_start);
-                    let (after, self_closing, complete) = skip_tag_body(html, end);
-                    if !complete {
-                        // A tag cut off by the end of the input is dropped.
-                        break;
-                    }
-                    let name = &html[name_start..end];
-                    // Raw text only where the real tokenizer switches: in HTML
-                    // content, outside `select` (which ignores such tags).
-                    let raw_text = class_of(name) & RAW_TEXT != 0
-                        && scan.mode() == Mode::Html
-                        && scan.selects == 0;
-                    let before = scan.stack.len();
-                    scan.start_tag(name_start, end, self_closing);
-                    i = after;
-                    if scan.max > limit {
-                        return scan.max;
-                    }
-                    // A raw-text start tag is only believed once its end tag
-                    // is found: otherwise the rest is read as markup, so a
-                    // wrong belief can never hide anything.
-                    if raw_text && scan.stack.len() > before {
-                        if let Some(past_end_tag) = raw_text_end(html, i, name) {
-                            scan.close(|o| named(html, o, name), 0);
-                            i = past_end_tag;
-                        }
-                    }
-                }
-                _ => i += 1,
-            }
-        }
-        scan.max
-    }
-
-    /// Offset just past the end of a comment whose body starts at `body[0]`.
-    fn comment_end(body: &[u8]) -> Option<usize> {
-        if body.starts_with(b">") {
-            return Some(1);
-        }
-        if body.starts_with(b"->") {
-            return Some(2);
-        }
-        let mut k = 0;
-        while k + 1 < body.len() {
-            if body[k] == b'-' && body[k + 1] == b'-' {
-                match (body.get(k + 2), body.get(k + 3)) {
-                    (Some(b'>'), _) => return Some(k + 3),
-                    (Some(b'!'), Some(b'>')) => return Some(k + 4),
-                    _ => {}
-                }
-            }
-            k += 1;
-        }
-        None
-    }
-
-    /// Index just past the next `>` at or after `from` (or the end).
-    fn skip_past_gt(html: &[u8], from: usize) -> usize {
-        let from = from.min(html.len());
-        match html[from..].iter().position(|&b| b == b'>') {
-            Some(at) => from + at + 1,
-            None => html.len(),
-        }
-    }
-
-    /// Skip a tag's attributes, starting just after its name: returns (index
-    /// past the closing `>`, whether the tag was written `.../>`, whether
-    /// the closing `>` was found at all). Quoted attribute values may
-    /// contain `>`.
-    fn skip_tag_body(html: &[u8], from: usize) -> (usize, bool, bool) {
-        let mut i = from;
-        let mut slash = false;
-        let mut expect_value = false;
-        while i < html.len() {
-            let b = html[i];
-            match b {
-                b'>' => return (i + 1, slash, true),
-                b'/' => {
-                    slash = !expect_value;
-                    i += 1;
-                }
-                b'=' => {
-                    expect_value = true;
-                    slash = false;
-                    i += 1;
-                }
-                b'"' | b'\'' if expect_value => {
-                    match html[i + 1..].iter().position(|&c| c == b) {
-                        Some(at) => i += at + 2,
-                        None => return (html.len(), false, false),
-                    }
-                    expect_value = false;
-                    slash = false;
-                }
-                c if c.is_ascii_whitespace() => i += 1,
-                _ => {
-                    if expect_value {
-                        // Unquoted value: to whitespace or `>`.
-                        while i < html.len() && !html[i].is_ascii_whitespace() && html[i] != b'>' {
-                            i += 1;
-                        }
-                        expect_value = false;
-                    } else {
-                        i += 1;
-                    }
-                    slash = false;
-                }
-            }
-        }
-        (html.len(), false, false)
-    }
-
-    /// Offset just past the `</name ...>` that ends the raw-text element
-    /// whose content starts at `from`; `None` when the end tag never comes.
-    fn raw_text_end(html: &[u8], from: usize, name: &[u8]) -> Option<usize> {
-        if name.eq_ignore_ascii_case(b"plaintext") {
-            return None;
-        }
-        let mut i = from;
-        loop {
-            i += html.get(i..)?.iter().position(|&b| b == b'<')?;
-            let after_slash = i + 2;
-            if html.get(i + 1) == Some(&b'/')
-                && html
-                    .get(after_slash..after_slash + name.len())
-                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
-                && html
-                    .get(after_slash + name.len())
-                    .is_some_and(|&b| is_tag_name_end(b))
-            {
-                let (past, _, complete) = skip_tag_body(html, after_slash + name.len());
-                return Some(if complete { past } else { html.len() });
-            }
-            i += 1;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn md(html: &str) -> String {
-        convert_html_to_markdown(html).unwrap()
+        convert_html_to_markdown(html, &HtmlLimits::default(), &AtomicBool::new(false)).unwrap()
     }
 
     #[test]
@@ -922,7 +541,14 @@ mod tests {
         assert!(md.contains("Content"));
     }
 
-    // ── the iterative walker against the recursive original ─────────
+    #[test]
+    fn the_article_body_is_found_by_id_and_class() {
+        let html = r#"<html><body><div>menu</div><div id="article-body"><p>the paper</p></div></body></html>"#;
+        let md = md(html);
+        assert!(md.contains("the paper") && !md.contains("menu"), "{md}");
+    }
+
+    // ── the walker and the bounded parser against scraper's own ─────
 
     /// The walker as it was before it became iterative: the oracle the new
     /// one must match byte for byte.
@@ -992,8 +618,7 @@ mod tests {
 
     /// A well-formed random fragment.
     fn well_formed(rng: &mut Rng, depth: usize, out: &mut String) {
-        let breadth = 1 + rng.below(3);
-        for _ in 0..breadth {
+        for _ in 0..(1 + rng.below(3)) {
             match rng.below(5) {
                 0 => out.push_str(rng.pick(&["alpha", "beta gamma", " delta ", "x < y", "a & b"])),
                 1 if depth > 0 => {
@@ -1001,7 +626,6 @@ mod tests {
                     if tag == "br" {
                         out.push_str("<br>");
                     } else if tag == "table" {
-                        // html5ever inserts the tbody a table row needs.
                         out.push_str("<table><tbody><tr><td>");
                         well_formed(rng, depth - 1, out);
                         out.push_str("</td></tr></tbody></table>");
@@ -1015,215 +639,6 @@ mod tests {
                 _ => out.push_str(rng.pick(&["word", "<i>t</i>", "<b>u</b>"])),
             }
         }
-    }
-
-    #[test]
-    fn the_iterative_walker_matches_the_recursive_original() {
-        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        for case in 0..300 {
-            let mut body = String::new();
-            well_formed(&mut rng, 6, &mut body);
-            let html = format!("<html><body>{body}</body></html>");
-            assert_eq!(
-                convert_unbounded(&html),
-                oracle_convert(&html),
-                "case {case}: {html}"
-            );
-        }
-    }
-
-    // ── hostile nesting, in a child process ─────────────────────────
-
-    const CHILD_ENV: &str = "HS_SCRIBE_CHILD_HTML";
-
-    /// Entry point of the child process. Each listed file is converted on a
-    /// thread with tokio's default 2 MiB blocking stack — `ungated` skips the
-    /// nesting bound, to prove the walk itself needs no stack — and the
-    /// child reports `ok <bytes> <contains-marker>` or `err <code>`.
-    #[test]
-    fn child_entry() {
-        let Ok(spec) = std::env::var(CHILD_ENV) else {
-            return;
-        };
-        for line in spec.split('\n') {
-            let (mode, file) = line.split_once(' ').unwrap();
-            let html = std::fs::read_to_string(file).unwrap();
-            let ungated = mode == "ungated";
-            let outcome = std::thread::Builder::new()
-                .stack_size(if ungated { 512 << 10 } else { 2 << 20 })
-                .spawn(move || {
-                    if ungated {
-                        Ok(convert_unbounded(&html))
-                    } else {
-                        convert_html_to_markdown(&html)
-                    }
-                })
-                .unwrap()
-                .join()
-                .unwrap();
-            match outcome {
-                Ok(md) => println!("RESULT ok {} {}", md.len(), md.contains("marker")),
-                Err(f) => println!("RESULT err {}", f.code().wire()),
-            }
-        }
-        std::process::exit(0);
-    }
-
-    fn run_in_child(cases: &[(&str, String)]) -> Vec<String> {
-        let dir = tempfile::tempdir().unwrap();
-        let mut spec = Vec::new();
-        for (i, (mode, html)) in cases.iter().enumerate() {
-            let path = dir.path().join(format!("case-{i}.html"));
-            std::fs::write(&path, html).unwrap();
-            spec.push(format!("{mode} {}", path.display()));
-        }
-        let started = std::time::Instant::now();
-        let child = crate::child_proc::run("html::tests::child_entry", CHILD_ENV, &spec.join("\n"));
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(60),
-            "took {:?}",
-            started.elapsed()
-        );
-        let results = child.results();
-        assert_eq!(results.len(), cases.len(), "{}", child.stdout);
-        results
-    }
-
-    fn nested(tag: &str, depth: usize) -> String {
-        format!(
-            "<html><body>{}marker{}</body></html>",
-            format!("<{tag}>").repeat(depth),
-            format!("</{tag}>").repeat(depth)
-        )
-    }
-
-    #[test]
-    fn deeply_nested_documents_are_refused_before_a_tree_is_built() {
-        // 20 000 nested <div>s aborted a 2 MiB-stack thread in the recursive
-        // walker; a million of them would have parsed for most of an hour.
-        let results = run_in_child(&[
-            ("gated", nested("div", 20_000)),
-            ("gated", nested("span", 1_000_000)),
-            (
-                "gated",
-                format!("<html><body>{}</body></html>", "<div><p>".repeat(100_000)),
-            ),
-            ("gated", nested("div", MAX_HTML_NESTING - 5)),
-        ]);
-        assert_eq!(results[0], "err html_parse_error");
-        assert_eq!(results[1], "err html_parse_error");
-        assert_eq!(results[2], "err html_parse_error");
-        assert!(
-            results[3].starts_with("ok ") && results[3].ends_with("true"),
-            "{}",
-            results[3]
-        );
-    }
-
-    #[test]
-    fn the_walk_itself_needs_no_stack() {
-        // The same 20 000-deep document, but past the nesting gate and on a
-        // 512 KiB stack: the recursive walker overflowed 2 MiB at this depth.
-        let results = run_in_child(&[("ungated", nested("div", 20_000))]);
-        assert!(
-            results[0].starts_with("ok ") && results[0].ends_with("true"),
-            "{}",
-            results[0]
-        );
-    }
-
-    // ── the nesting scan ────────────────────────────────────────────
-
-    fn depth(html: &str) -> usize {
-        nesting::max_open_elements(html.as_bytes(), usize::MAX)
-    }
-
-    #[test]
-    fn nesting_counts_open_elements() {
-        assert_eq!(depth("<div><p><b>x</b></p></div>"), 3);
-        assert_eq!(depth("<div></div><div></div>"), 1);
-        assert_eq!(depth(&nested("div", 40)), 40 + 2); // + html, body
-    }
-
-    #[test]
-    fn markup_that_is_not_an_element_does_not_count() {
-        for html in [
-            "<!-- <div><div><div> --><p>x</p>",
-            "<!DOCTYPE html><br><br><hr><img src=a><input><meta><link>",
-            r#"<a title="<div><div><div>" href='<span><span>'>x</a>"#,
-            "<script>if (a<b) { x = '<div><div><div>'; }</script>",
-            "<style>a > b { } /* <div><div> */</style>",
-            "<textarea><div><div><div></textarea>",
-            "<title><b><b><b></title>",
-        ] {
-            assert!(depth(html) <= 1, "{html}: {}", depth(html));
-        }
-    }
-
-    #[test]
-    fn unclosed_but_ordinary_markup_does_not_inflate_the_depth() {
-        // Idioms every real-world page uses; each must not nest.
-        let paragraphs = "<p>one<p>two<p>three<p>four".repeat(200);
-        assert!(depth(&paragraphs) <= 2, "p: {}", depth(&paragraphs));
-        let items = format!("<ul>{}</ul>", "<li>item".repeat(500));
-        assert!(depth(&items) <= 3, "li: {}", depth(&items));
-        let defs = format!("<dl>{}</dl>", "<dt>t<dd>d".repeat(500));
-        assert!(depth(&defs) <= 3, "dl: {}", depth(&defs));
-        let cells = format!("<table><tr>{}</table>", "<td>c".repeat(500));
-        assert!(depth(&cells) <= 4, "td: {}", depth(&cells));
-        let rows = format!("<table>{}</table>", "<tr><td>a<td>b".repeat(500));
-        assert!(depth(&rows) <= 4, "tr: {}", depth(&rows));
-        let options = format!("<select>{}</select>", "<option>o".repeat(500));
-        assert!(depth(&options) <= 3, "option: {}", depth(&options));
-        // A block end tag closes the unclosed inline elements inside it.
-        let sloppy = "<div><span>text</div>".repeat(500);
-        assert!(depth(&sloppy) <= 3, "div: {}", depth(&sloppy));
-        let bold = "<p><b>text</p>".repeat(500);
-        assert!(depth(&bold) <= 3, "b: {}", depth(&bold));
-    }
-
-    #[test]
-    fn tricks_that_hide_nesting_from_a_naive_count_do_not_work() {
-        let many = 2_000;
-        for (name, html) in [
-            // HTML ignores the slash of a "self-closing" non-void element.
-            ("self-closing div", "<div/>".repeat(many)),
-            // A stray end tag of another name does not pop anything.
-            ("stray closers", "<div></span>".repeat(many)),
-            // An end tag across a special element is ignored.
-            ("span across div", "<span><div></span>".repeat(many)),
-            // Slash-looking text inside an attribute value is not a self-close.
-            ("slash in value", "<div a=b/>".repeat(many)),
-            // Quotes that hide the closing `>`.
-            ("quoted gt", "<div a=\">\">".repeat(many)),
-            // Foreign content: an HTML breakout inside svg is an HTML element.
-            ("svg breakout", format!("<svg>{}", "<div/>".repeat(many))),
-            (
-                "foreignObject",
-                format!("<svg><foreignObject>{}", "<section/>".repeat(many)),
-            ),
-            // style/script inside svg is markup, not text.
-            ("svg style", format!("<svg><style>{}", "<div>".repeat(many))),
-        ] {
-            assert!(
-                depth(&html) >= many,
-                "{name}: scan saw only {}",
-                depth(&html)
-            );
-        }
-    }
-
-    // ── the scan against html5ever ──────────────────────────────────
-
-    /// Most elements on any root-to-leaf path of the tree html5ever builds.
-    fn real_depth(html: &str) -> usize {
-        let doc = Html::parse_document(html);
-        doc.tree
-            .nodes()
-            .filter(|n| n.value().is_element())
-            .map(|n| n.ancestors().filter(|a| a.value().is_element()).count() + 1)
-            .max()
-            .unwrap_or(0)
     }
 
     const SOUP_TAGS: &[&str] = &[
@@ -1289,63 +704,200 @@ mod tests {
         out
     }
 
-    /// Start tags of formatting elements: what html5ever may re-open after
-    /// a block closed them.
-    fn formatting_start_tags(html: &str) -> usize {
-        const NAMES: &[&str] = &[
-            "a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong",
-            "tt", "u",
-        ];
-        let lower = html.to_ascii_lowercase();
-        lower
-            .match_indices('<')
-            .filter(|(at, _)| {
-                let rest = &lower[at + 1..];
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric())
-                    .collect();
-                NAMES.contains(&name.as_str())
-            })
-            .count()
-    }
-
-    /// The soundness property: html5ever's depth never exceeds the scan's
-    /// plus the formatting-element copies it may re-open plus the html, head
-    /// and body it adds around any fragment.
-    fn undercounted(html: &str) -> bool {
-        const IMPLICIT: usize = 4;
-        depth(html) + formatting_start_tags(html) + IMPLICIT < real_depth(html)
-    }
-
     #[test]
-    fn the_scan_never_under_counts_what_html5ever_builds() {
-        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
-        for _ in 0..6_000 {
-            let html = soup(&mut rng);
-            assert!(
-                !undercounted(&html),
-                "scan {} + {} formatting tags, but html5ever built {} deep: {html}",
-                depth(&html),
-                formatting_start_tags(&html),
-                real_depth(&html)
-            );
-        }
-    }
-
-    #[test]
-    fn the_scan_is_tight_on_well_formed_documents() {
-        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
-        for _ in 0..500 {
+    fn the_bounded_parser_and_iterative_walker_match_scrapers_on_well_formed_documents() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for case in 0..300 {
             let mut body = String::new();
-            well_formed(&mut rng, 8, &mut body);
+            well_formed(&mut rng, 6, &mut body);
             let html = format!("<html><body>{body}</body></html>");
-            let (scan, real) = (depth(&html), real_depth(&html));
-            assert!(scan <= real, "scan {scan} over html5ever's {real}: {html}");
-            assert!(
-                real <= scan + 1,
-                "scan {scan} under html5ever's {real}: {html}"
-            );
+            assert_eq!(md(&html), oracle_convert(&html), "case {case}: {html}");
         }
+    }
+
+    #[test]
+    fn the_bounded_parser_builds_scrapers_tree_on_tag_soup() {
+        // Same text out for arbitrary garbage: the sink port loses nothing
+        // that reaches the markdown (generous limits, so nothing is refused).
+        let limits = HtmlLimits {
+            max_nesting: 100_000,
+            ..HtmlLimits::default()
+        };
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        for case in 0..1_500 {
+            let html = soup(&mut rng);
+            let ours = convert_html_to_markdown(&html, &limits, &AtomicBool::new(false)).unwrap();
+            assert_eq!(ours, oracle_convert(&html), "case {case}: {html}");
+        }
+    }
+
+    // ── bounds, in a child process on a 2 MiB stack ─────────────────
+
+    const CHILD_ENV: &str = "HS_SCRIBE_CHILD_HTML";
+
+    /// Child entry. Each listed file is converted on a 2 MiB-stack thread
+    /// under the default limits; the child reports `ok <bytes> <marker>` or
+    /// `err <code>`, then its peak RSS.
+    #[test]
+    fn child_entry() {
+        let Ok(spec) = std::env::var(CHILD_ENV) else {
+            return;
+        };
+        for file in spec.split('\n') {
+            let html = std::fs::read_to_string(file).unwrap();
+            let outcome = std::thread::Builder::new()
+                .stack_size(2 << 20)
+                .spawn(move || {
+                    convert_html_to_markdown(&html, &HtmlLimits::default(), &AtomicBool::new(false))
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            match outcome {
+                Ok(md) => println!("RESULT ok {} {}", md.len(), md.contains("marker")),
+                Err(f) => println!("RESULT err {}", f.code().wire()),
+            }
+        }
+        let peak_kb = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("VmHWM:"))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        println!("RESULT peak {peak_kb}");
+        std::process::exit(0);
+    }
+
+    /// Convert each case in a child; it must exit normally within `limit`.
+    /// Returns the per-case results and the child's peak RSS in kB.
+    fn run_in_child(cases: &[String], limit: std::time::Duration) -> (Vec<String>, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for (i, html) in cases.iter().enumerate() {
+            let path = dir.path().join(format!("case-{i}.html"));
+            std::fs::write(&path, html).unwrap();
+            files.push(path.display().to_string());
+        }
+        let started = std::time::Instant::now();
+        let child =
+            crate::child_proc::run("html::tests::child_entry", CHILD_ENV, &files.join("\n"));
+        assert!(started.elapsed() < limit, "took {:?}", started.elapsed());
+        let mut results = child.results();
+        let peak = results.pop().unwrap();
+        assert_eq!(results.len(), cases.len(), "{}", child.stdout);
+        (results, peak.trim_start_matches("peak ").parse().unwrap())
+    }
+
+    fn nested(tag: &str, depth: usize) -> String {
+        format!(
+            "<html><body>{}marker{}</body></html>",
+            format!("<{tag}>").repeat(depth),
+            format!("</{tag}>").repeat(depth)
+        )
+    }
+
+    /// The reviewer's unit that reaches real depth 3604 against a scan of 25.
+    const MISNESTED_UNIT: &str = "<em></select><li/><body><tr>text <u></textarea><foreignObject/ <?><dt><big><templatex><font><s>/><math><button/></u>//<p><em><b><frameset><code/><strong><p><tt><b></body><span--!>>";
+
+    #[test]
+    fn every_hostile_nesting_is_refused_inside_the_parse_in_bounded_time() {
+        let cases = vec![
+            // Plain deep nesting.
+            nested("div", 20_000),
+            nested("span", 1_000_000),
+            format!("<html><body>{}</body></html>", "<div><p>".repeat(100_000)),
+            // A quote after `=` that html5ever reads as part of an attribute
+            // name hid the rest of the document from the old byte scan.
+            format!("<a =\"{}", "<div>".repeat(20_000)),
+            // Mis-nested formatting markup the old scan under-counted 144x.
+            MISNESTED_UNIT.repeat(1_500),
+            // Legitimate depth still converts.
+            nested("div", 300),
+        ];
+        let (results, _) = run_in_child(&cases, std::time::Duration::from_secs(60));
+        for (i, result) in results[..5].iter().enumerate() {
+            assert_eq!(result, "err html_parse_error", "case {i}: {result}");
+        }
+        assert!(
+            results[5].starts_with("ok ") && results[5].ends_with("true"),
+            "{}",
+            results[5]
+        );
+    }
+
+    #[test]
+    fn the_dom_is_charged_to_a_budget_not_just_the_input() {
+        // 8 MiB of `<i></i>` is under the input cap but builds ~1.2 million
+        // nodes (179 MiB of DOM in the review's measurement).
+        let doc = format!(
+            "<html><body>{}</body></html>",
+            "<i></i>".repeat(8 * 1024 * 1024 / 7)
+        );
+        let over_input_cap = "x".repeat(HtmlLimits::default().max_input_bytes + 1);
+        let (results, peak_kb) =
+            run_in_child(&[doc, over_input_cap], std::time::Duration::from_secs(60));
+        assert_eq!(results[0], "err html_parse_error");
+        assert_eq!(results[1], "err html_parse_error");
+        assert!(peak_kb < 400 * 1024, "peak RSS {peak_kb} kB");
+    }
+
+    #[test]
+    fn the_limits_are_the_configured_ones() {
+        let flag = AtomicBool::new(false);
+        let tight = HtmlLimits {
+            max_input_bytes: 1_000,
+            max_nesting: 5,
+            max_nodes: 50,
+        };
+        let deep = nested("div", 10);
+        assert!(convert_html_to_markdown(&deep, &tight, &flag).is_err());
+        let wide = format!("<html><body>{}</body></html>", "<p>x</p>".repeat(100));
+        assert!(convert_html_to_markdown(&wide, &tight, &flag).is_err());
+        let big = format!("<html><body>{}</body></html>", "x".repeat(2_000));
+        assert!(convert_html_to_markdown(&big, &tight, &flag).is_err());
+        assert!(convert_html_to_markdown("<p>ok</p>", &tight, &flag).is_ok());
+        assert!(HtmlLimits {
+            max_nodes: 0,
+            ..HtmlLimits::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn raising_the_cancellation_flag_stops_the_parse_itself() {
+        let doc = format!("<html><body>{}</body></html>", "<p>x</p>".repeat(1_500_000));
+        let limits = HtmlLimits {
+            max_nodes: usize::MAX,
+            ..HtmlLimits::default()
+        };
+        // Already raised: not even the first chunk is parsed.
+        let raised = AtomicBool::new(true);
+        let err = convert_html_to_markdown(&doc, &limits, &raised).unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        // Raised mid-parse: the call returns long before it would have finished.
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let full = {
+            let started = std::time::Instant::now();
+            convert_html_to_markdown(&doc, &limits, &AtomicBool::new(false)).unwrap();
+            started.elapsed()
+        };
+        let raiser = std::thread::spawn(move || {
+            std::thread::sleep(full / 10);
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let err = convert_html_to_markdown(&doc, &limits, &cancel).unwrap_err();
+        raiser.join().unwrap();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert!(
+            started.elapsed() < full / 2,
+            "{:?} vs {:?}",
+            started.elapsed(),
+            full
+        );
     }
 }

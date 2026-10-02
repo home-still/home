@@ -2313,6 +2313,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hs-common",
+ "html5ever",
  "image",
  "ndarray",
  "ollama-rs",

@@ -53,6 +53,7 @@ bytes = "1"
 zip = { version = "3.0.0", default-features = false, features = ["deflate"] }
 xml = "1"
 ego-tree = "0.10"
+html5ever = "0.29"
 percent-encoding = "2"
 
 # Server Only

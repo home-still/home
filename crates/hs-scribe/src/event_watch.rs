@@ -349,20 +349,28 @@ async fn blocking<T: Send + 'static>(
 const PARSE_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(600);
 
 /// [`blocking`] under a wall-clock `budget`; running past it is a permanent
-/// failure with `code`.
+/// failure with `code`. The closure gets a cancellation flag which is raised
+/// when the budget expires: a conversion that checks it (the HTML parser does,
+/// between chunks) stops on its own, so the blocking thread does not keep
+/// burning a core for a document nobody is waiting for.
 async fn blocking_within<T: Send + 'static>(
     what: &'static str,
     key: &str,
     budget: Duration,
     code: FailureCode,
-    f: impl FnOnce() -> T + Send + 'static,
+    f: impl FnOnce(&std::sync::atomic::AtomicBool) -> T + Send + 'static,
 ) -> Result<T, HandlerError> {
-    match tokio::time::timeout(budget, blocking(what, key, f)).await {
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let for_task = Arc::clone(&cancel);
+    match tokio::time::timeout(budget, blocking(what, key, move || f(&for_task))).await {
         Ok(result) => result,
-        Err(_) => Err(permanent(
-            code,
-            format!("{what} of {key} did not finish within {budget:?}"),
-        )),
+        Err(_) => {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            Err(permanent(
+                code,
+                format!("{what} of {key} did not finish within {budget:?}"),
+            ))
+        }
     }
 }
 
@@ -517,12 +525,13 @@ pub async fn convert_and_upload(
         "html" | "htm" => {
             let bytes = source.bytes.clone();
             let key = event.key.clone();
+            let limits = epub_limits.clone();
             let converted = blocking_within(
                 "HTML conversion",
                 &event.key,
                 PARSE_WALL_CLOCK_BUDGET,
                 FailureCode::HtmlParseError,
-                move || {
+                move |cancel| {
                     let html = std::str::from_utf8(&bytes).map_err(|e| {
                         ConvertFailure::new(
                             FailureCode::HtmlNotUtf8,
@@ -543,7 +552,7 @@ pub async fn convert_and_upload(
                             ),
                         ));
                     }
-                    crate::html::convert_html_to_markdown(html)
+                    crate::html::convert_html_to_markdown(html, &limits.html, cancel)
                 },
             )
             .await?;
@@ -560,7 +569,7 @@ pub async fn convert_and_upload(
                 &event.key,
                 PARSE_WALL_CLOCK_BUDGET,
                 FailureCode::EpubParseError,
-                move || crate::epub::convert_epub_to_markdown_with(&bytes, &limits),
+                move |cancel| crate::epub::convert_epub_to_markdown_with(&bytes, &limits, cancel),
             )
             .await?;
             let md = converted.map_err(|e| {
@@ -1194,7 +1203,7 @@ mod tests {
             "papers/ab/slow.html",
             Duration::from_millis(50),
             FailureCode::HtmlParseError,
-            || std::thread::sleep(Duration::from_millis(1500)),
+            |_| std::thread::sleep(Duration::from_millis(1500)),
         )
         .await
         .unwrap_err();
@@ -1211,7 +1220,7 @@ mod tests {
             "papers/ab/fast.html",
             Duration::from_secs(5),
             FailureCode::HtmlParseError,
-            || 7,
+            |_| 7,
         )
         .await
         .unwrap();

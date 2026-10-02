@@ -18,11 +18,14 @@ pub fn convert(bytes: Vec<u8>) -> Result<String> {
 
 /// [`convert`] under explicit limits.
 pub fn convert_with(limits: &EpubLimits, bytes: &[u8]) -> Result<String> {
-    hs_scribe::epub::convert_epub_to_markdown_with(bytes, limits).map_err(|e| {
-        PersonalError::Converter {
-            format: "epub",
-            source: e,
-        }
+    hs_scribe::epub::convert_epub_to_markdown_with(
+        bytes,
+        limits,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .map_err(|e| PersonalError::Converter {
+        format: "epub",
+        source: e,
     })
 }
 
@@ -77,6 +80,7 @@ mod tests {
             max_entries: 100,
             max_entry_bytes: 100_000,
             max_total_bytes: 200_000,
+            ..EpubLimits::default()
         };
         let err = convert_with(&tight, &book).unwrap_err();
         assert!(format!("{err:#}").contains("limit"), "{err:#}");
