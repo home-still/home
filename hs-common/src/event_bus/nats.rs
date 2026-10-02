@@ -271,25 +271,39 @@ impl NatsBus {
             max_ack_pending: self.cfg.max_ack_pending,
             ..Default::default()
         };
-        // async_nats 0.47's `get_or_create_consumer` silently keeps
-        // the existing config on mismatch — a stale test consumer
-        // once pinned production to ack_wait=10s. Delete first (no-op
-        // if absent), then create fresh from the current NatsConfig.
-        // Single-daemon-per-consumer-group means no race.
-        if let Err(e) = stream.delete_consumer(spec.durable_name).await {
-            let msg = format!("{e}");
-            if !msg.contains("not found") && !msg.contains("10014") {
-                tracing::warn!(
-                    consumer = spec.durable_name,
-                    error = %e,
-                    "delete_consumer before recreate failed; continuing"
-                );
-            }
-        }
-        stream
-            .create_consumer(config)
+        // The durable consumer outlives the watcher. A restart finds it and
+        // keeps using it (deleting it on every start made two watchers that
+        // share a durable name tear each other's consumer down, each exit
+        // and restart in turn, and reset every message's delivery count, so
+        // a poison message was never dead-lettered). Two processes on one
+        // durable now load-balance, as the spec says they should.
+        //
+        // `get_or_create_consumer` keeps an existing consumer's config
+        // whatever ours says (a stale test consumer once pinned production
+        // to ack_wait=10s), so the existing config is compared with the
+        // wanted one and brought in line with `update_consumer` — in place,
+        // without deleting the consumer or its pending messages.
+        let consumer = stream
+            .get_or_create_consumer(spec.durable_name, config.clone())
             .await
-            .map_err(|e| anyhow::anyhow!("create consumer {}: {e}", spec.durable_name))
+            .map_err(|e| anyhow::anyhow!("get or create consumer {}: {e}", spec.durable_name))?;
+        let found = ConsumerShape::of_found(&consumer.cached_info().config);
+        let drift = found.drift_from(&ConsumerShape::of_wanted(&config));
+        if drift.is_empty() {
+            return Ok(consumer);
+        }
+        tracing::warn!(
+            consumer = spec.durable_name,
+            differs = %drift.join(", "),
+            "existing consumer does not match the configured one; updating it in place"
+        );
+        stream.update_consumer(config).await.map_err(|e| {
+            anyhow::anyhow!(
+                "update consumer {} (differs in {}): {e}",
+                spec.durable_name,
+                drift.join(", ")
+            )
+        })
     }
 
     /// Delete every pipeline stream (PAPERS, SCRIBE, DISTILL). All
@@ -317,6 +331,67 @@ impl NatsBus {
             }
         }
         Ok(())
+    }
+}
+/// The settings of a pull consumer that this crate sets and that can drift
+/// from the configuration (the other settings are left at the server's
+/// defaults on both sides).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConsumerShape {
+    ack_wait: Duration,
+    max_deliver: i64,
+    max_ack_pending: i64,
+    filter_subject: String,
+    explicit_ack: bool,
+}
+
+impl ConsumerShape {
+    fn of_found(config: &async_nats::jetstream::consumer::Config) -> Self {
+        Self {
+            ack_wait: config.ack_wait,
+            max_deliver: config.max_deliver,
+            max_ack_pending: config.max_ack_pending,
+            filter_subject: config.filter_subject.clone(),
+            explicit_ack: matches!(
+                config.ack_policy,
+                async_nats::jetstream::consumer::AckPolicy::Explicit
+            ),
+        }
+    }
+
+    fn of_wanted(config: &async_nats::jetstream::consumer::pull::Config) -> Self {
+        Self {
+            ack_wait: config.ack_wait,
+            max_deliver: config.max_deliver,
+            max_ack_pending: config.max_ack_pending,
+            filter_subject: config.filter_subject.clone(),
+            explicit_ack: matches!(
+                config.ack_policy,
+                async_nats::jetstream::consumer::AckPolicy::Explicit
+            ),
+        }
+    }
+
+    /// Names of the settings in which `self` (what the server has) differs
+    /// from `wanted`. Empty: the consumer can be used as it is.
+    fn drift_from(&self, wanted: &Self) -> Vec<&'static str> {
+        let mut drift = Vec::new();
+        if self.ack_wait != wanted.ack_wait {
+            drift.push("ack_wait");
+        }
+        if self.max_deliver != wanted.max_deliver {
+            drift.push("max_deliver");
+        }
+        if self.max_ack_pending != wanted.max_ack_pending {
+            drift.push("max_ack_pending");
+        }
+        if self.filter_subject != wanted.filter_subject {
+            drift.push("filter_subject");
+        }
+        if self.explicit_ack != wanted.explicit_ack {
+            drift.push("ack_policy");
+        }
+        drift
     }
 }
 
@@ -645,5 +720,71 @@ mod tests {
             };
             connect_options(&cfg).await.unwrap();
         }
+    }
+
+    fn shape() -> ConsumerShape {
+        ConsumerShape {
+            ack_wait: Duration::from_secs(7200),
+            max_deliver: 5,
+            max_ack_pending: 32,
+            filter_subject: "papers.ingested".into(),
+            explicit_ack: true,
+        }
+    }
+
+    #[test]
+    fn a_consumer_that_matches_is_reused_untouched() {
+        assert!(shape().drift_from(&shape()).is_empty());
+    }
+
+    #[test]
+    fn every_drifted_setting_is_named_so_the_consumer_is_updated_in_place() {
+        // A stale consumer once pinned production to ack_wait=10s; the
+        // check must see each setting this crate sets.
+        let mut found = shape();
+        found.ack_wait = Duration::from_secs(10);
+        found.max_deliver = -1;
+        found.max_ack_pending = 1000;
+        found.filter_subject = "papers.>".into();
+        found.explicit_ack = false;
+        assert_eq!(
+            found.drift_from(&shape()),
+            [
+                "ack_wait",
+                "max_deliver",
+                "max_ack_pending",
+                "filter_subject",
+                "ack_policy"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_stock_consumer_configs_convert_to_the_same_shape() {
+        use async_nats::jetstream::consumer::{pull::Config as PullConfig, AckPolicy};
+        let wanted = PullConfig {
+            durable_name: Some("d".into()),
+            filter_subject: "scribe.completed".into(),
+            ack_policy: AckPolicy::Explicit,
+            ack_wait: Duration::from_secs(90),
+            max_deliver: 3,
+            max_ack_pending: 8,
+            ..Default::default()
+        };
+        // What the server echoes back is the same settings in the generic
+        // consumer config.
+        let echoed = async_nats::jetstream::consumer::Config {
+            durable_name: wanted.durable_name.clone(),
+            filter_subject: wanted.filter_subject.clone(),
+            ack_policy: wanted.ack_policy,
+            ack_wait: wanted.ack_wait,
+            max_deliver: wanted.max_deliver,
+            max_ack_pending: wanted.max_ack_pending,
+            ..Default::default()
+        };
+        assert_eq!(
+            ConsumerShape::of_found(&echoed),
+            ConsumerShape::of_wanted(&wanted)
+        );
     }
 }

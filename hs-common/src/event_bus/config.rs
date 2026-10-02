@@ -52,6 +52,14 @@ pub struct NatsYaml {
     /// pipeline busy without pre-buffering so many messages that the
     /// tail ones time out before the handler reaches them.
     pub max_ack_pending: i64,
+    /// After the subscriber loop stops (delivery error, ended stream), how
+    /// long the watcher waits for handlers that were already running to
+    /// finish their ack/nak before it gives up on them and exits. The ones
+    /// it abandons are named in an ERROR log; their events stay un-acked and
+    /// are redelivered after `ack_wait`. Default 120 s: a watcher that
+    /// stopped consuming should be back on a fresh consumer in minutes, not
+    /// after the longest conversion (up to an hour).
+    pub drain_timeout_secs: u64,
 
     /// Authenticate with a NATS `.creds` file (JWT + NKey seed).
     pub credentials_file: Option<PathBuf>,
@@ -87,6 +95,7 @@ impl Default for NatsYaml {
             max_deliver: 5,
             max_age_secs: 7 * 24 * 3600,
             max_ack_pending: 32,
+            drain_timeout_secs: 120,
             credentials_file: None,
             token_env: None,
             user: None,
@@ -106,6 +115,9 @@ impl NatsYaml {
     pub fn validate(&self) -> Result<(), String> {
         if self.url.trim().is_empty() {
             return Err("`url` must not be empty".into());
+        }
+        if self.drain_timeout_secs == 0 {
+            return Err("`drain_timeout_secs` must be at least 1".into());
         }
         let methods = [
             self.credentials_file.is_some(),
@@ -173,6 +185,12 @@ impl EventBusConfig {
         Ok(Some(cfg))
     }
 
+    /// How long a watcher waits for running handlers after its subscription
+    /// stopped (`events.nats.drain_timeout_secs`).
+    pub fn drain_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.nats.drain_timeout_secs)
+    }
+
     /// The bus a component that publishes or consumes events must use.
     /// `None` (no `events:` section) is an error, never a bus that quietly
     /// drops everything.
@@ -185,6 +203,45 @@ impl EventBusConfig {
                  event-driven pipeline, or to `noop` to drop publishes deliberately",
                 crate::CONFIG_REL_PATH
             ),
+        }
+    }
+
+    /// Like [`Self::build_required`], but a NATS connection is made on first
+    /// use ([`super::LazyBus`]) instead of now. Everything that can be wrong
+    /// with the configuration is still found now: a missing section, an
+    /// invalid or contradictory key, an auth variable that is unset, a
+    /// credentials or certificate file that is missing. Only "the broker is
+    /// not reachable" waits, so that a process that rarely publishes is not
+    /// taken down by a broker outage; whoever publishes gets the connection
+    /// error.
+    pub async fn build_lazy(cfg: Option<&Self>) -> anyhow::Result<Arc<dyn EventBus>> {
+        let Some(cfg) = cfg else {
+            return Self::build_required(None).await;
+        };
+        cfg.validate()
+            .map_err(|e| anyhow::anyhow!("invalid `events` section: {e}"))?;
+        match cfg.backend {
+            EventsBackend::Noop => Ok(Arc::new(NoOpBus)),
+            EventsBackend::Nats => {
+                #[cfg(feature = "events-nats")]
+                {
+                    let connection = cfg.nats.connection(|name| std::env::var(name).ok())?;
+                    // Offline: reads the credentials / certificate files.
+                    super::nats::connect_options(&connection).await?;
+                    let lazy = super::LazyBus::new(move || {
+                        let connection = connection.clone();
+                        Box::pin(async move {
+                            let bus = super::nats::NatsBus::connect(connection).await?;
+                            Ok(Arc::new(bus) as Arc<dyn EventBus>)
+                        })
+                    });
+                    Ok(Arc::new(lazy))
+                }
+                #[cfg(not(feature = "events-nats"))]
+                {
+                    anyhow::bail!("events.backend=nats requires the `events-nats` cargo feature");
+                }
+            }
         }
     }
 

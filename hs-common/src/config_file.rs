@@ -103,9 +103,12 @@ pub struct ConfigFile {
     root: Mapping,
 }
 
-/// The `home:` section. Unknown keys are tolerated (other tools own them);
-/// the two keys below must be strings when present.
+/// The `home:` section. These two keys decide where all data and logs live,
+/// so an unknown key (a typo such as `project_directory`) is an error naming
+/// the valid keys, not a setting that is silently dropped. Both keys must be
+/// strings when present.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HomeYaml {
     project_dir: Option<String>,
     log_dir: Option<String>,
@@ -335,6 +338,226 @@ pub fn unknown_env_names(
     unknown
 }
 
+/// An unknown key found in a config section: its dotted path under the
+/// section and the keys that would have been valid at that level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKey {
+    pub path: String,
+    pub valid: Vec<String>,
+}
+
+/// Keys of `actual` (a section as read from the file) that `known` (the JSON
+/// of the section's struct at its defaults) does not have, recursing into
+/// nested mappings. A key whose default is not a mapping (a scalar, a list,
+/// an absent `Option`) is a leaf: whatever the file puts there is that key's
+/// business. Sorted, so the output is stable.
+pub fn unknown_keys(actual: &serde_json::Value, known: &serde_json::Value) -> Vec<UnknownKey> {
+    fn walk(
+        actual: &serde_json::Value,
+        known: &serde_json::Value,
+        prefix: &str,
+        out: &mut Vec<UnknownKey>,
+    ) {
+        let (Some(actual), Some(known)) = (actual.as_object(), known.as_object()) else {
+            return;
+        };
+        for (key, value) in actual {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            match known.get(key) {
+                None => out.push(UnknownKey {
+                    path,
+                    valid: known.keys().cloned().collect(),
+                }),
+                Some(known_value) => walk(value, known_value, &path, out),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(actual, known, "", &mut out);
+    out
+}
+
+/// `true` the first time `key` is seen in this process. Config loaders run
+/// several times per command; a warning about the same file is logged once.
+fn first_time(key: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+    SEEN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.to_string())
+}
+
+/// One line per unknown key in `section` (minus `ignore`: keys handled
+/// elsewhere, such as keys known to be removed, which have their own
+/// warning), each naming the file, the dotted key and the valid keys. For
+/// callers that cannot log yet (the logger is not installed when the
+/// `logs:` section is read) and carry the lines to where they can.
+pub fn unknown_key_notices(
+    file: &Path,
+    section: &str,
+    actual: &serde_json::Value,
+    known: &serde_json::Value,
+    ignore: &[&str],
+) -> Vec<String> {
+    unknown_keys(actual, known)
+        .into_iter()
+        .filter(|u| !ignore.contains(&u.path.as_str()))
+        .map(|u| {
+            format!(
+                "{}: unknown config key `{section}.{}` is ignored (a typo, or a key that no \
+                 longer exists); valid keys here: {}",
+                file.display(),
+                u.path,
+                u.valid.join(", ")
+            )
+        })
+        .collect()
+}
+
+/// Log (once per process and key) a warning for every unknown key in
+/// `section` (see [`unknown_key_notices`]). These sections tolerate stale
+/// keys (deployed configs carry some), so the finding is a warning.
+pub fn warn_unknown_keys(
+    file: &Path,
+    section: &str,
+    actual: &serde_json::Value,
+    known: &serde_json::Value,
+    ignore: &[&str],
+) {
+    for notice in unknown_key_notices(file, section, actual, known, ignore) {
+        if first_time(&notice) {
+            tracing::warn!("{notice}");
+        }
+    }
+}
+
+/// Names among `names` that start with `prefix` (e.g. `HS_SCRIBE_`), are not
+/// in `allow` (variables in that namespace that are not config keys, such as
+/// `HS_SCRIBE_DIAG_DIR`) and match no top-level key of any tree in `known`.
+/// Sorted.
+pub fn unknown_prefixed_env(
+    prefix: &str,
+    known: &[&serde_json::Value],
+    allow: &[&str],
+    names: impl Iterator<Item = String>,
+) -> Vec<String> {
+    let mut unknown: Vec<String> = names
+        .filter(|name| name.starts_with(prefix) && !allow.contains(&name.as_str()))
+        .filter(|name| {
+            let key = name[prefix.len()..].to_ascii_lowercase();
+            !known
+                .iter()
+                .any(|tree| tree.as_object().is_some_and(|o| o.contains_key(&key)))
+        })
+        .collect();
+    unknown.sort();
+    unknown
+}
+
+/// Every `<prefix>[A-Z0-9_]+` in `text`, sorted and de-duplicated: the
+/// environment variables a document (README, compose file, unit template)
+/// tells an operator about. A bare prefix, as in prose about "the
+/// `HS_SCRIBE_` prefix", is not a variable. Lets a test hold documentation
+/// to the variables the loaders actually read.
+pub fn env_names_in_text(text: &str, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(prefix) {
+        let tail = &rest[at..];
+        let len = tail
+            .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .unwrap_or(tail.len());
+        let name = &tail[..len];
+        if name.len() > prefix.len() && !name.ends_with('_') {
+            out.push(name.to_string());
+        }
+        rest = &tail[len.max(1)..];
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Log (once per process and name) a warning for every `prefix*` environment
+/// variable that sets nothing: such a variable is dropped by the loaders, so
+/// an operator who sets it believes in an effect it does not have.
+pub fn warn_unknown_prefixed_env(prefix: &str, known: &[&serde_json::Value], allow: &[&str]) {
+    let unknown = unknown_prefixed_env(
+        prefix,
+        known,
+        allow,
+        std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+    );
+    for name in unknown {
+        if first_time(&format!("env#{name}")) {
+            let mut valid: Vec<String> = known
+                .iter()
+                .filter_map(|tree| tree.as_object())
+                .flat_map(|o| o.keys())
+                .map(|k| format!("{prefix}{}", k.to_ascii_uppercase()))
+                .collect();
+            valid.sort();
+            valid.dedup();
+            tracing::warn!(
+                variable = %name,
+                valid = %valid.join(", "),
+                "environment variable sets nothing and is ignored; fix or unset it"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "storage")]
+impl ConfigFile {
+    /// The `storage:` section, or the documented default (local filesystem
+    /// at `~/home-still`) when the section is absent. An absent section on a
+    /// host whose `home.project_dir` points elsewhere is logged once (see
+    /// [`Self::default_storage`]).
+    pub fn storage(&self) -> Result<crate::storage::StorageConfig, ConfigError> {
+        match self.section("storage")? {
+            Some(storage) => Ok(storage),
+            None => self.default_storage(),
+        }
+    }
+
+    /// The default storage for a file with no `storage:` section. The
+    /// default root is `~/home-still` whatever `home.project_dir` says;
+    /// moving it would silently relocate the objects of every host that runs
+    /// on today's default, so it is only announced: once, naming both paths.
+    pub fn default_storage(&self) -> Result<crate::storage::StorageConfig, ConfigError> {
+        let storage = crate::storage::StorageConfig::default();
+        if let Some(note) = self.storage_default_note(&storage)? {
+            if first_time(&format!("storage-default#{}", self.path.display())) {
+                tracing::warn!("{note}");
+            }
+        }
+        Ok(storage)
+    }
+
+    fn storage_default_note(
+        &self,
+        storage: &crate::storage::StorageConfig,
+    ) -> Result<Option<String>, ConfigError> {
+        let project = self.project_dir()?;
+        if project == self.home.join(PROJECT_DIR_DEFAULT) {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "{}: no `storage:` section, so objects (papers, markdown, catalog) are stored under \
+             {} while `home.project_dir` is {}; add `storage.local.root` (or `storage.backend: \
+             s3`) so both agree, or confirm the split is intended",
+            self.path.display(),
+            storage.local.root.display(),
+            project.display()
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +690,155 @@ mod tests {
             unknown_env_names("HOME_STILL_", "HOME_STILL_PAPER_", &tree, names.into_iter()),
             vec!["HOME_STILL_PAPER_DOWNLOAD_TIMEOUT".to_string()]
         );
+    }
+
+    #[test]
+    fn unknown_keys_in_home_are_errors_naming_the_key_and_the_valid_ones() {
+        for yaml in [
+            "home:\n  project_directory: /x\n",
+            "home:\n  project_dir: /x\n  logdir: /y\n",
+        ] {
+            let home = home_with(Some(yaml));
+            let file = ConfigFile::load_in(home.path()).unwrap();
+            let err = file.project_dir().unwrap_err().to_string();
+            assert!(err.contains("`home`"), "{yaml}: {err}");
+            assert!(
+                err.contains("project_directory") || err.contains("logdir"),
+                "{err}"
+            );
+            assert!(
+                err.contains("project_dir") && err.contains("log_dir"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_found_at_any_depth_and_leaves_are_not_descended_into() {
+        let known = serde_json::json!({
+            "a": 1, "list": [], "maybe": null,
+            "nested": { "x": 1, "y": { "z": 1 } },
+        });
+        let actual = serde_json::json!({
+            "a": 2, "typo": 1, "list": [{"anything": 1}], "maybe": {"free": "form"},
+            "nested": { "x": 2, "w": 3, "y": { "z": 2, "q": 4 } },
+        });
+        let found: Vec<String> = unknown_keys(&actual, &known)
+            .into_iter()
+            .map(|u| u.path)
+            .collect();
+        assert_eq!(found, ["nested.w", "nested.y.q", "typo"]);
+        let top = unknown_keys(&actual, &known)
+            .into_iter()
+            .find(|u| u.path == "typo")
+            .unwrap();
+        assert_eq!(top.valid, ["a", "list", "maybe", "nested"]);
+        assert!(unknown_keys(&known, &known).is_empty());
+    }
+
+    #[test]
+    fn unknown_prefixed_env_skips_known_keys_in_any_tree_and_the_allowlist() {
+        let client = serde_json::json!({ "convert_timeout_secs": 1, "servers": [] });
+        let server = serde_json::json!({ "vlm_concurrency": 1 });
+        let names = [
+            "HS_SCRIBE_CONVERT_TIMEOUT_SECS",
+            "HS_SCRIBE_VLM_CONCURRENCY",
+            "HS_SCRIBE_TIMEOUT_SECS",
+            "HS_SCRIBE_DIAG_DIR",
+            "HS_SCRIBE_vlm_concurency",
+            "HS_OTHER_X",
+        ]
+        .map(String::from);
+        let unknown = unknown_prefixed_env(
+            "HS_SCRIBE_",
+            &[&client, &server],
+            &["HS_SCRIBE_DIAG_DIR"],
+            names.into_iter(),
+        );
+        assert_eq!(
+            unknown,
+            ["HS_SCRIBE_TIMEOUT_SECS", "HS_SCRIBE_vlm_concurency"]
+        );
+    }
+
+    #[test]
+    fn a_warning_is_logged_once_per_key() {
+        assert!(first_time("test-unique-key-a"));
+        assert!(!first_time("test-unique-key-a"));
+        assert!(first_time("test-unique-key-b"));
+    }
+
+    #[test]
+    fn the_variable_scanner_finds_variables_and_not_bare_prefixes() {
+        let text = "with the `HS_SCRIBE_` prefix set HS_SCRIBE_DPI=150 and\n  HS_SCRIBE_USE_CUDA: \"false\" (HS_SCRIBE_<KEY>) HS_SCRIBE_DPI";
+        assert_eq!(
+            env_names_in_text(text, "HS_SCRIBE_"),
+            ["HS_SCRIBE_DPI", "HS_SCRIBE_USE_CUDA"]
+        );
+        assert!(env_names_in_text("no variables here", "HS_SCRIBE_").is_empty());
+    }
+
+    #[cfg(feature = "storage")]
+    mod storage {
+        use super::*;
+
+        fn note(config: Option<&str>) -> (tempfile::TempDir, Option<String>) {
+            let home = home_with(config);
+            let file = ConfigFile::load_in(home.path()).unwrap();
+            let storage = crate::storage::StorageConfig::default();
+            let note = file.storage_default_note(&storage).unwrap();
+            (home, note)
+        }
+
+        #[test]
+        fn an_absent_storage_section_is_silent_on_the_default_project_dir() {
+            assert!(note(None).1.is_none());
+            assert!(note(Some("home:\n  log_dir: /var/log/hs\n")).1.is_none());
+        }
+
+        #[test]
+        fn an_absent_storage_section_with_a_moved_project_dir_names_both_paths() {
+            let (_home, note) = note(Some("home:\n  project_dir: /data/hs\n"));
+            let note = note.expect("must be announced");
+            let default_root = crate::storage::StorageConfig::default().local.root;
+            assert!(note.contains("/data/hs"), "{note}");
+            assert!(note.contains(&default_root.display().to_string()), "{note}");
+            assert!(note.contains("storage.local.root"), "{note}");
+        }
+
+        #[test]
+        fn the_default_root_is_not_moved_by_the_warning() {
+            // Only announced: relocating it would orphan the objects of
+            // every host that runs on today's default.
+            let home = home_with(Some("home:\n  project_dir: /data/hs\n"));
+            let file = ConfigFile::load_in(home.path()).unwrap();
+            assert_eq!(
+                file.storage().unwrap().local.root,
+                crate::storage::StorageConfig::default().local.root
+            );
+        }
+
+        #[test]
+        fn unknown_keys_in_storage_are_errors_naming_the_key() {
+            // `storage.root` instead of `storage.local.root` used to run on
+            // the default root without a word.
+            for yaml in [
+                "storage:\n  backend: local\n  root: /x\n",
+                "storage:\n  local:\n    rooot: /x\n",
+                "storage:\n  backend: s3\n  s3:\n    secret: x\n",
+            ] {
+                let home = home_with(Some(yaml));
+                let file = ConfigFile::load_in(home.path()).unwrap();
+                let err = file.storage().unwrap_err().to_string();
+                assert!(err.contains("`storage`"), "{yaml}: {err}");
+                assert!(err.contains("unknown field"), "{yaml}: {err}");
+            }
+            let home = home_with(Some("storage:\n  backend: local\n  local:\n    root: /x\n"));
+            let file = ConfigFile::load_in(home.path()).unwrap();
+            assert_eq!(
+                file.storage().unwrap().local.root,
+                std::path::PathBuf::from("/x")
+            );
+        }
     }
 }

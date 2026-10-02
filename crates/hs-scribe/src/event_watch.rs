@@ -715,12 +715,14 @@ pub async fn convert_and_upload(
 /// yields a delivery error) when the broker drops the consumer or the
 /// connection (a competing watcher deleting the durable, a broker restart,
 /// missed heartbeats); consumption has then stopped, so returning `Ok` would
-/// let the process exit 0 and stay down. Handlers already running are
-/// allowed to finish their ack/nak first.
+/// let the process exit 0 and stay down. Handlers already running get
+/// `drain_timeout` to finish their ack/nak; the ones still running after it
+/// are abandoned, named in an ERROR log, and redelivered after `ack_wait`.
 pub async fn run_subscriber<F, Fut>(
     bus: Arc<dyn EventBus>,
     _storage: Arc<dyn Storage>,
     concurrency: usize,
+    drain_timeout: Duration,
     handler: F,
 ) -> Result<()>
 where
@@ -740,6 +742,7 @@ where
     // all slots are busy, which gives JetStream back-pressure for free.
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let handler = Arc::new(handler);
+    let in_flight = hs_common::event_bus::InFlight::default();
 
     let mut delivery_error = None;
     // A handler that meets a fatal configuration error (the backend refuses
@@ -784,8 +787,10 @@ where
             .map_err(|_| anyhow::anyhow!("scribe worker semaphore closed"))?;
         let handler = Arc::clone(&handler);
         let fatal_tx = fatal_tx.clone();
+        let tracked = in_flight.track(parsed.key.clone());
         tokio::spawn(async move {
             let _permit = permit; // drop at scope end releases the slot
+            let _tracked = tracked;
             let key = parsed.key.clone();
             tracing::info!(key = %key, "scribe received ingested event");
             // The guard wraps the call too: a panic before the handler's
@@ -859,8 +864,18 @@ where
         });
     }
 
-    // Let handlers that are already running finish their ack/nak first.
-    let _ = sem.acquire_many(concurrency as u32).await;
+    // Let handlers that are already running finish their ack/nak, within
+    // the drain timeout.
+    let abandoned =
+        hs_common::event_bus::drain_in_flight(&sem, concurrency, drain_timeout, &in_flight).await;
+    let abandoned_note = if abandoned.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({} handler(s) abandoned after the drain timeout)",
+            abandoned.len()
+        )
+    };
     if let Some(e) = fatal {
         return Err(e);
     }
@@ -870,11 +885,11 @@ where
     }
     Err(match delivery_error {
         Some(e) => e.context(format!(
-            "event delivery for {} failed: the consumer is no longer receiving",
+            "event delivery for {} failed: the consumer is no longer receiving{abandoned_note}",
             specs::PAPERS_INGESTED.subject
         )),
         None => anyhow::anyhow!(
-            "event stream ended: the consumer or broker connection for {} is gone",
+            "event stream ended: the consumer or broker connection for {} is gone{abandoned_note}",
             specs::PAPERS_INGESTED.subject
         ),
     })
@@ -1236,14 +1251,20 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in = seen.clone();
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
-        let result = run_subscriber(bus, storage, concurrency, move |e| {
-            let seen = seen_in.clone();
-            async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                seen.lock().unwrap().push(e.key);
-                Ok(())
-            }
-        })
+        let result = run_subscriber(
+            bus,
+            storage,
+            concurrency,
+            Duration::from_secs(30),
+            move |e| {
+                let seen = seen_in.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    seen.lock().unwrap().push(e.key);
+                    Ok(())
+                }
+            },
+        )
         .await;
         let seen = seen.lock().unwrap().clone();
         (result, seen)
@@ -1374,7 +1395,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in = seen.clone();
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
-        let err = run_subscriber(bus, storage, 2, move |e| {
+        let err = run_subscriber(bus, storage, 2, Duration::from_secs(30), move |e| {
             let seen = seen_in.clone();
             async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1405,7 +1426,7 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         // Concurrency 1: the permit the panicking task held must be released
         // or the event after it would never be dispatched.
-        let result = run_subscriber(bus, storage, 1, move |e| {
+        let result = run_subscriber(bus, storage, 1, Duration::from_secs(30), move |e| {
             let seen = seen_in.clone();
             async move {
                 if e.key == "poison.pdf" {
@@ -1427,6 +1448,47 @@ mod tests {
         let mut seen = seen.lock().unwrap().clone();
         seen.sort();
         assert_eq!(seen, ["a.pdf", "b.pdf"]);
+    }
+
+    #[tokio::test]
+    async fn a_handler_that_never_finishes_is_abandoned_after_the_drain_timeout_and_named() {
+        let bus = Arc::new(FakeBus::default());
+        let (stuck, stuck_log) =
+            Event::recording("papers.ingested", br#"{"key":"stuck.pdf"}"#.to_vec());
+        let (quick, quick_log) =
+            Event::recording("papers.ingested", br#"{"key":"quick.pdf"}"#.to_vec());
+        *bus.to_consume.lock().unwrap() = vec![stuck, quick];
+        *bus.then_fail.lock().unwrap() = Some("missed idle heartbeat".into());
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
+        let started = std::time::Instant::now();
+        let err = run_subscriber(
+            bus,
+            storage,
+            2,
+            Duration::from_millis(300),
+            move |e| async move {
+                if e.key == "stuck.pdf" {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a delivery error must fail the subscriber");
+        // Bounded: it did not wait for the stuck handler forever.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        let shown = format!("{err:#}");
+        assert!(shown.contains("missed idle heartbeat"), "{shown}");
+        assert!(shown.contains("abandoned"), "{shown}");
+        // The finished one was acked; the abandoned one was left un-acked
+        // for the broker to redeliver after ack_wait.
+        use hs_common::event_bus::Settlement;
+        assert_eq!(quick_log.decisions(), [Settlement::Ack]);
+        assert!(stuck_log.decisions().is_empty());
     }
 
     // ── against the real scribe server (olmocr mode, stand-in CLI) ─────

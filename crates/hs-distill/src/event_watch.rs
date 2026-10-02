@@ -240,6 +240,7 @@ pub async fn run_subscriber<F, Fut>(
     bus: Arc<dyn EventBus>,
     _storage: Arc<dyn Storage>,
     concurrency: usize,
+    drain_timeout: std::time::Duration,
     handler: F,
 ) -> Result<()>
 where
@@ -256,6 +257,7 @@ where
 
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let handler = Arc::new(handler);
+    let in_flight = hs_common::event_bus::InFlight::default();
 
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<anyhow::Error>();
     let mut delivery_error = None;
@@ -303,8 +305,10 @@ where
         };
         let handler = Arc::clone(&handler);
         let fatal_tx = fatal_tx.clone();
+        let tracked = in_flight.track(parsed.key.clone());
         tokio::spawn(async move {
             let _permit = permit;
+            let _tracked = tracked;
             let key = parsed.key.clone();
             tracing::info!(key = %key, "distill received completed event");
             // A handler that panics terminates its event: a panic is a bug
@@ -382,15 +386,25 @@ where
     // durable, a broker restart, missed heartbeats). Consumption has
     // stopped, so this is a failure — returning Ok would let the process
     // exit 0 and stay down. Let handlers that are already running finish
-    // their ack/nak first.
-    let _ = sem.acquire_many(concurrency as u32).await;
+    // their ack/nak, within the drain timeout; the rest are abandoned and
+    // named in an ERROR log (their events are redelivered after ack_wait).
+    let abandoned =
+        hs_common::event_bus::drain_in_flight(&sem, concurrency, drain_timeout, &in_flight).await;
+    let abandoned_note = if abandoned.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({} handler(s) abandoned after the drain timeout)",
+            abandoned.len()
+        )
+    };
     Err(match delivery_error {
         Some(e) => e.context(format!(
-            "event delivery for {} failed: the consumer is no longer receiving",
+            "event delivery for {} failed: the consumer is no longer receiving{abandoned_note}",
             specs::SCRIBE_COMPLETED.subject
         )),
         None => anyhow::anyhow!(
-            "event stream ended: the consumer or broker connection for {} is gone",
+            "event stream ended: the consumer or broker connection for {} is gone{abandoned_note}",
             specs::SCRIBE_COMPLETED.subject
         ),
     })
@@ -805,14 +819,20 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in_handler = seen.clone();
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
-        let result = run_subscriber(bus, storage, concurrency, move |e| {
-            let seen = seen_in_handler.clone();
-            async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                seen.lock().push(e.key);
-                Ok(())
-            }
-        })
+        let result = run_subscriber(
+            bus,
+            storage,
+            concurrency,
+            Duration::from_secs(30),
+            move |e| {
+                let seen = seen_in_handler.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    seen.lock().push(e.key);
+                    Ok(())
+                }
+            },
+        )
         .await;
         let seen = seen.lock().clone();
         (result, seen)
@@ -855,7 +875,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in_handler = seen.clone();
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
-        let err = run_subscriber(bus, storage, 2, move |e| {
+        let err = run_subscriber(bus, storage, 2, Duration::from_secs(30), move |e| {
             let seen = seen_in_handler.clone();
             async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -887,7 +907,7 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         // Concurrency 1: the permit the panicking task held must be released
         // or the event after it would never be dispatched.
-        let result = run_subscriber(bus, storage, 1, move |e| {
+        let result = run_subscriber(bus, storage, 1, Duration::from_secs(30), move |e| {
             let seen = seen_in_handler.clone();
             async move {
                 if e.key == "poison" {
@@ -908,5 +928,46 @@ mod tests {
         let mut seen = seen.lock().clone();
         seen.sort();
         assert_eq!(seen, ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn a_handler_that_never_finishes_is_abandoned_after_the_drain_timeout_and_named() {
+        use hs_common::event_bus::Settlement;
+        let bus = Arc::new(FakeBus::default());
+        let (stuck, stuck_log) =
+            Event::recording("scribe.completed", br#"{"key":"stuck"}"#.to_vec());
+        let (quick, quick_log) =
+            Event::recording("scribe.completed", br#"{"key":"quick"}"#.to_vec());
+        *bus.events.lock() = vec![stuck, quick];
+        *bus.then_fail.lock() = Some("missed idle heartbeat".into());
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
+        let started = std::time::Instant::now();
+        let err = run_subscriber(
+            bus,
+            storage,
+            2,
+            Duration::from_millis(300),
+            move |e| async move {
+                if e.key == "stuck" {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a delivery error must fail the subscriber");
+        // Bounded: it did not wait for the stuck handler forever.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        let shown = format!("{err:#}");
+        assert!(shown.contains("missed idle heartbeat"), "{shown}");
+        assert!(shown.contains("abandoned"), "{shown}");
+        // The finished one was acked; the abandoned one is left un-acked for
+        // the broker to redeliver after ack_wait.
+        assert_eq!(quick_log.decisions(), [Settlement::Ack]);
+        assert!(stuck_log.decisions().is_empty());
     }
 }

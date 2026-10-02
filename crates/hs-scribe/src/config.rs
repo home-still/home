@@ -36,9 +36,27 @@ fn env_overrides(section: &'static str) -> Env {
     Env::prefixed("HS_SCRIBE_").map(move |key| format!("{section}.{key}").into())
 }
 
+/// `HS_SCRIBE_*` variables that are not config keys: read directly where
+/// they are used (diagnostics, a feature switch), so the unknown-variable
+/// warning leaves them alone.
+pub const NON_CONFIG_ENV: &[&str] = &["HS_SCRIBE_DIAG_DIR", "HS_SCRIBE_COLUMN_SPLIT_ACTIVE"];
+
+/// Default-valued JSON of both structs `HS_SCRIBE_<KEY>` can address (the
+/// client's and the server's keys are disjoint): the key tree the unknown
+/// keys of a section and the unknown variable names are judged against.
+fn key_trees() -> Result<(serde_json::Value, serde_json::Value), serde_json::Error> {
+    Ok((
+        serde_json::to_value(ScribeConfig::default())?,
+        serde_json::to_value(AppConfig::default())?,
+    ))
+}
+
 /// Layer `defaults`, the `section` of the config file and the `HS_SCRIBE_*`
 /// environment (later wins) and extract `T`. A section that is present but
 /// does not fit `T` is an error naming the file, the section and the key.
+/// A key in the section that no field has, and an `HS_SCRIBE_*` variable
+/// that sets nothing, are warnings (stale keys are common in deployed
+/// configs, so they are not errors), logged once.
 fn extract_section<T>(
     file: &ConfigFile,
     section: &'static str,
@@ -48,8 +66,18 @@ where
     T: Serialize + serde::de::DeserializeOwned,
 {
     let invalid = |e: figment::Error| ConfigError::section(file.path(), section, e);
+    let (client, server) =
+        key_trees().map_err(|e| ConfigError::section(file.path(), section, e))?;
+    let own = serde_json::to_value(defaults)
+        .map_err(|e| ConfigError::section(file.path(), section, e))?;
+    hs_common::config_file::warn_unknown_prefixed_env(
+        "HS_SCRIBE_",
+        &[&client, &server],
+        NON_CONFIG_ENV,
+    );
     let mut figment = Figment::from(Serialized::default(section, defaults));
     if let Some(from_file) = file.section_json(section)? {
+        hs_common::config_file::warn_unknown_keys(file.path(), section, &from_file, &own, &[]);
         figment = figment.merge(Serialized::default(section, from_file));
     }
     figment
@@ -588,7 +616,7 @@ impl ScribeConfig {
     pub fn from_file(file: &ConfigFile) -> Result<Self, ConfigError> {
         let defaults = Self::with_project_dir(&file.project_dir()?);
         let mut cfg: Self = extract_section(file, CLIENT_SECTION, &defaults)?;
-        cfg.storage = file.section("storage")?.unwrap_or_default();
+        cfg.storage = file.storage()?;
         cfg.events = EventBusConfig::from_file(file)?;
         cfg.validate()
             .map_err(|e| ConfigError::section(file.path(), CLIENT_SECTION, format!("{e:#}")))?;
@@ -1008,5 +1036,72 @@ mod tests {
             let err = with_env(&[], || AppConfig::from_file(&file)).expect_err(yaml);
             assert!(err.to_string().contains("`scribe_server`"), "{yaml}: {err}");
         }
+    }
+
+    // ── Unknown keys and variables (N9) ────────────────────────────────
+
+    #[test]
+    fn a_stale_key_in_a_service_section_is_a_warning_not_a_failure() {
+        let (_home, file) = home_with(Some(
+            "scribe:\n  convert_timeout_secs: 77\n  stale_key: 1\nscribe_server:\n  vlm_concurency: 2\n",
+        ));
+        let client = with_env(&[], || ScribeConfig::from_file(&file)).unwrap();
+        assert_eq!(client.convert_timeout_secs, 77, "known keys still apply");
+        let server = with_env(&[], || AppConfig::from_file(&file)).unwrap();
+        assert_eq!(
+            server.vlm_concurrency,
+            AppConfig::default().vlm_concurrency,
+            "a misspelt key changes nothing (and is warned about)"
+        );
+        let tree = serde_json::to_value(AppConfig::default()).unwrap();
+        let found = hs_common::config_file::unknown_keys(
+            &file.section_json(SERVER_SECTION).unwrap().unwrap(),
+            &tree,
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, "vlm_concurency");
+        assert!(found[0].valid.contains(&"vlm_concurrency".to_string()));
+    }
+
+    /// Every `HS_SCRIBE_*` variable that README, the compose files or the
+    /// Dockerfile tell an operator to set must set a real key (or be one of
+    /// the variables read directly). `HS_SCRIBE_TIMEOUT_SECS` was documented
+    /// and set in the e2e compose for a long time while mapping to no field.
+    #[test]
+    fn every_documented_variable_maps_to_a_field_or_a_direct_read() {
+        let documents = [
+            ("README.md", include_str!("../README.md")),
+            (
+                "docker-compose.yml",
+                include_str!("../docker/docker-compose.yml"),
+            ),
+            (
+                "docker-compose.e2e.yml",
+                include_str!("../docker/docker-compose.e2e.yml"),
+            ),
+            ("Dockerfile", include_str!("../docker/Dockerfile")),
+            (
+                "docs/deployment.md",
+                include_str!("../../../docs/deployment.md"),
+            ),
+        ];
+        let (client, server) = key_trees().unwrap();
+        let mut checked = 0;
+        for (name, text) in documents {
+            for var in hs_common::config_file::env_names_in_text(text, "HS_SCRIBE_") {
+                checked += 1;
+                let known = hs_common::config_file::unknown_prefixed_env(
+                    "HS_SCRIBE_",
+                    &[&client, &server],
+                    NON_CONFIG_ENV,
+                    std::iter::once(var.clone()),
+                );
+                assert!(
+                    known.is_empty(),
+                    "{name} documents {var}, which sets nothing"
+                );
+            }
+        }
+        assert!(checked > 10, "the scan found only {checked} variables");
     }
 }

@@ -74,6 +74,11 @@ pub struct LoggingConfig {
     pub s3_key_prefix: String,
     pub delete_on_ship_success: bool,
     pub spool_caps: SpoolCaps,
+    /// Findings of the config read that happened before the logger existed
+    /// (unknown keys in `logs:`); [`super::init`] logs each at WARN once the
+    /// subscriber is installed, where a `tracing::warn!` made earlier would
+    /// have been dropped.
+    pub notices: Vec<String>,
 }
 
 impl LoggingConfig {
@@ -98,6 +103,7 @@ impl LoggingConfig {
             s3_key_prefix,
             delete_on_ship_success: true,
             spool_caps: SpoolCaps::default(),
+            notices: Vec::new(),
         }
     }
 

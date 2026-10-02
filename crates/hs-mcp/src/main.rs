@@ -710,13 +710,18 @@ impl HomeStillMcp {
 
         // Event bus: `paper_download` and `scribe_convert` publish
         // `papers.ingested` / `scribe.completed`, so this server cannot run
-        // without one. A missing `events:` section, an unreachable broker or
-        // a build without NATS stops the start; the previous fallback to a
-        // bus that drops every publish reported success for downloads nobody
-        // would ever convert.
-        let events: Arc<dyn EventBus> = scribe_cfg.build_event_bus().await.map_err(|e| {
-            e.context("hs-mcp needs the event bus (`events:` in ~/.home-still/config.yaml)")
-        })?;
+        // without a valid `events:` section: a missing section, an invalid
+        // key, an unset auth variable or a build without NATS stops the
+        // start, and a bus that silently drops every publish is never
+        // substituted. The broker connection itself is made on first
+        // publish: only those two tools need it, and a broker outage must
+        // not take the dozen read-only tools (and a restart loop) with it.
+        let events: Arc<dyn EventBus> =
+            hs_common::event_bus::EventBusConfig::build_lazy(scribe_cfg.events.as_ref())
+                .await
+                .map_err(|e| {
+                    e.context("hs-mcp needs a valid `events:` section in ~/.home-still/config.yaml")
+                })?;
 
         // Config is the sole source of server URLs. To route through the
         // gateway, set the gateway URL explicitly in config (e.g.
@@ -961,12 +966,26 @@ impl HomeStillMcp {
         ))
     }
 
+    /// A tool that announces its result on the event bus checks, before it
+    /// does any work, that the bus can be reached: a download or conversion
+    /// whose announcement nobody receives is worse than a refusal.
+    async fn require_event_bus(&self, tool: &str) -> Result<(), String> {
+        self.events.ensure_ready().await.map_err(|e| {
+            format!(
+                "{tool} announces its result on the event bus and the bus is unreachable, so \
+                 nothing was done (read-only tools are unaffected): {e:#}"
+            )
+        })
+    }
+
     /// Convert the stored source of `stem` through the scribe watcher's own
     /// functions (`prepare_source` + `convert_and_upload`).
     async fn convert_source(&self, stem: &Stem) -> Result<String, String> {
         use hs_scribe::event_watch::{
             announce_completed, convert_and_upload, prepare_source, IngestedEvent, SourcePrep,
         };
+
+        self.require_event_bus("scribe_convert").await?;
 
         let source_key = self.find_source_key(stem).await?;
         let event = IngestedEvent {
@@ -1197,6 +1216,7 @@ impl HomeStillMcp {
 
         let doi = paper::stem::normalize_doi(&p.doi).map_err(|e| format!("invalid DOI: {e}"))?;
         let stem = paper::stem::doi_stem(&doi).map_err(|e| format!("invalid DOI: {e}"))?;
+        self.require_event_bus("paper_download").await?;
 
         let result = self
             .downloader

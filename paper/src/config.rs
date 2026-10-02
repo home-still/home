@@ -141,15 +141,25 @@ impl Config {
             "paper.download_path",
             user.project_dir()?.join("papers"),
         ));
+        let keys = Arc::new(known_keys()?);
         for file in [system, user] {
             for section in ["paper", "storage", "events"] {
                 if let Some(value) = file.section_json(section)? {
+                    if section == "paper" {
+                        // A stale or misspelt `paper:` key is ignored; say so.
+                        hs_common::config_file::warn_unknown_keys(
+                            file.path(),
+                            section,
+                            &value,
+                            &keys[section],
+                            &[],
+                        );
+                    }
                     figment = figment.merge(Serialized::default(section, value));
                 }
             }
         }
 
-        let keys = Arc::new(known_keys()?);
         reject_unknown_paper_env(&keys)?;
         let env_keys = Arc::clone(&keys);
         figment = figment.merge(
@@ -170,7 +180,7 @@ impl Config {
                 .extract::<StorageConfig>()
                 .with_context(|| format!("{shown}: invalid `storage` section"))?
         } else {
-            StorageConfig::default()
+            user.default_storage()?
         };
 
         config.events = if figment.contains("events") {
@@ -799,5 +809,26 @@ mod tests {
         assert_eq!(config.download_path, PathBuf::from("/elsewhere/papers"));
         // A broken `home` section is not "the default project dir".
         assert!(load_yaml(Some("home:\n  project_dir: [a]\n")).is_err());
+    }
+
+    #[test]
+    fn an_unknown_key_where_data_lives_is_an_error_and_elsewhere_a_warning() {
+        // `storage.root` for `storage.local.root` ran on the default root.
+        for yaml in [
+            "storage:\n  backend: local\n  root: /x\n",
+            "home:\n  project_directory: /x\n",
+        ] {
+            let err = format!("{:#}", load_yaml(Some(yaml)).expect_err(yaml));
+            assert!(
+                err.contains("unknown field") || err.contains("unknown"),
+                "{yaml}: {err}"
+            );
+        }
+        // A stale key in `paper:` is ignored (and warned about), not fatal.
+        let config = load_yaml(Some(
+            "paper:\n  download:\n    core_api_key: stale\n    timeout_secs: 55\n",
+        ))
+        .expect("stale keys in service sections must not stop the load");
+        assert_eq!(config.download.timeout_secs, 55);
     }
 }

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use futures::Stream;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -201,6 +202,131 @@ pub trait EventBus: Send + Sync {
     /// must be explicitly acked/naked/termed by the caller. See
     /// [`EventStream`] for how delivery failures are reported.
     async fn consume(&self, spec: &ConsumerSpec) -> anyhow::Result<EventStream>;
+
+    /// Fail now if this bus cannot be used. A bus that connects on first use
+    /// ([`LazyBus`]) establishes its connection here, so a caller that is
+    /// about to do expensive work for an event it must then publish can
+    /// refuse before starting. Buses that are connected when built have
+    /// nothing to check.
+    async fn ensure_ready(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// What a [`LazyBus`] connect function returns.
+pub type BusFuture = Pin<Box<dyn Future<Output = anyhow::Result<Arc<dyn EventBus>>> + Send>>;
+
+/// A bus whose connection is made on first use rather than at startup.
+///
+/// For processes that only occasionally publish (the MCP server: two tools
+/// publish, a dozen read-only ones do not), so that a broker outage costs
+/// those tools and nothing else instead of the whole process. The
+/// configuration is still validated when the bus is built
+/// ([`EventBusConfig::build_lazy`]); only the network connection is deferred.
+/// A failed connection is not remembered: the next call tries again, and
+/// once connected the client library reconnects by itself.
+pub struct LazyBus {
+    connect: Box<dyn Fn() -> BusFuture + Send + Sync>,
+    bus: tokio::sync::OnceCell<Arc<dyn EventBus>>,
+}
+
+impl LazyBus {
+    pub fn new(connect: impl Fn() -> BusFuture + Send + Sync + 'static) -> Self {
+        Self {
+            connect: Box::new(connect),
+            bus: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn bus(&self) -> anyhow::Result<&Arc<dyn EventBus>> {
+        self.bus.get_or_try_init(|| (self.connect)()).await
+    }
+}
+
+#[async_trait]
+impl EventBus for LazyBus {
+    async fn publish(&self, subject: &str, payload: &[u8]) -> anyhow::Result<()> {
+        self.bus().await?.publish(subject, payload).await
+    }
+
+    async fn consume(&self, spec: &ConsumerSpec) -> anyhow::Result<EventStream> {
+        self.bus().await?.consume(spec).await
+    }
+
+    async fn ensure_ready(&self) -> anyhow::Result<()> {
+        self.bus().await.map(|_| ())
+    }
+}
+
+/// The keys of the handlers a subscriber has started and not finished, so
+/// that a bounded drain can name what it abandons.
+#[derive(Clone, Default)]
+pub struct InFlight(Arc<Mutex<Vec<String>>>);
+
+/// Removes its key from [`InFlight`] when dropped (handler finished, or its
+/// task was cancelled or panicked).
+pub struct InFlightGuard {
+    set: InFlight,
+    key: String,
+}
+
+impl InFlight {
+    pub fn track(&self, key: impl Into<String>) -> InFlightGuard {
+        let key = key.into();
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(key.clone());
+        InFlightGuard {
+            set: self.clone(),
+            key,
+        }
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut keys = self.set.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = keys.iter().position(|k| *k == self.key) {
+            keys.swap_remove(at);
+        }
+    }
+}
+
+/// After a subscriber stopped consuming (delivery error, ended stream), wait
+/// up to `timeout` for the handlers it already started to finish their
+/// ack/nak, then give up on the rest. Returns the keys it gave up on (empty
+/// when everything finished) after logging them at ERROR: their events stay
+/// un-acked and the broker redelivers them after `ack_wait`, which beats a
+/// watcher that sits dead for as long as a book-length conversion.
+///
+/// `sem` is the dispatch semaphore (`concurrency` permits, one held per
+/// running handler).
+pub async fn drain_in_flight(
+    sem: &tokio::sync::Semaphore,
+    concurrency: usize,
+    timeout: Duration,
+    in_flight: &InFlight,
+) -> Vec<String> {
+    let all = u32::try_from(concurrency).unwrap_or(u32::MAX);
+    match tokio::time::timeout(timeout, sem.acquire_many(all)).await {
+        Ok(_) => Vec::new(),
+        Err(_) => {
+            let abandoned = in_flight.keys();
+            tracing::error!(
+                abandoned = ?abandoned,
+                drain_timeout_secs = timeout.as_secs(),
+                "event subscriber stopped; these handlers did not finish within the drain \
+                 timeout and are abandoned (their events stay un-acked and are redelivered \
+                 after ack_wait)"
+            );
+            abandoned
+        }
+    }
 }
 
 /// A bus that drops every publish and delivers nothing, selected by an
@@ -269,5 +395,99 @@ mod tests {
         ev.ack().await.unwrap();
         ev.nak(Some(Duration::from_secs(1))).await.unwrap();
         ev.term().await.unwrap();
+    }
+
+    /// A bus that records publishes, handed out by the lazy connect function.
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl EventBus for Recording {
+        async fn publish(&self, subject: &str, _payload: &[u8]) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(subject.to_string());
+            Ok(())
+        }
+        async fn consume(&self, _spec: &ConsumerSpec) -> anyhow::Result<EventStream> {
+            anyhow::bail!("not consumable")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lazy_bus_does_not_connect_until_used_and_retries_after_a_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = attempts.clone();
+        let bus = LazyBus::new(move || {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n < 2 {
+                    anyhow::bail!("broker unreachable (attempt {n})");
+                }
+                Ok(Arc::new(Recording::default()) as Arc<dyn EventBus>)
+            })
+        });
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "building connects nothing"
+        );
+
+        // Down: every use is an error carrying the cause, and none is cached.
+        let err = bus.publish("papers.ingested", b"x").await.unwrap_err();
+        assert!(err.to_string().contains("broker unreachable"), "{err}");
+        assert!(bus.ensure_ready().await.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        // Up: the next use connects, and later uses share that connection.
+        bus.ensure_ready().await.unwrap();
+        bus.publish("papers.ingested", b"x").await.unwrap();
+        bus.publish("scribe.completed", b"y").await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "connected exactly once");
+    }
+
+    #[tokio::test]
+    async fn the_drain_returns_at_once_when_nothing_is_running() {
+        let sem = tokio::sync::Semaphore::new(2);
+        let in_flight = InFlight::default();
+        let started = std::time::Instant::now();
+        let abandoned = drain_in_flight(&sem, 2, Duration::from_secs(30), &in_flight).await;
+        assert!(abandoned.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn the_drain_gives_up_after_its_timeout_and_names_what_it_abandoned() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        let in_flight = InFlight::default();
+        // One handler that finishes soon, one that never does.
+        for (key, runs) in [
+            ("quick.pdf", Some(Duration::from_millis(30))),
+            ("stuck.pdf", None),
+        ] {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let guard = in_flight.track(key);
+            tokio::spawn(async move {
+                let _held = (permit, guard);
+                match runs {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            });
+        }
+        let started = std::time::Instant::now();
+        let abandoned = drain_in_flight(&sem, 2, Duration::from_millis(300), &in_flight).await;
+        assert_eq!(abandoned, ["stuck.pdf"], "only the stuck handler is named");
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded");
+    }
+
+    #[test]
+    fn a_finished_handler_leaves_the_in_flight_set() {
+        let in_flight = InFlight::default();
+        let a = in_flight.track("a");
+        let b = in_flight.track("b");
+        drop(a);
+        assert_eq!(in_flight.keys(), ["b"]);
+        drop(b);
+        assert!(in_flight.keys().is_empty());
     }
 }

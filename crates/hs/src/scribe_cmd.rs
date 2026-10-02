@@ -374,6 +374,11 @@ pub(crate) async fn cmd_watch_events(
     let cfg = ScribeConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage()?;
     let bus = cfg.build_event_bus().await?;
+    let drain_timeout = cfg
+        .events
+        .as_ref()
+        .context("events section (checked by build_event_bus)")?
+        .drain_timeout();
 
     let convert_timeout = std::time::Duration::from_secs(cfg.convert_timeout_secs);
     // Resolve the converter servers. CLI `--server` override collapses to a
@@ -450,7 +455,7 @@ pub(crate) async fn cmd_watch_events(
         ceiling_secs = timeout_policy.ceiling_secs,
         "starting event-bus watcher with tiered least-loaded pool dispatch"
     );
-    run_subscriber(bus.clone(), storage.clone(), concurrency, move |event| {
+    run_subscriber(bus.clone(), storage.clone(), concurrency, drain_timeout, move |event| {
         let storage = storage_for_handler.clone();
         let bus = bus_for_handler.clone();
         let tiers = tiers.clone();

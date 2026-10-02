@@ -86,25 +86,110 @@ fn a_malformed_config_section_stops_the_server_naming_the_section() {
 
 #[test]
 fn a_missing_events_section_stops_the_server_instead_of_dropping_publishes() {
-    let home = home_with(
-        Some("storage:\n  backend: local\n  local:\n    root: /nonexistent-hs-root-for-test\n"),
-        Some(&format!("{TOKEN_VAR}={TOKEN}\n")),
-    );
-    let out = run_http(home.path());
-    assert!(!out.status.success());
-    let err = stderr(&out);
-    // Either the storage root or the bus is the first thing refused; the bus
-    // case is exercised once the storage root exists.
-    assert!(err.contains("storage") || err.contains("events"), "{err}");
-
+    let home = home_with(None, Some(&format!("{TOKEN_VAR}={TOKEN}\n")));
     let root = home.path().join("root");
     std::fs::create_dir_all(&root).unwrap();
-    let config = format!(
-        "storage:\n  backend: local\n  local:\n    root: {}\n",
-        root.display()
-    );
-    std::fs::write(home.path().join(".home-still/config.yaml"), config).unwrap();
+    write_config(&home, &format!("{}\n", storage_section(&root)));
     let out = run_http(home.path());
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("events"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("events.backend"), "{}", stderr(&out));
+}
+
+fn storage_section(root: &Path) -> String {
+    format!(
+        "storage:\n  backend: local\n  local:\n    root: {}\n",
+        root.display()
+    )
+}
+
+fn write_config(home: &tempfile::TempDir, config: &str) {
+    std::fs::write(home.path().join(".home-still/config.yaml"), config).unwrap();
+}
+
+#[test]
+fn an_invalid_events_section_still_stops_the_server_at_startup() {
+    // The broker connection is deferred; the configuration is not.
+    let root_home = home_with(None, Some(&format!("{TOKEN_VAR}={TOKEN}\n")));
+    let root = root_home.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    for (events, needle) in [
+        ("events:\n  backend: carrier-pigeon\n", "events"),
+        (
+            "events:\n  backend: nats\n  nats:\n    user: only-a-user\n",
+            "go together",
+        ),
+        (
+            "events:\n  backend: nats\n  nats:\n    token_env: HS_TEST_NATS_TOKEN_NOT_SET\n",
+            "HS_TEST_NATS_TOKEN_NOT_SET",
+        ),
+        (
+            "events:\n  backend: nats\n  nats:\n    credentials_file: /nonexistent/hs.creds\n",
+            "credentials_file",
+        ),
+    ] {
+        write_config(&root_home, &format!("{}{events}", storage_section(&root)));
+        let out = run_http(root_home.path());
+        assert!(!out.status.success(), "{events}");
+        assert!(stderr(&out).contains(needle), "{events}: {}", stderr(&out));
+    }
+}
+
+/// N6: with the broker down the server starts and stays up (the old
+/// behaviour was a restart loop that took every read-only tool with it).
+#[test]
+fn an_unreachable_broker_does_not_stop_the_server_from_starting() {
+    use std::io::{Read, Write};
+
+    let home = home_with(None, Some(&format!("{TOKEN_VAR}={TOKEN}\n")));
+    let root = home.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    // A closed loopback port is the broker.
+    write_config(
+        &home,
+        &format!(
+            "{}events:\n  backend: nats\n  nats:\n    url: nats://127.0.0.1:1\n",
+            storage_section(&root)
+        ),
+    );
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hs-mcp"))
+        .args(["--serve", &format!("127.0.0.1:{port}")])
+        .env_clear()
+        .env("HOME", home.path())
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let mut answer = None;
+    while started.elapsed() < std::time::Duration::from_secs(30) {
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut err = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = s.read_to_string(&mut err);
+            }
+            panic!("the server exited ({status}) with the broker down: {err}");
+        }
+        if let Ok(mut conn) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            conn.write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut head = String::new();
+            let _ = conn.read_to_string(&mut head);
+            answer = Some(head);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    // Up, and answering (unauthenticated requests get 401): the broker is
+    // only needed once a tool publishes.
+    let answer = answer.expect("the server never started listening");
+    assert!(answer.starts_with("HTTP/1.1 401"), "{answer}");
 }

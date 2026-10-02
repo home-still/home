@@ -191,7 +191,9 @@ Server-side settings use environment variables with the `HS_SCRIBE_` prefix (`HS
 | `HS_SCRIBE_OPENAI_URL` | `http://localhost:8080` | OpenAI-compatible server URL |
 | `HS_SCRIBE_CLOUD_URL` | `https://api.z.ai/...` | Cloud API endpoint |
 | `HS_SCRIBE_CLOUD_API_KEY` | *(none)* | Bearer token for cloud backend |
-| `HS_SCRIBE_TIMEOUT_SECS` | `120` | VLM request timeout |
+| `HS_SCRIBE_VLM_IDLE_TIMEOUT_SECS` | `300` | Longest silence tolerated on a VLM backend connection (first byte, then between reads of a streaming answer) |
+| `HS_SCRIBE_OLLAMA_REQUEST_TIMEOUT_SECS` | `600` | Longest one Ollama generate call may take (Ollama backend only) |
+| `HS_SCRIBE_CONVERT_DEADLINE_SECS` | `900` | Wall-clock deadline of one conversion on the server |
 
 ### Performance tuning
 

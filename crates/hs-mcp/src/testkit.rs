@@ -225,6 +225,15 @@ pub fn server_with_bus(storage: Arc<dyn Storage>, bus: Arc<RecordingBus>) -> Hom
     .unwrap()
 }
 
+/// [`server`] over an arbitrary event bus (for example a lazily connected
+/// one whose broker is down).
+pub fn server_with_event_bus(
+    storage: Arc<dyn Storage>,
+    events: Arc<dyn hs_common::event_bus::EventBus>,
+) -> HomeStillMcp {
+    HomeStillMcp::from_deps(deps(storage, events, Vec::new(), Vec::new())).unwrap()
+}
+
 /// A server over a synthetic OpenAlex DuckDB (a file in `dir`, never the real
 /// corpus) holding a handful of works. The readiness sentinel is set so the
 /// `openalex_*` tools stay exposed.

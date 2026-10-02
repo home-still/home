@@ -108,6 +108,10 @@ pub fn init(cfg: LoggingConfig) -> LoggingHandle {
             .try_init();
     }
 
+    for notice in &cfg.notices {
+        tracing::warn!("{notice}");
+    }
+
     let (rotate_shutdown, _) = watch::channel(false);
 
     LoggingHandle {
@@ -282,6 +286,10 @@ pub struct ConfigSections {
     pub logs: LogsYaml,
     /// `home.log_dir`, or `<home.project_dir>/logs`.
     pub log_dir: std::path::PathBuf,
+    /// Warnings about the file found while reading these sections (unknown
+    /// keys in `logs:`), to be logged once the logger exists: see
+    /// [`LoggingConfig::notices`].
+    pub notices: Vec<String>,
 }
 
 /// Read the `storage:` and `logs:` sections and the log directory from
@@ -299,10 +307,19 @@ pub fn load_config_sections() -> Result<ConfigSections, crate::config_file::Conf
 pub fn sections_of(
     file: &crate::config_file::ConfigFile,
 ) -> Result<ConfigSections, crate::config_file::ConfigError> {
+    let logs_notices = match file.section_json("logs")? {
+        Some(section) => {
+            let known = serde_json::to_value(LogsYaml::default())
+                .map_err(|e| crate::config_file::ConfigError::section(file.path(), "logs", e))?;
+            crate::config_file::unknown_key_notices(file.path(), "logs", &section, &known, &[])
+        }
+        None => Vec::new(),
+    };
     Ok(ConfigSections {
         storage: file.section("storage")?,
         logs: file.section("logs")?.unwrap_or_default(),
         log_dir: file.log_dir()?,
+        notices: logs_notices,
     })
 }
 
@@ -317,6 +334,7 @@ impl ConfigSections {
             storage: None,
             logs: LogsYaml::default(),
             log_dir: crate::default_project_dir().join("logs"),
+            notices: Vec::new(),
         }
     }
 
@@ -328,6 +346,7 @@ impl ConfigSections {
     ) -> Result<LoggingConfig, InvalidLogsConfig> {
         let mut cfg = LoggingConfig::for_service(service, &self.log_dir).with_stderr(stderr);
         self.logs.apply_to(&mut cfg)?;
+        cfg.notices = self.notices.clone();
         Ok(cfg)
     }
 }
@@ -535,5 +554,36 @@ mod tests {
         assert_eq!(s.log_dir, std::path::PathBuf::from("/srv/hs/logs"));
         assert_eq!(s.logs.bucket, "audit");
         assert_eq!(s.storage.unwrap().backend, Backend::Local);
+    }
+
+    #[test]
+    fn unknown_logs_keys_are_warnings_carried_to_the_logger_not_errors() {
+        let home = home_with(Some(
+            "logs:\n  bucket: audit\n  ship_interval: 30\n  rotate_max_bytez: 1\n",
+        ));
+        let s = sections(&home).expect("a stale key must not stop the process");
+        assert_eq!(s.logs.bucket, "audit");
+        assert_eq!(s.notices.len(), 2, "{:?}", s.notices);
+        assert!(
+            s.notices[0].contains("logs.rotate_max_bytez"),
+            "{:?}",
+            s.notices
+        );
+        assert!(
+            s.notices[1].contains("logs.ship_interval"),
+            "{:?}",
+            s.notices
+        );
+        assert!(
+            s.notices[0].contains("ship_interval_secs"),
+            "names the valid keys"
+        );
+        // They travel with the logging config, which `init` logs from once
+        // the subscriber exists (a warn! made while reading is dropped).
+        let cfg = s.logging_config("t", StderrOutput::Disabled).unwrap();
+        assert_eq!(cfg.notices, s.notices);
+
+        let clean = sections(&home_with(Some("logs:\n  bucket: audit\n"))).unwrap();
+        assert!(clean.notices.is_empty());
     }
 }

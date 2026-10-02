@@ -12,7 +12,7 @@ pub enum Backend {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LocalConfig {
     pub root: PathBuf,
 }
@@ -28,7 +28,7 @@ impl Default for LocalConfig {
 /// `Debug` is hand-written: it must not print the access key or the secret
 /// (a `{:?}` of any config embedding this struct would otherwise log them).
 #[derive(Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct S3ConfigYaml {
     pub endpoint: String,
     pub bucket: String,
@@ -52,7 +52,7 @@ impl std::fmt::Debug for S3ConfigYaml {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub backend: Backend,
     pub local: LocalConfig,

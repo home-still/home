@@ -124,14 +124,22 @@ impl Config {
     /// [`Self::load`] against already-read config files.
     pub fn load_from(system: &ConfigFile, user: &ConfigFile) -> Result<Self> {
         let project_dir = user.project_dir().map_err(config_error)?;
+        let keys = known_keys()?;
         let mut figment = Figment::new().merge(Serialized::default("personal", Self::default()));
         for file in [system, user] {
             if let Some(section) = file.section_json("personal").map_err(config_error)? {
+                // A stale or misspelt `personal:` key is ignored; say so.
+                hs_common::config_file::warn_unknown_keys(
+                    file.path(),
+                    "personal",
+                    &section,
+                    &keys["personal"],
+                    &[],
+                );
                 figment = figment.merge(Serialized::default("personal", section));
             }
         }
 
-        let keys = known_keys()?;
         let unknown = unknown_env_names(
             ENV_PREFIX,
             &format!("{ENV_PREFIX}PERSONAL_"),

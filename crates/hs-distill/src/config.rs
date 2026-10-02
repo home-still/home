@@ -95,11 +95,19 @@ pub const SERVER_SECTION: &str = "distill_server";
 /// Section holding the client's settings ([`DistillClientConfig`]).
 pub const CLIENT_SECTION: &str = "distill";
 
+/// `HS_DISTILL_*` variables that are not config keys. None today: the one
+/// the CLI sets for the server it starts (`HS_DISTILL_PORT`) is the `port`
+/// key. Kept as the explicit allowlist the warning below honours.
+pub const NON_CONFIG_ENV: &[&str] = &[];
+
 /// Layer `defaults`, the `section` of the config file and the `HS_DISTILL_*`
 /// environment (later wins; `HS_DISTILL_<KEY>` overrides `<section>.<key>`
 /// for the section's top-level keys) and extract `T`. A section that is
 /// present but does not fit `T` is an error naming the file, the section
-/// and the key.
+/// and the key. A key in the section that no field has (other than the
+/// [`REMOVED_KEYS`], which have their own warning) and an `HS_DISTILL_*`
+/// variable that sets nothing are warnings, logged once: stale keys are
+/// common in deployed configs, so they are not errors.
 fn extract_section<T>(
     file: &ConfigFile,
     section: &'static str,
@@ -108,8 +116,26 @@ fn extract_section<T>(
 where
     T: Serialize + serde::de::DeserializeOwned,
 {
+    let invalid = |e: serde_json::Error| ConfigError::section(file.path(), section, e);
+    let own = serde_json::to_value(defaults).map_err(invalid)?;
+    let project = file.project_dir()?;
+    let server =
+        serde_json::to_value(DistillServerConfig::with_project_dir(&project)).map_err(invalid)?;
+    let client =
+        serde_json::to_value(DistillClientConfig::with_project_dir(&project)).map_err(invalid)?;
+    hs_common::config_file::warn_unknown_prefixed_env(
+        "HS_DISTILL_",
+        &[&server, &client],
+        NON_CONFIG_ENV,
+    );
     let mut figment = Figment::from(Serialized::default(section, defaults));
     if let Some(from_file) = file.section_json(section)? {
+        let removed: &[&str] = if section == SERVER_SECTION {
+            &REMOVED_KEYS
+        } else {
+            &[]
+        };
+        hs_common::config_file::warn_unknown_keys(file.path(), section, &from_file, &own, removed);
         figment = figment.merge(Serialized::default(section, from_file));
     }
     figment
@@ -590,7 +616,7 @@ impl DistillClientConfig {
     pub fn from_file(file: &ConfigFile) -> Result<Self, ConfigError> {
         let defaults = Self::with_project_dir(&file.project_dir()?);
         let mut cfg: Self = extract_section(file, CLIENT_SECTION, &defaults)?;
-        cfg.storage = file.section("storage")?.unwrap_or_default();
+        cfg.storage = file.storage()?;
         cfg.events = EventBusConfig::from_file(file)?;
         cfg.validate()
             .map_err(|e| ConfigError::section(file.path(), CLIENT_SECTION, e))?;
@@ -1058,5 +1084,70 @@ mod tests {
             ..DistillClientConfig::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn a_stale_or_misspelt_key_is_a_warning_not_a_failure_and_removed_keys_keep_their_own() {
+        let (_home, file) = home_with(Some(
+            "distill_server:\n  port: 7555\n  qdrant_urll: http://x\n  embedding:\n    model: bge-m3\n    batchsize: 4\ndistill:\n  index_timeout: 5\n",
+        ));
+        let server = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();
+        assert_eq!(server.port, 7555);
+        assert_eq!(server.qdrant_url, DistillServerConfig::default().qdrant_url);
+        with_env(&[], || DistillClientConfig::from_file(&file)).unwrap();
+
+        let tree = serde_json::to_value(DistillServerConfig::default()).unwrap();
+        let section = file.section_json(SERVER_SECTION).unwrap().unwrap();
+        let found: Vec<String> = hs_common::config_file::unknown_key_notices(
+            file.path(),
+            SERVER_SECTION,
+            &section,
+            &tree,
+            &REMOVED_KEYS,
+        )
+        .into_iter()
+        .collect();
+        // `embedding.model` is a removed key with its own warning; the two
+        // typos are reported, naming the section and the valid keys.
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found
+            .iter()
+            .any(|n| n.contains("distill_server.qdrant_urll")));
+        assert!(found
+            .iter()
+            .any(|n| n.contains("distill_server.embedding.batchsize") && n.contains("batch_size")));
+    }
+
+    /// Every `HS_DISTILL_*` variable the README or the deployment guide
+    /// tells an operator about must set a real key (or be allow-listed).
+    #[test]
+    fn every_documented_variable_maps_to_a_field() {
+        let documents = [
+            ("README.md", include_str!("../README.md")),
+            (
+                "docs/deployment.md",
+                include_str!("../../../docs/deployment.md"),
+            ),
+        ];
+        let project = hs_common::default_project_dir();
+        let server = serde_json::to_value(DistillServerConfig::with_project_dir(&project)).unwrap();
+        let client = serde_json::to_value(DistillClientConfig::with_project_dir(&project)).unwrap();
+        let mut checked = 0;
+        for (name, text) in documents {
+            for var in hs_common::config_file::env_names_in_text(text, "HS_DISTILL_") {
+                checked += 1;
+                let unknown = hs_common::config_file::unknown_prefixed_env(
+                    "HS_DISTILL_",
+                    &[&server, &client],
+                    NON_CONFIG_ENV,
+                    std::iter::once(var.clone()),
+                );
+                assert!(
+                    unknown.is_empty(),
+                    "{name} documents {var}, which sets nothing"
+                );
+            }
+        }
+        assert!(checked >= 1, "the scan found no variables");
     }
 }

@@ -400,3 +400,78 @@ mod openalex {
         assert_eq!(ids(&out).len(), 3);
     }
 }
+
+/// RA-7 / N6: the server starts without the broker; only the tools that
+/// announce on it fail, and they fail loudly and before doing any work.
+mod broker_outage {
+    use super::*;
+    use hs_common::event_bus::config::NatsYaml;
+    use hs_common::event_bus::{EventBusConfig, EventsBackend};
+    use hs_common::storage::Storage;
+
+    /// A lazily connected NATS bus whose broker is a closed loopback port.
+    async fn unreachable_bus() -> Arc<dyn hs_common::event_bus::EventBus> {
+        let cfg = EventBusConfig {
+            backend: EventsBackend::Nats,
+            nats: NatsYaml {
+                url: "nats://127.0.0.1:1".into(),
+                ..NatsYaml::default()
+            },
+        };
+        // Building it succeeds: the configuration is valid, nothing connects.
+        EventBusConfig::build_lazy(Some(&cfg)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_only_tools_work_and_publishing_tools_error_loudly() {
+        let storage = FaultyStorage::new();
+        seed_markdown(
+            &*storage,
+            "paper-a",
+            "# A\n\nBody text long enough to index.",
+        )
+        .await;
+        let mcp = crate::testkit::server_with_event_bus(storage.clone(), unreachable_bus().await);
+
+        // Read-only: unaffected by the outage.
+        let listed = mcp
+            .markdown_list(Parameters(crate::ListParams {
+                limit: None,
+                offset: None,
+                embedded: None,
+            }))
+            .await
+            .expect("read-only tools must not depend on the broker");
+        assert!(listed.contains("paper-a"), "{listed}");
+
+        // scribe_convert refuses before it touches the source.
+        let err = mcp
+            .convert_source(&crate::stem::Stem::parse("paper-a").unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("scribe_convert") && err.contains("event bus"),
+            "{err}"
+        );
+        assert!(err.contains("nothing was done"), "{err}");
+
+        // paper_download refuses before any network request or storage write.
+        let err = mcp
+            .paper_download(Parameters(crate::PaperDownloadParams {
+                doi: "10.1234/abc".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("paper_download") && err.contains("event bus"),
+            "{err}"
+        );
+        assert!(
+            !storage
+                .exists("papers/10/10.1234_abc.pdf")
+                .await
+                .unwrap_or(false),
+            "nothing may be stored"
+        );
+    }
+}
