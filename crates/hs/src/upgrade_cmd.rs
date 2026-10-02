@@ -327,21 +327,6 @@ fn local_service_url<'a>(urls: impl IntoIterator<Item = &'a str>, service: &str)
     )
 }
 
-/// The distill server must be running on CUDA: assert it, never change it.
-async fn assert_distill_cuda(base_url: &str) -> Result<()> {
-    let health = hs_distill::client::DistillClient::new(base_url)?
-        .health()
-        .await
-        .with_context(|| format!("distill health probe failed at {base_url}"))?;
-    if !health.compute_device.eq_ignore_ascii_case("cuda") {
-        anyhow::bail!(
-            "distill at {base_url} reports compute_device `{}`, expected cuda",
-            health.compute_device
-        );
-    }
-    Ok(())
-}
-
 async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
     let scribe_compose = hidden_dir().join("docker-compose.yml");
@@ -353,16 +338,14 @@ async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     if hidden_dir().join("docker-compose-distill.yml").exists() {
-        // Docker: the container must come up and be on CUDA.
-        let cfg = hs_distill::config::DistillClientConfig::load()
-            .map_err(|e| anyhow::anyhow!("distill config: {e}"))?;
-        let url = local_service_url(cfg.servers.iter().map(String::as_str), "distill")?;
-        hs_common::compose::wait_for_url(&format!("{url}/health"), HEALTH_WAIT_SECS, "distill")
+        // That compose file (written by `hs distill init`) runs Qdrant only;
+        // the distill server is always a native unit, checked below.
+        let qdrant = crate::distill_cmd::qdrant_rest_url()?;
+        hs_common::compose::wait_for_url(&format!("{qdrant}/healthz"), HEALTH_WAIT_SECS, "Qdrant")
             .await?;
-        assert_distill_cuda(&url).await?;
-        reporter.status("Health", "distill: OK (cuda)");
-    } else if find_companion_binary("hs-distill-server").is_some() {
-        // Native install: distill is a unit running `hs-distill-server`.
+        reporter.status("Health", "Qdrant: OK");
+    }
+    if find_companion_binary("hs-distill-server").is_some() {
         let cfg = hs_distill::config::DistillClientConfig::load()
             .map_err(|e| anyhow::anyhow!("distill config: {e}"))?;
         verify_native_distill(&cfg.servers, reporter).await?;
@@ -479,24 +462,6 @@ mod tests {
                 r#"{{"status":"ok","compute_device":"{device}","collection":"c"}}"#
             )),
         )])
-    }
-
-    #[tokio::test]
-    async fn distill_reporting_cpu_fails_the_cuda_assertion() {
-        let base = serve(health_route("Cpu")).await;
-        let err = assert_distill_cuda(&base).await.unwrap_err();
-        assert!(format!("{err:#}").contains("cuda"), "{err:#}");
-    }
-
-    #[tokio::test]
-    async fn distill_reporting_cuda_passes_and_unreachable_distill_fails() {
-        let base = serve(health_route("Cuda")).await;
-        assert_distill_cuda(&base).await.unwrap();
-        let dead = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            format!("http://{}", l.local_addr().unwrap())
-        };
-        assert!(assert_distill_cuda(&dead).await.is_err());
     }
 
     #[test]

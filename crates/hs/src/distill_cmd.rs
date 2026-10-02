@@ -59,6 +59,13 @@ fn qdrant_rest_from_grpc(grpc_url: &str) -> String {
     )
 }
 
+/// Qdrant's REST base URL, from the distill server's configured gRPC URL.
+pub(crate) fn qdrant_rest_url() -> Result<String> {
+    Ok(qdrant_rest_from_grpc(
+        &DistillServerConfig::load()?.qdrant_url,
+    ))
+}
+
 fn distill_compose_yaml(data_dir: &std::path::Path) -> String {
     format!(
         r#"services:
