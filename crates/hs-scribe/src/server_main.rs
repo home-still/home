@@ -34,10 +34,15 @@ async fn async_main() -> Result<()> {
     let logging_handle = install_logging().await;
     let args = Args::parse();
 
+    // No fallback: a malformed `scribe_server:` section, a bad HS_SCRIBE_*
+    // value or a setting the server cannot run with stops the start (before
+    // anything heavy is initialised).
+    let config = AppConfig::load().context("loading the scribe server configuration")?;
+
     // Every route but /health and /readiness requires this secret; there is
     // no unauthenticated mode, and the server binds all interfaces by
-    // default. Checked first: a host without the token must not spend a
-    // model load discovering it.
+    // default. Checked before anything is loaded: a host without the token
+    // must not spend a model load discovering it.
     let token = hs_scribe::server::backend_token(|name| std::env::var(name))?;
 
     // libpdfium counts every PDF's pages (and renders them on Legacy hosts):
@@ -48,11 +53,6 @@ async fn async_main() -> Result<()> {
              system library path, or drop it into ~/.local/lib or ~/.home-still/dyld-libs"
         )
     })?;
-
-    // No fallback: a malformed `scribe_server:` section, a bad HS_SCRIBE_*
-    // value or a setting the server cannot run with stops the start (before
-    // anything heavy is initialised).
-    let config = AppConfig::load().context("loading the scribe server configuration")?;
 
     // libonnxruntime defaults to "warning" verbosity, which floods the log with
     // shape-inference noise (logical_and_0.tmp_0.0, fill_constant_27.tmp_0.0)

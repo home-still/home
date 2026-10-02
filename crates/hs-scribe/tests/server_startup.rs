@@ -51,3 +51,20 @@ fn a_bad_environment_override_refuses_to_start() {
         stderr(&out)
     );
 }
+
+#[test]
+fn a_server_without_the_backend_token_refuses_to_start() {
+    // A valid (empty) configuration: the token is the only thing missing.
+    let out = run("", &[]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("HS_BACKEND_TOKEN"), "{err}");
+
+    let out = run("", &[("HS_BACKEND_TOKEN", "too-short")]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("HS_BACKEND_TOKEN") && !err.contains("too-short"),
+        "{err}"
+    );
+}
