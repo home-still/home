@@ -174,11 +174,13 @@ impl LocalFsStorage {
     /// filesystem path: every trait method goes through it.
     fn resolve(&self, key: &str) -> anyhow::Result<PathBuf> {
         validate_key(key)?;
+        check_local_name(key)?;
         Ok(self.root.join(key))
     }
 
     fn resolve_prefix(&self, prefix: &str) -> anyhow::Result<PathBuf> {
         validate_prefix(prefix)?;
+        check_local_name(prefix)?;
         Ok(self.root.join(prefix))
     }
 
@@ -187,6 +189,23 @@ impl LocalFsStorage {
             .ok()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
     }
+}
+
+/// Win32 silently strips a trailing '.' or ' ' from every path segment, so on
+/// Windows such a key would name a different file (or fail with access
+/// denied). Refused there as an invalid key; other platforms store it as is.
+fn check_local_name(key: &str) -> Result<(), InvalidKey> {
+    if cfg!(windows)
+        && key
+            .split('/')
+            .any(|seg| seg.ends_with('.') || seg.ends_with(' '))
+    {
+        return Err(InvalidKey {
+            key: key.to_string(),
+            reason: "a segment ends with '.' or ' ' (not storable on Windows)",
+        });
+    }
+    Ok(())
 }
 
 /// Write `bytes` to `tmp`, fsync it, then rename it over `path`. Readers see
@@ -409,9 +428,17 @@ mod tests {
     async fn local_fs_accepts_dots_and_percent_inside_names() {
         let tmp = tempfile::tempdir().unwrap();
         let s = LocalFsStorage::new(tmp.path());
-        for key in ["a/..b/c..d.md", "a/foo%3Cbar.md", "a/...", "a/.hidden"] {
+        for key in ["a/..b/c..d.md", "a/foo%3Cbar.md", "a/.hidden"] {
             s.put(key, b"ok".to_vec()).await.unwrap();
             assert_eq!(s.get(key).await.unwrap(), b"ok", "{key}");
+        }
+        // A trailing '.' is a valid name everywhere but Windows (Win32 strips it).
+        let trailing = s.put("a/...", b"ok".to_vec()).await;
+        if cfg!(windows) {
+            assert!(is_invalid_key(&trailing.unwrap_err()));
+        } else {
+            trailing.unwrap();
+            assert_eq!(s.get("a/...").await.unwrap(), b"ok");
         }
     }
 

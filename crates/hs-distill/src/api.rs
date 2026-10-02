@@ -449,10 +449,21 @@ impl DistillServerState {
 /// that yields none is rejected — the old `"unknown"` fallback merged every
 /// such document into one doc id.
 pub fn doc_id_from_hint(path: &str) -> Result<String, ApiError> {
-    let stem = std::path::Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| ApiError::bad_request(format!("`path` {path:?} has no document name")))?;
+    // A storage key or file name from the client: '/'-separated on every
+    // platform. Parsed as text, not as an OS path (on Windows `Path` also
+    // splits on '\', which would file `a\b` under `b`).
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(ApiError::bad_request(format!(
+            "`path` {path:?} has no document name"
+        )));
+    }
+    // `Path::file_stem` semantics: drop the last extension, but a leading
+    // dot (".hidden") is part of the name.
+    let stem = match name.rfind('.') {
+        Some(0) | None => name,
+        Some(i) => &name[..i],
+    };
     validate_doc_id(stem)?;
     Ok(stem.to_string())
 }
