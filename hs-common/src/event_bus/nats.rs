@@ -292,16 +292,24 @@ impl NatsBus {
         if drift.is_empty() {
             return Ok(consumer);
         }
+        let fixed: Vec<&Drift> = drift.iter().filter(|d| !d.mutable).collect();
+        if !fixed.is_empty() {
+            return Err(immutable_drift_error(
+                spec.durable_name,
+                spec.stream,
+                &fixed,
+            ));
+        }
+        let names = drift.iter().map(|d| d.field).collect::<Vec<_>>().join(", ");
         tracing::warn!(
             consumer = spec.durable_name,
-            differs = %drift.join(", "),
+            differs = %names,
             "existing consumer does not match the configured one; updating it in place"
         );
         stream.update_consumer(config).await.map_err(|e| {
             anyhow::anyhow!(
-                "update consumer {} (differs in {}): {e}",
-                spec.durable_name,
-                drift.join(", ")
+                "update consumer {} (differs in {names}): {e}",
+                spec.durable_name
             )
         })
     }
@@ -342,7 +350,20 @@ struct ConsumerShape {
     max_deliver: i64,
     max_ack_pending: i64,
     filter_subject: String,
-    explicit_ack: bool,
+    ack_policy: String,
+    deliver_policy: String,
+    backoff: Vec<Duration>,
+}
+
+/// One setting in which the live consumer differs from the wanted one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Drift {
+    field: &'static str,
+    live: String,
+    wanted: String,
+    /// JetStream accepts a change of this setting on an existing consumer.
+    /// `ack_policy` and `deliver_policy` are fixed at creation.
+    mutable: bool,
 }
 
 impl ConsumerShape {
@@ -352,10 +373,9 @@ impl ConsumerShape {
             max_deliver: config.max_deliver,
             max_ack_pending: config.max_ack_pending,
             filter_subject: config.filter_subject.clone(),
-            explicit_ack: matches!(
-                config.ack_policy,
-                async_nats::jetstream::consumer::AckPolicy::Explicit
-            ),
+            ack_policy: format!("{:?}", config.ack_policy),
+            deliver_policy: format!("{:?}", config.deliver_policy),
+            backoff: config.backoff.clone(),
         }
     }
 
@@ -365,34 +385,95 @@ impl ConsumerShape {
             max_deliver: config.max_deliver,
             max_ack_pending: config.max_ack_pending,
             filter_subject: config.filter_subject.clone(),
-            explicit_ack: matches!(
-                config.ack_policy,
-                async_nats::jetstream::consumer::AckPolicy::Explicit
-            ),
+            ack_policy: format!("{:?}", config.ack_policy),
+            deliver_policy: format!("{:?}", config.deliver_policy),
+            backoff: config.backoff.clone(),
         }
     }
 
-    /// Names of the settings in which `self` (what the server has) differs
-    /// from `wanted`. Empty: the consumer can be used as it is.
-    fn drift_from(&self, wanted: &Self) -> Vec<&'static str> {
+    /// The settings in which `self` (what the server has) differs from
+    /// `wanted`. Empty: the consumer can be used as it is.
+    fn drift_from(&self, wanted: &Self) -> Vec<Drift> {
         let mut drift = Vec::new();
-        if self.ack_wait != wanted.ack_wait {
-            drift.push("ack_wait");
-        }
-        if self.max_deliver != wanted.max_deliver {
-            drift.push("max_deliver");
-        }
-        if self.max_ack_pending != wanted.max_ack_pending {
-            drift.push("max_ack_pending");
-        }
-        if self.filter_subject != wanted.filter_subject {
-            drift.push("filter_subject");
-        }
-        if self.explicit_ack != wanted.explicit_ack {
-            drift.push("ack_policy");
-        }
+        let mut check = |field, live: String, want: String, mutable, same: bool| {
+            if !same {
+                drift.push(Drift {
+                    field,
+                    live,
+                    wanted: want,
+                    mutable,
+                });
+            }
+        };
+        check(
+            "ack_wait",
+            format!("{:?}", self.ack_wait),
+            format!("{:?}", wanted.ack_wait),
+            true,
+            self.ack_wait == wanted.ack_wait,
+        );
+        check(
+            "max_deliver",
+            self.max_deliver.to_string(),
+            wanted.max_deliver.to_string(),
+            true,
+            self.max_deliver == wanted.max_deliver,
+        );
+        check(
+            "max_ack_pending",
+            self.max_ack_pending.to_string(),
+            wanted.max_ack_pending.to_string(),
+            true,
+            self.max_ack_pending == wanted.max_ack_pending,
+        );
+        check(
+            "filter_subject",
+            self.filter_subject.clone(),
+            wanted.filter_subject.clone(),
+            true,
+            self.filter_subject == wanted.filter_subject,
+        );
+        check(
+            "backoff",
+            format!("{:?}", self.backoff),
+            format!("{:?}", wanted.backoff),
+            true,
+            self.backoff == wanted.backoff,
+        );
+        check(
+            "ack_policy",
+            self.ack_policy.clone(),
+            wanted.ack_policy.clone(),
+            false,
+            self.ack_policy == wanted.ack_policy,
+        );
+        check(
+            "deliver_policy",
+            self.deliver_policy.clone(),
+            wanted.deliver_policy.clone(),
+            false,
+            self.deliver_policy == wanted.deliver_policy,
+        );
         drift
     }
+}
+
+/// The error for drift JetStream cannot repair in place. The watcher never
+/// deletes a consumer itself: it may hold messages another process is
+/// working on.
+fn immutable_drift_error(durable: &str, stream: &str, drift: &[&Drift]) -> anyhow::Error {
+    let fields = drift
+        .iter()
+        .map(|d| format!("{} (live: {}, wanted: {})", d.field, d.live, d.wanted))
+        .collect::<Vec<_>>()
+        .join("; ");
+    anyhow::anyhow!(
+        "consumer {durable} on stream {stream} differs in settings JetStream cannot change on an \
+         existing consumer: {fields}. Either restore the configuration to the live values, or \
+         delete the consumer once it has no pending or ack-pending messages \
+         (`nats consumer info {stream} {durable}`, then `nats consumer rm {stream} {durable}`) \
+         and start the watcher again; it recreates the consumer from the configuration"
+    )
 }
 
 /// Turn the broker's message stream into an [`EventStream`] in which a
@@ -728,7 +809,9 @@ mod tests {
             max_deliver: 5,
             max_ack_pending: 32,
             filter_subject: "papers.ingested".into(),
-            explicit_ack: true,
+            ack_policy: "Explicit".into(),
+            deliver_policy: "All".into(),
+            backoff: Vec::new(),
         }
     }
 
@@ -738,25 +821,60 @@ mod tests {
     }
 
     #[test]
-    fn every_drifted_setting_is_named_so_the_consumer_is_updated_in_place() {
-        // A stale consumer once pinned production to ack_wait=10s; the
-        // check must see each setting this crate sets.
+    fn every_drifted_setting_is_named_with_live_and_wanted_values() {
         let mut found = shape();
         found.ack_wait = Duration::from_secs(10);
         found.max_deliver = -1;
         found.max_ack_pending = 1000;
         found.filter_subject = "papers.>".into();
-        found.explicit_ack = false;
+        found.backoff = vec![Duration::from_secs(1)];
+        found.ack_policy = "None".into();
+        found.deliver_policy = "New".into();
+        let drift = found.drift_from(&shape());
+        let names: Vec<_> = drift.iter().map(|d| d.field).collect();
         assert_eq!(
-            found.drift_from(&shape()),
+            names,
             [
                 "ack_wait",
                 "max_deliver",
                 "max_ack_pending",
                 "filter_subject",
-                "ack_policy"
+                "backoff",
+                "ack_policy",
+                "deliver_policy"
             ]
         );
+        let ack = drift.iter().find(|d| d.field == "ack_policy").unwrap();
+        assert_eq!(
+            (ack.live.as_str(), ack.wanted.as_str()),
+            ("None", "Explicit")
+        );
+    }
+
+    #[test]
+    fn only_ack_and_deliver_policy_are_immutable() {
+        let mut found = shape();
+        found.ack_wait = Duration::from_secs(1);
+        found.backoff = vec![Duration::from_secs(1)];
+        assert!(found.drift_from(&shape()).iter().all(|d| d.mutable));
+        for (field, set) in [("ack_policy", 0), ("deliver_policy", 1)] {
+            let mut f = shape();
+            if set == 0 {
+                f.ack_policy = "None".into()
+            } else {
+                f.deliver_policy = "New".into()
+            }
+            let drift = f.drift_from(&shape());
+            assert_eq!(drift.len(), 1);
+            assert_eq!(drift[0].field, field);
+            assert!(!drift[0].mutable);
+            let err = immutable_drift_error("d", "S", &[&drift[0]]).to_string();
+            assert!(
+                err.contains(field) && err.contains("live:") && err.contains("wanted:"),
+                "{err}"
+            );
+            assert!(err.contains("nats consumer rm S d"), "{err}");
+        }
     }
 
     #[test]

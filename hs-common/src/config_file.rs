@@ -95,12 +95,29 @@ impl std::error::Error for ConfigError {
 
 /// The parsed `~/.home-still/config.yaml` (or an empty document when the
 /// file does not exist).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConfigFile {
     home: PathBuf,
     path: PathBuf,
     exists: bool,
     root: Mapping,
+}
+
+/// Section and key names only: the parsed document can hold secrets (S3
+/// keys, tokens), so no value is ever printed.
+impl fmt::Debug for ConfigFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let sections: Vec<String> = self
+            .root
+            .keys()
+            .map(|k| k.as_str().unwrap_or("<non-string key>").to_string())
+            .collect();
+        f.debug_struct("ConfigFile")
+            .field("path", &self.path)
+            .field("exists", &self.exists)
+            .field("sections", &sections)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The `home:` section. These two keys decide where all data and logs live,
@@ -766,6 +783,23 @@ mod tests {
         assert!(first_time("test-unique-key-a"));
         assert!(!first_time("test-unique-key-a"));
         assert!(first_time("test-unique-key-b"));
+    }
+
+    #[test]
+    fn debug_output_names_sections_and_never_values() {
+        let home = home_with(Some(
+            "storage:\n  s3:\n    secret_key: hunter2-secret\nevents:\n  nats:\n    user: bob\n",
+        ));
+        let file = ConfigFile::load_in(home.path()).unwrap();
+        let shown = format!("{file:?} {file:#?}");
+        assert!(
+            shown.contains("storage") && shown.contains("events"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("bob"),
+            "{shown}"
+        );
     }
 
     #[test]
