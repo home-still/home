@@ -13,10 +13,10 @@ Do these **before** restarting any service on the new binaries; each item names 
 ### 1. Provision `HS_BACKEND_TOKEN` (and understand its blast radius)
 
 * Generate once: `openssl rand -hex 32`. Put the **same** value in `~/.home-still/secrets.env` (`HS_BACKEND_TOKEN=<64-hex-chars>`, mode 0600) on the gateway host, on every backend host (`hs-mcp --serve`, distill, scribe) and on every host that runs `hs`. Minimum 32 bytes of visible ASCII; a shorter or malformed value stops the process with an error naming the variable.
-* Without it: `hs-mcp --serve` and the gateway refuse to start; clients get 401 from backends.
+* Without it: `hs-mcp --serve`, `hs-distill-server`, `hs-scribe-server` and the gateway refuse to start; clients get 401 from backends.
 * **What this secret is.** One static bearer for the whole cluster, not a per-service or per-user credential. It is sent **in cleartext over plain HTTP on the LAN**, and `AuthedHttp::plain` attaches it to *whatever URL is configured* under `scribe.servers` / `distill.servers` (and through `HTTP(S)_PROXY` if one is set). Consequences: keep those URLs on the trusted LAN and double-check them for typos; a LAN sniffer, or the compromise of **any one** client host, unlocks **every** backend and bypasses the gateway's scopes (including the `personal_*` tools). Treat `secrets.env` on every host as a cluster root credential, and rotate by regenerating and redeploying to all hosts at once.
 * Follow-up options (not implemented): per-service tokens (a leaked scribe token no longer opens distill/mcp), and TLS between gateway/clients and backends so the token is not on the wire in clear. Recommendation: TLS first, then per-service tokens.
-* The scribe server is about to require the token too. There is currently **no `hs scribe init`** command and no generated scribe compose file: provision the token in `secrets.env` as above (`hs serve scribe --install` units read it from there).
+* `hs-scribe-server` requires the token: every route except `GET /health` and `GET /readiness` answers 401 without `Authorization: Bearer <token>` (paths no route serves included). Provision it on **every** scribe host — the macOS launchd one included (`hs serve scribe --install` units read `secrets.env`; there is currently **no `hs scribe init`** command and no generated scribe compose file) — and on every host that runs a scribe client (`hs`, `hs-mcp`), before upgrading any of them: a client without it gets 401 on every convert (retried as transient, loudly).
 
 ### 2. Gateway
 
@@ -35,7 +35,9 @@ Do these **before** restarting any service on the new binaries; each item names 
 
 ### 4. Scribe hosts
 
-* **libpdfium is required** on hosts running the legacy/VLM scribe server (macOS: `libpdfium.dylib`, see 6.7). Legacy per-region hosts will not start without both ONNX models; check `/health` shows both loaded before upgrading.
+* **libpdfium is required on every host that runs `hs-scribe-server` or a watcher (`hs scribe watch-events`), on every converter — olmocr hosts included** (they counted pages without it before): pdfium is the one PDF parser and counts the pages of every PDF before it is dispatched or converted. Both refuse to start when it cannot be bound, naming where they looked (`./`, `~/.local/lib`, `~/.home-still/dyld-libs`, then the system library path; macOS: `libpdfium.dylib`, see 6.7; container images bundle it). `hs scribe convert` and the `scribe_convert` MCP tool need it too, but fail per call instead. Check with `ldconfig -p | grep pdfium` (Linux) before upgrading. Legacy per-region hosts will not start without both ONNX models; check `/health` shows both loaded before upgrading.
+* A PDF pdfium cannot open, or that has no pages or more than 65 535, is refused for good (`pdf_parse_error`); a counter stuck behind a hostile document makes the callers behind it retry instead. A PDF the old parser rejected but pdfium renders is now converted.
+* EPUBs: one reader serves the watcher, `hs scribe inbox` and `hs personal add`, all under the configured `scribe.epub.*` limits (the inbox and personal ingest used the defaults before). `max_total_bytes` now counts bytes inflated **plus** bytes produced; a chapter the spine repeats is read once; package XML that is not well-formed or nests past 64 elements, and a chapter whose elements nest past 512, fail that book (HTML: `html_parse_error`).
 * Concurrency, dpi, timeout values must be >= 1 and `timeout_policy.floor_secs <= ceiling_secs`; `scribe.servers[].concurrency >= 1`.
 * More Escalate/NAK traffic during VLM instability is expected: failed pages now fail the conversion instead of leaving holes.
 

@@ -484,6 +484,31 @@ pub(crate) mod tests {
         }
     }
 
+    /// A PDF whose xref offsets and `startxref` are wrong — the shape of a
+    /// damaged download. The structure is intact; only the index is not.
+    fn pdf_with_a_damaged_xref(pages: usize) -> Vec<u8> {
+        let mut good = pdf_with_pages(pages);
+        let at = good
+            .windows(9)
+            .rposition(|w| w == b"startxref")
+            .expect("fixture has a startxref");
+        good.truncate(at);
+        good.extend_from_slice(b"startxref\n12345\n%%EOF\n");
+        good
+    }
+
+    #[tokio::test]
+    async fn a_pdf_the_renderer_repairs_is_counted_not_refused() {
+        // The old lopdf counter refused this with "Invalid cross-reference
+        // table" and the watcher stamped it `pdf_parse_error` for good —
+        // while pdfium, which renders it, reads it fine (review F8).
+        skip_without_pdfium!("a_pdf_the_renderer_repairs_is_counted_not_refused");
+        let n = count_pages(Bytes::from(pdf_with_a_damaged_xref(3)))
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+    }
+
     #[tokio::test]
     async fn a_pdf_with_no_pages_is_refused() {
         skip_without_pdfium!("a_pdf_with_no_pages_is_refused");
