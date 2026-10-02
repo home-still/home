@@ -171,6 +171,10 @@ impl SeenSet {
         drop(f);
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("rename {} -> {}", tmp.display(), self.path.display()))?;
+        // A directory fsync makes the rename durable on POSIX filesystems.
+        // Windows cannot open a directory as a file (access denied); NTFS
+        // journals the rename's metadata itself.
+        #[cfg(unix)]
         File::open(parent)
             .and_then(|d| d.sync_all())
             .with_context(|| format!("fsync directory {}", parent.display()))?;
