@@ -15,12 +15,16 @@ use crate::client::DistillClient;
 pub enum HandlerError {
     Permanent(anyhow::Error),
     Transient(anyhow::Error),
+    /// Misconfiguration every event will hit (the server rejects our
+    /// `HS_BACKEND_TOKEN`): the event is NAKed untouched and
+    /// [`run_subscriber`] stops consuming and returns an error.
+    Fatal(anyhow::Error),
 }
 
 impl HandlerError {
     fn as_error(&self) -> &anyhow::Error {
         match self {
-            HandlerError::Permanent(e) | HandlerError::Transient(e) => e,
+            HandlerError::Permanent(e) | HandlerError::Transient(e) | HandlerError::Fatal(e) => e,
         }
     }
 }
@@ -30,6 +34,7 @@ impl std::fmt::Display for HandlerError {
         match self {
             HandlerError::Permanent(e) => write!(f, "permanent: {e:#}"),
             HandlerError::Transient(e) => write!(f, "transient: {e:#}"),
+            HandlerError::Fatal(e) => write!(f, "fatal: {e:#}"),
         }
     }
 }
@@ -111,6 +116,9 @@ where
 /// permanent; every other error — storage or server outages included — may
 /// clear up.
 fn classify(err: anyhow::Error) -> HandlerError {
+    if err.chain().any(|c| c.is::<crate::client::Unauthorized>()) {
+        return HandlerError::Fatal(err);
+    }
     let refused = err
         .chain()
         .filter_map(|c| c.downcast_ref::<crate::client::ServerError>())
@@ -219,6 +227,13 @@ pub async fn index_and_publish(
     Ok(())
 }
 
+fn fatal_stop(cause: anyhow::Error) -> anyhow::Error {
+    cause.context(
+        "fatal configuration error: the distill server rejected HS_BACKEND_TOKEN \
+         (set the same value in secrets.env as the server); the watcher stopped consuming",
+    )
+}
+
 /// Pull-consume `scribe.completed` and dispatch each event to
 /// `handler`. See the parallel scribe `run_subscriber` for ack policy.
 pub async fn run_subscriber<F, Fut>(
@@ -242,8 +257,17 @@ where
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let handler = Arc::new(handler);
 
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<anyhow::Error>();
     let mut delivery_error = None;
-    while let Some(next) = stream.next().await {
+    loop {
+        let next = tokio::select! {
+            biased;
+            Some(fatal) = fatal_rx.recv() => return Err(fatal_stop(fatal)),
+            next = stream.next() => match next {
+                Some(n) => n,
+                None => break,
+            },
+        };
         let event = match next {
             Ok(event) => event,
             Err(e) => {
@@ -266,12 +290,19 @@ where
             }
         };
 
-        let permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow::anyhow!("distill worker semaphore closed"))?;
+        let permit = tokio::select! {
+            biased;
+            Some(fatal) = fatal_rx.recv() => {
+                // Not yet started: hand the event back untouched.
+                let _ = event.nak(None).await;
+                return Err(fatal_stop(fatal));
+            }
+            permit = sem.clone().acquire_owned() => {
+                permit.map_err(|_| anyhow::anyhow!("distill worker semaphore closed"))?
+            }
+        };
         let handler = Arc::clone(&handler);
+        let fatal_tx = fatal_tx.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let key = parsed.key.clone();
@@ -304,6 +335,19 @@ where
                     if let Err(e) = event.ack().await {
                         tracing::warn!(key = %key, error = %e, "ack failed");
                     }
+                }
+                Err(HandlerError::Fatal(e)) => {
+                    tracing::error!(
+                        key = %key,
+                        error = ?e,
+                        "distill server rejected our credentials: HS_BACKEND_TOKEN is missing or \
+                         does not match the server's — stopping the watcher"
+                    );
+                    // Leave the event for the next, correctly configured run.
+                    if let Err(ne) = event.nak(None).await {
+                        tracing::warn!(key = %key, error = %ne, "nak failed");
+                    }
+                    let _ = fatal_tx.send(e);
                 }
                 Err(err) => {
                     let is_perm = matches!(err, HandlerError::Permanent(_));
@@ -494,7 +538,90 @@ mod tests {
             Ok(()) => "ok",
             Err(HandlerError::Permanent(_)) => "permanent",
             Err(HandlerError::Transient(_)) => "transient",
+            Err(HandlerError::Fatal(_)) => "fatal",
         }
+    }
+
+    #[tokio::test]
+    async fn an_index_panic_is_permanent_and_rejected_credentials_are_fatal() {
+        let server = serve(|_| Reply::Json(500, "index_panicked: x".into())).await;
+        let panicked = serve_with_code().await;
+        let mut rig = rig(|| Reply::Json(200, OK_INDEX.into())).await;
+        rig.client = DistillClient::new(&panicked.url()).unwrap();
+        assert_eq!(kind_of(run(&rig, "markdown/do/doc.md").await), "permanent");
+        // A plain 500 without the code stays transient.
+        rig.client = DistillClient::new(&server.url()).unwrap();
+        assert_eq!(kind_of(run(&rig, "markdown/do/doc.md").await), "transient");
+        for status in [401u16, 403] {
+            let auth = serve(move |_| Reply::Json(status, "unauthorized".into())).await;
+            rig.client = DistillClient::new(&auth.url()).unwrap();
+            assert_eq!(
+                kind_of(run(&rig, "markdown/do/doc.md").await),
+                "fatal",
+                "{status}"
+            );
+            assert!(rig.bus.published.lock().is_empty());
+        }
+    }
+
+    /// Raw loopback server answering 500 with the panic header.
+    async fn serve_with_code() -> FakeHttp {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 500 X\r\nx-hs-error-code: index_panicked\r\ncontent-length: 2\r\nconnection: close\r\n\r\nno",
+                        )
+                        .await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+        FakeHttp {
+            addr,
+            requests: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_watcher_stops_with_an_error_naming_the_token_when_credentials_are_rejected() {
+        let bus = Arc::new(FakeBus::default());
+        *bus.events.lock() = vec![completed("a"), completed("b"), completed("c")];
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen2 = seen.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_subscriber(bus, storage, 1, move |_| {
+                let seen = seen2.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Err(HandlerError::Fatal(anyhow::Error::new(
+                        crate::client::Unauthorized {
+                            status: reqwest::StatusCode::UNAUTHORIZED,
+                            body: String::new(),
+                        },
+                    )))
+                }
+            }),
+        )
+        .await
+        .expect("must not hang");
+        let err = result.expect_err("fatal must end the watcher with an error");
+        assert!(format!("{err:#}").contains("HS_BACKEND_TOKEN"), "{err:#}");
+        assert!(
+            seen.load(Ordering::SeqCst) < 3,
+            "must stop consuming after the first fatal"
+        );
     }
 
     #[tokio::test]

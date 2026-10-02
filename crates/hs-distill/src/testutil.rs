@@ -135,6 +135,8 @@ pub(crate) struct FakeEmbedder {
     /// Return this many fewer vectors than texts (to model a short batch).
     pub short_by: Mutex<usize>,
     pub slots: usize,
+    /// Panic inside `embed_batch` (to model a bug in the embed path).
+    pub panic: Mutex<bool>,
 }
 
 impl FakeEmbedder {
@@ -145,6 +147,7 @@ impl FakeEmbedder {
             health: Mutex::new(EmbedderHealth::Healthy),
             short_by: Mutex::new(0),
             slots: 2,
+            panic: Mutex::new(false),
         }
     }
 
@@ -160,6 +163,9 @@ impl FakeEmbedder {
 #[async_trait]
 impl Embedder for FakeEmbedder {
     async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<EmbeddingOutput>, DistillError> {
+        if *self.panic.lock() {
+            panic!("simulated embedder bug");
+        }
         if let Some(msg) = self.fail.lock().clone() {
             return Err(DistillError::Embedding(msg));
         }

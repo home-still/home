@@ -30,6 +30,10 @@ const READINESS_QDRANT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Hits returned when a search request names no `limit`.
 const DEFAULT_SEARCH_LIMIT: u64 = 10;
 
+/// Machine-readable code sent with a 500 caused by a panic in the index
+/// task (`x-hs-error-code` header; prefix of the NDJSON error line).
+pub const PANIC_CODE: &str = "index_panicked";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// The request is malformed or names something that does not exist
@@ -39,6 +43,9 @@ pub enum ErrorKind {
     Unavailable,
     /// Anything else (HTTP 500).
     Internal,
+    /// The indexing code panicked (HTTP 500 + [`PANIC_CODE`]). Deterministic
+    /// for the document that triggered it: retrying cannot help.
+    Panicked,
 }
 
 #[derive(Debug)]
@@ -215,7 +222,7 @@ impl DistillServerState {
             catalog,
             collection,
         } = job;
-        let chunks = pipeline::index_document(
+        let work = pipeline::index_document(
             IndexJob {
                 doc_id: &doc_id,
                 markdown_path: &path_hint,
@@ -228,12 +235,24 @@ impl DistillServerState {
             self.embedder.as_ref(),
             self.store.as_ref(),
             on_progress,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("Indexing failed: {e}");
-            ApiError::from(e)
-        })?;
+        );
+        // A panic here would otherwise unwind out of a spawned task (stream
+        // route) with no response, or become an untyped 500: surface it as a
+        // typed, non-retryable failure and name the document.
+        let chunks =
+            match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(work)).await {
+                Ok(r) => r.map_err(|e| {
+                    tracing::error!("Indexing failed: {e}");
+                    ApiError::from(e)
+                })?,
+                Err(_) => {
+                    tracing::error!(doc_id = %doc_id, "indexing panicked");
+                    return Err(ApiError {
+                        kind: ErrorKind::Panicked,
+                        message: format!("{PANIC_CODE}: indexing {doc_id} panicked"),
+                    });
+                }
+            };
         Ok(IndexResult {
             doc_id,
             chunks_indexed: chunks,
@@ -934,5 +953,28 @@ mod tests {
             );
         }
         assert_eq!(h.store.ops(), []);
+    }
+
+    #[tokio::test]
+    async fn a_panic_while_indexing_is_a_typed_failure_and_releases_the_slot() {
+        let h = harness();
+        *h.embedder.panic.lock() = true;
+        let job = h
+            .state
+            .prepare_index(index_req(Some("d.md"), Some(&prose(6)), None))
+            .unwrap();
+        let err = h
+            .state
+            .run_index(job, |_| {})
+            .await
+            .err()
+            .expect("must fail");
+        assert_eq!(err.kind, ErrorKind::Panicked);
+        assert!(
+            err.message.starts_with(PANIC_CODE) && err.message.contains("d"),
+            "{err}"
+        );
+        assert_eq!(h.state.in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(h.store.ops(), [], "nothing written");
     }
 }

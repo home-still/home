@@ -143,15 +143,40 @@ pub type DistillStreamLine = hs_common::service::protocol::StreamLine<DistillPro
 pub struct ServerError {
     pub status: reqwest::StatusCode,
     pub body: String,
+    /// `x-hs-error-code` header, when the server sent one.
+    pub code: Option<String>,
 }
+
+/// The server rejected our credentials (401/403): `HS_BACKEND_TOKEN` is
+/// missing, wrong, or not the value the server was started with. A
+/// configuration error, not an outage — retrying cannot succeed.
+#[derive(Debug, Clone)]
+pub struct Unauthorized {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl std::fmt::Display for Unauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "distill server rejected our credentials ({}): check HS_BACKEND_TOKEN matches the server's: {}",
+            self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for Unauthorized {}
 
 impl ServerError {
     /// The server understood the request and refuses it for what it
-    /// contains (400 bad input, 413 too large, 422 unprocessable): sending
-    /// it again cannot succeed. Everything else — 5xx, 404/405 during a
-    /// deploy, 401/403 until credentials are fixed, 408/429 — may clear up.
+    /// contains (400 bad input, 413 too large, 422 unprocessable) or crashed
+    /// on it (`index_panicked`): sending it again cannot succeed. Everything
+    /// else — 5xx, 404/405 during a deploy, 408/429 — may clear up. 401/403
+    /// are [`Unauthorized`], a separate type.
     pub fn is_permanent_rejection(&self) -> bool {
         matches!(self.status.as_u16(), 400 | 413 | 422)
+            || self.code.as_deref() == Some(crate::api::PANIC_CODE)
     }
 }
 
@@ -567,8 +592,16 @@ async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::Response> {
         return Ok(resp);
     }
     let status = resp.status();
+    let code = resp
+        .headers()
+        .get("x-hs-error-code")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let body = resp.text().await.unwrap_or_default();
-    Err(ServerError { status, body }.into())
+    if matches!(status.as_u16(), 401 | 403) {
+        return Err(Unauthorized { status, body }.into());
+    }
+    Err(ServerError { status, body, code }.into())
 }
 
 /// Decode a 2xx JSON reply into `T`.
@@ -705,8 +738,6 @@ mod tests {
             (400, true),
             (413, true),
             (422, true),
-            (401, false),
-            (403, false),
             (404, false),
             (408, false),
             (429, false),
@@ -792,5 +823,26 @@ mod tests {
         let r = client(&fake).readiness().await.unwrap();
         assert!(!r.ready);
         assert_eq!(r.reason.as_deref(), Some("embedder unusable"));
+    }
+
+    #[tokio::test]
+    async fn rejected_credentials_are_a_typed_unauthorized_not_a_server_error() {
+        for status in [401u16, 403] {
+            let fake =
+                serve(move |_| Reply::Json(status, r#"{"error":"unauthorized"}"#.into())).await;
+            let c = client(&fake);
+            for err in [
+                c.index_content("d.md", "x", None).await.unwrap_err(),
+                c.status().await.unwrap_err(),
+                c.delete_doc("d").await.unwrap_err(),
+            ] {
+                let u = err
+                    .downcast_ref::<Unauthorized>()
+                    .unwrap_or_else(|| panic!("{status}: untyped {err:#}"));
+                assert_eq!(u.status.as_u16(), status);
+                assert!(err.downcast_ref::<ServerError>().is_none());
+                assert!(format!("{err:#}").contains("HS_BACKEND_TOKEN"));
+            }
+        }
     }
 }

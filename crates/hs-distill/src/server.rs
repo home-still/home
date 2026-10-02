@@ -98,8 +98,19 @@ fn error_response(e: ApiError) -> Response {
     let status = match e.kind {
         ErrorKind::BadRequest => StatusCode::BAD_REQUEST,
         ErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-        ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorKind::Internal | ErrorKind::Panicked => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    if e.kind == ErrorKind::Panicked {
+        return (
+            status,
+            [(
+                axum::http::HeaderName::from_static("x-hs-error-code"),
+                crate::api::PANIC_CODE,
+            )],
+            e.message,
+        )
+            .into_response();
+    }
     (status, e.message).into_response()
 }
 
@@ -879,5 +890,64 @@ mod tests {
             "{msg}"
         );
         backend_token(|_| Ok(TOKEN.into())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_indexing_panic_is_a_typed_500_on_both_routes_and_the_server_survives() {
+        let h = start().await;
+        *h.embedder.panic.lock() = true;
+
+        let resp = h
+            .post(
+                "/distill",
+                serde_json::json!({"path":"boom.md","content":prose(6)}),
+            )
+            .await;
+        assert_eq!(resp.status(), 500);
+        assert_eq!(resp.headers()["x-hs-error-code"], crate::api::PANIC_CODE);
+
+        let text = h
+            .post(
+                "/distill/stream",
+                serde_json::json!({"path":"boom.md","content":prose(6)}),
+            )
+            .await
+            .text()
+            .await
+            .unwrap();
+        let last: DistillStreamLine = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        match last {
+            StreamLine::Error(m) => assert!(m.starts_with(crate::api::PANIC_CODE), "{m}"),
+            other => panic!("expected an error line: {other:?}"),
+        }
+
+        // The client sees a typed, permanent rejection.
+        let client = crate::client::DistillClient::new_with_client(
+            &h.base,
+            hs_common::auth::client::AuthedHttp::plain_with_backend_token(
+                http_client(None),
+                Some(token()),
+            ),
+        );
+        let err = client
+            .index_content("boom.md", &prose(6), None)
+            .await
+            .unwrap_err();
+        let typed = err
+            .downcast_ref::<crate::client::ServerError>()
+            .expect("typed");
+        assert!(typed.is_permanent_rejection());
+
+        // Still serving.
+        *h.embedder.panic.lock() = false;
+        assert_eq!(
+            h.post(
+                "/distill",
+                serde_json::json!({"path":"ok.md","content":prose(6)})
+            )
+            .await
+            .status(),
+            200
+        );
     }
 }
