@@ -402,7 +402,7 @@ async fn verify_native_distill(servers: &[String], reporter: &Arc<dyn Reporter>)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::installer::test_support::{serve, Route};

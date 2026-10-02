@@ -142,7 +142,7 @@ impl Installer {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_limits(mut self, max_archive: u64, max_binary: u64) -> Self {
         self.limits = Limits {
             max_archive,
@@ -583,7 +583,7 @@ fn replace_file(staged: tempfile::TempPath, dest: &Path, aside: bool) -> Result<
 
 // ── Tests ───────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod test_support {
     use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -654,7 +654,7 @@ pub(crate) mod test_support {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::test_support::{serve, Route};
     use super::*;
