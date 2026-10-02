@@ -64,12 +64,32 @@ pub enum OpenAlexCmd {
     BuildIndexes,
 }
 
+impl OpenAlexCmd {
+    /// The subcommands that open the database read-write.
+    fn writes(&self) -> bool {
+        matches!(
+            self,
+            Self::Load { .. } | Self::LoadWorks { .. } | Self::BuildFts | Self::BuildIndexes
+        )
+    }
+}
+
 pub async fn dispatch(cmd: OpenAlexCmd) -> Result<()> {
     let cfg = load_config()?;
     run(&cfg, cmd)
 }
 
 fn run(cfg: &Config, cmd: OpenAlexCmd) -> Result<()> {
+    // On Windows the next DuckDB call after a failed write never returns
+    // (windows-2022 CI: a duplicate key or a failed merge, then a hang), so a
+    // bad partition would wedge the loader instead of failing it (RA-149).
+    if cfg!(windows) && cmd.writes() {
+        bail!(
+            "`hs openalex` load and build commands are not supported on Windows: DuckDB hangs \
+             after a failed write there (RA-149). Run OpenAlex ingest on Linux or macOS; \
+             `status` and `query` work here"
+        );
+    }
     match cmd {
         OpenAlexCmd::Load {
             entity,
@@ -330,6 +350,7 @@ mod tests {
     /// RA-35: `hs openalex load-works` must exit non-zero (main maps every
     /// `Err` from `dispatch` to a failure exit code) when a partition fails,
     /// and `status` must then show the partition as failed.
+    #[cfg(not(windows))]
     #[test]
     fn load_works_fails_loudly_and_status_reports_the_failed_partition() {
         let env = env_with_partition(&[work(1, "T1")]);
@@ -361,6 +382,7 @@ mod tests {
         run(&env.cfg, OpenAlexCmd::Status).expect("status works on a failed database");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn load_works_succeeds_and_a_rerun_is_a_no_op() {
         let env = env_with_partition(&[work(1, "T1"), work(2, "T1")]);
@@ -375,6 +397,7 @@ mod tests {
         assert!(db.ingest_log_attention().unwrap().is_empty());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn single_partition_load_rejects_names_that_are_not_listed_partitions() {
         let env = env_with_partition(&[work(1, "T1")]);
@@ -423,6 +446,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn max_parse_errors_is_rejected_for_entities_that_take_no_limit() {
         let env = env_with_partition(&[]);
@@ -440,5 +464,30 @@ mod tests {
             Path::new("/data/oa/seen_set.bin")
         );
         assert!(seen_set_path(Path::new("/")).is_err());
+    }
+
+    /// RA-149: every read-write subcommand is refused on Windows before the
+    /// database is touched; `status` and `query` stay available.
+    #[cfg(windows)]
+    #[test]
+    fn write_commands_are_refused_on_windows_without_touching_the_database() {
+        let env = env_with_partition(&[work(1, "T1")]);
+        let writes = [
+            OpenAlexCmd::Load {
+                entity: "concepts".into(),
+                max_parse_errors: None,
+            },
+            load_works_cmd(None),
+            OpenAlexCmd::BuildFts,
+            OpenAlexCmd::BuildIndexes,
+        ];
+        for cmd in writes {
+            let err = run(&env.cfg, cmd).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not supported on Windows"),
+                "{err:#}"
+            );
+        }
+        assert!(!env.cfg.db_path.exists());
     }
 }

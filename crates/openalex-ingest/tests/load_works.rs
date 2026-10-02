@@ -1,6 +1,11 @@
 //! End-to-end behavior of the works / authors / simple-entity loaders on
 //! synthetic snapshots in temp dirs: failure injection, commit ordering,
 //! resume, tolerance policy, read-only access. Never touches real data.
+//!
+//! Not built on Windows: DuckDB there hangs on the next call after a failed
+//! write, and `hs openalex` refuses every load/build command on Windows for
+//! that reason (RA-149), so these paths are unreachable there.
+#![cfg(not(windows))]
 
 use openalex_ingest::{LoadOptions, OpenAlexDb, SeenSet, SimpleEntity};
 use std::path::{Path, PathBuf};
