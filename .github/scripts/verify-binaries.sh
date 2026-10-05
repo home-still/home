@@ -63,7 +63,11 @@ for bin in "${bins[@]}"; do
     die "$bin: no architecture check exists for $target, so --run is required"
   fi
 
-  grep -a -F -q -- "hs-version-marker:${version}:end" "$path" \
+  # LC_ALL=C is load-bearing: the macos-14 runner's BSD grep (2.6.0-FreeBSD)
+  # under its default en_US.UTF-8 locale cannot match inside a Mach-O file's
+  # invalid-UTF-8 bytes, even with -a, and reports the marker missing when
+  # `strings`, perl and python all find it (rc.359/rc.360 preflight).
+  LC_ALL=C grep -a -F -q -- "hs-version-marker:${version}:end" "$path" \
     || die "$bin does not contain the version marker for '$version' (stale or wrongly built binary)"
 
   if $run; then
