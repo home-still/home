@@ -202,6 +202,30 @@ Measured on `big` after the rc.356 upgrade, card contended at 4938 MiB free: `cu
 
 ## P0 — Blockers
 
+### P0-22. rc.359+ darwin scribe server refuses to start: `use_cuda` defaults to `true` and ort now errors when the CUDA provider cannot register (found rc.360 deploy, 2026-10-05)
+**Symptom:** after `hs upgrade --pre -y` to rc.360 on the Apple Silicon scribe host, `com.home-still.scribe` exited 1 in a KeepAlive loop. `/tmp/hs-scribe.log`: `Error: loading layout detector 1/4 from …/pp-doclayoutv3.onnx … The execution provider could not be registered because its corresponding Cargo feature is not enabled.` The host dropped out of the scribe pool (`hs status` on big: `bmb:7433 Connection refused`).
+**Cause:** `crates/hs-scribe/src/config.rs` defaults `use_cuda: true`; commit 1f9dd97 (RA-52) added `.error_on_failure()` to the CUDA provider in `LayoutDetector::new` / `TableStructureRecognizer::new`, where before ort silently fell back to CPU. A host whose LaunchAgent plist never set `HS_SCRIBE_USE_CUDA=false` therefore silently ran CPU before and now fails loudly. The loud failure is correct (ONE PATH); the host config and the default were the bug. `scribe.use_cuda` in `config.yaml` does not help: the key is unknown in that section, only `HS_SCRIBE_USE_CUDA` reaches `scribe_server.use_cuda`.
+**Workaround applied 2026-10-05:** added `HS_SCRIBE_USE_CUDA=false` to `~/Library/LaunchAgents/com.home-still.scribe.plist` on that host (backup `*.bak.rc360`), then `launchctl bootout` + `bootstrap` (a `kickstart -k` does NOT reload the plist). `/health` returned ok at 0.0.1-rc.360.
+**Scope:** `crates/hs-scribe/src/config.rs` (default), `crates/hs/src/scribe_cmd.rs` (service/plist generation), `hs upgrade` (service restart on macOS), docs.
+**Change:** Decide `use_cuda`'s default per build/platform (CUDA only when the binary has the `cuda` feature), or make `hs upgrade` refuse to restart a darwin scribe whose environment would fail this check. Have the plist generator write the key. `hs upgrade` should also reload the plist (`bootout`/`bootstrap`) rather than rely on `kickstart`.
+**Acceptance:** a fresh macOS scribe LaunchAgent with no `HS_SCRIBE_USE_CUDA` either starts on CPU by construction or `hs upgrade` names the missing setting before restarting it; a test on a non-cuda build covers the default.
+
+---
+
+### P0-23. `hs status` fails on `bmb`, `big_mac` and `mac_air` after the rc.360 upgrade (expired enrollment tokens)
+**Symptom:** `gateway rejected the refresh token (401): Refresh token expired — re-enroll with hs cloud enroll` (bmb, big_mac); `MCP initialize failed (401 Unauthorized): missing bearer token` (mac_air). Not caused by rc.360 (unrelated to the binary); found during the Gate 6 `hs status` sweep.
+**Change:** re-enroll each host with `hs cloud enroll` (needs an operator-issued invite).
+**Acceptance:** `hs status` prints the dashboard on all three hosts.
+
+---
+
+### P1-25. `hs upgrade` reports `io.home-still.scribe-inbox: still not running the new binary after restart (no pid)` as an error although launchd brought it up seconds later
+**Symptom:** on mac_air during the rc.360 upgrade the restart check ran before KeepAlive respawned the daemon (first respawn failed `connecting to NATS: No route to host`, the next succeeded); `launchctl list` then showed a pid and the inbox log showed a clean sweep. The upgrade returned a non-zero error for a service that was healthy ~20 s later.
+**Change:** poll for the new pid for a bounded window before failing the restart.
+**Acceptance:** upgrading a host whose LaunchAgent needs two respawns reports success.
+
+---
+
 ### P0-1. `big_mac` cannot run `hs` at all — panics on logging init, stuck at rc.326
 **Symptom:** every `hs` subcommand that initializes logging panics immediately:
 
