@@ -761,9 +761,16 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
     frame.render_widget(table, inner);
 }
 
+/// An unhealthy server is not necessarily a stopped one: the server's own
+/// activity label ("backend unavailable", "unhealthy: <why>") says what is
+/// actually wrong. "stopped" is only the answer when nothing was reported.
 fn format_status_activity(healthy: bool, running_label: &str, activity: &str) -> String {
     if !healthy {
-        return "stopped".into();
+        return if activity.is_empty() {
+            "stopped".into()
+        } else {
+            activity.into()
+        };
     }
     match activity {
         "" | "idle" => running_label.into(),
@@ -1046,6 +1053,20 @@ fn ellipsize(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn an_unhealthy_server_shows_why_instead_of_stopped() {
+        assert_eq!(
+            format_status_activity(false, "running", "backend unavailable"),
+            "backend unavailable"
+        );
+        assert_eq!(format_status_activity(false, "running", ""), "stopped");
+        assert_eq!(format_status_activity(true, "running", "idle"), "running");
+        assert_eq!(
+            format_status_activity(true, "running", "2 converting"),
+            "running · 2 converting"
+        );
+    }
 
     #[test]
     fn ellipsize_counts_characters_and_leaves_short_names_alone() {
