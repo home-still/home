@@ -395,6 +395,9 @@ pub fn unknown_keys(actual: &serde_json::Value, known: &serde_json::Value) -> Ve
     }
     let mut out = Vec::new();
     walk(actual, known, "", &mut out);
+    // serde_json's `preserve_order` feature (unified in by another workspace
+    // crate) makes object iteration follow the file; the contract is sorted.
+    out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
