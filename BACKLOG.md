@@ -593,6 +593,13 @@ if a doc that diagnose says yields N>0 chunks embeds 0 — do not silently stamp
 
 **FIXED rc.358 (2026-09-28).** `ReadinessInfo::admits_work` (scribe: `backend_status != backend_unavailable`). `pick_server` returns `NoAdmittingHost` only when every probe answered and refused; any unreachable, busy, or admitting host keeps it polling. The chain skips such a tier without overwriting `last_err`. Pool tests pin fail-fast, the one-gated-host-still-waits case, and the unreachable-host-still-polls case.
 
+### P1-24. `cargo test --locked -p hs-scribe --features server` died with SIGSEGV once on ubuntu-24.04 (rc.360 preflight, run 37326913748 attempt 1)
+**Motivation:** The Gate's ubuntu leg exited 101 with `process didn't exit successfully: .../hs_scribe-550cd748ef92b3ea (signal: 11, SIGSEGV)` partway through the `config::tests::*` output of the `hs-scribe` lib test binary. Same tree passed on the main push run and on the re-run of the failed job; 6 consecutive local runs under `unshare -rn` (loopback only) on big passed 371/371, so it is intermittent and not reproduced. The CI leg downloads a real `libpdfium.so`, so the pdfium-backed tests execute there (they print SKIPPED without it).
+**Scope:** `crates/hs-scribe/src/pdfium.rs` and the pdfium-backed tests in `crates/hs-scribe` (`pdf_meta.rs` and siblings); `.github/workflows/ci.yaml` ubuntu leg.
+**Change:** Find which test thread faulted (re-run with `RUST_TEST_THREADS=1` and `--nocapture` on a loop under the CI libpdfium, chromium/7749, and capture a core), then fix the unsound concurrent use of the library. Do not add a retry to the Gate.
+**Acceptance:** 50 consecutive CI-equivalent runs of the hs-scribe lib tests with libpdfium present without a SIGSEGV.
+
+
 ---
 
 ## P1 — branch/PR closeout (2026-09-19)
