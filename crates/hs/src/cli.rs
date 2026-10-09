@@ -99,11 +99,15 @@ pub enum TopCmd {
     },
     /// Local OpenAlex catalog (DuckDB) — bulk-load entities, query, build FTS
     #[command(after_help = "\
+  Steps, in order: load / load-works → build-indexes → install-fts → build-fts
+
   Examples:
     hs openalex load concepts
     hs openalex load-works --partition updated_date=2024-01-01
     hs openalex status
     hs openalex query \"SELECT COUNT(*) FROM works\"
+    hs openalex build-indexes
+    hs openalex install-fts      # needs network once per host
     hs openalex build-fts")]
     Openalex {
         #[command(subcommand)]

@@ -9,6 +9,40 @@ use serde::{Deserialize, Serialize};
 use crate::classify::{ConvertFailure, FailureCode};
 use crate::config::TimeoutPolicy;
 
+/// Upper bound on a `/health` or `/readiness` reply (a few hundred bytes of
+/// JSON in practice); a peer that streams more is not a scribe server.
+const MAX_CONTROL_REPLY_BYTES: usize = 1024 * 1024;
+
+/// Upper bound on the body of a refused convert request (a status token or
+/// a short error text).
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Read a response body, failing the moment it crosses `max` bytes (declared
+/// `Content-Length` or decoded bytes actually received) rather than buffering
+/// whatever a peer sends.
+pub(crate) async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > max as u64) {
+        anyhow::bail!("response body exceeds the {max}-byte limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("failed to read response body")? {
+        if body.len() + chunk.len() > max {
+            anyhow::bail!("response body exceeds the {max}-byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// [`read_capped`], then parse the body as JSON.
+pub(crate) async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    max: usize,
+) -> Result<T> {
+    let body = read_capped(resp, max).await?;
+    serde_json::from_slice(&body).context("response body is not the expected JSON")
+}
+
 /// HTTP header name carrying the per-request convert deadline. The
 /// server reads this and wraps the conversion in
 /// `tokio::time::timeout(header_value)`, so client and server agree on
@@ -321,7 +355,9 @@ impl ScribeClient {
             .send()
             .await
             .context("Failed to reach server")?;
-        resp.json().await.context("Invalid health response")
+        read_json_capped(resp, MAX_CONTROL_REPLY_BYTES)
+            .await
+            .context("Invalid health response")
     }
 
     /// One authenticated, side-effect-free request (`GET /info`, a protected
@@ -364,7 +400,9 @@ impl ScribeClient {
                 self.server_url
             );
         }
-        resp.json().await.context("Invalid readiness response")
+        read_json_capped(resp, MAX_CONTROL_REPLY_BYTES)
+            .await
+            .context("Invalid readiness response")
     }
 }
 
@@ -446,7 +484,10 @@ impl ScribeClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = match read_capped(resp, MAX_ERROR_BODY_BYTES).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(e) => format!("<body unreadable: {e:#}>"),
+            };
             let message = format!("Server error {status}: {body}");
             // A refusal the server typed (the 415 content gate) has the
             // wire token, and nothing else, as its body.
@@ -726,5 +767,65 @@ mod tests {
             .await;
         let head = log.lock().unwrap()[0].to_ascii_lowercase();
         assert!(head.contains("x-convert-deadline-secs: 777"), "{head}");
+    }
+}
+
+#[cfg(test)]
+mod capped_read_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve one canned reply per connection. `with_length: false` omits
+    /// `Content-Length` (close-delimited), so only the byte count can
+    /// refuse it.
+    async fn serve(body: Vec<u8>, with_length: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let length = if with_length {
+                        format!("Content-Length: {}\r\n", body.len())
+                    } else {
+                        String::new()
+                    };
+                    let head = format!("HTTP/1.1 200 OK\r\n{length}Connection: close\r\n\r\n");
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_body_within_the_cap_is_read_whole() {
+        let url = serve(b"{\"a\":1}".to_vec(), true).await;
+        let resp = reqwest::get(&url).await.unwrap();
+        let v: serde_json::Value = read_json_capped(resp, 64).await.unwrap();
+        assert_eq!(v["a"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_declared_oversize_body_is_refused() {
+        let url = serve(vec![b'x'; 200], true).await;
+        let resp = reqwest::get(&url).await.unwrap();
+        let err = read_capped(resp, 100).await.unwrap_err();
+        assert!(format!("{err:#}").contains("100-byte limit"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_oversize_body_is_refused_by_its_byte_count() {
+        let url = serve(vec![b'x'; 200], false).await;
+        let resp = reqwest::get(&url).await.unwrap();
+        let err = read_capped(resp, 100).await.unwrap_err();
+        assert!(format!("{err:#}").contains("100-byte limit"), "{err:#}");
     }
 }

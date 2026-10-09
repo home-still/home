@@ -1,21 +1,28 @@
 //! `hs openalex …` — local OpenAlex catalog management.
 //!
-//! Commands:
-//!   load           Bulk-load a snapshot entity into DuckDB.
+//! Commands, in the order a catalog is built:
+//!   load           Bulk-load a snapshot entity into DuckDB. Every entity
+//!                  (dimensions and authors included) follows the works rule:
+//!                  partitions are walked newest-first, a seen-set of integer
+//!                  IDs gates each record, and the newest copy wins.
 //!   load-works     Bulk-load works partitions via streaming pre-dedupe.
 //!                  Walks partitions newest-first; a SeenSet of seen
 //!                  integer work-IDs gates each row so the live tables
 //!                  hold their PRIMARY KEY invariants without ON CONFLICT.
 //!                  Exits non-zero on the first failed partition.
-//!   status         Print row counts per table and the ingest-log entries
-//!                  that failed or skipped records (read-only).
-//!   query          Run an ad-hoc SQL query and print rows as JSON (read-only).
-//!   build-fts      Build the BM25 FTS index over works.title + abstract_text.
 //!   build-indexes  Build the post-load secondary indexes.
+//!   install-fts    Download + load the DuckDB `fts` extension (needs network
+//!                  once per host and DuckDB version; touches no database).
+//!   build-fts      Build the BM25 FTS index over works.title + abstract_text.
+//!                  Only LOADs `fts`: run `install-fts` first.
+//! Read-only:
+//!   status         Print row counts per table and the ingest-log entries
+//!                  that failed or skipped records.
+//!   query          Run an ad-hoc SQL query and print rows as JSON.
 //!
 //! `status` and `query` open the database read-only: they never create it and
-//! can run next to hs-mcp's read-only handle. Every other command is a
-//! writer and takes the file exclusively.
+//! can run next to hs-mcp's read-only handle. `install-fts` does not open the
+//! database. Every other command is a writer and takes the file exclusively.
 
 use std::path::{Path, PathBuf};
 
@@ -28,14 +35,16 @@ use openalex_ingest::{
 
 #[derive(Subcommand, Debug)]
 pub enum OpenAlexCmd {
-    /// Load a "simple" entity (concepts, topics, authors, sources, …) via DuckDB JSONL ingest.
+    /// Load a "simple" entity (concepts, topics, authors, sources, …). Partitions
+    /// are walked newest-first and the newest copy of each ID wins.
     Load {
         /// Entity name. One of: concepts, topics, domains, fields, subfields,
         /// sources, institutions, funders, publishers, authors.
         entity: String,
         /// authors only: fail a partition once more than this many of its
-        /// records are unparseable (default 100). The SQL-ingested entities
-        /// fail on the first malformed line and take no limit.
+        /// records are unusable (unparseable, or without an A<digits> id;
+        /// default 100). The SQL-ingested entities fail on the first
+        /// malformed line or id and take no limit.
         #[arg(long)]
         max_parse_errors: Option<u64>,
     },
@@ -58,10 +67,15 @@ pub enum OpenAlexCmd {
     Status,
     /// Run an ad-hoc SELECT (read-only connection) and print row tuples.
     Query { sql: String },
-    /// Build the BM25 FTS index over works.title + abstract_text.
+    /// Build the BM25 FTS index over works.title + abstract_text (needs the
+    /// extension: run `install-fts` first; this never downloads it).
     BuildFts,
     /// Build the post-load secondary indexes.
     BuildIndexes,
+    /// Download and load the DuckDB `fts` extension that `build-fts` needs.
+    /// Needs network access once per host and DuckDB version; opens no
+    /// database.
+    InstallFts,
 }
 
 impl OpenAlexCmd {
@@ -76,7 +90,8 @@ impl OpenAlexCmd {
 
 pub async fn dispatch(cmd: OpenAlexCmd) -> Result<()> {
     let cfg = load_config()?;
-    run(&cfg, cmd)
+    // Every subcommand is synchronous DuckDB work; keep it off the async workers.
+    tokio::task::spawn_blocking(move || run(&cfg, cmd)).await?
 }
 
 fn run(cfg: &Config, cmd: OpenAlexCmd) -> Result<()> {
@@ -175,6 +190,10 @@ fn run(cfg: &Config, cmd: OpenAlexCmd) -> Result<()> {
         OpenAlexCmd::BuildIndexes => {
             OpenAlexDb::open(&cfg.db_path)?.build_post_load_indexes()?;
             println!("Post-load indexes built.");
+        }
+        OpenAlexCmd::InstallFts => {
+            OpenAlexDb::install_fts()?;
+            println!("fts extension installed and loaded. Next: `hs openalex build-fts`.");
         }
     }
 
@@ -464,6 +483,77 @@ mod tests {
             Path::new("/data/oa/seen_set.bin")
         );
         assert!(seen_set_path(Path::new("/")).is_err());
+    }
+
+    #[derive(clap::Parser, Debug)]
+    struct Wrapper {
+        #[command(subcommand)]
+        cmd: OpenAlexCmd,
+    }
+
+    /// `install-fts` is its own step in front of `build-fts`, and it is not a
+    /// database writer: it must not create the catalog or take its lock.
+    #[test]
+    fn install_fts_is_a_subcommand_that_never_opens_the_database() {
+        use clap::Parser;
+        let install = Wrapper::try_parse_from(["openalex", "install-fts"])
+            .unwrap()
+            .cmd;
+        assert!(matches!(install, OpenAlexCmd::InstallFts));
+        assert!(!install.writes());
+        let build = Wrapper::try_parse_from(["openalex", "build-fts"])
+            .unwrap()
+            .cmd;
+        assert!(matches!(build, OpenAlexCmd::BuildFts));
+        assert!(build.writes());
+    }
+
+    #[cfg(not(windows))]
+    fn concept(id: u64, name: &str) -> String {
+        format!(
+            r#"{{"id":"https://openalex.org/C{id}","display_name":"{name}","level":0,"description":"d","wikidata":"https://www.wikidata.org/wiki/Q{id}","works_count":1,"cited_by_count":2,"ancestors":[{{"id":"https://openalex.org/C9","display_name":"Root","level":0}}]}}"#
+        )
+    }
+
+    /// `hs openalex load <dimension>` follows the works rule: the copy in the
+    /// newest partition wins, an older copy is skipped without error.
+    #[cfg(not(windows))]
+    #[test]
+    fn load_keeps_the_newest_copy_of_a_dimension_record() {
+        let env = env_with_partition(&[]);
+        for (part, lines) in [
+            (NEW, vec![concept(1, "new")]),
+            (
+                "updated_date=2024-01-01",
+                vec![concept(1, "old"), concept(2, "old")],
+            ),
+        ] {
+            let dir = env.cfg.snapshot_dir.join("concepts").join(part);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("part_0000.jsonl"), lines.join("\n") + "\n").unwrap();
+        }
+        let load = OpenAlexCmd::Load {
+            entity: "concepts".into(),
+            max_parse_errors: None,
+        };
+        run(&env.cfg, load).unwrap();
+
+        let db = OpenAlexDb::open_read_only(&env.cfg.db_path).unwrap();
+        let rows: Vec<(String, String)> = db
+            .raw()
+            .prepare("SELECT openalex_id, display_name FROM concepts ORDER BY 1")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("C1".to_string(), "new".to_string()),
+                ("C2".to_string(), "old".to_string())
+            ]
+        );
     }
 
     /// RA-149: every read-write subcommand is refused on Windows before the

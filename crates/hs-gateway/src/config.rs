@@ -9,8 +9,26 @@ use serde::Deserialize;
 use crate::auth::SERVICES;
 use crate::backend_url;
 
+/// `cloud.gateway` keys that used to exist and no longer do. Deployed configs
+/// still carry them, so they are stripped (with one warning each) instead of
+/// tripping the unknown-key error.
+const GATEWAY_REMOVED_KEYS: [&str; 1] = ["key_rotation_days"];
+
+/// Remove the retired keys from `section`, returning those that were present.
+fn strip_removed_keys(section: &mut serde_json::Value) -> Vec<&'static str> {
+    let Some(map) = section.as_object_mut() else {
+        return Vec::new();
+    };
+    GATEWAY_REMOVED_KEYS
+        .iter()
+        .copied()
+        .filter(|key| map.remove(*key).is_some())
+        .collect()
+}
+
 /// Gateway configuration loaded from the cloud.gateway section of config.yaml.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     /// Address to listen on, e.g. `0.0.0.0:7440`
     pub listen: String,
@@ -160,7 +178,14 @@ impl GatewayConfig {
             .and_then(|cloud| cloud.get("gateway"))
             .ok_or_else(|| anyhow!("{}: missing `cloud.gateway` section", config_path.display()))?;
 
-        let mut config: Self = serde_json::from_value(section.clone()).with_context(|| {
+        let mut section = section.clone();
+        for key in strip_removed_keys(&mut section) {
+            tracing::warn!(
+                key = %format!("cloud.gateway.{key}"),
+                "config key no longer exists and is ignored; remove it"
+            );
+        }
+        let mut config: Self = serde_json::from_value(section).with_context(|| {
             format!("{}: invalid `cloud.gateway` section", config_path.display())
         })?;
 
@@ -295,6 +320,22 @@ mod tests {
     fn missing_listen_is_an_error() {
         let msg = err_of("cloud:\n  gateway:\n    routes:\n      mcp: http://127.0.0.1:7445\n");
         assert!(msg.contains("listen"), "{msg}");
+    }
+
+    #[test]
+    fn a_retired_key_is_stripped_and_reported() {
+        let yaml = "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    key_rotation_days: 90\n    routes:\n      mcp: http://127.0.0.1:7445\n";
+        assert!(GatewayConfig::from_yaml(yaml, Path::new(PATH)).is_ok());
+        let mut section =
+            serde_yaml_ng::from_str::<serde_json::Value>(yaml).unwrap()["cloud"]["gateway"].clone();
+        assert_eq!(strip_removed_keys(&mut section), ["key_rotation_days"]);
+        assert!(strip_removed_keys(&mut section).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_key_is_an_error_naming_it() {
+        let msg = err_of("cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    max_concurrent_proxy_request: 5\n    routes:\n      mcp: http://127.0.0.1:7445\n");
+        assert!(msg.contains("max_concurrent_proxy_request"), "{msg}");
     }
 
     #[test]

@@ -17,7 +17,7 @@ use rmcp::{
     },
     prompt, prompt_handler, prompt_router, schemars,
     service::RequestContext,
-    tool, tool_handler, tool_router, RoleServer, ServerHandler,
+    tool, tool_router, RoleServer, ServerHandler,
 };
 use stem::Stem;
 
@@ -42,7 +42,9 @@ struct PaperSearchParams {
     search_type: Option<String>,
     #[schemars(description = "Date filter, e.g. '>=2023' or '2020-2024'")]
     date: Option<String>,
-    #[schemars(description = "Result offset for pagination (default 0)")]
+    #[schemars(
+        description = "Result offset for pagination (default 0). OpenAlex needs a multiple of the page size (max_results); Europe PMC cannot page by offset (an error when requested alone, left out of `all` when offset > 0)."
+    )]
     offset: Option<usize>,
     #[schemars(
         description = "Provider: all, arxiv, openalex, semantic_scholar (s2), europmc (pmc), crossref, core (default: all). Unknown values return an error."
@@ -411,35 +413,76 @@ fn openalex_unavailable_error() -> String {
         .to_string()
 }
 
-/// Open the local OpenAlex DuckDB read-only. Reads `~/.home-still/config.yaml`
-/// for the `openalex.db_path` setting. Errors if the section or file is
-/// missing — caller decides whether to log+continue.
-fn open_openalex_readonly() -> anyhow::Result<duckdb::Connection> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no $HOME"))?;
-    let cfg_path = home.join(".home-still").join("config.yaml");
-    let raw = std::fs::read_to_string(&cfg_path)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", cfg_path.display()))?;
-    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&raw)?;
-    let oa = v
-        .get("openalex")
-        .ok_or_else(|| anyhow::anyhow!("missing 'openalex:' section in {}", cfg_path.display()))?;
-    let db_path_str = oa
-        .get("db_path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("openalex.db_path missing"))?;
+/// The `openalex:` section of `~/.home-still/config.yaml` as hs-mcp reads it.
+/// `snapshot_dir` belongs to `hs openalex load`; it is accepted here so the
+/// shared section is not rejected, and not used. hs-mcp does not own this
+/// section, and deployed configs carry stale keys in it, so an unknown key is
+/// a warning (the convention for such sections), not a startup error.
+#[derive(Debug, serde::Deserialize)]
+struct OpenAlexSection {
+    db_path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    snapshot_dir: Option<String>,
+}
+
+/// Open the local OpenAlex DuckDB read-only, using `openalex.db_path` from
+/// the already-loaded config file. `Ok(None)` is the two legitimate
+/// "OpenAlex is not set up on this host" states: no `openalex:` section, or
+/// a database file that `hs openalex load` has not created yet. A section
+/// that is present but malformed (a typo, a missing `db_path`) is an error
+/// that stops the server: it must not read as "not configured".
+fn open_openalex_readonly(
+    file: &hs_common::config_file::ConfigFile,
+) -> anyhow::Result<Option<duckdb::Connection>> {
+    if let Some(raw) = file.section_json("openalex")? {
+        hs_common::config_file::warn_unknown_keys(
+            file.path(),
+            "openalex",
+            &raw,
+            &serde_json::json!({ "db_path": "", "snapshot_dir": "" }),
+            &[],
+        );
+    }
+    let Some(section) = file.section::<OpenAlexSection>("openalex")? else {
+        tracing::info!("no `openalex:` section in the config; openalex_* tools are not offered");
+        return Ok(None);
+    };
+    let home = hs_common::config_file::home_dir()?;
+    let db_path_str = section.db_path.trim();
+    if db_path_str.is_empty() {
+        anyhow::bail!(
+            "{}: invalid `openalex` section: `db_path` is empty",
+            file.path().display()
+        );
+    }
     let db_path = if let Some(rest) = db_path_str.strip_prefix("~/") {
         home.join(rest)
     } else {
         std::path::PathBuf::from(db_path_str)
     };
     if !db_path.exists() {
-        anyhow::bail!(
-            "openalex db not found at {} — run `hs openalex load <entity>` first",
+        tracing::warn!(
+            "openalex db not found at {} — run `hs openalex load <entity>` first; \
+             openalex_* tools are not offered",
             db_path.display()
         );
+        return Ok(None);
     }
     let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
-    let conn = duckdb::Connection::open_with_flags(&db_path, cfg)?;
+    let conn = match duckdb::Connection::open_with_flags(&db_path, cfg) {
+        Ok(conn) => conn,
+        // The database is configured and present but cannot be opened: most
+        // often `hs openalex load` holds the write lock. Not a config error,
+        // so the server still starts, without the openalex_* tools.
+        Err(e) => {
+            tracing::warn!(
+                "openalex db at {} cannot be opened: {e}; openalex_* tools are not offered",
+                db_path.display()
+            );
+            return Ok(None);
+        }
+    };
     // Cap query memory so a single bad FTS call can't OOM-kill the entire
     // mcp process and trigger a systemd restart loop. `match_bm25` on
     // multi-term queries with common terms builds an ~11M-row intermediate
@@ -448,7 +491,7 @@ fn open_openalex_readonly() -> anyhow::Result<duckdb::Connection> {
     // conservatively and either completes or raises a recoverable
     // "Out of Memory" that surfaces cleanly to the MCP client.
     conn.execute_batch("SET memory_limit='4GB';")?;
-    Ok(conn)
+    Ok(Some(conn))
 }
 
 /// Probe whether the OpenAlex corpus has finished its end-to-end build
@@ -481,6 +524,17 @@ fn split_result<T, E: std::fmt::Display>(r: Result<T, E>) -> (Option<T>, Option<
         Ok(v) => (Some(v), None),
         Err(e) => (None, Some(format!("{e:#}"))),
     }
+}
+
+/// `"health: <why>; readiness: <why>"` for the calls that failed; `None`
+/// when none did. Carried into the system snapshot so an unhealthy instance
+/// says why.
+fn join_call_errors(calls: &[(&str, &Option<String>)]) -> Option<String> {
+    let parts: Vec<String> = calls
+        .iter()
+        .filter_map(|(name, err)| err.as_ref().map(|e| format!("{name}: {e}")))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// A private read-only handle for one request. The shared connection is
@@ -653,21 +707,29 @@ impl ProgressHeartbeat {
             return Self(None);
         };
         let peer = context.peer.clone();
-        Self(Some(tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            let mut tick =
-                tokio::time::interval_at(tokio::time::Instant::now() + Self::EVERY, Self::EVERY);
-            loop {
-                tick.tick().await;
-                let secs = started.elapsed().as_secs();
-                let params = ProgressNotificationParam::new(token.clone(), secs as f64)
-                    .with_message(format!("{label}: still running ({secs}s)"));
-                if let Err(e) = peer.notify_progress(params).await {
-                    tracing::warn!(label = %label, error = %e, "progress heartbeat stopped");
-                    break;
+        let started = std::time::Instant::now();
+        Self(Some(tokio::spawn(hs_common::panic_guard::supervise(
+            "progress-heartbeat",
+            move || {
+                let (peer, token, label) = (peer.clone(), token.clone(), label.clone());
+                async move {
+                    let mut tick = tokio::time::interval_at(
+                        tokio::time::Instant::now() + Self::EVERY,
+                        Self::EVERY,
+                    );
+                    loop {
+                        tick.tick().await;
+                        let secs = started.elapsed().as_secs();
+                        let params = ProgressNotificationParam::new(token.clone(), secs as f64)
+                            .with_message(format!("{label}: still running ({secs}s)"));
+                        if let Err(e) = peer.notify_progress(params).await {
+                            tracing::warn!(label = %label, error = %e, "progress heartbeat stopped");
+                            break;
+                        }
+                    }
                 }
-            }
-        })))
+            },
+        ))))
     }
 }
 
@@ -684,7 +746,10 @@ impl HomeStillMcp {
         // One read of ~/.home-still/config.yaml. A missing file is an empty
         // config; a malformed file or section stops the server with the
         // section named: nothing here substitutes defaults for it.
-        let file = hs_common::config_file::ConfigFile::load()?;
+        Self::from_config_file(hs_common::config_file::ConfigFile::load()?).await
+    }
+
+    async fn from_config_file(file: hs_common::config_file::ConfigFile) -> anyhow::Result<Self> {
         let distill_cfg = hs_distill::config::DistillClientConfig::from_file(&file)?;
         let scribe_cfg = hs_scribe::config::ScribeConfig::from_file(&file)?;
 
@@ -735,16 +800,11 @@ impl HomeStillMcp {
             scribe_cfg.servers.iter().map(|e| e.url.clone()).collect();
         let distill_servers = distill_cfg.servers.clone();
 
-        // Best-effort open of the local OpenAlex DuckDB. Missing config section
-        // = `None`, tools return a clear error. Missing file = `None` (don't
-        // create here — let `hs openalex` own DB lifecycle).
-        let openalex_db = open_openalex_readonly()
-            .map_err(|e| {
-                tracing::warn!("openalex DB unavailable: {e:#}");
-                e
-            })
-            .ok()
-            .map(|conn| Arc::new(std::sync::Mutex::new(conn)));
+        // Local OpenAlex DuckDB. No `openalex:` section or a database file
+        // that is not there yet = `None` (tools hidden; `hs openalex` owns
+        // the DB lifecycle); a malformed `openalex:` section stops the start.
+        let openalex_db =
+            open_openalex_readonly(&file)?.map(|conn| Arc::new(std::sync::Mutex::new(conn)));
 
         let paper_config = paper::config::Config::load()
             .map_err(|e| anyhow::anyhow!("paper config invalid: {e:#}"))?;
@@ -1083,11 +1143,16 @@ impl HomeStillMcp {
         let provider = self.providers.provider(&provider_arg);
 
         let search_type = match p.search_type.as_deref() {
+            None | Some("keywords") => paper::models::SearchType::Keywords,
             Some("title") => paper::models::SearchType::Title,
             Some("author") => paper::models::SearchType::Author,
             Some("doi") => paper::models::SearchType::DOI,
             Some("subject") => paper::models::SearchType::Subject,
-            _ => paper::models::SearchType::Keywords,
+            Some(other) => {
+                return Err(format!(
+                    "Unknown search_type {other:?}. Accepted: keywords, title, author, doi, subject."
+                ));
+            }
         };
 
         // A date filter that does not parse is an error: dropping it would
@@ -1821,7 +1886,7 @@ impl HomeStillMcp {
                 if filename.starts_with("._") {
                     return None;
                 }
-                Some(filename.trim_end_matches(".md").to_string())
+                Some(filename.strip_suffix(".md").unwrap_or(filename).to_string())
             })
             .collect();
 
@@ -1957,7 +2022,11 @@ impl HomeStillMcp {
     async fn catalog_backfill_title(
         &self,
         Parameters(p): Parameters<CatalogBackfillTitleParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
+        // Runs longer than the session idle timeout can tolerate without a
+        // progress signal; see `ProgressHeartbeat`.
+        let _heartbeat = ProgressHeartbeat::start(&context, "catalog_backfill_title".to_string());
         let triples =
             hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
                 .await
@@ -2004,8 +2073,8 @@ impl HomeStillMcp {
         let mut no_metadata = 0u64;
         let mut errors: Vec<String> = Vec::new();
 
-        for (stem, mut entry) in take {
-            let doi = match entry.doi.as_deref() {
+        for (stem, listed) in take {
+            let doi = match listed.doi.as_deref() {
                 Some(d) => d,
                 None => continue,
             };
@@ -2023,6 +2092,30 @@ impl HomeStillMcp {
 
             if meta.title.trim().is_empty() {
                 no_metadata += 1;
+                continue;
+            }
+
+            // The listing is minutes old by now (one provider round trip per
+            // row): write onto the row as it is, not as it was, or a
+            // conversion/embedding stamp landed in between is erased.
+            let mut entry = match hs_common::catalog::read_catalog_entry_via(
+                &*self.storage,
+                &self.catalog_prefix,
+                &stem,
+            )
+            .await
+            {
+                Ok(Some(entry)) => entry,
+                Ok(None) => {
+                    errors.push(format!("{stem}: catalog row vanished before the write"));
+                    continue;
+                }
+                Err(e) => {
+                    errors.push(format!("{stem}: catalog re-read failed: {e:#}"));
+                    continue;
+                }
+            };
+            if entry.title.as_ref().is_some_and(|t| !t.trim().is_empty()) {
                 continue;
             }
 
@@ -2358,7 +2451,11 @@ impl HomeStillMcp {
     async fn distill_scan_repetitions(
         &self,
         Parameters(p): Parameters<DistillScanRepetitionsParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
+        // Runs longer than the session idle timeout can tolerate without a
+        // progress signal; see `ProgressHeartbeat`.
+        let _heartbeat = ProgressHeartbeat::start(&context, "distill_scan_repetitions".to_string());
         let limit = p.limit.unwrap_or(100_000) as usize;
         let threshold = p.threshold.unwrap_or(20);
 
@@ -2389,7 +2486,14 @@ impl HomeStillMcp {
                     return Err(format!("{} is not valid UTF-8: {e}", obj.key));
                 }
             };
-            let (cleaned, breakdown) = hs_scribe::postprocess::clean_repetitions(&original);
+            // CPU-bound over a whole document: off the async worker threads,
+            // so a large scan cannot starve every other session.
+            let (original, cleaned, breakdown) = tokio::task::spawn_blocking(move || {
+                let (cleaned, breakdown) = hs_scribe::postprocess::clean_repetitions(&original);
+                (original, cleaned, breakdown)
+            })
+            .await
+            .map_err(|e| format!("repetition scan of {} failed: {e}", obj.key))?;
             let truncations = breakdown.total();
             if truncations <= threshold {
                 continue;
@@ -2467,7 +2571,11 @@ impl HomeStillMcp {
     async fn distill_backfill(
         &self,
         Parameters(p): Parameters<DistillBackfillParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
+        // Runs longer than the session idle timeout can tolerate without a
+        // progress signal; see `ProgressHeartbeat`.
+        let _heartbeat = ProgressHeartbeat::start(&context, "distill_backfill".to_string());
         let triples =
             hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
                 .await
@@ -2659,7 +2767,11 @@ impl HomeStillMcp {
     async fn personal_add(
         &self,
         Parameters(p): Parameters<PersonalAddParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
+        // Runs longer than the session idle timeout can tolerate without a
+        // progress signal; see `ProgressHeartbeat`.
+        let _heartbeat = ProgressHeartbeat::start(&context, "personal_add".to_string());
         let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
         let path = personal::services::inbox::resolve_inbox_path(&cfg, &p.filename)
             .map_err(|e| e.to_string())?;
@@ -3014,11 +3126,14 @@ impl HomeStillMcp {
                     continue;
                 }
             };
-            let health_res = client.health().await;
-            let health_err = health_res.as_ref().err().map(|e| format!("{e:#}"));
-            let health = health_res.ok();
-            let readiness = client.readiness().await.ok();
-            let status = client.status().await.ok();
+            let (health, health_err) = split_result(client.health().await);
+            let (readiness, readiness_err) = split_result(client.readiness().await);
+            let (status, status_err) = split_result(client.status().await);
+            let error = join_call_errors(&[
+                ("health", &health_err),
+                ("readiness", &readiness_err),
+                ("status", &status_err),
+            ]);
 
             let healthy = health.is_some();
             let version = health
@@ -3083,6 +3198,7 @@ impl HomeStillMcp {
                 in_flight,
                 slots_total: None,
                 slots_available: None,
+                error,
             });
         }
 
@@ -3096,10 +3212,9 @@ impl HomeStillMcp {
                     continue;
                 }
             };
-            let health_res = client.health().await;
-            let health_err = health_res.as_ref().err().map(|e| format!("{e:#}"));
-            let health = health_res.ok();
-            let readiness = client.readiness().await.ok();
+            let (health, health_err) = split_result(client.health().await);
+            let (readiness, readiness_err) = split_result(client.readiness().await);
+            let error = join_call_errors(&[("health", &health_err), ("readiness", &readiness_err)]);
 
             // A scribe whose VLM backend can't take work answers 503
             // with `status: "backend_unavailable"`. The body still
@@ -3143,6 +3258,7 @@ impl HomeStillMcp {
                 in_flight,
                 slots_total,
                 slots_available,
+                error,
             });
         }
 
@@ -3235,7 +3351,7 @@ impl HomeStillMcp {
         // indicate either stamped failures or stems that errored without a
         // stamp; check scribe/event-watch logs for the latter.
         let total_in_flight: u64 = scribe_instances.iter().map(|s| s.in_flight).sum();
-        match hs_common::status::count_unconverted_stems(
+        let unconverted = match hs_common::status::count_unconverted_stems(
             &*self.storage,
             &self.papers_prefix,
             &self.markdown_prefix,
@@ -3244,9 +3360,26 @@ impl HomeStillMcp {
         {
             Ok(unconverted) => {
                 pipeline.pipeline_drift = unconverted.saturating_sub(total_in_flight);
+                Some(unconverted)
             }
-            Err(e) => pipeline.mark_unavailable(&e),
-        }
+            Err(e) => {
+                pipeline.mark_unavailable(&e);
+                None
+            }
+        };
+        // Bounded: an unreachable broker must not stall the whole snapshot.
+        let depth = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.events
+                .queue_depth(&hs_common::event_bus::specs::PAPERS_INGESTED),
+        )
+        .await
+        {
+            Ok(Ok(depth)) => Ok(depth.outstanding()),
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Err(_) => Err("timed out asking the broker for queue depth".to_string()),
+        };
+        pipeline.record_queue(unconverted, depth);
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
         pipeline.corrupted_pdfs = corrupted_pdfs;
         pipeline.inbox_pending = inbox_pending;
@@ -3266,7 +3399,15 @@ impl HomeStillMcp {
         // Inbox-sweeper heartbeat. Populated server-side so every client
         // (mac_air, big, laptop) renders the same verdict. `None` = no
         // heartbeat key in storage; `Some(.running=false)` = stale.
-        let inbox_heartbeat = hs_common::status::read_inbox_heartbeat(&*self.storage).await;
+        // A storage/parse error is surfaced via `counts_error`, not folded
+        // into `None` (which means "no heartbeat key").
+        let inbox_heartbeat = match hs_common::status::read_inbox_heartbeat(&*self.storage).await {
+            Ok(hb) => hb,
+            Err(e) => {
+                pipeline.mark_unavailable(&e);
+                None
+            }
+        };
 
         StatusSnapshot {
             pipeline,
@@ -3361,9 +3502,49 @@ impl HomeStillMcp {
 
 // ── ServerHandler ───────────────────────────────────────────────
 
-#[tool_handler(router = self.tool_router)]
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for HomeStillMcp {
+    /// What `#[tool_handler]` generates, plus a panic guard. A panic inside
+    /// a tool would otherwise unwind the rmcp session task, which ends the
+    /// whole session with no answer to the call (the HTTP catch layer cannot
+    /// see it: the session runs on its own task). It becomes a tool error,
+    /// logged with the tool name, and the session keeps serving.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let tool = request.name.to_string();
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        match hs_common::panic_guard::catch_panic(self.tool_router.call(tcc)).await {
+            Ok(result) => result,
+            Err(message) => {
+                tracing::error!(tool = %tool, panic = %message, "tool handler panicked; answering with a tool error");
+                Ok(rmcp::model::CallToolResult::error(vec![
+                    rmcp::model::Content::text(format!(
+                        "{tool} failed: internal error (the server logged the details)"
+                    )),
+                ]))
+            }
+        }
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        Ok(rmcp::model::ListToolsResult {
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        self.tool_router.get(name).cloned()
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -3664,7 +3845,7 @@ async fn async_main() -> anyhow::Result<()> {
         Transport::Stdio => {
             let transport = rmcp::transport::io::stdio();
             let ct = rmcp::service::serve_server(server, transport).await?;
-            let _ = ct.waiting().await;
+            ct.waiting().await?;
             Ok(())
         }
     };
@@ -3774,19 +3955,8 @@ mod startup_tests {
     #[tokio::test]
     async fn refuses_to_start_without_storage_config() {
         let tmp = tempfile::tempdir().unwrap();
-        let prev_home = std::env::var("HOME").ok();
-        // SAFETY: #[tokio::test] default runtime is single-threaded; this
-        // block brackets the HOME mutation to a single await region.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-        }
-        let result = HomeStillMcp::new().await;
-        unsafe {
-            match prev_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        let file = hs_common::config_file::ConfigFile::load_in(tmp.path()).unwrap();
+        let result = HomeStillMcp::from_config_file(file).await;
         let err = result
             .err()
             .expect("new() must fail without storage config");
@@ -3795,6 +3965,48 @@ mod startup_tests {
             msg.contains("storage"),
             "error should mention storage; got: {msg}"
         );
+    }
+
+    fn config_with(yaml: &str) -> (tempfile::TempDir, hs_common::config_file::ConfigFile) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".home-still");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), yaml).unwrap();
+        let file = hs_common::config_file::ConfigFile::load_in(tmp.path()).unwrap();
+        (tmp, file)
+    }
+
+    /// RA-121: a malformed `openalex:` section stops the server; it is not
+    /// read as "OpenAlex is not configured".
+    #[test]
+    fn a_malformed_openalex_section_is_an_error() {
+        for yaml in [
+            "openalex:\n  snapshot_dir: /tmp/snap\n",
+            "openalex:\n  db_pth: /typo\n",
+            "openalex: [1, 2]\n",
+            "openalex:\n  db_path: \"  \"\n",
+        ] {
+            let (_tmp, file) = config_with(yaml);
+            let err = super::open_openalex_readonly(&file)
+                .err()
+                .unwrap_or_else(|| panic!("must refuse: {yaml}"));
+            assert!(format!("{err:#}").contains("openalex"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn an_absent_section_or_database_leaves_openalex_unconfigured() {
+        let (_tmp, file) = config_with("storage:\n  backend: local\n");
+        assert!(super::open_openalex_readonly(&file).unwrap().is_none());
+
+        // A stale key another tool once read (live configs carry
+        // `ingest_workers`) is warned about, never fatal.
+        let (tmp, file) = config_with(&format!(
+            "openalex:\n  db_path: {}\n  ingest_workers: 8\n",
+            "/definitely/not/there/openalex.db"
+        ));
+        assert!(super::open_openalex_readonly(&file).unwrap().is_none());
+        drop(tmp);
     }
 }
 

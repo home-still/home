@@ -503,7 +503,7 @@ impl EmbeddingConfig {
     /// able to see all of it.
     pub fn validate(&self, chunk_max_tokens: usize) -> Result<(), DistillError> {
         self.validate_self()?;
-        if chunk_max_tokens + CHUNK_HEADER_RESERVE_TOKENS > self.max_length {
+        if chunk_max_tokens.saturating_add(CHUNK_HEADER_RESERVE_TOKENS) > self.max_length {
             return Err(DistillError::Config(format!(
                 "chunk_max_tokens ({chunk_max_tokens}) + {CHUNK_HEADER_RESERVE_TOKENS} header tokens \
                  exceeds embedding.max_length ({}): the tail of every chunk would be \
@@ -644,7 +644,11 @@ impl DistillClientConfig {
             .filter(|e| e.backend == hs_common::event_bus::EventsBackend::Nats)
         {
             let ack_wait = events.nats.ack_wait_secs;
-            if self.index_timeout_secs + Self::ACK_WAIT_HEADROOM_SECS > ack_wait {
+            if self
+                .index_timeout_secs
+                .saturating_add(Self::ACK_WAIT_HEADROOM_SECS)
+                > ack_wait
+            {
                 return Err(DistillError::Config(format!(
                     "distill.index_timeout_secs ({}) + {} s headroom exceeds events.nats.ack_wait_secs \
                      ({ack_wait}): the broker would redeliver an event that is still being indexed",
@@ -880,22 +884,9 @@ mod tests {
 
     // ── Loading (RA-6) ─────────────────────────────────────────────────
     //
-    // Through `from_file` against a temporary home directory, with the
-    // process environment emptied and then set per test (figment's `Jail`).
-
-    #[allow(clippy::result_large_err)] // figment's `Jail` closure type
-    fn with_env<R>(vars: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
-        let mut out = None;
-        figment::Jail::expect_with(|jail| {
-            jail.clear_env();
-            for (k, v) in vars {
-                jail.set_env(k, v);
-            }
-            out = Some(f());
-            Ok(())
-        });
-        out.expect("closure ran")
-    }
+    // The tests that run `from_file` under a controlled process environment
+    // live in `tests/config_load.rs`: setting variables is not safe beside
+    // the other threads of this lib test binary.
 
     fn home_with(yaml: Option<&str>) -> (tempfile::TempDir, ConfigFile) {
         let home = tempfile::tempdir().unwrap();
@@ -906,60 +897,6 @@ mod tests {
         }
         let file = ConfigFile::load_in(home.path()).unwrap();
         (home, file)
-    }
-
-    #[test]
-    fn yaml_collections_replace_the_default_list_and_host_port_are_read() {
-        let (_home, file) = home_with(Some(
-            "distill_server:\n  host: 127.0.0.1\n  port: 7444\n  collections: [only_this]\n",
-        ));
-        let loaded = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();
-        assert_eq!(loaded.collections, ["only_this"]);
-        assert_eq!((loaded.host.as_str(), loaded.port), ("127.0.0.1", 7444));
-        loaded.validate().unwrap();
-        let served: Vec<_> = loaded.served_collections().collect();
-        assert_eq!(served, ["academic_papers", "only_this"]);
-    }
-
-    #[test]
-    fn env_overrides_the_file_and_the_project_dir_moves_the_data_dir() {
-        let (_home, file) = home_with(Some(
-            "home:\n  project_dir: /srv/hs\ndistill_server:\n  port: 7444\n",
-        ));
-        let loaded = with_env(&[("HS_DISTILL_PORT", "7555")], || {
-            DistillServerConfig::from_file(&file)
-        })
-        .unwrap();
-        assert_eq!(loaded.port, 7555);
-        assert_eq!(
-            loaded.qdrant_data_dir,
-            std::path::PathBuf::from("/srv/hs/data/qdrant")
-        );
-    }
-
-    #[test]
-    fn a_malformed_section_or_env_value_is_an_error_never_the_defaults() {
-        for yaml in [
-            "distill_server:\n  port: not-a-port\n",
-            "distill_server:\n  embedding:\n    compute_device: cpu\n",
-            "distill_server: [1, 2]\n",
-        ] {
-            let (_home, file) = home_with(Some(yaml));
-            let err = with_env(&[], || DistillServerConfig::from_file(&file))
-                .expect_err(yaml)
-                .to_string();
-            assert!(err.contains("`distill_server`"), "{yaml}: {err}");
-        }
-        let (_home, ok) = home_with(None);
-        let err = with_env(&[("HS_DISTILL_PORT", "http")], || {
-            DistillServerConfig::from_file(&ok)
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("distill_server") && err.to_ascii_lowercase().contains("port"),
-            "{err}"
-        );
     }
 
     #[test]
@@ -990,10 +927,6 @@ mod tests {
             removed_keys_present(&section),
             ["embedding.model", "embedding.sparse_enabled"]
         );
-        // Still loads: the keys were already inert.
-        let loaded = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();
-        assert_eq!(loaded.embedding.dimension, 1024);
-
         let (_home, clean) = home_with(Some("distill_server:\n  port: 7434\n"));
         let section = clean.section_json(SERVER_SECTION).unwrap().unwrap();
         assert!(removed_keys_present(&section).is_empty());
@@ -1011,47 +944,6 @@ mod tests {
             index_timeout_secs,
             events: Some(events),
             ..DistillClientConfig::default()
-        }
-    }
-
-    #[test]
-    fn the_client_has_no_default_server_and_no_default_bus() {
-        let (_home, file) = home_with(None);
-        let cfg = with_env(&[], || DistillClientConfig::from_file(&file)).unwrap();
-        assert!(cfg.servers.is_empty());
-        assert!(cfg.events.is_none());
-        let err = cfg.require_servers().unwrap_err().to_string();
-        assert!(err.contains("distill.servers"), "{err}");
-
-        let (_home, file) = home_with(Some(
-            "distill:\n  servers: [http://host-a.example:7434]\n  index_timeout_secs: 600\nevents:\n  backend: noop\n",
-        ));
-        let cfg = with_env(&[], || DistillClientConfig::from_file(&file)).unwrap();
-        assert_eq!(
-            cfg.require_servers().unwrap(),
-            ["http://host-a.example:7434"]
-        );
-        assert_eq!(cfg.index_timeout_secs, 600);
-        assert!(cfg.events.is_some());
-    }
-
-    #[test]
-    fn a_malformed_client_section_is_an_error_naming_it() {
-        for (yaml, section) in [
-            ("distill:\n  servers: not-a-list\n", "distill"),
-            ("distill:\n  index_timeout_secs: 0\n", "distill"),
-            ("storage:\n  backend: carrier-pigeon\n", "storage"),
-            ("events:\n  backend: carrier-pigeon\n", "events"),
-            (
-                "events:\n  backend: nats\n  nats:\n    ack_wait_secs: 100\n",
-                "distill",
-            ),
-        ] {
-            let (_home, file) = home_with(Some(yaml));
-            let err = with_env(&[], || DistillClientConfig::from_file(&file))
-                .expect_err(yaml)
-                .to_string();
-            assert!(err.contains(&format!("`{section}`")), "{yaml}: {err}");
         }
     }
 
@@ -1087,15 +979,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_or_misspelt_key_is_a_warning_not_a_failure_and_removed_keys_keep_their_own() {
+    fn a_stale_or_misspelt_key_is_a_warning_and_removed_keys_keep_their_own() {
         let (_home, file) = home_with(Some(
             "distill_server:\n  port: 7555\n  qdrant_urll: http://x\n  embedding:\n    model: bge-m3\n    batchsize: 4\ndistill:\n  index_timeout: 5\n",
         ));
-        let server = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();
-        assert_eq!(server.port, 7555);
-        assert_eq!(server.qdrant_url, DistillServerConfig::default().qdrant_url);
-        with_env(&[], || DistillClientConfig::from_file(&file)).unwrap();
-
         let tree = serde_json::to_value(DistillServerConfig::default()).unwrap();
         let section = file.section_json(SERVER_SECTION).unwrap().unwrap();
         let found: Vec<String> = hs_common::config_file::unknown_key_notices(

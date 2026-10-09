@@ -172,32 +172,38 @@ fn write_config(path: &PathBuf, value: &serde_json::Value) -> Result<()> {
 
 // ── Install ────────────────────────────────────────────────────
 
-fn build_stdio_entry(mcp_bin: &Path) -> serde_json::Value {
+fn build_stdio_entry(mcp_bin: &Path) -> Result<serde_json::Value> {
     let mut entry = serde_json::json!({
         "command": mcp_bin.to_string_lossy(),
     });
-    if let Some(env) = secrets_as_json() {
+    if let Some(env) = secrets_as_json()? {
         entry["env"] = env;
     }
-    entry
+    Ok(entry)
 }
 
 /// Load `~/.home-still/secrets.env` and return its KEY=VALUE pairs as a JSON
 /// object suitable for dropping into a Claude Desktop / opencode MCP entry's
-/// `env` field. Returns `None` if the file is absent or empty.
-fn secrets_as_json() -> Option<serde_json::Value> {
-    let path = hs_common::secrets::default_path()?;
-    let entries = hs_common::secrets::parse_secrets_from_path(&path)
-        .ok()
-        .flatten()?;
+/// `env` field. Returns `None` if the file is absent or empty; an unreadable
+/// file is an error (the entry would otherwise be installed without the
+/// credentials the MCP server needs).
+fn secrets_as_json() -> Result<Option<serde_json::Value>> {
+    let Some(path) = hs_common::secrets::default_path() else {
+        return Ok(None);
+    };
+    let Some(entries) = hs_common::secrets::parse_secrets_from_path(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?
+    else {
+        return Ok(None);
+    };
     if entries.is_empty() {
-        return None;
+        return Ok(None);
     }
     let map: serde_json::Map<String, serde_json::Value> = entries
         .into_iter()
         .map(|(k, v)| (k, serde_json::Value::String(v)))
         .collect();
-    Some(serde_json::Value::Object(map))
+    Ok(Some(serde_json::Value::Object(map)))
 }
 
 fn build_remote_entry(gateway_url: &str) -> serde_json::Value {
@@ -208,16 +214,16 @@ fn build_remote_entry(gateway_url: &str) -> serde_json::Value {
     })
 }
 
-fn build_opencode_stdio_entry(mcp_bin: &Path) -> serde_json::Value {
+fn build_opencode_stdio_entry(mcp_bin: &Path) -> Result<serde_json::Value> {
     let mut entry = serde_json::json!({
         "type": "local",
         "command": [mcp_bin.to_string_lossy()],
         "enabled": true,
     });
-    if let Some(env) = secrets_as_json() {
+    if let Some(env) = secrets_as_json()? {
         entry["environment"] = env;
     }
-    entry
+    Ok(entry)
 }
 
 fn build_opencode_remote_entry(gateway_url: &str) -> serde_json::Value {
@@ -238,7 +244,7 @@ async fn resolve_gateway_url(explicit: Option<String>) -> Result<String> {
         return Ok(url);
     }
     // Try to read from cloud credentials
-    let cred_path = hs_common::auth::client::CloudCredentials::default_path();
+    let cred_path = hs_common::auth::client::CloudCredentials::default_path()?;
     if cred_path.exists() {
         let creds = hs_common::auth::client::CloudCredentials::load(&cred_path)?;
         return Ok(creds.gateway_url);
@@ -288,10 +294,10 @@ async fn cmd_install(
         let mut config = read_config(path)?;
 
         if is_opencode(name) {
-            let entry = if let Some(ref url) = resolved_url {
+            let entry = if let Some(url) = &resolved_url {
                 build_opencode_remote_entry(url)
             } else {
-                build_opencode_stdio_entry(mcp_bin.as_deref().unwrap())
+                build_opencode_stdio_entry(mcp_bin.as_deref().unwrap())?
             };
 
             let servers = config
@@ -305,10 +311,10 @@ async fn cmd_install(
                 .context("mcp is not a JSON object")?
                 .insert("home-still".to_string(), entry);
         } else {
-            let entry = if let Some(ref url) = resolved_url {
+            let entry = if let Some(url) = &resolved_url {
                 build_remote_entry(url)
             } else {
-                build_stdio_entry(mcp_bin.as_deref().unwrap())
+                build_stdio_entry(mcp_bin.as_deref().unwrap())?
             };
 
             let servers = config
@@ -357,10 +363,13 @@ async fn download_mcp_binary(reporter: &Arc<dyn Reporter>) -> Result<PathBuf> {
         .with_context(|| build_hint.clone())?;
 
     // Install next to the running hs binary, falling back to ~/.local/bin
-    let install_dir = std::env::current_exe()
+    let install_dir = match std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/bin"));
+    {
+        Some(dir) => dir,
+        None => hs_common::home_dir()?.join(".local/bin"),
+    };
     let install_path = install_dir.join("hs-mcp");
     installer
         .install(&prepared, &install_path, reporter)

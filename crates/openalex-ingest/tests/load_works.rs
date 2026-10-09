@@ -446,14 +446,92 @@ fn a_truncated_gz_file_fails_the_partition() {
 
 // ---- authors -------------------------------------------------------------
 
-fn author(id: u64) -> String {
+fn author_named(id: u64, name: &str) -> String {
     format!(
-        r#"{{"id":"https://openalex.org/A{id}","display_name":"Author {id}","works_count":1,"cited_by_count":2}}"#
+        r#"{{"id":"https://openalex.org/A{id}","display_name":"{name}","works_count":1,"cited_by_count":2}}"#
     )
 }
 
+fn author(id: u64) -> String {
+    author_named(id, &format!("Author {id}"))
+}
+
+impl Fixture {
+    fn names(&self, table: &str) -> Vec<(String, String)> {
+        self.db
+            .raw()
+            .prepare(&format!(
+                "SELECT openalex_id, display_name FROM {table} ORDER BY 1"
+            ))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn ingest_status(&self, entity: &str, partition: &str) -> String {
+        self.db
+            .raw()
+            .query_row(
+                "SELECT status FROM _ingest_log WHERE entity = ? AND partition = ?",
+                [entity, partition],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+}
+
+fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+    rows.iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+
+/// RA-OPS-D8: authors follow the works rule. Partitions are walked
+/// newest-first, a duplicate id (across partitions, or inside one) is skipped
+/// silently, and the newest copy wins; no partition fails for a duplicate.
 #[test]
-fn authors_load_and_a_duplicate_key_fails_the_partition() {
+fn authors_duplicate_ids_load_once_and_the_newest_copy_wins() {
+    let f = fixture();
+    write_file(
+        &f.snap,
+        "authors",
+        NEW,
+        "part_0000.jsonl",
+        &[
+            author_named(1, "new1"),
+            author_named(2, "new2"),
+            author_named(1, "new1-again"),
+        ],
+    );
+    write_file(
+        &f.snap,
+        "authors",
+        OLD,
+        "part_0000.jsonl",
+        &[author_named(2, "old2"), author_named(3, "old3")],
+    );
+    let opts = LoadOptions::default();
+    let s = f.db.load_authors(&f.snap, &opts).unwrap();
+    assert_eq!((s.partitions_loaded, s.rows_inserted), (2, 3));
+    assert_eq!(
+        f.names("authors"),
+        pairs(&[("A1", "new1"), ("A2", "new2"), ("A3", "old3")])
+    );
+
+    // A re-run is a no-op: both partitions are logged ok.
+    let again = f.db.load_authors(&f.snap, &opts).unwrap();
+    assert_eq!((again.skipped_partitions, again.rows_inserted), (2, 0));
+    assert_eq!(f.count("authors"), 3);
+}
+
+/// The merge is one transaction and the set is updated only after it commits.
+/// A row the set does not know about (the invariant broken from outside) makes
+/// the merge hit the PRIMARY KEY: that is an error, an `error` stamp, nothing
+/// of the partition left behind, and nothing marked as seen.
+#[test]
+fn authors_merge_failure_leaves_the_table_and_the_seen_set_untouched() {
     let f = fixture();
     write_file(
         &f.snap,
@@ -462,31 +540,44 @@ fn authors_load_and_a_duplicate_key_fails_the_partition() {
         "part_0000.jsonl",
         &[author(1), author(2)],
     );
-    let opts = LoadOptions::default();
-    let s = f.db.load_authors(&f.snap, &opts).unwrap();
-    assert_eq!(s.rows_inserted, 2);
-    assert_eq!(f.count("authors"), 2);
+    let mut seen = SeenSet::from_table(f.db.raw(), "authors", Some('A')).unwrap();
+    f.db.raw()
+        .execute_batch("INSERT INTO authors(openalex_id) VALUES ('A2')")
+        .unwrap();
 
-    // A second partition re-emitting author 2 violates the PK; that must be
-    // an error and an `error` stamp, never a silent "ok".
+    let part = f.snap.join("authors").join(NEW);
+    f.db.load_authors_partition(&part, &mut seen, &LoadOptions::default())
+        .expect_err("A2 is already in the table but not in the set");
+    assert_eq!(f.ingest_status("authors", NEW), "error");
+    assert_eq!(
+        f.count("authors"),
+        1,
+        "author 1 was rolled back with the rest"
+    );
+    assert!(!seen.contains(1) && !seen.contains(2));
+}
+
+#[test]
+fn an_author_without_an_a_id_is_unusable_and_counts_against_the_budget() {
+    let f = fixture();
+    let bad = r#"{"id":"https://openalex.org/X7","display_name":"Nobody"}"#.to_string();
     write_file(
         &f.snap,
         "authors",
-        OLD,
+        NEW,
         "part_0000.jsonl",
-        &[author(3), author(2)],
+        &[author(1), bad],
     );
-    f.db.load_authors(&f.snap, &opts)
-        .expect_err("duplicate author id");
-    let status: String =
-        f.db.raw()
-            .query_row(
-                "SELECT status FROM _ingest_log WHERE entity='authors' AND partition=?",
-                [OLD],
-                |r| r.get(0),
-            )
-            .unwrap();
-    assert_eq!(status, "error");
+    let strict = LoadOptions {
+        max_parse_errors_per_partition: 0,
+    };
+    f.db.load_authors(&f.snap, &strict)
+        .expect_err("one unusable record over a budget of 0");
+    assert_eq!(f.count("authors"), 0);
+
+    let s = f.db.load_authors(&f.snap, &LoadOptions::default()).unwrap();
+    assert_eq!((s.rows_inserted, s.parse_errors), (1, 1));
+    assert_eq!(f.count("authors"), 1);
 }
 
 #[test]
@@ -507,18 +598,23 @@ fn authors_partition_over_the_parse_budget_fails() {
     let loose = LoadOptions {
         max_parse_errors_per_partition: 2,
     };
-    // The failed partition is retried (status 'error' is not 'ok'); the row
-    // flushed by the failed attempt makes the retry fail on its duplicate
-    // key, which is the documented non-atomic authors behavior.
-    assert!(f.db.load_authors(&f.snap, &loose).is_err());
+    // The failed partition is retried (status 'error' is not 'ok'). It left
+    // no rows behind, so the retry under a looser budget loads cleanly.
+    let s = f.db.load_authors(&f.snap, &loose).unwrap();
+    assert_eq!(s.rows_inserted, 1);
+    assert_eq!(f.count("authors"), 1);
 }
 
 // ---- simple entities / SQL construction (RA-113) -------------------------
 
-fn concept(id: u64) -> String {
+fn concept_named(id: u64, name: &str) -> String {
     format!(
-        r#"{{"id":"https://openalex.org/C{id}","display_name":"Concept {id}","level":0,"description":"d","wikidata":"https://www.wikidata.org/wiki/Q{id}","works_count":1,"cited_by_count":2,"ancestors":[{{"id":"https://openalex.org/C9","display_name":"Root","level":0}}]}}"#
+        r#"{{"id":"https://openalex.org/C{id}","display_name":"{name}","level":0,"description":"d","wikidata":"https://www.wikidata.org/wiki/Q{id}","works_count":1,"cited_by_count":2,"ancestors":[{{"id":"https://openalex.org/C9","display_name":"Root","level":0}}]}}"#
     )
+}
+
+fn concept(id: u64) -> String {
+    concept_named(id, &format!("Concept {id}"))
 }
 
 #[test]
@@ -580,6 +676,184 @@ fn simple_entity_failure_is_stamped_and_returned() {
         )
         .unwrap();
     assert_eq!(status, "error");
+}
+
+/// RA-OPS-D8: a dimension table follows the works rule. The partition walk is
+/// newest-first, a duplicate id (across partitions, or inside one) is skipped
+/// silently, and the newest copy is the one stored. (The pre-decision loader
+/// used `INSERT OR IGNORE` and walked oldest-first, so the oldest copy won.)
+#[test]
+fn dimension_duplicate_id_across_partitions_keeps_the_newest_copy() {
+    let f = fixture();
+    write_file(
+        &f.snap,
+        "concepts",
+        NEW,
+        "part_0000.jsonl",
+        &[
+            concept_named(1, "new1"),
+            concept_named(2, "new2"),
+            concept_named(1, "new1-again"),
+        ],
+    );
+    write_file(
+        &f.snap,
+        "concepts",
+        OLD,
+        "part_0000.jsonl",
+        &[concept_named(2, "old2"), concept_named(3, "old3")],
+    );
+    let s =
+        f.db.load_simple_entity(SimpleEntity::Concepts, &f.snap)
+            .unwrap();
+    assert_eq!((s.partitions_loaded, s.rows_inserted), (2, 3));
+    let rows = f.names("concepts");
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    // Newest partition wins for 1 and 2; 3 exists only in the old one. Which of
+    // the two copies of C1 inside the newest partition is kept is not specified.
+    assert!(rows[0].1.starts_with("new1"), "{rows:?}");
+    assert_eq!(rows[1], ("C2".to_string(), "new2".to_string()));
+    assert_eq!(rows[2], ("C3".to_string(), "old3".to_string()));
+
+    // A re-run changes nothing: both partitions are logged ok.
+    let again =
+        f.db.load_simple_entity(SimpleEntity::Concepts, &f.snap)
+            .unwrap();
+    assert_eq!((again.skipped_partitions, again.rows_inserted), (2, 0));
+    assert_eq!(f.names("concepts"), rows);
+}
+
+fn dimension_record(entity: &str, id: &str, name: &str) -> String {
+    let url = format!("https://openalex.org/{id}");
+    match entity {
+        "concepts" => format!(
+            r#"{{"id":"{url}","display_name":"{name}","level":0,"description":"d","wikidata":"w","works_count":1,"cited_by_count":2,"ancestors":[{{"id":"https://openalex.org/C9","display_name":"Root","level":0}}]}}"#
+        ),
+        "topics" => format!(
+            r#"{{"id":"{url}","display_name":"{name}","description":"d","keywords":["a","b"],"subfield":{{"id":"https://openalex.org/subfields/11"}},"field":{{"id":"https://openalex.org/fields/22"}},"domain":{{"id":"https://openalex.org/domains/3"}}}}"#
+        ),
+        "domains" => format!(r#"{{"id":"{url}","display_name":"{name}"}}"#),
+        "fields" => format!(
+            r#"{{"id":"{url}","display_name":"{name}","domain":{{"id":"https://openalex.org/domains/3"}}}}"#
+        ),
+        "subfields" => format!(
+            r#"{{"id":"{url}","display_name":"{name}","field":{{"id":"https://openalex.org/fields/22"}},"domain":{{"id":"https://openalex.org/domains/3"}}}}"#
+        ),
+        "sources" => format!(
+            r#"{{"id":"{url}","display_name":"{name}","issn_l":"1234-5678","issn":["1234-5678"],"host_organization_lineage":["https://openalex.org/P1"],"type":"journal","is_oa":true,"is_in_doaj":false,"works_count":1,"cited_by_count":2}}"#
+        ),
+        "institutions" => format!(
+            r#"{{"id":"{url}","display_name":"{name}","country_code":"US","type":"education","ror":"https://ror.org/x","works_count":1,"cited_by_count":2}}"#
+        ),
+        "funders" => format!(
+            r#"{{"id":"{url}","display_name":"{name}","country_code":"US","works_count":1,"cited_by_count":2}}"#
+        ),
+        "publishers" => format!(
+            r#"{{"id":"{url}","display_name":"{name}","works_count":1,"cited_by_count":2}}"#
+        ),
+        other => panic!("no record shape for {other}"),
+    }
+}
+
+/// Every SQL-ingested entity goes through the same stage → gate → merge path;
+/// this pins each projection's column order against its live table and the
+/// newest-wins rule for its id shape (letter-prefixed, or digits only for the
+/// taxonomy entities).
+#[test]
+fn every_simple_entity_loads_and_keeps_the_newest_copy() {
+    // (entity, id in the snapshot, id of an old-only record, stored ids)
+    let cases = [
+        ("concepts", "C1", "C2", "C1", "C2"),
+        ("topics", "T1", "T2", "T1", "T2"),
+        ("domains", "domains/3", "domains/4", "3", "4"),
+        ("fields", "fields/22", "fields/23", "22", "23"),
+        ("subfields", "subfields/11", "subfields/12", "11", "12"),
+        ("sources", "S1", "S2", "S1", "S2"),
+        ("institutions", "I1", "I2", "I1", "I2"),
+        ("funders", "F1", "F2", "F1", "F2"),
+        ("publishers", "P1", "P2", "P1", "P2"),
+    ];
+    let f = fixture();
+    for (entity, shared, old_only, stored_shared, stored_old_only) in cases {
+        write_file(
+            &f.snap,
+            entity,
+            NEW,
+            "part_0000.jsonl",
+            &[dimension_record(entity, shared, "new")],
+        );
+        write_file(
+            &f.snap,
+            entity,
+            OLD,
+            "part_0000.jsonl",
+            &[
+                dimension_record(entity, shared, "old"),
+                dimension_record(entity, old_only, "old-only"),
+            ],
+        );
+        let s =
+            f.db.load_simple_entity(SimpleEntity::parse(entity).unwrap(), &f.snap)
+                .unwrap_or_else(|e| panic!("{entity}: {e:#}"));
+        assert_eq!(s.rows_inserted, 2, "{entity}");
+        assert_eq!(
+            f.names(entity),
+            pairs(&[(stored_shared, "new"), (stored_old_only, "old-only")]),
+            "{entity}"
+        );
+    }
+}
+
+/// The table is the authority on what is already loaded: a row committed by
+/// an earlier run (here with its `_ingest_log` stamp missing) is neither
+/// overwritten nor duplicated by a later one.
+#[test]
+fn a_dimension_row_already_in_the_table_is_not_overwritten_or_duplicated() {
+    let f = fixture();
+    f.db.raw()
+        .execute_batch("INSERT INTO concepts(openalex_id, display_name) VALUES ('C2', 'kept')")
+        .unwrap();
+    write_file(
+        &f.snap,
+        "concepts",
+        NEW,
+        "part_0000.jsonl",
+        &[concept_named(1, "one"), concept_named(2, "from-snapshot")],
+    );
+    let s =
+        f.db.load_simple_entity(SimpleEntity::Concepts, &f.snap)
+            .unwrap();
+    assert_eq!(s.rows_inserted, 1);
+    assert_eq!(f.names("concepts"), pairs(&[("C1", "one"), ("C2", "kept")]));
+}
+
+/// A record that cannot be keyed cannot be gated: the partition fails, the
+/// error names the id, and nothing is left behind, so the retry after the data
+/// is fixed loads cleanly.
+#[test]
+fn a_dimension_record_with_a_malformed_id_fails_the_partition_and_names_it() {
+    let f = fixture();
+    let bad = concept(7).replace("openalex.org/C7", "openalex.org/X7");
+    write_file(
+        &f.snap,
+        "concepts",
+        NEW,
+        "part_0000.jsonl",
+        &[concept(1), bad],
+    );
+    let err =
+        f.db.load_simple_entity(SimpleEntity::Concepts, &f.snap)
+            .expect_err("X7 is not a concept id");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("X7") && msg.contains("malformed id"), "{msg}");
+    assert_eq!(f.ingest_status("concepts", NEW), "error");
+    assert_eq!(f.count("concepts"), 0);
+
+    write_file(&f.snap, "concepts", NEW, "part_0000.jsonl", &[concept(1)]);
+    let s =
+        f.db.load_simple_entity(SimpleEntity::Concepts, &f.snap)
+            .unwrap();
+    assert_eq!(s.rows_inserted, 1);
 }
 
 // ---- RA-109 ---------------------------------------------------------------

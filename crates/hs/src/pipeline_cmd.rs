@@ -49,12 +49,12 @@ pub enum PipelineCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Delete the JetStream PAPERS and SCRIBE streams — all queued and
-    /// in-flight events are discarded. Use when a consumer is stuck
-    /// with a stale config (e.g. wrong ack_wait) and `create_or_update`
-    /// alone can't recover it. The worker daemons recreate the streams
-    /// on their next connect using the current `NatsConfig`. Follow
-    /// with `hs pipeline catch-up` to re-queue unconverted papers.
+    /// Delete the JetStream PAPERS, SCRIBE and DISTILL streams and recreate
+    /// them from the current `NatsConfig` — all queued and in-flight events
+    /// are discarded. Use when a stream or consumer is stuck with a stale
+    /// config that cannot be updated in place (e.g. a different stream
+    /// retention). Follow with `hs pipeline catch-up` to re-queue
+    /// unconverted papers.
     EventsReset,
     /// Delete HTML paywall / loading-stub artifacts — source `.html`,
     /// derived `.md`, and catalog `.yaml` — for every catalog entry
@@ -182,16 +182,47 @@ async fn cmd_events_reset(reporter: &Arc<dyn Reporter>) -> Result<()> {
         ),
     };
     let nats_cfg = events.nats.connection(|n| std::env::var(n).ok())?;
-    let nats = hs_common::event_bus::nats::NatsBus::connect(nats_cfg)
+    let nats = hs_common::event_bus::nats::NatsBus::connect_unprovisioned(nats_cfg)
         .await
         .context("connecting to NATS for stream reset")?;
     nats.reset_streams()
         .await
         .context("reset JetStream streams")?;
-    reporter.finish(
-        "Deleted JetStream streams PAPERS, SCRIBE, and DISTILL. Next worker connect recreates them.",
-    );
+    reporter
+        .finish("Recreated JetStream streams PAPERS, SCRIBE, and DISTILL from the current config.");
     Ok(())
+}
+
+/// One source key per stem. A stem stored as both `.pdf` and `.html` would
+/// otherwise be published twice and converted twice, the second result
+/// overwriting the first; the PDF is the preferred source.
+fn one_source_per_stem(keys: Vec<String>) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let stem_of = |key: &str| -> String {
+        let name = key.rsplit('/').next().unwrap_or(key);
+        name.rsplit_once('.').map_or(name, |(s, _)| s).to_string()
+    };
+    let is_pdf = |key: &str| {
+        key.rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("pdf"))
+    };
+    let mut out: Vec<String> = Vec::with_capacity(keys.len());
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for key in keys {
+        match seen.get(&stem_of(&key)) {
+            Some(&i) => {
+                if is_pdf(&key) && !is_pdf(&out[i]) {
+                    out[i] = key;
+                }
+            }
+            None => {
+                seen.insert(stem_of(&key), out.len());
+                out.push(key);
+            }
+        }
+    }
+    out
 }
 
 /// What `catch-up` would republish.
@@ -223,29 +254,19 @@ async fn plan_catch_up(storage: &dyn Storage) -> Result<CatchUpPlan> {
         })
         .collect();
 
+    // `convertible_source_stem` is the one definition of "a source scribe
+    // would convert": it skips the inbox drop zone, `.quarantine/` (known-bad
+    // bytes `hs migrate quarantine-bad-content` stamped `conversion_failed`;
+    // republishing them would re-queue them forever), resource forks,
+    // zero-byte objects (scribe would fetch, fail, and the event would
+    // cycle) and unconvertible extensions. `hs status` counts "unconverted"
+    // with the same predicate, so everything it counts is queued here.
     let mut to_republish: Vec<String> = Vec::new();
     for obj in &papers {
-        // `hs migrate quarantine-bad-content` relocates non-PDF/non-HTML
-        // bytes here and stamps `conversion_failed` precisely so nothing
-        // re-publishes them; that sweeper skips its own output for the same
-        // reason. Republishing them would re-queue known-bad bytes forever.
-        if obj.key.contains("/.quarantine/") {
+        let Some(stem) = hs_common::status::convertible_source_stem(&obj.key, obj.size) else {
             continue;
-        }
-        let name = match obj.key.rsplit('/').next() {
-            Some(n) if !n.starts_with("._") => n,
-            _ => continue,
-        };
-        let stem = match name.rsplit_once('.') {
-            Some((s, e)) if e == "pdf" || e == "html" => s,
-            _ => continue,
         };
         if md_stems.contains(stem) {
-            continue;
-        }
-        // A zero-byte source has no bytes to convert; scribe would fetch it,
-        // fail, and the event would cycle. Reject at the door.
-        if obj.size == 0 {
             continue;
         }
         to_republish.push(obj.key.clone());
@@ -254,7 +275,7 @@ async fn plan_catch_up(storage: &dyn Storage) -> Result<CatchUpPlan> {
     Ok(CatchUpPlan {
         papers_total: papers.len(),
         markdown_stems: md_stems.len(),
-        to_republish,
+        to_republish: one_source_per_stem(to_republish),
     })
 }
 
@@ -381,7 +402,7 @@ async fn cmd_rebuild(
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage().context("building storage backend")?;
     let server_url = cfg.require_servers()?[0].clone();
-    let client = DistillClient::new(&server_url)?;
+    let client = crate::distill_cmd::make_distill_client(&server_url).await?;
 
     // Inventory: used for both dry-run report and live-run "before" snapshot.
     // It fails if distill or storage cannot be read: a rebuild planned from
@@ -588,21 +609,14 @@ struct Inventory {
 
 async fn inventory(storage: &Arc<dyn Storage>, client: &DistillClient) -> Result<Inventory> {
     let papers = storage.list("papers").await.context("list papers prefix")?;
+    // Same predicate as `plan_catch_up` and the `hs status` unconverted
+    // count; it keeps quarantined (known-bad) bytes out of a rebuild.
     let paper_keys: Vec<String> = papers
         .into_iter()
-        .filter_map(|o| {
-            let name = o.key.rsplit('/').next()?;
-            if name.starts_with("._") {
-                return None;
-            }
-            let ext = name.rsplit_once('.').map(|(_, e)| e)?;
-            if ext == "pdf" || ext == "html" {
-                Some(o.key)
-            } else {
-                None
-            }
-        })
+        .filter(|o| hs_common::status::convertible_source_stem(&o.key, o.size).is_some())
+        .map(|o| o.key)
         .collect();
+    let paper_keys = one_source_per_stem(paper_keys);
 
     let markdown_objs = storage
         .list("markdown")
@@ -734,11 +748,9 @@ async fn cmd_purge_skipped(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter
             interrupted = true;
             break;
         }
-        // Catalog yaml — we already have the exact key from the listing.
-        match storage.delete(&v.catalog_key).await {
-            Ok(()) => cat_deleted += 1,
-            Err(e) => errors.push(format!("catalog/{}: {e}", v.stem)),
-        }
+        // Derived objects go first and the catalog row (the handle a re-run
+        // finds this victim by) last, and only if nothing failed.
+        let errors_before = errors.len();
 
         // Markdown — always `markdown/{shard}/{stem}.md`.
         let md_key = hs_common::markdown::markdown_storage_key(&v.stem);
@@ -768,6 +780,14 @@ async fn cmd_purge_skipped(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter
             src_deleted += 1;
         }
 
+        // Catalog yaml — we already have the exact key from the listing.
+        if errors.len() == errors_before {
+            match storage.delete(&v.catalog_key).await {
+                Ok(()) => cat_deleted += 1,
+                Err(e) => errors.push(format!("catalog/{}: {e}", v.stem)),
+            }
+        }
+
         if (i + 1) % 50 == 0 {
             reporter.status("Progress", &format!("purged {}/{}", i + 1, victims.len()));
         }
@@ -789,7 +809,7 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage().context("building storage backend")?;
     let server_url = cfg.require_servers()?[0].clone();
-    let client = DistillClient::new(&server_url)?;
+    let client = crate::distill_cmd::make_distill_client(&server_url).await?;
 
     reporter.status("Scan", "markdown for known interstitial signatures");
     let markdown_objs = storage
@@ -909,11 +929,9 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
             }
         }
 
-        // Markdown
-        match storage.delete(&v.markdown_key).await {
-            Ok(()) => md_deleted += 1,
-            Err(e) => errors.push(format!("markdown/{}: {e}", v.stem)),
-        }
+        // The markdown is the handle a re-run finds this victim by, so it is
+        // deleted last and only when everything else succeeded.
+        let errors_before = errors.len();
 
         // Catalog yaml
         let cat_key = format!("catalog/{}", hs_common::sharded_key(&v.stem, "yaml"));
@@ -944,6 +962,14 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
         }
         if src_hit {
             src_deleted += 1;
+        }
+
+        // Markdown
+        if errors.len() == errors_before {
+            match storage.delete(&v.markdown_key).await {
+                Ok(()) => md_deleted += 1,
+                Err(e) => errors.push(format!("markdown/{}: {e}", v.stem)),
+            }
         }
 
         if (i + 1) % 50 == 0 {
@@ -1062,7 +1088,7 @@ async fn cmd_purge_poisoned_chunks(
 ) -> Result<()> {
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let server_url = cfg.require_servers()?[0].clone();
-    let client = DistillClient::new(&server_url)?;
+    let client = crate::distill_cmd::make_distill_client(&server_url).await?;
 
     // First pass: dry-run scan so the user can see what would be deleted.
     reporter.status("Scan", "Qdrant points for interstitial signatures");
@@ -1678,7 +1704,15 @@ mod tests {
         s.put("papers/ef/efghij.html", b"<html/>".to_vec())
             .await
             .unwrap();
-        // never republished: empty source, quarantined, resource fork, unsupported ext
+        // every source scribe converts is republished, not just pdf/html
+        s.put("papers/kl/klmnop.epub", b"epub".to_vec())
+            .await
+            .unwrap();
+        s.put("papers/mn/mnopqr.htm", b"<html/>".to_vec())
+            .await
+            .unwrap();
+        // never republished: empty source, quarantined, resource fork,
+        // inbox drop zone, unsupported ext
         s.put("papers/gh/ghijkl.pdf", Vec::new()).await.unwrap();
         s.put("papers/.quarantine/ij/ijklmn.pdf", b"junk".to_vec())
             .await
@@ -1686,7 +1720,10 @@ mod tests {
         s.put("papers/ab/._abcdef.pdf", b"fork".to_vec())
             .await
             .unwrap();
-        s.put("papers/kl/klmnop.epub", b"epub".to_vec())
+        s.put("papers/manually_downloaded/dropped.pdf", b"%PDF".to_vec())
+            .await
+            .unwrap();
+        s.put("papers/op/opqrst.txt", b"text".to_vec())
             .await
             .unwrap();
 
@@ -1696,7 +1733,21 @@ mod tests {
         pending.sort();
         assert_eq!(
             pending,
-            vec!["papers/cd/cdefgh.pdf", "papers/ef/efghij.html"]
+            vec![
+                "papers/cd/cdefgh.pdf",
+                "papers/ef/efghij.html",
+                "papers/kl/klmnop.epub",
+                "papers/mn/mnopqr.htm",
+            ]
+        );
+
+        // `hs status` counts "unconverted" with the same definition, so
+        // everything it reports is something catch-up just planned.
+        assert_eq!(
+            hs_common::status::count_unconverted_stems(&s, "papers", "markdown")
+                .await
+                .unwrap(),
+            pending.len() as u64
         );
     }
 

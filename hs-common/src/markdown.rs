@@ -118,7 +118,7 @@ pub async fn list_markdown_meta_via(
         if filename.starts_with("._") {
             continue;
         }
-        let stem = filename.trim_end_matches(".md").to_string();
+        let stem = filename.strip_suffix(".md").unwrap_or(filename).to_string();
         out.push((stem, obj));
     }
     Ok(out)

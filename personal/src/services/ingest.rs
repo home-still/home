@@ -47,37 +47,92 @@ pub async fn ingest(cfg: &Config, file: &Path, opts: IngestOptions) -> Result<In
     // only — partial overrides are fine and explicitly supported so a user
     // who knows the category but not the title can still leverage the LLM.
     let (title, category) = resolve_name_and_category(cfg, &markdown, &opts).await?;
+    // `personal.categories` is the taxonomy the user allows; the LLM pick and
+    // `--category` must both be inside it.
+    if !cfg
+        .categories
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(category.as_str()))
+    {
+        return Err(PersonalError::UnknownCategory(category.to_string()));
+    }
 
     let stem = build_stem(&title, &sha);
     let dest_orig = hs_common::sharded_path(&cfg.root_dir(), &stem, format.as_str());
     let dest_md = hs_common::sharded_path(&cfg.markdown_dir(), &stem, "md");
     let dest_cat = hs_common::sharded_path(&cfg.root_dir(), &stem, "catalog.yaml");
 
-    if !opts.force && (dest_orig.exists() || dest_md.exists() || dest_cat.exists()) {
+    let already_stored = dest_orig.exists() || dest_md.exists() || dest_cat.exists();
+    if !opts.force && already_stored {
         return Err(PersonalError::DuplicateStem(stem));
     }
 
-    write_atomic(&dest_orig, &bytes)?;
-    write_atomic(&dest_md, markdown.as_bytes())?;
+    // Writes and the index call are one unit: if any step fails the
+    // documented contract is "the store stays as it was", so the files this
+    // call created are removed (a retry would otherwise hit `DuplicateStem`
+    // on a document that was never indexed), and so are any vectors a
+    // failed or timed-out index call left behind (indexing upserts batch by
+    // batch). With `--force` over an existing document the files are
+    // overwritten in place and kept: the previous vectors are still there
+    // and `hs personal reindex` repairs the rest.
+    let mut index_attempted = false;
+    let stored = async {
+        write_atomic(&dest_orig, &bytes)?;
+        write_atomic(&dest_md, markdown.as_bytes())?;
 
-    let entry = build_catalog(&CatalogInput {
-        stem: &stem,
-        format,
-        title: &title,
-        category,
-        size,
-        sha: &sha,
-        orig_path: &dest_orig,
-        md_path: &dest_md,
-    });
-    let yaml = serde_yaml_ng::to_string(&entry)
-        .map_err(|e| PersonalError::Other(anyhow::anyhow!("catalog yaml: {e}")))?;
-    write_atomic(&dest_cat, yaml.as_bytes())?;
+        let entry = build_catalog(&CatalogInput {
+            stem: &stem,
+            format,
+            title: &title,
+            category,
+            size,
+            sha: &sha,
+            orig_path: &dest_orig,
+            md_path: &dest_md,
+        });
+        let yaml = serde_yaml_ng::to_string(&entry)
+            .map_err(|e| PersonalError::Other(anyhow::anyhow!("catalog yaml: {e}")))?;
+        write_atomic(&dest_cat, yaml.as_bytes())?;
 
-    let distill = PersonalDistill::new(cfg)?;
-    let result = distill
-        .index(&format!("{stem}.md"), &markdown, &entry)
-        .await?;
+        let distill = PersonalDistill::new(cfg)?;
+        index_attempted = true;
+        distill
+            .index(&format!("{stem}.md"), &markdown, &entry)
+            .await
+    }
+    .await;
+    let result = match stored {
+        Ok(result) => result,
+        Err(e) => {
+            if !already_stored {
+                if index_attempted {
+                    let purged = match PersonalDistill::new(cfg) {
+                        Ok(distill) => distill.delete(&stem).await.map(|_| ()),
+                        Err(rm) => Err(rm),
+                    };
+                    if let Err(rm) = purged {
+                        tracing::warn!(
+                            %stem,
+                            error = %rm,
+                            "could not remove vectors after failed ingest"
+                        );
+                    }
+                }
+                for path in [&dest_cat, &dest_md, &dest_orig] {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(rm) => tracing::warn!(
+                            path = %path.display(),
+                            error = %rm,
+                            "could not remove file after failed ingest"
+                        ),
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
 
     Ok(IngestOutcome {
         stem,

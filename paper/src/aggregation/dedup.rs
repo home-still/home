@@ -105,9 +105,13 @@ pub fn deduplicate(source_results: Vec<(String, Vec<Paper>)>) -> (Vec<DedupGroup
     (groups, stats)
 }
 
+/// Grouping key for a provider-supplied DOI: the same normalization the
+/// storage identity uses (resolver prefixes, whitespace, case), so two
+/// spellings of one DOI group together. A provider's malformed DOI cannot
+/// fail the search; it groups under its own lowercased text.
 fn normalize_doi(doi: &str) -> String {
-    doi.strip_prefix("https://doi.org/")
-        .unwrap_or(doi)
+    crate::stem::normalize_doi(doi)
+        .unwrap_or_else(|_| doi.trim().to_string())
         .to_lowercase()
 }
 

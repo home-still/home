@@ -191,21 +191,37 @@ impl LocalFsStorage {
     }
 }
 
-/// Win32 silently strips a trailing '.' or ' ' from every path segment, so on
-/// Windows such a key would name a different file (or fail with access
-/// denied). Refused there as an invalid key; other platforms store it as is.
+/// Why a key cannot be a file path on Windows, or `None` when it can. Win32
+/// silently strips a trailing '.' or ' ' from every path segment, so such a
+/// key would name a different file; `<>"|?*` and control characters are not
+/// valid in a name at all; and `:` starts an NTFS alternate data stream
+/// (`name:stream`), so a DOI-derived stem such as `…5:1…` would address a
+/// hidden stream of a different file instead of failing.
+fn windows_unstorable(key: &str) -> Option<&'static str> {
+    key.split('/').find_map(|seg| {
+        if seg.ends_with('.') || seg.ends_with(' ') {
+            Some("a segment ends with '.' or ' ' (not storable on Windows)")
+        } else if seg
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        {
+            Some("a segment contains one of < > : \" | ? * or a control character (not storable on Windows)")
+        } else {
+            None
+        }
+    })
+}
+
+/// [`windows_unstorable`], enforced on Windows only: other platforms store
+/// these names as they are.
 fn check_local_name(key: &str) -> Result<(), InvalidKey> {
-    if cfg!(windows)
-        && key
-            .split('/')
-            .any(|seg| seg.ends_with('.') || seg.ends_with(' '))
-    {
-        return Err(InvalidKey {
+    match windows_unstorable(key).filter(|_| cfg!(windows)) {
+        Some(reason) => Err(InvalidKey {
             key: key.to_string(),
-            reason: "a segment ends with '.' or ' ' (not storable on Windows)",
-        });
+            reason,
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Write `bytes` to `tmp`, fsync it, then rename it over `path`. Readers see
@@ -270,11 +286,22 @@ impl Storage for LocalFsStorage {
             };
             while let Some(entry) = rd.next_entry().await? {
                 let path = entry.path();
-                let ft = entry.file_type().await?;
+                let ft = match entry.file_type().await {
+                    Ok(ft) => ft,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
                 if ft.is_dir() {
                     stack.push(path);
                 } else if ft.is_file() && !is_put_temp(&entry.file_name()) {
-                    let md = entry.metadata().await?;
+                    // A file removed between readdir and stat (a concurrent
+                    // `delete`, or a rename over it) is simply no longer
+                    // listed; it must not fail the whole listing.
+                    let md = match entry.metadata().await {
+                        Ok(md) => md,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e.into()),
+                    };
                     if let Some(key) = self.key_from(&path) {
                         out.push(ObjectMeta {
                             key,
@@ -439,6 +466,37 @@ mod tests {
         } else {
             trailing.unwrap();
             assert_eq!(s.get("a/...").await.unwrap(), b"ok");
+        }
+    }
+
+    /// The Windows rule is a pure function so it is tested on every platform:
+    /// the SICI-style DOI stems in the corpus carry `:` (an NTFS alternate
+    /// data stream), which must be refused, not stored as a stream.
+    #[test]
+    fn windows_refuses_names_it_cannot_store_as_files() {
+        for key in [
+            "markdown/10/10.1002_(sici)1099-1050(199601)5:1_77.md",
+            "a/b<c.md",
+            "a/b>c.md",
+            "a/b\"c.md",
+            "a/b|c.md",
+            "a/b?c.md",
+            "a/b*c.md",
+            "a/b\nc.md",
+            "a/x.",
+            "a/x ",
+        ] {
+            assert!(windows_unstorable(key).is_some(), "{key:?}");
+        }
+        for key in [
+            "markdown/10/10.1002_(sici)1099;2-w.md",
+            "a/foo%3Cbar.md",
+            "a/..b/c..d.md",
+            "a/.hidden",
+            "papers/",
+            "",
+        ] {
+            assert_eq!(windows_unstorable(key), None, "{key:?}");
         }
     }
 

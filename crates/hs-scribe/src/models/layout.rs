@@ -220,7 +220,9 @@ impl LayoutDetector {
             let y2 = det_data[base + 5];
             let read_order = det_data[base + 6];
 
-            if score < self.confidence_threshold {
+            // A NaN score must be dropped, not kept (a NaN confidence has no
+            // order and breaks the sort in deduplication).
+            if score.is_nan() || score < self.confidence_threshold {
                 continue;
             }
 
@@ -277,11 +279,7 @@ impl LayoutDetector {
         }
 
         // Sort by native read_order (ascending) — replaces XY-Cut++
-        bboxes.sort_by(|a, b| {
-            a.read_order
-                .partial_cmp(&b.read_order)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        bboxes.sort_by(|a, b| a.read_order.total_cmp(&b.read_order));
 
         // Reassign unique_ids to match sorted order
         for (i, bbox) in bboxes.iter_mut().enumerate() {

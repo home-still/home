@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::aggregation::{dedup, merge, quality, ranking, relevance};
 use crate::error::PaperError;
 use crate::models::{Paper, ProviderFailure, SearchQuery, SearchResult, SearchType};
-use crate::ports::provider::PaperProvider;
+use crate::ports::provider::{doi_search_result, PaperProvider};
 
 /// Optional callback fired when each provider completes during aggregate search.
 pub type OnProviderDone = Arc<dyn Fn(&str) + Send + Sync>;
@@ -51,6 +51,10 @@ impl PaperProvider for AggregateProvider {
         0
     }
 
+    fn supports_offset(&self) -> bool {
+        self.providers.iter().any(|p| p.supports_offset())
+    }
+
     fn supported_search_types(&self) -> Vec<SearchType> {
         self.providers
             .iter()
@@ -59,12 +63,40 @@ impl PaperProvider for AggregateProvider {
     }
 
     async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
+        if matches!(query.search_type, SearchType::DOI) {
+            let paper = self.get_by_doi(&query.query).await?;
+            return Ok(doi_search_result(self.name(), paper));
+        }
         use futures::stream::{FuturesUnordered, StreamExt};
 
-        // Fan out to all providers with timeout, collect as each completes
-        let mut futs: FuturesUnordered<_> = self
+        // A provider that cannot page by offset is left out of a page-two+
+        // query: asking it would only add a guaranteed failure to the result.
+        // (A direct, single-provider search still gets its own error.)
+        let members: Vec<&Arc<dyn PaperProvider>> = self
             .providers
             .iter()
+            .filter(|p| {
+                let participates = query.offset == 0 || p.supports_offset();
+                if !participates {
+                    tracing::debug!(
+                        provider = %p.name(),
+                        offset = query.offset,
+                        "left out of offset search: provider cannot page by offset"
+                    );
+                }
+                participates
+            })
+            .collect();
+        if members.is_empty() {
+            return Err(PaperError::InvalidInput(format!(
+                "no provider in the aggregate can page by offset (offset {})",
+                query.offset
+            )));
+        }
+
+        // Fan out to the remaining providers with timeout, collect as each completes
+        let mut futs: FuturesUnordered<_> = members
+            .into_iter()
             .map(|p| {
                 let timeout = self.timeout;
                 async move {
@@ -502,5 +534,81 @@ mod tests {
         ]);
         let err = a.get_by_doi("10.48550/arXiv.2005.11401").await.unwrap_err();
         assert!(matches!(err, PaperError::RateLimited { .. }), "{err}");
+    }
+
+    /// A provider that, like Europe PMC, cannot page by offset: it rejects
+    /// any offset, and counts the searches it was asked to run.
+    struct CursorOnly {
+        searches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PaperProvider for CursorOnly {
+        fn name(&self) -> &'static str {
+            "europe_pmc"
+        }
+        fn supported_search_types(&self) -> Vec<SearchType> {
+            vec![]
+        }
+        fn supports_offset(&self) -> bool {
+            false
+        }
+        async fn search_by_query(&self, q: &SearchQuery) -> Result<SearchResult, PaperError> {
+            self.searches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if q.offset > 0 {
+                return Err(PaperError::InvalidInput("no offset".into()));
+            }
+            ok("europe_pmc", vec![paper("Cursor", "10.1/c")])
+                .search_by_query(q)
+                .await
+        }
+    }
+
+    fn cursor_only() -> Arc<CursorOnly> {
+        Arc::new(CursorOnly {
+            searches: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn an_offset_search_leaves_out_providers_that_cannot_page_by_offset() {
+        let epmc = cursor_only();
+        let a = agg(vec![
+            ok("arxiv", vec![paper("Attention", "10.1/a")]),
+            epmc.clone(),
+        ]);
+        let mut q = query();
+        q.offset = 10;
+
+        let result = a.search_by_query(&q).await.unwrap();
+
+        assert!(
+            result.provider_failures.is_empty(),
+            "an omitted provider is not a failure: {:?}",
+            result.provider_failures
+        );
+        assert_eq!(
+            epmc.searches.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the cursor-only provider must not be asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_page_search_still_includes_providers_that_cannot_page_by_offset() {
+        let epmc = cursor_only();
+        let a = agg(vec![ok("arxiv", vec![]), epmc.clone()]);
+        a.search_by_query(&query()).await.unwrap();
+        assert_eq!(epmc.searches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_offset_search_with_no_provider_that_can_page_is_invalid_input() {
+        let a = agg(vec![cursor_only()]);
+        let mut q = query();
+        q.offset = 10;
+        let err = a.search_by_query(&q).await.unwrap_err();
+        assert!(matches!(err, PaperError::InvalidInput(_)), "{err}");
     }
 }

@@ -91,9 +91,11 @@ impl OpenAiBackend {
     /// VLM backend's listen backlog is full (TCP RST), the service is
     /// briefly down (refused/closed), or it returns a transient 5xx —
     /// states that resolve within seconds once an in-flight slot frees up.
-    /// 4xx, successful streams, and the mid-stream repetition detector
-    /// remain paper-fatal: those signal real problems with the request
-    /// or content, not transient backend pressure.
+    /// A 4xx that names the request (bad request, payload too large,
+    /// unsupported media) fails the conversion permanently as
+    /// `vlm_request_rejected`; other statuses, successful streams, and the
+    /// mid-stream repetition detector remain paper-fatal: those signal real
+    /// problems with the content, not transient backend pressure.
     async fn send_with_retry(&self, body: &serde_json::Value) -> Result<reqwest::Response> {
         let endpoint = format!("{}/v1/chat/completions", self.url);
         let mut attempt = 0usize;
@@ -123,6 +125,19 @@ impl OpenAiBackend {
                         attempt += 1;
                         continue;
                     }
+                    if rejects_the_request(status) {
+                        let body = resp
+                            .text()
+                            .await
+                            .unwrap_or_else(|e| format!("<body unreadable: {e}>"));
+                        return Err(ConvertFailure::err(
+                            FailureCode::VlmRequestRejected,
+                            format!(
+                                "VLM backend rejected the request with {status}: {}",
+                                crate::diag::truncate_at_char_boundary(&body, MAX_REJECTION_BODY)
+                            ),
+                        ));
+                    }
                     return Ok(resp.error_for_status()?);
                 }
                 Err(err) => {
@@ -144,6 +159,18 @@ impl OpenAiBackend {
             }
         }
     }
+}
+
+/// How much of a rejected request's response body goes into the error.
+const MAX_REJECTION_BODY: usize = 512;
+
+/// `true` for a 4xx that is a verdict on this request and so repeats on
+/// every retry. 408 and 429 are the backend asking to be tried again; 401,
+/// 403, 404 and 407 describe the backend's configuration (key, model name,
+/// proxy), not the page, and failing a document permanently over them
+/// would stamp every document converted while the key is wrong.
+fn rejects_the_request(status: reqwest::StatusCode) -> bool {
+    status.is_client_error() && !matches!(status.as_u16(), 401 | 403 | 404 | 407 | 408 | 429)
 }
 
 /// Inspect a `reqwest::Error` chain for io-layer kinds that indicate the
@@ -663,5 +690,102 @@ mod tests {
         );
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], RegionType::Table.prompt());
+    }
+
+    // ── non-success statuses ───────────────────────────────────────────
+
+    /// A VLM stand-in on loopback that answers every request with `status`
+    /// and `body`.
+    async fn backend_answering(status: &str, body: &str) -> OpenAiBackend {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let reply = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 256 * 1024];
+                    let mut got = 0;
+                    // Read the whole (single-write) request before answering.
+                    while let Ok(Ok(n)) =
+                        tokio::time::timeout(Duration::from_millis(150), sock.read(&mut buf[got..]))
+                            .await
+                    {
+                        if n == 0 {
+                            break;
+                        }
+                        got += n;
+                    }
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        OpenAiBackend::new(&url, "glm-ocr", None, Duration::from_secs(5)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_4xx_that_names_the_request_is_a_permanent_rejection_with_status_and_body() {
+        for (status, reason) in [
+            ("400 Bad Request", "bad image"),
+            ("413 Payload Too Large", "image exceeds 20MB"),
+            ("415 Unsupported Media Type", "not a jpeg"),
+            ("422 Unprocessable Entity", "prompt too long"),
+        ] {
+            let backend = backend_answering(status, reason).await;
+            let err = backend.recognize(b"jpeg").await.unwrap_err();
+            assert_eq!(
+                code_of(&err),
+                Some(FailureCode::VlmRequestRejected),
+                "{status}: {err:#}"
+            );
+            assert!(matches!(
+                crate::classify::classify(&err),
+                crate::classify::FailureClass::Permanent("vlm_request_rejected")
+            ));
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(&status[..3]) && text.contains(reason),
+                "{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejection_body_is_truncated_in_the_error() {
+        let backend = backend_answering("400 Bad Request", &"x".repeat(5000)).await;
+        let err = backend.recognize(b"jpeg").await.unwrap_err();
+        assert_eq!(code_of(&err), Some(FailureCode::VlmRequestRejected));
+        let text = format!("{err:#}");
+        assert!(text.len() < 700, "{} bytes", text.len());
+        assert!(text.contains(&"x".repeat(MAX_REJECTION_BODY)), "{text}");
+    }
+
+    #[tokio::test]
+    async fn backend_pressure_and_backend_configuration_statuses_stay_transient() {
+        for status in [
+            "408 Request Timeout",
+            "429 Too Many Requests",
+            "401 Unauthorized",
+            "403 Forbidden",
+            "404 Not Found",
+            "500 Internal Server Error",
+        ] {
+            let backend = backend_answering(status, "try later").await;
+            let err = backend.recognize(b"jpeg").await.unwrap_err();
+            assert_eq!(code_of(&err), None, "{status}: {err:#}");
+            assert_eq!(
+                crate::classify::classify(&err),
+                crate::classify::FailureClass::Transient,
+                "{status}"
+            );
+        }
     }
 }

@@ -24,6 +24,43 @@ pub(crate) async fn make_distill_client(url: &str) -> Result<DistillClient> {
         DistillClient::new(url)
     }
 }
+
+/// GET `url`; `true` only for a 2xx. Bounded by a timeout: a bare
+/// `reqwest::get` has none, so a blackholed host hung the caller forever
+/// (RA-134). An unreachable or non-2xx host is `false`; failing to build the
+/// client is an error.
+async fn probe_ok(url: &str) -> Result<bool> {
+    let client = hs_common::http::http_client(std::time::Duration::from_secs(5))?;
+    Ok(client
+        .get(url)
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false))
+}
+
+/// Run one compose command; a non-zero exit is an error carrying the
+/// actionable stderr lines. `ComposeCmd::run_capture` returns the process
+/// output whatever its status, so `?` alone reported a failed `up`/`down` as
+/// success.
+pub(crate) async fn compose_step(compose: &ComposeCmd, args: &[&str]) -> Result<()> {
+    let out = compose
+        .run_capture(args)
+        .await
+        .with_context(|| format!("failed to run compose {}", args.join(" ")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let errors = hs_common::compose::filter_compose_stderr(&stderr);
+    anyhow::bail!(
+        "compose {} failed ({}){}{}",
+        args.join(" "),
+        out.status,
+        if errors.is_empty() { "" } else { ": " },
+        errors.join("; ")
+    )
+}
 const QDRANT_REST_PORT: u16 = 6333;
 const QDRANT_GRPC_PORT: u16 = 6334;
 
@@ -37,18 +74,34 @@ pub(crate) async fn resolve_servers(cli_server: Option<&str>) -> Result<Vec<Stri
     Ok(DistillClientConfig::load()?.require_servers()?.to_vec())
 }
 
-fn hidden_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(hs_common::HIDDEN_DIR)
+fn distill_compose_path() -> Result<PathBuf> {
+    Ok(hs_common::hidden_dir()?.join("docker-compose-distill.yml"))
 }
 
-fn distill_compose_path() -> PathBuf {
-    hidden_dir().join("docker-compose-distill.yml")
+fn distill_pid_path() -> Result<PathBuf> {
+    Ok(hs_common::hidden_dir()?.join("distill-server.pid"))
 }
 
-fn distill_pid_path() -> PathBuf {
-    hidden_dir().join("distill-server.pid")
+/// Executable name of the native distill server a PID file points at.
+const DISTILL_SERVER_EXE: &str = "hs-distill-server";
+
+/// Where the native server's `FASTEMBED_CACHE_DIR` points when the
+/// environment doesn't say: beside the binary if an older version cached its
+/// model there, else `~/.home-still/fastembed_cache`. fastembed would
+/// otherwise default to `CWD/.fastembed_cache`, which breaks under systemd
+/// (CWD = `/`).
+fn fastembed_cache_dir(binary: &Path) -> Result<String> {
+    if let Ok(dir) = std::env::var("FASTEMBED_CACHE_DIR") {
+        return Ok(dir);
+    }
+    let beside_binary = binary.parent().unwrap_or(binary).join(".fastembed_cache");
+    if beside_binary.exists() {
+        return Ok(beside_binary.to_string_lossy().into_owned());
+    }
+    Ok(hs_common::hidden_dir()?
+        .join("fastembed_cache")
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// Convert Qdrant gRPC URL (:6334) to REST URL (:6333) for health checks.
@@ -122,7 +175,12 @@ fn find_ort_cuda_libs() -> Option<String> {
     // Walk into the platform-specific subdir to find libonnxruntime_providers_cuda.so
     for entry in std::fs::read_dir(&cache).ok()?.flatten() {
         let platform_dir = entry.path();
-        for hash_entry in std::fs::read_dir(&platform_dir).ok()?.flatten() {
+        // A stray file beside the platform dirs is not a reason to stop
+        // looking; only an unreadable entry is skipped.
+        let Ok(hash_entries) = std::fs::read_dir(&platform_dir) else {
+            continue;
+        };
+        for hash_entry in hash_entries.flatten() {
             let dir = hash_entry.path();
             if dir.join("libonnxruntime_providers_cuda.so").exists() {
                 return Some(dir.to_string_lossy().to_string());
@@ -191,7 +249,7 @@ pub async fn dispatch(
 
 async fn cmd_purge(doc_id: &str, server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let servers = resolve_servers(server).await?;
-    let client = DistillClient::new(&servers[0])?;
+    let client = make_distill_client(&servers[0]).await?;
     reporter.status("Purging", doc_id);
     let deleted = client
         .delete_doc(doc_id)
@@ -383,7 +441,7 @@ async fn cmd_abstracts_build(
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage()?;
     let servers = resolve_servers(server).await?;
-    let client = DistillClient::new(&servers[0])?;
+    let client = make_distill_client(&servers[0]).await?;
 
     reporter.status("Init", "opening OpenAlex DuckDB (read-only)");
     let oa_conn: OpenAlexConn = Arc::new(std::sync::Mutex::new(
@@ -488,7 +546,6 @@ pub(crate) async fn cmd_watch_events(
     server_override: Option<String>,
     _reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    use hs_distill::client::DistillClient;
     use hs_distill::config::DistillClientConfig;
     use hs_distill::event_watch::{index_and_publish, run_subscriber};
 
@@ -505,8 +562,11 @@ pub(crate) async fn cmd_watch_events(
         Some(s) => s,
         None => cfg.require_servers()?[0].clone(),
     };
-    let distill =
-        Arc::new(DistillClient::new(&server_url)?.with_index_timeout(cfg.index_timeout()));
+    let distill = Arc::new(
+        make_distill_client(&server_url)
+            .await?
+            .with_index_timeout(cfg.index_timeout()),
+    );
 
     let concurrency = cfg.resolved_concurrency();
     tracing::info!(%server_url, concurrency, "starting distill event-bus watcher");
@@ -541,10 +601,7 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
 
     // Step 1: Check Qdrant availability
     reporter.status("Step 1/3", "Checking Qdrant availability");
-    let qdrant_reachable = reqwest::get(&format!("{qdrant_rest}/healthz"))
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    let qdrant_reachable = probe_ok(&format!("{qdrant_rest}/healthz")).await?;
 
     if qdrant_reachable && !force {
         reporter.status("Qdrant", &format!("already reachable at {qdrant_rest}"));
@@ -572,12 +629,12 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
 
         // Step 2: Write compose config
         reporter.status("Step 2/3", "Docker Compose config");
-        let compose_path = distill_compose_path();
+        let compose_path = distill_compose_path()?;
 
         if compose_path.exists() && !force {
             reporter.status("Config", "already exists");
         } else {
-            std::fs::create_dir_all(hidden_dir())?;
+            std::fs::create_dir_all(hs_common::hidden_dir()?)?;
             std::fs::create_dir_all(&config.qdrant_data_dir)?;
             std::fs::write(&compose_path, distill_compose_yaml(&config.qdrant_data_dir))?;
 
@@ -587,7 +644,7 @@ async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
         // Step 3: Start Qdrant
         reporter.status("Step 3/3", "Starting Qdrant");
         let cf = compose_path.to_string_lossy().to_string();
-        compose.run_capture(&["-f", &cf, "up", "-d"]).await?;
+        compose_step(&compose, &["-f", &cf, "up", "-d"]).await?;
         wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
         reporter.status("Qdrant", "OK");
     }
@@ -614,21 +671,18 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
 
     // 1. Start Qdrant container if compose file exists
-    let compose_path = distill_compose_path();
+    let compose_path = distill_compose_path()?;
     if compose_path.exists() {
         let compose = ComposeCmd::detect()
             .await
             .ok_or_else(|| anyhow::anyhow!("No container runtime found. Run: hs distill init"))?;
         let cf = compose_path.to_string_lossy().to_string();
-        compose.run_capture(&["-f", &cf, "up", "-d"]).await?;
+        compose_step(&compose, &["-f", &cf, "up", "-d"]).await?;
         wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
         reporter.status("Qdrant", "OK");
     } else {
         // No compose file — check if Qdrant is reachable anyway
-        let reachable = reqwest::get(&format!("{qdrant_rest}/healthz"))
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
+        let reachable = probe_ok(&format!("{qdrant_rest}/healthz")).await?;
         if !reachable {
             anyhow::bail!(
                 "Qdrant not reachable at {qdrant_rest} and no compose config found.\n\
@@ -639,28 +693,17 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     // 2. Stop any existing distill server (e.g. orphaned from a previous run)
-    let pid_path = distill_pid_path();
-    if let Some(pid) = crate::daemon::read_pid(&pid_path) {
-        if crate::daemon::is_process_alive(pid) {
-            reporter.status("Distill", &format!("stopping old process (PID {pid})"));
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-            for _ in 0..50 {
-                if !crate::daemon::is_process_alive(pid) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            #[cfg(unix)]
-            if crate::daemon::is_process_alive(pid) {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            }
-            crate::daemon::remove_pid_file(&pid_path);
+    let pid_path = distill_pid_path()?;
+    match crate::daemon::stop_pid_file_process(&pid_path, DISTILL_SERVER_EXE, &[]).await {
+        crate::daemon::StopOutcome::Stopped(pid) => {
+            reporter.status("Distill", &format!("stopped old process (PID {pid})"));
         }
+        crate::daemon::StopOutcome::Foreign(pid) => reporter.warn(&format!(
+            "PID file {} named PID {pid}, which is not {DISTILL_SERVER_EXE}; \
+             removed the stale PID file and left that process alone",
+            pid_path.display()
+        )),
+        crate::daemon::StopOutcome::Dead(_) | crate::daemon::StopOutcome::NoPidFile => {}
     }
 
     let binary = find_distill_binary()?.ok_or_else(|| {
@@ -720,23 +763,7 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
         }
     }
 
-    // fastembed defaults cache_dir to CWD/.fastembed_cache, which breaks
-    // when launched from systemd (CWD = /). Use a stable absolute path.
-    let fastembed_cache = std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| {
-        // Check next to the binary first (where old versions cached the model)
-        let beside_binary = binary
-            .parent()
-            .unwrap_or(binary.as_ref())
-            .join(".fastembed_cache");
-        if beside_binary.exists() {
-            return beside_binary.to_string_lossy().to_string();
-        }
-        // Otherwise use ~/.home-still/fastembed_cache
-        hidden_dir()
-            .join("fastembed_cache")
-            .to_string_lossy()
-            .to_string()
-    });
+    let fastembed_cache = fastembed_cache_dir(&binary)?;
 
     let child = std::process::Command::new(&binary)
         .env("LD_LIBRARY_PATH", &ld_path)
@@ -777,44 +804,35 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
 
 pub async fn cmd_server_stop(reporter: &Arc<dyn Reporter>) -> Result<()> {
     // 1. Stop native distill server
-    let pid_path = distill_pid_path();
-    if let Some(pid) = crate::daemon::read_pid(&pid_path) {
-        if crate::daemon::is_process_alive(pid) {
-            #[cfg(unix)]
-            {
-                // SIGTERM first, then wait, then SIGKILL
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-                for _ in 0..50 {
-                    if !crate::daemon::is_process_alive(pid) {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                if crate::daemon::is_process_alive(pid) {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
-                }
-            }
-            crate::daemon::remove_pid_file(&pid_path);
+    let pid_path = distill_pid_path()?;
+    match crate::daemon::stop_pid_file_process(&pid_path, DISTILL_SERVER_EXE, &[]).await {
+        crate::daemon::StopOutcome::Stopped(pid) => {
             reporter.status("Distill", &format!("stopped (PID {pid})"));
-        } else {
-            crate::daemon::remove_pid_file(&pid_path);
+        }
+        crate::daemon::StopOutcome::Dead(_) => {
             reporter.status("Distill", "not running (stale PID removed)");
         }
-    } else {
-        reporter.status("Distill", "not running");
+        crate::daemon::StopOutcome::Foreign(pid) => reporter.warn(&format!(
+            "Distill not running: PID file {} named PID {pid}, which is not \
+             {DISTILL_SERVER_EXE}; removed the stale PID file and left that process alone",
+            pid_path.display()
+        )),
+        crate::daemon::StopOutcome::NoPidFile => reporter.status("Distill", "not running"),
     }
 
     // 2. Stop Qdrant container
-    let compose_path = distill_compose_path();
+    let compose_path = distill_compose_path()?;
     if compose_path.exists() {
-        if let Some(compose) = ComposeCmd::detect().await {
-            let cf = compose_path.to_string_lossy().to_string();
-            compose.run_capture(&["-f", &cf, "down"]).await?;
-            reporter.status("Qdrant", "stopped");
+        match ComposeCmd::detect().await {
+            Some(compose) => {
+                let cf = compose_path.to_string_lossy().to_string();
+                compose_step(&compose, &["-f", &cf, "down"]).await?;
+                reporter.status("Qdrant", "stopped");
+            }
+            None => reporter.warn(&format!(
+                "{} exists but no container runtime was found; Qdrant was not stopped",
+                compose_path.display()
+            )),
         }
     }
 
@@ -836,20 +854,17 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
     let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
 
     // Ensure Qdrant is running
-    let compose_path = distill_compose_path();
+    let compose_path = distill_compose_path()?;
     if compose_path.exists() {
         let compose = ComposeCmd::detect()
             .await
             .ok_or_else(|| anyhow::anyhow!("No container runtime found. Run: hs distill init"))?;
         let cf = compose_path.to_string_lossy().to_string();
-        compose.run_capture(&["-f", &cf, "up", "-d"]).await?;
+        compose_step(&compose, &["-f", &cf, "up", "-d"]).await?;
         hs_common::compose::wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
         reporter.status("Qdrant", "OK");
     } else {
-        let reachable = reqwest::get(&format!("{qdrant_rest}/healthz"))
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
+        let reachable = probe_ok(&format!("{qdrant_rest}/healthz")).await?;
         if !reachable {
             anyhow::bail!(
                 "Qdrant not reachable at {qdrant_rest} and no compose config found.\n\
@@ -900,19 +915,7 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         }
     }
 
-    let fastembed_cache = std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| {
-        let beside_binary = binary
-            .parent()
-            .unwrap_or(binary.as_ref())
-            .join(".fastembed_cache");
-        if beside_binary.exists() {
-            return beside_binary.to_string_lossy().to_string();
-        }
-        hidden_dir()
-            .join("fastembed_cache")
-            .to_string_lossy()
-            .to_string()
-    });
+    let fastembed_cache = fastembed_cache_dir(&binary)?;
 
     reporter.status(
         "Distill",
@@ -926,11 +929,14 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         // Wait for the server to become healthy (up to 5 minutes for model load)
         for _ in 0..300 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            if reqwest::get(&check_url)
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-            {
+            let up = match probe_ok(&check_url).await {
+                Ok(up) => up,
+                Err(e) => {
+                    tracing::error!("distill health probe could not be built: {e:#}");
+                    false
+                }
+            };
+            if up {
                 match ensure_index_running().await {
                     Ok(true) => {
                         tracing::info!("Auto-started index daemon after distill server ready")
@@ -941,6 +947,9 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
                 return;
             }
         }
+        tracing::error!(
+            "distill server on port {index_port} did not become healthy within 300s; the index daemon was not auto-started"
+        );
     });
 
     // Run in foreground — inherit stdout/stderr, block until exit
@@ -970,9 +979,9 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
 /// binary, server unreachable) — the caller decides whether that matters.
 /// `Err`: the prerequisites were present but the daemon could not be spawned.
 pub async fn ensure_index_running() -> Result<bool> {
-    let pid_path = index_pid_path();
+    let pid_path = index_pid_path()?;
     if let Some(pid) = crate::daemon::read_pid(&pid_path) {
-        if crate::daemon::is_process_alive(pid) {
+        if is_index_daemon(pid)? {
             return Ok(true); // already running
         }
         crate::daemon::remove_pid_file(&pid_path);
@@ -986,7 +995,8 @@ pub async fn ensure_index_running() -> Result<bool> {
     // Uses an HTTP health check so it works for both local and remote
     // servers (e.g. big_mac → big).
     let server_url = DistillClientConfig::load()?.require_servers()?[0].clone();
-    let client = DistillClient::new(&server_url)
+    let client = make_distill_client(&server_url)
+        .await
         .with_context(|| format!("building distill client for {server_url}"))?;
     if client.health().await.is_err() {
         tracing::debug!("Skipping auto-index: distill server not reachable at {server_url}");
@@ -1004,10 +1014,7 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
     let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
 
     // Qdrant health
-    let qdrant_ok = reqwest::get(&format!("{qdrant_rest}/healthz"))
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    let qdrant_ok = probe_ok(&format!("{qdrant_rest}/healthz")).await?;
     if qdrant_ok {
         reporter.status("Qdrant", &format!("OK ({qdrant_rest})"));
     } else {
@@ -1015,9 +1022,9 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
     }
 
     // Distill server PID
-    let pid_path = distill_pid_path();
+    let pid_path = distill_pid_path()?;
     match crate::daemon::read_pid(&pid_path) {
-        Some(pid) if crate::daemon::is_process_alive(pid) => {
+        Some(pid) if crate::daemon::process_is(pid, DISTILL_SERVER_EXE, &[]) => {
             reporter.status("Server", &format!("running (PID {pid})"));
         }
         _ => {
@@ -1027,27 +1034,18 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
 
     // Collection info (if server is reachable)
     let servers = resolve_servers(server).await?;
-    let client = DistillClient::new(&servers[0])?;
+    let client = make_distill_client(&servers[0]).await?;
     match client.status().await {
         Ok(status) => {
             reporter.status("Collection", &status.collection);
             reporter.status("Points", &status.points_count.to_string());
             reporter.status("Device", &status.compute_device);
         }
-        Err(_) => {
+        Err(e) => {
             reporter.status(
                 "Collection",
-                &format!("unavailable (server at {} not reachable)", servers[0]),
+                &format!("unavailable (server at {} not reachable: {e:#})", servers[0]),
             );
-        }
-    }
-
-    // Compose status if available
-    let compose_path = distill_compose_path();
-    if compose_path.exists() {
-        if let Some(compose) = ComposeCmd::detect().await {
-            let cf = compose_path.to_string_lossy().to_string();
-            let _ = compose.run_capture(&["-f", &cf, "ps"]).await;
         }
     }
 
@@ -1058,12 +1056,37 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
 
 const INDEX_STATUS_FILE: &str = "distill-index-status.json";
 
-fn index_pid_path() -> PathBuf {
-    hidden_dir().join("distill-index.pid")
+fn index_pid_path() -> Result<PathBuf> {
+    Ok(hs_common::hidden_dir()?.join("distill-index.pid"))
 }
 
-pub fn index_status_path() -> PathBuf {
-    hidden_dir().join(INDEX_STATUS_FILE)
+pub fn index_status_path() -> Result<PathBuf> {
+    Ok(hs_common::hidden_dir()?.join(INDEX_STATUS_FILE))
+}
+
+/// What the index daemon looks like to the OS: the running `hs` invoked as
+/// `hs distill index --daemon-child ...` (see [`spawn_index_daemon`]).
+const INDEX_DAEMON_ARGS: [&str; 3] = ["distill", "index", "--daemon-child"];
+
+/// Is `pid` a live index daemon? A PID file outlives its process and the
+/// kernel recycles PIDs, so a bare "is the PID alive" can name a stranger.
+fn is_index_daemon(pid: u32) -> Result<bool> {
+    Ok(crate::daemon::process_is(
+        pid,
+        &crate::daemon::current_exe_name()?,
+        &INDEX_DAEMON_ARGS,
+    ))
+}
+
+/// Terminate the index daemon recorded in the PID file — and only if that
+/// PID really is an index daemon (see [`crate::daemon::stop_pid_file_process`]).
+pub(crate) async fn stop_index_daemon() -> Result<crate::daemon::StopOutcome> {
+    Ok(crate::daemon::stop_pid_file_process(
+        &index_pid_path()?,
+        &crate::daemon::current_exe_name()?,
+        &INDEX_DAEMON_ARGS,
+    )
+    .await)
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -1077,15 +1100,16 @@ pub struct IndexStatus {
     pub done: bool,
 }
 
-pub fn read_index_status() -> Option<IndexStatus> {
-    let contents = std::fs::read_to_string(index_status_path()).ok()?;
-    serde_json::from_str(&contents).ok()
+pub fn read_index_status() -> Result<Option<IndexStatus>> {
+    let contents = std::fs::read_to_string(index_status_path()?).ok();
+    Ok(contents.and_then(|c| serde_json::from_str(&c).ok()))
 }
 
 /// Write the status file. It is advisory (a dashboard reads it), so a failed
 /// write is logged and must not kill the indexing run — but it is logged.
 fn write_index_status(status: &IndexStatus) {
-    if let Err(e) = write_index_status_to(&index_status_path(), status) {
+    let written = index_status_path().and_then(|path| Ok(write_index_status_to(&path, status)?));
+    if let Err(e) = written {
         tracing::warn!(error = %e, "could not write the distill index status file");
     }
 }
@@ -1116,7 +1140,7 @@ fn spawn_index_daemon(
     server: Option<&str>,
     force: bool,
 ) -> Result<u32> {
-    let exe = std::env::current_exe().context("Cannot find current executable")?;
+    let exe = crate::daemon::current_exe_on_disk()?;
 
     let mut args = vec![
         "distill".to_string(),
@@ -1134,6 +1158,18 @@ fn spawn_index_daemon(
         for f in file_list {
             args.push("--file".to_string());
             args.push(f.to_string_lossy().to_string());
+        }
+    }
+
+    // A run whose attach was detached leaves its `done: true` status file
+    // behind. The new daemon only rewrites it after listing the markdown
+    // tree, so an attach in that window would read the stale file and report
+    // the previous run's result.
+    match std::fs::remove_file(index_status_path()?) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).context("remove the previous index run's status file");
         }
     }
 
@@ -1166,21 +1202,21 @@ async fn cmd_index(
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
     // Check if daemon already running
-    let pid_path = index_pid_path();
+    let pid_path = index_pid_path()?;
     if let Some(pid) = crate::daemon::read_pid(&pid_path) {
-        if crate::daemon::is_process_alive(pid) {
+        if is_index_daemon(pid)? {
             reporter.status(
                 "Index",
                 &format!("already running (PID {pid}). Attaching..."),
             );
-            return attach_index(reporter).await;
+            return attach_index(pid, reporter).await;
         }
         crate::daemon::remove_pid_file(&pid_path);
     }
 
     // Health check before spawning
     let servers = resolve_servers(server).await?;
-    let client = DistillClient::new(&servers[0])?;
+    let client = make_distill_client(&servers[0]).await?;
     match client.health().await {
         Ok(h) => reporter.status(
             "Connected",
@@ -1201,12 +1237,23 @@ async fn cmd_index(
     // Wait briefly for status file to appear
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    attach_index(reporter).await
+    attach_index(pid, reporter).await
 }
 
-/// Attach to a running index daemon — display progress, q to detach.
-async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
+/// Attach to the running index daemon `pid` — display progress, q to detach.
+/// While the daemon has written no status file yet, its liveness is checked
+/// on every poll: a daemon that dies before its first status write (bad
+/// config, unreachable server) would otherwise be waited on forever.
+async fn attach_index(pid: u32, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    /// Restores the terminal on every exit path, including `?` and `bail!`.
+    struct RawMode;
+    impl Drop for RawMode {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
     let raw_enabled = crossterm::terminal::enable_raw_mode().is_ok();
+    let _raw_guard = raw_enabled.then_some(RawMode);
     let mut last_indexed = 0usize;
 
     loop {
@@ -1220,7 +1267,7 @@ async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
                             crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc
                         )
                     {
-                        let _ = crossterm::terminal::disable_raw_mode();
+                        drop(_raw_guard);
                         reporter.status("Index", "detached. Daemon continues in background.");
                         return Ok(());
                     }
@@ -1230,36 +1277,65 @@ async fn attach_index(reporter: &Arc<dyn Reporter>) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
+        // Liveness is sampled BEFORE the status file is read: a daemon that
+        // writes its status and exits between the two reads as alive here and
+        // is picked up on the next poll, never as "died without a status".
+        let daemon_alive = is_index_daemon(pid)?;
+
         // Read status
-        if let Some(status) = read_index_status() {
-            if status.indexed > last_indexed {
-                let _ = crossterm::terminal::disable_raw_mode();
-                eprintln!(
-                    "  [{}/{}] {} — {} chunks total",
-                    status.indexed, status.total_files, status.current_file, status.total_chunks
+        let Some(status) = read_index_status()? else {
+            if !daemon_alive {
+                crate::daemon::remove_pid_file(&index_pid_path()?);
+                let log_path = hs_common::resolve_log_dir()?.join("distill-index.log");
+                anyhow::bail!(
+                    "index daemon (PID {pid}) exited before reporting any progress. \
+                     Check logs: {}",
+                    log_path.display()
                 );
-                if raw_enabled {
-                    let _ = crossterm::terminal::enable_raw_mode();
-                }
-                last_indexed = status.indexed;
             }
+            continue;
+        };
+        if status.indexed > last_indexed {
+            let _ = crossterm::terminal::disable_raw_mode();
+            eprintln!(
+                "  [{}/{}] {} — {} chunks total",
+                status.indexed, status.total_files, status.current_file, status.total_chunks
+            );
+            if raw_enabled {
+                let _ = crossterm::terminal::enable_raw_mode();
+            }
+            last_indexed = status.indexed;
+        }
 
-            if status.done {
-                let _ = crossterm::terminal::disable_raw_mode();
-                reporter.finish(&format!(
-                    "Indexed {}/{} files, {} chunks ({} failed)",
-                    status.indexed, status.total_files, status.total_chunks, status.failed
-                ));
-                let _ = std::fs::remove_file(index_status_path());
-                crate::daemon::remove_pid_file(&index_pid_path());
-                return Ok(());
+        if status.done {
+            drop(_raw_guard);
+            reporter.finish(&format!(
+                "Indexed {}/{} files, {} chunks ({} failed)",
+                status.indexed, status.total_files, status.total_chunks, status.failed
+            ));
+            let _ = std::fs::remove_file(index_status_path()?);
+            crate::daemon::remove_pid_file(&index_pid_path()?);
+            if status.failed > 0 {
+                let log_path = hs_common::resolve_log_dir()?.join("distill-index.log");
+                anyhow::bail!(
+                    "{} file(s) failed to index. Check logs: {}",
+                    status.failed,
+                    log_path.display()
+                );
             }
+            return Ok(());
+        }
 
-            if !crate::daemon::is_process_alive(status.pid) {
-                let _ = crossterm::terminal::disable_raw_mode();
-                reporter.error("Index daemon exited unexpectedly. Check logs.");
-                return Ok(());
-            }
+        // `daemon_alive` was sampled before this status read, so a daemon
+        // that finished in between was caught by `done` above.
+        if !daemon_alive {
+            let log_path = hs_common::resolve_log_dir()?.join("distill-index.log");
+            anyhow::bail!(
+                "index daemon (PID {pid}) exited before finishing ({}/{} files). Check logs: {}",
+                status.indexed,
+                status.total_files,
+                log_path.display()
+            );
         }
     }
 }
@@ -1271,11 +1347,11 @@ async fn cmd_index_daemon(
     force: bool,
 ) -> Result<()> {
     // Write PID
-    let pid_path = index_pid_path();
+    let pid_path = index_pid_path()?;
     crate::daemon::write_pid_file(&pid_path)?;
 
     let servers = resolve_servers(server).await?;
-    let client = DistillClient::new(&servers[0])?;
+    let client = make_distill_client(&servers[0]).await?;
 
     // Health check
     client
@@ -1292,6 +1368,7 @@ async fn cmd_index_daemon(
         files
     } else {
         hs_common::collect_files_recursive(&markdown_dir, "md")
+            .context("walking the markdown directory")?
     };
 
     let mut status = IndexStatus {
@@ -1303,10 +1380,14 @@ async fn cmd_index_daemon(
 
     for path in &paths {
         let path_str = path.to_string_lossy().to_string();
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            // A stem that is not valid UTF-8 cannot be a catalog key; indexing
+            // it under a placeholder id would stamp the wrong row.
+            status.failed += 1;
+            tracing::error!("{}: file name has no UTF-8 stem; not indexed", path.display());
+            write_index_status(&status);
+            continue;
+        };
 
         status.current_file = stem.to_string();
         write_index_status(&status);
@@ -1333,8 +1414,9 @@ async fn cmd_index_daemon(
         match client.index_file_with_progress(&path_str, |_| {}).await {
             Ok(result) => {
                 status.total_chunks += result.chunks_indexed;
-                status.indexed += 1;
-                if let Err(e) = hs_common::catalog::update_embedding_catalog_via(
+                // Indexed only once the stamp is written: a vector without
+                // its catalog stamp is a failure the run must report.
+                match hs_common::catalog::update_embedding_catalog_via(
                     &hs_common::storage::LocalFsStorage::new(&catalog_dir),
                     "",
                     stem,
@@ -1344,7 +1426,13 @@ async fn cmd_index_daemon(
                 )
                 .await
                 {
-                    tracing::warn!("{stem}: embedding stamp write failed: {e}");
+                    Ok(()) => status.indexed += 1,
+                    Err(e) => {
+                        status.failed += 1;
+                        tracing::error!(
+                            "{stem}: indexed but the embedding stamp write failed: {e}"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -1596,7 +1684,7 @@ async fn cmd_hnsw_enable(
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
     let servers = resolve_servers(server).await?;
-    let client = DistillClient::new(&servers[0])?;
+    let client = make_distill_client(&servers[0]).await?;
     hnsw_enable(&client, &servers[0], collection, yes, reporter).await
 }
 
@@ -1773,9 +1861,8 @@ async fn cmd_reconcile(
         let device = distill
             .health()
             .await
-            .ok()
-            .map(|h| h.compute_device)
-            .unwrap_or_else(|| "unknown".to_string());
+            .context("distill health (the backfilled stamp records its compute device)")?
+            .compute_device;
 
         reporter.status(
             "Fix stamps",
@@ -1845,9 +1932,17 @@ async fn cmd_reconcile(
             // Fall back to re-derivation for pre-rc.241 rows that predate
             // the `markdown_path` field.
             let catalog_entry =
-                hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem)
-                    .await
-                    .with_context(|| format!("catalog read for {stem}"))?;
+                match hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem).await
+                {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        // One unreadable row must not abort the batch with no
+                        // summary; count it and let the run fail at the end.
+                        tracing::warn!(%stem, error = %e, "catalog read failed during reembed");
+                        embed_failed += 1;
+                        continue;
+                    }
+                };
             let md_key = catalog_entry
                 .as_ref()
                 .and_then(|e| e.markdown_path.clone())
@@ -1859,7 +1954,9 @@ async fn cmd_reconcile(
                 Ok(result) => {
                     // Also write the stamp — if we don't, the next
                     // reconcile run will see this as StampMissing and
-                    // redo the work.
+                    // redo the work. The vectors are in place either way,
+                    // so a failed stamp is a stamp failure, not an embed
+                    // failure; it still fails the run.
                     if let Err(e) = hs_common::catalog::record_embedding_outcome_via(
                         &*storage,
                         "catalog",
@@ -1871,6 +1968,7 @@ async fn cmd_reconcile(
                     .await
                     {
                         tracing::warn!(%stem, error = %e, "stamp after reembed failed");
+                        stamp_failed += 1;
                     }
                     embed_done += 1;
                 }
@@ -1880,10 +1978,18 @@ async fn cmd_reconcile(
                     // doesn't keep retrying a doc the server can't
                     // handle.
                     let reason = format!("embed_failed: {e}");
-                    let _ = hs_common::catalog::update_embedding_skip_via(
+                    if let Err(skip_err) = hs_common::catalog::update_embedding_skip_via(
                         &*storage, "catalog", stem, &reason,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!(
+                            %stem,
+                            error = %skip_err,
+                            "could not record the embed_failed skip stamp"
+                        );
+                        stamp_failed += 1;
+                    }
                     embed_failed += 1;
                 }
             }

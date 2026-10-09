@@ -79,7 +79,11 @@ pub fn load_omnidocbench_filtered(
             }
         }
 
-        let image_name = page_info["image_path"].as_str().unwrap_or("").to_string();
+        let image_name = page_info["image_path"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .context("OmniDocBench entry has no page_info.image_path")?
+            .to_string();
         let page_idx = page_info["page_no"].as_u64().map(|n| n as usize);
 
         let image_path = resolve_image_path(&base, &image_name);

@@ -604,6 +604,14 @@ impl Processor {
             Pipeline::PerRegion { layout, table } => (Arc::clone(layout), Arc::clone(table)),
         };
 
+        // Concurrency model: stage 1 (pdfium open/render + layout) holds
+        // pdfium-render's process-wide lock for the whole document, so it
+        // serializes across conversions. Stage 2 (VLM calls, gated by
+        // `vlm_sem`) runs outside that lock. `vlm_concurrency` > 1 is thus
+        // deliberate: it sizes the admission semaphore, this VLM semaphore and
+        // `vlm_slots_total`, and pipelines one conversion's VLM stage with the
+        // next one's render. A wedged pdfium call `_exit`s the server (see
+        // `pdfium::guarded_call`).
         // Per-region mode: 2-stage async pipeline
         let (tx, rx) = tokio::sync::mpsc::channel::<PreparedPage>(3);
         let vlm_sem = Arc::clone(&self.vlm_sem);

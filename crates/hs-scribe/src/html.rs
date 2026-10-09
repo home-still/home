@@ -494,11 +494,34 @@ fn clean_blank_lines(md: &str) -> String {
             }
         } else {
             blank_count = 0;
-            cleaned.push_str(line);
+            cleaned.push_str(line.trim_end());
             cleaned.push('\n');
         }
     }
     cleaned.trim().to_string()
+}
+
+/// Append one text node's words. Whitespace at the node's edges survives as
+/// a single space, so `Hello <b>world</b> again` does not become
+/// `Hello**world**again`; a node that is only whitespace (the separator in
+/// `<b>Hello</b> <i>world</i>`) adds one space unless `md` already ends in
+/// whitespace, e.g. after a block or a table cell.
+fn push_text(md: &mut String, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        if !text.is_empty() && !md.is_empty() && !md.ends_with(char::is_whitespace) {
+            md.push(' ');
+        }
+        return;
+    }
+    if text.starts_with(char::is_whitespace) && !md.is_empty() && !md.ends_with(char::is_whitespace)
+    {
+        md.push(' ');
+    }
+    md.push_str(trimmed);
+    if text.ends_with(char::is_whitespace) {
+        md.push(' ');
+    }
 }
 
 /// Markdown written before and after the content of an element, or `None`
@@ -546,12 +569,7 @@ fn walk_html_node(element: &ElementRef, md: &mut String) {
                     continue;
                 }
                 match node.value() {
-                    Node::Text(text) => {
-                        let t = text.trim();
-                        if !t.is_empty() {
-                            md.push_str(t);
-                        }
-                    }
+                    Node::Text(text) => push_text(md, text),
                     // `<template>` contents are inert: never part of the text.
                     Node::Fragment => dropped = Some(node.id()),
                     Node::Element(el) => {
@@ -638,12 +656,7 @@ mod tests {
     fn oracle_walk(element: &ElementRef, md: &mut String) {
         for child in element.children() {
             match child.value() {
-                Node::Text(text) => {
-                    let t = text.trim();
-                    if !t.is_empty() {
-                        md.push_str(t);
-                    }
-                }
+                Node::Text(text) => push_text(md, text),
                 Node::Element(el) => {
                     let tag = el.name();
                     if let Some(child_ref) = ElementRef::wrap(child) {
@@ -1102,6 +1115,24 @@ mod tests {
             took.as_secs() < HtmlLimits::default().max_convert_secs / 2,
             "{took:?} against a {} s budget",
             HtmlLimits::default().max_convert_secs
+        );
+    }
+
+    #[test]
+    fn inline_elements_keep_the_spaces_around_them() {
+        let md = md("<html><body><p>Hello <b>world</b> again, <i>x</i>y</p></body></html>");
+        assert_eq!(md, "Hello **world** again, _x_y");
+    }
+
+    #[test]
+    fn a_whitespace_only_node_still_separates_inline_elements() {
+        assert_eq!(
+            md("<html><body><p><b>Hello</b> <i>world</i></p></body></html>"),
+            "**Hello** _world_"
+        );
+        assert_eq!(
+            md("<html><body><p><span>John</span> <span>Smith</span></p></body></html>"),
+            "John Smith"
         );
     }
 }

@@ -34,6 +34,15 @@ struct DashboardData {
     /// row so a busy pool is visible in the Pipeline panel, not just in
     /// per-scribe Services rows.
     in_flight_conversions: Option<u64>,
+    /// Outstanding work on the scribe consumer (waiting + unacked). `None`
+    /// with `queue_error` set means the broker could not say.
+    queued_conversions: Option<u64>,
+    /// Unconverted papers nothing is queued to convert.
+    stalled_conversions: Option<u64>,
+    queue_error: Option<String>,
+    /// True once a real server snapshot produced this value (not the
+    /// loading frame or the "status unavailable" frame).
+    snapshot_received: bool,
 
     scribe_servers: Vec<ServiceStatus>,
     distill_servers: Vec<ServiceStatus>,
@@ -53,7 +62,19 @@ struct DashboardData {
     counts_error: Option<String>,
 }
 
+/// Shown for Queued/Stalled when the MCP server answered but sent neither a
+/// queue depth nor a queue error.
+const QUEUE_SERVER_TOO_OLD: &str = "MCP server predates queue reporting — upgrade it";
+
 impl DashboardData {
+    /// A server that reports the queue always sets `queued_conversions` or
+    /// `queue_error` once it has built a snapshot, so neither being set on a
+    /// received snapshot means the server predates the queue fields.
+    /// Before the first snapshot this is false and the rows say "scanning".
+    fn queue_server_too_old(&self) -> bool {
+        self.snapshot_received && self.queued_conversions.is_none() && self.queue_error.is_none()
+    }
+
     /// Nothing known yet: `loading` before the first collection, or the
     /// "could not collect" frame (`counts_error` says why).
     fn blank(loading: bool, counts_error: Option<String>) -> Self {
@@ -67,6 +88,10 @@ impl DashboardData {
             embedding_skipped: 0,
             inbox_pending: None,
             in_flight_conversions: None,
+            queued_conversions: None,
+            stalled_conversions: None,
+            queue_error: None,
+            snapshot_received: false,
             scribe_servers: vec![],
             distill_servers: vec![],
             qdrant_healthy: false,
@@ -134,9 +159,10 @@ enum IndexerInfo {
 struct ServiceStatus {
     url: String,
     healthy: bool,
-    detail: String,   // e.g. "(Cpu)" or compute device
-    activity: String, // e.g. "idle", "3 converting", "1 embedding"
-    version: String,  // server version from /health
+    detail: String,        // e.g. "(Cpu)" or compute device
+    activity: String,      // e.g. "idle", "3 converting", "1 embedding"
+    version: String,       // server version from /health
+    error: Option<String>, // why a health/readiness/status call failed
 }
 
 struct HistoryEvent {
@@ -157,10 +183,19 @@ async fn collect_data() -> DashboardData {
     // never discarded.
     match collect_data_via_mcp().await {
         Ok(data) => data,
-        Err(e) => DashboardData {
-            indexer: read_indexer_status(),
-            ..DashboardData::blank(false, Some(format!("status unavailable: {e:#}")))
-        },
+        Err(e) => {
+            let (indexer, note) = match read_indexer_status() {
+                Ok(indexer) => (indexer, String::new()),
+                Err(ie) => (
+                    IndexerInfo::Stopped,
+                    format!("; indexer status unavailable: {ie:#}"),
+                ),
+            };
+            DashboardData {
+                indexer,
+                ..DashboardData::blank(false, Some(format!("status unavailable: {e:#}{note}")))
+            }
+        }
     }
 }
 
@@ -180,7 +215,7 @@ async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
     let snap: hs_common::status::StatusSnapshot = serde_json::from_value(called?)?;
 
     let mut data = snapshot_to_dashboard(snap);
-    data.indexer = read_indexer_status();
+    data.indexer = read_indexer_status()?;
     Ok(data)
 }
 
@@ -263,6 +298,10 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         embedding_skipped: snap.pipeline.embedding_skipped.unwrap_or(0),
         inbox_pending: snap.pipeline.inbox_pending,
         in_flight_conversions: snap.pipeline.in_flight_conversions,
+        queued_conversions: snap.pipeline.queued_conversions,
+        stalled_conversions: snap.pipeline.stalled_conversions,
+        queue_error: snap.pipeline.queue_error.clone(),
+        snapshot_received: true,
         scribe_servers,
         distill_servers,
         qdrant_healthy,
@@ -287,18 +326,19 @@ fn instance_to_status(inst: &hs_common::status::ServiceInstance) -> ServiceStatu
         detail,
         activity: inst.activity.clone(),
         version: inst.version.clone(),
+        error: inst.error.clone(),
     }
 }
 
-fn read_indexer_status() -> IndexerInfo {
-    let status = match crate::distill_cmd::read_index_status() {
+fn read_indexer_status() -> anyhow::Result<IndexerInfo> {
+    let status = match crate::distill_cmd::read_index_status()? {
         Some(s) => s,
-        None => return IndexerInfo::Stopped,
+        None => return Ok(IndexerInfo::Stopped),
     };
 
     // Cross-host liveness: trust the status file's mtime over local PID check.
     // The indexer updates the status file frequently while running.
-    let status_path = crate::distill_cmd::index_status_path();
+    let status_path = crate::distill_cmd::index_status_path()?;
     let status_is_fresh = std::fs::metadata(&status_path)
         .and_then(|m| m.modified())
         .map(|t| {
@@ -314,28 +354,28 @@ fn read_indexer_status() -> IndexerInfo {
 
     if !is_alive {
         if status.done {
-            return IndexerInfo::Finished {
+            return Ok(IndexerInfo::Finished {
                 indexed: status.indexed as u64,
                 chunks: status.total_chunks as u64,
-            };
+            });
         }
-        return IndexerInfo::Stopped;
+        return Ok(IndexerInfo::Stopped);
     }
 
     if status.done {
-        return IndexerInfo::Finished {
+        return Ok(IndexerInfo::Finished {
             indexed: status.indexed as u64,
             chunks: status.total_chunks as u64,
-        };
+        });
     }
 
-    IndexerInfo::Running {
+    Ok(IndexerInfo::Running {
         indexed: status.indexed as u64,
         total: status.total_files as u64,
         failed: status.failed as u64,
         chunks: status.total_chunks as u64,
         current_file: status.current_file,
-    }
+    })
 }
 
 // ── Formatting helpers ──────────────────────────────────────────
@@ -371,7 +411,7 @@ fn fmt_ago(dt: &chrono::DateTime<chrono::Utc>) -> String {
 fn render(frame: &mut Frame, data: &DashboardData) {
     let outer = Layout::vertical([
         Constraint::Length(1),  // title
-        Constraint::Length(11), // pipeline (Documents/Markdown/Cataloged/Embedded/In-flight/Inbox/Corrupted/Watcher/Indexer + header + padding)
+        Constraint::Length(14), // pipeline: header + Documents/Markdown/Cataloged/Embedded/In-flight/Queued/Stalled/Inbox/Corrupted/Watcher/Indexer rows + 2 border rows
         Constraint::Length(1),  // spacer
         Constraint::Length((data.scribe_servers.len() + data.distill_servers.len() + 3) as u16), // services
         Constraint::Length(1), // spacer
@@ -410,7 +450,11 @@ fn render(frame: &mut Frame, data: &DashboardData) {
 
 fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let block = Block::new()
-        .title(Line::from(" Pipeline "))
+        .title(match &data.counts_error {
+            Some(why) => Line::from(format!(" Pipeline — {} ", ellipsize(why, 100)))
+                .style(Style::default().fg(Color::Red)),
+            None => Line::from(" Pipeline "),
+        })
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .padding(Padding::horizontal(1));
@@ -452,6 +496,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     } else {
         "  ...".to_string()
     };
+    let too_old = data.queue_server_too_old();
 
     let rows = vec![
         Row::new(vec![
@@ -535,6 +580,60 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                 ),
                 Some(_) => "idle".to_string(),
                 None => String::new(),
+            }),
+            Cell::from(""),
+        ]),
+        Row::new(vec![
+            Cell::from("Queued"),
+            Cell::from(match (data.queued_conversions, &data.queue_error) {
+                (Some(n), _) => format!("{n:>6}"),
+                (None, Some(_)) => "     ?".to_string(),
+                (None, None) if too_old => "   n/a".to_string(),
+                (None, None) => scanning.clone(),
+            })
+            .style(match data.queued_conversions {
+                Some(n) if n > 0 => Style::default().fg(Color::Green),
+                _ => Style::default().fg(Color::DarkGray),
+            }),
+            Cell::from(match (data.queued_conversions, &data.queue_error) {
+                (Some(n), _) if n > 0 => "waiting for or held by a scribe".to_string(),
+                (Some(_), _) => "queue empty".to_string(),
+                (None, Some(reason)) => format!("unavailable: {reason}"),
+                (None, None) if too_old => QUEUE_SERVER_TOO_OLD.to_string(),
+                (None, None) => String::new(),
+            })
+            .style(if data.queue_error.is_some() {
+                Style::default().fg(Color::Red)
+            } else if too_old {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            }),
+            Cell::from(""),
+        ]),
+        Row::new(vec![
+            Cell::from("Stalled"),
+            Cell::from(match data.stalled_conversions {
+                Some(n) => format!("{n:>6}"),
+                None if too_old => "   n/a".to_string(),
+                None => "     ?".to_string(),
+            })
+            .style(match data.stalled_conversions {
+                Some(n) if n > 0 => Style::default().fg(Color::Yellow),
+                _ => Style::default().fg(Color::DarkGray),
+            }),
+            Cell::from(match data.stalled_conversions {
+                Some(n) if n > 0 => {
+                    "no markdown and not queued — run `hs pipeline catch-up`".to_string()
+                }
+                Some(_) => "none".to_string(),
+                None if too_old => QUEUE_SERVER_TOO_OLD.to_string(),
+                None => String::new(),
+            })
+            .style(if too_old {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
             }),
             Cell::from(""),
         ]),
@@ -751,7 +850,7 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
         [
             Constraint::Length(8),  // Name
             Constraint::Length(2),  // Indicator
-            Constraint::Length(18), // Status + Activity
+            Constraint::Length(24), // Status + Activity ("running · 12 converting", "backend unavailable")
             Constraint::Fill(3),    // URL — gets 3/5 of remaining
             Constraint::Fill(2),    // Detail — gets 2/5 of remaining
             Constraint::Length(16), // Version
@@ -874,6 +973,19 @@ async fn run_oneshot_text() -> Result<()> {
     if let Some(corrupted) = data.corrupted_count {
         println!("  Corrupted : {corrupted}");
     }
+    if data.queue_server_too_old() {
+        println!("  Queued    : n/a ({QUEUE_SERVER_TOO_OLD})");
+        println!("  Stalled   : n/a ({QUEUE_SERVER_TOO_OLD})");
+    } else {
+        if let Some(reason) = &data.queue_error {
+            println!("  Queued    : unavailable ({reason})");
+        } else if let Some(q) = data.queued_conversions {
+            println!("  Queued    : {q}");
+        }
+        if let Some(s) = data.stalled_conversions {
+            println!("  Stalled   : {s}");
+        }
+    }
     println!();
 
     // Services
@@ -887,6 +999,9 @@ async fn run_oneshot_text() -> Result<()> {
             "  {dot} scribe   {:<35}  {} {}  {}",
             s.url, s.activity, s.detail, s.version
         );
+        if let Some(e) = &s.error {
+            println!("      ! {e}");
+        }
     }
     for s in &data.distill_servers {
         let dot = if s.healthy { "●" } else { "○" };
@@ -894,6 +1009,9 @@ async fn run_oneshot_text() -> Result<()> {
             "  {dot} distill  {:<35}  {} {}  {}",
             s.url, s.activity, s.detail, s.version
         );
+        if let Some(e) = &s.error {
+            println!("      ! {e}");
+        }
     }
     let qdot = if data.qdrant_healthy { "●" } else { "○" };
     println!(
@@ -986,6 +1104,10 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
                         data.in_flight_conversions = new_data
                             .in_flight_conversions
                             .or(data.in_flight_conversions);
+                        // Not carried over: a stale "queue empty" would hide a broker outage.
+                        data.queued_conversions = new_data.queued_conversions;
+                        data.stalled_conversions = new_data.stalled_conversions;
+                        data.queue_error = new_data.queue_error;
                         // Always update network-sourced fields
                         data.scribe_servers = new_data.scribe_servers;
                         data.distill_servers = new_data.distill_servers;
@@ -1113,5 +1235,113 @@ mod tests {
                 .collect();
             assert!(screen.contains("Pipeline"), "the dashboard drew");
         }
+    }
+
+    fn draw(data: &DashboardData) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| render(frame, data)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// The Pipeline panel was one row short of its content, so the last row
+    /// (Indexer) never drew; and the Services status cell was narrower than
+    /// the "backend unavailable" label it exists to show.
+    #[test]
+    fn the_dashboard_shows_the_indexer_row_and_the_whole_unhealthy_label() {
+        let mut data = DashboardData::blank(false, None);
+        data.scribe_servers.push(ServiceStatus {
+            url: "http://scribe.example.local:7435".into(),
+            healthy: false,
+            detail: String::new(),
+            activity: "backend unavailable".into(),
+            version: String::new(),
+            error: None,
+        });
+        let screen = draw(&data);
+        assert!(screen.contains("Indexer"), "Indexer row clipped");
+        assert!(screen.contains("backend unavailable"), "label truncated");
+    }
+
+    /// A failed collection used to show only blank counts: the cause was
+    /// dropped on the floor.
+    #[test]
+    fn the_dashboard_says_why_the_status_is_unavailable() {
+        let data = DashboardData::blank(false, Some("status unavailable: gateway refused".into()));
+        assert!(draw(&data).contains("gateway refused"));
+    }
+
+    fn snapshot_with(
+        queued: Option<u64>,
+        stalled: Option<u64>,
+        queue_error: Option<&str>,
+    ) -> hs_common::status::StatusSnapshot {
+        let mut snap = hs_common::status::StatusSnapshot::default();
+        snap.pipeline.queued_conversions = queued;
+        snap.pipeline.stalled_conversions = stalled;
+        snap.pipeline.queue_error = queue_error.map(String::from);
+        snap
+    }
+
+    /// An older MCP server omits the queue fields (serde default: both
+    /// `None`). A received snapshot with neither set can never come from a
+    /// current server, so the rows say so instead of "scanning" forever.
+    #[test]
+    fn a_snapshot_from_a_server_without_queue_fields_says_to_upgrade_it() {
+        let data = snapshot_to_dashboard(snapshot_with(None, None, None));
+        assert!(data.queue_server_too_old());
+        let screen = draw(&data);
+        assert_eq!(
+            screen.matches(QUEUE_SERVER_TOO_OLD).count(),
+            2,
+            "both the Queued and Stalled rows explain: {screen}"
+        );
+    }
+
+    /// Before the first snapshot (and on the "status unavailable" frame)
+    /// nothing has been received, so the old-server verdict must not fire.
+    #[test]
+    fn before_the_first_snapshot_the_queue_rows_still_say_scanning() {
+        for data in [
+            DashboardData::blank(true, None),
+            DashboardData::blank(false, Some("status unavailable: gateway refused".into())),
+        ] {
+            assert!(!data.queue_server_too_old());
+            assert!(!draw(&data).contains(QUEUE_SERVER_TOO_OLD));
+        }
+    }
+
+    /// A current server always sets the depth or the error, so neither of
+    /// those readings is mistaken for an old server.
+    #[test]
+    fn a_current_server_snapshot_is_never_called_too_old() {
+        for snap in [
+            snapshot_with(Some(0), Some(0), None),
+            snapshot_with(Some(4), None, None),
+            snapshot_with(None, None, Some("broker down")),
+        ] {
+            let data = snapshot_to_dashboard(snap);
+            assert!(!data.queue_server_too_old());
+            assert!(!draw(&data).contains(QUEUE_SERVER_TOO_OLD));
+        }
+    }
+
+    #[test]
+    fn stalled_rows_point_at_catch_up_without_blaming_scribe() {
+        let screen = draw(&snapshot_to_dashboard(snapshot_with(
+            Some(0),
+            Some(7),
+            None,
+        )));
+        assert!(
+            screen.contains("no markdown and not queued — run `hs pipeline catch-up`"),
+            "{screen}"
+        );
+        assert!(!screen.contains("refused"), "{screen}");
     }
 }

@@ -151,6 +151,10 @@ impl<C: ServiceClient> ServicePool<C> {
     /// server refuses at its admission gate, fail at once with
     /// [`NoAdmittingHost`] instead.
     pub async fn pick_server(&self) -> Result<(&C, PickGuard)> {
+        anyhow::ensure!(
+            !self.clients.is_empty(),
+            "the server pool has no servers (check the configured server list)"
+        );
         let deadline = Instant::now() + self.ready_timeout;
         let mut attempt: u32 = 0;
         loop {
@@ -599,5 +603,20 @@ mod tests {
             "unreachable host closed the pool"
         );
         assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[tokio::test]
+    async fn an_empty_pool_fails_the_pick_at_once() {
+        // No configured servers used to park the caller for the whole
+        // ready timeout (65 minutes) before reporting anything.
+        let pool = ServicePool::<MockClient>::new(Vec::new());
+        let started = Instant::now();
+        let err = pool
+            .pick_server()
+            .await
+            .err()
+            .expect("empty pool must fail");
+        assert!(format!("{err:#}").contains("no servers"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

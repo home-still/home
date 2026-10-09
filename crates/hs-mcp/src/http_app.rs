@@ -7,6 +7,7 @@
 //! (`hs_common::auth::backend`), and the server refuses to start without the
 //! secret. There is no unauthenticated health route: nothing is exempt.
 
+use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,18 +97,65 @@ fn unauthorized(why: BackendAuthError) -> Response {
         .into_response()
 }
 
-/// Serve `router` on `addr` until ctrl-c.
+/// How long in-flight requests (open SSE streams, running tool calls) get to
+/// finish after SIGINT/SIGTERM before the server stops waiting and returns.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// Serve until SIGINT/SIGTERM, then drain in-flight requests for at most
+/// [`SHUTDOWN_GRACE`].
 pub async fn serve(addr: &str, router: Router) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // The bound address, not the requested one: `--serve host:0` reports the
     // port the kernel chose.
     tracing::info!("MCP server listening on {}", listener.local_addr()?);
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
+    let signal = shutdown_signal()?;
+    let (begin_drain, drain) = tokio::sync::oneshot::channel::<()>();
+
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = drain.await;
         })
-        .await?;
+        .into_future();
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => result?,
+        () = signal => {
+            tracing::info!("Shutting down MCP server");
+            let _ = begin_drain.send(());
+            match tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await {
+                Ok(result) => result?,
+                Err(_) => tracing::warn!(
+                    "in-flight requests did not finish within {}s; exiting anyway",
+                    SHUTDOWN_GRACE.as_secs()
+                ),
+            }
+        }
+    }
     Ok(())
+}
+
+/// A future that resolves on SIGINT or SIGTERM. Handlers are installed before
+/// serving starts, so failing to install them is a startup error.
+#[cfg(unix)]
+fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
+    use anyhow::Context;
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }
 
 #[cfg(test)]

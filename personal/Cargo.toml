@@ -24,6 +24,8 @@ hs-scribe = { path = "../crates/hs-scribe" }
 hs-distill = { path = "../crates/hs-distill" }
 sha2 = "0.10"
 docx-rs = "0.4"
+xml = "1"
+zip = { version = "3", default-features = false, features = ["deflate"] }
 dirs = "6"
 
 [dev-dependencies]
@@ -31,4 +33,3 @@ tempfile = "3"
 mockito = "1"
 # `Jail`: tests that set environment variables run serialised and restore them.
 figment = { workspace = true, features = ["test"] }
-zip = { version = "3", default-features = false, features = ["deflate"] }

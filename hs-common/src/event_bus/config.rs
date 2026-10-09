@@ -108,16 +108,69 @@ impl Default for NatsYaml {
     }
 }
 
+/// Byte range of the `user[:password]@` part of each comma-separated server
+/// URL in `url` (authority only; a `@` after the first `/` is a path).
+fn userinfo_spans(url: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    for part in url.split(',') {
+        let start = part.find("://").map_or(0, |i| i + 3);
+        let authority_end = part[start..].find('/').map_or(part.len(), |i| start + i);
+        if let Some(at) = part[start..authority_end].rfind('@') {
+            spans.push(offset + start..offset + start + at);
+        }
+        offset += part.len() + 1;
+    }
+    spans
+}
+
+/// Whether `url` embeds credentials (`nats://user:pass@host`).
+pub fn url_has_userinfo(url: &str) -> bool {
+    !userinfo_spans(url).is_empty()
+}
+
+/// `url` with any embedded `user:password` replaced by `***`. The one way a
+/// NATS URL may appear in a log line or error message.
+pub fn redact_url(url: &str) -> String {
+    let mut out = url.to_string();
+    for span in userinfo_spans(url).into_iter().rev() {
+        out.replace_range(span, "***");
+    }
+    out
+}
+
 impl NatsYaml {
     /// Check the connection keys against each other. Files are checked when
     /// the connection is made (they may live on a host other than the one
     /// that parses the config).
     pub fn validate(&self) -> Result<(), String> {
+        if url_has_userinfo(&self.url) {
+            return Err(format!(
+                "`url` ({}) must not embed `user:password@`; authenticate with \
+                 `credentials_file`, `token_env` or `user` + `password_env`",
+                redact_url(&self.url)
+            ));
+        }
         if self.url.trim().is_empty() {
             return Err("`url` must not be empty".into());
         }
         if self.drain_timeout_secs == 0 {
             return Err("`drain_timeout_secs` must be at least 1".into());
+        }
+        for (key, bad) in [
+            ("ack_wait_secs", self.ack_wait_secs == 0),
+            ("max_age_secs", self.max_age_secs == 0),
+            ("max_ack_pending", self.max_ack_pending <= 0),
+            ("max_deliver", self.max_deliver <= 0),
+        ] {
+            // JetStream reads 0 as "server default" and reports the default
+            // back, which the consumer drift check would see as permanent
+            // drift; a negative means "unlimited" (unbounded poison-message
+            // redelivery / un-acked buffering), which is never what a typo
+            // intends.
+            if bad {
+                return Err(format!("`{key}` must be at least 1"));
+            }
         }
         let methods = [
             self.credentials_file.is_some(),
@@ -315,6 +368,42 @@ mod tests {
             serde_yaml_ng::from_str("user: u\npassword_env: P\ntls_ca_file: /ca").unwrap();
         ok.validate().unwrap();
         NatsYaml::default().validate().unwrap();
+    }
+
+    #[test]
+    fn negative_limits_and_embedded_credentials_are_rejected() {
+        for yaml in ["max_deliver: -1", "max_ack_pending: -1"] {
+            let nats: NatsYaml = serde_yaml_ng::from_str(yaml).unwrap();
+            assert!(
+                nats.validate().unwrap_err().contains("at least 1"),
+                "{yaml}"
+            );
+        }
+        let nats: NatsYaml =
+            serde_yaml_ng::from_str("url: nats://bob:hunter2@broker:4222").unwrap();
+        let err = nats.validate().unwrap_err();
+        assert!(err.contains("nats://***@broker:4222"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+        assert_eq!(
+            redact_url("nats://a:b@x:1,tls://c@y:2/p@q"),
+            "nats://***@x:1,tls://***@y:2/p@q"
+        );
+        assert_eq!(redact_url("nats://x:1"), "nats://x:1");
+        assert!(!url_has_userinfo("nats://x:1/p@q"));
+    }
+
+    #[test]
+    fn zero_consumer_limits_are_rejected_naming_the_key() {
+        for key in [
+            "ack_wait_secs",
+            "max_age_secs",
+            "max_ack_pending",
+            "max_deliver",
+        ] {
+            let nats: NatsYaml = serde_yaml_ng::from_str(&format!("{key}: 0")).unwrap();
+            let err = nats.validate().unwrap_err();
+            assert!(err.contains(&format!("`{key}`")), "{key}: {err}");
+        }
     }
 
     #[test]

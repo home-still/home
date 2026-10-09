@@ -6,10 +6,15 @@ use hs_common::compose::ComposeCmd;
 use hs_common::global_args::GlobalArgs;
 use hs_common::reporter::Reporter;
 
+use crate::distill_cmd::compose_step;
 use crate::installer::{Installer, Prepared, Release};
 
 /// How long the upgraded services get to answer `/health`.
 const HEALTH_WAIT_SECS: u64 = 90;
+
+/// How long a restarted native distill server gets to start answering
+/// `/health` before the CUDA check is skipped as "unit stopped".
+const DISTILL_HEALTH_WAIT: std::time::Duration = std::time::Duration::from_secs(HEALTH_WAIT_SECS);
 
 /// Companion binaries upgraded when already installed on this host. Each
 /// name is a release-asset prefix (see `.github/workflows/release.yaml`).
@@ -82,13 +87,24 @@ pub async fn run(
         }
     }
 
-    // Phase 3: resolve every asset (and its checksum) before replacing any
-    // binary, then download and replace.
+    // Phase 3: resolve every asset (and its checksum) before changing
+    // anything, so a missing asset aborts with the host untouched.
     reporter.status("Platform", target);
     let plan = plan_installs(&installer, &release, reporter).await?;
 
-    // The binaries this run replaced; the restart phase is driven by this
-    // set, not by a fixed list of service names.
+    // Phase 4: update Docker services — BEFORE any binary is replaced. This
+    // phase is the failure-prone one (it pulls images over the network and
+    // recreates containers) and does not depend on the new binaries. Run
+    // after the swap, a failure here stranded the host on new binaries with
+    // old processes still running, and the rerun then reported "Already up
+    // to date" (the new `hs` is installed) without ever restarting them.
+    // Run first, a failure leaves the old `hs` in place and a plain
+    // `hs upgrade` retries everything.
+    upgrade_docker_services(reporter).await?;
+
+    // Phase 5: download and replace the binaries, `hs` last (see
+    // `plan_installs`). The replaced set drives the restart phase, not a
+    // fixed list of service names.
     let mut replaced: Vec<PathBuf> = Vec::new();
     for (prepared, path) in &plan.installs {
         installer.install(prepared, path, reporter).await?;
@@ -102,10 +118,7 @@ pub async fn run(
         ));
     }
 
-    // Phase 4: update Docker services
-    upgrade_docker_services(reporter).await?;
-
-    // Phase 5: restart the services running the binaries we replaced, and
+    // Phase 6: restart the services running the binaries we replaced, and
     // prove they came back on the new binary. A failure here fails the
     // upgrade — the new binaries are on disk but not running.
     reporter.status(
@@ -114,7 +127,7 @@ pub async fn run(
     );
     crate::restart_cmd::after_upgrade(&replaced, reporter).await?;
 
-    // Phase 6: health check
+    // Phase 7: health check
     post_upgrade_health_check(reporter).await?;
 
     let tail = if plan.skipped.is_empty() {
@@ -145,8 +158,13 @@ async fn plan_installs(
     release: &Release,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<InstallPlan> {
+    // `hs` is installed LAST. The release comparison in `run` is against the
+    // running `hs`: if it were replaced first and a companion install then
+    // failed, the next `hs upgrade` would report "Already up to date" and the
+    // companion would never be upgraded. With `hs` last, a failed run leaves
+    // the old `hs` in place and a rerun retries everything.
     let hs = installer.prepare_required(release, "hs").await?;
-    let mut installs = vec![(hs, install_path_for("hs")?)];
+    let mut installs = Vec::new();
     let mut skipped = Vec::new();
     for name in COMPANIONS {
         let Some(path) = find_companion_binary(name) else {
@@ -163,6 +181,7 @@ async fn plan_installs(
             }
         }
     }
+    installs.push((hs, install_path_for("hs")?));
     Ok(InstallPlan { installs, skipped })
 }
 
@@ -223,16 +242,11 @@ pub(crate) fn find_companion_binary(name: &str) -> Option<PathBuf> {
 
 // ── Docker service upgrade ──────────────────────────────────────
 
-fn hidden_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(hs_common::HIDDEN_DIR)
-}
-
 async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
-    let scribe_compose = hidden_dir().join("docker-compose.yml");
-    let distill_compose = hidden_dir().join("docker-compose-distill.yml");
+    let hidden = hs_common::hidden_dir()?;
+    let scribe_compose = hidden.join("docker-compose.yml");
+    let distill_compose = hidden.join("docker-compose-distill.yml");
 
     let has_scribe = scribe_cfg.local_server && scribe_compose.exists();
     let has_distill = distill_compose.exists();
@@ -262,29 +276,6 @@ async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
     Ok(())
 }
 
-/// Run one compose command; a non-zero exit is an error carrying the
-/// actionable stderr lines.
-async fn compose_step(compose: &ComposeCmd, cf: &str, name: &str, args: &[&str]) -> Result<()> {
-    let mut full = vec!["-f", cf];
-    full.extend_from_slice(args);
-    let out = compose
-        .run_capture(&full)
-        .await
-        .with_context(|| format!("failed to run compose {} for {name}", args.join(" ")))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let errors = hs_common::compose::filter_compose_stderr(&stderr);
-    anyhow::bail!(
-        "compose {} failed for {name} ({}){}{}",
-        args.join(" "),
-        out.status,
-        if errors.is_empty() { "" } else { ": " },
-        errors.join("; ")
-    )
-}
-
 /// pull → down → up -d for one compose file; any failing step fails the
 /// upgrade. (`down` first avoids podman pod conflicts on recreate.)
 async fn upgrade_compose_service(
@@ -297,11 +288,17 @@ async fn upgrade_compose_service(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 compose path {}", compose_file.display()))?;
     reporter.status("Pulling", &format!("new images for {name}..."));
-    compose_step(compose, cf, name, &["pull"]).await?;
+    compose_step(compose, &["-f", cf, "pull"])
+        .await
+        .with_context(|| format!("upgrading {name} containers"))?;
     reporter.status("Stopping", &format!("{name} containers..."));
-    compose_step(compose, cf, name, &["down"]).await?;
+    compose_step(compose, &["-f", cf, "down"])
+        .await
+        .with_context(|| format!("upgrading {name} containers"))?;
     reporter.status("Starting", &format!("{name} containers..."));
-    compose_step(compose, cf, name, &["up", "-d"]).await
+    compose_step(compose, &["-f", cf, "up", "-d"])
+        .await
+        .with_context(|| format!("upgrading {name} containers"))
 }
 
 // ── Post-upgrade health check ───────────────────────────────────
@@ -329,7 +326,8 @@ fn local_service_url<'a>(urls: impl IntoIterator<Item = &'a str>, service: &str)
 
 async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
-    let scribe_compose = hidden_dir().join("docker-compose.yml");
+    let hidden = hs_common::hidden_dir()?;
+    let scribe_compose = hidden.join("docker-compose.yml");
     if scribe_cfg.local_server && scribe_compose.exists() {
         let url = local_service_url(scribe_cfg.servers.iter().map(|s| s.url.as_str()), "scribe")?;
         hs_common::compose::wait_for_url(&format!("{url}/health"), HEALTH_WAIT_SECS, "scribe")
@@ -337,7 +335,7 @@ async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
         reporter.status("Health", "scribe: OK");
     }
 
-    if hidden_dir().join("docker-compose-distill.yml").exists() {
+    if hidden.join("docker-compose-distill.yml").exists() {
         // That compose file (written by `hs distill init`) runs Qdrant only;
         // the distill server is always a native unit, checked below.
         let qdrant = crate::distill_cmd::qdrant_rest_url()?;
@@ -348,17 +346,23 @@ async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
     if find_companion_binary("hs-distill-server").is_some() {
         let cfg = hs_distill::config::DistillClientConfig::load()
             .map_err(|e| anyhow::anyhow!("distill config: {e}"))?;
-        verify_native_distill(&cfg.servers, reporter).await?;
+        verify_native_distill(&cfg.servers, reporter, DISTILL_HEALTH_WAIT).await?;
     }
     Ok(())
 }
 
 /// After an upgrade of a natively installed distill server: a local distill
-/// that is answering MUST be on CUDA (never CPU, never flipped here). If it is
-/// not answering at all, the unit is stopped — the restart phase has already
-/// failed the upgrade for a unit that was running and did not come back — so
-/// there is nothing to assert; say so rather than pretend it was verified.
-async fn verify_native_distill(servers: &[String], reporter: &Arc<dyn Reporter>) -> Result<()> {
+/// that is answering MUST be on CUDA (never CPU, never flipped here). The
+/// restarted server needs time to load its models before it listens, so
+/// `/health` is polled for `wait`. If it never answers, the unit is stopped —
+/// the restart phase has already failed the upgrade for a unit that was
+/// running and did not come back — so there is nothing to assert; say so
+/// rather than pretend it was verified.
+async fn verify_native_distill(
+    servers: &[String],
+    reporter: &Arc<dyn Reporter>,
+    wait: std::time::Duration,
+) -> Result<()> {
     let Ok(url) = local_service_url(servers.iter().map(String::as_str), "distill") else {
         reporter.status(
             "Health",
@@ -367,20 +371,24 @@ async fn verify_native_distill(servers: &[String], reporter: &Arc<dyn Reporter>)
         return Ok(());
     };
     let client = hs_distill::client::DistillClient::new(&url)?;
-    match client.health().await {
-        Ok(health) if health.compute_device.eq_ignore_ascii_case("cuda") => {
-            reporter.status("Health", "distill: OK (cuda)");
-            Ok(())
-        }
-        Ok(health) => anyhow::bail!(
-            "distill at {url} reports compute_device `{}`, expected cuda",
-            health.compute_device
-        ),
-        Err(e) => {
-            reporter.warn(&format!(
-                "distill at {url} is not answering ({e:#}): its unit is stopped, CUDA was NOT verified"
-            ));
-            Ok(())
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match client.health().await {
+            Ok(health) if health.compute_device.eq_ignore_ascii_case("cuda") => {
+                reporter.status("Health", "distill: OK (cuda)");
+                return Ok(());
+            }
+            Ok(health) => anyhow::bail!(
+                "distill at {url} reports compute_device `{}`, expected cuda",
+                health.compute_device
+            ),
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                reporter.warn(&format!(
+                    "distill at {url} is not answering ({e:#}): its unit is stopped, CUDA was NOT verified"
+                ));
+                return Ok(());
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
         }
     }
 }
@@ -481,20 +489,25 @@ mod tests {
 
     #[tokio::test]
     async fn a_native_distill_that_answers_must_be_on_cuda() {
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
         let cpu = serve(health_route("Cpu")).await;
-        let err = verify_native_distill(&[cpu], &reporter())
+        let err = verify_native_distill(&[cpu], &reporter(), WAIT)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("cuda"), "{err:#}");
 
         let cuda = serve(health_route("Cuda")).await;
-        verify_native_distill(&[cuda], &reporter()).await.unwrap();
+        verify_native_distill(&[cuda], &reporter(), WAIT)
+            .await
+            .unwrap();
 
         // Stopped unit: nothing to assert (the restart phase owns that failure).
         let dead = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             format!("http://{}", l.local_addr().unwrap())
         };
-        verify_native_distill(&[dead], &reporter()).await.unwrap();
+        verify_native_distill(&[dead], &reporter(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
     }
 }

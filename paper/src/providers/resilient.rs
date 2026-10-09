@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::error::PaperError;
 use crate::models::{Paper, SearchQuery, SearchResult, SearchType};
-use crate::ports::provider::PaperProvider;
+use crate::ports::provider::{doi_search_result, PaperProvider};
 use crate::resilience::guard::Guard;
 
 /// A provider whose every search and DOI lookup runs under a shared
@@ -41,7 +41,15 @@ impl PaperProvider for ResilientProvider {
         self.inner.supported_search_types()
     }
 
+    fn supports_offset(&self) -> bool {
+        self.inner.supports_offset()
+    }
+
     async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
+        if matches!(query.search_type, SearchType::DOI) {
+            let paper = self.get_by_doi(&query.query).await?;
+            return Ok(doi_search_result(self.name(), paper));
+        }
         let inner = &self.inner;
         self.guard
             .run(|| async move { inner.search_by_query(query).await })

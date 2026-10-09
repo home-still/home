@@ -234,20 +234,54 @@ impl PaperDownloader {
         )
     }
 
-    /// `Some(skipped result)` when `key` is already stored.
+    /// `Some(skipped result)` when `key` is already stored. A skipped paper
+    /// is re-announced: a prior run may have stored it and then failed to
+    /// publish, and scribe dedups by stem so a repeat event is harmless.
     async fn existing(&self, key: &str) -> Result<Option<DownloadResult>, PaperError> {
         let meta = self
             .storage
             .head(key)
             .await
             .map_err(|e| PaperError::Storage(format!("head {key}: {e}")))?;
-        Ok(meta.map(|meta| DownloadResult {
+        let Some(meta) = meta else {
+            return Ok(None);
+        };
+        self.publish_ingested(key, None, meta.size).await?;
+        Ok(Some(DownloadResult {
             file_path: PathBuf::from(key),
             doi: None,
             sha256: String::new(),
             size_bytes: meta.size,
             skipped: true,
         }))
+    }
+
+    /// Announce a stored artifact on `papers.ingested`. The object stays in
+    /// storage on failure; the error names the key and the recovery path.
+    async fn publish_ingested(
+        &self,
+        key: &str,
+        sha256: Option<&str>,
+        size_bytes: u64,
+    ) -> Result<(), PaperError> {
+        let payload = serde_json::json!({
+            "key": key,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+            "source": "paper-download",
+        });
+        let bytes = serde_json::to_vec(&payload).map_err(|e| {
+            PaperError::Storage(format!("serialize papers.ingested payload for {key}: {e}"))
+        })?;
+        self.events
+            .publish("papers.ingested", &bytes)
+            .await
+            .map_err(|e| {
+                PaperError::Storage(format!(
+                    "publish papers.ingested for {key} failed (stored, but not queued for conversion; \
+                     re-run the download or `hs pipeline catch-up` to requeue it): {e}"
+                ))
+            })
     }
 
     /// GET `url` and return the validated PDF body.
@@ -345,25 +379,8 @@ impl PaperDownloader {
         // Announce the new artifact so scribe (or any other subscriber) can
         // pick it up. On NoOpBus this is a cheap no-op; with NATS it reaches
         // every subscriber on `papers.ingested`.
-        let payload = serde_json::json!({
-            "key": key,
-            "sha256": sha256,
-            "size_bytes": size_bytes,
-            "source": "paper-download",
-        });
-        if let Err(e) = self
-            .events
-            .publish(
-                "papers.ingested",
-                serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
-            )
-            .await
-        {
-            // Publish failure shouldn't fail the download — the file is
-            // safely in storage. Log and move on; a reconcile pass can
-            // backfill missed events later.
-            tracing::warn!(key = %key, error = %e, "event publish failed");
-        }
+        self.publish_ingested(key, Some(&sha256), size_bytes)
+            .await?;
 
         Ok(DownloadResult {
             file_path: PathBuf::from(key),

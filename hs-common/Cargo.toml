@@ -81,7 +81,8 @@ events-nats = [
     "dep:bytes",
 ]
 # `panic_guard::catch_panic` plus the axum middleware that turns a handler
-# panic into a 500 (RA-5). The async helper alone needs only `events`.
+# panic into a 500 (RA-5). The async helpers alone need only `events` (or
+# `logging`, for `supervise`).
 catch-panic = [
     "dep:axum",
     "dep:futures",
@@ -95,6 +96,7 @@ logging = [
     "dep:chrono",
     "dep:anyhow",
     "dep:tokio",
+    "dep:futures",
     "tokio/sync",
     "tokio/time",
     "tokio/fs",

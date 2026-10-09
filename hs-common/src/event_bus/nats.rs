@@ -4,8 +4,8 @@ use futures::{Stream, StreamExt};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::config::NatsYaml;
-use super::{ConsumerSpec, Event, EventBus, EventStream};
+use super::config::{redact_url, NatsYaml};
+use super::{ConsumerSpec, Event, EventBus, EventStream, QueueDepth};
 
 /// How the client authenticates to the broker. At most one method.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -212,19 +212,31 @@ pub async fn connect_options(cfg: &NatsConfig) -> anyhow::Result<async_nats::Con
 
 impl NatsBus {
     pub async fn connect(cfg: NatsConfig) -> anyhow::Result<Self> {
+        let bus = Self::connect_unprovisioned(cfg).await?;
+        // Provision both streams up-front so the first publish / consume
+        // on a cold broker doesn't race. get_or_create is idempotent.
+        bus.provision_streams().await?;
+        Ok(bus)
+    }
+
+    /// Connect without touching the streams. Only [`Self::reset_streams`]
+    /// uses this: the repair for a stream whose live config cannot be
+    /// updated in place must be able to connect while [`Self::connect`]
+    /// refuses to.
+    pub async fn connect_unprovisioned(cfg: NatsConfig) -> anyhow::Result<Self> {
         let client = connect_options(&cfg)
             .await?
             .connect(&cfg.url)
             .await
-            .with_context(|| format!("connecting to NATS at {}", cfg.url))?;
+            .with_context(|| format!("connecting to NATS at {}", redact_url(&cfg.url)))?;
         let jetstream = async_nats::jetstream::new(client);
-        let bus = Self { jetstream, cfg };
-        // Provision both streams up-front so the first publish / consume
-        // on a cold broker doesn't race. get_or_create is idempotent.
-        bus.ensure_stream(PAPERS_STREAM, PAPERS_SUBJECTS).await?;
-        bus.ensure_stream(SCRIBE_STREAM, SCRIBE_SUBJECTS).await?;
-        bus.ensure_stream(DISTILL_STREAM, DISTILL_SUBJECTS).await?;
-        Ok(bus)
+        Ok(Self { jetstream, cfg })
+    }
+
+    async fn provision_streams(&self) -> anyhow::Result<()> {
+        self.ensure_stream(PAPERS_STREAM, PAPERS_SUBJECTS).await?;
+        self.ensure_stream(SCRIBE_STREAM, SCRIBE_SUBJECTS).await?;
+        self.ensure_stream(DISTILL_STREAM, DISTILL_SUBJECTS).await
     }
 
     async fn ensure_stream(&self, name: &str, subjects: &[&str]) -> anyhow::Result<()> {
@@ -243,10 +255,35 @@ impl NatsBus {
             max_age: self.cfg.max_age,
             ..Default::default()
         };
-        self.jetstream
-            .get_or_create_stream(config)
+        // `get_or_create_stream` keeps an existing stream's config whatever
+        // ours says, so — like the consumers — the live config is compared
+        // with the wanted one and brought in line with `update_stream`.
+        // Retention and storage cannot change on a live stream: that is an
+        // error naming the field, never a delete (the stream holds messages).
+        let stream = self
+            .jetstream
+            .get_or_create_stream(config.clone())
             .await
             .map_err(|e| anyhow::anyhow!("create stream {name}: {e}"))?;
+        let found = StreamShape::of(&stream.cached_info().config);
+        let drift = found.drift_from(&StreamShape::of(&config));
+        if drift.is_empty() {
+            return Ok(());
+        }
+        let fixed: Vec<&Drift> = drift.iter().filter(|d| !d.mutable).collect();
+        if !fixed.is_empty() {
+            return Err(immutable_stream_drift_error(name, &fixed));
+        }
+        let names = drift.iter().map(|d| d.field).collect::<Vec<_>>().join(", ");
+        tracing::warn!(
+            stream = name,
+            differs = %names,
+            "existing stream does not match the configured one; updating it in place"
+        );
+        self.jetstream
+            .update_stream(config)
+            .await
+            .map_err(|e| anyhow::anyhow!("update stream {name} (differs in {names}): {e}"))?;
         Ok(())
     }
 
@@ -314,12 +351,13 @@ impl NatsBus {
         })
     }
 
-    /// Delete every pipeline stream (PAPERS, SCRIBE, DISTILL). All
-    /// queued and in-flight messages are discarded. Operators use this
-    /// to recover from config drift (e.g. a consumer stuck with the
-    /// wrong ack_wait) — after wiping, the next [`connect`] recreates
-    /// everything from the current [`NatsConfig`]. The list must match
-    /// what [`connect`] provisions: resetting a subset leaves the
+    /// Delete every pipeline stream (PAPERS, SCRIBE, DISTILL) and recreate
+    /// it from the current [`NatsConfig`]. All queued and in-flight
+    /// messages are discarded. Operators use this to recover from config
+    /// drift (e.g. a stream whose retention differs, which cannot be
+    /// updated in place). Meant for a bus from
+    /// [`Self::connect_unprovisioned`]. The list must match what
+    /// [`Self::connect`] provisions: resetting a subset leaves the
     /// omitted stream carrying exactly the drifted config the operator
     /// is trying to clear.
     pub async fn reset_streams(&self) -> anyhow::Result<()> {
@@ -338,7 +376,7 @@ impl NatsBus {
                 }
             }
         }
-        Ok(())
+        self.provision_streams().await
     }
 }
 /// The settings of a pull consumer that this crate sets and that can drift
@@ -476,6 +514,95 @@ fn immutable_drift_error(durable: &str, stream: &str, drift: &[&Drift]) -> anyho
     )
 }
 
+/// The settings of a stream that this crate sets and that can drift from the
+/// configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamShape {
+    /// Sorted: the server may list subjects in any order.
+    subjects: Vec<String>,
+    retention: String,
+    storage: String,
+    discard: String,
+    max_age: Duration,
+}
+
+impl StreamShape {
+    fn of(config: &async_nats::jetstream::stream::Config) -> Self {
+        let mut subjects = config.subjects.clone();
+        subjects.sort();
+        Self {
+            subjects,
+            retention: format!("{:?}", config.retention),
+            storage: format!("{:?}", config.storage),
+            discard: format!("{:?}", config.discard),
+            max_age: config.max_age,
+        }
+    }
+
+    /// The settings in which `self` (what the server has) differs from
+    /// `wanted`. `retention` and `storage` are fixed at creation.
+    fn drift_from(&self, wanted: &Self) -> Vec<Drift> {
+        let mut drift = Vec::new();
+        let mut check = |field, live: String, want: String, mutable| {
+            if live != want {
+                drift.push(Drift {
+                    field,
+                    live,
+                    wanted: want,
+                    mutable,
+                });
+            }
+        };
+        check(
+            "subjects",
+            format!("{:?}", self.subjects),
+            format!("{:?}", wanted.subjects),
+            true,
+        );
+        check(
+            "max_age",
+            format!("{:?}", self.max_age),
+            format!("{:?}", wanted.max_age),
+            true,
+        );
+        check(
+            "discard",
+            self.discard.clone(),
+            wanted.discard.clone(),
+            true,
+        );
+        check(
+            "retention",
+            self.retention.clone(),
+            wanted.retention.clone(),
+            false,
+        );
+        check(
+            "storage",
+            self.storage.clone(),
+            wanted.storage.clone(),
+            false,
+        );
+        drift
+    }
+}
+
+/// The error for stream drift JetStream cannot repair in place. Nothing
+/// deletes a stream on its own: it holds queued messages.
+fn immutable_stream_drift_error(stream: &str, drift: &[&Drift]) -> anyhow::Error {
+    let fields = drift
+        .iter()
+        .map(|d| format!("{} (live: {}, wanted: {})", d.field, d.live, d.wanted))
+        .collect::<Vec<_>>()
+        .join("; ");
+    anyhow::anyhow!(
+        "stream {stream} differs in settings JetStream cannot change on an existing stream: \
+         {fields}. Either restore the configuration to the live values, or discard the \
+         stream's queued messages and recreate it from the configuration with \
+         `hs pipeline events-reset`"
+    )
+}
+
 /// Turn the broker's message stream into an [`EventStream`] in which a
 /// delivery error is an `Err` item, and the last one: the stream ends right
 /// after it.
@@ -541,6 +668,24 @@ impl EventBus for NatsBus {
             .await
             .map_err(|e| anyhow::anyhow!("consumer.messages(): {e}"))?;
         Ok(surface_errors(messages, Event::from_jetstream))
+    }
+
+    async fn queue_depth(&self, spec: &ConsumerSpec) -> anyhow::Result<QueueDepth> {
+        let stream = self
+            .jetstream
+            .get_stream(spec.stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("get stream {}: {e}", spec.stream))?;
+        // Read the broker's live counters; `consumer_info` is a fresh request,
+        // unlike the info cached when the consumer handle was built. A missing
+        // consumer (no watcher has ever subscribed) is an error, not depth 0.
+        let info = stream.consumer_info(spec.durable_name).await.map_err(|e| {
+            anyhow::anyhow!("consumer {} on {}: {e}", spec.durable_name, spec.stream)
+        })?;
+        Ok(QueueDepth {
+            pending: info.num_pending,
+            ack_pending: info.num_ack_pending as u64,
+        })
     }
 }
 
@@ -875,6 +1020,58 @@ mod tests {
             );
             assert!(err.contains("nats consumer rm S d"), "{err}");
         }
+    }
+
+    fn stream_shape() -> StreamShape {
+        StreamShape {
+            subjects: vec!["papers.ingested".into()],
+            retention: "WorkQueue".into(),
+            storage: "File".into(),
+            discard: "Old".into(),
+            max_age: Duration::from_secs(7 * 24 * 3600),
+        }
+    }
+
+    #[test]
+    fn a_stream_that_matches_is_left_alone_and_subject_order_is_irrelevant() {
+        assert!(stream_shape().drift_from(&stream_shape()).is_empty());
+        let cfg = |subjects: &[&str]| async_nats::jetstream::stream::Config {
+            subjects: subjects.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            StreamShape::of(&cfg(&["b", "a"])),
+            StreamShape::of(&cfg(&["a", "b"]))
+        );
+    }
+
+    #[test]
+    fn stream_drift_names_each_field_and_only_retention_and_storage_are_immutable() {
+        let mut found = stream_shape();
+        found.subjects = vec!["x".into()];
+        found.max_age = Duration::from_secs(1);
+        found.discard = "New".into();
+        let drift = found.drift_from(&stream_shape());
+        let names: Vec<_> = drift.iter().map(|d| d.field).collect();
+        assert_eq!(names, ["subjects", "max_age", "discard"]);
+        assert!(drift.iter().all(|d| d.mutable));
+
+        let mut found = stream_shape();
+        found.retention = "Limits".into();
+        found.storage = "Memory".into();
+        let drift = found.drift_from(&stream_shape());
+        assert_eq!(
+            drift.iter().map(|d| d.field).collect::<Vec<_>>(),
+            ["retention", "storage"]
+        );
+        assert!(drift.iter().all(|d| !d.mutable));
+        let refs: Vec<&Drift> = drift.iter().collect();
+        let err = immutable_stream_drift_error("S", &refs).to_string();
+        assert!(
+            err.contains("retention (live: Limits, wanted: WorkQueue)")
+                && err.contains("storage (live: Memory, wanted: File)"),
+            "{err}"
+        );
     }
 
     #[test]

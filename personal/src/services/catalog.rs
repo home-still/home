@@ -41,7 +41,17 @@ pub fn list_entries(cfg: &Config, category: Option<&str>, limit: usize) -> Resul
     Ok(out)
 }
 
+/// A stem names one document's files under the store: reject anything that
+/// could name a path instead (`../..`, separators, NUL) before it reaches
+/// `sharded_path`. The MCP `personal_read` / `personal_reindex` tools pass a
+/// caller-supplied stem straight here.
+fn check_stem(stem: &str) -> Result<()> {
+    hs_common::validate_stem(stem)
+        .map_err(|e| PersonalError::Other(anyhow::anyhow!("invalid stem {stem:?}: {e}")))
+}
+
 pub fn read_markdown(cfg: &Config, stem: &str) -> Result<String> {
+    check_stem(stem)?;
     let path = hs_common::sharded_path(&cfg.markdown_dir(), stem, "md");
     if !path.exists() {
         return Err(PersonalError::Other(anyhow::anyhow!(
@@ -52,6 +62,7 @@ pub fn read_markdown(cfg: &Config, stem: &str) -> Result<String> {
 }
 
 pub async fn delete(cfg: &Config, stem: &str) -> Result<u64> {
+    check_stem(stem)?;
     let distill = PersonalDistill::new(cfg)?;
     let removed = distill.delete(stem).await?;
 
@@ -73,6 +84,7 @@ pub async fn delete(cfg: &Config, stem: &str) -> Result<u64> {
 }
 
 pub async fn reindex(cfg: &Config, stem: &str) -> Result<u32> {
+    check_stem(stem)?;
     let entry_path = hs_common::sharded_path(&cfg.root_dir(), stem, "catalog.yaml");
     let entry = read_sidecar(&entry_path)?;
     let md = read_markdown(cfg, stem)?;
@@ -179,5 +191,30 @@ mod tests {
         assert!(err.to_string().contains("embedder down"), "{err}");
         index.assert_async().await;
         delete.assert_async().await;
+    }
+}
+
+#[cfg(test)]
+mod stem_boundary_tests {
+    use super::*;
+
+    /// `personal_read` takes a caller-supplied stem; `../../x` used to be
+    /// spliced into `sharded_path` and read any `.md` file on the host.
+    #[tokio::test]
+    async fn a_stem_that_names_a_path_is_rejected_before_touching_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            project_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let outside = dir.path().join("secret.md");
+        std::fs::write(&outside, "secret").unwrap();
+
+        for stem in ["../../secret", "..", "a/b", "", "a\\b"] {
+            assert!(read_markdown(&cfg, stem).is_err(), "read {stem:?}");
+            assert!(delete(&cfg, stem).await.is_err(), "delete {stem:?}");
+            assert!(reindex(&cfg, stem).await.is_err(), "reindex {stem:?}");
+        }
+        assert!(outside.exists());
     }
 }

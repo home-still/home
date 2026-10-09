@@ -16,6 +16,13 @@ pub enum PaperError {
     #[error("Provider unavailable: {0}. Try a different provider with --provider")]
     ProviderUnavailable(String),
 
+    /// The provider answered and refused the request (HTTP 4xx other than
+    /// 408/429): a bad query, a missing or invalid API key, a forbidden
+    /// resource. Repeating the call cannot succeed, so it is neither retried
+    /// nor counted against the circuit breaker.
+    #[error("Provider rejected the request: {0}. Check the query and credentials, or try a different provider with --provider")]
+    ProviderRejected(String),
+
     #[error("Rate limited by {provider} (retry-after: {retry_after:?}). Wait ~30 seconds and retry this exact call, or try a different provider (arxiv, openalex, europmc, crossref, core).")]
     RateLimited {
         provider: String,
@@ -166,6 +173,7 @@ impl PaperError {
             Self::InvalidInput(_) => ErrorCategory::Permanent,
             Self::NotFound(_) => ErrorCategory::Permanent,
             Self::ParseError(_) => ErrorCategory::Permanent,
+            Self::ProviderRejected(_) => ErrorCategory::Permanent,
             Self::NoDownloadUrl(_) => ErrorCategory::Permanent,
             Self::UnsafeUrl { .. } => ErrorCategory::Permanent,
             Self::TooLarge { .. } => ErrorCategory::Permanent,

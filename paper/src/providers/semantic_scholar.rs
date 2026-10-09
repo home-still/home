@@ -12,6 +12,7 @@ use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType, SortBy
 use crate::ports::provider::PaperProvider;
 use crate::providers::downloader::strip_arxiv_doi_prefix;
 use crate::providers::response::{check_response, send_with_429_retry};
+use crate::resilience::guard::Guard;
 
 /// Choose the Semantic Scholar identifier prefix for a DOI input. SS does not
 /// index DataCite-synthesized arXiv DOIs (`10.48550/arXiv.X`) under its `DOI:`
@@ -173,6 +174,9 @@ fn s2_paper_to_entry(p: S2Paper) -> CitationGraphEntry {
     }
 }
 
+/// Largest `limit` Semantic Scholar's search endpoint accepts.
+const S2_SEARCH_PAGE_MAX: usize = 100;
+
 pub struct SemanticScholarProvider {
     client: Client,
     base_url: String,
@@ -276,7 +280,7 @@ impl SemanticScholarProvider {
         ));
 
         // Pagination
-        let limit = query.max_results.min(100);
+        let limit = query.max_results.min(S2_SEARCH_PAGE_MAX);
         params.push(("limit", limit.to_string()));
         params.push(("offset", query.offset.to_string()));
 
@@ -295,7 +299,9 @@ impl SemanticScholarProvider {
             }
             range.push('-');
             if let Some(before) = df.before {
-                range.push_str(&before.format("%Y").to_string());
+                // `before` is the first excluded day; S2's year range is inclusive.
+                let last_included = before - chrono::Duration::days(1);
+                range.push_str(&last_included.format("%Y").to_string());
             }
             if range != "-" {
                 params.push(("year", range));
@@ -369,10 +375,15 @@ impl SemanticScholarProvider {
     /// reliably by year). For `sort="citations"` the full citing set is
     /// fetched (bounded by `MAX_CITATION_SORT_FETCH`) so the ranking is global;
     /// for the default year sort, fetch stops once `limit` edges are gathered.
+    ///
+    /// Every page request runs under `guard` — the provider's shared
+    /// limiter, breaker and retry — so a ten-page fetch is ten rate-limited,
+    /// breaker-counted requests, not one.
     pub async fn citations(
         &self,
         doi: &str,
         opts: CitationsOpts,
+        guard: &Guard,
     ) -> Result<CitationsResponse, PaperError> {
         let id = ss_identifier_for_doi(&crate::stem::normalize_doi(doi)?);
         let effective_limit = opts.limit.unwrap_or(100).min(1000) as usize;
@@ -419,33 +430,9 @@ impl SemanticScholarProvider {
                     "Semantic Scholar citations for {doi} needed more than {MAX_CITATION_PAGES} pages"
                 )));
             }
-            let url = self.paper_url(
-                &id,
-                &["citations"],
-                &[
-                    (
-                        "fields",
-                        "externalIds,title,year,authors,venue,citationCount",
-                    ),
-                    ("limit", &PAGE_SIZE.to_string()),
-                    ("offset", &offset.to_string()),
-                ],
-            )?;
-
-            let response = send_with_429_retry(
-                self.authorized(self.client.get(url)),
-                "semantic_scholar",
-                self.max_retry_after,
-            )
-            .await?;
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
-                return Err(PaperError::NotFound(doi.to_string()));
-            }
-            check_response(&response, "semantic_scholar")?;
-
-            let body: S2RefList = response.json().await.map_err(|e| {
-                PaperError::ParseError(format!("Failed to parse Semantic Scholar citations: {}", e))
-            })?;
+            let body = guard
+                .run(|| self.citations_page(&id, doi, offset, PAGE_SIZE))
+                .await?;
 
             if total_available.is_none() {
                 total_available = body.total;
@@ -513,6 +500,44 @@ impl SemanticScholarProvider {
             total_returned,
         })
     }
+
+    /// One `/citations` page: a single guarded unit (limiter, breaker and
+    /// retry apply per page).
+    async fn citations_page(
+        &self,
+        id: &str,
+        doi: &str,
+        offset: u32,
+        page_size: u32,
+    ) -> Result<S2RefList, PaperError> {
+        let url = self.paper_url(
+            id,
+            &["citations"],
+            &[
+                (
+                    "fields",
+                    "externalIds,title,year,authors,venue,citationCount",
+                ),
+                ("limit", &page_size.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        )?;
+
+        let response = send_with_429_retry(
+            self.authorized(self.client.get(url)),
+            "semantic_scholar",
+            self.max_retry_after,
+        )
+        .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(PaperError::NotFound(doi.to_string()));
+        }
+        check_response(&response, "semantic_scholar")?;
+
+        response.json().await.map_err(|e| {
+            PaperError::ParseError(format!("Failed to parse Semantic Scholar citations: {}", e))
+        })
+    }
 }
 
 #[async_trait]
@@ -556,7 +581,7 @@ impl PaperProvider for SemanticScholarProvider {
             .map(|p| self.s2_paper_to_paper(p))
             .collect();
 
-        let next_offset = query.offset + query.max_results;
+        let next_offset = query.offset + query.max_results.min(S2_SEARCH_PAGE_MAX);
         let next_offset = if next_offset < body.total {
             Some(next_offset)
         } else {
@@ -905,6 +930,26 @@ mod tests {
     // ProviderUnavailable, 429-then-200 → success via send_with_429_retry.
     // The 429 test takes ≈2s due to the retry helper's hard-coded backoff.
 
+    /// A guard whose limiter spacing is negligible, so paging tests stay fast.
+    fn test_guard() -> Guard {
+        Guard::new(
+            "semantic_scholar",
+            Duration::from_millis(1),
+            &crate::resilience::config::ResilienceConfig::default(),
+        )
+        .expect("guard builds")
+    }
+
+    /// A guard at the configured production spacing, for the live tests.
+    fn live_guard() -> Guard {
+        Guard::new(
+            "semantic_scholar",
+            Duration::from_millis(SemanticScholarConfig::default().rate_limit_interval_ms),
+            &crate::resilience::config::ResilienceConfig::default(),
+        )
+        .expect("guard builds")
+    }
+
     fn provider_pointing_at(server_uri: &str) -> SemanticScholarProvider {
         let config = SemanticScholarConfig {
             base_url: server_uri.to_string(),
@@ -1003,7 +1048,7 @@ mod tests {
 
         let provider = provider_pointing_at(&server.uri());
         let err = provider
-            .citations("10.1234/gone", CitationsOpts::default())
+            .citations("10.1234/gone", CitationsOpts::default(), &test_guard())
             .await
             .expect_err("404 must surface as Err");
         assert!(matches!(err, PaperError::NotFound(_)), "got {err:?}");
@@ -1053,6 +1098,7 @@ mod tests {
                     sort: Some("citations".to_string()),
                     ..CitationsOpts::default()
                 },
+                &test_guard(),
             )
             .await
             .expect("citations must succeed");
@@ -1119,6 +1165,7 @@ mod tests {
                     sort: Some("citations".to_string()),
                     ..CitationsOpts::default()
                 },
+                &test_guard(),
             )
             .await
             .expect("must stop at SS offset ceiling, not request past it and 400");
@@ -1148,6 +1195,7 @@ mod tests {
                     sort: Some("citations".to_string()),
                     ..CitationsOpts::default()
                 },
+                &live_guard(),
             )
             .await
             .expect("sort=citations on a high-citation paper must not 400");
@@ -1200,6 +1248,7 @@ mod tests {
                     limit: Some(200),
                     ..CitationsOpts::default()
                 },
+                &live_guard(),
             )
             .await
             .expect("citations call must succeed against live SS");
@@ -1253,7 +1302,7 @@ mod tests {
         let provider = provider_pointing_at(&server.uri());
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            provider.citations("10.1/x", CitationsOpts::default()),
+            provider.citations("10.1/x", CitationsOpts::default(), &test_guard()),
         )
         .await
         .expect("pagination must terminate");
@@ -1264,6 +1313,114 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A three-page citing set, one edge per page, chained by `next`.
+    async fn mount_three_citation_pages(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for (offset, next) in [(0u32, Some(1000u32)), (1000, Some(2000)), (2000, None)] {
+            Mock::given(method("GET"))
+                .and(path("/graph/v1/paper/DOI:10.1/pages/citations"))
+                .and(query_param("offset", offset.to_string()))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(citations_page(next, true)),
+                )
+                .mount(server)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn every_citations_page_waits_for_the_rate_limiter() {
+        // Three pages through a limiter spaced 300 ms apart: the first request
+        // is immediate, each of the other two waits a full interval. Taking the
+        // limiter once per call (the old behaviour) finishes in a few ms.
+        let server = wiremock::MockServer::start().await;
+        mount_three_citation_pages(&server).await;
+        let interval = Duration::from_millis(300);
+        let guard = Guard::new(
+            "semantic_scholar",
+            interval,
+            &crate::resilience::config::ResilienceConfig::default(),
+        )
+        .unwrap();
+
+        let provider = provider_pointing_at(&server.uri());
+        let started = std::time::Instant::now();
+        provider
+            .citations(
+                "10.1/pages",
+                CitationsOpts {
+                    limit: Some(10),
+                    sort: Some("citations".to_string()),
+                    ..CitationsOpts::default()
+                },
+                &guard,
+            )
+            .await
+            .expect("three pages");
+
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        assert!(
+            started.elapsed() >= interval * 2,
+            "3 page requests must be spaced by the limiter, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_citations_page_is_retried_alone() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // Page 2 fails once with a 503. The retry re-requests page 2 only —
+        // page 1 is fetched exactly once — so each page is its own guarded unit.
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/graph/v1/paper/DOI:10.1/pages/citations"))
+            .and(query_param("offset", "1000"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_three_citation_pages(&server).await;
+        let config = crate::resilience::config::ResilienceConfig {
+            retry_max_attempts: 2,
+            retry_min_backoff_ms: 1,
+            retry_max_backoff_secs: 1,
+            ..crate::resilience::config::ResilienceConfig::default()
+        };
+        let guard = Guard::new("semantic_scholar", Duration::from_millis(1), &config).unwrap();
+
+        let provider = provider_pointing_at(&server.uri());
+        provider
+            .citations(
+                "10.1/pages",
+                CitationsOpts {
+                    limit: Some(10),
+                    sort: Some("citations".to_string()),
+                    ..CitationsOpts::default()
+                },
+                &guard,
+            )
+            .await
+            .expect("page 2 recovers on retry");
+
+        let offsets: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| {
+                r.url
+                    .query_pairs()
+                    .find(|(k, _)| k == "offset")
+                    .map(|(_, v)| v.into_owned())
+            })
+            .collect();
+        assert_eq!(offsets, ["0", "1000", "1000", "2000"]);
     }
 
     #[tokio::test]
@@ -1288,6 +1445,7 @@ mod tests {
                     limit: Some(500),
                     ..CitationsOpts::default()
                 },
+                &test_guard(),
             )
             .await
             .expect("stops at the offset ceiling");
@@ -1329,5 +1487,29 @@ mod tests {
                 "{doi:?}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn year_range_is_inclusive_of_the_last_day_included() {
+        // `<=2019` is `before = 2020-01-01` (exclusive); S2's `year=-2020`
+        // would return 2020 papers.
+        let provider = provider();
+        let query = SearchQuery {
+            query: "x".to_string(),
+            search_type: SearchType::Keywords,
+            max_results: 250,
+            offset: 0,
+            date_filter: Some(crate::models::DateFilter::parse(">=2015 <=2019").unwrap()),
+            sort_by: SortBy::default(),
+            min_citations: None,
+        };
+        let url = Url::parse(&provider.build_search_url(&query).unwrap()).unwrap();
+        let param = |name: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
+        };
+        assert_eq!(param("year").as_deref(), Some("2015-2019"));
+        assert_eq!(param("limit").as_deref(), Some("100"));
     }
 }

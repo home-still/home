@@ -85,7 +85,9 @@ impl PdfParser {
             .set_target_width(size.width as i32)
             .set_target_height(size.height as i32);
 
-        let bitmap = page.render_with_config(&config)?;
+        let bitmap = page
+            .render_with_config(&config)
+            .map_err(|e| crate::pdfium::render_error(e, idx))?;
         let image = bitmap.as_image();
 
         Ok(PageData {

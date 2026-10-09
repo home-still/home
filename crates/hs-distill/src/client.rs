@@ -249,6 +249,26 @@ impl DistillClient {
         self
     }
 
+    /// `<server_url>/<segments…>?<query>` with every segment and query
+    /// value percent-encoded. A document stem may contain `?`, `#`, `%` or
+    /// spaces (DOIs do); spliced into the URL as text they cut the path
+    /// short or address a different document, and on `DELETE /doc/{id}`
+    /// that deletes the wrong one.
+    fn endpoint(&self, segments: &[&str], query: &[(&str, &str)]) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.server_url)
+            .with_context(|| format!("invalid distill server url {:?}", self.server_url))?;
+        url.path_segments_mut()
+            .map_err(|()| {
+                anyhow::anyhow!("distill server url {:?} cannot be a base", self.server_url)
+            })?
+            .pop_if_empty()
+            .extend(segments);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        Ok(url)
+    }
+
     pub async fn health(&self) -> Result<HealthResponse> {
         let url = format!("{}/health", self.server_url);
         let resp = self
@@ -444,10 +464,10 @@ impl DistillClient {
             exists: bool,
             chunks: u64,
         }
-        let url = format!("{}/exists/{}", self.server_url, doc_id);
+        let url = self.endpoint(&["exists", doc_id], &[])?;
         let resp = self
             .http
-            .get(&url)
+            .get(url)
             .timeout(Duration::from_secs(5))
             .send()
             .await
@@ -468,13 +488,10 @@ impl DistillClient {
         struct Deleted {
             deleted: u64,
         }
-        let mut url = format!("{}/doc/{}", self.server_url, doc_id);
-        if let Some(c) = collection {
-            url.push_str(&format!("?collection={c}"));
-        }
+        let url = self.endpoint(&["doc", doc_id], &collection_query(collection))?;
         let resp = self
             .http
-            .delete(&url)
+            .delete(url)
             .timeout(Duration::from_secs(30))
             .send()
             .await
@@ -506,13 +523,10 @@ impl DistillClient {
     /// `None`) with its configured parameters. Returns at once; Qdrant builds
     /// the graph in the background. Idempotent.
     pub async fn enable_hnsw(&self, collection: Option<&str>) -> Result<crate::store::HnswEnable> {
-        let mut url = format!("{}/collection/hnsw", self.server_url);
-        if let Some(c) = collection {
-            url.push_str(&format!("?collection={c}"));
-        }
+        let url = self.endpoint(&["collection", "hnsw"], &collection_query(collection))?;
         let resp = self
             .http
-            .post(&url)
+            .post(url)
             .timeout(Duration::from_secs(60))
             .send()
             .await
@@ -574,6 +588,11 @@ impl DistillClient {
         }
         Ok(data.doc_ids)
     }
+}
+
+/// The `collection` query pair, when a collection is named.
+fn collection_query(collection: Option<&str>) -> Vec<(&'static str, &str)> {
+    collection.map(|c| ("collection", c)).into_iter().collect()
 }
 
 /// Body of an index request.
@@ -718,6 +737,26 @@ mod tests {
         assert_eq!(default.index_timeout, DEFAULT_INDEX_TIMEOUT);
         let custom = client(&fake).with_index_timeout(Duration::from_secs(42));
         assert_eq!(custom.index_timeout, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn a_stem_with_url_metacharacters_stays_one_path_segment() {
+        let c = DistillClient::new("http://example.local:7434/").unwrap();
+        let url = c
+            .endpoint(
+                &["doc", "10.1002_a?b#c%41 d"],
+                &collection_query(Some("a&b")),
+            )
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://example.local:7434/doc/10.1002_a%3Fb%23c%2541%20d?collection=a%26b"
+        );
+        let gw = DistillClient::new("https://gw.example.local/distill").unwrap();
+        assert_eq!(
+            gw.endpoint(&["exists", "x"], &[]).unwrap().as_str(),
+            "https://gw.example.local/distill/exists/x"
+        );
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ pub struct CompositeScore {
 /// text from composite (only uses structural metrics like TEDS/CDM if available).
 /// Uses official per-block Hungarian matching with length-weighted NED
 /// (sum(ED)/sum(max_len)) when blocks are available.
+#[allow(clippy::too_many_arguments)]
 pub fn omnidocbench_composite(
     reference_text: &str,
     hypothesis_text: &str,
@@ -63,7 +64,8 @@ pub fn omnidocbench_composite(
     // (the page may be table-only or formula-only with incomplete annotations)
     let ref_trimmed = reference_text.trim();
     let has_structural = teds.is_some() || cdm.is_some();
-    let include_text = text_score.is_some() && (ref_trimmed.len() >= 5 || !has_structural);
+    let include_text =
+        text_score.is_some() && (ref_trimmed.chars().count() >= 5 || !has_structural);
 
     let mut sum = 0.0;
     let mut count = 0;

@@ -211,91 +211,141 @@ pub fn qc_verdict(
 /// `clean_repetitions` strips the run — once cleaned, the loop is gone and
 /// the byte span is unrecoverable.
 pub fn longest_repeated_run_bytes(text: &str) -> usize {
-    let mut max_run = 0;
-
-    // Character-level: walk the whole text. Char runs aren't constrained
-    // to single lines (a `gggggg...` run can span newlines).
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let (start_byte, ch) = chars[i];
-        let mut j = i + 1;
-        while j < chars.len() && chars[j].1 == ch {
-            j += 1;
-        }
-        let reps = j - i;
-        if reps >= LOOP_MIN_REPS {
-            let end_byte = chars.get(j).map(|(b, _)| *b).unwrap_or(text.len());
-            max_run = max_run.max(end_byte - start_byte);
-        }
-        i = j;
-    }
-
     // Word-n-gram level: process line by line — `clean_ngram_repetitions`
     // does the same. n=3 catches the F1 incident ("the retrieval of "
     // repeated); the 1..=4 sweep covers the rest of the cleaning passes.
+    let mut max_run = longest_char_run(text);
     for line in text.split('\n') {
-        let words = collect_word_positions(line);
-        if words.is_empty() {
-            continue;
-        }
         for n in 1..=4 {
-            if words.len() < n * LOOP_MIN_REPS {
-                continue;
-            }
-            let mut i = 0;
-            while i + n <= words.len() {
-                let ngram: Vec<&str> = words[i..i + n].iter().map(|(_, w)| *w).collect();
-                let mut reps = 1;
-                let mut j = i + n;
-                while j + n <= words.len()
-                    && words[j..j + n]
-                        .iter()
-                        .map(|(_, w)| *w)
-                        .eq(ngram.iter().copied())
-                {
-                    reps += 1;
-                    j += n;
-                }
-                if reps >= LOOP_MIN_REPS {
-                    let start_byte = words[i].0;
-                    let (last_start, last_word) = words[j - 1];
-                    let end_byte = last_start + last_word.len();
-                    max_run = max_run.max(end_byte - start_byte);
-                    i = j;
-                } else {
-                    i += 1;
-                }
-            }
+            max_run = max_run.max(longest_ngram_run(line, n));
         }
     }
-
     max_run
 }
 
-/// Tokenize `line` into (byte_offset, word) pairs without allocating per
-/// word. Whitespace via `char::is_whitespace` so multi-byte separators
-/// don't accidentally land inside a word.
-fn collect_word_positions(line: &str) -> Vec<(usize, &str)> {
-    let mut out = Vec::new();
-    let mut chars = line.char_indices().peekable();
-    while let Some(&(start, ch)) = chars.peek() {
-        if ch.is_whitespace() {
-            chars.next();
-            continue;
-        }
+/// Character-level: walk the whole text. Char runs aren't constrained to
+/// single lines (a `gggggg...` run can span newlines). One pass, no
+/// per-character storage.
+fn longest_char_run(text: &str) -> usize {
+    let mut max_run = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        let mut reps = 1;
         let mut end = start + ch.len_utf8();
-        chars.next();
-        while let Some(&(_, c)) = chars.peek() {
-            if c.is_whitespace() {
+        while let Some(&(at, next)) = chars.peek() {
+            if next != ch {
                 break;
             }
-            end += c.len_utf8();
+            reps += 1;
+            end = at + next.len_utf8();
             chars.next();
         }
-        out.push((start, &line[start..end]));
+        if reps >= LOOP_MIN_REPS {
+            max_run = max_run.max(end - start);
+        }
     }
-    out
+    max_run
+}
+
+/// Byte length of the longest span of `line` that is one `n`-word block
+/// repeated at least `LOOP_MIN_REPS` times back to back (whole blocks only;
+/// words are whitespace-separated).
+fn longest_ngram_run(line: &str, n: usize) -> usize {
+    debug_assert!((1..=MAX_NGRAM).contains(&n));
+    let mut words = WordWindow::new(line);
+    let mut max_run = 0;
+    let mut i = 0;
+    while let Some((start_byte, _)) = words.get(i) {
+        // The block at `i` must be complete: a partial block cannot repeat.
+        let mut pattern = [""; MAX_NGRAM];
+        let mut end_byte = 0;
+        for (k, slot) in pattern[..n].iter_mut().enumerate() {
+            let Some((at, word)) = words.get(i + k) else {
+                return max_run;
+            };
+            *slot = word;
+            end_byte = at + word.len();
+        }
+        let mut reps = 1;
+        let mut j = i + n;
+        loop {
+            let mut block_end = 0;
+            let repeats = pattern[..n]
+                .iter()
+                .enumerate()
+                .all(|(k, want)| match words.get(j + k) {
+                    Some((at, got)) if got == *want => {
+                        block_end = at + got.len();
+                        true
+                    }
+                    _ => false,
+                });
+            if !repeats {
+                break;
+            }
+            reps += 1;
+            end_byte = block_end;
+            j += n;
+            if reps >= LOOP_MIN_REPS {
+                // The run is counted whole and the scan resumes after it, so
+                // nothing before `j` is read again.
+                words.drop_before(j);
+            }
+        }
+        if reps >= LOOP_MIN_REPS {
+            max_run = max_run.max(end_byte - start_byte);
+            i = j;
+        } else {
+            i += 1;
+        }
+        words.drop_before(i);
+    }
+    max_run
+}
+
+/// Longest word n-gram the loop cleaners and the QC scan consider.
+const MAX_NGRAM: usize = 4;
+
+/// A lazily tokenized line (`(byte_offset, word)` pairs, whitespace via
+/// `char::is_whitespace` so multi-byte separators don't land inside a word)
+/// that keeps only the words between the scan position and its lookahead.
+/// Memory is bounded by `(LOOP_MIN_REPS + 1) * MAX_NGRAM` words, not by the
+/// line (a markdown document with no newline is one line).
+struct WordWindow<'a> {
+    line: &'a str,
+    rest: std::str::SplitWhitespace<'a>,
+    buf: std::collections::VecDeque<(usize, &'a str)>,
+    /// Absolute index of `buf[0]`.
+    base: usize,
+}
+
+impl<'a> WordWindow<'a> {
+    fn new(line: &'a str) -> Self {
+        Self {
+            line,
+            rest: line.split_whitespace(),
+            buf: std::collections::VecDeque::new(),
+            base: 0,
+        }
+    }
+
+    /// The `k`-th word of the line (`k` must not precede the window).
+    fn get(&mut self, k: usize) -> Option<(usize, &'a str)> {
+        debug_assert!(k >= self.base);
+        while self.base + self.buf.len() <= k {
+            let word = self.rest.next()?;
+            let offset = word.as_ptr() as usize - self.line.as_ptr() as usize;
+            self.buf.push_back((offset, word));
+        }
+        Some(self.buf[k - self.base])
+    }
+
+    /// Forget the words before `k`.
+    fn drop_before(&mut self, k: usize) {
+        let n = k.saturating_sub(self.base).min(self.buf.len());
+        self.buf.drain(..n);
+        self.base += n;
+    }
 }
 
 /// Clean repetition artifacts from a doc-wide markdown string per-page,
@@ -398,6 +448,7 @@ fn clean_ngram_repetitions(text: &str, n: usize, max_repeats: usize) -> (String,
             continue;
         }
 
+        let truncations_before = truncations;
         let mut cleaned_words: Vec<&str> = Vec::new();
         let mut i = 0;
 
@@ -428,7 +479,13 @@ fn clean_ngram_repetitions(text: &str, n: usize, max_repeats: usize) -> (String,
             }
         }
 
-        result_lines.push(cleaned_words.join(" "));
+        // A line with nothing truncated keeps its own whitespace (code
+        // indentation, nested list markers, table alignment).
+        if truncations == truncations_before {
+            result_lines.push(line.to_string());
+        } else {
+            result_lines.push(cleaned_words.join(" "));
+        }
     }
 
     (result_lines.join("\n"), truncations)
@@ -813,5 +870,189 @@ mod tests {
         let (output, count) = clean_repetitions(input);
         assert_eq!(output, input);
         assert_eq!(count.total(), 0);
+    }
+
+    #[test]
+    fn lines_without_truncation_keep_their_whitespace() {
+        let input = "    indented code line here\n  - nested  item two";
+        let (output, count) = clean_repetitions(input);
+        assert_eq!(output, input);
+        assert_eq!(count.total(), 0);
+    }
+
+    /// The previous implementation, kept as the oracle: it materialises a
+    /// `Vec<(usize, char)>` for the whole text (16 B/char) and a word vector
+    /// per line, which is what the streaming scan replaced.
+    fn oracle_longest_repeated_run_bytes(text: &str) -> usize {
+        fn collect_word_positions(line: &str) -> Vec<(usize, &str)> {
+            let mut out = Vec::new();
+            let mut chars = line.char_indices().peekable();
+            while let Some(&(start, ch)) = chars.peek() {
+                if ch.is_whitespace() {
+                    chars.next();
+                    continue;
+                }
+                let mut end = start + ch.len_utf8();
+                chars.next();
+                while let Some(&(_, c)) = chars.peek() {
+                    if c.is_whitespace() {
+                        break;
+                    }
+                    end += c.len_utf8();
+                    chars.next();
+                }
+                out.push((start, &line[start..end]));
+            }
+            out
+        }
+
+        let mut max_run = 0;
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let (start_byte, ch) = chars[i];
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].1 == ch {
+                j += 1;
+            }
+            if j - i >= LOOP_MIN_REPS {
+                let end_byte = chars.get(j).map(|(b, _)| *b).unwrap_or(text.len());
+                max_run = max_run.max(end_byte - start_byte);
+            }
+            i = j;
+        }
+        for line in text.split('\n') {
+            let words = collect_word_positions(line);
+            if words.is_empty() {
+                continue;
+            }
+            for n in 1..=4 {
+                if words.len() < n * LOOP_MIN_REPS {
+                    continue;
+                }
+                let mut i = 0;
+                while i + n <= words.len() {
+                    let ngram: Vec<&str> = words[i..i + n].iter().map(|(_, w)| *w).collect();
+                    let mut reps = 1;
+                    let mut j = i + n;
+                    while j + n <= words.len()
+                        && words[j..j + n]
+                            .iter()
+                            .map(|(_, w)| *w)
+                            .eq(ngram.iter().copied())
+                    {
+                        reps += 1;
+                        j += n;
+                    }
+                    if reps >= LOOP_MIN_REPS {
+                        let start_byte = words[i].0;
+                        let (last_start, last_word) = words[j - 1];
+                        max_run = max_run.max(last_start + last_word.len() - start_byte);
+                        i = j;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        max_run
+    }
+
+    /// xorshift64*: deterministic, no dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn the_streaming_scan_matches_the_oracle_on_random_and_adversarial_text() {
+        const WORDS: [&str; 9] = ["a", "b", "ab", "ba", "the", "é", "日本", "x\u{301}", "zz"];
+        const SEPS: [&str; 7] = [" ", " ", "  ", "\n", "\t", "\u{3000}", "\u{a0}\n"];
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut cases: Vec<String> = Vec::new();
+
+        // Random word soup over a tiny alphabet so runs of every n occur.
+        for _ in 0..4000 {
+            let alphabet = 1 + rng.below(WORDS.len());
+            let len = rng.below(60);
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push_str(WORDS[rng.below(alphabet)]);
+                s.push_str(SEPS[rng.below(SEPS.len())]);
+            }
+            cases.push(s);
+        }
+        // Periodic blocks (every n, every repeat count around the threshold)
+        // with a noise prefix, a perturbed middle repeat and a tail.
+        for n in 1..=5usize {
+            for reps in 1..=9usize {
+                for noise in 0..4usize {
+                    let block: Vec<&str> =
+                        (0..n).map(|k| WORDS[(k + noise) % WORDS.len()]).collect();
+                    let mut s = "p q ".repeat(noise);
+                    for r in 0..reps {
+                        for (k, w) in block.iter().enumerate() {
+                            if r == reps / 2 && k == n - 1 && noise % 2 == 1 {
+                                s.push_str("DIFFERENT ");
+                            } else {
+                                s.push_str(w);
+                                s.push(' ');
+                            }
+                        }
+                    }
+                    s.push_str("tail\nnext line a a a a a a");
+                    cases.push(s);
+                }
+            }
+        }
+        // Character runs: lengths around the threshold, multi-byte, across
+        // newlines, adjacent runs of different characters.
+        for len in 0..9usize {
+            for ch in ['g', 'é', '日', '\n', ' ', '😀'] {
+                let run: String = std::iter::repeat_n(ch, len).collect();
+                cases.push(format!("x{run}y{run}{run}z"));
+                cases.push(format!("{run}{run}"));
+            }
+        }
+        // Whole-text edge cases and one very long run.
+        for s in [
+            "",
+            " ",
+            "\n",
+            "\n\n\n",
+            "a",
+            "a a a a",
+            "a a a a\n",
+            " a a a a ",
+        ] {
+            cases.push(s.to_string());
+        }
+        cases.push("the retrieval of ".repeat(600));
+        cases.push(format!("{}tail", "a b a c ".repeat(500)));
+        cases.push(format!("{} z z z z z z", "q ".repeat(3)));
+
+        for text in &cases {
+            assert_eq!(
+                longest_repeated_run_bytes(text),
+                oracle_longest_repeated_run_bytes(text),
+                "diverged on {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_run_does_not_buffer_the_line() {
+        // 4 M words of one 3-gram on a single line: the window holds a few
+        // words, so this is bounded memory (and finishes quickly).
+        let text = "the retrieval of ".repeat(1_400_000);
+        assert_eq!(longest_repeated_run_bytes(&text), text.len() - 1);
     }
 }

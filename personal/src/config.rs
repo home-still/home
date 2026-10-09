@@ -17,7 +17,6 @@ const SYSTEM_CONFIG_PATH: &str = "/etc/home-still/config.yaml";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub enabled: bool,
     pub collection_name: String,
     pub storage_dir: String,
     /// Subdirectory under `storage_dir` where files are staged for MCP-driven
@@ -30,9 +29,10 @@ pub struct Config {
     pub naming: NamingConfig,
     pub distill_url: String,
     pub scribe_url: String,
-    /// The fixed category taxonomy. Loaded from config so the user can rename,
-    /// but the application enforces that the LLM's pick is in this list — no
-    /// runtime extensions, no fallbacks to `other` when the LLM hallucinates.
+    /// The categories this store accepts: a subset of [`Category::ALL`],
+    /// validated at load. The naming prompt offers exactly this list and an
+    /// ingest whose category is outside it fails — no runtime extensions, no
+    /// fallbacks to `other` when the LLM hallucinates.
     pub categories: Vec<String>,
     /// `home.project_dir`, which `storage_dir` is relative to. Not a
     /// `personal:` key: set by [`Config::load`] from the `home:` section.
@@ -54,7 +54,6 @@ impl Default for Config {
     /// back to this value.
     fn default() -> Self {
         Self {
-            enabled: true,
             collection_name: "personal_docs".to_string(),
             storage_dir: "personal".to_string(),
             ingest_inbox: "inbox".to_string(),
@@ -177,7 +176,20 @@ impl Config {
                 "personal.categories must list at least one category".into(),
             ));
         }
-
+        // A configured name the application has no category for could never
+        // match an ingest, so it is a typo to report, not to carry.
+        for name in &cfg.categories {
+            if name.parse::<Category>().is_err() {
+                return Err(PersonalError::Config(format!(
+                    "personal.categories entry {name:?} is not a known category (known: {})",
+                    Category::ALL
+                        .iter()
+                        .map(Category::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
         Ok(cfg)
     }
 
@@ -202,111 +214,5 @@ impl Config {
         } else {
             self.root_dir().join(p)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Load against a config file with `yaml` as its content (or none) under
-    /// a hermetic environment plus `vars`.
-    #[allow(clippy::result_large_err)] // figment's `Jail` closure type
-    fn load_yaml(yaml: Option<&str>, vars: &[(&str, &str)]) -> Result<Config> {
-        let mut out = None;
-        figment::Jail::expect_with(|jail| {
-            jail.clear_env();
-            for (k, v) in vars {
-                jail.set_env(k, v);
-            }
-            let home = jail.directory().to_path_buf();
-            if let Some(yaml) = yaml {
-                let path = home.join(hs_common::CONFIG_REL_PATH);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, yaml).unwrap();
-            }
-            let user = ConfigFile::load_in(&home).unwrap();
-            let system = ConfigFile::load_at(Path::new("/nonexistent/config.yaml"), &home).unwrap();
-            out = Some(Config::load_from(&system, &user));
-            Ok(())
-        });
-        out.expect("closure ran")
-    }
-
-    #[test]
-    fn documented_multi_word_env_keys_bind() {
-        // `.split("_")` read `STORAGE_DIR` as `storage.dir`, a key that does
-        // not exist, so every one of these overrides was dropped silently.
-        let c = load_yaml(
-            None,
-            &[
-                ("HOME_STILL_PERSONAL_STORAGE_DIR", "scans"),
-                ("HOME_STILL_PERSONAL_COLLECTION_NAME", "my_docs"),
-                ("HOME_STILL_PERSONAL_NAMING_MAX_INPUT_TOKENS", "512"),
-                (
-                    "HOME_STILL_PERSONAL_NAMING_OLLAMA_URL",
-                    "http://llm.example:11434",
-                ),
-                ("HOME_STILL_PERSONAL_INGEST_INBOX", "drop"),
-            ],
-        )
-        .unwrap();
-        assert_eq!(c.storage_dir, "scans");
-        assert_eq!(c.collection_name, "my_docs");
-        assert_eq!(c.naming.max_input_tokens, 512);
-        assert_eq!(c.naming.ollama_url, "http://llm.example:11434");
-        assert_eq!(c.ingest_inbox, "drop");
-        assert_eq!(c.naming.model, "qwen2.5:7b", "others keep their defaults");
-    }
-
-    #[test]
-    fn env_beats_the_file_and_the_file_beats_the_default() {
-        let yaml = "personal:\n  storage_dir: from_file\n  naming:\n    model: file-model\n";
-        let c = load_yaml(Some(yaml), &[]).unwrap();
-        assert_eq!(
-            (c.storage_dir.as_str(), c.naming.model.as_str()),
-            ("from_file", "file-model")
-        );
-        let c = load_yaml(
-            Some(yaml),
-            &[("HOME_STILL_PERSONAL_STORAGE_DIR", "from_env")],
-        )
-        .unwrap();
-        assert_eq!(c.storage_dir, "from_env");
-        assert_eq!(c.naming.model, "file-model");
-    }
-
-    #[test]
-    fn an_env_key_that_names_nothing_is_an_error_not_silence() {
-        let err = load_yaml(None, &[("HOME_STILL_PERSONAL_STORAGE", "x")])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("HOME_STILL_PERSONAL_STORAGE"), "{err}");
-        // Variables for the other tools' sections are theirs, not ours.
-        load_yaml(None, &[("HOME_STILL_PAPER_DOWNLOAD_PATH", "/x")]).unwrap();
-    }
-
-    #[test]
-    fn a_malformed_section_is_an_error_not_the_defaults() {
-        for yaml in [
-            "personal:\n  enabled: maybe\n",
-            "personal:\n  categories: not-a-list\n",
-            "personal: [1, 2]\n",
-            "home:\n  project_dir: [a]\n",
-        ] {
-            assert!(load_yaml(Some(yaml), &[]).is_err(), "{yaml}");
-        }
-        let err = load_yaml(Some("personal:\n  enabled: maybe\n"), &[])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("personal"), "{err}");
-    }
-
-    #[test]
-    fn the_store_lives_under_home_project_dir() {
-        let c = load_yaml(Some("home:\n  project_dir: /srv/hs\n"), &[]).unwrap();
-        assert_eq!(c.root_dir(), PathBuf::from("/srv/hs/personal"));
-        assert_eq!(c.markdown_dir(), PathBuf::from("/srv/hs/personal/markdown"));
-        assert_eq!(c.inbox_dir(), PathBuf::from("/srv/hs/personal/inbox"));
     }
 }

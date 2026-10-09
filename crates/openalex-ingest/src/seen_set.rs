@@ -1,22 +1,27 @@
-//! In-RAM seen-set for streaming pre-dedupe of the OpenAlex works ingest.
+//! In-RAM seen-set for the streaming pre-dedupe of the OpenAlex ingest.
 //!
-//! The works snapshot emits the same `openalex_id` in every `updated_date`
+//! The snapshot emits the same `openalex_id` in every `updated_date`
 //! partition where a record changed. We walk partitions newest-first and
 //! gate each row through this set: the first sighting of an ID is the
 //! canonical (newest) version, every later sighting is a stale duplicate to
-//! skip. This is how we hold the PRIMARY KEY invariant on the live
-//! `works`/`work_topics`/`work_concepts`/`work_references` tables without
-//! ever paying for `ON CONFLICT` or a separate dedupe phase.
+//! skip. This is how we hold the PRIMARY KEY invariant on the live tables
+//! (`works` and its edge tables, and every dimension table: authors,
+//! concepts, topics, domains, fields, subfields, sources, institutions,
+//! funders, publishers) without ever paying for `ON CONFLICT` /
+//! `INSERT OR IGNORE` or a separate dedupe phase. One set per entity; the
+//! works set is the only one with a sidecar checkpoint (see below).
 //!
-//! Storage shape: `HashSet<u64>` keyed on the integer portion of the work-ID
+//! Storage shape: `HashSet<u64>` keyed on the integer portion of the ID
 //! (`W2741809807` → `2741809807`). At 250M unique works that's ~2 GB raw
 //! plus ~3× HashSet overhead, ~6 GB resident. `big` has 32 GB total with
 //! ~10 GB pinned by services and ~10 GB to DuckDB during ingest, leaving
-//! the budget tight but feasible.
+//! the budget tight but feasible. The dimension sets are smaller: authors,
+//! the largest, holds a fraction of the works IDs, the rest a few hundred
+//! thousand IDs each at most.
 //!
 //! # The invariant
 //!
-//! **The set holds exactly the IDs whose `works` row is committed.** An ID
+//! **The set holds exactly the IDs whose row is committed in its table.** An ID
 //! enters the set only through [`SeenSet::commit`], which the loader calls
 //! after the transaction that inserted the rows has committed, never before.
 //! (The original loader inserted on first sighting, i.e. before its row was
@@ -37,6 +42,20 @@
 //! * a checkpoint ID with no `works` row means the checkpoint was written
 //!   ahead of the database (written by the pre-fix loader). Continuing would
 //!   permanently skip those works, so `open` fails and says what to do.
+//!
+//! # Dimension entities: no checkpoint
+//!
+//! [`SeenSet::from_table`] builds the set of a dimension table by scanning
+//! the table's own `openalex_id` column and has no sidecar file. The table is
+//! the authority, and a partition's rows and its IDs commit together (one
+//! merge transaction, IDs added to the set only afterwards), so the rebuilt
+//! set is exactly what a checkpoint could have held. The scan is
+//! sub-second for the entity tables and about the cost of `open`'s `works`
+//! scan for authors; a checkpoint would only add a second state that the
+//! scan would then have to be reconciled against, as `open` must do for
+//! works. (Works keeps its file; `open` never trusts it over the table, so
+//! its only remaining effect is refusing a checkpoint written ahead of the
+//! database.)
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -46,7 +65,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::Connection;
 
-use crate::parser::parse_work_id_u64;
+use crate::parser::parse_entity_id_u64;
 
 /// Default partitions-between-checkpoints. At 311 works partitions and ~5s
 /// per checkpoint write, 10 means ≤30 checkpoint writes per full ingest =
@@ -55,7 +74,9 @@ pub const DEFAULT_CHECKPOINT_EVERY_N: u32 = 10;
 
 pub struct SeenSet {
     ids: HashSet<u64>,
-    path: PathBuf,
+    /// Sidecar checkpoint file. `None` for a set rebuilt from its table on
+    /// every open ([`SeenSet::from_table`]), which cannot be checkpointed.
+    path: Option<PathBuf>,
     checkpoint_every_n_partitions: u32,
     partitions_since_checkpoint: u32,
 }
@@ -69,20 +90,15 @@ impl SeenSet {
         let mut ids = read_checkpoint(&path)?;
         let checkpointed = ids.len() as u64;
 
-        let mut stmt = conn.prepare("SELECT openalex_id FROM works")?;
-        let mut rows = stmt.query([])?;
         let mut matched = 0u64;
         let mut adopt: Vec<u64> = Vec::new();
-        while let Some(row) = rows.next()? {
-            let raw: String = row.get(0)?;
-            let id = parse_work_id_u64(&raw)
-                .ok_or_else(|| anyhow!("works row has a non-W<digits> openalex_id: {raw:?}"))?;
+        scan_ids(conn, "works", Some('W'), |id| {
             if ids.contains(&id) {
                 matched += 1;
             } else {
                 adopt.push(id);
             }
-        }
+        })?;
 
         let absent_from_db = checkpointed.saturating_sub(matched);
         if absent_from_db > 0 {
@@ -108,13 +124,37 @@ impl SeenSet {
         tracing::info!(ids = ids.len(), path = %path.display(), "seen-set ready");
         Ok(Self {
             ids,
-            path,
+            path: Some(path),
             checkpoint_every_n_partitions: DEFAULT_CHECKPOINT_EVERY_N,
             partitions_since_checkpoint: 0,
         })
     }
 
-    /// Whether `id` already has a committed `works` row.
+    /// Build the set of a dimension table from its committed rows, with no
+    /// checkpoint file (see the module docs for why). `prefix` is the type
+    /// letter of the table's IDs, `None` for the digits-only taxonomy IDs
+    /// (see [`parse_entity_id_u64`]); a row whose `openalex_id` does not parse
+    /// is an error naming it, because the loader could not gate that ID.
+    /// `table` is interpolated into SQL, hence `'static`: pass a fixed name.
+    pub fn from_table(
+        conn: &Connection,
+        table: &'static str,
+        prefix: Option<char>,
+    ) -> Result<Self> {
+        let mut ids = HashSet::new();
+        scan_ids(conn, table, prefix, |id| {
+            ids.insert(id);
+        })?;
+        tracing::info!(table, ids = ids.len(), "seen-set rebuilt from table");
+        Ok(Self {
+            ids,
+            path: None,
+            checkpoint_every_n_partitions: DEFAULT_CHECKPOINT_EVERY_N,
+            partitions_since_checkpoint: 0,
+        })
+    }
+
+    /// Whether `id` already has a committed row in the set's table.
     pub fn contains(&self, id: u64) -> bool {
         self.ids.contains(&id)
     }
@@ -134,8 +174,10 @@ impl SeenSet {
     }
 
     /// Increment the partition counter; flush to disk if the threshold
-    /// is hit. Call after each partition completes.
+    /// is hit. Call after each partition completes. Fails on a set built by
+    /// [`SeenSet::from_table`], which has no checkpoint file.
     pub fn maybe_checkpoint(&mut self) -> Result<()> {
+        self.checkpoint_path()?;
         self.partitions_since_checkpoint += 1;
         if self.partitions_since_checkpoint >= self.checkpoint_every_n_partitions {
             self.force_checkpoint()?;
@@ -144,14 +186,21 @@ impl SeenSet {
         Ok(())
     }
 
+    fn checkpoint_path(&self) -> Result<&Path> {
+        self.path.as_deref().ok_or_else(|| {
+            anyhow!("this seen-set has no checkpoint file: it is rebuilt from its table on open")
+        })
+    }
+
     /// Write the entire set to disk, overwriting any prior checkpoint.
     /// Crash-safe: the bytes go to `<path>.tmp`, are fsynced, and only then
     /// renamed over the live file, so a crash leaves either the old or the
     /// new checkpoint, never a torn one. The parent directory is fsynced so
     /// the rename itself survives a power loss.
     pub fn force_checkpoint(&self) -> Result<()> {
-        let tmp = self.path.with_extension("tmp");
-        let parent = match self.path.parent() {
+        let path = self.checkpoint_path()?;
+        let tmp = path.with_extension("tmp");
+        let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
@@ -169,8 +218,8 @@ impl SeenSet {
             .map_err(|e| anyhow!("flush seen-set checkpoint: {e}"))?;
         f.sync_all().context("fsync seen-set checkpoint")?;
         drop(f);
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("rename {} -> {}", tmp.display(), self.path.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         // A directory fsync makes the rename durable on POSIX filesystems.
         // Windows cannot open a directory as a file (access denied); NTFS
         // journals the rename's metadata itself.
@@ -178,9 +227,32 @@ impl SeenSet {
         File::open(parent)
             .and_then(|d| d.sync_all())
             .with_context(|| format!("fsync directory {}", parent.display()))?;
-        tracing::info!(ids = self.ids.len(), path = %self.path.display(), "seen-set checkpointed");
+        tracing::info!(ids = self.ids.len(), path = %path.display(), "seen-set checkpointed");
         Ok(())
     }
+}
+
+/// Stream the `openalex_id` of every row of `table`, parsed as `prefix` +
+/// digits (see [`parse_entity_id_u64`]). A row that does not parse fails the
+/// scan: a seen-set that silently lacked it would let the loader insert that
+/// ID a second time.
+fn scan_ids(
+    conn: &Connection,
+    table: &str,
+    prefix: Option<char>,
+    mut on_id: impl FnMut(u64),
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("SELECT openalex_id FROM {table}"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let raw: String = row.get(0)?;
+        let id = parse_entity_id_u64(&raw, prefix).ok_or_else(|| {
+            let shape = prefix.map(String::from).unwrap_or_default();
+            anyhow!("{table} row has an openalex_id that is not {shape}<digits>: {raw:?}")
+        })?;
+        on_id(id);
+    }
+    Ok(())
 }
 
 /// Read a checkpoint file: a stream of little-endian u64s, no framing. A
@@ -350,5 +422,52 @@ mod tests {
         let s = SeenSet::open(&db_with_works(&[]), sub.join("seen.bin")).unwrap();
         std::fs::write(&sub, "a file where the directory should be").unwrap();
         assert!(s.force_checkpoint().is_err());
+    }
+
+    fn db_with_dimension_rows(table: &str, ids: &[&str]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_DDL).unwrap();
+        for id in ids {
+            conn.execute(
+                &format!("INSERT INTO {table}(openalex_id) VALUES (?)"),
+                duckdb::params![id],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn from_table_holds_exactly_the_rows_of_its_table() {
+        let conn = db_with_dimension_rows("concepts", &["C5", "C77"]);
+        let mut s = SeenSet::from_table(&conn, "concepts", Some('C')).unwrap();
+        assert_eq!(s.len(), 2);
+        assert!(s.contains(5) && s.contains(77));
+        assert!(!s.contains(6));
+        s.commit(set(&[6]));
+        assert!(s.contains(6));
+
+        // Digits-only taxonomy IDs.
+        let conn = db_with_dimension_rows("domains", &["3", "4"]);
+        let s = SeenSet::from_table(&conn, "domains", None).unwrap();
+        assert!(s.contains(3) && s.contains(4) && s.len() == 2);
+    }
+
+    #[test]
+    fn from_table_refuses_a_row_it_cannot_key() {
+        let conn = db_with_dimension_rows("concepts", &["C5", "X9"]);
+        let err = SeenSet::from_table(&conn, "concepts", Some('C'))
+            .err()
+            .expect("a concepts row without a C<digits> id must fail the scan");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("concepts") && msg.contains("X9"), "{msg}");
+    }
+
+    #[test]
+    fn a_table_set_has_no_checkpoint_and_says_so() {
+        let conn = db_with_dimension_rows("concepts", &[]);
+        let mut s = SeenSet::from_table(&conn, "concepts", Some('C')).unwrap();
+        assert!(s.force_checkpoint().is_err());
+        assert!(s.maybe_checkpoint().is_err());
     }
 }

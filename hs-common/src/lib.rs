@@ -6,7 +6,7 @@ pub mod html;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod mode;
-#[cfg(any(feature = "events", feature = "catch-panic"))]
+#[cfg(any(feature = "events", feature = "catch-panic", feature = "logging"))]
 pub mod panic_guard;
 pub mod pipe_reporter;
 pub mod quality;
@@ -22,7 +22,9 @@ pub const HIDDEN_DIR: &str = ".home-still";
 /// Visible project directory for papers, markdown (relative to $HOME).
 pub const PROJECT_DIR_DEFAULT: &str = "home-still";
 
-pub use config_file::{default_project_dir, resolve_log_dir, resolve_project_dir};
+pub use config_file::{
+    default_project_dir, hidden_dir, home_dir, resolve_log_dir, resolve_project_dir,
+};
 
 /// Shard prefix of a stem: the leading characters that fit in 2 bytes,
 /// never splitting a UTF-8 character and never empty for a non-empty stem.
@@ -124,22 +126,34 @@ pub fn validate_stem(stem: &str) -> Result<(), InvalidStem> {
 }
 
 /// Recursively collect all files with a given extension under `dir`.
-pub fn collect_files_recursive(dir: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
-    let mut result = Vec::new();
-    fn walk(dir: &std::path::Path, ext: &str, result: &mut Vec<std::path::PathBuf>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    walk(&path, ext, result);
-                } else if path.extension().is_some_and(|e| e == ext) {
-                    result.push(path);
-                }
+///
+/// Any unreadable directory or entry is an `Err` naming the path: a partial
+/// list reads as a smaller corpus.
+pub fn collect_files_recursive(
+    dir: &std::path::Path,
+    ext: &str,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    fn walk(
+        dir: &std::path::Path,
+        ext: &str,
+        result: &mut Vec<std::path::PathBuf>,
+    ) -> std::io::Result<()> {
+        let annotate = |e: std::io::Error| {
+            std::io::Error::new(e.kind(), format!("read {}: {e}", dir.display()))
+        };
+        for entry in std::fs::read_dir(dir).map_err(annotate)? {
+            let path = entry.map_err(annotate)?.path();
+            if path.is_dir() {
+                walk(&path, ext, result)?;
+            } else if path.extension().is_some_and(|e| e == ext) {
+                result.push(path);
             }
         }
+        Ok(())
     }
-    walk(dir, ext, &mut result);
-    result
+    let mut result = Vec::new();
+    walk(dir, ext, &mut result)?;
+    Ok(result)
 }
 
 #[cfg(feature = "cli")]

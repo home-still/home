@@ -12,7 +12,10 @@ use crate::ports::provider::PaperProvider;
 use crate::providers::response::check_response;
 
 /// Fields requested from `/works`: everything `work_to_paper` reads.
-const WORK_FIELDS: &str = "id,doi,display_name,publication_date,abstract_inverted_index,authorships,open_access,best_oa_location,cited_by_count";
+const WORK_FIELDS: &str = "id,doi,display_name,publication_date,abstract_inverted_index,authorships,open_access,best_oa_location,locations,cited_by_count";
+
+/// Largest `per_page` OpenAlex's works endpoint accepts.
+const OPENALEX_PAGE_MAX: usize = 200;
 
 #[derive(Debug, Deserialize)]
 struct OpenAlexResponse {
@@ -182,33 +185,33 @@ impl OpenAlexProvider {
     }
 
     fn build_search_url(&self, query: &SearchQuery) -> Result<String, PaperError> {
-        // TODO: Build the OpenAlex API URL
         let mut params: Vec<(&str, String)> = Vec::new();
+        // OpenAlex reads one `filter` parameter: every clause is joined into
+        // it with `,`. A repeated `filter` would drop all but one clause.
+        let mut filters: Vec<String> = Vec::new();
 
-        // Search vs filter based on search type
+        // Search vs filter based on search type. Inside a filter value `,`
+        // starts the next clause and `|` means OR, so neither may come from
+        // the query text.
         let uses_search = matches!(query.search_type, SearchType::Keywords);
+        let filter_text = query.query.replace([',', '|'], " ");
 
         match query.search_type {
             SearchType::Keywords => {
                 params.push(("search", query.query.clone()));
             }
-            SearchType::Title => params.push(("filter", format!("title.search:{}", query.query))),
-            SearchType::Author => params.push((
-                "filter",
-                format!("authorships.author.display_name.search:{}", query.query),
+            SearchType::Title => filters.push(format!("title.search:{filter_text}")),
+            SearchType::Author => filters.push(format!(
+                "authorships.author.display_name.search:{filter_text}"
             )),
             SearchType::Subject => {
-                params.push((
-                    "filter",
-                    format!("topics.display_name.search:{}", query.query),
-                ));
+                filters.push(format!("topics.display_name.search:{filter_text}"))
             }
             _ => params.push(("search", query.query.clone())),
         }
 
         // Date filter
         if let Some(ref df) = query.date_filter {
-            let mut filters = Vec::new();
             if let Some(after) = df.after {
                 filters.push(format!(
                     "from_publication_date:{}",
@@ -222,9 +225,9 @@ impl OpenAlexProvider {
                     inclusive.format("%Y-%m-%d")
                 ));
             }
-            if !filters.is_empty() {
-                params.push(("filter", filters.join(",")));
-            }
+        }
+        if !filters.is_empty() {
+            params.push(("filter", filters.join(",")));
         }
 
         // Sort
@@ -239,8 +242,17 @@ impl OpenAlexProvider {
         }
 
         // Pagination
-        let per_page = query.max_results.min(200);
-        let page = (query.offset / query.max_results.max(1)) + 1;
+        let per_page = query.max_results.min(OPENALEX_PAGE_MAX);
+        // OpenAlex pages by number, not offset. An offset that is not a whole
+        // number of pages would silently return the wrong window.
+        let page_size = per_page.max(1);
+        if !query.offset.is_multiple_of(page_size) {
+            return Err(PaperError::InvalidInput(format!(
+                "openalex pages by page number: offset {} must be a multiple of the page size {page_size}",
+                query.offset
+            )));
+        }
+        let page = (query.offset / page_size) + 1;
         params.push(("per_page", per_page.to_string()));
         params.push(("page", page.to_string()));
 
@@ -295,7 +307,7 @@ impl PaperProvider for OpenAlexProvider {
             .map(|w| self.work_to_paper(w))
             .collect();
 
-        let next_offset = query.offset + query.max_results;
+        let next_offset = query.offset + query.max_results.min(OPENALEX_PAGE_MAX);
         let next_offset = if next_offset < body.meta.count && next_offset < 10_000 {
             Some(next_offset)
         } else {
@@ -446,5 +458,82 @@ mod tests {
         let text = reconstruct_abstract(&index).unwrap();
         assert!(text.ends_with("end"));
         assert_eq!(text.len(), MAX_ABSTRACT_POSITION + 3);
+    }
+
+    #[test]
+    fn title_search_with_a_date_range_sends_one_filter_param() {
+        let provider = OpenAlexProvider::new(&OpenAlexConfig::default()).unwrap();
+        let query = SearchQuery {
+            query: "graph, networks|x".to_string(),
+            search_type: SearchType::Title,
+            max_results: 10,
+            offset: 0,
+            date_filter: Some(crate::models::DateFilter::parse(">=2020 <2022").unwrap()),
+            sort_by: SortBy::default(),
+            min_citations: None,
+        };
+        let url = url::Url::parse(&provider.build_search_url(&query).unwrap()).unwrap();
+        let filters: Vec<String> = url
+            .query_pairs()
+            .filter(|(k, _)| k == "filter")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(
+            filters,
+            vec![
+                "title.search:graph  networks x,from_publication_date:2020-01-01,\
+                 to_publication_date:2021-12-31"
+                    .to_string()
+            ]
+        );
+    }
+
+    fn paged_query(max_results: usize, offset: usize) -> SearchQuery {
+        SearchQuery {
+            query: "graphs".to_string(),
+            search_type: SearchType::Keywords,
+            max_results,
+            offset,
+            date_filter: None,
+            sort_by: SortBy::default(),
+            min_citations: None,
+        }
+    }
+
+    #[test]
+    fn an_offset_that_is_not_a_whole_page_is_rejected_not_rounded_down() {
+        let provider = OpenAlexProvider::new(&OpenAlexConfig::default()).unwrap();
+        // 25 / 20 used to become page 2, i.e. offset 20: the wrong window.
+        let err = provider
+            .build_search_url(&paged_query(20, 25))
+            .expect_err("misaligned offset");
+        assert!(
+            matches!(&err, PaperError::InvalidInput(m)
+                if m.contains("openalex") && m.contains("offset 25") && m.contains("multiple of the page size 20")),
+            "{err:?}"
+        );
+
+        // The page size is the *clamped* one: 500 asked, 200 served.
+        let err = provider
+            .build_search_url(&paged_query(500, 250))
+            .expect_err("misaligned against the clamped page size");
+        assert!(
+            matches!(&err, PaperError::InvalidInput(m) if m.contains("page size 200")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_aligned_offset_selects_its_page() {
+        let provider = OpenAlexProvider::new(&OpenAlexConfig::default()).unwrap();
+        let page_of = |q: SearchQuery| {
+            let url = url::Url::parse(&provider.build_search_url(&q).unwrap()).unwrap();
+            url.query_pairs()
+                .find(|(k, _)| k == "page")
+                .map(|(_, v)| v.into_owned())
+        };
+        assert_eq!(page_of(paged_query(20, 0)).as_deref(), Some("1"));
+        assert_eq!(page_of(paged_query(20, 40)).as_deref(), Some("3"));
+        assert_eq!(page_of(paged_query(500, 400)).as_deref(), Some("3"));
     }
 }

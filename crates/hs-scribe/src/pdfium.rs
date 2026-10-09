@@ -17,6 +17,15 @@
 //! `PdfParser::new()` waits for the first to drop. Hold a parser only on a
 //! blocking thread, and never create a second one on a thread that already
 //! holds one.
+//!
+//! Consequence for the Legacy converter: stage 1 of a conversion (open, render
+//! and layout-detect every page, `Processor::process_pdf_with_progress`) holds
+//! that lock from the first page to the last, so stage 1 of two conversions
+//! never overlaps. Stage 2 (the per-region VLM calls) runs outside the lock;
+//! `vlm_concurrency` > 1 therefore lets one conversion's VLM work overlap the
+//! next one's render. A pdfium call that does not return within its budget
+//! (see [`guarded_call`]) wedges that lock for good, so the watchdog `_exit`s
+//! the whole server, ending every conversion in flight on it.
 
 use crate::classify::{ConvertFailure, FailureCode};
 use anyhow::Result;
@@ -118,11 +127,19 @@ pub fn set_call_budget(budget: Duration) {
 /// has its own budget in `pdf_meta::bounded`; this is the same accounting for
 /// the Legacy converter, which holds pdfium's lock for a whole conversion.
 pub fn guarded_call<T>(call: impl FnOnce() -> T) -> T {
+    /// Ends the call's accounting however `call` ends: a panic that unwinds
+    /// out of it must not leave the call "in flight", or the watchdog would
+    /// declare the process wedged one budget later and exit it.
+    struct Finished;
+    impl Drop for Finished {
+        fn drop(&mut self) {
+            CALL_STARTED_MS.store(0, Ordering::SeqCst);
+            clear_wedged();
+        }
+    }
     CALL_STARTED_MS.store(now_ms(), Ordering::SeqCst);
-    let result = call();
-    CALL_STARTED_MS.store(0, Ordering::SeqCst);
-    clear_wedged();
-    result
+    let _finished = Finished;
+    call()
 }
 
 /// Poll the in-flight call; spawned once by [`install_fault_exit`].
@@ -261,17 +278,17 @@ pub struct PdfParser {
     pdfium: Pdfium,
 }
 
-/// Where libpdfium may live, in lookup order: beside the working directory,
-/// then the deployment drop directories (`hs_common::service::lib_bootstrap`),
-/// then the system search path (tried last by [`PdfParser::new`]).
+/// Where libpdfium may live, in lookup order: the deployment drop
+/// directories (`hs_common::service::lib_bootstrap`, all under the home
+/// directory), then the system search path (tried last by
+/// [`PdfParser::new`]). The working directory is deliberately not a
+/// candidate: a command run from an untrusted directory must not load
+/// whatever library sits there.
 fn library_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![Pdfium::pdfium_platform_library_name_at_path("./")];
-    candidates.extend(
-        hs_common::service::lib_bootstrap::pdfium_drop_dirs()
-            .iter()
-            .map(Pdfium::pdfium_platform_library_name_at_path),
-    );
-    candidates
+    hs_common::service::lib_bootstrap::pdfium_drop_dirs()
+        .iter()
+        .map(Pdfium::pdfium_platform_library_name_at_path)
+        .collect()
 }
 
 impl PdfParser {
@@ -297,7 +314,7 @@ impl PdfParser {
             Some(bindings) => bindings,
             None => Pdfium::bind_to_system_library().map_err(|e| {
                 anyhow::anyhow!(
-                    "libpdfium could not be loaded (searched ./, {}, and the system library path): {e:?}",
+                    "libpdfium could not be loaded (searched {}, and the system library path): {e:?}",
                     hs_common::service::lib_bootstrap::pdfium_drop_dirs()
                         .iter()
                         .map(|d| d.display().to_string())
@@ -396,5 +413,75 @@ pub(crate) fn page_error(e: PdfiumError, idx: u16) -> anyhow::Error {
         )
     } else {
         anyhow::anyhow!("loading page {idx}: {e:?}")
+    }
+}
+
+/// A page that failed to render. pdfium reports a document fault (format,
+/// password, security, page) as a verdict on the bytes — permanent. A bare
+/// `Unknown` is not: `render_with_config` raises it when pdfium hands back
+/// a null bitmap, and the size was already bounded by `plan_render`, so it
+/// is an allocation failure that a later attempt can survive. Every other
+/// error stays untyped, hence transient.
+#[cfg(feature = "server")]
+pub(crate) fn render_error(e: PdfiumError, idx: u16) -> anyhow::Error {
+    let bitmap_allocation_failed = matches!(
+        e,
+        PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown)
+    );
+    if is_document_fault(&e) && !bitmap_allocation_failed {
+        ConvertFailure::err(
+            FailureCode::PdfParseError,
+            format!("page {idx} cannot be rendered: {e:?}"),
+        )
+    } else {
+        anyhow::anyhow!("rendering page {idx}: {e:?}")
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use crate::classify::{classify, failure_code, FailureClass};
+
+    #[test]
+    fn a_render_failure_pdfium_pins_on_the_document_is_permanent() {
+        for internal in [
+            PdfiumInternalError::FormatError,
+            PdfiumInternalError::PasswordError,
+            PdfiumInternalError::SecurityError,
+            PdfiumInternalError::PageError,
+        ] {
+            let err = render_error(PdfiumError::PdfiumLibraryInternalError(internal), 3);
+            assert_eq!(failure_code(&err), Some(FailureCode::PdfParseError));
+            assert_eq!(classify(&err), FailureClass::Permanent("pdf_parse_error"));
+        }
+    }
+
+    #[test]
+    fn a_null_bitmap_and_other_render_errors_stay_transient() {
+        for e in [
+            PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown),
+            PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::FileError),
+            PdfiumError::UnknownBitmapFormat,
+        ] {
+            let err = render_error(e, 3);
+            assert_eq!(failure_code(&err), None);
+            assert_eq!(classify(&err), FailureClass::Transient);
+        }
+    }
+}
+
+#[cfg(test)]
+mod library_search_tests {
+    use super::*;
+
+    /// RA-137: a relative candidate resolves against the working directory,
+    /// so `hs scribe convert` run from an untrusted directory would load
+    /// whatever library sits there.
+    #[test]
+    fn no_library_candidate_depends_on_the_working_directory() {
+        for candidate in library_candidates() {
+            assert!(candidate.is_absolute(), "{}", candidate.display());
+        }
     }
 }

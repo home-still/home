@@ -210,7 +210,9 @@ fn spawn_idle_sweeper(
     last_used_ms: Arc<AtomicI64>,
     idle_secs: u64,
 ) {
-    let idle_ms = idle_secs.saturating_mul(1000) as i64;
+    // Clamp before the cast: a huge `idle_secs` would wrap negative and make
+    // the sweeper treat the model as always idle.
+    let idle_ms = idle_secs.saturating_mul(1000).min(i64::MAX as u64) as i64;
     let sweep_interval = Duration::from_secs(30);
     tokio::spawn(async move {
         loop {

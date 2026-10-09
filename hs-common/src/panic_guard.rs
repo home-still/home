@@ -36,6 +36,53 @@ pub async fn catch_panic<F: Future>(fut: F) -> Result<F::Output, String> {
         .map_err(|payload| panic_message(payload.as_ref()))
 }
 
+/// How long [`supervise`] waits before it starts a panicked task again, so a
+/// task that panics every time it starts logs once per interval instead of
+/// spinning.
+#[cfg(any(feature = "events", feature = "logging"))]
+pub const SUPERVISE_RESTART_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run a long-lived background task so that a panic in it is neither silent
+/// nor the end of the task. Under `panic = "unwind"` a panic on a spawned
+/// task only ends that task (tokio does not propagate it) while the process
+/// lives on without whatever the task did (log rotation, a heartbeat).
+/// Here the panic is logged at ERROR with the task name and message, and the
+/// task is started again from `make` after [`SUPERVISE_RESTART_DELAY`]. A
+/// task that returns normally ends the supervision.
+///
+/// `make` must build a fresh future each call (clone what it owns): the
+/// panicked future is dropped, not resumed.
+#[cfg(any(feature = "events", feature = "logging"))]
+pub async fn supervise<F, Fut>(name: &'static str, make: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    supervise_after(name, SUPERVISE_RESTART_DELAY, make).await
+}
+
+#[cfg(any(feature = "events", feature = "logging"))]
+async fn supervise_after<F, Fut>(name: &'static str, delay: std::time::Duration, mut make: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    loop {
+        match catch_panic(make()).await {
+            Ok(()) => return,
+            Err(message) => {
+                tracing::error!(
+                    task = name,
+                    panic = %message,
+                    restart_in = ?delay,
+                    "background task panicked; restarting it"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
 /// Axum middleware: a panic in any handler below it becomes a 500 with no
 /// internals in the body, logged at ERROR with the route, and the server
 /// keeps serving.
@@ -101,6 +148,30 @@ mod tests {
 
         let r = catch_panic(async { std::panic::panic_any(42u8) }).await;
         assert!(r.unwrap_err().contains("non-string"));
+    }
+
+    #[cfg(any(feature = "events", feature = "logging"))]
+    #[tokio::test]
+    async fn a_supervised_task_is_restarted_after_a_panic_and_ends_when_it_returns() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let starts = Arc::new(AtomicUsize::new(0));
+        let s = starts.clone();
+        supervise_after(
+            "test-task",
+            std::time::Duration::from_millis(1),
+            move || {
+                let s = s.clone();
+                async move {
+                    if s.fetch_add(1, Ordering::SeqCst) < 2 {
+                        panic!("boom");
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(starts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

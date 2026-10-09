@@ -25,6 +25,12 @@ const NAMESPACE_UUID: Uuid = Uuid::from_bytes([
 ]);
 
 /// Generate a deterministic point ID from doc_id and chunk_index.
+///
+/// Collision bound: the ID is xxh3-64 of `"{doc_id}:{chunk_index}"` fed into
+/// UUIDv5, so the effective ID space is 64 bits, not 122. Birthday odds of any
+/// collision are about N²/2⁶⁵: ~3e-6 at 10M chunks, ~3e-4 at 100M, ~1e-3 at
+/// 200M. A collision overwrites one chunk with another. Changing the scheme
+/// changes every point ID and requires a full re-embed, so it is left as is.
 pub fn deterministic_id(doc_id: &str, chunk_index: u32) -> String {
     let hash = xxhash_rust::xxh3::xxh3_64(format!("{}:{}", doc_id, chunk_index).as_bytes());
     Uuid::new_v5(&NAMESPACE_UUID, &hash.to_le_bytes()).to_string()

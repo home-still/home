@@ -52,6 +52,20 @@ impl Revocations {
         Ok(now)
     }
 
+    /// The `iat` a token minted now for `subject` must carry: the current
+    /// second, but never at or before the subject's revocation. Revocation has
+    /// one-second resolution (`iat <= revoked_at`), so without this a device
+    /// re-enrolled in the same second it was revoked would be born revoked.
+    /// Tokens issued before the revocation keep their old `iat <= revoked_at`,
+    /// so they stay revoked; nothing is made less revoked.
+    pub fn issue_iat(&self, subject: &str) -> u64 {
+        let now = token::now_epoch();
+        match self.revoked_at.lock().get(subject) {
+            Some(&at) => now.max(at.saturating_add(1)),
+            None => now,
+        }
+    }
+
     /// True if `claims` was issued at or before its subject's revocation.
     pub fn is_revoked(&self, claims: &TokenClaims) -> bool {
         self.revoked_at
@@ -122,6 +136,23 @@ mod tests {
         assert!(!revocations.is_revoked(&claims("laptop", at + 1)));
         // Other subjects are untouched.
         assert!(!revocations.is_revoked(&claims("desktop", before)));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn reenrollment_in_the_revocation_second_is_not_born_revoked() {
+        let path = temp_path("same-second");
+        let revocations = Revocations::load(path.clone()).unwrap();
+        let old = claims("laptop", token::now_epoch());
+        let at = revocations.revoke("laptop").unwrap();
+        // Issued in the very second of the revocation.
+        let iat = revocations.issue_iat("laptop");
+        assert!(iat > at);
+        assert!(!revocations.is_revoked(&claims("laptop", iat)));
+        // The pre-revocation token (same second) is still revoked.
+        assert!(revocations.is_revoked(&old));
+        // Subjects never revoked are minted at the current second.
+        assert!(revocations.issue_iat("desktop") <= token::now_epoch());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

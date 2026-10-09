@@ -10,6 +10,9 @@ use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType, SortBy
 use crate::ports::provider::PaperProvider;
 use crate::providers::response::check_response;
 
+/// Largest `rows` CrossRef's works endpoint accepts.
+const CROSSREF_PAGE_MAX: usize = 100;
+
 // Search response: message contains items array
 #[derive(Debug, Deserialize)]
 struct CrSearchResponse {
@@ -158,7 +161,7 @@ impl CrossRefProvider {
         }
 
         // Pagination
-        let rows = query.max_results.min(100);
+        let rows = query.max_results.min(CROSSREF_PAGE_MAX);
         params.push(("rows", rows.to_string()));
         params.push(("offset", query.offset.to_string()));
 
@@ -238,7 +241,7 @@ impl PaperProvider for CrossRefProvider {
             .map(|w| self.cr_work_to_paper(w))
             .collect();
 
-        let next_offset = query.offset + query.max_results;
+        let next_offset = query.offset + query.max_results.min(CROSSREF_PAGE_MAX);
         let next_offset = if next_offset < body.message.total_results {
             Some(next_offset)
         } else {

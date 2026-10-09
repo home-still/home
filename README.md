@@ -117,7 +117,7 @@ Converted output is post-processed with repetition detection to clean VLM genera
 ### Setup
 
 ```sh
-hs scribe init    # downloads models, sets up Docker/Podman services
+hs serve scribe    # run the scribe server in the foreground (needs models, libpdfium and HS_BACKEND_TOKEN; see crates/hs-scribe/README.md)
 ```
 
 On **macOS Apple Silicon**, Ollama runs natively with Metal GPU acceleration. On **Linux with NVIDIA GPU**, CUDA acceleration is auto-detected. On **CPU-only** systems, inference runs in software mode.
@@ -131,21 +131,21 @@ hs scribe convert paper.pdf -o paper.md  # output to file
 
 ### Watch directory
 
-Auto-convert PDFs as they appear in a directory:
+Convert PDFs as `papers.ingested` events arrive on the configured event bus (`events.backend: nats`):
 
 ```sh
-hs scribe watch start   # start background daemon
-hs scribe watch stop    # stop daemon
-hs scribe status        # show conversion progress
+hs scribe watch-events              # foreground
+hs serve scribe-watch --install     # install as a user-level service
+hs status                           # show conversion progress
 ```
 
 ### Server management
 
 ```sh
-hs scribe server start   # start Docker services
-hs scribe server stop    # stop Docker services
-hs scribe server list    # show status and health
-hs scribe server ping    # health check
+hs serve scribe start    # run the scribe server in the background
+hs serve scribe stop     # stop it
+hs serve scribe --install  # install as a systemd / launchd service and start it
+hs status                # service health
 ```
 
 With multiple servers configured, PDFs are load-balanced across them based on server readiness. See [crates/hs-scribe/README.md](crates/hs-scribe/README.md) for full documentation.
@@ -158,7 +158,7 @@ Chunk, embed, and index converted markdown into a Qdrant vector database for sem
 
 ```sh
 hs distill init                          # set up Qdrant container
-hs distill server start                  # start Qdrant + distill server
+hs serve distill start                   # start Qdrant + distill server
 ```
 
 ### Index and search
@@ -191,7 +191,7 @@ Refreshes every 3 seconds. Press `q` to quit.
 
 ## Service Deployment (Serve)
 
-Run a service on the current machine. Each `hs serve` command initializes the service if needed and starts it.
+Run a service on the current machine in the foreground (`start` / `stop` run it in the background; `--install` makes it a systemd / launchd service).
 
 ```sh
 hs serve scribe                   # run scribe (PDF conversion) on this machine
@@ -199,7 +199,7 @@ hs serve distill                  # run distill (embedding + search) on this mac
 hs serve mcp                      # run MCP server on this machine
 ```
 
-Services auto-initialize on first run (equivalent to `hs scribe init` / `hs distill init`). To make a node reachable through the gateway, add its URL to `cloud.gateway.routes` on the gateway host.
+`hs serve distill` initializes the Qdrant/distill prerequisites on first run (the `hs distill init` step). `hs serve scribe` does not provision anything: the scribe host needs its models, libpdfium and `HS_BACKEND_TOKEN` in place first. To make a node reachable through the gateway, add its URL to `cloud.gateway.routes` on the gateway host.
 
 ## Load balancing
 
@@ -429,7 +429,7 @@ When accessing the shared NFS mount from macOS, you may see:
 1. **NFS export was `sync`** (every write blocks on disk — bad for USB-attached SSDs).
    On the server, edit `/etc/exports`:
    ```
-   /mnt/share 192.0.2.0/24(rw,async,no_subtree_check,all_squash,anonuid=1000,anongid=1000)
+   <nfs-mount> <lan-subnet>(rw,async,no_subtree_check,all_squash,anonuid=1000,anongid=1000)
    ```
    Then `sudo exportfs -ra`.
 
@@ -450,7 +450,7 @@ When accessing the shared NFS mount from macOS, you may see:
 
 5. **Orphaned `.tmp*` files in `markdown/`** from crashed writes. Clean them on the server:
    ```sh
-   ssh <nfs-server> "rm -f /mnt/share/home-still/markdown/.tmp* /mnt/share/home-still/markdown/._.tmp*"
+   ssh <nfs-server> "rm -f <nfs-mount>/home-still/markdown/.tmp* <nfs-mount>/home-still/markdown/._.tmp*"
    ```
 
 ### Finder still hangs on `markdown/` even after the fixes above

@@ -336,17 +336,6 @@ pub async fn handle_authorize_post(
         }
     };
 
-    let Some(enrollment) = state
-        .enrollments
-        .take(&normalize_code(&form.enrollment_code))
-    else {
-        return error_page(
-            StatusCode::UNAUTHORIZED,
-            "Invalid Code",
-            "The enrollment code was invalid or expired. Generate a new one with `hs cloud invite`, then go back and try again.",
-        );
-    };
-
     let auth_code = generate_auth_code();
     let location = match redirect_location(&req.redirect_uri, &auth_code, &req.state) {
         Ok(l) => l,
@@ -360,18 +349,36 @@ pub async fn handle_authorize_post(
         }
     };
 
-    let pending = PendingAuthCode {
-        client_id: req.client.client_id,
-        redirect_uri: req.redirect_uri,
-        code_challenge: req.code_challenge,
-        scopes: enrollment.scopes,
-    };
-    if state.auth_codes.insert(auth_code, pending).is_err() {
-        return error_page(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Busy",
-            "Too many authorizations are in progress. Try again in a minute.",
-        );
+    // Reserve the auth-code slot first; the single-use enrollment code is only
+    // consumed once the slot is held, so a full store never burns it.
+    let normalized = normalize_code(&form.enrollment_code);
+    let (client_id, redirect_uri, code_challenge) =
+        (req.client.client_id, req.redirect_uri, req.code_challenge);
+    let inserted = state.auth_codes.insert_with(auth_code, || {
+        let enrollment = state.enrollments.take(&normalized)?;
+        Some(PendingAuthCode {
+            client_id,
+            redirect_uri,
+            code_challenge,
+            scopes: enrollment.scopes,
+        })
+    });
+    match inserted {
+        Ok(true) => {}
+        Ok(false) => {
+            return error_page(
+                StatusCode::UNAUTHORIZED,
+                "Invalid Code",
+                "The enrollment code was invalid or expired. Generate a new one with `hs cloud invite`, then go back and try again.",
+            );
+        }
+        Err(_) => {
+            return error_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Busy",
+                "Too many authorizations are in progress. Try again in a minute.",
+            );
+        }
     }
 
     let mut resp = StatusCode::SEE_OTHER.into_response();
@@ -936,6 +943,34 @@ mod tests {
         assert!(resp.headers().get("location").is_none());
         // The enrollment code is still usable for a legitimate request.
         assert_eq!(state.enrollments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authorize_post_with_a_full_auth_code_store_does_not_burn_the_code() {
+        let state = test_state(&[]).await;
+        let client_id = register_client(&state, "c", &[REDIRECT]).await;
+        for i in 0..MAX_AUTH_CODES {
+            let pending = PendingAuthCode {
+                client_id: "x".into(),
+                redirect_uri: REDIRECT.into(),
+                code_challenge: CHALLENGE.into(),
+                scopes: vec![],
+            };
+            state
+                .auth_codes
+                .insert(format!("fill{i}"), pending)
+                .unwrap();
+        }
+        let code = invite(&state, &["mcp"]);
+
+        let resp = call(
+            &state,
+            post_form("/authorize", &authorize_pairs(&client_id, &code)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get("location").is_none());
+        assert_eq!(state.enrollments.len(), 1, "enrollment code must survive");
     }
 
     #[tokio::test]

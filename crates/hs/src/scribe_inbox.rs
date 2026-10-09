@@ -241,15 +241,34 @@ pub struct SweepReport {
     pub interrupted: bool,
 }
 
+/// Liveness stamping done from inside a sweep. A sweep over a large backlog
+/// (EPUB unpacking, big PDFs, slow S3) can outlast `hs status`'s liveness
+/// window (2× poll interval + grace); without stamps from inside the loop the
+/// watcher would read as dead while it works.
+#[derive(Debug, Clone, Copy)]
+pub struct SweepHeartbeat {
+    pub sweep_interval_secs: u64,
+    /// Counts of the previous completed sweep, carried forward unchanged so
+    /// the `swept N / M` display doesn't flicker mid-sweep.
+    pub last_sweep: Option<(u64, u64, u64)>,
+}
+
+/// Minimum spacing between in-sweep heartbeat writes, so a backlog of
+/// thousands of small files costs a handful of puts rather than one each.
+const SWEEP_HEARTBEAT_MIN_GAP: Duration = Duration::from_secs(1);
+
 /// Walk `{papers_prefix}/manually_downloaded/` once and process each file.
 /// Returns a report; individual failures are collected into `errors` and do
 /// not abort the sweep. Stops starting new files once `stop` is requested.
+/// When `heartbeat` is set, the inbox heartbeat is stamped before the first
+/// file and then at most once per [`SWEEP_HEARTBEAT_MIN_GAP`] before each file.
 pub async fn sweep_inbox_once(
     storage: &dyn Storage,
     bus: &dyn EventBus,
     papers_prefix: &str,
     epub_limits: &EpubLimits,
     stop: &Shutdown,
+    heartbeat: Option<SweepHeartbeat>,
 ) -> anyhow::Result<SweepReport> {
     let inbox_prefix = format!(
         "{}/manually_downloaded/",
@@ -266,10 +285,25 @@ pub async fn sweep_inbox_once(
         ..Default::default()
     };
 
+    let mut last_stamp: Option<std::time::Instant> = None;
     for obj in objects {
         if stop.requested() {
             report.interrupted = true;
             break;
+        }
+        if let Some(hb) = heartbeat {
+            if last_stamp.is_none_or(|t| t.elapsed() >= SWEEP_HEARTBEAT_MIN_GAP) {
+                if let Err(e) = hs_common::status::write_inbox_heartbeat(
+                    storage,
+                    hb.sweep_interval_secs,
+                    hb.last_sweep,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "in-sweep heartbeat write failed; sweep continues");
+                }
+                last_stamp = Some(std::time::Instant::now());
+            }
         }
         match handle_inbox_source(
             storage,
@@ -331,7 +365,7 @@ async fn cmd_sweep(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let bus = cfg.build_event_bus().await?;
 
     reporter.status("Sweep", "scanning papers/manually_downloaded/");
-    let report = sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX, &cfg.epub, &stop).await?;
+    let report = sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX, &cfg.epub, &stop, None).await?;
     log_report(reporter, &report);
     if !report.errors.is_empty() {
         anyhow::bail!("sweep completed with {} error(s)", report.errors.len());
@@ -382,7 +416,20 @@ async fn cmd_run(reporter: &Arc<dyn Reporter>, _daemon_child: bool) -> Result<()
     {
         tracing::warn!(error = %e, "initial heartbeat write failed");
     }
-    match sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX, &cfg.epub, &stop).await {
+    let heartbeat = SweepHeartbeat {
+        sweep_interval_secs,
+        last_sweep,
+    };
+    match sweep_inbox_once(
+        &*storage,
+        &*bus,
+        PAPERS_PREFIX,
+        &cfg.epub,
+        &stop,
+        Some(heartbeat),
+    )
+    .await
+    {
         Ok(r) => {
             log_report(reporter, &r);
             last_sweep = Some((r.found as u64, r.relocated, r.errors.len() as u64));
@@ -420,7 +467,20 @@ async fn cmd_run(reporter: &Arc<dyn Reporter>, _daemon_child: bool) -> Result<()
         {
             tracing::warn!(error = %e, "heartbeat write failed; sweep will still run");
         }
-        match sweep_inbox_once(&*storage, &*bus, PAPERS_PREFIX, &cfg.epub, &stop).await {
+        let heartbeat = SweepHeartbeat {
+            sweep_interval_secs,
+            last_sweep,
+        };
+        match sweep_inbox_once(
+            &*storage,
+            &*bus,
+            PAPERS_PREFIX,
+            &cfg.epub,
+            &stop,
+            Some(heartbeat),
+        )
+        .await
+        {
             Ok(r) => {
                 if r.relocated > 0 || !r.errors.is_empty() || !r.rejected.is_empty() {
                     log_report(reporter, &r);
@@ -492,11 +552,16 @@ mod tests {
     #[derive(Default)]
     struct RecordingBus {
         published: Mutex<Vec<(String, serde_json::Value)>>,
+        /// While set, `publish` fails (a broker outage).
+        down: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
     impl EventBus for RecordingBus {
         async fn publish(&self, subject: &str, payload: &[u8]) -> anyhow::Result<()> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("broker is down");
+            }
             let value = serde_json::from_slice(payload).expect("publish payload is JSON");
             self.published
                 .lock()
@@ -889,6 +954,7 @@ mod tests {
             PAPERS,
             &EpubLimits::default(),
             &Shutdown::new(),
+            None,
         )
         .await
         .unwrap();
@@ -977,10 +1043,7 @@ mod tests {
             b"c",
         )
         .await;
-        storage
-            .put("papers/c/c.pdf", b"prior-c".to_vec())
-            .await
-            .unwrap();
+        storage.put("papers/c/c.pdf", b"c".to_vec()).await.unwrap();
 
         let report = sweep_inbox_once(
             &storage,
@@ -988,6 +1051,7 @@ mod tests {
             PAPERS,
             &EpubLimits::default(),
             &Shutdown::new(),
+            None,
         )
         .await
         .unwrap();
@@ -997,6 +1061,110 @@ mod tests {
         assert_eq!(report.already_at_target, 1, "c.pdf target already exists");
         assert_eq!(report.ignored_unsupported, 1, "b.pdf.download ignored");
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    /// A broker outage after the target is written must neither lose the
+    /// paper nor pass silently: the sweep reports the failure and keeps the
+    /// source, and the next sweep publishes and only then deletes it.
+    #[tokio::test]
+    async fn sweep_reports_publish_failure_keeps_source_and_heals_next_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let bus = RecordingBus::default();
+        put_settled(&storage, tmp.path(), &format!("{INBOX}/a.pdf"), b"a").await;
+        let limits = EpubLimits::default();
+        let stop = Shutdown::new();
+        let sweep = || sweep_inbox_once(&storage, &bus, PAPERS, &limits, &stop, None);
+
+        bus.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        let failed = sweep().await.unwrap();
+        assert_eq!(failed.relocated, 0);
+        assert_eq!(failed.errors.len(), 1, "{:?}", failed.errors);
+        assert!(failed.errors[0].contains("papers.ingested"), "{failed:?}");
+        assert!(storage.exists(&format!("{INBOX}/a.pdf")).await.unwrap());
+        assert!(bus.published.lock().await.is_empty());
+
+        bus.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        let healed = sweep().await.unwrap();
+        assert!(healed.errors.is_empty(), "{:?}", healed.errors);
+        assert_eq!(healed.already_at_target, 1);
+        assert!(!storage.exists(&format!("{INBOX}/a.pdf")).await.unwrap());
+        let published = bus.published.lock().await;
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].1["key"], "papers/a/a.pdf");
+    }
+
+    /// A drop whose stem already exists with different content is a per-file
+    /// error naming both keys; neither file is touched.
+    #[tokio::test]
+    async fn sweep_reports_content_conflict_and_touches_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let bus = RecordingBus::default();
+        put_settled(&storage, tmp.path(), &format!("{INBOX}/a.pdf"), b"new").await;
+        storage
+            .put("papers/a/a.pdf", b"different-old".to_vec())
+            .await
+            .unwrap();
+
+        let report = sweep_inbox_once(
+            &storage,
+            &bus,
+            PAPERS,
+            &EpubLimits::default(),
+            &Shutdown::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.already_at_target, 0);
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(report.errors[0].contains(&format!("{INBOX}/a.pdf")));
+        assert!(report.errors[0].contains("papers/a/a.pdf"));
+        assert_eq!(
+            storage.get(&format!("{INBOX}/a.pdf")).await.unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            storage.get("papers/a/a.pdf").await.unwrap(),
+            b"different-old"
+        );
+        assert!(bus.published.lock().await.is_empty());
+    }
+
+    /// The heartbeat is stamped from inside the sweep, so a sweep that
+    /// outlasts the liveness window does not read as a dead watcher.
+    #[tokio::test]
+    async fn sweep_stamps_heartbeat_from_inside_the_loop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+        let bus = RecordingBus::default();
+        put_settled(&storage, tmp.path(), &format!("{INBOX}/a.pdf"), b"a").await;
+        assert!(!storage
+            .exists(hs_common::status::INBOX_HEARTBEAT_KEY)
+            .await
+            .unwrap());
+
+        sweep_inbox_once(
+            &storage,
+            &bus,
+            PAPERS,
+            &EpubLimits::default(),
+            &Shutdown::new(),
+            Some(SweepHeartbeat {
+                sweep_interval_secs: 30,
+                last_sweep: Some((4, 3, 0)),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let hb = hs_common::status::read_inbox_heartbeat(&storage)
+            .await
+            .unwrap()
+            .expect("heartbeat stamped during the sweep");
+        assert_eq!(hb.last_sweep_found, Some(4));
     }
 
     /// RA-4 through the real sweep: names whose second byte falls inside a
@@ -1027,6 +1195,7 @@ mod tests {
             PAPERS,
             &EpubLimits::default(),
             &Shutdown::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1095,6 +1264,7 @@ mod tests {
             PAPERS,
             &EpubLimits::default(),
             &Shutdown::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1138,6 +1308,7 @@ mod tests {
             PAPERS,
             &EpubLimits::default(),
             &Shutdown::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1229,7 +1400,7 @@ mod tests {
         let stop = Shutdown::new();
         stop.request();
 
-        let report = sweep_inbox_once(&storage, &bus, PAPERS, &EpubLimits::default(), &stop)
+        let report = sweep_inbox_once(&storage, &bus, PAPERS, &EpubLimits::default(), &stop, None)
             .await
             .unwrap();
 

@@ -179,15 +179,14 @@ impl ProviderSet {
         self.s2_guard.run(|| self.s2_graph.references(doi)).await
     }
 
-    /// Semantic Scholar citing papers, under the same guard as its search.
+    /// Semantic Scholar citing papers. Each page request runs under the same
+    /// guard as its search (limiter, breaker, retry), not the call as a whole.
     pub async fn citations(
         &self,
         doi: &str,
         opts: CitationsOpts,
     ) -> Result<CitationsResponse, PaperError> {
-        self.s2_guard
-            .run(|| self.s2_graph.citations(doi, opts.clone()))
-            .await
+        self.s2_graph.citations(doi, opts, &self.s2_guard).await
     }
 
     fn members(&self) -> Vec<Arc<dyn PaperProvider>> {

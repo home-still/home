@@ -321,12 +321,15 @@ pub fn split_suspect_at_gutter(bboxes: &mut Vec<BBox>, suspect_idx: usize, gutte
 /// the scribe-server unit, restart, and the next conversion uses
 /// active split). Default off — Phase 1 is shadow-only.
 pub fn active_split_enabled() -> bool {
-    matches!(
+    split_gate_value_enabled(
         std::env::var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE")
             .ok()
             .as_deref(),
-        Some("1" | "true" | "yes" | "TRUE" | "YES")
     )
+}
+
+fn split_gate_value_enabled(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "yes" | "TRUE" | "YES"))
 }
 
 /// Otsu's threshold for an 8-bit luma image. Returns the threshold value
@@ -665,27 +668,23 @@ mod tests {
         // Gate must default OFF — we will not silently start splitting
         // bboxes on a freshly-deployed scribe just because the env var
         // is unset.
-        std::env::remove_var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE");
-        assert!(!active_split_enabled());
+        assert!(!split_gate_value_enabled(None));
     }
 
     #[test]
     fn active_split_gate_on_when_env_truthy() {
         for v in ["1", "true", "yes", "TRUE", "YES"] {
-            std::env::set_var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE", v);
             assert!(
-                active_split_enabled(),
+                split_gate_value_enabled(Some(v)),
                 "expected gate ON for env value `{v}`"
             );
         }
         for v in ["0", "false", "no", "off", ""] {
-            std::env::set_var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE", v);
             assert!(
-                !active_split_enabled(),
+                !split_gate_value_enabled(Some(v)),
                 "expected gate OFF for env value `{v}`"
             );
         }
-        std::env::remove_var("HS_SCRIBE_COLUMN_SPLIT_ACTIVE");
     }
 
     #[test]

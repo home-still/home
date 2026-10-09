@@ -83,13 +83,12 @@ storage:
 # `nats` connects to a NATS server; pairs with `hs scribe watch-events` and
 # `hs distill watch-events` to run the event-driven pipeline.
 # Required: omitting `events.backend` makes watchers/inbox/pipeline commands
-# refuse to run.
-events:
-  # Set to nats to run the event-driven pipeline (example below).
-  backend: noop           # noop | nats
-  # backend: nats
-  # nats:
-  #   url: nats://three:4222
+# refuse to run. The block is left commented so the first run forces an
+# explicit choice instead of silently dropping publishes; uncomment one:
+# events:
+#   backend: nats
+#   nats:
+#     url: nats://<host>:4222
 
 # --- Centralized logging (ship JSONL to object storage) --------------
 # Every binary spools log records locally and uploads closed files to a

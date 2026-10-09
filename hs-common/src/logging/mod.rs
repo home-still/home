@@ -140,12 +140,20 @@ impl LoggingHandle {
             return;
         };
         if self.rotate_join.is_none() {
-            self.rotate_join = Some(tokio::spawn(spool::run_rotate_controller(
-                spool,
-                self.rotate_max_bytes,
-                self.rotate_interval,
-                self.spool_caps,
-                self.rotate_shutdown.subscribe(),
+            let (max_bytes, interval, caps) =
+                (self.rotate_max_bytes, self.rotate_interval, self.spool_caps);
+            let shutdown = self.rotate_shutdown.subscribe();
+            self.rotate_join = Some(tokio::spawn(crate::panic_guard::supervise(
+                "log-spool-rotator",
+                move || {
+                    spool::run_rotate_controller(
+                        spool.clone(),
+                        max_bytes,
+                        interval,
+                        caps,
+                        shutdown.clone(),
+                    )
+                },
             )));
         }
     }
@@ -161,14 +169,19 @@ impl LoggingHandle {
         self.ensure_rotator();
         if self.shipper_join.is_none() {
             let (tx, rx) = watch::channel(false);
-            let join = tokio::spawn(shipper::run_shipper(
-                spool.dir(),
-                storage,
-                self.s3_key_prefix.clone(),
-                self.ship_interval,
-                self.delete_on_ship_success,
-                rx,
-            ));
+            let spool_dir = spool.dir();
+            let key_prefix = self.s3_key_prefix.clone();
+            let (interval, delete_on_success) = (self.ship_interval, self.delete_on_ship_success);
+            let join = tokio::spawn(crate::panic_guard::supervise("log-shipper", move || {
+                shipper::run_shipper(
+                    spool_dir.clone(),
+                    storage.clone(),
+                    key_prefix.clone(),
+                    interval,
+                    delete_on_success,
+                    rx.clone(),
+                )
+            }));
             self.shipper_shutdown = Some(tx);
             self.shipper_join = Some(join);
         }
@@ -391,7 +404,14 @@ mod tests {
             .with_stderr(StderrOutput::Disabled);
         let handle = init(cfg);
         assert!(handle.has_spool());
-        assert!(spool_dir.join(spool::CURRENT_FILE).exists());
+        let has_current_file = std::fs::read_dir(&spool_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(spool::CURRENT_PREFIX)
+        });
+        assert!(has_current_file);
         handle.shutdown().await.expect("shutdown is infallible");
     }
 

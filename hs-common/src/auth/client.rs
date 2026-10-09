@@ -56,12 +56,10 @@ impl std::fmt::Display for RefreshRejected {
 impl std::error::Error for RefreshRejected {}
 
 impl CloudCredentials {
-    /// Default path for credential storage.
-    pub fn default_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(crate::HIDDEN_DIR)
-            .join("cloud-token")
+    /// Default path for credential storage. Fails when the home directory is
+    /// unknown rather than yielding a relative path.
+    pub fn default_path() -> Result<PathBuf, crate::config_file::ConfigError> {
+        Ok(crate::hidden_dir()?.join("cloud-token"))
     }
 
     /// Load credentials from disk.
@@ -133,7 +131,7 @@ impl AuthenticatedClient {
 
     /// Load credentials from the default path and create a client.
     pub fn from_default_path() -> anyhow::Result<Self> {
-        let creds = CloudCredentials::load(&CloudCredentials::default_path())?;
+        let creds = CloudCredentials::load(&CloudCredentials::default_path()?)?;
         Self::new(creds)
     }
 

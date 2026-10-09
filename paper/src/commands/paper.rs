@@ -44,8 +44,12 @@ pub async fn run_search(
         return lookup_and_display(&query, "DOI", &*provider, stage, global, reporter, styles)
             .await;
     } else if looks_like_arxiv_id(&query) {
+        // Lookups are by DOI, and a bare arXiv id is not one (`normalize_doi`
+        // rejects it): ask for the id's DataCite DOI, which every provider
+        // router resolves to arXiv.
+        let doi = format!("10.48550/arXiv.{query}");
         return lookup_and_display(
-            &query, "arXiv ID", &*provider, stage, global, reporter, styles,
+            &doi, "arXiv ID", &*provider, stage, global, reporter, styles,
         )
         .await;
     };
@@ -450,10 +454,13 @@ fn parse_date_arg(date: Option<String>) -> Result<Option<crate::models::DateFilt
 /// arXiv ID format: digits, a dot, then more digits
 /// e.g., "2408.13479" or "2408.13479v5"
 fn looks_like_arxiv_id(query: &str) -> bool {
-    let stripped = query.split('v').next().unwrap_or(query);
-    let parts: Vec<&str> = stripped.splitn(2, '.').collect();
-    parts.len() == 2
-        && parts[0].len() == 4
-        && parts[0].chars().all(|c| c.is_ascii_digit())
-        && parts[1].chars().all(|c| c.is_ascii_digit())
+    let (id, version) = match query.split_once('v') {
+        Some((id, version)) => (id, Some(version)),
+        None => (query, None),
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let well_formed_id = id
+        .split_once('.')
+        .is_some_and(|(yymm, number)| yymm.len() == 4 && digits(yymm) && digits(number));
+    well_formed_id && version.is_none_or(digits)
 }

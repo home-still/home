@@ -139,7 +139,7 @@ fn read_entry<R: Read + Seek>(
     let allowance = entry_cap.min(budget.remaining());
     let mut bytes = Vec::with_capacity(entry.size().min(allowance) as usize);
     entry
-        .take(allowance + 1)
+        .take(allowance.saturating_add(1))
         .read_to_end(&mut bytes)
         .with_context(|| format!("EPUB entry `{name}` failed to decompress"))?;
     let produced = bytes.len() as u64;
@@ -312,10 +312,10 @@ fn resolve_href(root_dir: &str, href: &str) -> Option<String> {
 
 /// Read an EPUB once, in reading order, handing each distinct chapter's
 /// XHTML to `on_chapter` together with the conversion's [`Budget`] (so a
-/// consumer charges what it produces). A chapter the archive does not
-/// contain, or whose bytes are not UTF-8, is skipped with a warning; every
-/// other fault — bad zip, over a limit, malformed or too deeply nested
-/// package XML, a failing consumer — is an error.
+/// consumer charges what it produces). A spine item that is missing from
+/// the archive, escapes it, or is not UTF-8 fails the whole conversion with
+/// a typed `epub_parse_error`, as does every other fault — bad zip, over a
+/// limit, malformed or too deeply nested package XML, a failing consumer.
 fn read_chapters(
     bytes: &[u8],
     limits: &EpubLimits,
@@ -346,21 +346,21 @@ fn read_chapters(
 
     let mut seen_idrefs = HashSet::new();
     let mut seen_entries = HashSet::new();
-    let mut skipped = 0usize;
     for idref in &package.spine {
         // Each chapter once: by idref, and by the entry it resolves to (many
         // manifest ids may point at one file).
         if !seen_idrefs.insert(idref.as_str()) {
             continue;
         }
-        let Some(href) = package.manifest.get(idref) else {
-            skipped += 1;
-            continue;
-        };
-        let Some(entry_name) = resolve_href(root_dir, href) else {
-            skipped += 1;
-            continue;
-        };
+        let href = package.manifest.get(idref).ok_or_else(|| {
+            spine_failure(idref, "the spine references an id absent from the manifest")
+        })?;
+        let entry_name = resolve_href(root_dir, href).ok_or_else(|| {
+            spine_failure(
+                href,
+                "its path escapes the archive or is not a valid entry name",
+            )
+        })?;
         if !seen_entries.insert(entry_name.clone()) {
             continue;
         }
@@ -375,22 +375,23 @@ fn read_chapters(
                 _ => None,
             },
         };
-        let Some(content) = content else {
-            skipped += 1;
-            continue;
-        };
-        match std::str::from_utf8(&content) {
-            Ok(xhtml) => on_chapter(xhtml, &mut budget)?,
-            Err(_) => skipped += 1,
-        }
-    }
-    if skipped > 0 {
-        tracing::warn!(
-            skipped,
-            "EPUB spine items skipped: no such archive entry, or not UTF-8 text"
-        );
+        let content =
+            content.ok_or_else(|| spine_failure(&entry_name, "no such entry in the archive"))?;
+        let xhtml = std::str::from_utf8(&content)
+            .map_err(|_| spine_failure(&entry_name, "it is not valid UTF-8"))?;
+        on_chapter(xhtml, &mut budget)?;
     }
     Ok(())
+}
+
+/// A spine item that cannot be read makes the whole book unconvertible:
+/// converting the rest would silently drop chapters. Permanent
+/// (`epub_parse_error`) — the same bytes fail the same way every time.
+fn spine_failure(item: &str, reason: &str) -> anyhow::Error {
+    crate::classify::ConvertFailure::err(
+        crate::classify::FailureCode::EpubParseError,
+        format!("EPUB spine item `{item}` cannot be converted: {reason}"),
+    )
 }
 
 /// Convert an EPUB archive's bytes to markdown, chapters in spine order,
@@ -593,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spine_item_with_no_entry_is_skipped_not_fatal() {
+    fn a_spine_item_with_no_entry_fails_the_conversion_permanently() {
         let mut entries: Vec<(&str, Vec<u8>)> = vec![
             ("META-INF/container.xml", CONTAINER.as_bytes().to_vec()),
             (
@@ -602,9 +603,32 @@ mod tests {
             ),
         ];
         entries.push(("OEBPS/a.xhtml", chapter("Alpha", 1)));
-        let md = convert_epub_to_markdown_with(&zip_of(&entries), &EpubLimits::default(), &NEVER)
-            .unwrap();
-        assert!(md.contains("# Alpha"), "{md}");
+        let err = convert_epub_to_markdown_with(&zip_of(&entries), &EpubLimits::default(), &NEVER)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("OEBPS/gone.xhtml")
+                && err.to_string().contains("no such entry"),
+            "{err:#}"
+        );
+        assert_eq!(
+            crate::classify::classify(&err),
+            crate::classify::FailureClass::Permanent("epub_parse_error")
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_spine_item_fails_the_conversion() {
+        let entries: Vec<(&str, Vec<u8>)> = vec![
+            ("META-INF/container.xml", CONTAINER.as_bytes().to_vec()),
+            (
+                "OEBPS/content.opf",
+                opf(&[("a", "a.xhtml")], &["a"]).into_bytes(),
+            ),
+            ("OEBPS/a.xhtml", vec![0xff, 0xfe, 0xfd]),
+        ];
+        let err = convert_epub_to_markdown_with(&zip_of(&entries), &EpubLimits::default(), &NEVER)
+            .unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"), "{err:#}");
     }
 
     // ── F2: spine repetition ────────────────────────────────────────

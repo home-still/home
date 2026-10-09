@@ -191,6 +191,23 @@ pub struct ConsumerSpec {
     pub durable_name: &'static str,
 }
 
+/// Outstanding work on one durable consumer, as the broker counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueDepth {
+    /// Messages in the stream not yet delivered to any worker.
+    pub pending: u64,
+    /// Messages delivered to a worker and not yet acked: being converted,
+    /// or awaiting redelivery after `ack_wait`.
+    pub ack_pending: u64,
+}
+
+impl QueueDepth {
+    /// Everything the consumer has not finished: waiting plus being worked.
+    pub fn outstanding(&self) -> u64 {
+        self.pending.saturating_add(self.ack_pending)
+    }
+}
+
 #[async_trait]
 pub trait EventBus: Send + Sync {
     /// Publish a payload on `subject`. JetStream buses persist the
@@ -210,6 +227,16 @@ pub trait EventBus: Send + Sync {
     /// nothing to check.
     async fn ensure_ready(&self) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// How much work is outstanding on the durable consumer `spec` names,
+    /// for the status panel. Errors when the bus cannot say (no broker, no
+    /// such consumer yet); an unknown depth is never reported as zero.
+    async fn queue_depth(&self, spec: &ConsumerSpec) -> anyhow::Result<QueueDepth> {
+        anyhow::bail!(
+            "this event bus does not report queue depth (consumer {})",
+            spec.durable_name
+        )
     }
 }
 
@@ -255,6 +282,10 @@ impl EventBus for LazyBus {
 
     async fn ensure_ready(&self) -> anyhow::Result<()> {
         self.bus().await.map(|_| ())
+    }
+
+    async fn queue_depth(&self, spec: &ConsumerSpec) -> anyhow::Result<QueueDepth> {
+        self.bus().await?.queue_depth(spec).await
     }
 }
 

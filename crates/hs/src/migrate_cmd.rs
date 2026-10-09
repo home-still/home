@@ -159,7 +159,12 @@ fn shard_directory(
 
         let target = hs_common::sharded_path(dir, stem, ext);
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                stats
+                    .failures
+                    .push(format!("{name}: {}: {e}", parent.display()));
+                continue;
+            }
         }
         match move_without_clobbering(&path, &target) {
             Ok(Moved::Moved) => stats.moved += 1,
@@ -370,8 +375,12 @@ pub async fn run_move_root_orphans(
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
-                        Ok(RelocateOutcome::AlreadyAtTarget) => {
+                        Ok(RelocateOutcome::AlreadyAtTarget { catalog_updated }) => {
                             skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if catalog_updated {
+                                catalog_rewritten
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                         Err(e) => {
                             errors.lock().await.push(format!("{src}: {e}"));
@@ -429,7 +438,32 @@ pub async fn run_move_root_orphans(
 #[derive(Debug)]
 enum RelocateOutcome {
     Moved { catalog_updated: bool },
-    AlreadyAtTarget,
+    AlreadyAtTarget { catalog_updated: bool },
+}
+
+/// Point the catalog row's `pdf_path` at `tgt` when it still names the
+/// bucket-root key `src`. Returns whether a row was rewritten.
+/// `hs_common::catalog::read_catalog_entry_via` looks up by stem and uses the
+/// sharded layout under `catalog/`, which is already correct.
+async fn rewrite_catalog_pdf_path(
+    storage: &dyn hs_common::storage::Storage,
+    stem: &str,
+    src: &str,
+    tgt: &str,
+) -> anyhow::Result<bool> {
+    match hs_common::catalog::read_catalog_entry_via(storage, "catalog", stem)
+        .await
+        .map_err(|e| anyhow::anyhow!("catalog read for {stem}: {e}"))?
+    {
+        Some(mut entry) if entry.pdf_path.as_deref() == Some(src) => {
+            entry.pdf_path = Some(tgt.to_string());
+            hs_common::catalog::write_catalog_entry_via(storage, "catalog", stem, &entry)
+                .await
+                .map_err(|e| anyhow::anyhow!("catalog pdf_path rewrite {stem}: {e}"))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Move one object. Guarantees:
@@ -446,7 +480,8 @@ enum RelocateOutcome {
 ///
 /// The `Storage` trait has no conditional put, so a writer that creates
 /// `tgt` between the probe and the put would be overwritten: run this with
-/// the downloader/inbox quiet.
+/// the downloader/inbox quiet. That is an accepted operator invariant
+/// (RA-OPS-D4): migrations are operator-run, one at a time.
 async fn relocate_one(
     storage: &dyn hs_common::storage::Storage,
     src: &str,
@@ -497,11 +532,15 @@ async fn relocate_one(
                 src_meta.size
             );
         }
+        // A prior run may have stopped after the put but before (or while)
+        // rewriting the catalog row; the source is the only thing that names
+        // that stem's old key, so rewrite before it is deleted.
+        let catalog_updated = rewrite_catalog_pdf_path(storage, &stem, src, tgt).await?;
         storage
             .delete(src)
             .await
             .map_err(|e| anyhow::anyhow!("delete src {src}: {e}"))?;
-        return Ok(RelocateOutcome::AlreadyAtTarget);
+        return Ok(RelocateOutcome::AlreadyAtTarget { catalog_updated });
     }
 
     let bytes = storage
@@ -525,23 +564,7 @@ async fn relocate_one(
     }
     drop(written);
 
-    // Rewrite catalog row's `pdf_path` if it still points at the bucket-root
-    // key. `hs_common::catalog::read_catalog_entry_via` looks up by stem and
-    // uses the sharded layout under `catalog/`, which is already correct.
-    let catalog_updated =
-        match hs_common::catalog::read_catalog_entry_via(storage, "catalog", &stem)
-            .await
-            .map_err(|e| anyhow::anyhow!("catalog read for {stem}: {e}"))?
-        {
-            Some(mut entry) if entry.pdf_path.as_deref() == Some(src) => {
-                entry.pdf_path = Some(tgt.to_string());
-                hs_common::catalog::write_catalog_entry_via(storage, "catalog", &stem, &entry)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("catalog pdf_path rewrite {stem}: {e}"))?;
-                true
-            }
-            _ => false,
-        };
+    let catalog_updated = rewrite_catalog_pdf_path(storage, &stem, src, tgt).await?;
 
     storage
         .delete(src)
@@ -763,10 +786,30 @@ async fn inspect_and_quarantine(
         if dry_run {
             return Ok(QuarantineOutcome::RenamedToHtml);
         }
-        storage
-            .put(&tgt, bytes)
+        // Never replace an existing `.html` twin with different bytes: it
+        // may be the real download, and deleting the `.pdf` after that
+        // overwrite would destroy the only other copy.
+        match storage
+            .head(&tgt)
             .await
-            .map_err(|e| anyhow::anyhow!("put({tgt}): {e}"))?;
+            .map_err(|e| anyhow::anyhow!("head({tgt}): {e}"))?
+        {
+            Some(_) => {
+                let existing = storage
+                    .get(&tgt)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("get({tgt}): {e}"))?;
+                if existing != bytes {
+                    anyhow::bail!(
+                        "{tgt} already exists with different content; refusing to overwrite it or delete {src}"
+                    );
+                }
+            }
+            None => storage
+                .put(&tgt, bytes)
+                .await
+                .map_err(|e| anyhow::anyhow!("put({tgt}): {e}"))?,
+        }
         storage
             .delete(src)
             .await
@@ -779,13 +822,8 @@ async fn inspect_and_quarantine(
             "key": tgt,
             "source": "hs migrate quarantine-bad-content:html_rename",
         });
-        if let Err(e) = bus
-            .publish(
-                "papers.ingested",
-                serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
-            )
-            .await
-        {
+        let body = serde_json::to_vec(&payload)?;
+        if let Err(e) = bus.publish("papers.ingested", body.as_slice()).await {
             tracing::warn!(key = %tgt, error = %e, "re-queue publish failed; file relies on catalog_repair");
         }
         return Ok(QuarantineOutcome::RenamedToHtml);
@@ -801,8 +839,10 @@ async fn inspect_and_quarantine(
         return Ok(QuarantineOutcome::Quarantined);
     }
     // Stamp catalog first so a mid-op crash still leaves the row dead
-    // rather than resurrectable by stuck_convert.
-    if let Err(e) = hs_common::catalog::update_conversion_failed_via(
+    // rather than resurrectable by stuck_convert. A failed stamp aborts
+    // before anything is moved: moving the file without it would leave a
+    // resurrectable row pointing at a missing source.
+    hs_common::catalog::update_conversion_failed_via(
         storage,
         "catalog",
         &stem,
@@ -810,9 +850,7 @@ async fn inspect_and_quarantine(
         Vec::new(),
     )
     .await
-    {
-        tracing::warn!(stem, error = %e, "conversion_failed stamp failed; continuing with move");
-    }
+    .map_err(|e| anyhow::anyhow!("conversion_failed stamp for {stem}: {e}"))?;
     storage
         .put(&tgt, bytes)
         .await
@@ -862,13 +900,10 @@ async fn purge_local_html_rows(
     }
 
     for (stem, _meta, _entry) in entries {
-        match hs_common::catalog::delete_catalog_entry_via(storage, "catalog", &stem).await {
-            Ok(()) => stats.deleted_catalog += 1,
-            Err(e) => {
-                stats.errors.push(format!("catalog/{stem}: {e}"));
-                continue;
-            }
-        }
+        // Companion objects first, the catalog row last: the row is how a
+        // re-run finds this stem, so it may only go once nothing else is
+        // left behind.
+        let errors_before = stats.errors.len();
 
         let md_key = format!("markdown/{}", hs_common::sharded_key(&stem, "md"));
         match storage.exists(&md_key).await {
@@ -896,6 +931,14 @@ async fn purge_local_html_rows(
                 Ok(()) => stats.deleted_paper += 1,
                 Err(e) => stats.errors.push(format!("papers/{stem}.{ext}: {e}")),
             }
+        }
+
+        if stats.errors.len() > errors_before {
+            continue;
+        }
+        match hs_common::catalog::delete_catalog_entry_via(storage, "catalog", &stem).await {
+            Ok(()) => stats.deleted_catalog += 1,
+            Err(e) => stats.errors.push(format!("catalog/{stem}: {e}")),
         }
     }
 
@@ -1068,7 +1111,12 @@ mod root_orphan_tests {
         let outcome = relocate_one(&storage, "ab/abcdef.pdf", "papers/ab/abcdef.pdf")
             .await
             .unwrap();
-        assert!(matches!(outcome, RelocateOutcome::AlreadyAtTarget));
+        assert!(matches!(
+            outcome,
+            RelocateOutcome::AlreadyAtTarget {
+                catalog_updated: false
+            }
+        ));
         assert!(storage.exists("ab/abcdef.pdf").await.unwrap().not());
         assert!(storage.exists("papers/ab/abcdef.pdf").await.unwrap());
     }
@@ -1513,7 +1561,7 @@ pub async fn run_canonicalize_doi_stems(
     }
 
     let servers = crate::distill_cmd::resolve_servers(server).await?;
-    let distill = hs_distill::client::DistillClient::new(&servers[0])?;
+    let distill = crate::distill_cmd::make_distill_client(&servers[0]).await?;
 
     let stop = crate::shutdown::cooperative();
     let mut interrupted = false;
@@ -1584,6 +1632,7 @@ pub async fn run_canonicalize_doi_stems(
         // Any stem whose canonical markdown ends up different from what is
         // currently indexed has to be re-indexed, or search keeps serving
         // the old body under the canonical doc_id.
+        let errors_before = stats.errors.len();
         let mut canonical_content_changed = false;
 
         let from_md = hs_common::markdown::markdown_storage_key(&v.stem);
@@ -1652,68 +1701,88 @@ pub async fn run_canonicalize_doi_stems(
         }
 
         // Catalog row: carry this row's metadata over only when the
-        // canonical row is absent, then drop the variant row either way.
-        match hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", &v.stem).await {
-            Ok(Some(mut entry)) => {
-                let canonical_exists = match hs_common::catalog::read_catalog_entry_via(
-                    &*storage,
-                    "catalog",
-                    &v.canonical,
-                )
-                .await
-                {
-                    Ok(row) => row.is_some(),
-                    Err(e) => {
-                        // Unknown is not "absent": the variant row is deleted
-                        // below, so deciding blind could destroy the only copy.
-                        stats
-                            .errors
-                            .push(format!("read catalog {}: {e:#}", v.canonical));
-                        continue;
-                    }
-                };
-                // Write this row onto the canonical key when the canonical
-                // row is absent, and also when this spelling won a collision
-                // — its markdown was just promoted, so its provenance
-                // (`conversion`, `converted_by`, page offsets) has to travel
-                // with the bytes. Leaving the loser's stamp attached to the
-                // winner's content is exactly the kind of mismatched record
-                // that takes hours to trace later.
-                if !canonical_exists || (v.is_collision() && v.variant_wins()) {
-                    entry.markdown_path = Some(to_md.clone());
-                    if let Some(p) = entry.pdf_path.as_ref() {
-                        let ext = Path::new(p)
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("pdf")
-                            .to_string();
-                        entry.pdf_path = Some(format!(
-                            "papers/{}",
-                            hs_common::sharded_key(&v.canonical, &ext)
-                        ));
-                    }
-                    match hs_common::catalog::write_catalog_entry_via(
+        // canonical row is absent (or this spelling won a collision).
+        // Failures here leave the block, not the stem: the markdown may
+        // already sit on the canonical key, so the purge and re-index below
+        // must still run.
+        'catalog: {
+            match hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", &v.stem).await {
+                Ok(Some(mut entry)) => {
+                    let canonical_exists = match hs_common::catalog::read_catalog_entry_via(
                         &*storage,
                         "catalog",
                         &v.canonical,
-                        &entry,
                     )
                     .await
                     {
-                        Ok(()) => stats.rewrote_catalog += 1,
-                        Err(e) => stats
-                            .errors
-                            .push(format!("write catalog {}: {e}", v.canonical)),
+                        Ok(row) => row.is_some(),
+                        Err(e) => {
+                            // Unknown is not "absent": the variant row is deleted
+                            // below, so deciding blind could destroy the only copy.
+                            stats
+                                .errors
+                                .push(format!("read catalog {}: {e:#}", v.canonical));
+                            break 'catalog;
+                        }
+                    };
+                    // Write this row onto the canonical key when the canonical
+                    // row is absent, and also when this spelling won a collision
+                    // — its markdown was just promoted, so its provenance
+                    // (`conversion`, `converted_by`, page offsets) has to travel
+                    // with the bytes. Leaving the loser's stamp attached to the
+                    // winner's content is exactly the kind of mismatched record
+                    // that takes hours to trace later.
+                    if !canonical_exists || (v.is_collision() && v.variant_wins()) {
+                        entry.markdown_path = Some(to_md.clone());
+                        if let Some(p) = entry.pdf_path.as_ref() {
+                            let ext = Path::new(p)
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("pdf")
+                                .to_string();
+                            entry.pdf_path = Some(format!(
+                                "papers/{}",
+                                hs_common::sharded_key(&v.canonical, &ext)
+                            ));
+                        }
+                        match hs_common::catalog::write_catalog_entry_via(
+                            &*storage,
+                            "catalog",
+                            &v.canonical,
+                            &entry,
+                        )
+                        .await
+                        {
+                            Ok(()) => stats.rewrote_catalog += 1,
+                            Err(e) => {
+                                // The variant row below is the only copy of this
+                                // metadata; do not delete it.
+                                stats
+                                    .errors
+                                    .push(format!("write catalog {}: {e}", v.canonical));
+                                break 'catalog;
+                            }
+                        }
                     }
                 }
+                Ok(None) => {}
+                Err(e) => {
+                    stats.errors.push(format!("read catalog {}: {e}", v.stem));
+                    break 'catalog;
+                }
             }
-            Ok(None) => {}
-            Err(e) => stats.errors.push(format!("read catalog {}: {e}", v.stem)),
         }
 
-        match hs_common::catalog::delete_catalog_entry_via(&*storage, "catalog", &v.stem).await {
-            Ok(()) => stats.deleted_catalog += 1,
-            Err(e) => stats.errors.push(format!("delete catalog {}: {e}", v.stem)),
+        // Any failure above leaves the variant row as the only handle for a
+        // retry, so it is deleted only on a clean pass. The purge and
+        // re-index still run: once the markdown has moved, a re-run sees no
+        // variant markdown and would never re-index the canonical key.
+        if stats.errors.len() == errors_before {
+            match hs_common::catalog::delete_catalog_entry_via(&*storage, "catalog", &v.stem).await
+            {
+                Ok(()) => stats.deleted_catalog += 1,
+                Err(e) => stats.errors.push(format!("delete catalog {}: {e}", v.stem)),
+            }
         }
 
         // Drop the variant's vectors. Until this happens the duplicate is
@@ -2138,8 +2207,48 @@ mod migration_safety_tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, RelocateOutcome::AlreadyAtTarget));
+        assert!(matches!(
+            outcome,
+            RelocateOutcome::AlreadyAtTarget {
+                catalog_updated: false
+            }
+        ));
         assert!(!storage.inner.exists("ab/abcdef.pdf").await.unwrap());
         assert_eq!(storage.puts.load(Ordering::SeqCst), 0);
+    }
+
+    /// A run that put the target but failed the catalog write left source and
+    /// target identical; the re-run used to delete the source without ever
+    /// rewriting the row, leaving `pdf_path` pointing at a deleted key.
+    #[tokio::test]
+    async fn a_rerun_after_a_failed_catalog_rewrite_still_rewrites_the_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FaultyStorage::new(tmp.path());
+        for key in ["ab/abcdef.pdf", "papers/ab/abcdef.pdf"] {
+            storage.inner.put(key, b"identical".to_vec()).await.unwrap();
+        }
+        let entry = hs_common::catalog::CatalogEntry {
+            pdf_path: Some("ab/abcdef.pdf".to_string()),
+            ..Default::default()
+        };
+        hs_common::catalog::write_catalog_entry_via(&storage, "catalog", "abcdef", &entry)
+            .await
+            .unwrap();
+
+        let outcome = relocate_one(&storage, "ab/abcdef.pdf", "papers/ab/abcdef.pdf")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            RelocateOutcome::AlreadyAtTarget {
+                catalog_updated: true
+            }
+        ));
+        let row = hs_common::catalog::read_catalog_entry_via(&storage, "catalog", "abcdef")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.pdf_path.as_deref(), Some("papers/ab/abcdef.pdf"));
     }
 }

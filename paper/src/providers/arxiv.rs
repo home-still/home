@@ -7,6 +7,7 @@ use crate::config::ArxivConfig;
 use crate::error::PaperError;
 use crate::models::{Paper, SearchQuery, SearchResult, SearchType, SortBy};
 use crate::ports::provider::PaperProvider;
+use crate::providers::response::{check_response, status_error};
 
 pub struct ArxivProvider {
     client: Client,
@@ -50,12 +51,7 @@ impl ArxivProvider {
         let url = url::Url::parse_with_params(&self.base_url, &[("id_list", id)])
             .map_err(|e| PaperError::InvalidInput(e.to_string()))?;
         let response = self.client.get(url).send().await?;
-        if !response.status().is_success() {
-            return Err(PaperError::ProviderUnavailable(format!(
-                "arXiv id_list returned {}",
-                response.status()
-            )));
-        }
+        check_response(&response, "arxiv")?;
         let xml = response.text().await?;
         let (papers, _) = self.parse_atom_feed(&xml)?;
         Ok(papers.into_iter().next())
@@ -205,9 +201,34 @@ impl ArxivProvider {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
 
-        let papers: Vec<Paper> = root
+        let entries: Vec<roxmltree::Node> = root
             .children()
             .filter(|n| n.has_tag_name((ns, "entry")))
+            .collect();
+
+        // The arXiv API reports a bad request (malformed id, bad query) as a
+        // 200 feed with ONE entry whose `<id>` is under `/api/errors` and
+        // whose `<summary>` is the message. It is not a paper.
+        if let Some(failure) = entries.iter().find(|entry| {
+            entry
+                .children()
+                .find(|n| n.has_tag_name((ns, "id")))
+                .and_then(|n| n.text())
+                .is_some_and(|id| id.contains("arxiv.org/api/errors"))
+        }) {
+            let message = failure
+                .children()
+                .find(|n| n.has_tag_name((ns, "summary")))
+                .and_then(|n| n.text())
+                .unwrap_or("no message")
+                .trim();
+            return Err(PaperError::InvalidInput(format!(
+                "arXiv rejected the request: {message}"
+            )));
+        }
+
+        let papers: Vec<Paper> = entries
+            .into_iter()
             .filter_map(|entry| self.extract_paper(entry, ns).ok())
             .collect();
 
@@ -259,10 +280,7 @@ impl PaperProvider for ArxivProvider {
                 retry_after: None,
             });
         } else if !response.status().is_success() {
-            return Err(PaperError::ProviderUnavailable(format!(
-                "arXiv returned {}",
-                response.status()
-            )));
+            return Err(status_error("arxiv", response.status()));
         }
 
         let xml = response.text().await?;
@@ -271,7 +289,7 @@ impl PaperProvider for ArxivProvider {
         Ok(SearchResult {
             papers,
             total_results,
-            next_offset: Some(query.offset + query.max_results),
+            next_offset: Some(query.offset + query.max_results).filter(|&n| n < total_results),
             provider: String::from("arxiv"),
             provider_failures: Vec::new(),
         })
@@ -435,5 +453,28 @@ mod tests {
         let (papers, _) = p.parse_atom_feed(xml).expect("feed parses");
         assert_eq!(papers.len(), 1);
         assert_eq!(papers[0].publication_date, None);
+    }
+
+    #[test]
+    fn an_api_error_feed_is_an_error_not_a_paper() {
+        // arXiv answers a malformed `id_list` with HTTP 200 and one entry
+        // under `/api/errors`; it used to surface as a paper titled "Error".
+        let p = provider();
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+              <feed xmlns="http://www.w3.org/2005/Atom"
+                    xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+                  <opensearch:totalResults>1</opensearch:totalResults>
+                  <entry>
+                      <id>http://arxiv.org/api/errors#incorrect_id_format_for_foo</id>
+                      <title>Error</title>
+                      <summary>incorrect id format for foo</summary>
+                  </entry>
+              </feed>"#;
+
+        let err = p.parse_atom_feed(xml).expect_err("error feed must fail");
+        assert!(
+            matches!(&err, PaperError::InvalidInput(m) if m.contains("incorrect id format")),
+            "{err:?}"
+        );
     }
 }

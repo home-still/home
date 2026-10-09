@@ -134,8 +134,7 @@ struct HomeYaml {
 impl ConfigFile {
     /// Read `$HOME/.home-still/config.yaml`.
     pub fn load() -> Result<Self, ConfigError> {
-        let home = dirs::home_dir().ok_or(ConfigError::NoHomeDir)?;
-        Self::load_in(&home)
+        Self::load_in(&home_dir()?)
     }
 
     /// Read `<home>/.home-still/config.yaml`. `home` is also what `~/` in
@@ -276,13 +275,30 @@ fn kind_of(value: &Value) -> &'static str {
     }
 }
 
+/// The current user's home directory. A host that cannot name one is an
+/// error: every `~/.home-still/...` path would otherwise degrade to a
+/// relative path under whatever the working directory happens to be.
+pub fn home_dir() -> Result<PathBuf, ConfigError> {
+    dirs::home_dir().ok_or(ConfigError::NoHomeDir)
+}
+
+/// `$HOME/.home-still`, where config, credentials, PID files and caches live.
+pub fn hidden_dir() -> Result<PathBuf, ConfigError> {
+    Ok(home_dir()?.join(crate::HIDDEN_DIR))
+}
+
 /// The built-in project directory, `~/home-still`, ignoring the config file.
 /// This is what `Default` impls use; loaders resolve the effective
 /// directory with [`resolve_project_dir`] instead.
+///
+/// `Default` cannot return an error, so a host with no home directory panics
+/// here with the [`ConfigError::NoHomeDir`] message rather than yielding a
+/// relative `home-still`.
 pub fn default_project_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(PROJECT_DIR_DEFAULT)
+    match home_dir() {
+        Ok(home) => home.join(PROJECT_DIR_DEFAULT),
+        Err(e) => panic!("{e}"),
+    }
 }
 
 /// The effective project directory (`home.project_dir`, else `~/home-still`).
@@ -536,7 +552,7 @@ pub fn warn_unknown_prefixed_env(prefix: &str, known: &[&serde_json::Value], all
 impl ConfigFile {
     /// The `storage:` section, or the documented default (local filesystem
     /// at `~/home-still`) when the section is absent. An absent section on a
-    /// host whose `home.project_dir` points elsewhere is logged once (see
+    /// host whose `home.project_dir` points elsewhere is an error (see
     /// [`Self::default_storage`]).
     pub fn storage(&self) -> Result<crate::storage::StorageConfig, ConfigError> {
         match self.section("storage")? {
@@ -547,35 +563,51 @@ impl ConfigFile {
 
     /// The default storage for a file with no `storage:` section. The
     /// default root is `~/home-still` whatever `home.project_dir` says;
-    /// moving it would silently relocate the objects of every host that runs
-    /// on today's default, so it is only announced: once, naming both paths.
+    /// when the two name different directories the host would split its
+    /// objects from its logs and data, so loading refuses until the operator
+    /// states the root in an explicit `storage:` section.
     pub fn default_storage(&self) -> Result<crate::storage::StorageConfig, ConfigError> {
         let storage = crate::storage::StorageConfig::default();
-        if let Some(note) = self.storage_default_note(&storage)? {
-            if first_time(&format!("storage-default#{}", self.path.display())) {
-                tracing::warn!("{note}");
-            }
-        }
+        let project = self.home_section()?.project_dir;
+        let project = match project {
+            Some(value) => Some(self.expand("home.project_dir", &value)?),
+            None => None,
+        };
+        check_storage_default(&self.path, project.as_deref(), false, &storage.local.root)?;
         Ok(storage)
     }
+}
 
-    fn storage_default_note(
-        &self,
-        storage: &crate::storage::StorageConfig,
-    ) -> Result<Option<String>, ConfigError> {
-        let project = self.project_dir()?;
-        if project == self.home.join(PROJECT_DIR_DEFAULT) {
-            return Ok(None);
-        }
-        Ok(Some(format!(
-            "{}: no `storage:` section, so objects (papers, markdown, catalog) are stored under \
-             {} while `home.project_dir` is {}; add `storage.local.root` (or `storage.backend: \
-             s3`) so both agree, or confirm the split is intended",
-            self.path.display(),
-            storage.local.root.display(),
-            project.display()
-        )))
+/// Decide whether an implicit storage root may stand. Fails when there is no
+/// explicit `storage:` section and `home.project_dir` resolves to a
+/// directory other than the default storage root.
+#[cfg(feature = "storage")]
+fn check_storage_default(
+    config_path: &Path,
+    project_dir: Option<&Path>,
+    explicit_storage: bool,
+    default_root: &Path,
+) -> Result<(), ConfigError> {
+    let Some(project) = project_dir else {
+        return Ok(());
+    };
+    if explicit_storage || project == default_root {
+        return Ok(());
     }
+    Err(ConfigError::section(
+        config_path,
+        "storage",
+        format!(
+            "no `storage:` section, so objects (papers, markdown, catalog) would be stored \
+             under {} while `home.project_dir` is {}; add an explicit `storage:` section \
+             stating the root:\n\nstorage:\n  backend: local\n  local:\n    root: {}\n\n\
+             (use the default root {} to keep the existing objects where they are)",
+            default_root.display(),
+            project.display(),
+            project.display(),
+            default_root.display()
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -819,39 +851,54 @@ mod tests {
     mod storage {
         use super::*;
 
-        fn note(config: Option<&str>) -> (tempfile::TempDir, Option<String>) {
-            let home = home_with(config);
-            let file = ConfigFile::load_in(home.path()).unwrap();
-            let storage = crate::storage::StorageConfig::default();
-            let note = file.storage_default_note(&storage).unwrap();
-            (home, note)
+        use std::path::Path;
+
+        const CFG: &str = "/h/.home-still/config.yaml";
+
+        fn decide(project: Option<&str>, explicit: bool) -> Result<(), ConfigError> {
+            check_storage_default(
+                Path::new(CFG),
+                project.map(Path::new),
+                explicit,
+                Path::new("/h/home-still"),
+            )
         }
 
         #[test]
-        fn an_absent_storage_section_is_silent_on_the_default_project_dir() {
-            assert!(note(None).1.is_none());
-            assert!(note(Some("home:\n  log_dir: /var/log/hs\n")).1.is_none());
+        fn no_project_dir_or_the_default_one_or_explicit_storage_passes() {
+            assert!(decide(None, false).is_ok());
+            assert!(decide(Some("/h/home-still"), false).is_ok());
+            assert!(decide(Some("/data/hs"), true).is_ok());
         }
 
         #[test]
-        fn an_absent_storage_section_with_a_moved_project_dir_names_both_paths() {
-            let (_home, note) = note(Some("home:\n  project_dir: /data/hs\n"));
-            let note = note.expect("must be announced");
-            let default_root = crate::storage::StorageConfig::default().local.root;
-            assert!(note.contains("/data/hs"), "{note}");
-            assert!(note.contains(&default_root.display().to_string()), "{note}");
-            assert!(note.contains("storage.local.root"), "{note}");
+        fn a_moved_project_dir_without_storage_is_an_error_naming_both_paths_and_the_yaml() {
+            let err = decide(Some("/data/hs"), false).unwrap_err().to_string();
+            assert!(err.contains("/data/hs"), "{err}");
+            assert!(err.contains("/h/home-still"), "{err}");
+            assert!(
+                err.contains("storage:\n  backend: local\n  local:\n    root: /data/hs"),
+                "{err}"
+            );
         }
 
         #[test]
-        fn the_default_root_is_not_moved_by_the_warning() {
-            // Only announced: relocating it would orphan the objects of
-            // every host that runs on today's default.
+        fn the_loader_refuses_a_moved_project_dir_and_accepts_an_explicit_storage() {
             let home = home_with(Some("home:\n  project_dir: /data/hs\n"));
+            let file = ConfigFile::load_in(home.path()).unwrap();
+            let err = file.storage().unwrap_err().to_string();
+            assert!(
+                err.contains("/data/hs") && err.contains("`storage`"),
+                "{err}"
+            );
+
+            let home = home_with(Some(
+                "home:\n  project_dir: /data/hs\nstorage:\n  backend: local\n  local:\n    root: /data/hs\n",
+            ));
             let file = ConfigFile::load_in(home.path()).unwrap();
             assert_eq!(
                 file.storage().unwrap().local.root,
-                crate::storage::StorageConfig::default().local.root
+                std::path::PathBuf::from("/data/hs")
             );
         }
 

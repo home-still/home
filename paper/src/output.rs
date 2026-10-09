@@ -50,7 +50,25 @@ pub fn print_search_result(
     }
 }
 
-/// Format search results as one-line-per-result tab-separated text.
+/// Escape a field for tab-separated output: backslash, tab, newline and
+/// carriage return become `\\`, `\t`, `\n`, `\r`, so a field can never add a
+/// column or a line.
+fn escape_tsv(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    for c in field.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Format search results as one-line-per-result tab-separated text. Every
+/// field is escaped with [`escape_tsv`].
 pub fn format_search_result_pipe(result: &SearchResult) -> String {
     let mut out = String::new();
     for paper in &result.papers {
@@ -62,7 +80,10 @@ pub fn format_search_result_pipe(result: &SearchResult) -> String {
         let doi = paper.doi.as_deref().unwrap_or("-");
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\n",
-            paper.title, authors, date, doi
+            escape_tsv(&paper.title),
+            escape_tsv(&authors),
+            escape_tsv(&date),
+            escape_tsv(doi)
         ));
     }
     out
@@ -220,5 +241,18 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("Paper One"));
         assert!(lines[1].starts_with("Paper Two"));
+    }
+
+    #[test]
+    fn pipe_format_escapes_control_characters_in_every_field() {
+        let mut paper = make_paper("A\tB\nC\r\\D", Some("10.1/x\ty"), None);
+        paper.authors[0].name = "Smi\tth\nJ".into();
+        let out = format_search_result_pipe(&make_result(vec![paper]));
+        assert_eq!(out.matches('\n').count(), 1, "one line per paper: {out:?}");
+        let fields: Vec<&str> = out.trim_end_matches('\n').split('\t').collect();
+        assert_eq!(fields.len(), 4, "{out:?}");
+        assert_eq!(fields[0], "A\\tB\\nC\\r\\\\D");
+        assert_eq!(fields[1], "Smi\\tth\\nJ, Zhang Y");
+        assert_eq!(fields[3], "10.1/x\\ty");
     }
 }

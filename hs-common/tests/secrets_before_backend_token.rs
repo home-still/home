@@ -1,14 +1,15 @@
 //! A backend token that exists only in `secrets.env` must be visible to
 //! `BackendToken::from_env` once `load_secrets_from` has run, which is the
 //! order every server's `main()` now follows (secrets, then runtime, then the
-//! token read). Only the first test touches the process environment, and it
-//! is the only one that reads it, so they cannot interfere.
+//! token read). This binary holds a single test: it mutates the process
+//! environment, and a concurrent test thread reading it (`tempdir()`,
+//! `var_os`) beside `setenv` can SIGSEGV on glibc before 2.41.
 #![cfg(feature = "auth")]
 
 use hs_common::auth::backend::{BackendToken, ENV_VAR};
 
 #[test]
-fn a_token_provided_only_via_secrets_env_is_visible_to_from_env() {
+fn secrets_env_feeds_the_token_read_and_an_unreadable_file_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("secrets.env");
     std::fs::write(
@@ -24,10 +25,7 @@ fn a_token_provided_only_via_secrets_env_is_visible_to_from_env() {
 
     assert_eq!(hs_common::secrets::load_secrets_from(&path).unwrap(), 1);
     BackendToken::from_env().expect("loaded from secrets.env");
-}
 
-#[test]
-fn an_unreadable_secrets_file_is_an_error_the_caller_can_propagate() {
     // A directory where the file should be: reading it fails.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("secrets.env");

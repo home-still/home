@@ -75,10 +75,10 @@ WantedBy=multi-user.target
 
 ## Configuration
 
-The MCP server reads the same `~/.home-still/config.yaml` as the CLI. It discovers scribe and distill servers from the gateway service registry, falling back to config values when the gateway is unavailable. It uses:
+The MCP server reads the same `~/.home-still/config.yaml` as the CLI. It takes scribe and distill server addresses from the config (there is no service registry). It uses:
 
-- `scribe.servers` — fallback scribe backends (overridden by gateway registry)
-- `distill.servers` — fallback distill backends (overridden by gateway registry)
+- `scribe.servers` — scribe backends
+- `distill.servers` — distill backends
 - `scribe.output_dir` / `scribe.watch_dir` / `scribe.catalog_dir` — for filesystem tools
 - `home.project_dir` — base directory for papers and markdown
 

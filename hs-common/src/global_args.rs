@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 #[derive(clap::ValueEnum, Clone, Debug, Default)]
 pub enum ColorChoice {
     #[default]
@@ -43,10 +41,6 @@ pub struct GlobalArgs {
     /// Show debug-level output
     #[arg(long, global = true, help_heading = "Global Options")]
     pub verbose: bool,
-
-    /// Override config directory
-    #[arg(long, global = true, help_heading = "Global Options")]
-    pub config_dir: Option<PathBuf>,
 
     /// Skip interactive prompts (assume yes)                               
     #[arg(short = 'y', long, global = true, help_heading = "Global Options")]

@@ -3,7 +3,6 @@
 /// Strips only formatting commands (not structural ones like \frac, \alpha, \sum),
 /// keeps braces, subscripts, and other structural LaTeX.
 /// Score in [0, 100] where 100 means identical.
-
 /// Score a single formula pair using token-level F1 matching.
 ///
 /// Approximates official CDM: tokenize LaTeX → multiset intersection → F1.
@@ -280,9 +279,11 @@ fn strip_arraycolsep(s: &str) -> String {
     result
 }
 
+/// Byte offset of the `}` that closes the `{` at the start of `s`. Callers
+/// slice `s` with it, so it must be a byte offset, not a char index.
 fn find_matching_brace(s: &str) -> Option<usize> {
     let mut depth = 0;
-    for (i, ch) in s.chars().enumerate() {
+    for (i, ch) in s.char_indices() {
         if ch == '{' {
             depth += 1;
         } else if ch == '}' {

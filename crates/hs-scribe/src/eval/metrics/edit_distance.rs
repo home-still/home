@@ -31,7 +31,12 @@ pub fn normalize_for_ned(text: &str) -> String {
         // Remove markdown table formatting (pipe delimiters, separator rows)
         if l.contains('|') {
             // Check if it's a separator row like | --- | --- |
-            let stripped = l.replace('|', "").replace('-', "").trim().to_string();
+            let stripped = l
+                .chars()
+                .filter(|&c| c != '|' && c != '-')
+                .collect::<String>()
+                .trim()
+                .to_string();
             if stripped.is_empty() {
                 continue; // Skip table separator rows
             }
@@ -41,47 +46,53 @@ pub fn normalize_for_ned(text: &str) -> String {
 
         // Normalize Unicode variants that OCR may produce differently
         l = l
-            .replace('\u{2013}', "-") // en-dash → hyphen
-            .replace('\u{2014}', "-") // em-dash → hyphen
-            .replace('\u{2018}', "'") // left single quote
-            .replace('\u{2019}', "'") // right single quote / apostrophe
-            .replace('\u{201C}', "\"") // left double quote
-            .replace('\u{201D}', "\"") // right double quote
-            .replace('\u{00A0}', " ") // non-breaking space
-            .replace('\u{2009}', " ") // thin space
-            .replace('\u{200B}', "") // zero-width space
-            .replace('\u{FEFF}', "") // BOM
-            .replace('\u{00B7}', ".") // middle dot
-            .replace('\u{2022}', "-") // bullet
-            .replace('\u{00D7}', "x") // multiplication sign → x
-            .replace('\u{2212}', "-") // minus sign → hyphen
-            .replace('\u{2264}', "<=") // ≤
-            .replace('\u{2265}', ">=") // ≥
-            .replace('\u{00B1}', "+-") // ±
-            .replace('\u{00AD}', "") // soft hyphen (PDF line-break hint)
-            .replace('\u{200C}', "") // zero-width non-joiner
-            .replace('\u{200D}', "") // zero-width joiner
-            .replace('\u{2002}', " ") // en space
-            .replace('\u{2003}', " ") // em space
-            .replace('\u{2004}', " ") // three-per-em space
-            .replace('\u{2005}', " ") // four-per-em space
-            .replace('\u{2006}', " ") // six-per-em space
-            .replace('\u{2007}', " ") // figure space
-            .replace('\u{2008}', " ") // punctuation space
-            // Fullwidth forms → ASCII equivalents
-            .replace('\u{FF08}', "(") // fullwidth left paren
-            .replace('\u{FF09}', ")") // fullwidth right paren
-            .replace('\u{FF0C}', ",") // fullwidth comma
-            .replace('\u{FF0E}', ".") // fullwidth period
-            .replace('\u{FF1A}', ":") // fullwidth colon
-            .replace('\u{FF1B}', ";") // fullwidth semicolon
-            .replace('\u{FF01}', "!") // fullwidth exclamation
-            .replace('\u{FF1F}', "?") // fullwidth question mark
-            .replace('\u{3001}', ",") // ideographic comma
-            .replace('\u{3002}', ".") // ideographic period
-            .replace('\u{201E}', "\"") // double low-9 quote
-            .replace('\u{2033}', "\"") // double prime → quote
-            .replace('\u{2032}', "'"); // prime → apostrophe
+            .chars()
+            .fold(String::with_capacity(l.len()), |mut acc, c| {
+                match c {
+                    '\u{2013}' => acc.push('-'),      // en-dash → hyphen
+                    '\u{2014}' => acc.push('-'),      // em-dash → hyphen
+                    '\u{2018}' => acc.push('\''),     // left single quote
+                    '\u{2019}' => acc.push('\''),     // right single quote / apostrophe
+                    '\u{201C}' => acc.push('"'),      // left double quote
+                    '\u{201D}' => acc.push('"'),      // right double quote
+                    '\u{00A0}' => acc.push(' '),      // non-breaking space
+                    '\u{2009}' => acc.push(' '),      // thin space
+                    '\u{200B}' => acc.push_str(""),   // zero-width space
+                    '\u{FEFF}' => acc.push_str(""),   // BOM
+                    '\u{00B7}' => acc.push('.'),      // middle dot
+                    '\u{2022}' => acc.push('-'),      // bullet
+                    '\u{00D7}' => acc.push('x'),      // multiplication sign → x
+                    '\u{2212}' => acc.push('-'),      // minus sign → hyphen
+                    '\u{2264}' => acc.push_str("<="), // ≤
+                    '\u{2265}' => acc.push_str(">="), // ≥
+                    '\u{00B1}' => acc.push_str("+-"), // ±
+                    '\u{00AD}' => acc.push_str(""),   // soft hyphen (PDF line-break hint)
+                    '\u{200C}' => acc.push_str(""),   // zero-width non-joiner
+                    '\u{200D}' => acc.push_str(""),   // zero-width joiner
+                    '\u{2002}' => acc.push(' '),      // en space
+                    '\u{2003}' => acc.push(' '),      // em space
+                    '\u{2004}' => acc.push(' '),      // three-per-em space
+                    '\u{2005}' => acc.push(' '),      // four-per-em space
+                    '\u{2006}' => acc.push(' '),      // six-per-em space
+                    '\u{2007}' => acc.push(' '),      // figure space
+                    '\u{2008}' => acc.push(' '),      // punctuation space
+                    '\u{FF08}' => acc.push('('),      // fullwidth left paren
+                    '\u{FF09}' => acc.push(')'),      // fullwidth right paren
+                    '\u{FF0C}' => acc.push(','),      // fullwidth comma
+                    '\u{FF0E}' => acc.push('.'),      // fullwidth period
+                    '\u{FF1A}' => acc.push(':'),      // fullwidth colon
+                    '\u{FF1B}' => acc.push(';'),      // fullwidth semicolon
+                    '\u{FF01}' => acc.push('!'),      // fullwidth exclamation
+                    '\u{FF1F}' => acc.push('?'),      // fullwidth question mark
+                    '\u{3001}' => acc.push(','),      // ideographic comma
+                    '\u{3002}' => acc.push('.'),      // ideographic period
+                    '\u{201E}' => acc.push('"'),      // double low-9 quote
+                    '\u{2033}' => acc.push('"'),      // double prime → quote
+                    '\u{2032}' => acc.push('\''),     // prime → apostrophe
+                    _ => acc.push(c),
+                }
+                acc
+            });
 
         // Collapse multiple spaces to single
         let mut prev_space = false;
@@ -111,11 +122,7 @@ pub fn normalize_for_ned(text: &str) -> String {
     let joined = lines.join(" ");
 
     // Strip LaTeX structural characters remaining after command stripping
-    let joined = joined
-        .replace('_', "")
-        .replace('^', "")
-        .replace('{', "")
-        .replace('}', "");
+    let joined = joined.replace(['_', '^', '{', '}'], "");
 
     // Remove spaces around periods between digits (OCR artifact: "0. 45" → "0.45")
     let joined = collapse_digit_spaces(&joined);
@@ -420,7 +427,7 @@ pub fn normalized_edit_distance(reference: &str, hypothesis: &str) -> f64 {
     if ref_norm.is_empty() && hyp_norm.is_empty() {
         return 0.0;
     }
-    let max_len = ref_norm.len().max(hyp_norm.len()) as f64;
+    let max_len = ref_norm.chars().count().max(hyp_norm.chars().count()) as f64;
     let dist = edit_distance(&ref_norm, &hyp_norm) as f64;
     dist / max_len
 }
@@ -466,7 +473,7 @@ pub fn omnidocbench_text_score_blocks(ref_blocks: &[String], hyp_blocks: &[Strin
     // Per-block scoring can only IMPROVE on this, never make it worse.
     let ref_concat: String = ref_normed.join("");
     let hyp_concat: String = hyp_normed.join("");
-    let concat_max = ref_concat.len().max(hyp_concat.len());
+    let concat_max = ref_concat.chars().count().max(hyp_concat.chars().count());
     let concat_score = if concat_max == 0 {
         100.0
     } else {
@@ -530,7 +537,7 @@ pub fn omnidocbench_text_score_blocks(ref_blocks: &[String], hyp_blocks: &[Strin
         if matched_ref[i] || ref_normed[i].is_empty() {
             continue;
         }
-        let ref_len = ref_normed[i].len();
+        let ref_len = ref_normed[i].chars().count();
         let ref_chars: Vec<char> = ref_normed[i].chars().collect();
 
         // First try block-level NED against unmatched hyp blocks
@@ -542,7 +549,7 @@ pub fn omnidocbench_text_score_blocks(ref_blocks: &[String], hyp_blocks: &[Strin
             if matched_merged_hyp[j] || hyp.is_empty() {
                 continue;
             }
-            let max_len = ref_normed[i].len().max(hyp.len());
+            let max_len = ref_len.max(hyp.chars().count());
             let ned = edit_distance::edit_distance(&ref_normed[i], hyp) as f64 / max_len as f64;
             if ned < best_ned {
                 best_ned = ned;
@@ -556,7 +563,7 @@ pub fn omnidocbench_text_score_blocks(ref_blocks: &[String], hyp_blocks: &[Strin
         // Slide a window of size ~L across the hyp block and find the best NED.
         if best_ned > 0.3 && ref_len >= 10 {
             for (j, hyp) in merged_hyp.iter().enumerate() {
-                if hyp.is_empty() || hyp.len() < ref_len / 2 {
+                if hyp.is_empty() || hyp.chars().count() < ref_len / 2 {
                     continue;
                 }
                 let hyp_chars: Vec<char> = hyp.chars().collect();
@@ -576,7 +583,7 @@ pub fn omnidocbench_text_score_blocks(ref_blocks: &[String], hyp_blocks: &[Strin
                     let mut offset = 0;
                     while offset + win_size <= hyp_chars.len() {
                         let window: String = hyp_chars[offset..offset + win_size].iter().collect();
-                        let max_len = ref_len.max(window.len());
+                        let max_len = ref_len.max(win_size);
                         let ned = edit_distance::edit_distance(&ref_normed[i], &window) as f64
                             / max_len as f64;
                         if ned < best_ned {
@@ -612,12 +619,15 @@ pub fn omnidocbench_text_score_blocks(ref_blocks: &[String], hyp_blocks: &[Strin
             // For substring matches, use the NED from the sliding window.
             // The ref block was matched against a substring of the hyp block,
             // so comparing against the full hyp block would unfairly penalize.
-            let ref_len = ref_normed[i].len();
+            let ref_len = ref_normed[i].chars().count();
             sum_ed += (ned * ref_len as f64).round() as usize;
             sum_max += ref_len;
         } else {
             let ed = edit_distance::edit_distance(&ref_normed[i], &merged_hyp[j]);
-            let max_len = ref_normed[i].len().max(merged_hyp[j].len());
+            let max_len = ref_normed[i]
+                .chars()
+                .count()
+                .max(merged_hyp[j].chars().count());
             sum_ed += ed;
             sum_max += max_len;
         }
@@ -626,7 +636,7 @@ pub fn omnidocbench_text_score_blocks(ref_blocks: &[String], hyp_blocks: &[Strin
     // Unmatched ref blocks: full penalty
     for i in 0..n {
         if !matched_ref[i] && !ref_normed[i].is_empty() {
-            let len = ref_normed[i].len();
+            let len = ref_normed[i].chars().count();
             sum_ed += len;
             sum_max += len;
         }
@@ -647,7 +657,7 @@ pub fn omnidocbench_text_score_blocks(ref_blocks: &[String], hyp_blocks: &[Strin
     }
     for j in 0..m {
         if !consumed_hyp[j] && !hyp_normed[j].is_empty() {
-            let len = hyp_normed[j].len();
+            let len = hyp_normed[j].chars().count();
             sum_ed += len;
             sum_max += len;
         }
@@ -670,7 +680,7 @@ fn compute_ned_matrix(ref_normed: &[String], hyp_normed: &[String]) -> Vec<Vec<f
             hyp_normed
                 .iter()
                 .map(|h| {
-                    let max_len = r.len().max(h.len());
+                    let max_len = r.chars().count().max(h.chars().count());
                     if max_len == 0 {
                         0.0
                     } else {
@@ -708,7 +718,7 @@ fn try_merge_consecutive_hyp(
 
     // Find ref blocks with a good single-block match (NED < 0.25)
     let mut well_matched_hyp: Vec<bool> = vec![false; m];
-    for (_i, row) in ned_matrix.iter().enumerate() {
+    for row in ned_matrix.iter() {
         if let Some(best) = row
             .iter()
             .copied()
@@ -747,7 +757,7 @@ fn try_merge_consecutive_hyp(
                 merged.push_str(&hyp_normed[end]);
                 indices.push(end);
 
-                let max_len = ref_normed[i].len().max(merged.len());
+                let max_len = ref_normed[i].chars().count().max(merged.chars().count());
                 if max_len == 0 {
                     continue;
                 }
@@ -761,7 +771,7 @@ fn try_merge_consecutive_hyp(
                 }
 
                 // Stop if merged is already longer than ref
-                if merged.len() > ref_normed[i].len() * 2 {
+                if merged.chars().count() > ref_normed[i].chars().count() * 2 {
                     break;
                 }
             }
@@ -899,9 +909,9 @@ fn hungarian_minimize(costs: &[Vec<f64>]) -> Vec<(usize, usize)> {
 
     // Extract real assignments (skip padding)
     let mut result = Vec::new();
-    for j in 1..=size {
-        if p[j] > 0 && p[j] <= n && j <= m {
-            result.push((p[j] - 1, j - 1));
+    for (j, &pj) in p.iter().enumerate().take(size + 1).skip(1) {
+        if pj > 0 && pj <= n && j <= m {
+            result.push((pj - 1, j - 1));
         }
     }
     result

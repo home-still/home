@@ -114,7 +114,7 @@ pub fn issue_token(
     scope: &[String],
     typ: TokenType,
 ) -> anyhow::Result<String> {
-    let now = token::now_epoch();
+    let now = state.revocations.issue_iat(sub);
     let ttl = match typ {
         TokenType::Access => state.config.token_ttl_secs,
         TokenType::Refresh => state.config.refresh_ttl_secs,
@@ -122,7 +122,7 @@ pub fn issue_token(
     state.keys.sign(&TokenClaims {
         sub: sub.to_string(),
         iat: now,
-        exp: now + ttl,
+        exp: now.saturating_add(ttl),
         scope: scope.to_vec(),
         typ,
     })

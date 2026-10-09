@@ -509,14 +509,31 @@ async fn restart_launchd_unit(unit: &ServiceUnit) -> Result<(), String> {
         ));
     }
 
-    match launchd_pid(&unit.name).await {
-        Some(_) => Ok(()),
-        None => Err(format!(
-            "{}: still not running the new binary after restart (no pid)",
-            unit.name
-        )),
+    // launchd respawns a KeepAlive job on its own schedule (ThrottleInterval,
+    // and a respawn that dies on its first attempt — e.g. NATS not yet
+    // reachable — is retried): wait for a pid instead of judging the first
+    // instant after `kickstart`.
+    let deadline = tokio::time::Instant::now() + LAUNCHD_RESPAWN_TIMEOUT;
+    loop {
+        if launchd_pid(&unit.name).await.is_some() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{}: still not running the new binary after restart (no pid after {}s)",
+                unit.name,
+                LAUNCHD_RESPAWN_TIMEOUT.as_secs()
+            ));
+        }
+        tokio::time::sleep(LAUNCHD_POLL_INTERVAL).await;
     }
 }
+
+/// How long a kickstarted launchd job is given to get a pid.
+#[cfg(target_os = "macos")]
+const LAUNCHD_RESPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+#[cfg(target_os = "macos")]
+const LAUNCHD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[cfg(target_os = "macos")]
 fn launchd_target(label: &str) -> String {
@@ -609,7 +626,7 @@ fn matches_replaced(unit: &ServiceUnit, binaries: &[PathBuf]) -> bool {
 ///
 /// Deliberately *not* applied to `/proc/<pid>/exe` when verifying a restart:
 /// there the marker means the old inode is still running, which is a failure.
-fn on_disk_path(path: &Path) -> PathBuf {
+pub(crate) fn on_disk_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     match raw.strip_suffix(" (deleted)") {
         Some(stripped) => PathBuf::from(stripped),
@@ -719,38 +736,13 @@ fn parse_launchd_print_pid(stdout: &str) -> Option<u32> {
 /// was running and could not be brought back is an error — the old one was
 /// already killed, so "nothing to do" would hide an outage.
 async fn restart_index_daemon(reporter: &Arc<dyn Reporter>) -> Result<bool> {
-    let pid_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(hs_common::HIDDEN_DIR)
-        .join("distill-index.pid");
+    use crate::daemon::StopOutcome;
 
-    let pid = crate::daemon::read_pid(&pid_path);
-
-    match pid {
-        Some(pid) if crate::daemon::is_process_alive(pid) => {
+    // Only a PID that is really the index daemon is signaled; a PID file
+    // naming anything else is stale and is removed.
+    match crate::distill_cmd::stop_index_daemon().await? {
+        StopOutcome::Stopped(pid) => {
             reporter.status("Restart", &format!("distill indexer (PID {pid})"));
-
-            // Stop it (same pattern as distill_cmd::cmd_server_stop)
-            #[cfg(unix)]
-            {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-                for _ in 0..50 {
-                    if !crate::daemon::is_process_alive(pid) {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                if crate::daemon::is_process_alive(pid) {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
-                }
-            }
-            crate::daemon::remove_pid_file(&pid_path);
-
-            // Re-spawn
             if !crate::distill_cmd::ensure_index_running().await? {
                 bail!(
                     "the old indexer (PID {pid}) was stopped but a new one was not started: \
@@ -760,7 +752,14 @@ async fn restart_index_daemon(reporter: &Arc<dyn Reporter>) -> Result<bool> {
             reporter.status("OK", "distill indexer restarted");
             Ok(true)
         }
-        _ => Ok(false),
+        StopOutcome::Foreign(pid) => {
+            reporter.warn(&format!(
+                "distill-index.pid named PID {pid}, which is not the index daemon; \
+                 removed the stale PID file and left that process alone"
+            ));
+            Ok(false)
+        }
+        StopOutcome::Dead(_) | StopOutcome::NoPidFile => Ok(false),
     }
 }
 
@@ -794,9 +793,7 @@ fn classify_compose_restart(
 async fn restart_compose_services(reporter: &Arc<dyn Reporter>) -> Result<(u32, Vec<String>)> {
     use hs_common::compose::ComposeCmd;
 
-    let hidden = dirs::home_dir()
-        .unwrap_or_default()
-        .join(hs_common::HIDDEN_DIR);
+    let hidden = hs_common::hidden_dir()?;
 
     let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
 

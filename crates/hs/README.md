@@ -9,17 +9,17 @@ hs paper search    Search 6 academic providers
 hs paper download  Download papers by query or DOI
 hs paper get       Look up a single paper by DOI
 
-hs scribe init     Bootstrap PDF conversion services
-hs scribe convert  Convert a single PDF to markdown
-hs scribe watch    Auto-convert PDFs in a watched directory
-hs scribe server   Manage scribe Docker services (start/stop/ping/list)
-hs scribe status   Show watch daemon status
+hs scribe convert       Convert a single PDF to markdown
+hs scribe watch-events  Convert PDFs as `papers.ingested` events arrive (NATS)
+hs scribe reconvert     Clear a stem's conversion stamps and republish it for reconversion
+hs scribe catalog-backfill  Backfill catalog entries for markdown converted before the catalog existed
 hs scribe inbox    Sweep / run the manual-download inbox daemon
 
 hs distill init    Set up Qdrant and distill server
 hs distill index   Index markdown files into Qdrant
 hs distill search  Semantic search across indexed documents
-hs distill server  Manage distill server (start/stop/ping)
+hs distill watch-events  Index markdown as `scribe.completed` events arrive (NATS)
+hs distill reconcile    Reconcile markdown, Qdrant and the catalog (dry-run by default)
 hs distill status  Show collection statistics
 hs distill hnsw enable --collection <name> --yes   Start the background HNSW index build (needs HS_BACKEND_TOKEN; without --yes it prints the plan and exits 1)
 
@@ -47,7 +47,7 @@ hs cloud token     Print a fresh access token
 
 hs pipeline        Cross-service operations: rebuild, catch-up, purge-*, reap-phantoms, reconvert-failed, events-reset
 hs migrate         One-shot data migrations: sharding, move-root-orphans, quarantine-bad-content, canonicalize-doi-stems, drop-local-html
-hs openalex        Local OpenAlex catalog (DuckDB): load, load-works, status, query, build-indexes, build-fts
+hs openalex        Local OpenAlex catalog (DuckDB), steps in order: load / load-works (newest copy of each id wins), build-indexes, install-fts (needs network once), build-fts; also status, query
 hs personal        Personal-document store
 
 hs config init     Generate default config file

@@ -4,6 +4,8 @@ use std::time::Duration;
 
 /// How long a connection attempt to the cloud endpoint may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on one recognize reply (the markdown of a single page image).
+const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct CloudBackend {
     url: String,
@@ -41,7 +43,8 @@ impl CloudBackend {
         }
 
         let resp = req.send().await?.error_for_status()?;
-        let body: serde_json::Value = resp.json().await?;
+        let body: serde_json::Value =
+            crate::client::read_json_capped(resp, MAX_REPLY_BYTES).await?;
         md_results(&body)
     }
 

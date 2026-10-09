@@ -210,12 +210,16 @@ pub fn now_epoch() -> u64 {
 pub const MIN_SECRET_LEN: usize = 32;
 
 /// Default location of the gateway signing secret.
+///
+/// Serde defaults cannot fail, so a host with no home directory panics here
+/// with the [`ConfigError::NoHomeDir`](crate::config_file::ConfigError)
+/// message rather than yielding a relative path. The gateway's own loader
+/// reports the missing home directory as an error before it parses
+/// `secret_path`.
 pub fn default_secret_path() -> PathBuf {
-    match dirs::home_dir() {
-        Some(home) => home.join(crate::HIDDEN_DIR).join("cloud-secret.key"),
-        // No home dir means there is no config file to read either; keep the
-        // path relative rather than inventing an absolute one.
-        None => PathBuf::from(crate::HIDDEN_DIR).join("cloud-secret.key"),
+    match crate::hidden_dir() {
+        Ok(dir) => dir.join("cloud-secret.key"),
+        Err(e) => panic!("{e}"),
     }
 }
 
@@ -235,11 +239,31 @@ pub fn generate_admin_key() -> String {
 }
 
 /// Write `contents` to a brand-new file that is mode 0600 from the moment it
-/// exists. Fails with `AlreadyExists` rather than touching an existing file.
+/// exists and is complete from the moment it is visible at `path`. Fails with
+/// `AlreadyExists` rather than touching an existing file.
+///
+/// The bytes go to a private temp file in the same directory, are fsynced, and
+/// the temp file is then hard-linked to `path` (a link, unlike a rename, never
+/// replaces an existing file). A concurrent loser therefore reads either no
+/// file or the winner's complete one, never a half-written one.
 fn create_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(dir)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
+        .to_string_lossy();
+    let tmp = dir.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -247,9 +271,13 @@ fn create_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut file = opts.open(path)?;
-    file.write_all(contents)?;
-    file.sync_all()
+    let written = opts.open(&tmp).and_then(|mut file| {
+        file.write_all(contents)?;
+        file.sync_all()
+    });
+    let linked = written.and_then(|()| std::fs::hard_link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    linked
 }
 
 /// Read the signing secret at `path`. A file shorter than [`MIN_SECRET_LEN`]
@@ -546,6 +574,33 @@ mod tests {
         assert!(format!("{err:#}").contains("shorter"), "{err:#}");
         assert_eq!(std::fs::read(&path).unwrap(), b"too-short");
         assert!(load_secret(&path).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn racing_creators_all_get_the_one_complete_secret_and_leave_no_temp_files() {
+        let dir = temp_dir("secret-race");
+        let path = dir.join("cloud-secret.key");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_or_create_secret(&path).unwrap()
+                })
+            })
+            .collect();
+        let secrets: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(secrets
+            .iter()
+            .all(|s| s == &secrets[0] && s.len() == MIN_SECRET_LEN));
+        assert_eq!(std::fs::read(&path).unwrap(), secrets[0]);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("cloud-secret.key")]);
         std::fs::remove_dir_all(dir).ok();
     }
 

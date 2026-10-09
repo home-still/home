@@ -34,16 +34,23 @@ pub fn load_secrets_from(path: &Path) -> io::Result<usize> {
     };
     check_mode_warn(path);
     let mut exported = 0;
-    for (k, v) in entries {
-        if std::env::var_os(&k).is_none() {
-            // SAFETY: set_var is unsafe in edition-2024 preview because of
-            // multi-threaded mutation; we call this before any tokio runtime
-            // starts so the process is still single-threaded.
-            unsafe { std::env::set_var(&k, v) };
-            exported += 1;
-        }
+    for (k, v) in select_unset(entries, |k| std::env::var_os(k).is_some()) {
+        // SAFETY: set_var is unsafe in edition-2024 preview because of
+        // multi-threaded mutation; we call this before any tokio runtime
+        // starts so the process is still single-threaded.
+        unsafe { std::env::set_var(&k, v) };
+        exported += 1;
     }
     Ok(exported)
+}
+
+/// The entries whose key `is_set` reports as absent from the environment —
+/// explicit process env always wins over the file.
+fn select_unset(
+    entries: HashMap<String, String>,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    entries.into_iter().filter(|(k, _)| !is_set(k)).collect()
 }
 
 /// Parse `secrets.env` at `path` and return its `KEY=VALUE` pairs. Returns
@@ -55,9 +62,17 @@ pub fn parse_secrets_from_path(path: &Path) -> io::Result<Option<HashMap<String,
         Err(e) => return Err(e),
     };
     let mut out = HashMap::new();
-    for line in io::BufReader::new(file).lines() {
+    for (idx, line) in io::BufReader::new(file).lines().enumerate() {
         let line = line?;
         if let Some((k, v)) = parse_line(&line) {
+            // `set_var` panics on a NUL; refuse the file instead. Only the
+            // position is named, never the entry: it may be a secret.
+            if k.contains('\0') || v.contains('\0') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}:{}: entry contains a NUL byte", path.display(), idx + 1),
+                ));
+            }
             out.insert(k, v);
         }
     }
@@ -80,7 +95,19 @@ fn parse_line(raw: &str) -> Option<(String, String)> {
         .or_else(|| key.strip_prefix("export\t"))
         .map(str::trim)
         .unwrap_or(key);
-    let mut val = rest.trim().to_string();
+    let rest = rest.trim();
+    // A quoted value may be followed by a comment: `KEY="value" # note`. The
+    // closing quote ends the value; anything else after it is not a comment,
+    // and the value falls through to the literal handling below.
+    if let Some(quote @ ('"' | '\'')) = rest.chars().next() {
+        if let Some(close) = rest[1..].find(quote) {
+            let after = rest[1 + close + 1..].trim_start();
+            if after.is_empty() || after.starts_with('#') {
+                return Some((stripped_key.to_string(), rest[1..1 + close].to_string()));
+            }
+        }
+    }
+    let mut val = rest.to_string();
     // Strip a trailing ` # comment` only when the value isn't quoted.
     if !val.starts_with('"') && !val.starts_with('\'') {
         if let Some(hash) = val.find(" #") {
@@ -156,6 +183,34 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_after_a_quoted_value_is_not_part_of_the_value() {
+        let (_t, p) = write_tmp(
+            "TOKEN=\"abc123\" # rotated 2026-10\n\
+             SINGLE='x y'   #note\n\
+             HASH_INSIDE=\"keep # this\"\n\
+             JUNK_AFTER=\"a\"b\"\n",
+        );
+        let map = parse_secrets_from_path(&p).unwrap().unwrap();
+        assert_eq!(map["TOKEN"], "abc123");
+        assert_eq!(map["SINGLE"], "x y");
+        assert_eq!(map["HASH_INSIDE"], "keep # this");
+        assert_eq!(map["JUNK_AFTER"], "a\"b");
+    }
+
+    #[test]
+    fn a_nul_byte_is_an_error_that_does_not_echo_the_entry() {
+        let (_t, p) = write_tmp("OK=1\nSECRET_KEY=hunter2\0tail\n");
+        let err = parse_secrets_from_path(&p).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains(":2:"), "{msg}");
+        assert!(
+            !msg.contains("hunter2") && !msg.contains("SECRET_KEY"),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn missing_file_is_not_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("nope.env");
@@ -166,24 +221,16 @@ mod tests {
     fn load_does_not_overwrite_existing_env() {
         let (_t, p) =
             write_tmp("HS_TEST_SECRETS_LOADER_A=from_file\nHS_TEST_SECRETS_LOADER_B=from_file\n");
-        // SAFETY: tests run single-threaded within this test body.
-        unsafe {
-            std::env::set_var("HS_TEST_SECRETS_LOADER_A", "from_env");
-            std::env::remove_var("HS_TEST_SECRETS_LOADER_B");
-        }
-        let exported = load_secrets_from(&p).unwrap();
-        assert_eq!(exported, 1, "only B should be newly exported");
+        let entries = parse_secrets_from_path(&p).unwrap().unwrap();
+        // A is already in the environment, B is not.
+        let chosen = select_unset(entries, |k| k == "HS_TEST_SECRETS_LOADER_A");
         assert_eq!(
-            std::env::var("HS_TEST_SECRETS_LOADER_A").unwrap(),
-            "from_env"
+            chosen,
+            vec![(
+                "HS_TEST_SECRETS_LOADER_B".to_string(),
+                "from_file".to_string()
+            )],
+            "only B should be newly exported"
         );
-        assert_eq!(
-            std::env::var("HS_TEST_SECRETS_LOADER_B").unwrap(),
-            "from_file"
-        );
-        unsafe {
-            std::env::remove_var("HS_TEST_SECRETS_LOADER_A");
-            std::env::remove_var("HS_TEST_SECRETS_LOADER_B");
-        }
     }
 }

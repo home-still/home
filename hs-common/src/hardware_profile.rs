@@ -135,8 +135,16 @@ fn detect_uncached() -> HardwareProfile {
     let gpu = detect_gpu();
 
     let class = if let Ok(env_override) = std::env::var("HS_HOST_CLASS") {
-        HostClass::from_str_override(&env_override)
-            .unwrap_or_else(|| classify(cpu_count, ram_gb, gpu))
+        HostClass::from_str_override(&env_override).unwrap_or_else(|| {
+            let detected = classify(cpu_count, ram_gb, gpu);
+            tracing::warn!(
+                value = %env_override,
+                using = ?detected,
+                "HS_HOST_CLASS is not a host class (pi, apple_low, apple_high, nvidia_mid, \
+                 nvidia_high, generic_cpu); ignoring it and using the detected class"
+            );
+            detected
+        })
     } else {
         classify(cpu_count, ram_gb, gpu)
     };
@@ -185,16 +193,11 @@ fn detect_gpu() -> GpuInfo {
     GpuInfo::None
 }
 
+/// Total VRAM of the first GPU, via the one bounded `nvidia-smi` runner
+/// ([`crate::gpu`]): an unbounded shell-out here hung `detect()` forever on
+/// a wedged driver, the failure that module exists to survive.
 fn query_nvidia_vram_mb() -> Option<u64> {
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.lines().next()?.trim().parse::<u64>().ok()
+    crate::gpu::query_gpu_info().memory_total_mb
 }
 
 fn is_apple_silicon() -> bool {

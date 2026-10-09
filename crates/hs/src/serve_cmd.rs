@@ -878,8 +878,7 @@ async fn uninstall_service(service_type: &str, reporter: &Arc<dyn Reporter>) -> 
         #[cfg(target_os = "macos")]
         {
             let label = format!("com.home-still.{service_type}");
-            let plist_path = dirs::home_dir()
-                .unwrap_or_default()
+            let plist_path = hs_common::home_dir()?
                 .join("Library/LaunchAgents")
                 .join(format!("{label}.plist"));
 

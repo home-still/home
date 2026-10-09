@@ -67,6 +67,14 @@ pub fn partition<'a>(
 }
 
 fn classify(in_qdrant: bool, state: &CatalogState) -> Classification {
+    // A recorded embed failure outranks whatever Qdrant holds for the stem:
+    // indexing upserts batch by batch, so a failed run can leave a document
+    // with only some of its chunks (or a stale tail) in Qdrant. Stamping
+    // those as embedded would record a partial index as a success; only a
+    // fresh index (which replaces the document's chunks) settles it.
+    if !state.has_embedding_stamp && is_embed_failure(state.embedding_skip_reason.as_deref()) {
+        return Classification::EmbedMissing;
+    }
     match (in_qdrant, state.has_embedding_stamp) {
         (true, true) => Classification::Ok,
         (true, false) => Classification::StampMissing,
@@ -84,12 +92,12 @@ fn classify(in_qdrant: bool, state: &CatalogState) -> Classification {
     }
 }
 
+fn is_embed_failure(reason: Option<&str>) -> bool {
+    reason.is_some_and(|r| r.starts_with("embed_failed"))
+}
+
 fn is_intentional_skip(reason: Option<&str>) -> bool {
-    match reason {
-        None => false,
-        Some(r) if r.starts_with("embed_failed") => false,
-        Some(_) => true,
-    }
+    reason.is_some() && !is_embed_failure(reason)
 }
 
 /// Counts for each bucket. Used for the reconcile summary report.
@@ -190,6 +198,34 @@ mod tests {
         );
         let parts = partition(&md, &qdrant, &cat);
         assert_eq!(parts[0].1, Classification::EmbedMissing);
+    }
+
+    #[test]
+    fn embed_failed_doc_present_in_qdrant_is_reindexed_not_stamped() {
+        // A failed index can leave some chunks (or a stale tail) behind;
+        // backfilling a success stamp from that count would record a
+        // partial index as complete.
+        let md = stems(&["a", "b"]);
+        let qdrant = s(&["a", "b"]);
+        let mut cat = HashMap::new();
+        cat.insert(
+            "a".into(),
+            CatalogState {
+                embedding_skip_reason: Some("embed_failed: upsert".into()),
+                ..Default::default()
+            },
+        );
+        // Stamped AND failed (a later re-index failed): the stamp stands.
+        cat.insert(
+            "b".into(),
+            CatalogState {
+                has_embedding_stamp: true,
+                embedding_skip_reason: Some("embed_failed: upsert".into()),
+            },
+        );
+        let parts = partition(&md, &qdrant, &cat);
+        assert_eq!(parts[0].1, Classification::EmbedMissing);
+        assert_eq!(parts[1].1, Classification::Ok);
     }
 
     #[test]

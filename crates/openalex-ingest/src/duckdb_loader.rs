@@ -1,54 +1,77 @@
 //! DuckDB connection management + entity loaders.
 //!
-//! Two ingest patterns:
+//! Every entity follows ONE rule, the streaming pre-dedupe: walk the
+//! `updated_date=*` partitions **newest-first**, gate each record on an
+//! in-RAM [`SeenSet`] of the entity's integer IDs, and let only first
+//! sightings (the newest version) reach the live table through a plain bulk
+//! INSERT. A later sighting of an ID is a stale duplicate and is skipped
+//! silently. The live tables keep their PRIMARY KEYs; nothing here uses
+//! `ON CONFLICT` or `INSERT OR IGNORE`, which would let the oldest copy win
+//! (the walk order is the only thing that decides which copy is newest).
+//!
+//! Three ingest shapes share that rule:
 //!
 //! 1. **Simple entities** (concepts, topics, sources, institutions,
 //!    domains, fields, subfields, funders, publishers): DuckDB reads the
-//!    JSONL files natively via `read_json` and projects / transforms columns
-//!    inline. No Rust round-trip — DuckDB handles arrays/structs directly.
-//!    (`authors` goes through a Rust Appender path, see `load_authors`.)
+//!    partition's JSONL natively via `read_json` and projects / transforms
+//!    columns inline into a temp stage table (no Rust round-trip for the
+//!    payload; DuckDB handles arrays/structs directly). Rust then reads the
+//!    stage's IDs, gates them on the entity's `SeenSet`, and ONE transaction
+//!    inserts the first sightings into the live table. (`authors` goes
+//!    through the Rust Appender path, see `load_authors`.)
 //!
-//! 2. **Works**: streaming pre-dedupe. Walk partitions newest-first; for
-//!    each row, gate on a shared `SeenSet` keyed on integer work-ID. First
-//!    sighting → append to staging tables (5 Appenders); duplicate → skip.
-//!    At end of file, ONE transaction bulk-INSERTs the staging tables into
-//!    the live tables. No `ON CONFLICT` is needed because the staging tables
-//!    only ever contain first-sightings that don't already exist in the live
-//!    tables. PRIMARY KEY constraints on works/work_topics/work_concepts/
-//!    work_references are safe.
+//! 2. **Authors**: Rust streaming + Appender into a temp stage table, gated
+//!    the same way, merged in one transaction per partition.
+//!
+//! 3. **Works**: Rust streaming; for each row, gate on a shared `SeenSet`
+//!    keyed on integer work-ID. First sighting → append to staging tables (5
+//!    Appenders); duplicate → skip. At end of file, ONE transaction
+//!    bulk-INSERTs the staging tables into the live tables. PRIMARY KEY
+//!    constraints on works/work_topics/work_concepts/work_references are safe
+//!    because the staging tables only ever contain first-sightings that
+//!    don't already exist in the live tables.
+//!
+//! The dimension tables' sets ([`SeenSet::from_table`]) are rebuilt from the
+//! table at the start of each `hs openalex load <entity>` and have no
+//! checkpoint file; only the works set has one (see `seen_set.rs` for why a
+//! checkpoint would add nothing at dimension scale).
 //!
 //! # Failure and commit ordering (the part that keeps the dedupe honest)
 //!
-//! * A file's IDs are *staged* (a local set) while it is read. They enter the
-//!   `SeenSet` only after the merge transaction has committed
-//!   ([`SeenSet::commit`]); a failed file therefore leaves the set, the
-//!   database and every later checkpoint exactly as they were.
+//! * A partition's (works: a file's) IDs are *staged* (a local set) while it
+//!   is read. They enter the `SeenSet` only after the merge transaction has
+//!   committed ([`SeenSet::commit`]); a failed partition therefore leaves the
+//!   set, the database and every later checkpoint exactly as they were.
 //! * The merge is one transaction: `works` and its four edge tables land
 //!   together or not at all, so there are never works without edges, edges
 //!   without works, or duplicated `work_authorships` rows (that table has no
-//!   PK to catch a retry).
+//!   PK to catch a retry). A dimension partition lands whole or not at all.
 //! * Any failure aborts the whole load. Partitions are walked newest-first
-//!   and the newest version of a work must win, so continuing past a failed
-//!   partition would let older partitions load stale versions of its works.
+//!   and the newest version of a record must win, so continuing past a failed
+//!   partition would let older partitions load stale versions of its records.
 //!   The failed partition is logged `error` in `_ingest_log` and the error is
-//!   returned (`hs openalex load-works` exits non-zero).
-//! * The seen-set checkpoint is written only after the partition it covers
-//!   has committed and been logged. A crash can leave the database ahead of
-//!   the checkpoint but never behind it, and `SeenSet::open` reconciles the
-//!   two on the next start (see `seen_set.rs`).
+//!   returned (`hs openalex load-works` / `load <entity>` exit non-zero).
+//! * The works seen-set checkpoint is written only after the partition it
+//!   covers has committed and been logged. A crash can leave the database
+//!   ahead of the checkpoint but never behind it, and `SeenSet::open`
+//!   reconciles the two on the next start (see `seen_set.rs`).
 //!
 //! Resumability: every partition load consults `_ingest_log` first and skips
-//! if status='ok'. Progress inside a partition is tracked by the data itself:
-//! a re-run of a partly loaded partition finds the already-committed works
-//! in the `SeenSet` (rebuilt from `works` on open) and skips exactly those.
+//! if status='ok'. Progress inside a works partition is tracked by the data
+//! itself: a re-run of a partly loaded partition finds the already-committed
+//! works in the `SeenSet` (rebuilt from `works` on open) and skips exactly
+//! those. A dimension partition is atomic, so it is either logged `ok` or
+//! redone whole; its IDs are in the set only if its rows are in the table.
 
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::{params, Connection};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::model::{Author, Work};
-use crate::parser::{parse_work_id_u64, reconstruct_abstract, strip_doi, strip_openalex_id};
+use crate::parser::{
+    parse_entity_id_u64, parse_work_id_u64, reconstruct_abstract, strip_doi, strip_openalex_id,
+};
 use crate::reader::{list_partitions, partition_files, read_jsonl_file, read_partition};
 use crate::schema::{POST_LOAD_INDEXES, SCHEMA_DDL};
 use crate::seen_set::SeenSet;
@@ -63,6 +86,9 @@ const LOAD_MEMORY_LIMIT: &str = "24GB";
 /// the loader or the services on the same host.
 const READ_ONLY_MEMORY_LIMIT: &str = "4GB";
 
+/// Type letter of an author ID (`A5023888391`); see [`parse_entity_id_u64`].
+const AUTHOR_ID_PREFIX: char = 'A';
+
 /// Default for [`LoadOptions::max_parse_errors_per_partition`]. The real
 /// snapshot has the occasional malformed line (see `tests/snapshot_live.rs`),
 /// so zero would stop every load; a schema drift produces thousands.
@@ -72,7 +98,7 @@ pub const DEFAULT_MAX_PARSE_ERRORS_PER_PARTITION: u64 = 100;
 #[derive(Debug, Clone, Copy)]
 pub struct LoadOptions {
     /// A partition fails when more than this many of its records are
-    /// unusable (do not parse, or carry a malformed work ID). The records
+    /// unusable (do not parse, or carry a malformed work/author ID). The records
     /// within the budget are skipped, logged, and counted in
     /// `_ingest_log.parse_errors`.
     pub max_parse_errors_per_partition: u64,
@@ -182,6 +208,25 @@ impl OpenAlexDb {
         Ok(())
     }
 
+    /// Download the DuckDB `fts` extension into DuckDB's extension directory
+    /// (`~/.duckdb/extensions/<version>/<platform>/`) and `LOAD` it to prove
+    /// it is usable: `hs openalex install-fts`, the explicit once-per-host
+    /// (and per DuckDB version) step in front of [`Self::build_fts`]. The
+    /// `duckdb` crate's `bundled` build has no FTS feature to link it in
+    /// statically, and `build_fts` never touches the network, so this is the
+    /// only place the extension is fetched.
+    ///
+    /// Needs network access to DuckDB's extension repository unless the
+    /// extension is already present (then `INSTALL` is a no-op); offline and
+    /// not installed it fails with an error saying so. Needs no database file:
+    /// it runs on an in-memory connection, so it neither creates the catalog
+    /// nor takes its write lock (the extension directory is per user, not per
+    /// database).
+    pub fn install_fts() -> Result<()> {
+        let conn = Connection::open_in_memory().context("open an in-memory duckdb")?;
+        install_fts_on(&conn)
+    }
+
     /// Build the BM25 full-text index over works.title + works.abstract_text,
     /// then write the `openalex_works` readiness sentinel into
     /// `_corpus_state`. The sentinel is the gate hs-mcp checks at startup to
@@ -190,18 +235,22 @@ impl OpenAlexDb {
     /// visible, every code path they exercise (search, get, references,
     /// citations, authors_by_topic) has the data it needs.
     ///
-    /// `INSTALL fts` is a no-op when the extension is already present in
-    /// DuckDB's extension directory and downloads it on the first run of a
-    /// host; the `duckdb` crate's `bundled` build has no FTS feature to link
-    /// it in statically. Offline hosts must install it beforehand (the call
-    /// then fails loudly). Slow at full corpus (~hour+) — run once after
-    /// works ingest.
+    /// Only `LOAD`s the `fts` extension; it never downloads it. When the
+    /// extension is not installed this fails before touching the database,
+    /// naming `hs openalex install-fts` (see [`Self::install_fts`]). Slow at
+    /// full corpus (~hour+) — run once after works ingest.
+    ///
+    /// The `_corpus_state` upsert is the one remaining `ON CONFLICT` in the
+    /// crate: it stamps the readiness sentinel (one row per component,
+    /// re-stamped when the index is rebuilt), which is not entity data and
+    /// has no stream to pre-dedupe.
     pub fn build_fts(&self) -> Result<()> {
+        self.conn.execute_batch("LOAD fts;").context(
+            "fts extension not installed — run `hs openalex install-fts` (needs network once)",
+        )?;
         self.conn
             .execute_batch(
                 r#"
-                INSTALL fts;
-                LOAD fts;
                 PRAGMA create_fts_index('works', 'openalex_id', 'title', 'abstract_text', overwrite=1);
                 INSERT INTO _corpus_state(component, ready_at, notes)
                 VALUES ('openalex_works', CURRENT_TIMESTAMP, 'fts ready')
@@ -286,42 +335,47 @@ impl OpenAlexDb {
         Ok(rows)
     }
 
-    /// Bulk-load a "simple" entity by letting DuckDB read the JSONL natively.
-    /// `entity` is the snapshot subdir name (e.g. "concepts"). Each partition
-    /// is a separate INSERT so resumability is per-partition.
+    /// Bulk-load a "simple" entity: DuckDB reads each partition's JSONL
+    /// natively into a stage table, the entity's [`SeenSet`] gates the rows,
+    /// and one transaction inserts the first sightings into the live table.
+    /// `entity` is the snapshot subdir name (e.g. "concepts").
+    ///
+    /// Partitions are walked **newest-first**, so the first sighting of an ID
+    /// is its newest version and a later (older) copy is skipped silently.
+    /// The first failure aborts the load: continuing would let older
+    /// partitions store stale versions of the failed partition's records.
+    /// Resumability is per partition (`_ingest_log`); the set is rebuilt from
+    /// the table on every call, so a re-run skips exactly the committed rows.
     pub fn load_simple_entity(
         &self,
         entity: SimpleEntity,
         snapshot_root: &Path,
     ) -> Result<EntityStats> {
-        let entity_dir = snapshot_root.join(entity.snapshot_dir());
-        let partitions = list_partitions(&entity_dir)?;
+        let table = entity.table_name();
+        let partitions = newest_first_partitions(&snapshot_root.join(entity.snapshot_dir()))?;
+        let mut seen = SeenSet::from_table(&self.conn, table, entity.id_prefix())?;
         let mut stats = EntityStats::default();
         for part in partitions {
             let part_name = partition_name(&part)?;
-            if self.partition_done(entity.table_name(), &part_name)? {
+            if self.partition_done(table, &part_name)? {
                 stats.skipped_partitions += 1;
                 continue;
             }
             let loaded = self
-                .load_simple_partition(entity, &part)
-                .with_context(|| format!("insert {} partition {}", entity.table_name(), part_name));
+                .load_simple_partition(entity, &part, &mut seen)
+                .with_context(|| format!("insert {table} partition {part_name}"));
             let inserted = match loaded {
                 Ok(n) => n,
                 Err(e) => {
-                    self.log_partition_failure(
-                        entity.table_name(),
-                        &part_name,
-                        &PartitionProgress::default(),
-                    );
+                    self.log_partition_failure(table, &part_name, &PartitionProgress::default());
                     return Err(e);
                 }
             };
-            self.log_partition(entity.table_name(), &part_name, "ok", inserted, 0)?;
+            self.log_partition(table, &part_name, "ok", inserted, 0)?;
             stats.partitions_loaded += 1;
             stats.rows_inserted += inserted;
             tracing::info!(
-                entity = entity.table_name(),
+                entity = table,
                 partition = %part_name,
                 rows = inserted,
                 "partition loaded"
@@ -330,8 +384,14 @@ impl OpenAlexDb {
         Ok(stats)
     }
 
-    /// One partition's single auto-committed INSERT; returns the rows added.
-    fn load_simple_partition(&self, entity: SimpleEntity, partition_dir: &Path) -> Result<u64> {
+    /// One partition: stage → gate → merge; returns the rows added. The stage
+    /// tables do not outlive the call.
+    fn load_simple_partition(
+        &self,
+        entity: SimpleEntity,
+        partition_dir: &Path,
+        seen: &mut SeenSet,
+    ) -> Result<u64> {
         let dir = partition_dir
             .to_str()
             .ok_or_else(|| anyhow!("path {} is not valid UTF-8", partition_dir.display()))?;
@@ -342,15 +402,104 @@ impl OpenAlexDb {
             bail!("partition path {dir:?} contains glob metacharacters");
         }
         let glob = format!("{dir}/*.jsonl");
+        let loaded = self.stage_gate_merge_simple(entity, &glob, seen);
+        if loaded.is_err() {
+            // The merge is one transaction, so nothing was committed; drop
+            // the stage so it does not hold memory until the next partition.
+            if let Err(e) = self.conn.execute_batch(
+                "DROP TABLE IF EXISTS _stage_simple; DROP TABLE IF EXISTS _keep_simple;",
+            ) {
+                tracing::warn!(error = %format!("{e:#}"), "could not drop the simple-entity stage after a failed partition");
+            }
+        }
+        loaded
+    }
+
+    fn stage_gate_merge_simple(
+        &self,
+        entity: SimpleEntity,
+        glob: &str,
+        seen: &mut SeenSet,
+    ) -> Result<u64> {
+        // CREATE OR REPLACE clears the leftovers of an aborted partition.
+        self.conn.execute(&entity.stage_sql(), params![glob])?;
+        let staged = self.gate_staged_simple(entity, seen)?;
+        let merged = self.merge_staged_simple(entity, staged.len() as u64)?;
+        // The rows are committed; only now may the IDs count as seen.
+        seen.commit(staged);
+        Ok(merged)
+    }
+
+    /// The streaming pre-dedupe gate for a staged SQL partition: walk the
+    /// stage in `rowid` order and keep a record only if its ID is not in
+    /// `seen` (a newer partition, or an earlier run, already committed it) and
+    /// is the first sighting inside this partition. The kept `rowid`s go to
+    /// `_keep_simple`; the returned IDs are NOT yet in `seen`.
+    ///
+    /// A record without an ID, or with one that is not `<prefix><digits>`,
+    /// cannot be deduped or keyed: the partition fails and the error names it
+    /// (the SQL-ingested entities take no parse-error budget). All copies of
+    /// an ID inside one partition carry the same `updated_date`, so which of
+    /// them is kept does not matter; the lowest `rowid` is, deterministically.
+    fn gate_staged_simple(&self, entity: SimpleEntity, seen: &SeenSet) -> Result<HashSet<u64>> {
         let table = entity.table_name();
-        let count_before: u64 =
-            self.conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
-        self.conn.execute(&entity.insert_sql(), params![glob])?;
-        let count_after: u64 =
-            self.conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
-        Ok(count_after - count_before)
+        let prefix = entity.id_prefix();
+        let mut staged: HashSet<u64> = HashSet::new();
+        let mut keep: Vec<i64> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT rowid, openalex_id FROM _stage_simple ORDER BY rowid")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let rowid: i64 = row.get(0)?;
+                let raw: Option<String> = row.get(1)?;
+                let raw = raw.ok_or_else(|| anyhow!("a {table} record has no id"))?;
+                let id = parse_entity_id_u64(&raw, prefix)
+                    .ok_or_else(|| anyhow!("a {table} record has a malformed id {raw:?}"))?;
+                if seen.contains(id) || !staged.insert(id) {
+                    continue;
+                }
+                keep.push(rowid);
+            }
+        }
+        self.conn
+            .execute_batch("CREATE OR REPLACE TEMP TABLE _keep_simple (stage_row BIGINT);")?;
+        let mut app = self.conn.appender("_keep_simple")?;
+        for rowid in keep {
+            app.append_row(params![rowid])?;
+        }
+        // Appender flush errors are swallowed by its Drop, so flush
+        // explicitly: a row that never reached the keep list would be dropped
+        // from the table without trace.
+        app.flush().context("flush the keep-list appender")?;
+        Ok(staged)
+    }
+
+    /// Insert the kept rows of `_stage_simple` into the live table and drop
+    /// both stage tables, in ONE transaction. Plain INSERT, no `ON CONFLICT`:
+    /// the gate guarantees every kept ID is new (the set is rebuilt from the
+    /// table), so a PK violation means the invariant broke and fails the
+    /// transaction loudly; so does a row count that differs from `expected`.
+    fn merge_staged_simple(&self, entity: SimpleEntity, expected: u64) -> Result<u64> {
+        let table = entity.table_name();
+        let tx = self.conn.unchecked_transaction()?;
+        let inserted = tx.execute(
+            &format!(
+                "INSERT INTO {table} SELECT s.* FROM _stage_simple s \
+                 JOIN _keep_simple k ON s.rowid = k.stage_row"
+            ),
+            [],
+        )? as u64;
+        if inserted != expected {
+            bail!(
+                "merged {inserted} {table} rows but staged {expected}; rolling the partition back"
+            );
+        }
+        tx.execute_batch("DROP TABLE _stage_simple; DROP TABLE _keep_simple;")?;
+        tx.commit()
+            .with_context(|| format!("commit {table} merge"))?;
+        Ok(inserted)
     }
 
     /// Load one works partition through the streaming pre-dedupe pipeline.
@@ -609,12 +758,7 @@ impl OpenAlexDb {
         seen_set_path: std::path::PathBuf,
         opts: &LoadOptions,
     ) -> Result<EntityStats> {
-        let works_dir = snapshot_root.join("works");
-        let mut partitions = list_partitions(&works_dir)?;
-        // Walk newest-first. `list_partitions` sorts ascending by name; the
-        // OpenAlex partition naming convention is `updated_date=YYYY-MM-DD`,
-        // so reverse alphabetical = reverse chronological.
-        partitions.reverse();
+        let partitions = newest_first_partitions(&snapshot_root.join("works"))?;
 
         let mut seen = SeenSet::open(&self.conn, seen_set_path)?;
         let mut total = EntityStats::default();
@@ -669,13 +813,25 @@ impl OpenAlexDb {
     /// because `read_json` with auto-detected STRUCT lists has to buffer per
     /// row group; this path streams one record at a time and is bounded.
     ///
-    /// Authors are appended straight into the live table (no staging), so a
-    /// failure part-way leaves the rows flushed so far in place; re-running
-    /// that partition then fails on the first duplicate key instead of
-    /// loading anything twice.
+    /// Each record is gated on `seen` (the `authors` set, see
+    /// [`Self::load_authors`]): an author already committed from a newer
+    /// partition, or earlier in this one, is a stale duplicate and is skipped.
+    /// A record whose ID is not `A<digits>` cannot be keyed: it counts against
+    /// `opts.max_parse_errors_per_partition` like an unparseable line, as for
+    /// works.
+    ///
+    /// The partition is staged in a temp table and merged into `authors` in
+    /// ONE transaction (the works loader's stage → merge path), so a failure
+    /// anywhere before the commit leaves the live table and `seen` untouched
+    /// and the partition can simply be re-run. Unlike works, a partition is
+    /// staged whole (not per file).
+    ///
+    /// **Walk order matters**, as for [`Self::load_works_partition`]: call
+    /// this newest-first (use [`Self::load_authors`]) or older records win.
     pub fn load_authors_partition(
         &self,
         partition_dir: &Path,
+        seen: &mut SeenSet,
         opts: &LoadOptions,
     ) -> Result<EntityStats> {
         let part_name = partition_name(partition_dir)?;
@@ -688,7 +844,7 @@ impl OpenAlexDb {
 
         let mut progress = PartitionProgress::default();
         let loaded = self
-            .append_authors(partition_dir, opts, &mut progress)
+            .append_authors(partition_dir, seen, opts, &mut progress)
             .with_context(|| format!("authors partition {part_name}"));
         if let Err(e) = loaded {
             self.log_partition_failure("authors", &part_name, &progress);
@@ -712,31 +868,120 @@ impl OpenAlexDb {
     fn append_authors(
         &self,
         partition_dir: &Path,
+        seen: &mut SeenSet,
         opts: &LoadOptions,
         progress: &mut PartitionProgress,
     ) -> Result<()> {
-        let mut app = self.conn.appender("authors")?;
-        let mut rows = 0u64;
+        // The temp table lives for the connection lifetime; CREATE OR REPLACE
+        // clears the leftovers of an aborted partition. Same columns as the
+        // live table, no PK: the gate, not a constraint, keeps it duplicate-free.
+        self.conn.execute_batch(
+            "CREATE OR REPLACE TEMP TABLE _stage_authors AS SELECT * FROM authors LIMIT 0;",
+        )?;
+        let merged = self
+            .stage_authors(partition_dir, seen, opts, progress)
+            .and_then(|staged| {
+                self.merge_staged_authors(staged.len() as u64)?;
+                Ok(staged)
+            });
+        match merged {
+            // The rows are committed; only now may the IDs count as seen.
+            Ok(staged) => {
+                seen.commit(staged);
+                Ok(())
+            }
+            Err(e) => {
+                // Nothing was committed: the live table was never touched and
+                // the error stamp must not claim the staged rows.
+                progress.rows = 0;
+                if let Err(drop_err) = self
+                    .conn
+                    .execute_batch("DROP TABLE IF EXISTS _stage_authors;")
+                {
+                    tracing::warn!(error = %format!("{drop_err:#}"), "could not drop _stage_authors after a failed partition");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Stream the partition through the first-sighting gate into
+    /// `_stage_authors`; returns the staged IDs, which are NOT yet in `seen`.
+    fn stage_authors(
+        &self,
+        partition_dir: &Path,
+        seen: &SeenSet,
+        opts: &LoadOptions,
+        progress: &mut PartitionProgress,
+    ) -> Result<HashSet<u64>> {
+        let mut app = self.conn.appender("_stage_authors")?;
+        let mut staged: HashSet<u64> = HashSet::new();
+        let mut malformed_ids = 0u64;
         let parsed =
             read_partition::<Author, _>(partition_dir, opts.max_parse_errors_per_partition, |a| {
-                append_author(&mut app, &a).with_context(|| format!("append author {}", a.id))?;
-                rows += 1;
-                Ok(())
+                let Some(id) = parse_entity_id_u64(&a.id, Some(AUTHOR_ID_PREFIX)) else {
+                    // Not an `A<digits>` ID: cannot be deduped or keyed.
+                    tracing::warn!(author_id = %a.id, "skipping author with malformed id");
+                    malformed_ids += 1;
+                    return Ok(());
+                };
+                // Streaming dedupe gate: an author already committed from a
+                // newer partition (or earlier in this one) is a stale duplicate.
+                if seen.contains(id) || !staged.insert(id) {
+                    return Ok(());
+                }
+                append_author(&mut app, &a).with_context(|| format!("append author {}", a.id))
             });
-        // Report what was read even when the read failed part-way.
-        progress.rows = rows;
+        // Report what was staged even when the read failed part-way.
+        progress.rows = staged.len() as u64;
         let stats = parsed?;
-        progress.parse_errors = stats.parse_errors;
-        app.flush().context("flush authors appender")?;
+        progress.parse_errors = stats.parse_errors + malformed_ids;
+        if progress.parse_errors > opts.max_parse_errors_per_partition {
+            bail!(
+                "{} unusable records ({} unparseable, {} with a malformed id) in this partition \
+                 exceed the limit of {}; nothing from this partition was merged",
+                progress.parse_errors,
+                stats.parse_errors,
+                malformed_ids,
+                opts.max_parse_errors_per_partition
+            );
+        }
+        // Appender flush errors are swallowed by its Drop, so flush
+        // explicitly: rows that never reached the staging table must fail
+        // the partition, not vanish from it.
+        app.flush().context("flush authors staging appender")?;
+        Ok(staged)
+    }
+
+    /// Merge `_stage_authors` into `authors` and drop it, in one transaction.
+    /// Plain INSERT, no `ON CONFLICT`: the gate keeps the stage free of
+    /// duplicates and of IDs already in the table (the set is rebuilt from
+    /// it), so a PK violation means the invariant broke and fails the
+    /// transaction, rolling it back.
+    fn merge_staged_authors(&self, expected: u64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let inserted = tx.execute("INSERT INTO authors SELECT * FROM _stage_authors", [])?;
+        if inserted as u64 != expected {
+            bail!(
+                "merged {inserted} authors rows but staged {expected}; rolling the partition back"
+            );
+        }
+        tx.execute_batch("DROP TABLE _stage_authors;")?;
+        tx.commit().context("commit authors merge")?;
         Ok(())
     }
 
+    /// Load every authors partition under `snapshot_root/authors/`, walking
+    /// **newest-first** with one `authors` [`SeenSet`] (rebuilt from the table
+    /// on entry, no checkpoint file; see `seen_set.rs`) so the newest version
+    /// of each author wins. The first failing partition aborts the load; see
+    /// the module docs for why continuing is not safe.
     pub fn load_authors(&self, snapshot_root: &Path, opts: &LoadOptions) -> Result<EntityStats> {
-        let authors_dir = snapshot_root.join("authors");
-        let partitions = list_partitions(&authors_dir)?;
+        let partitions = newest_first_partitions(&snapshot_root.join("authors"))?;
+        let mut seen = SeenSet::from_table(&self.conn, "authors", Some(AUTHOR_ID_PREFIX))?;
         let mut total = EntityStats::default();
         for part in partitions {
-            let s = self.load_authors_partition(&part, opts)?;
+            let s = self.load_authors_partition(&part, &mut seen, opts)?;
             total.partitions_loaded += s.partitions_loaded;
             total.skipped_partitions += s.skipped_partitions;
             total.rows_inserted += s.rows_inserted;
@@ -798,6 +1043,17 @@ pub struct IngestLogEntry {
 struct PartitionProgress {
     rows: u64,
     parse_errors: u64,
+}
+
+/// The partition directories of an entity, **newest first**.
+/// `list_partitions` sorts ascending by name; the OpenAlex partition naming
+/// convention is `updated_date=YYYY-MM-DD`, so reverse alphabetical = reverse
+/// chronological. Every loader walks in this order: the first sighting of an
+/// ID must be its newest version.
+fn newest_first_partitions(entity_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut partitions = list_partitions(entity_dir)?;
+    partitions.reverse();
+    Ok(partitions)
 }
 
 fn partition_name(partition_dir: &Path) -> Result<String> {
@@ -1001,21 +1257,42 @@ impl SimpleEntity {
         }
     }
 
-    /// SQL that ingests one partition's JSONL files into the target table.
-    /// The file glob is the statement's single `?` parameter.
+    /// Type letter of this entity's IDs, for the integer seen-set key
+    /// ([`parse_entity_id_u64`]); `None` for domains, fields and subfields,
+    /// whose stored ID is digits only (`3`, `17`, `1702`).
+    fn id_prefix(self) -> Option<char> {
+        match self {
+            SimpleEntity::Concepts => Some('C'),
+            SimpleEntity::Topics => Some('T'),
+            SimpleEntity::Domains | SimpleEntity::Fields | SimpleEntity::Subfields => None,
+            SimpleEntity::Sources => Some('S'),
+            SimpleEntity::Institutions => Some('I'),
+            SimpleEntity::Funders => Some('F'),
+            SimpleEntity::Publishers => Some('P'),
+        }
+    }
+
+    /// SQL that reads one partition's JSONL files into the temp table
+    /// `_stage_simple`, projected to the live table's columns in order (the
+    /// merge is `INSERT INTO <table> SELECT s.* …`, so the column order is
+    /// the contract). The file glob is the statement's single `?` parameter.
     ///
-    /// Uses `INSERT OR IGNORE` so the partition loader can safely retry the
-    /// same partition without duplicating PK violations. NOTE: this is the
-    /// `ON CONFLICT DO NOTHING` the works loader gave up. It is kept for the
-    /// small dimension tables pending the decision on RA-113 (BACKLOG.md):
-    /// partitions are walked oldest-first, so for an ID that appears in
-    /// several partitions the *oldest* version wins.
-    fn insert_sql(self) -> String {
+    /// It only stages: which rows reach the live table is decided by the
+    /// `SeenSet` gate (newest partition wins), not by an `INSERT OR IGNORE`
+    /// that would keep the first-loaded, i.e. the oldest, copy.
+    fn stage_sql(self) -> String {
+        format!(
+            "CREATE OR REPLACE TEMP TABLE _stage_simple AS {}",
+            self.select_sql()
+        )
+    }
+
+    /// The projection behind [`Self::stage_sql`].
+    fn select_sql(self) -> String {
         let strip = "regexp_replace";
         match self {
             SimpleEntity::Concepts => format!(
                 r#"
-                INSERT OR IGNORE INTO concepts
                 SELECT
                     {strip}(id, '^https://openalex.org/', '') AS openalex_id,
                     display_name,
@@ -1030,7 +1307,6 @@ impl SimpleEntity {
             ),
             SimpleEntity::Topics => format!(
                 r#"
-                INSERT OR IGNORE INTO topics
                 SELECT
                     {strip}(id, '^https://openalex.org/', '') AS openalex_id,
                     display_name,
@@ -1044,7 +1320,6 @@ impl SimpleEntity {
             ),
             SimpleEntity::Domains => format!(
                 r#"
-                INSERT OR IGNORE INTO domains
                 SELECT
                     {strip}(id, '^https://openalex.org/domains/', '') AS openalex_id,
                     display_name
@@ -1053,7 +1328,6 @@ impl SimpleEntity {
             ),
             SimpleEntity::Fields => format!(
                 r#"
-                INSERT OR IGNORE INTO fields
                 SELECT
                     {strip}(id, '^https://openalex.org/fields/', '') AS openalex_id,
                     display_name,
@@ -1063,7 +1337,6 @@ impl SimpleEntity {
             ),
             SimpleEntity::Subfields => format!(
                 r#"
-                INSERT OR IGNORE INTO subfields
                 SELECT
                     {strip}(id, '^https://openalex.org/subfields/', '') AS openalex_id,
                     display_name,
@@ -1074,7 +1347,6 @@ impl SimpleEntity {
             ),
             SimpleEntity::Sources => format!(
                 r#"
-                INSERT OR IGNORE INTO sources
                 SELECT
                     {strip}(id, '^https://openalex.org/', '') AS openalex_id,
                     display_name,
@@ -1095,7 +1367,6 @@ impl SimpleEntity {
             ),
             SimpleEntity::Institutions => format!(
                 r#"
-                INSERT OR IGNORE INTO institutions
                 SELECT
                     {strip}(id, '^https://openalex.org/', '') AS openalex_id,
                     display_name,
@@ -1109,7 +1380,6 @@ impl SimpleEntity {
             ),
             SimpleEntity::Funders => format!(
                 r#"
-                INSERT OR IGNORE INTO funders
                 SELECT
                     {strip}(id, '^https://openalex.org/', '') AS openalex_id,
                     display_name,
@@ -1121,7 +1391,6 @@ impl SimpleEntity {
             ),
             SimpleEntity::Publishers => format!(
                 r#"
-                INSERT OR IGNORE INTO publishers
                 SELECT
                     {strip}(id, '^https://openalex.org/', '') AS openalex_id,
                     display_name,
@@ -1132,6 +1401,17 @@ impl SimpleEntity {
             ),
         }
     }
+}
+
+/// `INSTALL fts` then `LOAD fts` on `conn`; see [`OpenAlexDb::install_fts`].
+fn install_fts_on(conn: &Connection) -> Result<()> {
+    conn.execute_batch("INSTALL fts;").context(
+        "cannot install the DuckDB fts extension: `hs openalex install-fts` downloads it from \
+         DuckDB's extension repository, so it needs network access (once per host and DuckDB \
+         version)",
+    )?;
+    conn.execute_batch("LOAD fts;")
+        .context("the fts extension installed but will not LOAD")
 }
 
 #[cfg(test)]
@@ -1173,5 +1453,61 @@ mod tests {
         assert!(SimpleEntity::parse("authors").is_err());
         assert!(SimpleEntity::parse("works").is_err());
         assert!(SimpleEntity::parse("nope").is_err());
+    }
+
+    /// Point `conn` at an empty extension directory and an unreachable
+    /// extension repository, so neither an `fts` copy cached in the host's
+    /// `~/.duckdb` nor network access on the machine running the tests can
+    /// change the outcome.
+    #[cfg(not(windows))]
+    fn without_the_fts_extension(conn: &Connection, extension_dir: &Path) {
+        conn.execute_batch(&format!(
+            "SET extension_directory={}; \
+             SET custom_extension_repository='http://127.0.0.1:1';",
+            sql_string_literal(extension_dir.to_str().unwrap())
+        ))
+        .unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn build_fts_without_the_extension_names_install_fts_and_never_downloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = OpenAlexDb::open(&tmp.path().join("oa.duckdb")).unwrap();
+        without_the_fts_extension(db.raw(), &tmp.path().join("ext"));
+
+        let msg = format!("{:#}", db.build_fts().unwrap_err());
+        assert!(
+            msg.contains(
+                "fts extension not installed — run `hs openalex install-fts` (needs network once)"
+            ),
+            "{msg}"
+        );
+        // `LOAD` found nothing and stopped: it did not go to the (unreachable)
+        // repository, and the readiness sentinel was not written.
+        assert!(!msg.contains("Failed to download"), "{msg}");
+        let stamped: u64 = db
+            .raw()
+            .query_row("SELECT COUNT(*) FROM _corpus_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stamped, 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn install_fts_offline_fails_loudly_and_says_what_it_needs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        without_the_fts_extension(&conn, &tmp.path().join("ext"));
+
+        let msg = format!("{:#}", install_fts_on(&conn).unwrap_err());
+        assert!(
+            msg.contains(
+                "`hs openalex install-fts` downloads it from DuckDB's extension repository"
+            ) && msg.contains("needs network access"),
+            "{msg}"
+        );
+        // The DuckDB cause stays in the chain.
+        assert!(msg.contains("Failed to download"), "{msg}");
     }
 }

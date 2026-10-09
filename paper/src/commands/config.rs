@@ -8,7 +8,19 @@ use crate::output;
 pub async fn run(action: ConfigAction, global: &GlobalArgs) -> Result<()> {
     match action {
         ConfigAction::Show => {
-            let config = Config::load().context("Failed to load config")?;
+            let mut config = Config::load().context("Failed to load config")?;
+            // `show` goes to terminals, logs and bug reports: print that a key
+            // is configured, never the key.
+            let providers = &mut config.providers;
+            for key in [
+                &mut providers.openalex.api_key,
+                &mut providers.semantic_scholar.api_key,
+                &mut providers.core.api_key,
+            ] {
+                if key.is_some() {
+                    *key = Some("<redacted>".to_string());
+                }
+            }
             if global.is_json() {
                 output::print_json(&config)?;
             } else {

@@ -52,7 +52,8 @@ pub enum FailureCode {
     /// The PDF is structurally broken, encrypted, or has a page box or
     /// page count the renderer refuses; every renderer fails identically.
     PdfParseError,
-    /// The EPUB archive cannot be opened, or exceeds the size caps.
+    /// The EPUB archive cannot be opened, exceeds the size caps, or has a
+    /// spine item that is missing, escapes the archive, or is not UTF-8.
     EpubParseError,
     HtmlNotUtf8,
     /// HTML the converter refuses to parse: elements nested deeper than
@@ -91,6 +92,10 @@ pub enum FailureCode {
     /// Part of the document could not be processed (regions the pipeline
     /// had to skip), so the markdown has holes.
     GappedConversion,
+    /// The VLM backend refused the page's request with a 4xx that names the
+    /// request itself (bad request, payload too large, unsupported media).
+    /// The same page is refused the same way on every retry.
+    VlmRequestRejected,
 }
 
 impl FailureCode {
@@ -117,10 +122,11 @@ impl FailureCode {
             Self::OlmocrIncompletePages => "olmocr_incomplete_pages",
             Self::GappedConversion => "gapped_conversion",
             Self::ConversionPanicked => "conversion_panicked",
+            Self::VlmRequestRejected => "vlm_request_rejected",
         }
     }
 
-    const ALL: [FailureCode; 20] = [
+    const ALL: [FailureCode; 21] = [
         Self::UnsupportedContentTypeHtml,
         Self::UnsupportedContentTypeBinary,
         Self::PaywallHtml,
@@ -141,6 +147,7 @@ impl FailureCode {
         Self::OlmocrIncompletePages,
         Self::GappedConversion,
         Self::ConversionPanicked,
+        Self::VlmRequestRejected,
     ];
 
     /// Parse a wire token. Exact match only: an unknown token is not a
@@ -165,6 +172,7 @@ impl FailureCode {
             | Self::MissingExtension
             | Self::InvalidKey
             | Self::ConversionPanicked
+            | Self::VlmRequestRejected
             | Self::EmptyConversion => FailureClass::Permanent(token),
             Self::EmptyVlmConversion
             | Self::VlmRepetitionLoop
@@ -279,6 +287,7 @@ mod tests {
             (FailureCode::InvalidKey, "invalid_key"),
             (FailureCode::EmptyConversion, "empty_conversion"),
             (FailureCode::ConversionPanicked, "conversion_panicked"),
+            (FailureCode::VlmRequestRejected, "vlm_request_rejected"),
         ] {
             assert_eq!(
                 classify(&ConvertFailure::err(code, "x")),

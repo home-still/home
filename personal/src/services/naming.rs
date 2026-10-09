@@ -27,16 +27,30 @@ struct ModelOutput {
     category: String,
 }
 
-const PROMPT_PREFIX: &str = "You are tagging a personal document for a private archive. \
+const PROMPT_HEAD: &str = "You are tagging a personal document for a private archive. \
 Read the excerpt below and reply with a single JSON object on one line, no prose, \
 no markdown fences, with exactly two string fields: \
-\"title\" (5-10 words, no quotes, no trailing punctuation) and \
-\"category\" (one of: medical, financial, education, legal, employment, tax, insurance, correspondence, other). \
-Pick the closest category; if nothing fits, use \"other\".\n\nDocument excerpt:\n";
+\"title\" (5-10 words, no quotes, no trailing punctuation) and ";
+
+/// The prompt offers exactly `personal.categories`: offering a category the
+/// config forbids would make the ingest fail on a pick the model was invited
+/// to make.
+fn build_prompt(categories: &[String], excerpt: &str) -> String {
+    let list = categories.join(", ");
+    let other = if categories.iter().any(|c| c.eq_ignore_ascii_case("other")) {
+        " If nothing fits, use \"other\"."
+    } else {
+        ""
+    };
+    format!(
+        "{PROMPT_HEAD}\"category\" (one of: {list}). Pick the closest category.{other}\
+         \n\nDocument excerpt:\n{excerpt}\n\nJSON:"
+    )
+}
 
 pub async fn title_and_category(cfg: &Config, markdown: &str) -> Result<NameResult> {
     let excerpt = take_chars(markdown, cfg.naming.max_input_tokens.saturating_mul(4));
-    let prompt = format!("{PROMPT_PREFIX}{excerpt}\n\nJSON:");
+    let prompt = build_prompt(&cfg.categories, &excerpt);
 
     let body = serde_json::json!({
         "model": cfg.naming.model,
@@ -95,6 +109,13 @@ pub async fn title_and_category(cfg: &Config, markdown: &str) -> Result<NameResu
     }
 
     let category: Category = parsed.category.trim().parse()?;
+    if !cfg
+        .categories
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(category.as_str()))
+    {
+        return Err(PersonalError::UnknownCategory(category.to_string()));
+    }
 
     Ok(NameResult { title, category })
 }
@@ -186,6 +207,33 @@ mod tests {
         assert!(
             matches!(err, crate::error::PersonalError::UnknownCategory(_)),
             "expected UnknownCategory, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn offers_and_accepts_only_the_configured_categories() {
+        let mut server = mockito::Server::new_async().await;
+        let envelope = serde_json::json!({
+            "response": "{\"title\":\"Annual Return Summary\",\"category\":\"tax\"}"
+        });
+        let _m = server
+            .mock("POST", "/api/generate")
+            .match_body(mockito::Matcher::Regex(
+                r"one of: medical, other\)\. Pick the closest category\. If nothing fits".into(),
+            ))
+            .with_status(200)
+            .with_body(envelope.to_string())
+            .create_async()
+            .await;
+
+        let cfg = Config {
+            categories: vec!["medical".into(), "other".into()],
+            ..cfg_with_url(&server.url())
+        };
+        let err = title_and_category(&cfg, "anything").await.unwrap_err();
+        assert!(
+            matches!(&err, crate::error::PersonalError::UnknownCategory(c) if c == "tax"),
+            "expected UnknownCategory(tax), got: {err:?}"
         );
     }
 

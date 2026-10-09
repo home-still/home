@@ -16,7 +16,7 @@
 //! aborts the read immediately and is returned.
 
 use anyhow::{bail, Context, Result};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use serde::de::DeserializeOwned;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -127,7 +127,7 @@ where
 {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let reader: Box<dyn Read> = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-        Box::new(GzDecoder::new(file))
+        Box::new(MultiGzDecoder::new(file))
     } else {
         Box::new(file)
     };
@@ -306,6 +306,23 @@ mod tests {
         writeln!(enc, "{C1}").unwrap();
         writeln!(enc, "{C2}").unwrap();
         enc.finish().unwrap();
+        let stats = read_jsonl_file::<Concept, _>(&path, 0, &mut |_| Ok(())).unwrap();
+        assert_eq!((stats.parsed, stats.parse_errors), (2, 0));
+    }
+
+    /// `cat a.gz b.gz` is a valid gzip file of two members; a first-member-
+    /// only decoder would stop after `a` and report a clean, short read.
+    #[test]
+    fn concatenated_gz_members_are_all_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part_0000.gz");
+        let mut bytes = Vec::new();
+        for line in [C1, C2] {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            writeln!(enc, "{line}").unwrap();
+            bytes.extend(enc.finish().unwrap());
+        }
+        std::fs::write(&path, bytes).unwrap();
         let stats = read_jsonl_file::<Concept, _>(&path, 0, &mut |_| Ok(())).unwrap();
         assert_eq!((stats.parsed, stats.parse_errors), (2, 0));
     }

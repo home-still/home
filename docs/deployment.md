@@ -16,7 +16,7 @@ Do these **before** restarting any service on the new binaries; each item names 
 * Without it: `hs-mcp --serve`, `hs-distill-server`, `hs-scribe-server` and the gateway refuse to start; clients get 401 from backends.
 * **What this secret is.** One static bearer for the whole cluster, not a per-service or per-user credential. It is sent **in cleartext over plain HTTP on the LAN**, and `AuthedHttp::plain` attaches it to *whatever URL is configured* under `scribe.servers` / `distill.servers` (and through `HTTP(S)_PROXY` if one is set). Consequences: keep those URLs on the trusted LAN and double-check them for typos; a LAN sniffer, or the compromise of **any one** client host, unlocks **every** backend and bypasses the gateway's scopes (including the `personal_*` tools). Treat `secrets.env` on every host as a cluster root credential, and rotate by regenerating and redeploying to all hosts at once.
 * Follow-up options (not implemented): per-service tokens (a leaked scribe token no longer opens distill/mcp), and TLS between gateway/clients and backends so the token is not on the wire in clear. Recommendation: TLS first, then per-service tokens.
-* `hs-scribe-server` requires the token: every route except `GET /health` and `GET /readiness` answers 401 without `Authorization: Bearer <token>` (paths no route serves included). Provision it on **every** scribe host — the macOS launchd one included (`hs serve scribe --install` units read `secrets.env`; there is currently **no `hs scribe init`** command and no generated scribe compose file) — and on every host that runs a scribe client (`hs`, `hs-mcp`), before upgrading any of them: a client without it gets 401 on every convert (retried as transient, loudly).
+* `hs-scribe-server` requires the token: every route except `GET /health` and `GET /readiness` answers 401 without `Authorization: Bearer <token>` (paths no route serves included). Provision it on **every** scribe host — the macOS launchd one included (`hs serve scribe --install` units read `secrets.env`; nothing generates a scribe compose file or provisions the token for you) — and on every host that runs a scribe client (`hs`, `hs-mcp`), before upgrading any of them: a client without it gets 401 on every convert (retried as transient, loudly).
 
 ### 2. Gateway
 
@@ -33,7 +33,7 @@ Do these **before** restarting any service on the new binaries; each item names 
 * Scribe **server** settings live under `scribe_server:` in `~/.home-still/config.yaml` (or `HS_SCRIBE_*` env, which wins). The old `~/.config/home-still/config.yaml` is no longer read. Invalid values stop `hs-scribe-server` instead of starting on defaults.
 * A malformed `storage:`, `events:`, `logs:`, `home:`, `scribe:`, `distill:`, `scribe_server:` or `distill_server:` section, an unreadable `secrets.env`, or an invalid `HS_*` / `HOME_STILL_*` value now stops the binary (exit 1, or 2 for logging) with the key named.
 * Unknown keys: inside `storage:` (including `storage.local` and `storage.s3`) and `home:` they are **errors** naming the key and the valid ones (these decide where data lives: `storage.root` instead of `storage.local.root` used to run on the default root without a word). Inside `scribe`, `scribe_server`, `distill`, `distill_server`, `paper`, `personal` and `logs` they are **warnings**, logged once at start with the section, the key and the valid keys; so is an `HS_SCRIBE_*` / `HS_DISTILL_*` variable that sets nothing (the generic scribe "timeout secs" variable the README used to list never mapped to a field; use `HS_SCRIBE_VLM_IDLE_TIMEOUT_SECS`, `HS_SCRIBE_OLLAMA_REQUEST_TIMEOUT_SECS` or `HS_SCRIBE_CONVERT_DEADLINE_SECS`). `cloud.gateway` keys are not checked.
-* **Operator decision:** with no `storage:` section, local objects are still stored under `~/home-still` even when `home.project_dir` points elsewhere (moving the default would silently relocate the data of hosts that run on it today). Such a host now logs a WARN at start naming both paths; add `storage.local.root` to make them agree, or confirm the split is intended.
+* **Operator decision:** with no `storage:` section the local storage root defaults to `~/home-still`. If `home.project_dir` is set and names a different directory, the config is **refused** (an error naming both paths and the exact `storage:\n  backend: local\n  local:\n    root: <path>` section to add), so objects never silently split from the rest of the project data. An explicit `storage:` section is never checked.
 * Paper config: a provider API key with a plain-`http` non-loopback `base_url` refuses to load (e.g. `openalex.api_key` with `http://api.openalex.org`: use https).
 
 * **Rollout order: binaries first, then config.** `events` and `events.nats` reject unknown keys, so an older binary refuses to start on a config that already has `events.nats.drain_timeout_secs` (or any other key added in this release). Upgrade every host's binaries, then add new keys.
@@ -45,6 +45,7 @@ Do these **before** restarting any service on the new binaries; each item names 
 * A PDF pdfium cannot open, or that has no pages or more than 65 535, is refused for good (`pdf_parse_error`); a counter stuck behind a hostile document makes the callers behind it retry instead. A PDF the old parser rejected but pdfium renders is now converted.
 * **pdfium faults end the process.** A panic that unwinds through a live pdfium object poisons pdfium-render's process-wide lock, and a native pdfium call that never returns cannot be killed from inside the process. Both turn `/health` red (`status: pdfium_fault`, 503) and, after a 10 s grace, exit with status 70 so the supervisor restarts the unit (keep `Restart=always`/`RestartSec`). A panic during conversion is a typed permanent failure (`conversion_panicked`) on the wire, never a verdict about the PDF.
 * **Accepted residual: a PDF that keeps pdfium busy longer than its budget plus the grace period restarts the whole process.** The page count has a 60 s budget, each Legacy render/open call 120 s (`pdfium::guarded_call`), then a 10 s grace; past that the process exits 70 (`_exit`, so a wedged thread cannot block shutdown) and the supervisor restarts it, ending every conversion in flight on that host (up to `vlm_concurrency` of them). In-process recovery is impossible: pdfium holds a process-wide lock for the life of a call, a native call cannot be cancelled or killed from another thread, and a thread stuck inside it cannot be abandoned while the lock stays held. The only alternative is counting/rendering in a killable child process, which is deliberately not built. The document itself is refused for good (`pdf_parse_error`) on the count path, so it does not loop. The same restart follows a panic that poisons a layout/table ONNX slot (`DetectorPool`).
+* **What happens to those in-flight conversions.** A Legacy host serializes pdfium work (stage 1: open, render, layout) across conversions through pdfium-render's process-wide lock, while the VLM stage runs outside it, so `vlm_concurrency` > 1 is intended and sizes admission, the VLM semaphore and `/readiness` `vlm_slots_total`. When the exit-70 fires, each caller's HTTP connection drops. A caller using `hs scribe watch-events` (a separate process) sees an error with no typed `ConvertFailure`, which `classify` treats as `Transient`, and NAKs the event with `NAK_BACKOFF`; the event is acked only after a successful convert and upload, so JetStream redelivers it (bounded by the consumer's `max_deliver`). Caveats: a document that wedges a *render* (the page count passed) is redelivered and can wedge the server again until `max_deliver` retires it; and a watcher that dies together with the server (same host crash) leaves its events un-acked until `ack_wait` expires (see the next bullet). Callers that are not event watchers (`hs scribe convert`, MCP `scribe_convert`) just get the error and nothing retries for them.
 * **Events in flight at a restart.** On an orderly stop (broker/stream ended, delivery error, a rejected token) the watcher hands back every event it pulled but never started (NAK, immediate redelivery, bounded to 256 events / 5 s). After a crash or the exit-70 above those events stay invisible to the broker until `ack_wait` (default 2 h) expires.
 * **Token preflight.** `hs scribe watch-events` makes one authenticated `GET /info` to each configured scribe server before pulling any event. A wrong or missing `HS_BACKEND_TOKEN` (401 carrying the server's `realm="hs-scribe"`) stops the watcher there with exit 1; an unreachable server, a 403, or a 401 from a proxy/WAF is only logged (not a verdict on the credential).
 * **Size `MemoryMax` per scribe unit (operational; none is generated).** A compressed object-stream bomb makes pdfium (and any PDF parser) inflate ~2x the decoded size in RAM (measured: a 1.5 MB file costs ~2.5 GB). Recommendation: `MemoryMax=` = host RAM minus what the other tenants need (e.g. the VLM backend, distill), plus `MemoryHigh=` ~10% below it, on `hs-serve-scribe*` and the watcher unit; the OOM then kills one unit, not the host.
@@ -72,6 +73,8 @@ Do these **before** restarting any service on the new binaries; each item names 
 * Stems beginning with `..` are rejected everywhere (an inbox file named `....pdf` goes to `corrupted/`).
 * Downloads that are not PDFs (landing pages, HTML) fail that source instead of being stored.
 * `hs pipeline`, `hs migrate`, `hs distill abstracts` exit 1 on any per-item error.
+* `hs openalex` (hosts that keep the local OpenAlex catalog): the steps are `load` / `load-works` → `build-indexes` → `install-fts` → `build-fts`. `build-fts` no longer runs `INSTALL fts`; it only `LOAD`s the extension and, when it is missing, fails with "fts extension not installed — run `hs openalex install-fts` (needs network once)". Run `hs openalex install-fts` once per host (and again after a DuckDB version bump) on a host that can reach DuckDB's extension repository; it needs no catalog file and is a no-op when the extension is already in the running user's `~/.duckdb/extensions/`. A host where `build-fts` already ran under that user has the extension and needs nothing.
+* `hs openalex load <entity>` follows the same rule as `load-works` for every entity, the dimension tables (concepts, topics, domains, fields, subfields, sources, institutions, funders, publishers) and authors included: partitions are walked newest-first, a seen-set of integer ids gates each record, and the newest copy of an id wins; later copies are skipped silently and nothing uses `INSERT OR IGNORE`. A malformed id fails the partition (authors: counts against `--max-parse-errors`). Tables the SQL loaders filled before this release kept the *oldest* copy of an id that appears in several partitions, and their partitions are logged `ok` in `_ingest_log`, so a re-run does not touch them. To rebuild one with the new rule, stop the services that hold the catalog open, empty the table and its log rows with the DuckDB CLI (`DELETE FROM <table>; DELETE FROM _ingest_log WHERE entity = '<table>';`; `hs openalex query` is read-only), and run `hs openalex load <entity>` again.
 
 ---
 
@@ -180,7 +183,7 @@ All ports below are LAN-only **except** the gateway, which exits the LAN through
 
 (Cross-check against the "Network ports" table in the root README — they should agree.)
 
-A LAN firewall rule that only permits traffic *between* `192.0.2.0/24` hosts is enough. The tunnel host is the only one that needs outbound 443 to `*.cloudflare.com`.
+A LAN firewall rule that only permits traffic *between* `<lan-subnet>` hosts is enough. The tunnel host is the only one that needs outbound 443 to `*.cloudflare.com`.
 
 ## 6. Per-host setup recipes
 
@@ -334,7 +337,7 @@ sudo chown -R 1000:1000 /mnt/share/home-still
 Edit `/etc/exports`:
 
 ```
-/mnt/share/home-still   192.0.2.0/24(rw,async,no_subtree_check,all_squash,anonuid=1000,anongid=1000)
+<nfs-mount>/home-still   <lan-subnet>(rw,async,no_subtree_check,all_squash,anonuid=1000,anongid=1000)
 ```
 
 The `async` flag is critical — without it, every write blocks on disk and a USB SSD will crawl. (Symptom: jukebox errors, Mac Finder hangs. See the root README's NFS troubleshooting section.)
@@ -914,8 +917,8 @@ The install baked-in path is whatever `hs` binary ran the `install` — so upgra
 # Drop a PDF:
 cp ~/Downloads/foo.pdf <shared-root>/papers/manually_downloaded/
 
-# Within ~30s the catalog should have a row for it:
-hs catalog recent | head
+# Within ~30s the new paper should appear in the dashboard's pipeline stats:
+hs status
 ```
 
 If `catalog_repair`'s `disk_no_catalog` direction starts reporting orphans on a cluster where the watcher is supposed to be running, the daemon is either (a) not running (`hs scribe inbox status`), (b) pointed at the wrong storage root, or (c) racing with another copy on another client.
@@ -934,7 +937,7 @@ This pattern keeps big_mac a pure Ollama-VLM worker — no shared-storage auth, 
 
 **Prereqs on the secondary host**
 
-1. `rustc` + `cargo` (rustup).
+1. `rustup` (the repo pins its Rust version only in `rust-toolchain.toml`; rustup installs it automatically on first `cargo` call. To bump, edit `channel` there).
 2. `libpdfium` on every host that runs the scribe server or the watcher (`hs scribe watch-events`), on any converter — it counts the pages of every PDF, and both refuse to start without it. For macOS: `libpdfium.dylib` (pdfium-render dlopens this at runtime, and macOS has no system pdfium); `hs` and the server look in `~/.local/lib/` and `~/.home-still/dyld-libs/` themselves. Drop the bblanchon prebuilt into `~/.local/lib/` or `~/.home-still/dyld-libs/`:
    ```bash
    URL=$(curl -s https://api.github.com/repos/bblanchon/pdfium-binaries/releases/latest \
@@ -1092,8 +1095,8 @@ curl -fsS http://localhost:6333/collections
 
 ```bash
 nvidia-smi
-hs scribe server ping
-hs distill server ping
+curl -fsS http://localhost:7433/health   # scribe (if this host runs one)
+curl -fsS http://localhost:7434/health   # distill
 hs distill status
 # Look for non-zero VRAM in distill server logs:
 tail -n 50 ~/home-still/logs/distill-server.log | grep -i 'vram\|cuda\|provider'
@@ -1123,8 +1126,8 @@ For `big`:
 
 ```bash
 hs upgrade            # rolls scribe + distill in place; brief downtime per service
-hs scribe server ping
-hs distill server ping
+curl -fsS http://localhost:7433/health   # scribe (if this host runs one)
+curl -fsS http://localhost:7434/health   # distill
 ```
 
 For `two`:

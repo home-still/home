@@ -83,7 +83,7 @@ hs distill init --force
 ### 4. Start
 
 ```bash
-hs distill server start
+hs serve distill start
 ```
 
 Starts both the Qdrant container and the native `hs-distill-server` process. Logs are written to `{project_dir}/logs/distill-server.log`.
@@ -91,8 +91,8 @@ Starts both the Qdrant container and the native `hs-distill-server` process. Log
 ### 5. Manage
 
 ```bash
-hs distill server stop     # stop both Qdrant and distill server
-hs distill server ping     # health check
+hs serve distill stop     # stop the distill server
+hs status                 # health of the configured distill servers
 hs distill status          # show Qdrant health, server PID, collection info
 ```
 
@@ -120,12 +120,12 @@ distill:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `servers` | `["http://localhost:7434"]` | Distill server URL(s); overridden by gateway registry when available |
+| `servers` | `["http://localhost:7434"]` | Distill server URL(s) |
 | `markdown_dir` | `{project_dir}/markdown` | Where to find `.md` files |
 | `catalog_dir` | `{project_dir}/catalog` | Where to find catalog `.yaml` files |
 | `index_timeout_secs` | `1800` | Deadline for one indexing request. With NATS events it must be at least 120 s below `events.nats.ack_wait_secs` (default 7200). |
 
-Server discovery uses the gateway service registry when available, falling back to the configured server list.
+The configured `distill.servers` list is the only source of server addresses; there is no service registry.
 
 ### 3. Index
 
@@ -136,7 +136,7 @@ hs distill index --file doc1.md doc2.md # index specific files
 
 The client reads each `.md` file locally and sends its content to the server for chunking, embedding, and storage. Files are identified by their stem name (e.g., `paper.md` becomes doc_id `paper`). The server never reads documents from disk: a request without `content` is rejected with HTTP 400. Re-indexing a document replaces all of its chunks (including ones past the new end), and a document that is skipped (empty, an anti-bot stub, nothing passes the quality filter) has its old chunks removed.
 
-Indexing can also be triggered automatically: `hs scribe watch` auto-starts the distill indexer when new conversions complete, so newly converted markdown is embedded without a separate manual step.
+Indexing is also triggered automatically: `hs distill watch-events` (`hs serve distill-watch --install` runs it as a service) indexes each markdown object when a `scribe.completed` event arrives, so newly converted markdown is embedded without a separate manual step.
 
 ### 4. Search
 

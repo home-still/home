@@ -14,18 +14,32 @@ pub fn strip_doi(doi: &str) -> &str {
     doi.strip_prefix("https://doi.org/").unwrap_or(doi)
 }
 
-/// Parse the integer portion of an OpenAlex work ID as `u64`. Accepts both
-/// the URL form (`"https://openalex.org/W2741809807"`) and the bare form
-/// (`"W2741809807"`). Returns `None` if the prefix is wrong, the prefix
-/// letter isn't `W`, or the trailing digits don't parse.
+/// Parse the integer portion of an OpenAlex entity ID as `u64`. Accepts both
+/// the URL form (`"https://openalex.org/C41008148"`) and the bare form
+/// (`"C41008148"`). `prefix` is the entity's type letter (`W` works, `A`
+/// authors, `C` concepts, `T` topics, `S` sources, `I` institutions, `F`
+/// funders, `P` publishers); `None` is for the taxonomy entities whose stored
+/// ID is only digits (domains, fields, subfields: `3`, `17`, `1702`, the part
+/// after `https://openalex.org/domains/` and its siblings, which the loader's
+/// SQL strips before the ID reaches here). Returns `None` if the prefix
+/// letter is wrong or the digits don't parse.
 ///
-/// Used by the streaming-pre-dedupe seen-set: integer IDs collide-free
+/// Used by the streaming-pre-dedupe seen-sets: integer IDs collide-free
 /// at corpus scale (vs hashing the string, which has ~3-in-1000 collision
 /// risk at 250M items via xxhash64).
-pub fn parse_work_id_u64(id: &str) -> Option<u64> {
+pub fn parse_entity_id_u64(id: &str, prefix: Option<char>) -> Option<u64> {
     let bare = strip_openalex_id(id);
-    let digits = bare.strip_prefix('W')?;
+    let digits = match prefix {
+        Some(p) => bare.strip_prefix(p)?,
+        None => bare,
+    };
     digits.parse::<u64>().ok()
+}
+
+/// [`parse_entity_id_u64`] for a work ID (`W` prefix), e.g.
+/// `"https://openalex.org/W2741809807"` or `"W2741809807"`.
+pub fn parse_work_id_u64(id: &str) -> Option<u64> {
+    parse_entity_id_u64(id, Some('W'))
 }
 
 /// Upper bound on a word position in `abstract_inverted_index`. Positions come
@@ -157,5 +171,27 @@ mod tests {
         assert_eq!(parse_work_id_u64(""), None);
         assert_eq!(parse_work_id_u64("W"), None);
         assert_eq!(parse_work_id_u64("Wabc"), None);
+    }
+
+    #[test]
+    fn parses_entity_ids_with_their_own_prefix() {
+        assert_eq!(
+            parse_entity_id_u64("A5023888391", Some('A')),
+            Some(5_023_888_391)
+        );
+        assert_eq!(
+            parse_entity_id_u64("https://openalex.org/C41008148", Some('C')),
+            Some(41_008_148)
+        );
+        assert_eq!(parse_entity_id_u64("W1", Some('A')), None);
+        assert_eq!(parse_entity_id_u64("A", Some('A')), None);
+    }
+
+    #[test]
+    fn parses_taxonomy_ids_that_are_only_digits() {
+        assert_eq!(parse_entity_id_u64("3", None), Some(3));
+        assert_eq!(parse_entity_id_u64("1702", None), Some(1702));
+        assert_eq!(parse_entity_id_u64("A3", None), None);
+        assert_eq!(parse_entity_id_u64("", None), None);
     }
 }

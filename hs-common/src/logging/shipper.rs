@@ -126,7 +126,7 @@ mod tests {
 
         ship_once(spool_tmp.path(), storage.as_ref(), "hs-test/host-a/", true).await;
 
-        // spool dir should now only have current.jsonl (empty)
+        // spool dir should now only have the live current-*.jsonl (empty)
         let leftover = spool::list_closed(spool_tmp.path()).await.unwrap();
         assert!(
             leftover.is_empty(),

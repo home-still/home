@@ -671,7 +671,22 @@ async fn handle_scribe_stream(
         // end the task, drop `tx` and leave the client an untyped
         // "connection closed" it retries. Catch it, say so, and type it.
         let convert_fut = guarded_conversion(&stem, convert_pdf(&state, _tmp.path(), on_progress));
-        match tokio::time::timeout(deadline, convert_fut).await {
+        // The response body (the receiver) is dropped when the client goes
+        // away; nobody can read this conversion's result any more, so stop
+        // it here and free the slot — an olmocr subprocess is killed on drop
+        // and a Legacy conversion stops at its next await — instead of
+        // running it to the deadline for no reader.
+        let outcome = tokio::select! {
+            outcome = tokio::time::timeout(deadline, convert_fut) => outcome,
+            () = tx.closed() => {
+                tracing::warn!(
+                    stem = %stem,
+                    "client disconnected mid-conversion — aborting; slot released"
+                );
+                return;
+            }
+        };
+        match outcome {
             Ok(Ok((markdown, per_page_region_classes, per_page_diags))) => {
                 record_success(
                     &state.last_conversion_ms,

@@ -61,6 +61,30 @@ impl<V> ExpiringStore<V> {
         Ok(())
     }
 
+    /// Reserve a slot, then build the value under the same lock. Refuses with
+    /// [`Full`] *before* calling `make`, so a side effect in `make` (consuming a
+    /// single-use code elsewhere) never happens for a refused insert. Returns
+    /// `Ok(false)` when `make` yields nothing and so nothing was inserted.
+    /// `make` must not touch this store.
+    pub fn insert_with(&self, key: String, make: impl FnOnce() -> Option<V>) -> Result<bool, Full> {
+        let mut map = self.lock();
+        self.reap(&mut map);
+        if map.len() >= self.max_entries && !map.contains_key(&key) {
+            return Err(Full);
+        }
+        let Some(value) = make() else {
+            return Ok(false);
+        };
+        map.insert(
+            key,
+            Entry {
+                value,
+                inserted: Instant::now(),
+            },
+        );
+        Ok(true)
+    }
+
     /// Insert `value`, evicting the oldest live entry when the store is full.
     pub fn insert_evicting_oldest(&self, key: String, value: V) {
         let mut map = self.lock();

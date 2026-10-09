@@ -19,9 +19,18 @@ use crate::models::layout::BBox;
 pub fn join_pages(pages: &[String]) -> String {
     const SEPARATOR: &str = "\n\n---\n\n";
     const HR_EQUIVALENT: &str = "\n\n***\n\n";
+    // One `replace` pass is not enough: consecutive rules (`---` blank
+    // `---`) share their blank line, so the first pass leaves a fresh
+    // separator behind. Each pass removes at least one `---`, so this ends.
     let reserved: Vec<String> = pages
         .iter()
-        .map(|p| p.replace(SEPARATOR, HR_EQUIVALENT))
+        .map(|p| {
+            let mut page = p.replace(SEPARATOR, HR_EQUIVALENT);
+            while page.contains(SEPARATOR) {
+                page = page.replace(SEPARATOR, HR_EQUIVALENT);
+            }
+            page
+        })
         .collect();
     reserved.join(SEPARATOR)
 }
@@ -263,5 +272,14 @@ mod tests {
         assert!(md.contains("# Title Here"));
         assert!(md.contains("Some body text."));
         assert!(md.contains("$$\nx^2\n$$"));
+    }
+
+    #[test]
+    fn join_pages_normalizes_consecutive_in_page_rules() {
+        // Two rules in a row share a blank line; one `replace` pass leaves a
+        // reserved separator behind.
+        let pages = vec!["a\n\n---\n\n---\n\nb".to_string(), "c".to_string()];
+        let joined = join_pages(&pages);
+        assert_eq!(joined.split("\n\n---\n\n").count(), pages.len());
     }
 }

@@ -9,6 +9,11 @@
 //! steps in `duckdb_loader` so they don't slow ingest.
 
 pub const SCHEMA_DDL: &str = r#"
+-- Dimension tables (concepts .. publishers, authors): PRIMARY KEY (openalex_id)
+-- is safe for the same reason `works` is below. Their loaders walk partitions
+-- newest-first and gate every record through an in-RAM seen-set of integer
+-- IDs, so a duplicate never reaches the INSERT and the newest copy is the one
+-- stored. No ON CONFLICT / INSERT OR IGNORE: that would keep the oldest.
 CREATE TABLE IF NOT EXISTS concepts (
     openalex_id     VARCHAR PRIMARY KEY,
     display_name    VARCHAR,

@@ -155,6 +155,12 @@ async fn cmd_reconvert(stem: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
     const CATALOG_PREFIX: &str = "catalog";
     const CANDIDATE_EXTS: &[&str] = &["pdf", "html", "htm", "epub"];
 
+    // `stem` is operator-typed and becomes storage keys that are read,
+    // deleted and rewritten below; `..` or a separator would walk out of the
+    // papers/markdown/catalog prefixes.
+    hs_common::validate_stem(stem)
+        .map_err(|e| anyhow::anyhow!("`{stem}` is not a usable catalog stem: {e}"))?;
+
     let cfg = ScribeConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage()?;
     let bus = cfg.build_event_bus().await?;
@@ -939,18 +945,20 @@ mod markdown_path_tests {
 // ── Server ──────────────────────────────────────────────────────
 
 pub async fn cmd_server(action: ServerAction) -> Result<()> {
-    let compose_path = hidden_dir().join("docker-compose.yml");
+    let compose_path = hs_common::hidden_dir()?.join("docker-compose.yml");
     if !compose_path.exists() {
         anyhow::bail!("No compose config found at ~/.home-still/docker-compose.yml; the scribe server is started with `hs serve scribe` instead.");
     }
     let compose = ComposeCmd::detect()
         .await
         .ok_or_else(|| anyhow::anyhow!("No container runtime found"))?;
-    let cf = compose_path.to_str().unwrap_or_default();
+    let cf = compose_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{} is not valid UTF-8", compose_path.display()))?;
 
     match action {
         ServerAction::Start => {
-            compose.run_capture(&["-f", cf, "up", "-d"]).await?;
+            crate::distill_cmd::compose_step(&compose, &["-f", cf, "up", "-d"]).await?;
             eprintln!("Waiting for services...");
             let cfg = ScribeConfig::load()?;
             let server = cfg.require_servers()?[0].url.clone();
@@ -958,7 +966,7 @@ pub async fn cmd_server(action: ServerAction) -> Result<()> {
             eprintln!("Ready.");
         }
         ServerAction::Stop => {
-            compose.run_capture(&["-f", cf, "down"]).await?;
+            crate::distill_cmd::compose_step(&compose, &["-f", cf, "down"]).await?;
             eprintln!("Stopped.");
         }
     }
@@ -1036,13 +1044,6 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-/// Hidden directory for config, cache, models, compose (~/.home-still)
-fn hidden_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(hs_common::HIDDEN_DIR)
-}
-
 use hs_common::compose::ComposeCmd;
 
 async fn wait_for_health(server_url: &str, timeout_secs: u64) -> Result<()> {
@@ -1057,16 +1058,23 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let catalog_store = hs_common::storage::LocalFsStorage::new(catalog_dir);
     let papers_dir = &scribe_cfg.watch_dir;
 
-    let entries = hs_common::collect_files_recursive(markdown_dir, "md");
+    let entries = hs_common::collect_files_recursive(markdown_dir, "md")
+        .context("walking the markdown directory")?;
 
     let mut created = 0u32;
     let mut skipped = 0u32;
+    let mut unreadable = 0u32;
 
     for md_path in &entries {
         let stem = md_path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} has a non-UTF-8 file name; no catalog stem",
+                    md_path.display()
+                )
+            })?;
 
         // Skip if catalog entry already exists
         if hs_common::catalog::read_catalog_entry_via(&catalog_store, "", stem)
@@ -1081,7 +1089,11 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
         // Read markdown to extract metadata
         let content = match std::fs::read_to_string(md_path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                reporter.warn(&format!("cannot read {}: {e}", md_path.display()));
+                unreadable += 1;
+                continue;
+            }
         };
 
         // Extract title from first line if it looks like a heading
@@ -1149,8 +1161,11 @@ async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
     }
 
     reporter.finish(&format!(
-        "Backfill complete: {created} created, {skipped} already existed"
+        "Backfill complete: {created} created, {skipped} already existed, {unreadable} unreadable"
     ));
+    if unreadable > 0 {
+        anyhow::bail!("{unreadable} markdown file(s) could not be read and were not backfilled");
+    }
     Ok(())
 }
 

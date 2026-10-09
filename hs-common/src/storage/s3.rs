@@ -44,6 +44,17 @@ impl std::fmt::Debug for S3Config {
 
 impl S3Storage {
     pub fn new(cfg: S3Config) -> anyhow::Result<Self> {
+        // `ensure_bucket` signs requests against `<endpoint>/<bucket>/` and
+        // must be able to parse it; refuse a malformed endpoint here, as a
+        // configuration error, instead of panicking there.
+        let bucket_url = format!("{}/{}/", cfg.endpoint.trim_end_matches('/'), cfg.bucket);
+        url::Url::parse(&bucket_url).map_err(|e| {
+            anyhow::anyhow!(
+                "storage.s3.endpoint {:?} with bucket {:?} is not a valid URL: {e}",
+                cfg.endpoint,
+                cfg.bucket
+            )
+        })?;
         let store = AmazonS3Builder::new()
             .with_endpoint(&cfg.endpoint)
             .with_bucket_name(&cfg.bucket)

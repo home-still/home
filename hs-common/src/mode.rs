@@ -8,6 +8,21 @@ pub enum OutputMode {
 }
 
 pub fn detect(color_choice: &str, is_json: bool) -> OutputMode {
+    detect_with(
+        color_choice,
+        is_json,
+        |k| std::env::var(k).ok(),
+        || std::io::stderr().is_terminal(),
+    )
+}
+
+/// [`detect`] with the environment lookup and the TTY probe injected.
+fn detect_with(
+    color_choice: &str,
+    is_json: bool,
+    env: impl Fn(&str) -> Option<String>,
+    stderr_is_terminal: impl Fn() -> bool,
+) -> OutputMode {
     if is_json {
         return OutputMode::Pipe;
     }
@@ -18,19 +33,19 @@ pub fn detect(color_choice: &str, is_json: bool) -> OutputMode {
         _ => {}
     }
 
-    if std::env::var("FORCE_COLOR").is_ok_and(|v| !v.is_empty()) {
+    if env("FORCE_COLOR").is_some_and(|v| !v.is_empty()) {
         return OutputMode::Rich;
     }
 
-    if !std::io::stderr().is_terminal() {
+    if !stderr_is_terminal() {
         return OutputMode::Pipe;
     }
 
-    if std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty()) {
+    if env("NO_COLOR").is_some_and(|v| !v.is_empty()) {
         return OutputMode::Plain;
     }
 
-    if std::env::var("TERM").is_ok_and(|v| v == "dumb") {
+    if env("TERM").is_some_and(|v| v == "dumb") {
         return OutputMode::Plain;
     }
 
@@ -58,10 +73,29 @@ mod tests {
 
     #[test]
     fn force_color_returns_rich() {
-        // FORCE_COLOR is checked before the TTY check, so this works in test runners
-        std::env::set_var("FORCE_COLOR", "1");
-        let result = detect("auto", false);
-        std::env::remove_var("FORCE_COLOR");
-        assert_eq!(result, OutputMode::Rich);
+        // FORCE_COLOR is checked before the TTY check.
+        let env = |k: &str| (k == "FORCE_COLOR").then(|| "1".to_string());
+        assert_eq!(detect_with("auto", false, env, || false), OutputMode::Rich);
+    }
+
+    #[test]
+    fn empty_force_color_is_ignored() {
+        let env = |k: &str| (k == "FORCE_COLOR").then(String::new);
+        assert_eq!(detect_with("auto", false, env, || false), OutputMode::Pipe);
+    }
+
+    #[test]
+    fn terminal_honours_no_color_and_dumb_term() {
+        let no_color = |k: &str| (k == "NO_COLOR").then(|| "1".to_string());
+        assert_eq!(
+            detect_with("auto", false, no_color, || true),
+            OutputMode::Plain
+        );
+        let dumb = |k: &str| (k == "TERM").then(|| "dumb".to_string());
+        assert_eq!(detect_with("auto", false, dumb, || true), OutputMode::Plain);
+        assert_eq!(
+            detect_with("auto", false, |_| None, || true),
+            OutputMode::Rich
+        );
     }
 }

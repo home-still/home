@@ -10,6 +10,9 @@ use crate::models::{Author, Paper, SearchQuery, SearchResult, SearchType, SortBy
 use crate::ports::provider::PaperProvider;
 use crate::providers::response::{check_response, parse_json_or_log};
 
+/// Largest `limit` CORE's search endpoint accepts.
+const CORE_PAGE_MAX: usize = 100;
+
 #[derive(Debug, Deserialize)]
 struct CoreResponse {
     #[serde(rename = "totalHits")]
@@ -101,7 +104,10 @@ impl CoreProvider {
         // Date filter (year-only precision) — must come before q moves into params
         let q = if let Some(ref df) = query.date_filter {
             let from = df.after.map(|d| d.format("%Y").to_string());
-            let to = df.before.map(|d| d.format("%Y").to_string());
+            // `before` is the first excluded day; `yearPublished<=` is inclusive.
+            let to = df
+                .before
+                .map(|d| (d - chrono::Duration::days(1)).format("%Y").to_string());
             match (from, to) {
                 (Some(f), Some(t)) => {
                     format!("({}) AND yearPublished>={} AND yearPublished<={}", q, f, t)
@@ -114,7 +120,7 @@ impl CoreProvider {
             q
         };
 
-        let limit = query.max_results.min(100);
+        let limit = query.max_results.min(CORE_PAGE_MAX);
 
         let mut params: Vec<(&str, String)> = vec![
             ("q", q),
@@ -167,7 +173,7 @@ impl PaperProvider for CoreProvider {
         let response = request.send().await?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(PaperError::ProviderUnavailable(
+            return Err(PaperError::ProviderRejected(
                 "CORE API key required or invalid. Set providers.core.api_key in config.".into(),
             ));
         }
@@ -181,7 +187,7 @@ impl PaperProvider for CoreProvider {
             .map(|w| self.core_work_to_paper(w))
             .collect();
 
-        let next_offset = query.offset + query.max_results;
+        let next_offset = query.offset + query.max_results.min(CORE_PAGE_MAX);
         let next_offset = if next_offset < body.total_hits {
             Some(next_offset)
         } else {
@@ -214,7 +220,7 @@ impl PaperProvider for CoreProvider {
         let response = request.send().await?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(PaperError::ProviderUnavailable(
+            return Err(PaperError::ProviderRejected(
                 "CORE API key required or invalid. Set providers.core.api_key in config.".into(),
             ));
         }

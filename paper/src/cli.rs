@@ -27,7 +27,8 @@ pub enum PaperCmd {
         #[arg(short = 'n', long, default_value = "10")]
         max_results: u16,
 
-        /// Pagination offset
+        /// Pagination offset. OpenAlex needs a multiple of the page size;
+        /// Europe PMC cannot page by offset (rejected alone, skipped in `all`)
         #[arg(long, default_value = "0")]
         offset: usize,
 

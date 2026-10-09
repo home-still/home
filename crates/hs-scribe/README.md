@@ -21,34 +21,25 @@ The pipeline has two modes:
 ## Quick start
 
 ```sh
-# One-time setup (downloads models, starts services)
-hs scribe init
+# Run a scribe server on a GPU host (models, libpdfium and HS_BACKEND_TOKEN in place; see below)
+hs serve scribe
 
 # Convert a PDF
 hs scribe convert paper.pdf -o paper.md
 
-# Watch a folder and auto-convert new PDFs
-hs scribe watch --dir ~/papers --output ~/papers/markdown
+# Convert PDFs automatically as `papers.ingested` events arrive on the event bus
+hs scribe watch-events
 ```
 
 ## Setup
 
-```sh
-hs scribe init
-```
+Nothing provisions a scribe host for you: `hs serve scribe` starts the server and provisions nothing. The scribe host needs, before it starts:
 
-This single command handles everything:
+1. **The layout model** (PP-DocLayout-V3, ~125 MB ONNX file) at the configured model path (Legacy converter), and a VLM backend reachable at the configured URL (Ollama, an OpenAI-compatible server such as llama-swap, or a cloud API).
+2. **libpdfium** and **`HS_BACKEND_TOKEN`** (below).
+3. **GPU acceleration** chosen by the server's configuration: Metal via a native Ollama on Apple Silicon, CUDA on NVIDIA hosts (`HS_SCRIBE_USE_CUDA`).
 
-1. **Detects your container runtime** (Docker or Podman). On macOS, auto-installs via Homebrew if needed.
-2. **Detects your hardware**:
-   - Apple Silicon? Installs Ollama natively for Metal GPU acceleration.
-   - NVIDIA GPU? Enables CUDA in the container config.
-   - Neither? Falls back to CPU mode.
-3. **Downloads the layout model** (~125 MB ONNX file).
-4. **Writes the Docker Compose config** tailored to your platform.
-5. **Starts services and pulls the VLM model** (~2.5 GB on first run).
-
-Use `hs scribe init --force` to regenerate everything, or `hs scribe init --check` for a dry-run status report.
+`hs serve scribe --install` installs the server as a systemd (Linux) or launchd (macOS) unit that reads `~/.home-still/secrets.env`.
 
 ### Requirements of a scribe host
 
@@ -81,23 +72,22 @@ During conversion, you'll see a live progress bar with elapsed time and ETA:
 Converting ━━━━━━━━━━━━━━╸              22/43  00:01:30 ETA 00:00:42  [vlm] OCR region 5/12 on page 22
 ```
 
-### Watch a directory
+### Watch for new PDFs
 
 ```sh
-hs scribe watch --dir ~/papers --output ~/papers/markdown
-hs scribe watch   # uses watch_dir/output_dir from config, or current dir
+hs scribe watch-events               # foreground; needs events.backend: nats
+hs serve scribe-watch --install      # install as a user-level service
 ```
 
-Watches recursively for new or modified `.pdf` files. Skips PDFs that already have up-to-date markdown (compares file modification times). Runs until CTRL+C.
+Subscribes to `papers.ingested`, converts each PDF through the configured scribe servers and uploads the markdown back to storage.
 
 ### Manage the server
 
 ```sh
-hs scribe server start   # start containers
-hs scribe server stop    # stop containers
-hs scribe server list    # show status + health
-hs scribe server ping    # quick health check
-hs scribe server ping http://remote:7433  # check a specific server
+hs serve scribe start    # run in the background
+hs serve scribe stop     # stop it
+hs status                # health of every configured scribe server
+curl http://<host>:7433/health   # liveness of one server
 ```
 
 ## Architecture
@@ -152,9 +142,9 @@ scribe:
     - http://pi-cluster:7433
 ```
 
-With multiple servers, `hs scribe convert` and `hs scribe watch` automatically load-balance across them. The CLI queries each server's `/readiness` endpoint and routes each PDF to the server with the most available VLM slots.
+With multiple servers, `hs scribe convert` and `hs scribe watch-events` automatically load-balance across them. The CLI queries each server's `/readiness` endpoint and routes each PDF to the server with the most available VLM slots.
 
-Server discovery uses the gateway service registry when available, falling back to the configured server list.
+The configured `scribe.servers` list is the only source of server addresses; there is no service registry.
 
 EPUBs (the watcher, `hs scribe inbox` and `hs personal add` all read them through one bounded reader) are limited by:
 
@@ -199,10 +189,10 @@ Server-side settings use environment variables with the `HS_SCRIBE_` prefix (`HS
 
 | Variable | Default | Description |
 |---|---|---|
-| `HS_SCRIBE_VLM_CONCURRENCY` | `4` | Max concurrent VLM requests across pages |
+| `HS_SCRIBE_VLM_CONCURRENCY` | host-class default (e.g. `4` on low-end Apple Silicon, `2` on a Pi) | Legacy: the shared VLM-call semaphore across all conversions, the number of conversions admitted at once (more get 503) and the `vlm_slots_total` `/readiness` advertises. olmocr: concurrent `olmocr` runs. In Legacy, PDF open/render/layout (stage 1) is serialized by pdfium-render's process-wide lock, so only the VLM stage overlaps between conversions; values > 1 are intended (they pipeline VLM work with the next render). A wedged pdfium call makes the watchdog exit the whole server, ending all in-flight conversions (see `docs/deployment.md`) |
 | `HS_SCRIBE_REGION_PARALLEL` | `4` | Max concurrent regions within one page |
 | `HS_SCRIBE_PARALLEL` | `1` | Max concurrent pages in FullPage mode |
-| `HS_SCRIBE_USE_CUDA` | `true` | Enable CUDA for ONNX layout detection |
+| `HS_SCRIBE_USE_CUDA` | `true` (`false` on macOS) | Enable CUDA for ONNX layout detection. `true` on macOS is a startup error: CUDA is not available there |
 | `HS_SCRIBE_MAX_IMAGE_DIM` | `1800` | Downscale images larger than this (pixels) |
 
 ### Model paths
@@ -266,7 +256,7 @@ docker run -p 7433:7433 -v ~/.local/share/home-still/models:/models:ro \
   ghcr.io/home-still/hs-scribe-server:latest
 ```
 
-Or just use `hs scribe init` which handles all of this automatically.
+Or run the server natively with `hs serve scribe`.
 
 ### Health check
 

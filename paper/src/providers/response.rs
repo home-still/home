@@ -89,13 +89,22 @@ pub fn check_response(response: &reqwest::Response, provider: &str) -> Result<()
             retry_after,
         });
     } else if !response.status().is_success() {
-        return Err(PaperError::ProviderUnavailable(format!(
-            "{} returned {}",
-            provider,
-            response.status()
-        )));
+        return Err(status_error(provider, response.status()));
     }
     Ok(())
+}
+
+/// The error for a non-success, non-429 status. A 4xx says the request
+/// itself is wrong ([`PaperError::ProviderRejected`]: permanent); 408 and
+/// everything else (5xx, odd 3xx) says the provider could not answer now
+/// ([`PaperError::ProviderUnavailable`]: retried, counted by the breaker).
+pub fn status_error(provider: &str, status: reqwest::StatusCode) -> PaperError {
+    let message = format!("{provider} returned {status}");
+    if status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT {
+        PaperError::ProviderRejected(message)
+    } else {
+        PaperError::ProviderUnavailable(message)
+    }
 }
 
 /// Deserialize a JSON response body, capturing the raw bytes and `Content-Type`
@@ -218,5 +227,34 @@ mod tests {
                 .unwrap();
         let err = check_response(&response, "test").unwrap_err();
         assert_eq!(err.retry_after(), Some(Duration::from_secs(7200)));
+    }
+
+    #[test]
+    fn a_4xx_is_permanent_and_a_5xx_is_transient() {
+        use crate::error::ErrorCategory;
+        use reqwest::StatusCode;
+
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+        ] {
+            let err = status_error("test", status);
+            assert!(matches!(err, PaperError::ProviderRejected(_)), "{status}");
+            assert!(matches!(err.category(), ErrorCategory::Permanent));
+        }
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let err = status_error("test", status);
+            assert!(
+                matches!(err, PaperError::ProviderUnavailable(_)),
+                "{status}"
+            );
+            assert!(matches!(err.category(), ErrorCategory::Transient));
+        }
     }
 }

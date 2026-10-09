@@ -50,9 +50,11 @@ pub struct EvalResults {
 }
 
 /// Result of the parallel OCR phase for a single sample.
+type OcrOutput = (String, Vec<String>, Option<String>, Option<Vec<String>>);
+
 struct OcrResult {
     index: usize,
-    result: Option<(String, Vec<String>, Option<String>, Option<Vec<String>>)>,
+    result: Option<OcrOutput>,
 }
 
 /// Run the processor against ground truth samples and score output.
@@ -187,8 +189,8 @@ pub async fn run_eval(
                         bleu: 0.0,
                         composite: CompositeScoreSerializable {
                             text_score: if has_text_ref { Some(0.0) } else { None },
-                            teds_score: None,
-                            cdm_score: None,
+                            teds_score: sample.table_html.as_ref().map(|_| 0.0),
+                            cdm_score: sample.formula_latex.as_ref().map(|_| 0.0),
                             composite: 0.0,
                         },
                         reference_len: reference.len(),

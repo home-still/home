@@ -147,6 +147,29 @@ pub struct PipelineCounts {
     /// panel, not just in the per-scribe Services rows.
     #[serde(default)]
     pub in_flight_conversions: Option<u64>,
+    /// Work outstanding on the scribe consumer of `papers.ingested`: waiting
+    /// in the stream plus delivered and not yet acked (so it includes what is
+    /// being converted right now). This is what a `hs pipeline catch-up`
+    /// burst looks like before and while scribe works through it. `None`
+    /// when the broker could not be asked — see `queue_error`.
+    #[serde(default)]
+    pub queued_conversions: Option<u64>,
+    /// Papers that have a convertible source file (see
+    /// [`convertible_source_stem`]) but no markdown and are NOT outstanding
+    /// on the queue: nothing is queued to convert them, so `hs pipeline
+    /// catch-up` would queue every one. `None` when either the storage
+    /// listing or the queue depth is unavailable, or when the snapshot comes
+    /// from a server that predates queue reporting (see `queue_error`).
+    #[serde(default)]
+    pub stalled_conversions: Option<u64>,
+    /// Why `queued_conversions` is unknown (broker unreachable, consumer
+    /// missing). Rendered as such, never as an empty queue. A server that
+    /// reports the queue always sets one of `queued_conversions` or
+    /// `queue_error` (see [`PipelineCounts::record_queue`]), so a received
+    /// snapshot with neither came from a server that predates queue
+    /// reporting.
+    #[serde(default)]
+    pub queue_error: Option<String>,
     /// Unaccounted rows: `documents − markdown − in_flight`. Small
     /// residual (<= threshold) is expected due to stage-in-progress;
     /// larger values indicate a conversion error the operator needs to
@@ -171,6 +194,28 @@ impl PipelineCounts {
     pub fn mark_unavailable(&mut self, reason: impl std::fmt::Display) {
         if self.counts_error.is_none() {
             self.counts_error = Some(format!("{reason:#}"));
+        }
+    }
+
+    /// Fold the queue reading into the snapshot. `unconverted` is the count
+    /// of papers with a convertible source and no markdown (`None` if it
+    /// could not be taken); `outstanding` is the scribe consumer's waiting +
+    /// unacked messages, or why the broker could not say. A failed reading
+    /// leaves `queued_conversions`/`stalled_conversions` unset and names the
+    /// cause. Exactly one of `queued_conversions` / `queue_error` is set
+    /// afterwards.
+    pub fn record_queue(&mut self, unconverted: Option<u64>, outstanding: Result<u64, String>) {
+        match outstanding {
+            Ok(queued) => {
+                self.queued_conversions = Some(queued);
+                self.stalled_conversions = unconverted.map(|u| u.saturating_sub(queued));
+                self.queue_error = None;
+            }
+            Err(reason) => {
+                self.queued_conversions = None;
+                self.stalled_conversions = None;
+                self.queue_error = Some(reason);
+            }
         }
     }
 }
@@ -203,6 +248,11 @@ pub struct ServiceInstance {
     pub slots_total: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots_available: Option<u64>,
+    /// Why the service answered less than fully: the text of each failed
+    /// health, readiness or status call, `; `-joined. `None` when every call
+    /// succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Convenience rollup of the first healthy distill instance.
@@ -395,6 +445,49 @@ pub async fn count_ext_via(storage: &dyn Storage, prefix: &str, ext: &str) -> an
     Ok(count_ext(&objs, ext))
 }
 
+/// Source extensions scribe converts on the `papers.ingested` event path
+/// (`hs-scribe` `convert_and_upload` dispatches on exactly these, after
+/// lowercasing). The one list behind "is this object something catch-up
+/// would queue": `hs pipeline catch-up`/`rebuild`, the unconverted count
+/// below and the inbox sweeper's whitelist all read it.
+pub const CONVERTIBLE_SOURCE_EXTS: &[&str] = &["pdf", "html", "htm", "epub"];
+
+/// Stem of a `papers/` object that is a convertible source, or `None` for
+/// anything catch-up must not queue and the unconverted count must not
+/// include:
+///
+/// - `papers/manually_downloaded/` — the inbox drop zone. Its files are not
+///   sources yet (the sweeper relocates them and publishes the event);
+///   they are reported as `inbox_pending`.
+/// - `papers/.quarantine/` — known-bad bytes relocated by `hs migrate
+///   quarantine-bad-content`, stamped `conversion_failed` to stay out of
+///   the pipeline.
+/// - `._*` macOS resource forks.
+/// - Zero-byte objects — nothing to convert; scribe would fetch, fail and
+///   the event would cycle.
+/// - Any extension outside [`CONVERTIBLE_SOURCE_EXTS`] (case-insensitive,
+///   like scribe's dispatcher).
+pub fn convertible_source_stem(key: &str, size: u64) -> Option<&str> {
+    if size == 0 {
+        return None;
+    }
+    // Directory segments, matched whole so a key with no leading `papers/`
+    // (a dedicated bucket with an empty prefix) is excluded the same way.
+    let mut segments = key.rsplit('/');
+    let name = segments.next()?;
+    if segments.any(|dir| dir == ".quarantine" || dir == "manually_downloaded") {
+        return None;
+    }
+    if name.starts_with("._") {
+        return None;
+    }
+    let (stem, ext) = name.rsplit_once('.')?;
+    CONVERTIBLE_SOURCE_EXTS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(ext))
+        .then_some(stem)
+}
+
 /// Count distinct source stems under `papers_prefix` that have no markdown.
 ///
 /// This is the honest basis for `pipeline_drift`. Comparing raw object
@@ -414,13 +507,10 @@ pub async fn count_ext_via(storage: &dyn Storage, prefix: &str, ext: &str) -> an
 /// threshold of 3. Counting stems makes the number reachable: it goes to
 /// zero exactly when every live source has markdown.
 ///
-/// `.quarantine/` is excluded: `hs migrate quarantine-bad-content`
-/// relocates known-bad bytes there and stamps `conversion_failed`
-/// specifically to take them out of the pipeline, and `hs pipeline
-/// catch-up` skips them for the same reason. They surface through the
-/// corrupted count instead. Stamped failures still sitting in the live
-/// papers tree are deliberately *not* excluded — drift is meant to show
-/// those.
+/// "Source" is [`convertible_source_stem`] — the same predicate `hs
+/// pipeline catch-up` plans with, so every stem counted here is one
+/// catch-up would queue. Stamped failures still sitting in the live papers
+/// tree are deliberately *not* excluded — drift is meant to show those.
 #[cfg(feature = "storage")]
 pub async fn count_unconverted_stems(
     storage: &dyn Storage,
@@ -428,15 +518,6 @@ pub async fn count_unconverted_stems(
     markdown_prefix: &str,
 ) -> anyhow::Result<u64> {
     use anyhow::Context;
-
-    fn stem_of(key: &str, exts: &[&str]) -> Option<String> {
-        let name = key.rsplit('/').next()?;
-        if name.starts_with("._") {
-            return None;
-        }
-        let (stem, ext) = name.rsplit_once('.')?;
-        exts.contains(&ext).then(|| stem.to_string())
-    }
 
     // A failed listing is an error, never "0 unconverted": an S3 outage must
     // not read as a fully converted corpus.
@@ -449,15 +530,20 @@ pub async fn count_unconverted_stems(
         .await
         .with_context(|| format!("list {markdown_prefix:?} to count unconverted stems"))?;
 
-    let md_stems: std::collections::HashSet<String> = markdown
+    let md_stems: std::collections::HashSet<&str> = markdown
         .iter()
-        .filter_map(|o| stem_of(&o.key, &["md"]))
+        .filter_map(|o| {
+            let name = o.key.rsplit('/').next()?;
+            if name.starts_with("._") {
+                return None;
+            }
+            name.strip_suffix(".md")
+        })
         .collect();
 
-    let unconverted: std::collections::HashSet<String> = papers
+    let unconverted: std::collections::HashSet<&str> = papers
         .iter()
-        .filter(|o| !o.key.contains("/.quarantine/"))
-        .filter_map(|o| stem_of(&o.key, &["pdf", "html", "epub"]))
+        .filter_map(|o| convertible_source_stem(&o.key, o.size))
         .filter(|stem| !md_stems.contains(stem))
         .collect();
 
@@ -568,7 +654,7 @@ pub fn list_catalog_rows_without_markdown(
             if filename.starts_with("._") {
                 return None;
             }
-            Some(filename.trim_end_matches(".md").to_string())
+            Some(filename.strip_suffix(".md").unwrap_or(filename).to_string())
         })
         .collect();
 
@@ -755,7 +841,7 @@ pub fn list_catalog_flag_drift(
         if filename.starts_with("._") {
             continue;
         }
-        let stem = filename.trim_end_matches(".md").to_string();
+        let stem = filename.strip_suffix(".md").unwrap_or(filename).to_string();
         md_mtime_by_stem.insert(stem, o.last_modified);
     }
 
@@ -849,7 +935,7 @@ pub fn list_catalog_flag_drift_resync_candidates(
         if filename.starts_with("._") {
             continue;
         }
-        let stem = filename.trim_end_matches(".md").to_string();
+        let stem = filename.strip_suffix(".md").unwrap_or(filename).to_string();
         md_mtime_by_stem.insert(stem, o.last_modified);
     }
 
@@ -985,7 +1071,10 @@ pub fn list_catalog_rows_without_source(
                 return None;
             }
             let (stem, ext) = filename.rsplit_once('.')?;
-            if ext == "pdf" || ext == "html" {
+            if CONVERTIBLE_SOURCE_EXTS
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(ext))
+            {
                 Some(stem.to_string())
             } else {
                 None
@@ -1002,7 +1091,7 @@ pub fn list_catalog_rows_without_source(
             if filename.starts_with("._") {
                 return None;
             }
-            Some(filename.trim_end_matches(".md").to_string())
+            Some(filename.strip_suffix(".md").unwrap_or(filename).to_string())
         })
         .collect();
 
@@ -1020,13 +1109,13 @@ pub fn list_catalog_rows_without_source(
     orphans
 }
 
-/// Stamp the inbox-sweeper heartbeat. The daemon writes twice per tick:
-/// once BEFORE the sweep starts (`last_sweep=None`, keeps the TUI's
-/// Watcher row "running" during a slow sweep), and once AFTER it
-/// completes with the actual `(found, relocated, errors)` so the TUI
-/// can show `swept N / M`. Cost is one tiny `storage.put` per call —
-/// negligible compared to the sweep itself. Failures are the caller's
-/// to surface; most daemons log-and-continue.
+/// Stamp the inbox-sweeper heartbeat. The daemon writes it BEFORE each sweep
+/// (`last_sweep` = the previous sweep's counts, keeps the TUI's Watcher row
+/// "running"), from INSIDE the sweep before files (so a long sweep never
+/// outlasts the liveness window), and AFTER it completes with the actual
+/// `(found, relocated, errors)` so the TUI can show `swept N / M`. Cost is
+/// one tiny `storage.put` per call — negligible compared to the sweep
+/// itself. Failures are the caller's to surface; most daemons log-and-continue.
 #[cfg(feature = "storage")]
 pub async fn write_inbox_heartbeat(
     storage: &dyn Storage,
@@ -1063,10 +1152,14 @@ pub fn classify_inbox_heartbeat(
     last_modified: std::time::SystemTime,
     now: std::time::SystemTime,
 ) -> InboxHeartbeatSnapshot {
-    let last_tick_seconds_ago = now
-        .duration_since(last_modified)
-        .map(|d| d.as_secs())
-        .unwrap_or(u64::MAX);
+    // A `last_modified` ahead of `now` is clock skew between the object
+    // store and this host, not a dead daemon: it is zero seconds old, which
+    // is what the 5s grace below exists to absorb. (An unreadable error
+    // would otherwise read as `u64::MAX` and report a live daemon stopped.)
+    let last_tick_seconds_ago = match now.duration_since(last_modified) {
+        Ok(age) => age.as_secs(),
+        Err(_ahead) => 0,
+    };
     // 5s grace absorbs clock skew + tick jitter. `saturating_mul` so a
     // maliciously huge sweep_interval doesn't overflow.
     let running =
@@ -1084,23 +1177,37 @@ pub fn classify_inbox_heartbeat(
     }
 }
 
-/// Read the heartbeat and classify freshness. Returns `None` if the key
-/// doesn't exist or can't be parsed. Otherwise the caller can trust
-/// `running` — the server did the freshness math so every client renders
-/// the same verdict.
+/// Read the heartbeat and classify freshness. `Ok(None)` means the key does
+/// not exist; a storage error or an unparsable heartbeat is an `Err`, so
+/// "watcher dead" and "storage down" are distinguishable. Otherwise the
+/// caller can trust `running` — the server did the freshness math so every
+/// client renders the same verdict.
 #[cfg(feature = "storage")]
-pub async fn read_inbox_heartbeat(storage: &dyn Storage) -> Option<InboxHeartbeatSnapshot> {
-    let bytes = storage.get(INBOX_HEARTBEAT_KEY).await.ok()?;
-    let hb: InboxHeartbeat = serde_yaml_ng::from_slice(&bytes).ok()?;
-    let meta = storage.head(INBOX_HEARTBEAT_KEY).await.ok().flatten()?;
+pub async fn read_inbox_heartbeat(
+    storage: &dyn Storage,
+) -> anyhow::Result<Option<InboxHeartbeatSnapshot>> {
+    use anyhow::Context;
+    let bytes = match storage.get(INBOX_HEARTBEAT_KEY).await {
+        Ok(b) => b,
+        Err(e) if crate::storage::is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e.context("read inbox heartbeat")),
+    };
+    let hb: InboxHeartbeat = serde_yaml_ng::from_slice(&bytes).context("parse inbox heartbeat")?;
+    let Some(meta) = storage
+        .head(INBOX_HEARTBEAT_KEY)
+        .await
+        .context("head inbox heartbeat")?
+    else {
+        return Ok(None);
+    };
     let last_modified = meta
         .last_modified
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    Some(classify_inbox_heartbeat(
+    Ok(Some(classify_inbox_heartbeat(
         hb,
         last_modified,
         std::time::SystemTime::now(),
-    ))
+    )))
 }
 
 /// Pipeline counts via Storage. Same source of truth as MCP today.
@@ -1146,6 +1253,9 @@ pub async fn collect_pipeline_counts(
         inbox_pending: None,
         // Computed by caller once it knows total in_flight.
         in_flight_conversions: None,
+        queued_conversions: None,
+        stalled_conversions: None,
+        queue_error: None,
         pipeline_drift: 0,
         pipeline_drift_threshold: PIPELINE_DRIFT_THRESHOLD,
         counts_error: None,
@@ -1327,6 +1437,75 @@ mod unconverted_stem_tests {
         );
     }
 
+    #[test]
+    fn convertible_source_stem_accepts_exactly_what_scribe_converts() {
+        for (key, stem) in [
+            ("papers/aa/a.pdf", "a"),
+            ("papers/aa/a.html", "a"),
+            ("papers/aa/a.htm", "a"),
+            ("papers/aa/a.epub", "a"),
+            ("papers/aa/a.b.PDF", "a.b"),
+        ] {
+            assert_eq!(convertible_source_stem(key, 1), Some(stem), "{key}");
+        }
+        for key in [
+            "papers/aa/a.md",
+            "papers/aa/a.txt",
+            "papers/aa/noext",
+            "papers/aa/._a.pdf",
+            "papers/manually_downloaded/a.pdf",
+            "papers/.quarantine/aa/a.pdf",
+            // Dedicated bucket (empty prefix): no leading `papers/`.
+            "manually_downloaded/a.pdf",
+            ".quarantine/aa/a.pdf",
+        ] {
+            assert_eq!(convertible_source_stem(key, 1), None, "{key}");
+        }
+        assert_eq!(
+            convertible_source_stem("papers/aa/a.pdf", 0),
+            None,
+            "a zero-byte source has nothing to convert"
+        );
+    }
+
+    /// "Unconverted" is exactly what `hs pipeline catch-up` would queue:
+    /// the inbox drop zone, zero-byte sources and unconvertible extensions
+    /// are not counted; `.htm` and `.epub` sources are.
+    #[tokio::test]
+    async fn counts_only_what_catch_up_would_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = LocalFsStorage::new(tmp.path());
+
+        for key in [
+            "papers/aa/real.pdf",
+            "papers/bb/page.htm",
+            "papers/cc/book.epub",
+        ] {
+            storage.put(key, b"bytes".to_vec()).await.unwrap();
+        }
+        // Not counted: inbox drop zone, zero-byte source, non-source file.
+        storage
+            .put("papers/manually_downloaded/dropped.pdf", b"bytes".to_vec())
+            .await
+            .unwrap();
+        storage
+            .put("papers/dd/empty.pdf", Vec::new())
+            .await
+            .unwrap();
+        storage
+            .put("papers/ee/notes.txt", b"bytes".to_vec())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_unconverted_stems(&storage, "papers", "markdown")
+                .await
+                .unwrap(),
+            3,
+            "pdf + htm + epub; not the inbox file, the empty file or the .txt"
+        );
+    }
+
     /// Storage whose listings always fail, standing in for an S3 outage.
     struct Unreachable;
 
@@ -1398,6 +1577,35 @@ mod unconverted_stem_tests {
         c.mark_unavailable("first");
         c.mark_unavailable("second");
         assert_eq!(c.counts_error.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn stalled_is_unconverted_minus_what_is_queued() {
+        let mut c = PipelineCounts::default();
+        c.record_queue(Some(122), Ok(100));
+        assert_eq!(c.queued_conversions, Some(100));
+        assert_eq!(c.stalled_conversions, Some(22));
+        assert!(c.queue_error.is_none());
+
+        // More queued than unconverted (redelivery of an already-written
+        // paper) is not negative stalled work.
+        c.record_queue(Some(3), Ok(10));
+        assert_eq!(c.stalled_conversions, Some(0));
+    }
+
+    #[test]
+    fn an_unreadable_queue_is_unknown_not_empty() {
+        let mut c = PipelineCounts::default();
+        c.record_queue(Some(5), Ok(2));
+        c.record_queue(Some(5), Err("broker down".into()));
+        assert_eq!(c.queued_conversions, None);
+        assert_eq!(c.stalled_conversions, None);
+        assert_eq!(c.queue_error.as_deref(), Some("broker down"));
+
+        // Queue known but the storage count failed: queued shown, stalled not.
+        c.record_queue(None, Ok(7));
+        assert_eq!(c.queued_conversions, Some(7));
+        assert_eq!(c.stalled_conversions, None);
     }
 }
 
@@ -1753,7 +1961,18 @@ mod inbox_heartbeat_tests {
     async fn read_missing_heartbeat_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = crate::storage::LocalFsStorage::new(tmp.path());
-        assert!(read_inbox_heartbeat(&storage).await.is_none());
+        assert!(read_inbox_heartbeat(&storage).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_corrupt_heartbeat_is_an_error_not_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::LocalFsStorage::new(tmp.path());
+        storage
+            .put(INBOX_HEARTBEAT_KEY, b"{{ not yaml".to_vec())
+            .await
+            .unwrap();
+        assert!(read_inbox_heartbeat(&storage).await.is_err());
     }
 
     #[tokio::test]
@@ -1764,6 +1983,7 @@ mod inbox_heartbeat_tests {
         write_inbox_heartbeat(&storage, 10, None).await.unwrap();
         let snap = read_inbox_heartbeat(&storage)
             .await
+            .unwrap()
             .expect("heartbeat just written");
         assert!(snap.running);
         assert_eq!(snap.sweep_interval_secs, 10);
@@ -1788,6 +2008,7 @@ mod inbox_heartbeat_tests {
             .unwrap();
         let snap = read_inbox_heartbeat(&storage)
             .await
+            .unwrap()
             .expect("heartbeat just written");
         assert_eq!(snap.last_sweep_found, Some(66));
         assert_eq!(snap.last_sweep_relocated, Some(18));

@@ -25,7 +25,6 @@ serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 dialoguer = { workspace = true }
 reqwest = { workspace = true }
-notify = "8"
 futures = "0.3"
 tempfile = "3"
 sha2 = "0.10"

@@ -20,7 +20,7 @@ pub struct LocalConfig {
 impl Default for LocalConfig {
     fn default() -> Self {
         Self {
-            root: dirs::home_dir().unwrap_or_default().join("home-still"),
+            root: crate::default_project_dir(),
         }
     }
 }
@@ -73,7 +73,13 @@ impl Default for StorageConfig {
 /// non-UTF-8) variable is an error — expanding it to "" would hand empty S3
 /// credentials to the backend with nothing to say why. Errors name the
 /// variable, never the surrounding text (it may be a literal secret).
+#[cfg(feature = "storage-s3")]
 fn expand(s: &str) -> anyhow::Result<String> {
+    expand_with(s, |v| std::env::var(v).ok())
+}
+
+#[cfg(feature = "storage-s3")]
+fn expand_with(s: &str, lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<String> {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(pos) = rest.find("${") {
@@ -83,7 +89,7 @@ fn expand(s: &str) -> anyhow::Result<String> {
             anyhow::bail!("unterminated `${{` in a storage config value");
         };
         let var = &after[..end];
-        let val = std::env::var(var).map_err(|_| {
+        let val = lookup(var).ok_or_else(|| {
             anyhow::anyhow!(
                 "environment variable `{var}` referenced by the storage config is not set"
             )
@@ -95,18 +101,22 @@ fn expand(s: &str) -> anyhow::Result<String> {
     Ok(out)
 }
 
-fn expand_home(p: &std::path::Path) -> PathBuf {
+/// Expand a leading `~` to the home directory. A path that does not start
+/// with `~` never consults the home directory; one that does fails loudly
+/// when the home directory is unknown instead of becoming a relative path.
+fn expand_home(p: &std::path::Path) -> anyhow::Result<PathBuf> {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix("~/") {
-        return dirs::home_dir().unwrap_or_default().join(rest);
+        return Ok(crate::home_dir()?.join(rest));
     }
     if s == "~" {
-        return dirs::home_dir().unwrap_or_default();
+        return Ok(crate::home_dir()?);
     }
-    p.to_path_buf()
+    Ok(p.to_path_buf())
 }
 
 /// Build-time check that a required S3 setting is present.
+#[cfg(feature = "storage-s3")]
 fn require_s3_field(name: &str, value: &str) -> anyhow::Result<()> {
     if value.trim().is_empty() {
         anyhow::bail!("storage.backend=s3 requires storage.s3.{name} to be set (it is empty)");
@@ -117,7 +127,9 @@ fn require_s3_field(name: &str, value: &str) -> anyhow::Result<()> {
 impl StorageConfig {
     pub fn build(&self) -> anyhow::Result<Arc<dyn Storage>> {
         match self.backend {
-            Backend::Local => Ok(Arc::new(LocalFsStorage::new(expand_home(&self.local.root)))),
+            Backend::Local => Ok(Arc::new(LocalFsStorage::new(expand_home(
+                &self.local.root,
+            )?))),
             Backend::S3 => {
                 #[cfg(feature = "storage-s3")]
                 {
@@ -170,9 +182,10 @@ local:
         assert_eq!(cfg.local.root, PathBuf::from("/tmp/hs-test"));
     }
 
+    #[cfg(feature = "storage-s3")]
     #[test]
     fn parse_s3_yaml_with_env_expand() {
-        std::env::set_var("HS_TEST_SECRET", "shhh");
+        let lookup = |k: &str| (k == "HS_TEST_SECRET").then(|| "shhh".to_string());
         let yaml = r#"
 backend: s3
 s3:
@@ -185,7 +198,7 @@ s3:
         let cfg: StorageConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.backend, Backend::S3);
         assert_eq!(cfg.s3.bucket, "home-still");
-        assert_eq!(expand(&cfg.s3.secret_key).unwrap(), "shhh");
+        assert_eq!(expand_with(&cfg.s3.secret_key, lookup).unwrap(), "shhh");
     }
 
     #[test]
@@ -210,29 +223,44 @@ s3:
         assert_eq!(s.get("k/v.txt").await.unwrap(), b"hi");
     }
 
+    #[cfg(feature = "storage-s3")]
     #[test]
     fn expand_substitutes_every_reference_and_keeps_non_ascii_literals() {
-        std::env::set_var("HS_TEST_EXPAND_A", "alpha");
-        std::env::set_var("HS_TEST_EXPAND_B", "βeta");
+        let lookup = |k: &str| match k {
+            "HS_TEST_EXPAND_A" => Some("alpha".to_string()),
+            "HS_TEST_EXPAND_B" => Some("βeta".to_string()),
+            _ => None,
+        };
         assert_eq!(
-            expand("pässwörd-${HS_TEST_EXPAND_A}/中/${HS_TEST_EXPAND_B}!").unwrap(),
+            expand_with(
+                "pässwörd-${HS_TEST_EXPAND_A}/中/${HS_TEST_EXPAND_B}!",
+                lookup
+            )
+            .unwrap(),
             "pässwörd-alpha/中/βeta!"
         );
-        assert_eq!(expand("no references é").unwrap(), "no references é");
-        assert_eq!(expand("$notabrace {x}").unwrap(), "$notabrace {x}");
+        assert_eq!(
+            expand_with("no references é", lookup).unwrap(),
+            "no references é"
+        );
+        assert_eq!(
+            expand_with("$notabrace {x}", lookup).unwrap(),
+            "$notabrace {x}"
+        );
     }
 
     /// RA-77: an unset variable used to expand to "" and produce empty S3
     /// credentials with no error.
+    #[cfg(feature = "storage-s3")]
     #[test]
     fn expand_errors_on_an_unset_variable_and_never_echoes_the_input() {
-        std::env::remove_var("HS_TEST_EXPAND_UNSET");
-        let err = expand("prefix-literal-secret-${HS_TEST_EXPAND_UNSET}").unwrap_err();
+        let err =
+            expand_with("prefix-literal-secret-${HS_TEST_EXPAND_UNSET}", |_| None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("HS_TEST_EXPAND_UNSET"), "{msg}");
         assert!(!msg.contains("literal-secret"), "leaked input: {msg}");
 
-        let err = expand("abc${UNTERMINATED").unwrap_err();
+        let err = expand_with("abc${UNTERMINATED", |_| None).unwrap_err();
         assert!(!format!("{err:#}").contains("abc"), "leaked input");
     }
 
@@ -274,7 +302,7 @@ s3:
     #[cfg(feature = "storage-s3")]
     #[test]
     fn build_s3_fails_when_a_credential_variable_is_unset() {
-        std::env::remove_var("HS_TEST_BUILD_UNSET");
+        // Never set by any test or fixture; build() reads the real environment.
         let mut cfg = s3_cfg();
         cfg.s3.secret_key = "${HS_TEST_BUILD_UNSET}".into();
         let err = cfg.build().err().expect("unset secret var must fail");

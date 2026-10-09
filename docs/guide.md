@@ -77,7 +77,7 @@ A PDF is a picture of text. To search a paper by meaning, you first need to extr
 1. A **layout detector** looks at each page and identifies regions: title, paragraphs, figures, tables, equations, footnotes. It gets the reading order right even on tricky two-column papers.
 2. A **vision-language model (VLM)** reads each region. Tables are reconstructed cell-by-cell. Equations come out in proper format. The result is clean markdown that a human or a program can read.
 
-Behind the scenes, this needs a GPU to be fast — Apple Silicon (Metal), an NVIDIA card (CUDA), or a strong CPU as a last resort. `hs scribe init` figures out what you have and configures itself.
+Behind the scenes, this needs a GPU to be fast — Apple Silicon (Metal), an NVIDIA card (CUDA), or a strong CPU as a last resort. The scribe server picks its backend from its configuration (`HS_SCRIBE_*`), see [crates/hs-scribe/README.md](../crates/hs-scribe/README.md).
 
 This is the moment a paper becomes *readable* — not just visible, but parseable, searchable, and quotable.
 

@@ -65,19 +65,20 @@ fn parse_html_table(html: &str) -> Option<TreeNode> {
                         cell_text.clear();
                         stack.push(node);
                     }
-                    "br" => {
-                        // <br> inside a cell → treat as space separator
-                        if in_cell {
-                            cell_text.push(' ');
-                        }
-                    }
+                    // <br> inside a cell → treat as space separator
+                    "br" if in_cell => cell_text.push(' '),
                     _ => {} // ignore other tags
                 }
             }
             HtmlToken::CloseTag(tag) => {
                 let tag_lower = tag.to_lowercase();
+                // A stray or mismatched close tag must not pop the element
+                // it does not close (a lone `</tr>` used to pop the table
+                // root and discard the whole tree).
+                let top_matches =
+                    stack.len() > 1 && stack.last().is_some_and(|n| n.tag == tag_lower);
                 match tag_lower.as_str() {
-                    "td" | "th" => {
+                    "td" | "th" if top_matches => {
                         in_cell = false;
                         if let Some(mut node) = stack.pop() {
                             node.content = cell_text.trim().to_string();
@@ -87,14 +88,14 @@ fn parse_html_table(html: &str) -> Option<TreeNode> {
                         }
                         cell_text.clear();
                     }
-                    "tr" => {
+                    "tr" if top_matches => {
                         if let Some(node) = stack.pop() {
                             if let Some(parent) = stack.last_mut() {
                                 parent.children.push(node);
                             }
                         }
                     }
-                    "thead" | "tbody" => {
+                    "thead" | "tbody" if top_matches => {
                         if let Some(node) = stack.pop() {
                             if let Some(parent) = stack.last_mut() {
                                 parent.children.push(node);
@@ -171,8 +172,8 @@ fn tokenize_html(html: &str) -> Vec<HtmlToken> {
             i += 1; // skip '>'
 
             let trimmed = tag_content.trim().to_string();
-            if trimmed.starts_with('/') {
-                let tag_name = trimmed[1..].trim().to_string();
+            if let Some(rest) = trimmed.strip_prefix('/') {
+                let tag_name = rest.trim().to_string();
                 tokens.push(HtmlToken::CloseTag(tag_name));
             } else {
                 // Split tag name from attributes
@@ -202,7 +203,7 @@ fn parse_span_attr(attrs: &str, name: &str) -> usize {
     let lower = attrs.to_lowercase();
     if let Some(pos) = lower.find(name) {
         let rest = &lower[pos + name.len()..];
-        let rest = rest.trim_start_matches(|c: char| c == '=' || c == ' ' || c == '"' || c == '\'');
+        let rest = rest.trim_start_matches(['=', ' ', '"', '\'']);
         let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         num.parse().unwrap_or(1).max(1)
     } else {
@@ -315,7 +316,7 @@ fn rename_cost(a: &IndexedNode, b: &IndexedNode) -> f64 {
             if a_norm.is_empty() && b_norm.is_empty() {
                 return 0.0;
             }
-            let max_len = a_norm.len().max(b_norm.len());
+            let max_len = a_norm.chars().count().max(b_norm.chars().count());
             if max_len == 0 {
                 return 0.0;
             }
@@ -379,8 +380,8 @@ fn tree_edit_distance(t1: &IndexedTree, t2: &IndexedTree) -> f64 {
                         td[node_i + 1][node_j + 1] = fd[i][j];
                     } else {
                         // Forest distance → use previously computed tree distances
-                        let ti = if li >= l1 { li - l1 } else { 0 };
-                        let tj = if lj >= l2 { lj - l2 } else { 0 };
+                        let ti = li.saturating_sub(l1);
+                        let tj = lj.saturating_sub(l2);
                         fd[i][j] = (fd[i - 1][j] + 1.0)           // delete
                             .min(fd[i][j - 1] + 1.0)               // insert
                             .min(fd[ti][tj] + td[node_i + 1][node_j + 1]); // match subtrees
@@ -502,18 +503,18 @@ fn teds_score_single(reference_html: &str, hypothesis_html: &str) -> Option<f64>
 /// Split concatenated table HTML into individual tables.
 fn split_tables(html: &str) -> Vec<String> {
     let mut tables = Vec::new();
-    let lower = html.to_lowercase();
+    // ASCII-only lowercasing: offsets found in `lower` index `html`, so the
+    // two must have the same byte length (`to_lowercase` rewrites e.g. `İ`
+    // to three bytes, which would put `html[start..end]` off a char boundary).
+    let lower = html.to_ascii_lowercase();
     let mut search_from = 0;
 
-    loop {
-        let start = match lower[search_from..].find("<table") {
-            Some(pos) => search_from + pos,
-            None => break,
+    while let Some(pos) = lower[search_from..].find("<table") {
+        let start = search_from + pos;
+        let Some(pos) = lower[start..].find("</table>") else {
+            break;
         };
-        let end = match lower[start..].find("</table>") {
-            Some(pos) => start + pos + "</table>".len(),
-            None => break,
-        };
+        let end = start + pos + "</table>".len();
         tables.push(html[start..end].to_string());
         search_from = end;
     }
@@ -571,7 +572,7 @@ fn normalize_table_html(html: &str) -> String {
 
 /// Remove a matched pair of tags and ALL content between them (e.g., `<colgroup>...</colgroup>`)
 fn remove_tag_pair(html: &str, tag: &str) -> String {
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     let open = format!("<{}", tag);
     let close = format!("</{}>", tag);
     let mut result = String::with_capacity(html.len());
@@ -601,7 +602,7 @@ fn remove_tag_pair(html: &str, tag: &str) -> String {
 
 /// Remove opening and closing tags but keep their text content (e.g., `<sub>x</sub>` → `x`)
 fn strip_tag_keep_content(html: &str, tag: &str) -> String {
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     let open = format!("<{}", tag);
     let close = format!("</{}>", tag);
     let mut result = String::with_capacity(html.len());
@@ -647,7 +648,7 @@ fn strip_html_attributes(html: &str, attrs: &[&str]) -> String {
     for attr in attrs {
         loop {
             // Find attr=" case-insensitively by searching in lowercase copy
-            let lower = result.to_lowercase();
+            let lower = result.to_ascii_lowercase();
             let pattern = format!("{}=\"", attr);
             let attr_start = match lower.find(&pattern) {
                 Some(pos) => pos,
@@ -732,8 +733,8 @@ fn edit_distance(a: &str, b: &str) -> usize {
     let mut prev = vec![0usize; n + 1];
     let mut curr = vec![0usize; n + 1];
 
-    for j in 0..=n {
-        prev[j] = j;
+    for (j, v) in prev.iter_mut().enumerate() {
+        *v = j;
     }
 
     for i in 1..=m {

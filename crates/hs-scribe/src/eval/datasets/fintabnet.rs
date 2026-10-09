@@ -57,8 +57,7 @@ pub fn load_fintabnet_samples(split: &str, limit: Option<usize>) -> Result<Vec<G
 
         let table_html = if annotation_path.exists() {
             build_table_html(&annotation_path, table_index)
-                .ok()
-                .flatten()
+                .with_context(|| format!("Failed to read {}", annotation_path.display()))?
         } else {
             None
         };

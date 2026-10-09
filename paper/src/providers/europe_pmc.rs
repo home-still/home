@@ -172,7 +172,21 @@ impl PaperProvider for EuropePmcProvider {
         ]
     }
 
+    fn supports_offset(&self) -> bool {
+        false
+    }
+
     async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
+        // Europe PMC pages by an opaque `cursorMark` (it has no offset or
+        // page parameter), and this provider always requests the first
+        // page. Answering an offset query with page one would repeat
+        // results as if they were the next page.
+        if query.offset > 0 {
+            return Err(PaperError::InvalidInput(
+                "Europe PMC does not support offset pagination (it pages by cursor); use offset 0"
+                    .into(),
+            ));
+        }
         let url = self.build_search_url(query);
         let response = self.client.get(&url).send().await?;
 
@@ -189,17 +203,11 @@ impl PaperProvider for EuropePmcProvider {
             .map(|w| self.epmc_work_to_paper(w))
             .collect();
 
-        let next_offset = query.offset + papers.len();
-        let next_offset = if next_offset < body.hit_count {
-            Some(next_offset)
-        } else {
-            None
-        };
-
         Ok(SearchResult {
             papers,
             total_results: body.hit_count,
-            next_offset,
+            // No offset to hand back: the next page needs Europe PMC's cursor.
+            next_offset: None,
             provider: String::from("europe_pmc"),
             provider_failures: Vec::new(),
         })
@@ -237,5 +245,37 @@ impl PaperProvider for EuropePmcProvider {
             .into_iter()
             .next()
             .map(|w| self.epmc_work_to_paper(w)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_offset_is_refused_rather_than_answered_with_page_one() {
+        // Unreachable base URL: the refusal must come before any request.
+        let config = EuropePmcConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            ..EuropePmcConfig::default()
+        };
+        let provider = EuropePmcProvider::new(&config).unwrap();
+        let query = SearchQuery {
+            query: "crispr".to_string(),
+            search_type: SearchType::Keywords,
+            max_results: 10,
+            offset: 10,
+            date_filter: None,
+            sort_by: SortBy::default(),
+            min_citations: None,
+        };
+        let err = provider.search_by_query(&query).await.unwrap_err();
+        assert!(matches!(err, PaperError::InvalidInput(_)), "{err:?}");
+    }
+
+    #[test]
+    fn europe_pmc_reports_that_it_cannot_page_by_offset() {
+        let provider = EuropePmcProvider::new(&EuropePmcConfig::default()).unwrap();
+        assert!(!provider.supports_offset());
     }
 }

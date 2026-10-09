@@ -50,11 +50,9 @@ pub fn load_readoc_samples(limit: Option<usize>) -> Result<Vec<GroundTruthSample
                 .to_string();
 
             let md_path = gt_dir.join(format!("{}.md", stem));
-            let markdown = if md_path.exists() {
-                std::fs::read_to_string(&md_path).ok()
-            } else {
-                None
-            };
+            let markdown = std::fs::read_to_string(&md_path).with_context(|| {
+                format!("Failed to read READoc ground truth {}", md_path.display())
+            })?;
 
             let doc_id = format!("{}:{}", split, stem);
 
@@ -67,7 +65,7 @@ pub fn load_readoc_samples(limit: Option<usize>) -> Result<Vec<GroundTruthSample
                 text_blocks: None,
                 table_html: None,
                 formula_latex: None,
-                markdown,
+                markdown: Some(markdown),
             });
         }
     }

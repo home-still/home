@@ -8,7 +8,7 @@ pub fn from_error(err: &anyhow::Error) -> ExitCode {
             use crate::error::{OutcomeKind, PaperError::*};
             return ExitCode::from(match pfe {
                 InvalidInput(_) | NoDownloadUrl(_) => USAGE_ERROR,
-                NotFound(_) | ParseError(_) => GENERAL_ERROR,
+                NotFound(_) | ParseError(_) | ProviderRejected(_) => GENERAL_ERROR,
                 Http(_)
                 | RateLimited { .. }
                 | ProviderUnavailable(_)

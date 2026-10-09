@@ -16,9 +16,10 @@ use crate::event_bus::EventBus;
 use crate::storage::Storage;
 
 /// File extensions the inbox sweeper (and the `Inbox` pipeline count that
-/// surfaces it in `hs status`) treat as first-class ingestable sources.
+/// surfaces it in `hs status`) treat as first-class ingestable sources:
+/// exactly what scribe converts ([`crate::status::CONVERTIBLE_SOURCE_EXTS`]).
 /// Anything else under `papers/manually_downloaded/` is ignored.
-pub const INBOX_SUPPORTED_EXTS: &[&str] = &["pdf", "html", "htm", "epub"];
+pub const INBOX_SUPPORTED_EXTS: &[&str] = crate::status::CONVERTIBLE_SOURCE_EXTS;
 
 /// True iff a filename dropped into `papers/manually_downloaded/` is a
 /// convertible paper source. Shared by the sweeper's per-file dispatch
@@ -59,8 +60,9 @@ pub fn is_inbox_candidate_filename(filename: &str) -> bool {
 pub enum WriteOutcome {
     /// Target put + NATS publish + source delete all succeeded.
     Relocated,
-    /// Target already existed (another client got there first, or the source
-    /// is a stale duplicate). The source was deleted; put/publish not called.
+    /// Target already existed with byte-identical content (another client got
+    /// there first, or the source is a stale duplicate). `papers.ingested` was
+    /// (re)published — scribe dedups by stem — and the source deleted.
     AlreadyAtTarget,
     /// Target put + publish succeeded, but deleting the source failed.
     /// Next sweep will see `AlreadyAtTarget` and clean the orphan source.
@@ -69,10 +71,15 @@ pub enum WriteOutcome {
 
 /// Write `bytes` to `target_key`, publish `papers.ingested`, delete `source_key`.
 ///
-/// See the module docs for the ordering rationale. On any storage/bus failure
-/// after the put, the function still tries to delete the source — the target
-/// is in place and further progress is possible; the alternative (leaving the
-/// source) just means the next sweep retries.
+/// See the module docs for the ordering rationale. The source is deleted only
+/// after the target is durable AND the event is published. A publish failure
+/// returns `Err` with the source (and the already-written target) left in
+/// place, so the next sweep takes the already-at-target path, re-publishes
+/// (harmless: scribe dedups by stem) and only then deletes the source — a
+/// broker outage can never lose a paper.
+///
+/// If the target already exists with different content than `bytes`, nothing
+/// is overwritten or deleted and an error naming both keys is returned.
 pub async fn write_target_and_publish(
     storage: &dyn Storage,
     bus: &dyn EventBus,
@@ -81,16 +88,19 @@ pub async fn write_target_and_publish(
     bytes: Vec<u8>,
 ) -> anyhow::Result<WriteOutcome> {
     // Fast-path: target already present. This is the duplicate-drop case
-    // and the recovery path for a prior PartialLeftSource. A storage error
-    // here MUST propagate — `.unwrap_or(false)` let a transient S3 failure
-    // masquerade as "no target yet", causing a second PUT that clobbered
-    // whatever was actually there (rc.306 P0-11).
-    let target_exists = storage
-        .exists(target_key)
+    // and the recovery path for a prior PartialLeftSource or publish failure.
+    // A storage error here MUST propagate — `.unwrap_or(false)` let a
+    // transient S3 failure masquerade as "no target yet", causing a second
+    // PUT that clobbered whatever was actually there (rc.306 P0-11).
+    let existing = storage
+        .head(target_key)
         .await
         .map_err(|e| anyhow::anyhow!("head target {target_key}: {e}"))?;
-    if target_exists {
-        // Best-effort source cleanup. 404 is fine.
+    if let Some(meta) = existing {
+        ensure_same_content(storage, source_key, target_key, meta.size, &bytes).await?;
+        publish_ingested(bus, target_key).await?;
+        // Best-effort source cleanup. 404 is fine; a failure just means the
+        // next sweep repeats this path.
         if let Err(e) = storage.delete(source_key).await {
             tracing::warn!(src = source_key, error = %e, "delete source after AlreadyAtTarget failed");
         }
@@ -104,22 +114,7 @@ pub async fn write_target_and_publish(
         .await
         .map_err(|e| anyhow::anyhow!("put target {target_key}: {e}"))?;
 
-    // Publish payload serialization must not fail silently. A serde failure
-    // with `unwrap_or_default()` would publish an empty vec that downstream
-    // consumers treat as a no-op event (rc.306 P0-11). Propagate instead.
-    let payload = serde_json::json!({
-        "key": target_key,
-        "source": "inbox",
-    });
-    let payload_bytes = serde_json::to_vec(&payload)
-        .map_err(|e| anyhow::anyhow!("serialize papers.ingested payload: {e}"))?;
-    if let Err(e) = bus.publish("papers.ingested", &payload_bytes).await {
-        tracing::warn!(
-            target = target_key,
-            error = %e,
-            "papers.ingested publish failed (target in place, will recover via catalog_repair)",
-        );
-    }
+    publish_ingested(bus, target_key).await?;
 
     // Delete source. Failure → PartialLeftSource; the next sweep hits the
     // fast-path above and cleans up the orphan.
@@ -134,6 +129,59 @@ pub async fn write_target_and_publish(
             Ok(WriteOutcome::PartialLeftSource)
         }
     }
+}
+
+/// Publish `papers.ingested` for `target_key`. A failure is returned, not
+/// swallowed: the caller must keep the source so the next sweep retries.
+async fn publish_ingested(bus: &dyn EventBus, target_key: &str) -> anyhow::Result<()> {
+    // Publish payload serialization must not fail silently. A serde failure
+    // with `unwrap_or_default()` would publish an empty vec that downstream
+    // consumers treat as a no-op event (rc.306 P0-11). Propagate instead.
+    let payload = serde_json::json!({
+        "key": target_key,
+        "source": "inbox",
+    });
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|e| anyhow::anyhow!("serialize papers.ingested payload: {e}"))?;
+    bus.publish("papers.ingested", &payload_bytes)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "publish papers.ingested for {target_key} failed (target written, source kept; next sweep retries): {e}"
+            )
+        })
+}
+
+/// Verify the existing target holds exactly `bytes`: size first (from the
+/// HEAD already done), then the bytes themselves. Differing content under the
+/// same stem is a conflict the watcher must not resolve by discarding either
+/// file.
+async fn ensure_same_content(
+    storage: &dyn Storage,
+    source_key: &str,
+    target_key: &str,
+    target_size: u64,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let conflict = |why: String| {
+        anyhow::anyhow!(
+            "{source_key} conflicts with existing {target_key}: {why}; neither file was changed"
+        )
+    };
+    if target_size != bytes.len() as u64 {
+        return Err(conflict(format!(
+            "different size ({} vs {target_size} bytes)",
+            bytes.len()
+        )));
+    }
+    let existing = storage
+        .get(target_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("read target {target_key}: {e}"))?;
+    if existing != bytes {
+        return Err(conflict("same size, different content".to_string()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -190,11 +238,35 @@ mod tests {
     use super::*;
     use crate::event_bus::NoOpBus;
     use crate::storage::LocalFsStorage;
+    use std::sync::atomic::Ordering;
 
     fn mk_env() -> (tempfile::TempDir, LocalFsStorage, NoOpBus) {
         let tmp = tempfile::tempdir().unwrap();
         let storage = LocalFsStorage::new(tmp.path());
         (tmp, storage, NoOpBus)
+    }
+
+    /// Bus whose `publish` fails while `down` is set and counts successes.
+    #[derive(Default)]
+    struct FlakyBus {
+        down: std::sync::atomic::AtomicBool,
+        published: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl EventBus for FlakyBus {
+        async fn publish(&self, _subject: &str, _payload: &[u8]) -> anyhow::Result<()> {
+            if self.down.load(Ordering::SeqCst) {
+                anyhow::bail!("bus is down")
+            }
+            self.published.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn consume(
+            &self,
+            _spec: &crate::event_bus::ConsumerSpec,
+        ) -> anyhow::Result<crate::event_bus::EventStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
     }
 
     #[tokio::test]
@@ -224,14 +296,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_already_exists_deletes_source_only() {
-        let (_tmp, storage, bus) = mk_env();
+    async fn target_already_exists_identical_publishes_and_deletes_source() {
+        let (_tmp, storage, _) = mk_env();
+        let bus = FlakyBus::default();
         storage
-            .put("papers/manually_downloaded/foo.pdf", b"new".to_vec())
+            .put("papers/manually_downloaded/foo.pdf", b"same".to_vec())
             .await
             .unwrap();
         storage
-            .put("papers/fo/foo.pdf", b"already-here".to_vec())
+            .put("papers/fo/foo.pdf", b"same".to_vec())
             .await
             .unwrap();
 
@@ -240,18 +313,15 @@ mod tests {
             &bus,
             "papers/manually_downloaded/foo.pdf",
             "papers/fo/foo.pdf",
-            b"new".to_vec(),
+            b"same".to_vec(),
         )
         .await
         .unwrap();
 
         assert_eq!(out, WriteOutcome::AlreadyAtTarget);
-        // Target is unchanged — we never overwrite on AlreadyAtTarget.
-        assert_eq!(
-            storage.get("papers/fo/foo.pdf").await.unwrap(),
-            b"already-here"
-        );
-        // Source is cleaned up.
+        assert_eq!(storage.get("papers/fo/foo.pdf").await.unwrap(), b"same");
+        // The event is published before the source is deleted.
+        assert_eq!(bus.published.load(Ordering::SeqCst), 1);
         assert!(!storage
             .exists("papers/manually_downloaded/foo.pdf")
             .await
@@ -259,42 +329,139 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_failure_still_deletes_source() {
-        // NoOpBus never fails, so this test uses an explicit failing bus.
-        struct FailingBus;
-        #[async_trait::async_trait]
-        impl EventBus for FailingBus {
-            async fn publish(&self, _subject: &str, _payload: &[u8]) -> anyhow::Result<()> {
-                anyhow::bail!("bus is down")
-            }
-            async fn consume(
-                &self,
-                _spec: &crate::event_bus::ConsumerSpec,
-            ) -> anyhow::Result<crate::event_bus::EventStream> {
-                Ok(Box::pin(futures::stream::pending()))
-            }
+    async fn target_exists_with_different_content_is_a_conflict() {
+        for (target, why) in [
+            (&b"already-here"[..], "different size"),
+            (&b"old"[..], "same size, different content"),
+        ] {
+            let (_tmp, storage, _) = mk_env();
+            let bus = FlakyBus::default();
+            storage
+                .put("papers/manually_downloaded/foo.pdf", b"new".to_vec())
+                .await
+                .unwrap();
+            storage
+                .put("papers/fo/foo.pdf", target.to_vec())
+                .await
+                .unwrap();
+
+            let err = write_target_and_publish(
+                &storage,
+                &bus,
+                "papers/manually_downloaded/foo.pdf",
+                "papers/fo/foo.pdf",
+                b"new".to_vec(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+            assert!(err.contains("papers/manually_downloaded/foo.pdf"), "{err}");
+            assert!(err.contains("papers/fo/foo.pdf"), "{err}");
+            assert!(err.contains(why), "{err}");
+            // Nothing overwritten, nothing deleted, nothing published.
+            assert_eq!(storage.get("papers/fo/foo.pdf").await.unwrap(), target);
+            assert_eq!(
+                storage
+                    .get("papers/manually_downloaded/foo.pdf")
+                    .await
+                    .unwrap(),
+                b"new"
+            );
+            assert_eq!(bus.published.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn publish_failure_keeps_source_and_next_sweep_publishes_then_deletes() {
         let (_tmp, storage, _) = mk_env();
+        let bus = FlakyBus::default();
         storage
             .put("papers/manually_downloaded/foo.pdf", b"x".to_vec())
             .await
             .unwrap();
 
+        bus.down.store(true, Ordering::SeqCst);
+        let err = write_target_and_publish(
+            &storage,
+            &bus,
+            "papers/manually_downloaded/foo.pdf",
+            "papers/fo/foo.pdf",
+            b"x".to_vec(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        // Failure is reported; the target is written but the source is kept
+        // so the paper cannot be lost over a broker outage.
+        assert!(err.contains("papers.ingested"), "{err}");
+        assert!(storage.exists("papers/fo/foo.pdf").await.unwrap());
+        assert!(storage
+            .exists("papers/manually_downloaded/foo.pdf")
+            .await
+            .unwrap());
+        assert_eq!(bus.published.load(Ordering::SeqCst), 0);
+
+        // Still down: the retry fails the same way and still keeps the source.
+        write_target_and_publish(
+            &storage,
+            &bus,
+            "papers/manually_downloaded/foo.pdf",
+            "papers/fo/foo.pdf",
+            b"x".to_vec(),
+        )
+        .await
+        .unwrap_err();
+        assert!(storage
+            .exists("papers/manually_downloaded/foo.pdf")
+            .await
+            .unwrap());
+
+        // Broker back: next sweep publishes, then deletes the source.
+        bus.down.store(false, Ordering::SeqCst);
         let out = write_target_and_publish(
             &storage,
-            &FailingBus,
+            &bus,
             "papers/manually_downloaded/foo.pdf",
             "papers/fo/foo.pdf",
             b"x".to_vec(),
         )
         .await
         .unwrap();
-
-        // Target is written, source is deleted — we don't strand data over
-        // a transient NATS outage.
-        assert_eq!(out, WriteOutcome::Relocated);
-        assert!(storage.exists("papers/fo/foo.pdf").await.unwrap());
+        assert_eq!(out, WriteOutcome::AlreadyAtTarget);
+        assert_eq!(bus.published.load(Ordering::SeqCst), 1);
         assert!(!storage
+            .exists("papers/manually_downloaded/foo.pdf")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn already_at_target_publish_failure_keeps_source() {
+        let (_tmp, storage, _) = mk_env();
+        let bus = FlakyBus::default();
+        bus.down.store(true, Ordering::SeqCst);
+        storage
+            .put("papers/manually_downloaded/foo.pdf", b"x".to_vec())
+            .await
+            .unwrap();
+        storage
+            .put("papers/fo/foo.pdf", b"x".to_vec())
+            .await
+            .unwrap();
+
+        write_target_and_publish(
+            &storage,
+            &bus,
+            "papers/manually_downloaded/foo.pdf",
+            "papers/fo/foo.pdf",
+            b"x".to_vec(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(storage
             .exists("papers/manually_downloaded/foo.pdf")
             .await
             .unwrap());
@@ -463,7 +630,7 @@ mod tests {
         // force serde_json::to_vec to fail for a `serde_json::Value`
         // (valid JSON round-trips), but the compile-time change from
         // `.unwrap_or_default()` to `?` is the guarantee. The
-        // `publish_failure_still_deletes_source` test above exercises
+        // `publish_failure_keeps_source_and_next_sweep_publishes_then_deletes` test above exercises
         // the `bus.publish` failure path.
         //
         // A pedagogical assertion:

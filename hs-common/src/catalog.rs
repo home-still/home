@@ -314,6 +314,10 @@ fn catalog_key(prefix: &str, stem: &str) -> anyhow::Result<String> {
 /// chained `.ok()` on both the storage GET and the YAML parse, collapsing
 /// both into "missing", which let catalog_repair misclassify corruption
 /// as a deletion candidate.
+///
+/// The HEAD comes first so that a storage-layer failure is reported as such
+/// (it does not depend on how a backend words its GET errors); a row that
+/// disappears between the HEAD and the GET is absent, not an error.
 #[cfg(feature = "storage")]
 pub async fn read_catalog_entry_via(
     storage: &dyn crate::storage::Storage,
@@ -321,13 +325,14 @@ pub async fn read_catalog_entry_via(
     stem: &str,
 ) -> anyhow::Result<Option<CatalogEntry>> {
     let key = catalog_key(prefix, stem)?;
-    // Prefer `head` to distinguish absent (Ok(None)) from a storage-layer
-    // failure — `get` surfaces both as Err, which is exactly the ambiguity
-    // we're trying to eliminate.
     if storage.head(&key).await?.is_none() {
         return Ok(None);
     }
-    let bytes = storage.get(&key).await?;
+    let bytes = match storage.get(&key).await {
+        Ok(bytes) => bytes,
+        Err(e) if crate::storage::is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let entry: CatalogEntry = serde_yaml_ng::from_slice(&bytes)
         .map_err(|e| anyhow::anyhow!("catalog YAML parse failed for {key}: {e}"))?;
     Ok(Some(entry))
@@ -355,6 +360,18 @@ pub async fn delete_catalog_entry_via(
     storage.delete(&key).await
 }
 
+/// The stem of a listed catalog object, or `None` when the object is not a
+/// catalog row: anything but a `.yaml` file, and macOS AppleDouble `._*`
+/// metadata files. One definition for every lister below.
+#[cfg(feature = "storage")]
+fn catalog_row_stem(key: &str) -> Option<&str> {
+    let filename = key.rsplit('/').next().unwrap_or(key);
+    if filename.starts_with("._") {
+        return None;
+    }
+    filename.strip_suffix(".yaml")
+}
+
 /// List the stems of every catalog entry under `prefix`.
 ///
 /// Walks `Storage::list(prefix)`, keeps keys ending in `.yaml`, strips the
@@ -366,29 +383,22 @@ pub async fn list_catalog_stems_via(
     prefix: &str,
 ) -> anyhow::Result<Vec<String>> {
     let objects = storage.list(prefix).await?;
-    let mut stems = Vec::with_capacity(objects.len());
-    for obj in objects {
-        // Only yaml files are catalog entries.
-        if !obj.key.ends_with(".yaml") {
-            continue;
-        }
-        // Skip macOS AppleDouble metadata files just in case.
-        let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
-        if filename.starts_with("._") {
-            continue;
-        }
-        let stem = filename.trim_end_matches(".yaml").to_string();
-        stems.push(stem);
-    }
-    Ok(stems)
+    Ok(objects
+        .iter()
+        .filter_map(|obj| catalog_row_stem(&obj.key))
+        .map(str::to_string)
+        .collect())
 }
 
 /// List every catalog entry under `prefix`, deserialized.
 ///
 /// Returns `(stem, ObjectMeta, CatalogEntry)` tuples so callers can preserve
 /// filesystem mtime ordering (for history panes) without a second roundtrip.
-/// Entries that fail to deserialize are silently skipped — matches the
-/// lenient behavior of the pre-migration filesystem walk.
+/// Entries that fail to deserialize are an `Err` naming the key (a skipped row
+/// vanishes from every listing); a row deleted between the listing and its GET
+/// is skipped; any other GET
+/// failure is an `Err`, because a partial list reads as a smaller catalog
+/// (rows that "do not exist" get re-embedded, mislabelled, or purged).
 #[cfg(feature = "storage")]
 pub async fn list_catalog_entries_via(
     storage: &dyn crate::storage::Storage,
@@ -397,20 +407,16 @@ pub async fn list_catalog_entries_via(
     let objects = storage.list(prefix).await?;
     let mut out = Vec::with_capacity(objects.len());
     for obj in objects {
-        if !obj.key.ends_with(".yaml") {
-            continue;
-        }
-        let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
-        if filename.starts_with("._") {
-            continue;
-        }
-        let stem = filename.trim_end_matches(".yaml").to_string();
-        let Ok(bytes) = storage.get(&obj.key).await else {
+        let Some(stem) = catalog_row_stem(&obj.key).map(str::to_string) else {
             continue;
         };
-        let Ok(entry) = serde_yaml_ng::from_slice::<CatalogEntry>(&bytes) else {
-            continue;
+        let bytes = match storage.get(&obj.key).await {
+            Ok(bytes) => bytes,
+            Err(e) if crate::storage::is_not_found(&e) => continue,
+            Err(e) => return Err(e.context(format!("read catalog entry {}", obj.key))),
         };
+        let entry = serde_yaml_ng::from_slice::<CatalogEntry>(&bytes)
+            .map_err(|e| anyhow::anyhow!("catalog YAML parse failed for {}: {e}", obj.key))?;
         out.push((stem, obj, entry));
     }
     Ok(out)
@@ -436,8 +442,8 @@ pub const CATALOG_FETCH_CONCURRENCY: usize = 24;
 ///   fetcher, with the offending key in the message. `storage.list`
 ///   already promised this key exists, so a GET failure signals a real
 ///   storage-integrity problem worth surfacing loudly.
-/// - Deserialization failure of a fetched YAML → silently skipped, matching
-///   the existing lenient schema-evolution behavior.
+/// - Deserialization failure of a fetched YAML → `Err` naming the key: a
+///   skipped row vanishes from every listing, status and drift count.
 ///
 /// `on_progress(done, total)` fires every 64 completed GETs and once at the
 /// end. `total` is the post-filter YAML count (skips `._` hidden files and
@@ -457,14 +463,7 @@ pub async fn list_catalog_entries_parallel(
         .into_iter()
         .enumerate()
         .filter_map(|(idx, obj)| {
-            if !obj.key.ends_with(".yaml") {
-                return None;
-            }
-            let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
-            if filename.starts_with("._") {
-                return None;
-            }
-            let stem = filename.trim_end_matches(".yaml").to_string();
+            let stem = catalog_row_stem(&obj.key)?.to_string();
             Some((idx, obj, stem))
         })
         .collect();
@@ -503,9 +502,9 @@ pub async fn list_catalog_entries_parallel(
         if done.is_multiple_of(64) || done == total {
             on_progress(done, total);
         }
-        if let Ok(entry) = serde_yaml_ng::from_slice::<CatalogEntry>(&bytes) {
-            slotted[slot] = Some((stem, obj, entry));
-        }
+        let entry = serde_yaml_ng::from_slice::<CatalogEntry>(&bytes)
+            .map_err(|e| anyhow::anyhow!("catalog YAML parse failed for {key}: {e}"))?;
+        slotted[slot] = Some((stem, obj, entry));
     }
 
     Ok(slotted.into_iter().flatten().collect())
@@ -857,9 +856,8 @@ conversion:
 
     #[tokio::test]
     async fn parallel_fetcher_matches_serial() {
-        // 100 valid catalog rows + 3 malformed YAML objects. Both fetchers
-        // must return the same (stem -> title) set — the malformed ones are
-        // silently skipped by both paths, and any other divergence is a bug.
+        // 100 valid catalog rows: both fetchers must return the same
+        // (stem -> title) set.
         let tmp = tempfile::tempdir().unwrap();
         let storage = LocalFsStorage::new(tmp.path());
 
@@ -870,13 +868,6 @@ conversion:
                 ..Default::default()
             };
             write_catalog_entry_via(&storage, "catalog", &stem, &entry)
-                .await
-                .unwrap();
-        }
-        for stem in ["bad_a", "bad_b", "bad_c"] {
-            let key = format!("catalog/{}", crate::sharded_key(stem, "yaml"));
-            storage
-                .put(&key, b"{{ not: valid ::: yaml }}\n".to_vec())
                 .await
                 .unwrap();
         }
@@ -896,7 +887,24 @@ conversion:
             .map(|(stem, _meta, entry)| (stem, entry.title))
             .collect();
 
-        assert_eq!(serial_map.len(), 100, "100 valid rows, 3 malformed skipped");
+        assert_eq!(serial_map.len(), 100);
+
+        // A malformed row is an error from both fetchers, naming its key,
+        // never a silently shorter listing.
+        let key = format!("catalog/{}", crate::sharded_key("bad_a", "yaml"));
+        storage
+            .put(&key, b"{{ not: valid ::: yaml }}\n".to_vec())
+            .await
+            .unwrap();
+        let e1 = list_catalog_entries_via(&storage, "catalog")
+            .await
+            .unwrap_err();
+        let e2 = list_catalog_entries_parallel(&storage, "catalog", 8, |_, _| {})
+            .await
+            .unwrap_err();
+        for e in [e1, e2] {
+            assert!(format!("{e:#}").contains("bad_a.yaml"), "{e:#}");
+        }
         assert_eq!(parallel_map, serial_map);
     }
 
@@ -1121,6 +1129,44 @@ conversion:
             "storage error should bubble up verbatim: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn a_row_deleted_between_head_and_get_reads_as_absent() {
+        use crate::storage::{ObjectMeta, Storage};
+        use async_trait::async_trait;
+
+        /// HEAD sees the row; by the time of the GET it has been deleted.
+        struct DeletedUnderneath;
+
+        #[async_trait]
+        impl Storage for DeletedUnderneath {
+            async fn get(&self, _: &str) -> anyhow::Result<Vec<u8>> {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+            }
+            async fn put(&self, _: &str, _: Vec<u8>) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn head(&self, key: &str) -> anyhow::Result<Option<ObjectMeta>> {
+                Ok(Some(ObjectMeta {
+                    key: key.to_string(),
+                    size: 1,
+                    last_modified: None,
+                    etag: None,
+                }))
+            }
+            async fn list(&self, _: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+                Ok(Vec::new())
+            }
+            async fn delete(&self, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+        }
+
+        let got = read_catalog_entry_via(&DeletedUnderneath, "catalog", "whatever")
+            .await
+            .expect("a deleted row is absent, not an error");
+        assert!(got.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1175,5 +1221,50 @@ mod page_accounting_tests {
             resolve_page_accounting(offsets.len() as u64, Some(3)).total_pages,
             3
         );
+    }
+}
+
+#[cfg(all(test, feature = "storage"))]
+mod list_get_failure_tests {
+    use super::*;
+    use crate::storage::{LocalFsStorage, ObjectMeta, Storage};
+
+    /// Lists what the inner storage has but fails every GET with a
+    /// transport-style error (not "not found").
+    struct FlakyGet(LocalFsStorage);
+
+    #[async_trait::async_trait]
+    impl Storage for FlakyGet {
+        async fn get(&self, _: &str) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("connection reset")
+        }
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+            self.0.put(key, bytes).await
+        }
+        async fn head(&self, key: &str) -> anyhow::Result<Option<ObjectMeta>> {
+            self.0.head(key).await
+        }
+        async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+            self.0.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key).await
+        }
+    }
+
+    /// A transient GET failure must not make a catalog row vanish from the
+    /// listing: callers treat absence as "no such row".
+    #[tokio::test]
+    async fn a_failed_get_is_an_error_not_a_missing_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FlakyGet(LocalFsStorage::new(tmp.path()));
+        write_catalog_entry_via(&storage, "catalog", "ab123", &CatalogEntry::default())
+            .await
+            .unwrap();
+
+        let err = list_catalog_entries_via(&storage, "catalog")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("connection reset"), "{err:#}");
     }
 }

@@ -370,7 +370,7 @@ async fn cmd_enroll(gateway_url: &str, reporter: &Arc<dyn Reporter>) -> Result<(
         device_name: body.device_name.clone(),
     };
 
-    let cred_path = CloudCredentials::default_path();
+    let cred_path = CloudCredentials::default_path()?;
     creds.save(&cred_path)?;
 
     reporter.status("Enrolled", &format!("as \"{}\"", body.device_name));
@@ -383,7 +383,7 @@ async fn cmd_enroll(gateway_url: &str, reporter: &Arc<dyn Reporter>) -> Result<(
 // ── Status ──────────────────────────────────────────────────────
 
 async fn cmd_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let cred_path = CloudCredentials::default_path();
+    let cred_path = CloudCredentials::default_path()?;
 
     if !cred_path.exists() {
         reporter.status("Cloud", "not enrolled");
@@ -411,7 +411,7 @@ async fn cmd_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
 // ── Token ───────────────────────────────────────────────────────
 
 async fn cmd_token(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let cred_path = CloudCredentials::default_path();
+    let cred_path = CloudCredentials::default_path()?;
     if !cred_path.exists() {
         anyhow::bail!("Not enrolled. Run `hs cloud enroll --gateway <url>` first.");
     }

@@ -35,7 +35,7 @@ The 18:19Z self-test FAILed on 6 gates. This session resolved F1 + F2 + F6 + lan
 
 ## Not deployed in this session
 
-- **`big_mac` (192.168.1.111) scribe**: Apple Silicon Mac; needs a native build of `hs-scribe-server` since the cross-compiled aarch64-unknown-linux-gnu binary won't run on Darwin. Until then, the second scribe in the pool will accept paywall HTML the new patterns reject — partial coverage. Build natively on big_mac next session.
+- **`big_mac` (<host>) scribe**: Apple Silicon Mac; needs a native build of `hs-scribe-server` since the cross-compiled aarch64-unknown-linux-gnu binary won't run on Darwin. Until then, the second scribe in the pool will accept paywall HTML the new patterns reject — partial coverage. Build natively on big_mac next session.
 - **F3 (3387 missing `downloaded_at`), F4 (33 phantom catalog rows), F5 (22 stuck_convert)**: deferred per plan to BACKLOG P1-15 (build `hs catalog repair --apply` CLI). The MCP `catalog_repair` tool's seven scan directions exist as read-only logic in `crates/hs-mcp/src/main.rs:779-1017`; building the apply path is mechanical translation but ~300-500 LOC of CLI command + atomic-write paths + tests.
 
 ## BACKLOG entries added
