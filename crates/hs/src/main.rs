@@ -366,7 +366,9 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> anyhow::Result
 /// double-quoted YAML scalars (JSON string syntax is valid YAML), so input
 /// containing `: `, `#` or a leading `*`/`&`/`!` still loads.
 fn generate_config(email: &str, core_key: &str) -> String {
-    let mut content = DEFAULT_CONFIG.to_string();
+    // A Windows checkout may carry CRLF; the multi-line `core:` replacement
+    // below and the written file both assume LF.
+    let mut content = DEFAULT_CONFIG.replace("\r\n", "\n");
     if !email.is_empty() {
         content = content.replace(
             "# unpaywall_email: you@example.com",
