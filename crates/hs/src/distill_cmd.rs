@@ -1044,7 +1044,10 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
         Err(e) => {
             reporter.status(
                 "Collection",
-                &format!("unavailable (server at {} not reachable: {e:#})", servers[0]),
+                &format!(
+                    "unavailable (server at {} not reachable: {e:#})",
+                    servers[0]
+                ),
             );
         }
     }
@@ -1384,7 +1387,10 @@ async fn cmd_index_daemon(
             // A stem that is not valid UTF-8 cannot be a catalog key; indexing
             // it under a placeholder id would stamp the wrong row.
             status.failed += 1;
-            tracing::error!("{}: file name has no UTF-8 stem; not indexed", path.display());
+            tracing::error!(
+                "{}: file name has no UTF-8 stem; not indexed",
+                path.display()
+            );
             write_index_status(&status);
             continue;
         };
@@ -1931,18 +1937,20 @@ async fn cmd_reconcile(
             // percent-encoded bytes silently orphan the markdown otherwise.
             // Fall back to re-derivation for pre-rc.241 rows that predate
             // the `markdown_path` field.
-            let catalog_entry =
-                match hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", stem).await
-                {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        // One unreadable row must not abort the batch with no
-                        // summary; count it and let the run fail at the end.
-                        tracing::warn!(%stem, error = %e, "catalog read failed during reembed");
-                        embed_failed += 1;
-                        continue;
-                    }
-                };
+            let catalog_entry = match hs_common::catalog::read_catalog_entry_via(
+                &*storage, "catalog", stem,
+            )
+            .await
+            {
+                Ok(entry) => entry,
+                Err(e) => {
+                    // One unreadable row must not abort the batch with no
+                    // summary; count it and let the run fail at the end.
+                    tracing::warn!(%stem, error = %e, "catalog read failed during reembed");
+                    embed_failed += 1;
+                    continue;
+                }
+            };
             let md_key = catalog_entry
                 .as_ref()
                 .and_then(|e| e.markdown_path.clone())
