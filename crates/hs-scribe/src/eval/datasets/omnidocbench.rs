@@ -100,6 +100,10 @@ pub fn load_omnidocbench_filtered(
             continue;
         }
 
+        if let Some(html) = table_html.as_deref() {
+            super::ensure_reference_table_scorable(&image_name, html)?;
+        }
+
         samples.push(GroundTruthSample {
             id: image_name.clone(),
             pdf_path: PathBuf::new(), // OmniDocBench doesn't provide PDFs

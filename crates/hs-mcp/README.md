@@ -6,7 +6,7 @@
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| **paper_search** | query, max_results?, search_type?, date?, offset?, provider?, min_citations?, sort? | Search 6 academic providers |
+| **paper_search** | query, max_results?, search_type?, date?, offset?, provider?, min_citations?, sort? | Search 5 academic providers (6 with a CORE API key) |
 | **paper_get** | doi | Look up a paper by DOI |
 | **paper_references** | doi | Structured reference list of a paper (Semantic Scholar) |
 | **paper_citations** | doi, limit?, year_from?, sort? | Papers that cite a DOI (default limit 100, max 1000) |

@@ -48,15 +48,59 @@ pub struct LoggingHandle {
     _worker_guards: Vec<WorkerGuard>,
 }
 
+/// The stderr layer's filter: `RUST_LOG` when set (an unparsable value is an
+/// error, not a silent fallback), else the configured default. An explicit
+/// `--quiet` wins over `RUST_LOG`. `None` when stderr output is disabled.
+/// Pure over its inputs so tests never touch the process environment.
+pub(crate) fn resolve_stderr_filter(
+    output: &StderrOutput,
+    rust_log: Option<&str>,
+) -> Result<Option<EnvFilter>, String> {
+    // Validated whether or not stderr is enabled: one `RUST_LOG` rule for
+    // every layer.
+    let parsed = parse_rust_log(rust_log)?;
+    let Some(default) = output.filter_string() else {
+        return Ok(None);
+    };
+    let quiet = matches!(output, StderrOutput::VerboseQuiet { quiet: true, .. });
+    Ok(Some(match parsed {
+        Some(f) if !quiet => f,
+        _ => EnvFilter::new(default),
+    }))
+}
+
+/// The file layer's filter: `RUST_LOG` when set, else the configured
+/// default; an unparsable `RUST_LOG` is an error.
+pub(crate) fn resolve_file_filter(
+    default: &str,
+    rust_log: Option<&str>,
+) -> Result<EnvFilter, String> {
+    Ok(parse_rust_log(rust_log)?.unwrap_or_else(|| EnvFilter::new(default)))
+}
+
+fn parse_rust_log(rust_log: Option<&str>) -> Result<Option<EnvFilter>, String> {
+    rust_log
+        .map(|value| {
+            EnvFilter::try_new(value).map_err(|e| format!("invalid RUST_LOG `{value}`: {e}"))
+        })
+        .transpose()
+}
+
 /// Install the global tracing subscriber and open the spool. Synchronous; may
 /// be called before a tokio runtime exists. Background tasks (rotation +
 /// shipping) are started by [`LoggingHandle::spawn_shipper`].
 ///
 /// A spool directory that cannot be opened degrades to stderr-only logging
 /// instead of failing: an unwritable log dir must never brick an invocation,
-/// including the `hs upgrade` that would repair the config.
+/// including the `hs upgrade` that would repair the config. An unparsable
+/// `RUST_LOG` is a startup error.
 pub fn init(cfg: LoggingConfig) -> LoggingHandle {
-    let stderr_filter = cfg.stderr.filter_string();
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let stderr_env_filter = resolve_stderr_filter(&cfg.stderr, rust_log.as_deref())
+        .unwrap_or_else(|e| exit_on_config_error(&cfg.service_name, e));
+    let file_env_filter = resolve_file_filter(&cfg.file_filter, rust_log.as_deref())
+        .unwrap_or_else(|e| exit_on_config_error(&cfg.service_name, e));
+    let stderr_filter = stderr_env_filter;
 
     let spool = match Spool::new(cfg.spool_dir.clone()) {
         Ok(spool) => Some(spool),
@@ -80,8 +124,7 @@ pub fn init(cfg: LoggingConfig) -> LoggingHandle {
         let writer = SpoolWriter::new(spool.clone());
         let (non_blocking_file, file_worker_guard) = tracing_appender::non_blocking(writer);
         worker_guards.push(file_worker_guard);
-        let file_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.file_filter));
+        let file_filter = file_env_filter;
         fmt::layer()
             .json()
             .with_current_span(true)
@@ -96,7 +139,7 @@ pub fn init(cfg: LoggingConfig) -> LoggingHandle {
         fmt::layer()
             .with_target(false)
             .with_writer(non_blocking_stderr)
-            .with_filter(EnvFilter::new(filter))
+            .with_filter(filter)
     });
 
     // `try_init` so a second call (e.g. in tests) stays a no-op. With neither
@@ -567,11 +610,18 @@ mod tests {
 
     #[test]
     fn log_dir_follows_the_home_section() {
-        let home = home_with(Some(
-            "home:\n  project_dir: /srv/hs\nstorage:\n  backend: local\nlogs:\n  bucket: audit\n",
-        ));
+        // `/srv/hs` has no drive on Windows, where a relative project dir is
+        // refused.
+        let project = if cfg!(windows) {
+            "C:/srv/hs"
+        } else {
+            "/srv/hs"
+        };
+        let home = home_with(Some(&format!(
+            "home:\n  project_dir: {project}\nstorage:\n  backend: local\nlogs:\n  bucket: audit\n"
+        )));
         let s = sections(&home).unwrap();
-        assert_eq!(s.log_dir, std::path::PathBuf::from("/srv/hs/logs"));
+        assert_eq!(s.log_dir, std::path::PathBuf::from(project).join("logs"));
         assert_eq!(s.logs.bucket, "audit");
         assert_eq!(s.storage.unwrap().backend, Backend::Local);
     }
@@ -605,5 +655,70 @@ mod tests {
 
         let clean = sections(&home_with(Some("logs:\n  bucket: audit\n"))).unwrap();
         assert!(clean.notices.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod stderr_filter_tests {
+    use super::*;
+
+    fn rendered(f: Option<EnvFilter>) -> String {
+        f.expect("stderr enabled").to_string()
+    }
+
+    #[test]
+    fn rust_log_overrides_the_configured_default() {
+        let out = StderrOutput::VerboseQuiet {
+            verbose: false,
+            quiet: false,
+        };
+        let f = resolve_stderr_filter(&out, Some("info")).unwrap();
+        assert_eq!(rendered(f), "info");
+    }
+
+    #[test]
+    fn unset_rust_log_uses_the_default() {
+        let out = StderrOutput::VerboseQuiet {
+            verbose: false,
+            quiet: false,
+        };
+        assert_eq!(rendered(resolve_stderr_filter(&out, None).unwrap()), "warn");
+    }
+
+    #[test]
+    fn quiet_beats_rust_log() {
+        let out = StderrOutput::VerboseQuiet {
+            verbose: false,
+            quiet: true,
+        };
+        let f = resolve_stderr_filter(&out, Some("info")).unwrap();
+        assert_eq!(rendered(f), "error");
+    }
+
+    #[test]
+    fn unparsable_rust_log_is_an_error() {
+        let out = StderrOutput::EnvFilter("warn".into());
+        let err = resolve_stderr_filter(&out, Some("info=nope=x")).unwrap_err();
+        assert!(err.starts_with("invalid RUST_LOG `info=nope=x`: "), "{err}");
+    }
+
+    #[test]
+    fn unparsable_rust_log_is_an_error_even_with_stderr_disabled() {
+        let err = resolve_stderr_filter(&StderrOutput::Disabled, Some("info=nope=x")).unwrap_err();
+        assert!(err.starts_with("invalid RUST_LOG `info=nope=x`: "), "{err}");
+        assert!(resolve_file_filter("info", Some("info=nope=x")).is_err());
+        assert_eq!(
+            resolve_file_filter("info", Some("debug"))
+                .unwrap()
+                .to_string(),
+            "debug"
+        );
+        assert_eq!(
+            resolve_file_filter("info", None).unwrap().to_string(),
+            "info"
+        );
+        assert!(resolve_stderr_filter(&StderrOutput::Disabled, None)
+            .unwrap()
+            .is_none());
     }
 }

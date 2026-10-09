@@ -539,10 +539,9 @@ pub struct DistillClientConfig {
     /// (Pi=2, AppleSiliconLow=4, AppleSiliconHigh=6, Nvidia*=8, GenericCpu
     /// scales with `cpu_count/4`). Explicit override wins.
     pub concurrency: Option<usize>,
-    /// Deadline for one indexing request, seconds. It must leave room
-    /// inside the event bus's `ack_wait` (default 7200 s) for the stamp and
-    /// publish that follow indexing — otherwise the broker redelivers an
-    /// event whose first delivery is still running. See
+    /// Deadline for one indexing request, seconds. The event watcher sends
+    /// JetStream in-progress heartbeats while a handler runs, so this no
+    /// longer has to fit inside `events.nats.ack_wait_secs`. See
     /// `client::DEFAULT_INDEX_TIMEOUT` for the reasoning behind the default.
     pub index_timeout_secs: u64,
     #[serde(skip)]
@@ -623,10 +622,6 @@ impl DistillClientConfig {
         Ok(cfg)
     }
 
-    /// Seconds of `ack_wait` that must remain after an index request ends
-    /// (catalog stamp with retries, `distill.completed` publish).
-    const ACK_WAIT_HEADROOM_SECS: u64 = 120;
-
     pub fn validate(&self) -> Result<(), DistillError> {
         if self.index_timeout_secs == 0 {
             return Err(DistillError::Config(
@@ -637,25 +632,6 @@ impl DistillClientConfig {
             return Err(DistillError::Config(
                 "distill.concurrency must be at least 1 (omit it for the hardware default)".into(),
             ));
-        }
-        if let Some(events) = self
-            .events
-            .as_ref()
-            .filter(|e| e.backend == hs_common::event_bus::EventsBackend::Nats)
-        {
-            let ack_wait = events.nats.ack_wait_secs;
-            if self
-                .index_timeout_secs
-                .saturating_add(Self::ACK_WAIT_HEADROOM_SECS)
-                > ack_wait
-            {
-                return Err(DistillError::Config(format!(
-                    "distill.index_timeout_secs ({}) + {} s headroom exceeds events.nats.ack_wait_secs \
-                     ({ack_wait}): the broker would redeliver an event that is still being indexed",
-                    self.index_timeout_secs,
-                    Self::ACK_WAIT_HEADROOM_SECS
-                )));
-            }
         }
         Ok(())
     }
@@ -934,43 +910,23 @@ mod tests {
 
     // ── Client config ──────────────────────────────────────────────────
 
-    fn nats_client_config(index_timeout_secs: u64, ack_wait_secs: u64) -> DistillClientConfig {
-        let mut events = EventBusConfig {
-            backend: hs_common::event_bus::EventsBackend::Nats,
-            nats: hs_common::event_bus::config::NatsYaml::default(),
-        };
-        events.nats.ack_wait_secs = ack_wait_secs;
+    fn client_config(index_timeout_secs: u64) -> DistillClientConfig {
         DistillClientConfig {
             index_timeout_secs,
-            events: Some(events),
             ..DistillClientConfig::default()
         }
     }
 
     #[test]
-    fn default_client_config_is_valid_against_the_default_ack_wait() {
-        let mut c = DistillClientConfig::default();
+    fn default_client_config_is_valid() {
+        let c = DistillClientConfig::default();
         c.validate().unwrap();
-        c.events = Some(hs_common::event_bus::EventBusConfig {
-            backend: hs_common::event_bus::EventsBackend::Nats,
-            nats: hs_common::event_bus::config::NatsYaml::default(),
-        });
-        c.validate()
-            .expect("1800 s index timeout fits the 7200 s ack_wait");
         assert_eq!(c.index_timeout(), crate::client::DEFAULT_INDEX_TIMEOUT);
     }
 
     #[test]
-    fn index_timeout_must_fit_inside_ack_wait() {
-        // Equal to ack_wait would let the broker redeliver mid-index.
-        assert!(nats_client_config(7200, 7200).validate().is_err());
-        assert!(nats_client_config(7100, 7200).validate().is_err());
-        nats_client_config(7080, 7200).validate().unwrap();
-    }
-
-    #[test]
     fn zero_timeout_or_concurrency_is_rejected() {
-        assert!(nats_client_config(0, 7200).validate().is_err());
+        assert!(client_config(0).validate().is_err());
         let c = DistillClientConfig {
             concurrency: Some(0),
             ..DistillClientConfig::default()

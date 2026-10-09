@@ -201,11 +201,9 @@ impl std::error::Error for ServerError {}
 /// Indexing a book-length markdown is chunk -> GPU embed -> upsert on a card
 /// shared with the scribe VLM: minutes under contention, never close to
 /// half an hour. The bound exists for the stalled-server case, where a
-/// request with no deadline holds its handler slot for as long as the
-/// event's `ack_wait` (default 7200 s), after which the broker redelivers
-/// the event and a second worker indexes the same document concurrently.
-/// 1800 s leaves >5000 s of that window for the stamp and publish that
-/// follow.
+/// request with no deadline would hold its watcher handler slot forever
+/// (the watcher's in-progress heartbeats keep the broker from redelivering,
+/// so nothing else would ever free it).
 pub const DEFAULT_INDEX_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Bound for every request that is not an index, a scrub or a reset and does

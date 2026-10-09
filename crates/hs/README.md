@@ -5,7 +5,7 @@ Unified CLI for the home-still research pipeline.
 ## Subcommands
 
 ```
-hs paper search    Search 6 academic providers
+hs paper search    Search academic providers (5, plus CORE with an API key)
 hs paper download  Download papers by query or DOI
 hs paper get       Look up a single paper by DOI
 
@@ -28,7 +28,7 @@ hs serve distill   Run distill service on this machine (auto-init)
 hs serve mcp       Run MCP server on this machine (auto-init)
 
 hs status          Live TUI dashboard (pipeline stats, service health)
-hs restart         Restart the services running this host's installed binaries
+hs restart         Restart the services running this host's installed binaries (macOS: LaunchAgents are booted out and bootstrapped, so plist edits take effect)
 
 hs upgrade         Self-update binaries (checksum + version verified) + Docker images + restart
 hs upgrade --check Check for updates without installing

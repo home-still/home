@@ -36,10 +36,12 @@ pub struct EventBusConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct NatsYaml {
     pub url: String,
-    /// Per-message processing deadline in seconds. Translates to the
-    /// JetStream consumer's `ack_wait`. Default 7200 (2× the scribe
-    /// timeout ceiling of 3600s) so a legitimately slow book-length
-    /// convert isn't reclaimed by the broker mid-flight.
+    /// Per-message deadline in seconds. Translates to the JetStream
+    /// consumer's `ack_wait`: the longest the broker waits for an ack or an
+    /// in-progress heartbeat before redelivering. The watchers send a
+    /// heartbeat every `ack_wait / 3` while a handler runs, so this need
+    /// not cover a whole conversion; it bounds how long an event stays
+    /// invisible after a watcher crash. Default 7200.
     pub ack_wait_secs: u64,
     /// After this many redeliveries, JetStream drops the message.
     /// Prevents a NAK storm on a poison message from stalling the queue.
@@ -236,6 +238,13 @@ impl EventBusConfig {
         cfg.validate()
             .map_err(|e| ConfigError::section(file.path(), "events", e))?;
         Ok(Some(cfg))
+    }
+
+    /// The consumer's per-message deadline (`events.nats.ack_wait_secs`):
+    /// how long the broker waits for an ack or an in-progress heartbeat
+    /// before it redelivers an event.
+    pub fn ack_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.nats.ack_wait_secs)
     }
 
     /// How long a watcher waits for running handlers after its subscription

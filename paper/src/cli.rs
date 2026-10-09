@@ -36,7 +36,10 @@ pub enum PaperCmd {
         #[arg(short, long, default_value = "all")]
         provider: ProviderArg,
 
-        /// Sort result by: relevance (default), date, citations
+        /// Sort result by: relevance (default; blended score), date (newest
+        /// first) or citations (most cited first). date/citations are strict
+        /// orders, papers with no date/count last; citations also drops
+        /// papers that do not match the query terms
         #[arg(short = 's', long = "sort", default_value = "relevance")]
         sort_by: SortByArg,
 

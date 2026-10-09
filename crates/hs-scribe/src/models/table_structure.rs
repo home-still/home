@@ -327,7 +327,22 @@ impl TableStructureRecognizer {
     }
 }
 
-/// Build HTML table from structure tokens and cell texts.
+/// Append `text` to `html` as element content: `&`, `<` and `>` are escaped
+/// so VLM-read cell text ("a<b & c", "<.001") can neither open a tag nor
+/// start an entity.
+fn push_escaped(html: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '&' => html.push_str("&amp;"),
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            _ => html.push(ch),
+        }
+    }
+}
+
+/// Build HTML table from structure tokens and cell texts. Cell text is
+/// escaped; the tokens are the recognizer's own markup and are emitted as is.
 pub fn build_html_from_structure(structure: &TableStructure, cell_texts: &[String]) -> String {
     let mut html = String::from("<table>");
     let mut cell_idx = 0;
@@ -335,14 +350,16 @@ pub fn build_html_from_structure(structure: &TableStructure, cell_texts: &[Strin
     for token in &structure.tokens {
         if token == "<td></td>" {
             let text = cell_texts.get(cell_idx).map(|s| s.as_str()).unwrap_or("");
-            html.push_str(&format!("<td>{}</td>", text));
+            html.push_str("<td>");
+            push_escaped(&mut html, text);
+            html.push_str("</td>");
             cell_idx += 1;
         } else if token == "<td" {
             html.push_str("<td");
         } else if token == ">" {
             html.push('>');
             let text = cell_texts.get(cell_idx).map(|s| s.as_str()).unwrap_or("");
-            html.push_str(text);
+            push_escaped(&mut html, text);
             cell_idx += 1;
         } else {
             html.push_str(token);
@@ -401,6 +418,30 @@ mod tests {
         let texts = vec!["merged".into()];
         let html = build_html_from_structure(&structure, &texts);
         assert!(html.contains("<td colspan=\"2\">merged</td>"));
+    }
+
+    #[test]
+    fn cell_text_is_escaped_so_it_cannot_become_markup() {
+        let structure = TableStructure {
+            tokens: vec![
+                "<tr>".into(),
+                "<td></td>".into(),
+                "<td".into(),
+                " colspan=\"2\"".into(),
+                ">".into(),
+                "</td>".into(),
+                "</tr>".into(),
+            ],
+            cells: vec![],
+            confidence: 0.9,
+        };
+        let texts = vec!["a<b & c".into(), "<script>x</script> &amp;".into()];
+        let html = build_html_from_structure(&structure, &texts);
+        assert_eq!(
+            html,
+            "<table><tr><td>a&lt;b &amp; c</td><td colspan=\"2\">\
+             &lt;script&gt;x&lt;/script&gt; &amp;amp;</td></tr></table>"
+        );
     }
 
     #[test]

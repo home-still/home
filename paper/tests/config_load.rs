@@ -148,11 +148,18 @@ fn an_absent_events_section_is_no_bus_and_refuses_to_build_one() {
 
 #[test]
 fn the_default_download_path_follows_home_project_dir_and_an_explicit_one_wins() {
-    const STORAGE: &str = "storage:\n  backend: local\n  local:\n    root: /srv/hs\n";
-    let config = load_yaml(Some(&format!("home:\n  project_dir: /srv/hs\n{STORAGE}"))).unwrap();
-    assert_eq!(config.download_path, PathBuf::from("/srv/hs/papers"));
+    // `/srv/hs` has no drive on Windows, where a relative project dir is
+    // refused.
+    let project = if cfg!(windows) {
+        "C:/srv/hs"
+    } else {
+        "/srv/hs"
+    };
+    let storage = format!("storage:\n  backend: local\n  local:\n    root: {project}\n");
+    let config = load_yaml(Some(&format!("home:\n  project_dir: {project}\n{storage}"))).unwrap();
+    assert_eq!(config.download_path, PathBuf::from(project).join("papers"));
     let config = load_yaml(Some(&format!(
-        "home:\n  project_dir: /srv/hs\n{STORAGE}paper:\n  download_path: /elsewhere/papers\n",
+        "home:\n  project_dir: {project}\n{storage}paper:\n  download_path: /elsewhere/papers\n",
     )))
     .unwrap();
     assert_eq!(config.download_path, PathBuf::from("/elsewhere/papers"));

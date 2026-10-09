@@ -54,9 +54,16 @@ fn yaml_collections_replace_the_default_list_and_host_port_are_read() {
 
 #[test]
 fn env_overrides_the_file_and_the_project_dir_moves_the_data_dir() {
-    let (_home, file) = home_with(Some(
-        "home:\n  project_dir: /srv/hs\ndistill_server:\n  port: 7444\n",
-    ));
+    // `/srv/hs` has no drive on Windows, where a relative project dir is
+    // refused.
+    let project = if cfg!(windows) {
+        "C:/srv/hs"
+    } else {
+        "/srv/hs"
+    };
+    let (_home, file) = home_with(Some(&format!(
+        "home:\n  project_dir: {project}\ndistill_server:\n  port: 7444\n"
+    )));
     let loaded = with_env(&[("HS_DISTILL_PORT", "7555")], || {
         DistillServerConfig::from_file(&file)
     })
@@ -64,7 +71,7 @@ fn env_overrides_the_file_and_the_project_dir_moves_the_data_dir() {
     assert_eq!(loaded.port, 7555);
     assert_eq!(
         loaded.qdrant_data_dir,
-        std::path::PathBuf::from("/srv/hs/data/qdrant")
+        std::path::PathBuf::from(project).join("data/qdrant")
     );
 }
 
@@ -130,9 +137,10 @@ fn a_malformed_client_section_is_an_error_naming_it() {
         ("distill:\n  index_timeout_secs: 0\n", "distill"),
         ("storage:\n  backend: carrier-pigeon\n", "storage"),
         ("events:\n  backend: carrier-pigeon\n", "events"),
+        // A zero `ack_wait_secs` would give the heartbeat a zero interval.
         (
-            "events:\n  backend: nats\n  nats:\n    ack_wait_secs: 100\n",
-            "distill",
+            "events:\n  backend: nats\n  nats:\n    ack_wait_secs: 0\n",
+            "events",
         ),
     ] {
         let (_home, file) = home_with(Some(yaml));

@@ -16,9 +16,10 @@
 //!
 //! Detection thresholds are calibrated against the 5-page sample, not derived
 //! from theory. They will produce some false positives on bibliography
-//! regions; the postprocess QC's bibliography-multiplier handles that
-//! gracefully and the alternative (raising thresholds high enough to never
-//! FP on bibs) lets through too many real loops.
+//! regions. An aborted region is a hole in the markdown, so the caller counts
+//! it as a skipped region and QC rejects the conversion as gapped (the tier
+//! chain escalates); the alternative (raising thresholds high enough to
+//! never FP on bibs) lets through too many real loops.
 
 use std::collections::{HashMap, VecDeque};
 use unicode_segmentation::UnicodeSegmentation;
@@ -248,8 +249,8 @@ impl RepetitionDetector {
     ///   are typically 2-3 ("the present study").
     /// - **n=4..=6, threshold 3:** Verbatim chunk repeats need only 3
     ///   occurrences. Legitimate ≥4-gram repeats above count 2 are rare
-    ///   outside reference lists, which the bibliography QC multiplier
-    ///   handles separately.
+    ///   outside reference lists, where this can abort a legitimate region
+    ///   (the conversion is then rejected as gapped and escalates).
     pub fn check(&self) -> Option<LoopReason> {
         if self.window.len() < MIN_WINDOW_FOR_CHECK {
             return None;

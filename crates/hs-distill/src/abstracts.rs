@@ -139,9 +139,13 @@ pub fn build_embed_input(title: Option<&str>, coalesced: &CoalescedAbstract) -> 
 ///    (abstracts are always near the top — anchoring this way avoids
 ///    matching the word "abstract" inside the body or references).
 /// 2. Capture content from after that line until either:
-///    - The next markdown heading (`^#+\s+`)
+///    - A markdown heading (`#`..`###`) that starts with an IMRaD label
+///      (`## Results and Discussion`)
 ///    - A standalone section-name line for a common IMRaD section
-///      (`Introduction`, `Background`, `Methods`, `Results`, etc.)
+///      (`Introduction`, `Background`, `Methods`, `Results`, etc. — the
+///      whole line, optionally with `**` markers and a trailing `:`;
+///      `Background: We studied…` and `Results show…` do not end it), or a
+///      line starting `Keywords`/`References`/`Funding`/`Acknowledgements`.
 ///    - 4 KB past the start (hard cap; typical abstracts < 3 KB).
 ///    - End of document.
 /// 3. Trim and return; caller decides if the result is long enough.
@@ -164,10 +168,22 @@ pub fn extract_markdown_abstract(md: &str) -> Option<String> {
             .expect("ABSTRACT_MARKER regex")
     });
     let section_break = SECTION_BREAK.get_or_init(|| {
-        // End of abstract: next heading or a standalone IMRaD section line.
-        // The leading anchor `^` is line-mode courtesy of `(?m)`.
+        // End of abstract. Three alternatives, each anchored to a line start
+        // (`(?m)`):
+        //  - a markdown heading (`#`..`###`) that STARTS with an IMRaD label
+        //    (`## Results and Discussion`, `## 1. Introduction`): a heading is
+        //    a section start whatever follows the label.
+        //  - an IMRaD label (Introduction, Background, Methods, Materials and
+        //    Methods, Results, Discussion, Conclusion(s), optionally numbered
+        //    `1.`) with optional `**` markers breaks ONLY when it is the whole
+        //    line — optional closing `**`, optional `:`, end of line. A
+        //    structured abstract's own `Background: We studied…` /
+        //    `Results show that…` lines carry the abstract and must not end it.
+        //  - Keywords / References / Funding / Acknowledgements / author
+        //    statements break on the label prefix: whatever follows on the
+        //    line is not abstract text.
         Regex::new(
-            r"(?im)^\s*(?:#{1,3}\s+|\*\*\s*)?(?:introduction|background|methods?|materials?\s+and\s+methods?|results?|discussion|conclusions?|keywords?|references?|acknowledg(?:e?)ments?|funding|author\s+contributions?|conflicts?\s+of\s+interest|1\.?\s+introduction|1\.?\s+background)\b",
+            r"(?im)^\s*(?:(?:#{1,3}[ \t]+(?:1\.?[ \t]+)?(?:introduction|background|methods?|materials?[ \t]+and[ \t]+methods?|results?|discussion|conclusions?)\b)|(?:(?:\*\*[ \t]*)?(?:1\.?[ \t]+)?(?:introduction|background|methods?|materials?[ \t]+and[ \t]+methods?|results?|discussion|conclusions?)[ \t]*(?:\*\*)?[ \t]*[:.]?[ \t]*(?:\*\*)?[ \t]*$)|(?:(?:#{1,3}[ \t]+|\*\*[ \t]*)?(?:keywords?|references?|acknowledg(?:e?)ments?|funding|author[ \t]+contributions?|conflicts?[ \t]+of[ \t]+interest)\b))",
         )
         .expect("SECTION_BREAK regex")
     });
@@ -226,6 +242,51 @@ mod tests {
         let got = extract_markdown_abstract(md).unwrap();
         assert!(got.contains("Autism spectrum disorder"));
         assert!(!got.contains("ASD prevalence"));
+    }
+
+    #[test]
+    fn structured_abstract_opening_with_a_labelled_background_line_is_kept_whole() {
+        let md = "## Abstract\nBackground: We studied spinal shrinkage in long-distance runners with chronic lower back pain over twelve months.\nMethods: Twenty-five athletes were measured weekly.\nResults: Shrinkage was larger in the symptomatic group.\nConclusions: Running load modulates disc height.\n\n## Introduction\nRunning is a complex motor task.\n";
+        let got = extract_markdown_abstract(md).unwrap();
+        assert!(got.starts_with("Background: We studied"));
+        assert!(got.contains("Conclusions: Running load"));
+        assert!(!got.contains("Running is a complex"));
+    }
+
+    #[test]
+    fn a_results_sentence_does_not_truncate_the_abstract() {
+        let md = "Abstract\nWe measured spinal shrinkage in athletes over a year of training.\nResults show that shrinkage was larger in the symptomatic group than in controls, across all sites.\n\nIntroduction\nbody text\n";
+        let got = extract_markdown_abstract(md).unwrap();
+        assert!(got.contains("Results show that shrinkage"));
+        assert!(!got.contains("body text"));
+    }
+
+    #[test]
+    fn standalone_markup_section_labels_still_break() {
+        for label in [
+            "## Methods",
+            "**Results**",
+            "**Discussion:**",
+            "Conclusions:",
+            "1. Introduction",
+            "## Results and Discussion",
+            "## 1. Introduction and aims",
+            "INTRODUCTION.",
+        ] {
+            let md = format!(
+                "## Abstract\nWe measured spinal shrinkage in athletes over a year of training sessions.\n\n{label}\nTAIL TEXT\n"
+            );
+            let got = extract_markdown_abstract(&md).unwrap();
+            assert!(got.contains("spinal shrinkage"), "{label}");
+            assert!(!got.contains("TAIL"), "{label}");
+        }
+    }
+
+    #[test]
+    fn keywords_line_breaks_by_prefix() {
+        let md = "## Abstract\nWe measured spinal shrinkage in athletes over a year of training sessions.\nKeywords: running, spine\n";
+        let got = extract_markdown_abstract(md).unwrap();
+        assert!(!got.contains("running, spine"));
     }
 
     #[test]

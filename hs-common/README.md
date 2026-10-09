@@ -50,13 +50,13 @@ let claims = token::validate_token(&[&secret], &token, TokenType::Access, false)
 `ServicePool<C>` — generic load-balanced server pool. Queries all servers for readiness, picks the least-loaded one, retries on failure.
 
 ### `storage`
-The `Storage` trait (`get`, `put`, `head`, `list`, `delete`, `exists`, `ensure_ready`) with a `LocalFsStorage` and an `S3Storage` backend, selected by the `storage:` config section (`StorageConfig::build`). Every key is checked by `validate_key` on every operation (no `..`, absolute or backslash keys). `LocalFsStorage::put` writes a temp file and renames it, so readers never see a partial object. `is_not_found` / `is_invalid_key` classify errors for event handlers.
+The `Storage` trait (`get`, `put`, `head`, `list`, `delete`, `exists`, `ensure_ready`) with a `LocalFsStorage` and an `S3Storage` backend, selected by the `storage:` config section (`StorageConfig::build`). Every key is checked by `validate_key` on every operation (no `..`, absolute or backslash keys). `LocalFsStorage::put` writes a temp file and renames it, so readers never see a partial object. `is_not_found` / `is_invalid_key` classify errors for event handlers. `S3Storage` gives every request a fixed 15-minute total timeout (not configurable; connect timeout and retries keep object_store's defaults), so a stalled peer fails the request instead of hanging it. `storage.local.root`, `home.project_dir` and `home.log_dir` must be absolute after `~/` expansion (`~\` too on Windows); a relative value is a config error naming the key. An unparsable `RUST_LOG` is a startup error (`invalid RUST_LOG `<value>`: ...`); a valid one overrides the stderr level, except under `--quiet`.
 
 ### `catalog`
 `CatalogEntry` — YAML-serialized paper metadata with conversion info, page offsets, and file references. Read and written through `Storage`: `read_catalog_entry_via()`, `write_catalog_entry_via()`, `update_conversion_catalog_via()` and the other `*_via` stamp helpers, `list_catalog_entries_via()` / `list_catalog_entries_parallel()`.
 
 ### `event_bus`
-`EventBus` publish / pull-consume with explicit `ack` / `nak` / `term`. `events.backend` has no default: `EventBusConfig::build_required` fails when the section is missing, and `noop` must be named. `NatsBus` provisions the `PAPERS`, `SCRIBE` and `DISTILL` JetStream streams and the durable consumers.
+`EventBus` publish / pull-consume with explicit `ack` / `nak` / `term`. A handler that outlives the consumer's `ack_wait` keeps its event alive with `Event::in_progress()`; `with_progress_heartbeat(&event, progress_interval(ack_wait), handler)` sends it every `ack_wait / 3` for as long as `handler` runs (both watchers use it). `events.backend` has no default: `EventBusConfig::build_required` fails when the section is missing, and `noop` must be named. `NatsBus` provisions the `PAPERS`, `SCRIBE` and `DISTILL` JetStream streams and the durable consumers.
 
 ### `compose`
 `ComposeCmd` — auto-detects Docker Compose, Podman Compose, or standalone variants. Methods: `run()`, `run_silent()`, `run_capture()`, `exec_run()`.

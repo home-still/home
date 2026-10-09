@@ -18,7 +18,7 @@ Installs the `hs` binary to `~/.local/bin/`. Supports macOS (Intel + Apple Silic
 
 ```sh
 hs config init                                    # set up config + API keys
-hs paper search "transformer attention mechanisms" # search across 6 providers
+hs paper search "transformer attention mechanisms" # search across all providers
 hs paper download "neural nets" -n 25              # download PDFs (publishes papers.ingested for the watchers)
 hs serve scribe                                    # run scribe service on this machine
 hs serve distill                                   # run distill service on this machine
@@ -32,7 +32,7 @@ home-still is a four-phase academic research engine:
 
 | Phase | Tool | What it does | Status |
 |---|---|---|---|
-| **Acquire** | `hs paper` | Search and download papers from 6 providers | Working |
+| **Acquire** | `hs paper` | Search and download papers from 5 providers (6 with a CORE key) | Working |
 | **Convert** | `hs scribe` | Convert PDFs to markdown using layout detection + VLM OCR | Working |
 | **Index** | `hs distill` | Chunk, embed, and index documents into Qdrant | Working |
 | **Search** | `hs distill search` | Semantic search across indexed documents | Working |
@@ -41,7 +41,7 @@ home-still is a four-phase academic research engine:
 
 ## Paper search
 
-Search 6 academic providers simultaneously. Results are deduplicated, merged, and ranked using reciprocal rank fusion.
+Search 5 academic providers simultaneously (6 with a CORE API key). Results are deduplicated, merged, and ranked using reciprocal rank fusion.
 
 ```sh
 # Keyword search (queries all providers by default)
@@ -392,7 +392,7 @@ crates/hs-scribe/   PDF-to-markdown (ONNX layout detection + VLM OCR, client/ser
 crates/hs-distill/  Vector embedding + semantic search (ONNX embeddings, Qdrant, client/server)
 crates/hs-gateway/  Cloud access reverse proxy (OAuth2, token auth, service routing)
 crates/hs-mcp/      MCP server (35 tools, stdio + streamable HTTP transport)
-paper/              Academic paper meta-search library (6 providers, aggregation)
+paper/              Academic paper meta-search library (5 providers, 6 with a CORE key; aggregation)
 hs-common/          Shared infrastructure (reporter, service pool, catalog, auth, compose)
 ```
 

@@ -438,10 +438,10 @@ pub const CATALOG_FETCH_CONCURRENCY: usize = 24;
 /// version would produce.
 ///
 /// Error policy (divergent from `list_catalog_entries_via` by design):
-/// - Per-key `storage.get` failure or 10s timeout → `Err` from the whole
-///   fetcher, with the offending key in the message. `storage.list`
-///   already promised this key exists, so a GET failure signals a real
-///   storage-integrity problem worth surfacing loudly.
+/// - A row deleted between the listing and its GET (not-found) is skipped.
+/// - Any other per-key `storage.get` failure or 10s timeout → `Err` from the
+///   whole fetcher, with the offending key in the message: a partial list
+///   reads as a smaller catalog.
 /// - Deserialization failure of a fetched YAML → `Err` naming the key: a
 ///   skipped row vanishes from every listing, status and drift count.
 ///
@@ -486,7 +486,10 @@ pub async fn list_catalog_entries_parallel(
 
     while let Some((slot, obj, stem, key, res)) = stream.next().await {
         let bytes = match res {
-            Ok(Ok(b)) => b,
+            Ok(Ok(b)) => Some(b),
+            // Listed, then deleted before its GET: the row is gone, not
+            // broken (same rule as `list_catalog_entries_via`).
+            Ok(Err(e)) if crate::storage::is_not_found(&e) => None,
             Ok(Err(e)) => {
                 return Err(anyhow::anyhow!(
                     "list_catalog_entries_parallel: storage.get({key}) failed: {e}"
@@ -502,6 +505,9 @@ pub async fn list_catalog_entries_parallel(
         if done.is_multiple_of(64) || done == total {
             on_progress(done, total);
         }
+        let Some(bytes) = bytes else {
+            continue;
+        };
         let entry = serde_yaml_ng::from_slice::<CatalogEntry>(&bytes)
             .map_err(|e| anyhow::anyhow!("catalog YAML parse failed for {key}: {e}"))?;
         slotted[slot] = Some((stem, obj, entry));
@@ -975,6 +981,74 @@ conversion:
             msg.contains(&fail) && msg.contains("failed"),
             "error must name the offending key: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn parallel_fetcher_skips_a_row_deleted_mid_listing() {
+        use crate::storage::ObjectMeta;
+        use async_trait::async_trait;
+
+        struct Vanishing {
+            keys: Vec<String>,
+            gone: String,
+            broken: Option<String>,
+        }
+
+        #[async_trait]
+        impl Storage for Vanishing {
+            async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+                if key == self.gone {
+                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+                }
+                if self.broken.as_deref() == Some(key) {
+                    return Err(anyhow::anyhow!("simulated backend 500"));
+                }
+                Ok(serde_yaml_ng::to_string(&CatalogEntry::default())?.into_bytes())
+            }
+            async fn put(&self, _: &str, _: Vec<u8>) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn head(&self, _: &str) -> anyhow::Result<Option<ObjectMeta>> {
+                unimplemented!()
+            }
+            async fn list(&self, _: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+                Ok(self
+                    .keys
+                    .iter()
+                    .map(|k| ObjectMeta {
+                        key: k.clone(),
+                        size: 1,
+                        last_modified: None,
+                        etag: None,
+                    })
+                    .collect())
+            }
+            async fn delete(&self, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+        }
+
+        let keys: Vec<String> = (0..4).map(|i| format!("catalog/xx/doc_{i}.yaml")).collect();
+        let ok = Vanishing {
+            keys: keys.clone(),
+            gone: keys[1].clone(),
+            broken: None,
+        };
+        let rows = list_catalog_entries_parallel(&ok, "catalog", 4, |_, _| {})
+            .await
+            .unwrap();
+        let stems: Vec<&str> = rows.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert_eq!(stems, ["doc_0", "doc_2", "doc_3"]);
+
+        let bad = Vanishing {
+            keys: keys.clone(),
+            gone: keys[1].clone(),
+            broken: Some(keys[2].clone()),
+        };
+        let err = list_catalog_entries_parallel(&bad, "catalog", 4, |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(&keys[2]), "{err}");
     }
 
     // ── P0-10 regression: three-state read ────────────────────────────

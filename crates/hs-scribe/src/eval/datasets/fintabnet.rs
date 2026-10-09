@@ -58,10 +58,10 @@ pub fn load_fintabnet_samples(split: &str, limit: Option<usize>) -> Result<Vec<G
         let (page_stem, table_index) = derive_page_stem_and_index(&stem)?;
         let annotation_path = annotations_dir.join(format!("{}_tables.json", page_stem));
 
-        let table_html = Some(
-            build_table_html(&annotation_path, table_index)
-                .with_context(|| format!("Failed to read {}", annotation_path.display()))?,
-        );
+        let table_html = build_table_html(&annotation_path, table_index)
+            .with_context(|| format!("Failed to read {}", annotation_path.display()))?;
+        super::ensure_reference_table_scorable(&stem, &table_html)?;
+        let table_html = Some(table_html);
 
         samples.push(GroundTruthSample {
             id: stem,

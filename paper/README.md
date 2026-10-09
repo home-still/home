@@ -1,6 +1,6 @@
 # paper
 
-Academic paper meta-search library for Rust. Searches 6 providers simultaneously with resilient request handling (rate limiting, circuit breakers, retries). Part of [home-still](../README.md).
+Academic paper meta-search library for Rust. Searches 5 providers simultaneously (6 with a CORE API key) with resilient request handling (rate limiting, circuit breakers, retries). Part of [home-still](../README.md).
 
 ## Usage
 
@@ -26,7 +26,9 @@ hs paper get --doi "10.1038/s41586-024-07487-w"   # lookup metadata
 | CrossRef | 147M+ DOI records | Yes | Publisher links |
 | CORE | 300M+ open access papers | Yes | CORE repository |
 
-When using `--provider all` (default), all providers are queried in parallel. Results are deduplicated by DOI + fuzzy title matching and ranked with reciprocal rank fusion.
+When using `--provider all` (default), all providers are queried in parallel. CORE answers only with an API key (`paper.providers.core.api_key`): without one it is left out of `all` (logged once at startup: `CORE provider disabled: no paper.providers.core.api_key`) rather than failing every search; `--provider core` still asks it and reports the missing key. Results are deduplicated by DOI + fuzzy title matching and ranked with reciprocal rank fusion.
+
+`--sort relevance` (default) orders by the blended score (source consensus, content match, citation weight). `--sort date` and `--sort citations` are strict orderings applied after the relevance floors: newest first / most cited first, papers with no date / no count last, ties in blended-score order. `--sort citations` additionally drops papers whose title or content does not match the query, so a famous off-topic paper cannot lead the list.
 
 `--provider` takes `all`, `arxiv`, `openalex`, `semantic_scholar` (or `s2`), `europe_pmc` (or `europmc`, `pmc`), `crossref`, `core`; clap's own spellings `semanticscholar` and `europepmc` work too.
 
@@ -59,7 +61,7 @@ CLI (clap)
         -> Aggregation (dedup, merge, RRF ranking, quality filtering)
 ```
 
-Ports-and-adapters pattern: providers implement the `PaperProvider` trait, wrapped by `ResilientProvider` for fault tolerance. `AggregateProvider` fans out to all providers with per-provider timeouts, deduplicates by DOI + fuzzy title matching, and ranks with reciprocal rank fusion enhanced by recency, citation, and multi-source boosts.
+Ports-and-adapters pattern: providers implement the `PaperProvider` trait, wrapped by `ResilientProvider` for fault tolerance. `AggregateProvider` fans out to all providers with per-provider timeouts, deduplicates by DOI + fuzzy title matching, and ranks by a blend of reciprocal rank fusion, content relevance and a log-scaled citation count (no recency term; use `--sort date` for newest first).
 
 ### Download pipeline
 

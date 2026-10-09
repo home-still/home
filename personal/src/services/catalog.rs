@@ -57,6 +57,20 @@ pub fn list_entries(cfg: &Config, category: Option<&str>, limit: usize) -> Resul
         .collect())
 }
 
+/// Stems (sorted) of every stored document whose source file has this
+/// SHA-256 (lowercase hex), read from the sidecars. Empty when none does.
+pub fn stems_with_sha256(cfg: &Config, sha256: &str) -> Result<Vec<String>> {
+    let mut stems = Vec::new();
+    walk_sidecars(&cfg.root_dir(), &mut |path| {
+        if read_sidecar(path)?.sha256.as_deref() == Some(sha256) {
+            stems.push(sidecar_stem(path));
+        }
+        Ok(())
+    })?;
+    stems.sort();
+    Ok(stems)
+}
+
 /// A stem names one document's files under the store: reject anything that
 /// could name a path instead (`../..`, separators, NUL) before it reaches
 /// `sharded_path`. The MCP `personal_read` / `personal_reindex` tools pass a

@@ -350,12 +350,10 @@ fn discover_launchd_units() -> Result<Vec<ServiceUnit>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let agents = dirs::home_dir()
-        .context("no home directory to locate ~/Library/LaunchAgents")?
-        .join("Library/LaunchAgents");
+    let home = dirs::home_dir().context("no home directory to locate ~/Library/LaunchAgents")?;
 
     let jobs = launchd_jobs(&String::from_utf8_lossy(&output.stdout), |label| {
-        std::fs::read_to_string(agents.join(format!("{label}.plist")))
+        std::fs::read_to_string(launchd_plist_path(&home, label))
     })?;
     Ok(jobs
         .into_iter()
@@ -494,65 +492,216 @@ async fn inspect_systemd_unit(unit: &ServiceUnit) -> Result<(), String> {
     Ok(())
 }
 
+/// Restart a LaunchAgent so it runs the plist and binary on disk now.
+///
+/// `launchctl kickstart -k` relaunches the job launchd already has in memory:
+/// an edited plist (environment, arguments) is not re-read. The job is booted
+/// out and bootstrapped from its plist instead.
 #[cfg(target_os = "macos")]
 async fn restart_launchd_unit(unit: &ServiceUnit) -> Result<(), String> {
-    let target = launchd_target(&unit.name);
-    let output = tokio::process::Command::new("launchctl")
-        .args(["kickstart", "-k", &target])
-        .output()
+    let home = dirs::home_dir().ok_or_else(|| {
+        format!(
+            "{}: no home directory to locate ~/Library/LaunchAgents",
+            unit.name
+        )
+    })?;
+    restart_launchd_job(
+        &SystemLaunchctl,
+        &format!("gui/{}", crate::scribe_inbox_install::users_uid()),
+        &unit.name,
+        &launchd_plist_path(&home, &unit.name),
+        &unit.exec_path,
+    )
+    .await
+}
+
+/// Where the installers (`hs serve <svc> --install`, `hs scribe inbox
+/// install`) write a label's plist.
+#[cfg(target_os = "macos")]
+fn launchd_plist_path(home: &Path, label: &str) -> PathBuf {
+    home.join("Library/LaunchAgents")
+        .join(format!("{label}.plist"))
+}
+
+/// Exit of one `launchctl` / `ps` invocation.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchctlExit {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl LaunchctlExit {
+    fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+/// The commands [`restart_launchd_job`] issues, so the sequencing can be
+/// driven without a launchd.
+#[cfg(any(target_os = "macos", test))]
+trait LaunchdRunner {
+    /// Run `launchctl <args>`. `Err` is "could not run at all".
+    async fn launchctl(&self, args: &[&str]) -> Result<LaunchctlExit, String>;
+    /// Executable path of a running process.
+    async fn exe_of(&self, pid: u32) -> Result<PathBuf, String>;
+    async fn sleep(&self, duration: std::time::Duration);
+}
+
+#[cfg(target_os = "macos")]
+struct SystemLaunchctl;
+
+#[cfg(target_os = "macos")]
+impl LaunchdRunner for SystemLaunchctl {
+    async fn launchctl(&self, args: &[&str]) -> Result<LaunchctlExit, String> {
+        let output = tokio::process::Command::new("launchctl")
+            .args(args)
+            .output()
+            .await
+            .map_err(|e| format!("`launchctl {}` could not run: {e}", args.join(" ")))?;
+        Ok(LaunchctlExit {
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    /// `ps -o comm=` prints a darwin process's full executable path.
+    async fn exe_of(&self, pid: u32) -> Result<PathBuf, String> {
+        let output = tokio::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .await
+            .map_err(|e| format!("`ps -p {pid}` could not run: {e}"))?;
+        let comm = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() || comm.is_empty() {
+            return Err(format!("`ps -o comm= -p {pid}` found no process"));
+        }
+        Ok(PathBuf::from(comm))
+    }
+
+    async fn sleep(&self, duration: std::time::Duration) {
+        tokio::time::sleep(duration).await;
+    }
+}
+
+/// `launchctl bootout` of a job that is not loaded: exit 3 (`No such
+/// process`) or 113 (`Could not find service`). That is "was not running",
+/// not a failure.
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHCTL_NOT_LOADED: [i32; 2] = [3, 113];
+/// `launchctl bootstrap` exit 5 (`Input/output error`): launchd has not
+/// finished tearing down the job just booted out (BACKLOG P1-25). Transient.
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHCTL_IO_ERROR: i32 = 5;
+#[cfg(any(target_os = "macos", test))]
+const BOOTSTRAP_ATTEMPTS: u32 = 5;
+#[cfg(any(target_os = "macos", test))]
+const BOOTSTRAP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a bootstrapped launchd job is given to get a pid. launchd
+/// respawns a KeepAlive job on its own schedule (ThrottleInterval, and a
+/// respawn that dies on its first attempt — e.g. NATS not yet reachable — is
+/// retried), so the first instant after `bootstrap` is not judged.
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_RESPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Consecutive polls a pid may show the wrong executable before that is a
+/// failure (a fresh process reports its path a moment after it exists).
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_EXE_SETTLE_POLLS: u32 = 6;
+
+/// bootout → bootstrap (retrying the transient I/O error) → wait for a pid →
+/// require that pid to be running `expected`, the installed binary.
+#[cfg(any(target_os = "macos", test))]
+async fn restart_launchd_job<R: LaunchdRunner>(
+    runner: &R,
+    domain: &str,
+    label: &str,
+    plist: &Path,
+    expected: &Path,
+) -> Result<(), String> {
+    let target = format!("{domain}/{label}");
+    let plist_arg = plist
+        .to_str()
+        .ok_or_else(|| format!("{label}: plist path {} is not valid UTF-8", plist.display()))?;
+
+    let out = runner
+        .launchctl(&["bootout", &target])
         .await
-        .map_err(|e| format!("{}: launchctl kickstart could not run: {e}", unit.name))?;
-    if !output.status.success() {
+        .map_err(|e| format!("{label}: {e}"))?;
+    if !out.success() && !out.code.is_some_and(|c| LAUNCHCTL_NOT_LOADED.contains(&c)) {
         return Err(format!(
-            "{}: `launchctl kickstart -k {target}` exited {:?}: {}",
-            unit.name,
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{label}: `launchctl bootout {target}` exited {:?}: {}",
+            out.code,
+            out.stderr.trim()
         ));
     }
 
-    // launchd respawns a KeepAlive job on its own schedule (ThrottleInterval,
-    // and a respawn that dies on its first attempt — e.g. NATS not yet
-    // reachable — is retried): wait for a pid instead of judging the first
-    // instant after `kickstart`.
-    let deadline = tokio::time::Instant::now() + LAUNCHD_RESPAWN_TIMEOUT;
+    let mut attempt = 1;
     loop {
-        if launchd_pid(&unit.name).await.is_some() {
-            return Ok(());
+        let out = runner
+            .launchctl(&["bootstrap", domain, plist_arg])
+            .await
+            .map_err(|e| format!("{label}: {e}"))?;
+        if out.success() {
+            break;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if out.code == Some(LAUNCHCTL_IO_ERROR) && attempt < BOOTSTRAP_ATTEMPTS {
+            attempt += 1;
+            runner.sleep(BOOTSTRAP_RETRY_INTERVAL).await;
+            continue;
+        }
+        return Err(format!(
+            "{label}: `launchctl bootstrap {domain} {}` exited {:?} after {attempt} attempt(s): {}",
+            plist.display(),
+            out.code,
+            out.stderr.trim()
+        ));
+    }
+
+    let expected_exe = canonical_or(expected);
+    let polls = (LAUNCHD_RESPAWN_TIMEOUT.as_millis() / LAUNCHD_POLL_INTERVAL.as_millis()) as u32;
+    let mut with_pid = 0;
+    for poll in 0..polls {
+        if poll > 0 {
+            runner.sleep(LAUNCHD_POLL_INTERVAL).await;
+        }
+        let Some(pid) = launchd_pid(runner, &target).await else {
+            with_pid = 0;
+            continue;
+        };
+        with_pid += 1;
+        let seen = match runner.exe_of(pid).await {
+            Ok(exe) if canonical_or(&exe) == expected_exe => return Ok(()),
+            Ok(exe) => exe.display().to_string(),
+            Err(e) => e,
+        };
+        if with_pid >= LAUNCHD_EXE_SETTLE_POLLS {
             return Err(format!(
-                "{}: still not running the new binary after restart (no pid after {}s)",
-                unit.name,
-                LAUNCHD_RESPAWN_TIMEOUT.as_secs()
+                "{label}: still not running the new binary after restart (pid {pid} runs {seen}, \
+                 installed binary is {})",
+                expected_exe.display()
             ));
         }
-        tokio::time::sleep(LAUNCHD_POLL_INTERVAL).await;
     }
+    Err(format!(
+        "{label}: still not running the new binary after restart (no pid after {}s)",
+        LAUNCHD_RESPAWN_TIMEOUT.as_secs()
+    ))
 }
 
-/// How long a kickstarted launchd job is given to get a pid.
-#[cfg(target_os = "macos")]
-const LAUNCHD_RESPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
-#[cfg(target_os = "macos")]
-const LAUNCHD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-
-#[cfg(target_os = "macos")]
-fn launchd_target(label: &str) -> String {
-    format!("gui/{}/{}", crate::scribe_inbox_install::users_uid(), label)
-}
-
-#[cfg(target_os = "macos")]
-async fn launchd_pid(label: &str) -> Option<u32> {
-    let output = tokio::process::Command::new("launchctl")
-        .args(["print", &launchd_target(label)])
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
+/// The job's pid, `None` while launchd has not started it.
+#[cfg(any(target_os = "macos", test))]
+async fn launchd_pid<R: LaunchdRunner>(runner: &R, target: &str) -> Option<u32> {
+    let out = runner.launchctl(&["print", target]).await.ok()?;
+    if !out.success() {
         return None;
     }
-    parse_launchd_print_pid(&String::from_utf8_lossy(&output.stdout))
+    parse_launchd_print_pid(&out.stdout)
 }
 
 // ── Pure helpers ───────────────────────────────────────────────
@@ -1288,6 +1437,203 @@ mod tests {
 
         let garbled = launchd_jobs(listed, |_| Ok("<plist></plist>".to_string())).unwrap_err();
         assert!(format!("{garbled:#}").contains("com.home-still.scribe"));
+    }
+
+    // ── launchd restart: bootout → bootstrap → pid → executable ─
+
+    const DOMAIN: &str = "gui/501";
+    const LABEL: &str = "com.home-still.scribe";
+    const PLIST: &str = "/Users/u/Library/LaunchAgents/com.home-still.scribe.plist";
+    const INSTALLED: &str = "/Users/u/.local/bin/hs";
+
+    /// A scripted launchd: each list is consumed in order and its last entry
+    /// repeats.
+    struct FakeLaunchd {
+        bootout: i32,
+        bootstrap: Vec<i32>,
+        pids: Vec<Option<u32>>,
+        exes: Vec<Result<&'static str, &'static str>>,
+        calls: std::cell::RefCell<Vec<String>>,
+        sleeps: std::cell::Cell<u32>,
+        prints: std::cell::Cell<usize>,
+        exe_reads: std::cell::Cell<usize>,
+    }
+
+    impl FakeLaunchd {
+        fn new(
+            bootout: i32,
+            bootstrap: &[i32],
+            pids: &[Option<u32>],
+            exes: &[Result<&'static str, &'static str>],
+        ) -> Self {
+            Self {
+                bootout,
+                bootstrap: bootstrap.to_vec(),
+                pids: pids.to_vec(),
+                exes: exes.to_vec(),
+                calls: Default::default(),
+                sleeps: Default::default(),
+                prints: Default::default(),
+                exe_reads: Default::default(),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+
+        fn bootstraps(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|c| c.starts_with("bootstrap"))
+                .count()
+        }
+
+        fn exit(code: i32, stdout: String) -> LaunchctlExit {
+            LaunchctlExit {
+                code: Some(code),
+                stdout,
+                stderr: format!("launchctl said {code}"),
+            }
+        }
+    }
+
+    fn nth<T: Clone>(items: &[T], n: usize) -> T {
+        items[n.min(items.len() - 1)].clone()
+    }
+
+    impl LaunchdRunner for FakeLaunchd {
+        async fn launchctl(&self, args: &[&str]) -> Result<LaunchctlExit, String> {
+            self.calls.borrow_mut().push(args.join(" "));
+            Ok(match args[0] {
+                "bootout" => Self::exit(self.bootout, String::new()),
+                "bootstrap" => {
+                    let n = self
+                        .calls()
+                        .iter()
+                        .filter(|c| c.starts_with("bootstrap"))
+                        .count();
+                    Self::exit(nth(&self.bootstrap, n - 1), String::new())
+                }
+                "print" => {
+                    let n = self.prints.get();
+                    self.prints.set(n + 1);
+                    match nth(&self.pids, n) {
+                        Some(pid) => Self::exit(0, format!("state = running\n\tpid = {pid}\n")),
+                        None => Self::exit(0, "state = waiting\n".to_string()),
+                    }
+                }
+                other => panic!("unexpected launchctl {other}"),
+            })
+        }
+
+        async fn exe_of(&self, _pid: u32) -> Result<PathBuf, String> {
+            let n = self.exe_reads.get();
+            self.exe_reads.set(n + 1);
+            nth(&self.exes, n)
+                .map(PathBuf::from)
+                .map_err(str::to_string)
+        }
+
+        async fn sleep(&self, _duration: std::time::Duration) {
+            self.sleeps.set(self.sleeps.get() + 1);
+        }
+    }
+
+    async fn restart(fake: &FakeLaunchd) -> Result<(), String> {
+        restart_launchd_job(fake, DOMAIN, LABEL, Path::new(PLIST), Path::new(INSTALLED)).await
+    }
+
+    #[tokio::test]
+    async fn a_job_is_booted_out_and_bootstrapped_from_its_plist() {
+        let fake = FakeLaunchd::new(0, &[0], &[Some(4242)], &[Ok(INSTALLED)]);
+        restart(&fake).await.unwrap();
+        assert_eq!(
+            fake.calls(),
+            [
+                format!("bootout {DOMAIN}/{LABEL}"),
+                format!("bootstrap {DOMAIN} {PLIST}"),
+                format!("print {DOMAIN}/{LABEL}"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_transient_bootstrap_io_error_is_retried_until_it_succeeds() {
+        let fake = FakeLaunchd::new(0, &[5, 5, 0], &[Some(4242)], &[Ok(INSTALLED)]);
+        restart(&fake).await.unwrap();
+        assert_eq!(fake.bootstraps(), 3);
+        assert_eq!(fake.sleeps.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_persistent_bootstrap_io_error_fails_after_five_attempts() {
+        let fake = FakeLaunchd::new(0, &[5], &[Some(4242)], &[Ok(INSTALLED)]);
+        let err = restart(&fake).await.unwrap_err();
+        assert_eq!(fake.bootstraps(), 5);
+        assert!(
+            err.contains("bootstrap") && err.contains("5 attempt") && err.contains(PLIST),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_other_bootstrap_failure_is_not_retried() {
+        let fake = FakeLaunchd::new(0, &[1], &[Some(4242)], &[Ok(INSTALLED)]);
+        let err = restart(&fake).await.unwrap_err();
+        assert_eq!(fake.bootstraps(), 1);
+        assert!(err.contains("exited Some(1)"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn bootout_of_a_job_that_was_not_loaded_is_not_a_failure() {
+        for code in [3, 113] {
+            let fake = FakeLaunchd::new(code, &[0], &[Some(4242)], &[Ok(INSTALLED)]);
+            restart(&fake).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bootout_failure_stops_before_bootstrap() {
+        let fake = FakeLaunchd::new(1, &[0], &[Some(4242)], &[Ok(INSTALLED)]);
+        let err = restart(&fake).await.unwrap_err();
+        assert_eq!(fake.bootstraps(), 0);
+        assert!(err.contains("bootout"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_pid_that_appears_after_respawns_is_waited_for() {
+        let fake = FakeLaunchd::new(0, &[0], &[None, None, None, Some(4242)], &[Ok(INSTALLED)]);
+        restart(&fake).await.unwrap();
+        assert_eq!(fake.sleeps.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_job_that_never_gets_a_pid_fails() {
+        let fake = FakeLaunchd::new(0, &[0], &[None], &[Ok(INSTALLED)]);
+        let err = restart(&fake).await.unwrap_err();
+        assert!(err.contains("no pid after 45s"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_pid_running_another_binary_names_both_paths() {
+        let fake = FakeLaunchd::new(0, &[0], &[Some(4242)], &[Ok("/Users/u/old/bin/hs")]);
+        let err = restart(&fake).await.unwrap_err();
+        assert!(
+            err.contains("/Users/u/old/bin/hs") && err.contains(INSTALLED),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_executable_that_is_only_briefly_unreadable_is_waited_for() {
+        let fake = FakeLaunchd::new(
+            0,
+            &[0],
+            &[Some(4242)],
+            &[Err("no such process"), Ok(INSTALLED)],
+        );
+        restart(&fake).await.unwrap();
     }
 
     // ── RA-66: compose exit status is the verdict ─────────────

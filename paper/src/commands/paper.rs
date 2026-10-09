@@ -184,12 +184,11 @@ pub async fn run_download(
             ));
         }
     } else if let Some(query_str) = query {
-        // For aggregate search, show a counted progress bar; for single provider, a spinner
-        let search_total = if matches!(provider, ProviderArg::All) {
-            Some(6u64)
-        } else {
-            None
-        };
+        // For aggregate search, show a counted progress bar over the members
+        // the aggregate really fans out to; for one provider, a spinner.
+        // Own aggregate (for the progress callback) over the shared members.
+        let aggregate = matches!(provider, ProviderArg::All).then(|| providers.aggregate());
+        let search_total = aggregate.as_ref().map(|a| a.provider_count() as u64);
         let search_stage: Arc<Box<dyn hs_common::reporter::StageHandle>> =
             Arc::new(reporter.begin_counted_stage("Searching", search_total));
         search_stage.set_message(&format!("for '{}'", query_str));
@@ -200,11 +199,9 @@ pub async fn run_download(
             search_stage_cb.inc(1);
         });
 
-        let provider_impl: Arc<dyn PaperProvider> = if matches!(provider, ProviderArg::All) {
-            // Own aggregate (for the progress callback) over the shared members.
-            Arc::new(providers.aggregate().on_provider_done(on_provider_done))
-        } else {
-            providers.provider(&provider)
+        let provider_impl: Arc<dyn PaperProvider> = match aggregate {
+            Some(aggregate) => Arc::new(aggregate.on_provider_done(on_provider_done)),
+            None => providers.provider(&provider),
         };
 
         let date_filter = parse_date_arg(date)?;

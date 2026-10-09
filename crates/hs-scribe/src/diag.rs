@@ -62,20 +62,20 @@ pub struct PageDiagRecord {
     /// mode — Phase 2 wires the verdict into the routing path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column_split_shadow: Option<ColumnSplitShadow>,
-    /// Number of regions on this page where the streaming repetition
-    /// detector aborted the VLM call mid-stream. Each aborted region
-    /// surfaces as an empty placeholder in the assembled markdown — the
-    /// page continues, the doc continues. Tracking the count lets
-    /// post-mortems gauge how often the detector fires per page and
-    /// per corpus without re-running OCR. Zero on pages where every
-    /// region completed cleanly.
+    /// Number of regions (text regions and table cells) on this page where
+    /// the streaming repetition detector aborted the VLM call mid-stream.
+    /// Each aborted region surfaces as an empty placeholder in the
+    /// assembled markdown. Every one is also counted in `skipped_regions`;
+    /// this field keeps the abort rate readable on its own for post-mortems
+    /// without re-running OCR. Zero on pages where every region completed
+    /// cleanly.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub repetition_aborted_regions: u32,
-    /// Regions the pipeline had to leave out of this page's markdown
-    /// because they could not be processed (0-dim crop after clamping,
-    /// JPEG encode failure) — as opposed to `repetition_aborted_regions`,
-    /// which the repetition detector dropped on purpose. Any non-zero
-    /// value makes the QC gate refuse the conversion.
+    /// Regions the pipeline left out of this page's markdown: ones that
+    /// could not be processed (0-dim crop after clamping, JPEG encode
+    /// failure) plus those the repetition detector aborted
+    /// (`repetition_aborted_regions`). Any non-zero value makes the QC gate
+    /// refuse the conversion as gapped.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub skipped_regions: u32,
 }
@@ -130,6 +130,17 @@ pub struct TruncationCounts {
 impl TruncationCounts {
     pub fn total(&self) -> usize {
         self.char + self.ngram4 + self.ngram2 + self.ngram1
+    }
+}
+
+impl std::iter::Sum for TruncationCounts {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |acc, t| Self {
+            char: acc.char + t.char,
+            ngram4: acc.ngram4 + t.ngram4,
+            ngram2: acc.ngram2 + t.ngram2,
+            ngram1: acc.ngram1 + t.ngram1,
+        })
     }
 }
 
@@ -274,6 +285,38 @@ mod tests {
             ngram1: 4,
         };
         assert_eq!(c.total(), 10);
+    }
+
+    #[test]
+    fn truncation_counts_sum_adds_each_pass() {
+        let pages = [
+            TruncationCounts {
+                char: 1,
+                ngram4: 2,
+                ngram2: 3,
+                ngram1: 4,
+            },
+            TruncationCounts {
+                char: 10,
+                ngram4: 20,
+                ngram2: 30,
+                ngram1: 40,
+            },
+        ];
+        let sum: TruncationCounts = pages.iter().copied().sum();
+        assert_eq!(
+            sum,
+            TruncationCounts {
+                char: 11,
+                ngram4: 22,
+                ngram2: 33,
+                ngram1: 44,
+            }
+        );
+        assert_eq!(
+            std::iter::empty::<TruncationCounts>().sum::<TruncationCounts>(),
+            TruncationCounts::default()
+        );
     }
 
     #[test]

@@ -18,7 +18,8 @@ pub use config::{EventBusConfig, EventsBackend};
 /// ack handle: the subscriber MUST call exactly one of [`Event::ack`],
 /// [`Event::nak`], or [`Event::term`] before dropping it. Dropping an
 /// un-acked event lets the server redeliver it after `ack_wait` — fine as
-/// a crash-recovery mechanism, not as a normal flow.
+/// a crash-recovery mechanism, not as a normal flow. A handler that runs
+/// longer than `ack_wait` keeps the event alive with [`Event::in_progress`].
 pub struct Event {
     pub subject: String,
     pub payload: Vec<u8>,
@@ -42,6 +43,9 @@ pub enum Settlement {
     Ack,
     Nak(Option<Duration>),
     Term,
+    /// A heartbeat ([`Event::in_progress`]): not a settlement, the event is
+    /// still owed exactly one of the others.
+    InProgress,
 }
 
 /// Read-back side of [`Event::recording`].
@@ -147,6 +151,67 @@ impl Event {
                 .await
                 .map_err(|e| anyhow::anyhow!("jetstream term: {e}")),
         }
+    }
+
+    /// Tell the broker this event is still being worked on, which resets its
+    /// `ack_wait` timer. A handler that runs longer than `ack_wait` calls
+    /// this periodically (see [`with_progress_heartbeat`]) so the broker
+    /// does not redeliver an event whose first delivery is still running.
+    /// Not a settlement: the event still needs exactly one ack/nak/term.
+    /// On the inert (noop) handle there is no broker and nothing to reset,
+    /// so it is a no-op by definition.
+    pub async fn in_progress(&self) -> anyhow::Result<()> {
+        match &self.handle {
+            AckHandle::None => Ok(()),
+            AckHandle::Recording(log) => {
+                Self::record(log, Settlement::InProgress);
+                Ok(())
+            }
+            #[cfg(feature = "events-nats")]
+            AckHandle::JetStream(m) => m
+                .ack_with(async_nats::jetstream::AckKind::Progress)
+                .await
+                .map_err(|e| anyhow::anyhow!("jetstream in-progress: {e}")),
+        }
+    }
+}
+
+/// How often a running handler reports progress: a third of `ack_wait`, so
+/// two consecutive heartbeats can be lost before the broker reclaims the
+/// event.
+pub fn progress_interval(ack_wait: Duration) -> Duration {
+    ack_wait / 3
+}
+
+/// Drive `handler` to completion while sending [`Event::in_progress`] for
+/// `event` every `interval` (first one after one full `interval`, so a
+/// handler that finishes sooner sends nothing). A failed heartbeat is logged
+/// at WARN and never fails the handler. The heartbeat is a branch of this
+/// future, not a spawned task: it stops the moment the handler completes,
+/// panics out, or this future is dropped.
+pub async fn with_progress_heartbeat<T>(
+    event: &Event,
+    interval: Duration,
+    handler: impl Future<Output = T>,
+) -> T {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let heartbeat = async {
+        loop {
+            ticker.tick().await;
+            if let Err(e) = event.in_progress().await {
+                tracing::warn!(
+                    subject = %event.subject,
+                    error = %e,
+                    "in-progress heartbeat failed; the broker may redeliver this event"
+                );
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        out = handler => out,
+        () = heartbeat => unreachable!("the heartbeat loop never ends"),
     }
 }
 
@@ -421,11 +486,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inert_event_ack_nak_term_are_noops() {
+    async fn inert_event_ack_nak_term_in_progress_are_noops() {
         let ev = Event::inert("x", b"y".to_vec());
+        ev.in_progress().await.unwrap();
         ev.ack().await.unwrap();
         ev.nak(Some(Duration::from_secs(1))).await.unwrap();
         ev.term().await.unwrap();
+    }
+
+    #[test]
+    fn the_heartbeat_interval_is_a_third_of_ack_wait() {
+        assert_eq!(
+            progress_interval(Duration::from_secs(7200)),
+            Duration::from_secs(2400)
+        );
+        assert_eq!(
+            progress_interval(Duration::from_secs(30)),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handler_that_outlives_the_interval_sends_heartbeats_until_it_finishes() {
+        let (ev, log) = Event::recording("x", b"y".to_vec());
+        let out = with_progress_heartbeat(&ev, Duration::from_millis(40), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            7
+        })
+        .await;
+        assert_eq!(out, 7, "the handler's result passes through");
+        let sent = log.decisions().len();
+        assert!(sent >= 1, "a slow handler must send a heartbeat");
+        assert!(
+            log.decisions().iter().all(|d| *d == Settlement::InProgress),
+            "a heartbeat is not a settlement"
+        );
+        // No ticker survives the handler.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(log.decisions().len(), sent, "no heartbeat after completion");
+    }
+
+    #[tokio::test]
+    async fn a_handler_that_finishes_before_the_first_tick_sends_nothing() {
+        let (ev, log) = Event::recording("x", b"y".to_vec());
+        with_progress_heartbeat(&ev, Duration::from_secs(60), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        })
+        .await;
+        assert!(log.decisions().is_empty());
     }
 
     /// A bus that records publishes, handed out by the lazy connect function.

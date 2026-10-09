@@ -552,11 +552,12 @@ pub(crate) async fn cmd_watch_events(
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage()?;
     let bus = cfg.build_event_bus().await?;
-    let drain_timeout = cfg
+    let events_cfg = cfg
         .events
         .as_ref()
-        .context("events section (checked by build_event_bus)")?
-        .drain_timeout();
+        .context("events section (checked by build_event_bus)")?;
+    let drain_timeout = events_cfg.drain_timeout();
+    let ack_wait = events_cfg.ack_wait();
 
     let server_url = match server_override {
         Some(s) => s,
@@ -581,6 +582,7 @@ pub(crate) async fn cmd_watch_events(
         storage.clone(),
         concurrency,
         drain_timeout,
+        ack_wait,
         move |event| {
             let storage = storage_for_handler.clone();
             let bus = bus_for_handler.clone();

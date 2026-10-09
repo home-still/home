@@ -234,14 +234,41 @@ impl ConfigFile {
                 format!("`{key}` is empty (omit it to use the default)"),
             ));
         }
-        if value == "~" {
-            return Ok(self.home.clone());
-        }
-        Ok(match value.strip_prefix("~/") {
-            Some(rest) => self.home.join(rest),
-            None => PathBuf::from(value),
-        })
+        expand_home_path(key, value, || Ok(self.home.clone()))
+            .map_err(|reason| ConfigError::section(&self.path, "home", reason))
     }
+}
+
+/// Expand a leading `~` (`~`, `~/…`, and on Windows `~\…`) to the home
+/// directory and require the result to be absolute: a relative directory
+/// would resolve against whatever the process's working directory happens to
+/// be. `home` is only consulted when the value starts with `~`. Pure over
+/// its inputs; the error is a complete message naming `key` and `value`.
+pub fn expand_home_path(
+    key: &str,
+    value: &str,
+    home: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
+    let tilde_rest = if value == "~" {
+        Some("")
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        Some(rest)
+    } else if cfg!(windows) {
+        value.strip_prefix("~\\")
+    } else {
+        None
+    };
+    let path = match tilde_rest {
+        Some("") => home()?,
+        Some(rest) => home()?.join(rest),
+        None => PathBuf::from(value),
+    };
+    if !path.is_absolute() {
+        return Err(format!(
+            "`{key}` is `{value}`, which is not an absolute path; use an absolute path or `~/...`"
+        ));
+    }
+    Ok(path)
 }
 
 fn parse_root(path: &Path, text: &str) -> Result<Mapping, ConfigError> {
@@ -624,6 +651,16 @@ mod tests {
         home
     }
 
+    /// `path` made absolute on every platform: `/x` has no drive on Windows,
+    /// where it is relative.
+    fn abs(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
     #[test]
     fn an_absent_file_gives_the_documented_defaults() {
         let home = home_with(None);
@@ -647,12 +684,13 @@ mod tests {
         assert_eq!(file.project_dir().unwrap(), home.path().join("home-still"));
         assert_eq!(file.log_dir().unwrap(), home.path().join("elsewhere"));
 
-        let home = home_with(Some(
-            "# comment\nhome:\n  project_dir: '/mnt/project'   # inline comment\n  log_dir: /var/log/hs\n",
-        ));
+        let (project, logs) = (abs("/mnt/project"), abs("/var/log/hs"));
+        let home = home_with(Some(&format!(
+            "# comment\nhome:\n  project_dir: '{project}'   # inline comment\n  log_dir: {logs}\n"
+        )));
         let file = ConfigFile::load_in(home.path()).unwrap();
-        assert_eq!(file.project_dir().unwrap(), PathBuf::from("/mnt/project"));
-        assert_eq!(file.log_dir().unwrap(), PathBuf::from("/var/log/hs"));
+        assert_eq!(file.project_dir().unwrap(), PathBuf::from(project));
+        assert_eq!(file.log_dir().unwrap(), PathBuf::from(logs));
     }
 
     #[test]
@@ -667,6 +705,63 @@ mod tests {
         let home = home_with(Some("other:\n  project_dir: /wrong\n"));
         let file = ConfigFile::load_in(home.path()).unwrap();
         assert_eq!(file.project_dir().unwrap(), home.path().join("home-still"));
+    }
+
+    #[test]
+    fn expand_home_path_requires_an_absolute_result() {
+        let home = || Ok(PathBuf::from(abs("/home/u")));
+        assert_eq!(
+            expand_home_path("k", "~/x", home).unwrap(),
+            PathBuf::from(abs("/home/u")).join("x")
+        );
+        assert_eq!(
+            expand_home_path("k", "~", home).unwrap(),
+            PathBuf::from(abs("/home/u"))
+        );
+        assert_eq!(
+            expand_home_path("k", &abs("/abs"), || Err("never asked".into())).unwrap(),
+            PathBuf::from(abs("/abs"))
+        );
+        for bad in ["data", "./data", "~user/x", "~x"] {
+            let err = expand_home_path("home.log_dir", bad, home).unwrap_err();
+            assert!(
+                err.contains("`home.log_dir`") && err.contains(bad) && err.contains("absolute"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_and_unc_paths_are_absolute_and_drive_relative_ones_are_not() {
+        let never = || Err("never asked".to_string());
+        for ok in [r"C:\data\hs", r"\\host\share\hs"] {
+            assert_eq!(expand_home_path("k", ok, never).unwrap(), PathBuf::from(ok));
+        }
+        for bad in [r"\data", "C:data"] {
+            assert!(expand_home_path("k", bad, never).is_err(), "{bad}");
+        }
+        assert_eq!(
+            expand_home_path("k", r"~\x", || Ok(PathBuf::from(r"C:\Users\u"))).unwrap(),
+            PathBuf::from(r"C:\Users\u\x")
+        );
+    }
+
+    #[test]
+    fn relative_home_dirs_are_config_errors() {
+        for key in ["project_dir", "log_dir"] {
+            let home = home_with(Some(format!("home:\n  {key}: relative/dir\n").as_str()));
+            let file = ConfigFile::load_in(home.path()).unwrap();
+            let err = if key == "project_dir" {
+                file.project_dir().unwrap_err().to_string()
+            } else {
+                file.log_dir().unwrap_err().to_string()
+            };
+            assert!(
+                err.contains(&format!("home.{key}")) && err.contains("relative/dir"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -884,21 +979,19 @@ mod tests {
 
         #[test]
         fn the_loader_refuses_a_moved_project_dir_and_accepts_an_explicit_storage() {
-            let home = home_with(Some("home:\n  project_dir: /data/hs\n"));
+            let data = abs("/data/hs");
+            let home = home_with(Some(&format!("home:\n  project_dir: {data}\n")));
             let file = ConfigFile::load_in(home.path()).unwrap();
             let err = file.storage().unwrap_err().to_string();
-            assert!(
-                err.contains("/data/hs") && err.contains("`storage`"),
-                "{err}"
-            );
+            assert!(err.contains(&data) && err.contains("`storage`"), "{err}");
 
-            let home = home_with(Some(
-                "home:\n  project_dir: /data/hs\nstorage:\n  backend: local\n  local:\n    root: /data/hs\n",
-            ));
+            let home = home_with(Some(&format!(
+                "home:\n  project_dir: {data}\nstorage:\n  backend: local\n  local:\n    root: {data}\n"
+            )));
             let file = ConfigFile::load_in(home.path()).unwrap();
             assert_eq!(
                 file.storage().unwrap().local.root,
-                std::path::PathBuf::from("/data/hs")
+                std::path::PathBuf::from(data)
             );
         }
 

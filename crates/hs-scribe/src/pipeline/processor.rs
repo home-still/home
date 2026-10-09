@@ -1208,9 +1208,10 @@ async fn execute_vlm_for_page(
 
     let total_regions = text_regions.len();
     let region_done = Arc::new(AtomicU64::new(0));
-    // Counter for streaming-detector aborts. Threaded into the diag
-    // record so post-mortems can gauge per-page and per-corpus abort
-    // rates without re-running OCR.
+    // Counter for streaming-detector aborts (text regions and table cells).
+    // Threaded into the diag record both as `repetition_aborted_regions` (so
+    // post-mortems can gauge abort rates without re-running OCR) and into
+    // `skipped_regions`, which is what the QC gate reads.
     let aborted_count = Arc::new(AtomicU64::new(0));
 
     on_progress(ProgressEvent {
@@ -1231,8 +1232,10 @@ async fn execute_vlm_for_page(
     //   streaming OCR backend mid-generation): the region's output is a
     //   degenerate cycle that the VLM was about to spam to max_tokens.
     //   Treat as a per-region drop, NOT a page failure. The page assembles
-    //   markdown from the surviving regions; the doc continues. Increment
-    //   `aborted_count` so the per-page diag records the abort.
+    //   markdown from the surviving regions and the doc continues, but the
+    //   region is a hole in the markdown: `aborted_count` is counted as a
+    //   skipped region so QC rejects the conversion as gapped and the tier
+    //   chain escalates.
     //
     // - **Other VLM errors** (transport, server 5xx, semaphore closed):
     //   propagate as page-fatal via `?`. Silent fallthrough on these is
@@ -1278,7 +1281,8 @@ async fn execute_vlm_for_page(
                                 reason = %loop_err.reason,
                                 bytes_at_abort = loop_err.bytes_at_abort,
                                 "streaming repetition detector aborted region; \
-                                 dropping from page output (paper continues)"
+                                 dropping it from the page, the conversion will be \
+                                 rejected as gapped"
                             );
                             aborted_count.fetch_add(1, Ordering::Relaxed);
                             drop(permit);
@@ -1305,7 +1309,6 @@ async fn execute_vlm_for_page(
         .buffer_unordered(region_parallel)
         .try_collect()
         .await?;
-    let aborted_count = aborted_count.load(Ordering::Relaxed) as u32;
 
     let mut regions: Vec<(BBox, String)> = region_results;
 
@@ -1329,23 +1332,22 @@ async fn execute_vlm_for_page(
         // PATH). Table cells are different: each cell is a single-image
         // VLM call whose output (often "0.5", "<.001", "Mean (SD)") is
         // pathologically prone to tripping the streaming repetition
-        // detector. The detector firing on a 4-gram cycle ≥3 times is
-        // easy on tabular numerics — and aborting an entire 30-page
-        // paper because one cell on one page emitted "0.5 0.5 0.5 0.5"
-        // is a worse outcome than emitting an empty cell.
+        // detector, and one cell that loops must not discard the whole
+        // table or paper.
         //
         // So: a single cell's `RepetitionLoopError` degrades to an empty
-        // cell, the rest of the table is preserved, and the paper
-        // continues. This is NOT a generic "swallow VLM errors" path —
-        // only the repetition-loop class downgrades; transport errors
-        // and other failures still fail the conversion. The text-region
-        // path remains strict.
+        // cell and the rest of the table is preserved — but the empty cell
+        // is a hole, so it is counted as an aborted (skipped) region and QC
+        // rejects the conversion as gapped. This is NOT a generic "swallow
+        // VLM errors" path — only the repetition-loop class downgrades;
+        // transport errors and other failures still fail the conversion.
         let cell_texts: Vec<String> = stream::iter(table.cell_jpegs)
             .map(|jpeg| {
                 let ocr = Arc::clone(&ocr);
                 let sem = Arc::clone(&sem);
                 let on_progress = Arc::clone(&on_progress);
                 let cell_done = Arc::clone(&cell_done);
+                let aborted_count = Arc::clone(&aborted_count);
                 async move {
                     if jpeg.is_empty() {
                         cell_done.fetch_add(1, Ordering::Relaxed);
@@ -1355,24 +1357,25 @@ async fn execute_vlm_for_page(
                         .acquire()
                         .await
                         .map_err(|e| anyhow::anyhow!("VLM semaphore closed mid-table: {e}"))?;
-                    let text = match ocr
-                        .recognize_region(&jpeg, RegionType::Text)
-                        .await
-                    {
+                    let text = match ocr.recognize_region(&jpeg, RegionType::Text).await {
                         Ok(t) => t,
                         Err(e) => {
-                            if e.downcast_ref::<crate::ocr::RepetitionLoopError>().is_some() {
+                            if e.downcast_ref::<crate::ocr::RepetitionLoopError>()
+                                .is_some()
+                            {
                                 tracing::warn!(
                                     page = page_num,
                                     error = %e,
-                                    "table cell VLM repetition loop — emitting empty cell (table and paper continue)"
+                                    "table cell VLM repetition loop — emitting empty cell; \
+                                     the conversion will be rejected as gapped"
                                 );
+                                aborted_count.fetch_add(1, Ordering::Relaxed);
                                 cell_done.fetch_add(1, Ordering::Relaxed);
                                 return Ok(String::new());
                             }
-                            return Err(e.context(format!(
-                                "table cell VLM failed on page {page_num}"
-                            )));
+                            return Err(
+                                e.context(format!("table cell VLM failed on page {page_num}"))
+                            );
                         }
                     };
                     drop(permit);
@@ -1393,6 +1396,8 @@ async fn execute_vlm_for_page(
         let html = build_html_from_structure(&table.structure, &cell_texts);
         regions.push((table.bbox, html));
     }
+
+    let aborted_count = aborted_count.load(Ordering::Relaxed) as u32;
 
     // Re-sort by detection order
     let order_map: std::collections::HashMap<usize, usize> = detection_order
@@ -1436,7 +1441,7 @@ async fn execute_vlm_for_page(
         wall_clock_ms: started.elapsed().as_millis() as u64,
         column_split_shadow,
         repetition_aborted_regions: aborted_count,
-        skipped_regions,
+        skipped_regions: skipped_regions + aborted_count,
     };
     Ok((page_idx, markdown, region_classes, diag))
 }
@@ -1755,6 +1760,102 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(result.skipped_regions(), 2);
+    }
+
+    /// A page whose only VLM-bound content is `text_regions` / `table_regions`,
+    /// served by a VLM that answers every request with a degenerate loop the
+    /// streaming detector aborts.
+    async fn page_through_a_looping_vlm(
+        text_regions: Vec<PreparedRegion>,
+        table_regions: Vec<PreparedTable>,
+    ) -> (String, crate::diag::PageDiagRecord) {
+        let looped = "and relationship ".repeat(40);
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": looped}}]})
+        );
+        let url = fake_vlm(sse_reply("200 OK", &body)).await;
+        let config = AppConfig {
+            backend: crate::config::BackendChoice::OpenAi,
+            openai_url: url,
+            ..AppConfig::default()
+        };
+        let ocr = Arc::new(OcrEngine::from_config(&config).unwrap());
+        let prepared = PreparedPage {
+            page_idx: 0,
+            region_classes: vec![],
+            image_width: 10,
+            image_height: 10,
+            detection_order: vec![0],
+            text_regions,
+            table_regions,
+            column_split_shadow: None,
+            skipped_regions: 0,
+        };
+        let (_, markdown, _, diag) = execute_vlm_for_page(
+            prepared,
+            ocr,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            1,
+            Arc::new(|_| {}),
+            1,
+            1,
+            200,
+        )
+        .await
+        .unwrap();
+        (markdown, diag)
+    }
+
+    fn gapped_verdict(diag: crate::diag::PageDiagRecord) -> crate::postprocess::QcVerdict {
+        let result = crate::client::ConversionResult {
+            per_page_diags: vec![diag],
+            ..Default::default()
+        };
+        crate::postprocess::qc_verdict(
+            &[crate::diag::TruncationCounts::default()],
+            &[false],
+            0,
+            result.skipped_regions(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_region_the_repetition_detector_aborted_makes_the_verdict_gapped() {
+        let region = PreparedRegion {
+            bbox: bbox(0.0, 0.0, 8.0, 8.0),
+            region_type: RegionType::Text,
+            jpeg_bytes: vec![1, 2, 3],
+        };
+        let (markdown, diag) = page_through_a_looping_vlm(vec![region], vec![]).await;
+        assert_eq!(markdown.trim(), "");
+        assert_eq!(diag.repetition_aborted_regions, 1);
+        assert_eq!(diag.skipped_regions, 1);
+        assert_eq!(
+            gapped_verdict(diag),
+            crate::postprocess::QcVerdict::RejectGapped
+        );
+    }
+
+    #[tokio::test]
+    async fn a_table_cell_the_repetition_detector_aborted_makes_the_verdict_gapped() {
+        let table = PreparedTable {
+            bbox: bbox(0.0, 0.0, 8.0, 8.0),
+            structure: TableStructure {
+                tokens: vec!["<tr>".into(), "<td></td>".into(), "</tr>".into()],
+                cells: vec![],
+                confidence: 0.9,
+            },
+            cell_jpegs: vec![vec![1, 2, 3]],
+        };
+        let (markdown, diag) = page_through_a_looping_vlm(vec![], vec![table]).await;
+        assert!(markdown.contains("<td></td>"), "{markdown}");
+        assert_eq!(diag.repetition_aborted_regions, 1);
+        assert_eq!(diag.skipped_regions, 1);
+        assert_eq!(
+            gapped_verdict(diag),
+            crate::postprocess::QcVerdict::RejectGapped
+        );
     }
 
     const POOL_CHILD_ENV: &str = "HS_SCRIBE_POOL_FAULT_CHILD";

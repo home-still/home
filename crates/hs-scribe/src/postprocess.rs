@@ -356,8 +356,11 @@ impl<'a> WordWindow<'a> {
 /// [`hs_common::catalog::compute_page_offsets`] uses, so the returned
 /// per-page counts correspond 1:1 with the offset entries downstream.
 ///
-/// Invariant: the sum of `.total()` across the returned vec equals
-/// `clean_repetitions(text).1.total()` for the same input.
+/// Each page is cleaned (and gated by `QC_LOOP_RUN_FLOOR`) on its own, so the
+/// returned vec holds, per page, exactly what `clean_repetitions(page)`
+/// reports. A document-wide `clean_repetitions(text)` gates on the longest
+/// run anywhere in the document and is NOT the sum of these: once one page
+/// loops it would also rewrite and count the benign runs on every other page.
 pub fn clean_repetitions_per_page(text: &str) -> (String, Vec<crate::diag::TruncationCounts>) {
     const SEPARATOR: &str = "\n\n---\n\n";
     let mut cleaned_pages: Vec<String> = Vec::new();
@@ -372,9 +375,18 @@ pub fn clean_repetitions_per_page(text: &str) -> (String, Vec<crate::diag::Trunc
 
 /// Clean repetition artifacts from markdown text.
 ///
+/// The cleaners only run on text whose longest repeated run reaches
+/// `QC_LOOP_RUN_FLOOR` — the same floor below which `qc_verdict` sees no loop.
+/// Shorter runs are benign structure (11+ space indentation, wide table rules,
+/// dot leaders, `| - | - |` rows) and the text is returned byte-for-byte with
+/// a zero breakdown.
+///
 /// Returns `(cleaned_text, breakdown)` where `breakdown` is the per-pass
 /// truncation count. Total truncations = `breakdown.total()`.
 pub fn clean_repetitions(text: &str) -> (String, crate::diag::TruncationCounts) {
+    if longest_repeated_run_bytes(text) < QC_LOOP_RUN_FLOOR {
+        return (text.to_string(), crate::diag::TruncationCounts::default());
+    }
     let mut result = text.to_string();
     let mut breakdown = crate::diag::TruncationCounts::default();
 
@@ -508,8 +520,8 @@ mod tests {
 
     #[test]
     fn char_repetition_truncated() {
-        let input = "hello ggggggggggggggggggg world";
-        let (output, count) = clean_repetitions(input);
+        let input = format!("hello {} world", "g".repeat(200));
+        let (output, count) = clean_repetitions(&input);
         assert_eq!(output, "hello g world");
         assert_eq!(count.total(), 1);
         assert_eq!(count.char, 1);
@@ -517,9 +529,8 @@ mod tests {
 
     #[test]
     fn ngram_repetition_truncated() {
-        let input =
-            "and modeling and modeling and modeling and modeling and modeling and modeling done";
-        let (output, count) = clean_repetitions(input);
+        let input = format!("intro {}done", "and modeling ".repeat(12));
+        let (output, count) = clean_repetitions(&input);
         assert!(output.contains("and modeling"));
         assert!(!output.contains("and modeling and modeling and modeling and modeling"));
         assert!(output.ends_with("done"));
@@ -545,9 +556,10 @@ mod tests {
 
     #[test]
     fn bigram_repetition_truncated() {
-        let input = "J J J J J J J J J J J J J J done";
-        let (output, count) = clean_repetitions(input);
-        assert!(output.contains("J J"));
+        let input = format!("{}done", "J ".repeat(70));
+        let (output, count) = clean_repetitions(&input);
+        assert!(output.starts_with('J'));
+        assert!(output.len() < 20, "run should be collapsed: {output}");
         assert!(output.ends_with("done"));
         assert!(count.total() > 0);
     }
@@ -562,8 +574,11 @@ mod tests {
 
     #[test]
     fn mixed_repetitions() {
-        let input = "eseseseseseseseseseseseseses and the model the model the model the model the model the model end";
-        let (output, count) = clean_repetitions(input);
+        let input = format!(
+            "eseseseseseseseseseseseseses and {}end",
+            "the model ".repeat(14)
+        );
+        let (output, count) = clean_repetitions(&input);
         assert!(count.total() >= 1); // "the model" bigram repetition is caught
         assert!(output.contains("end"));
         assert!(!output.contains("the model the model the model the model the model"));
@@ -575,8 +590,8 @@ mod tests {
         // "Bywaters, Pover, P, P, P, P, P, Featherstone, B".
         // The `P,` unigram repeats — 2-gram and 4-gram passes miss it
         // because the surrounding tokens differ.
-        let input = "Bywaters, Pover, P, P, P, P, P, P, P, P, Featherstone, B";
-        let (output, count) = clean_repetitions(input);
+        let input = format!("Bywaters, Pover, {}Featherstone, B", "P, ".repeat(50));
+        let (output, count) = clean_repetitions(&input);
         assert!(count.total() > 0, "expected at least one truncation");
         assert!(
             !output.contains("P, P, P, P, P, P"),
@@ -589,8 +604,8 @@ mod tests {
     fn mixed_token_period_run_truncated() {
         // From a real VLM loop on a WASH paper: "s. s. s. . . . .".
         // Two unigrams alternate: `s.` and `.`. Each is a unigram run.
-        let input = "sample s. s. s. s. s. s. s. s. . . . . . . end";
-        let (output, _count) = clean_repetitions(input);
+        let input = format!("sample {}and {}end", "s. ".repeat(50), ". ".repeat(40));
+        let (output, _count) = clean_repetitions(&input);
         assert!(
             !output.contains("s. s. s. s. s. s."),
             "`s.` unigram run should be collapsed: {output}"
@@ -600,6 +615,39 @@ mod tests {
             "`.` unigram run should be collapsed: {output}"
         );
         assert!(output.contains("end"));
+    }
+
+    #[test]
+    fn benign_runs_below_loop_floor_are_stored_verbatim() {
+        // 11+ space code indentation, a wide table rule, a `| - | - |` row,
+        // dot leaders and a symbol run: all repeat, none is a loop.
+        let input = [
+            "            indented_call(argument)",
+            "|--------------------------------------|",
+            "| - | - | - | - | - | - | - | - | - | - |",
+            "Chapter One ........................ 5",
+            "* * * * * * * * * * * *",
+        ]
+        .join("\n");
+        assert!(longest_repeated_run_bytes(&input) < QC_LOOP_RUN_FLOOR);
+        let (output, count) = clean_repetitions(&input);
+        assert_eq!(output, input);
+        assert_eq!(count.total(), 0);
+    }
+
+    #[test]
+    fn only_pages_that_reach_the_loop_floor_are_cleaned() {
+        let benign =
+            "            indented_call(argument)\n|--------------------------------------|";
+        let looped = format!("start {} end", "g".repeat(200));
+        let doc = [benign, looped.as_str(), benign].join("\n\n---\n\n");
+        let (cleaned, per_page) = clean_repetitions_per_page(&doc);
+        let expected = [benign, "start g end", benign].join("\n\n---\n\n");
+        assert_eq!(cleaned, expected);
+        assert_eq!(
+            per_page.iter().map(|t| t.total()).collect::<Vec<_>>(),
+            vec![0, 1, 0]
+        );
     }
 
     fn pages_with(truncations: &[TruncationCounts]) -> Vec<bool> {
@@ -755,20 +803,25 @@ mod tests {
     }
 
     #[test]
-    fn clean_repetitions_per_page_invariant_sum() {
-        // Sum of per-page counts must equal the doc-wide count.
+    fn clean_repetitions_per_page_counts_each_page_on_its_own() {
         let pages = [
             "clean text".to_string(),
-            "P, P, P, P, P, P repeat".to_string(),
-            "the retrieval of ".repeat(50),
-            "more clean text".to_string(),
+            format!("start {}end", "P, ".repeat(60)),
+            format!("{}\nsecond line", "g".repeat(200)),
+            "            indented_call(argument)".to_string(),
         ];
         let joined = pages.join("\n\n---\n\n");
-        let (_, doc_total) = clean_repetitions(&joined);
         let (_, per_page) = clean_repetitions_per_page(&joined);
-        let per_page_sum: usize = per_page.iter().map(|t| t.total()).sum();
         assert_eq!(per_page.len(), 4);
-        assert_eq!(per_page_sum, doc_total.total());
+        for (page, counts) in pages.iter().zip(&per_page) {
+            assert_eq!(*counts, clean_repetitions(page).1);
+        }
+        assert!(per_page[1].total() > 0 && per_page[2].total() > 0);
+        assert_eq!(per_page[3].total(), 0, "benign page must not be counted");
+        // Document-wide cleaning is not the sum: once the document has a
+        // loop it also rewrites the benign page's indentation.
+        let per_page_sum: usize = per_page.iter().map(|t| t.total()).sum();
+        assert!(clean_repetitions(&joined).1.total() > per_page_sum);
     }
 
     #[test]

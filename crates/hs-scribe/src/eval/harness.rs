@@ -45,7 +45,8 @@ pub struct EvalResults {
     pub avg_ned: f64,
     pub avg_bleu: f64,
     pub avg_composite: f64,
-    pub official_overall: f64,
+    /// `None` unless text, TEDS and CDM each have at least one scored page.
+    pub official_overall: Option<f64>,
     pub pages: Vec<PageResult>,
 }
 
@@ -304,35 +305,30 @@ pub async fn run_eval(
         .iter()
         .filter_map(|p| p.composite.text_score)
         .collect();
-    let avg_text_score = if text_pages.is_empty() {
-        0.0
-    } else {
-        text_pages.iter().sum::<f64>() / text_pages.len() as f64
-    };
     let teds_pages: Vec<f64> = pages
         .iter()
         .filter_map(|p| p.composite.teds_score)
         .collect();
-    let avg_teds = if teds_pages.is_empty() {
-        0.0
-    } else {
-        teds_pages.iter().sum::<f64>() / teds_pages.len() as f64
-    };
     let cdm_pages: Vec<f64> = pages.iter().filter_map(|p| p.composite.cdm_score).collect();
-    let avg_cdm = if cdm_pages.is_empty() {
-        0.0
-    } else {
-        cdm_pages.iter().sum::<f64>() / cdm_pages.len() as f64
-    };
-    let official_overall = (avg_text_score + avg_teds + avg_cdm) / 3.0;
+    let avg_text_score = mean(&text_pages);
+    let avg_teds = mean(&teds_pages);
+    let avg_cdm = mean(&cdm_pages);
+    let official_overall = official_overall_score(avg_text_score, avg_teds, avg_cdm);
 
     if num_failures > 0 {
         eprintln!("WARNING: {num_failures}/{num_samples} samples failed and were scored as zero");
     }
 
+    let show = |avg: Option<f64>| avg.map_or("n/a".to_string(), |v| format!("{v:.2}"));
     eprintln!(
-        "Official v1.5 breakdown: text={:.2} ({} pages) + TEDS={:.2} ({} pages) + CDM={:.2} ({} pages) = Overall {:.2}",
-        avg_text_score, text_pages.len(), avg_teds, teds_pages.len(), avg_cdm, cdm_pages.len(), official_overall
+        "Official v1.5 breakdown: text={} ({} pages) + TEDS={} ({} pages) + CDM={} ({} pages) = Overall {}",
+        show(avg_text_score),
+        text_pages.len(),
+        show(avg_teds),
+        teds_pages.len(),
+        show(avg_cdm),
+        cdm_pages.len(),
+        show(official_overall)
     );
 
     Ok(EvalResults {
@@ -348,6 +344,19 @@ pub async fn run_eval(
     })
 }
 
+/// Mean of the scores, `None` when there are none.
+fn mean(scores: &[f64]) -> Option<f64> {
+    (!scores.is_empty()).then(|| scores.iter().sum::<f64>() / scores.len() as f64)
+}
+
+/// The official v1.5 overall: the mean of the text, TEDS and CDM averages.
+/// Defined only when all three categories have pages — a missing category is
+/// not a score of zero, and dividing by 3 anyway would report a partial
+/// dataset's overall as if it were comparable to a full one.
+fn official_overall_score(text: Option<f64>, teds: Option<f64>, cdm: Option<f64>) -> Option<f64> {
+    Some((text? + teds? + cdm?) / 3.0)
+}
+
 fn get_git_commit() -> String {
     std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -356,4 +365,28 @@ fn get_git_commit() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn official_overall_needs_all_three_categories() {
+        assert_eq!(
+            official_overall_score(Some(90.0), Some(60.0), Some(30.0)),
+            Some(60.0)
+        );
+        // A dataset without formulas is not "text + TEDS + 0" over 3.
+        assert_eq!(official_overall_score(Some(90.0), Some(60.0), None), None);
+        assert_eq!(official_overall_score(None, Some(60.0), Some(30.0)), None);
+        assert_eq!(official_overall_score(Some(90.0), None, Some(30.0)), None);
+        assert_eq!(official_overall_score(None, None, None), None);
+    }
+
+    #[test]
+    fn a_category_with_no_pages_has_no_mean() {
+        assert_eq!(mean(&[]), None);
+        assert_eq!(mean(&[10.0, 20.0]), Some(15.0));
+    }
 }

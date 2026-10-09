@@ -8,6 +8,11 @@ pub enum PersonalError {
     #[error("duplicate document (stem '{0}' already exists); rerun with --force to replace")]
     DuplicateStem(String),
 
+    #[error(
+        "duplicate content (already ingested as stem '{0}'); rerun with --force to replace it"
+    )]
+    DuplicateContent(String),
+
     #[error("converter error ({format}): {source}")]
     Converter {
         format: &'static str,

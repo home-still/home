@@ -380,11 +380,12 @@ pub(crate) async fn cmd_watch_events(
     let cfg = ScribeConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage()?;
     let bus = cfg.build_event_bus().await?;
-    let drain_timeout = cfg
+    let events_cfg = cfg
         .events
         .as_ref()
-        .context("events section (checked by build_event_bus)")?
-        .drain_timeout();
+        .context("events section (checked by build_event_bus)")?;
+    let drain_timeout = events_cfg.drain_timeout();
+    let ack_wait = events_cfg.ack_wait();
 
     let convert_timeout = std::time::Duration::from_secs(cfg.convert_timeout_secs);
     // Resolve the converter servers. CLI `--server` override collapses to a
@@ -465,7 +466,7 @@ pub(crate) async fn cmd_watch_events(
     // single event is pulled (and so before any delivery is burned).
     let server_urls: Vec<String> = labelled_servers.iter().map(|(u, _, _)| u.clone()).collect();
     hs_scribe::event_watch::preflight_token(&server_urls, convert_timeout).await?;
-    run_subscriber(bus.clone(), storage.clone(), concurrency, drain_timeout, move |event| {
+    run_subscriber(bus.clone(), storage.clone(), concurrency, drain_timeout, ack_wait, move |event| {
         let storage = storage_for_handler.clone();
         let bus = bus_for_handler.clone();
         let tiers = tiers.clone();

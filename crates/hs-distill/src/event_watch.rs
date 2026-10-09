@@ -305,12 +305,16 @@ async fn termination_signal() {
 
 /// Pull-consume `scribe.completed` and dispatch each event to
 /// `handler`. See the parallel scribe `run_subscriber` for ack policy.
+/// While a handler runs, the event is kept alive with an in-progress
+/// heartbeat every `ack_wait / 3` (the shared
+/// `hs_common::event_bus::with_progress_heartbeat`).
 /// Returns `Ok(())` only on an orderly stop (SIGTERM / ctrl-c).
 pub async fn run_subscriber<F, Fut>(
     bus: Arc<dyn EventBus>,
     storage: Arc<dyn Storage>,
     concurrency: usize,
     drain_timeout: std::time::Duration,
+    ack_wait: std::time::Duration,
     handler: F,
 ) -> Result<()>
 where
@@ -322,6 +326,7 @@ where
         storage,
         concurrency,
         drain_timeout,
+        ack_wait,
         handler,
         termination_signal(),
     )
@@ -341,6 +346,7 @@ pub async fn run_subscriber_until<F, Fut>(
     _storage: Arc<dyn Storage>,
     concurrency: usize,
     drain_timeout: std::time::Duration,
+    ack_wait: std::time::Duration,
     handler: F,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()>
@@ -350,6 +356,7 @@ where
 {
     tokio::pin!(shutdown);
     let mut stream = bus.consume(&specs::SCRIBE_COMPLETED).await?;
+    let progress = hs_common::event_bus::progress_interval(ack_wait);
     let concurrency = concurrency.max(1);
     tracing::info!(
         concurrency,
@@ -427,29 +434,36 @@ where
             let _tracked = tracked;
             let key = parsed.key.clone();
             tracing::info!(key = %key, "distill received completed event");
+            // The heartbeat keeps the broker from redelivering the event
+            // while the handler runs (`with_progress_heartbeat`); it ends
+            // with the handler.
+            //
             // A handler that panics terminates its event: a panic is a bug
             // this input triggers, redelivery would hit it again (up to
             // `max_deliver` times, each `ack_wait` apart), and without the
             // guard the event sat un-acked until `ack_wait` expired. The
             // guard wraps the call too, so a panic before the handler's
             // first await is caught as well.
-            let result =
-                match hs_common::panic_guard::catch_panic(async move { handler(parsed).await })
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(panic) => {
-                        tracing::error!(
-                            key = %key,
-                            panic = %panic,
-                            "distill handler PANICKED — terminating this event (will not redeliver)"
-                        );
-                        if let Err(e) = event.term().await {
-                            tracing::warn!(key = %key, error = %e, "term after panic failed");
-                        }
-                        return;
+            let result = match hs_common::event_bus::with_progress_heartbeat(
+                &event,
+                progress,
+                hs_common::panic_guard::catch_panic(async move { handler(parsed).await }),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(panic) => {
+                    tracing::error!(
+                        key = %key,
+                        panic = %panic,
+                        "distill handler PANICKED — terminating this event (will not redeliver)"
+                    );
+                    if let Err(e) = event.term().await {
+                        tracing::warn!(key = %key, error = %e, "term after panic failed");
                     }
-                };
+                    return;
+                }
+            };
             match result {
                 Ok(()) => {
                     if let Err(e) = event.ack().await {
@@ -810,18 +824,25 @@ mod tests {
         let seen2 = seen.clone();
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run_subscriber(bus, storage, 1, Duration::from_secs(30), move |_| {
-                let seen = seen2.clone();
-                async move {
-                    seen.fetch_add(1, Ordering::SeqCst);
-                    Err(HandlerError::Fatal(anyhow::Error::new(
-                        crate::client::Unauthorized {
-                            status: reqwest::StatusCode::UNAUTHORIZED,
-                            body: String::new(),
-                        },
-                    )))
-                }
-            }),
+            run_subscriber(
+                bus,
+                storage,
+                1,
+                Duration::from_secs(30),
+                ACK_WAIT,
+                move |_| {
+                    let seen = seen2.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        Err(HandlerError::Fatal(anyhow::Error::new(
+                            crate::client::Unauthorized {
+                                status: reqwest::StatusCode::UNAUTHORIZED,
+                                body: String::new(),
+                            },
+                        )))
+                    }
+                },
+            ),
         )
         .await
         .expect("must not hang");
@@ -1005,6 +1026,10 @@ mod tests {
         )
     }
 
+    /// `events.nats.ack_wait_secs` default: heartbeats never fire in tests
+    /// that do not ask for them.
+    const ACK_WAIT: Duration = Duration::from_secs(7200);
+
     async fn subscribe(
         events: Vec<Event>,
         concurrency: usize,
@@ -1019,6 +1044,7 @@ mod tests {
             storage,
             concurrency,
             Duration::from_secs(30),
+            ACK_WAIT,
             move |e| {
                 let seen = seen_in_handler.clone();
                 async move {
@@ -1070,14 +1096,21 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in_handler = seen.clone();
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
-        let err = run_subscriber(bus, storage, 2, Duration::from_secs(30), move |e| {
-            let seen = seen_in_handler.clone();
-            async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                seen.lock().push(e.key);
-                Ok(())
-            }
-        })
+        let err = run_subscriber(
+            bus,
+            storage,
+            2,
+            Duration::from_secs(30),
+            ACK_WAIT,
+            move |e| {
+                let seen = seen_in_handler.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    seen.lock().push(e.key);
+                    Ok(())
+                }
+            },
+        )
         .await
         .expect_err("a delivery error must fail the subscriber");
         let shown = format!("{err:#}");
@@ -1102,16 +1135,23 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         // Concurrency 1: the permit the panicking task held must be released
         // or the event after it would never be dispatched.
-        let result = run_subscriber(bus, storage, 1, Duration::from_secs(30), move |e| {
-            let seen = seen_in_handler.clone();
-            async move {
-                if e.key == "poison" {
-                    panic!("chunker exploded on {}", e.key);
+        let result = run_subscriber(
+            bus,
+            storage,
+            1,
+            Duration::from_secs(30),
+            ACK_WAIT,
+            move |e| {
+                let seen = seen_in_handler.clone();
+                async move {
+                    if e.key == "poison" {
+                        panic!("chunker exploded on {}", e.key);
+                    }
+                    seen.lock().push(e.key);
+                    Ok(())
                 }
-                seen.lock().push(e.key);
-                Ok(())
-            }
-        })
+            },
+        )
         .await;
         assert!(result
             .unwrap_err()
@@ -1142,6 +1182,7 @@ mod tests {
             storage,
             2,
             Duration::from_millis(300),
+            ACK_WAIT,
             move |e| async move {
                 if e.key == "stuck" {
                     std::future::pending::<()>().await;
@@ -1166,6 +1207,41 @@ mod tests {
         assert!(stuck_log.decisions().is_empty());
     }
 
+    /// With an `ack_wait` of 150 ms the heartbeat interval is 50 ms.
+    #[tokio::test]
+    async fn a_slow_handler_is_kept_alive_with_heartbeats_and_a_fast_one_sends_none() {
+        let bus = Arc::new(FakeBus::default());
+        let (slow, slow_log) = Event::recording("scribe.completed", br#"{"key":"slow"}"#.to_vec());
+        let (fast, fast_log) = Event::recording("scribe.completed", br#"{"key":"fast"}"#.to_vec());
+        *bus.events.lock() = vec![slow, fast];
+        *bus.then_fail.lock() = Some("stream closed".into());
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
+        let _ = run_subscriber(
+            bus,
+            storage,
+            2,
+            Duration::from_secs(30),
+            Duration::from_millis(150),
+            move |e| async move {
+                if e.key == "slow" {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                Ok(())
+            },
+        )
+        .await;
+        let slow = slow_log.decisions();
+        assert_eq!(slow.last(), Some(&Settlement::Ack), "{slow:?}");
+        assert!(
+            slow[..slow.len() - 1]
+                .iter()
+                .all(|d| *d == Settlement::InProgress)
+                && slow.len() >= 2,
+            "a handler longer than the interval sends >= 1 heartbeat before its ack: {slow:?}"
+        );
+        assert_eq!(fast_log.decisions(), [Settlement::Ack]);
+    }
+
     // ── R4: unstarted events go back to the broker ─────────────────────
 
     use hs_common::event_bus::Settlement;
@@ -1188,6 +1264,7 @@ mod tests {
             storage,
             1,
             Duration::from_millis(200),
+            ACK_WAIT,
             move |e| {
                 let started = started2.clone();
                 async move {
@@ -1241,9 +1318,14 @@ mod tests {
         let (ea, log_a) = Event::recording("scribe.completed", br#"{"key":"a"}"#.to_vec());
         *bus.events.lock() = vec![ea];
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
-        let r = run_subscriber(bus, storage, 1, Duration::from_secs(5), |_| async {
-            Err(HandlerError::Fatal(anyhow::anyhow!("rejected")))
-        })
+        let r = run_subscriber(
+            bus,
+            storage,
+            1,
+            Duration::from_secs(5),
+            ACK_WAIT,
+            |_| async { Err(HandlerError::Fatal(anyhow::anyhow!("rejected"))) },
+        )
         .await;
         assert!(r.is_err());
         assert_eq!(log_a.decisions(), [Settlement::Nak(Some(NAK_BACKOFF))]);

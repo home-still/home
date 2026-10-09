@@ -396,7 +396,9 @@ struct PersonalAddParams {
     category: Option<String>,
     #[schemars(description = "Override the LLM-picked title.")]
     title: Option<String>,
-    #[schemars(description = "If true, replace an existing document with the same stem.")]
+    #[schemars(
+        description = "If true, replace an existing document with the same stem or the same file content."
+    )]
     #[serde(default)]
     force: bool,
 }
@@ -1129,7 +1131,7 @@ impl HomeStillMcp {
     // ── Paper Tools ────────────────────────────────────────────
 
     #[tool(
-        description = "Search academic papers across 6 providers (arXiv, OpenAlex, Semantic Scholar, Europe PMC, CrossRef, CORE). Returns a JSON object {\"papers\": [...], \"provider_failures\": [...]}: papers with title, authors, abstract, DOI, citations; provider_failures names each provider that failed (empty when all answered). If every provider fails the call is an error.",
+        description = "Search academic papers across arXiv, OpenAlex, Semantic Scholar, Europe PMC, CrossRef and (with an API key) CORE. Returns a JSON object {\"papers\": [...], \"provider_failures\": [...]}: papers with title, authors, abstract, DOI, citations; provider_failures names each provider that failed (empty when all answered). If every provider fails the call is an error.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1411,10 +1413,14 @@ impl HomeStillMcp {
         )
     )]
     async fn catalog_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
-        let mut triples =
-            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
-                .await
-                .map_err(|e| format!("catalog list failed: {e:#}"))?;
+        let mut triples = hs_common::catalog::list_catalog_entries_parallel(
+            &*self.storage,
+            &self.catalog_prefix,
+            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
+            |_, _| {},
+        )
+        .await
+        .map_err(|e| format!("catalog list failed: {e:#}"))?;
         // Stable ordering by stem for deterministic pagination.
         triples.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -1482,10 +1488,14 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<CatalogRecentParams>,
     ) -> Result<String, String> {
-        let triples =
-            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
-                .await
-                .map_err(|e| format!("catalog list failed: {e:#}"))?;
+        let triples = hs_common::catalog::list_catalog_entries_parallel(
+            &*self.storage,
+            &self.catalog_prefix,
+            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
+            |_, _| {},
+        )
+        .await
+        .map_err(|e| format!("catalog list failed: {e:#}"))?;
 
         let include_repaired = p.include_repaired.unwrap_or(false);
 
@@ -2046,10 +2056,14 @@ impl HomeStillMcp {
         // Runs longer than the session idle timeout can tolerate without a
         // progress signal; see `ProgressHeartbeat`.
         let _heartbeat = ProgressHeartbeat::start(&context, "catalog_backfill_title".to_string());
-        let triples =
-            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
-                .await
-                .map_err(|e| format!("catalog list failed: {e:#}"))?;
+        let triples = hs_common::catalog::list_catalog_entries_parallel(
+            &*self.storage,
+            &self.catalog_prefix,
+            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
+            |_, _| {},
+        )
+        .await
+        .map_err(|e| format!("catalog list failed: {e:#}"))?;
 
         // Candidates: row has a DOI and title is missing/empty.
         let candidates: Vec<(String, hs_common::catalog::CatalogEntry)> = triples
@@ -2515,9 +2529,14 @@ impl HomeStillMcp {
                 }
             };
             // CPU-bound over a whole document: off the async worker threads,
-            // so a large scan cannot starve every other session.
+            // so a large scan cannot starve every other session. Cleaned per
+            // page, exactly as the scribe QC gate does: a page whose longest
+            // repeated run is below the loop floor is benign structure and
+            // contributes no truncations.
             let (original, cleaned, breakdown) = tokio::task::spawn_blocking(move || {
-                let (cleaned, breakdown) = hs_scribe::postprocess::clean_repetitions(&original);
+                let (cleaned, per_page) =
+                    hs_scribe::postprocess::clean_repetitions_per_page(&original);
+                let breakdown: hs_scribe::diag::TruncationCounts = per_page.iter().copied().sum();
                 (original, cleaned, breakdown)
             })
             .await
@@ -2604,10 +2623,14 @@ impl HomeStillMcp {
         // Runs longer than the session idle timeout can tolerate without a
         // progress signal; see `ProgressHeartbeat`.
         let _heartbeat = ProgressHeartbeat::start(&context, "distill_backfill".to_string());
-        let triples =
-            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
-                .await
-                .map_err(|e| format!("catalog list failed: {e:#}"))?;
+        let triples = hs_common::catalog::list_catalog_entries_parallel(
+            &*self.storage,
+            &self.catalog_prefix,
+            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
+            |_, _| {},
+        )
+        .await
+        .map_err(|e| format!("catalog list failed: {e:#}"))?;
 
         let candidates: Vec<String> = triples
             .into_iter()
@@ -3301,15 +3324,18 @@ impl HomeStillMcp {
 
         // Scan the catalog once; reuse for both the pipeline failed-count
         // and the history panel so we don't pay to deserialize every YAML twice.
-        let (catalog_triples, catalog_error) = match hs_common::catalog::list_catalog_entries_via(
-            &*self.storage,
-            &self.catalog_prefix,
-        )
-        .await
-        {
-            Ok(triples) => (Some(triples), None),
-            Err(e) => (None, Some(format!("listing the catalog failed: {e:#}"))),
-        };
+        let (catalog_triples, catalog_error) =
+            match hs_common::catalog::list_catalog_entries_parallel(
+                &*self.storage,
+                &self.catalog_prefix,
+                hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
+                |_, _| {},
+            )
+            .await
+            {
+                Ok(triples) => (Some(triples), None),
+                Err(e) => (None, Some(format!("listing the catalog failed: {e:#}"))),
+            };
 
         // Count entries stamped `embedding_skip` so progress percentages
         // can exclude intentionally-skipped docs from the denominator.
@@ -3636,12 +3662,14 @@ impl ServerHandler for HomeStillMcp {
         let mut resources = Vec::new();
 
         // Catalog entries via Storage
-        let triples =
-            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
-                .await
-                .map_err(|e| {
-                    ErrorData::internal_error(format!("catalog list failed: {e:#}"), None)
-                })?;
+        let triples = hs_common::catalog::list_catalog_entries_parallel(
+            &*self.storage,
+            &self.catalog_prefix,
+            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
+            |_, _| {},
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("catalog list failed: {e:#}"), None))?;
         for (stem, _meta, cat) in triples {
             let title = cat.title.unwrap_or_else(|| stem.clone());
             resources.push(

@@ -460,26 +460,91 @@ pub fn convert_html_to_markdown(
 }
 
 fn markdown_of(doc: &Html) -> String {
-    let Some(root) = article_root(doc) else {
+    let roots = article_roots(doc);
+    if roots.is_empty() {
         return doc.root_element().text().collect::<Vec<_>>().join(" ");
-    };
+    }
     let mut md = String::new();
-    walk_html_node(&root, &mut md);
+    for root in &roots {
+        walk_html_node(root, &mut md);
+        md.push_str("\n\n");
+    }
     clean_blank_lines(&md)
 }
 
-/// The element holding the article body: the first match of the selectors
+/// The elements holding the article body. A document with `<article>`s is
+/// converted from every outermost one that is not itself inside dropped
+/// content (a sidebar's teaser), in document order; a nested `<article>` is
+/// part of the one around it. Without any, the first match of the selectors
 /// below, most specific first.
-fn article_root(doc: &Html) -> Option<ElementRef<'_>> {
-    let body_selectors = ["article", "main", "#article-body", ".article-body", "body"];
+fn article_roots(doc: &Html) -> Vec<ElementRef<'_>> {
+    let articles = top_level_articles(doc);
+    if !articles.is_empty() {
+        return articles;
+    }
+    let body_selectors = ["main", "#article-body", ".article-body", "body"];
     for sel_str in &body_selectors {
         if let Ok(sel) = Selector::parse(sel_str) {
             if let Some(el) = doc.select(&sel).next() {
-                return Some(el);
+                return vec![el];
             }
         }
     }
-    None
+    Vec::new()
+}
+
+/// Every outermost `<article>` the walk would reach, in document order: one
+/// iterative pass with the walker's own notion of dropped content.
+fn top_level_articles(doc: &Html) -> Vec<ElementRef<'_>> {
+    let mut articles = Vec::new();
+    let mut dropped: Option<NodeId> = None;
+    let mut open_article: Option<NodeId> = None;
+    let mut sectioning = 0usize;
+    for edge in doc.root_element().traverse() {
+        match edge {
+            Edge::Open(node) => {
+                if dropped.is_some() {
+                    continue;
+                }
+                match node.value() {
+                    Node::Fragment => dropped = Some(node.id()),
+                    Node::Element(el) => {
+                        if is_dropped(el, sectioning > 0) {
+                            dropped = Some(node.id());
+                            continue;
+                        }
+                        if is_sectioning(el.name()) {
+                            sectioning += 1;
+                        }
+                        if el.name() == "article" && open_article.is_none() {
+                            if let Some(article) = ElementRef::wrap(node) {
+                                articles.push(article);
+                                open_article = Some(node.id());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Edge::Close(node) => {
+                if let Some(id) = dropped {
+                    if node.id() == id {
+                        dropped = None;
+                    }
+                    continue;
+                }
+                if let Node::Element(el) = node.value() {
+                    if is_sectioning(el.name()) {
+                        sectioning = sectioning.saturating_sub(1);
+                    }
+                    if open_article == Some(node.id()) {
+                        open_article = None;
+                    }
+                }
+            }
+        }
+    }
+    articles
 }
 
 /// At most two consecutive blank lines, no leading or trailing whitespace.
@@ -562,10 +627,13 @@ fn wrap(tag: &str) -> Option<(&'static str, &'static str)> {
 /// Elements whose whole subtree is dropped. `header` and `footer` are page
 /// chrome only outside sectioning content: inside an `<article>`,
 /// `<main>` or `<section>` they are that section's own title block, which
-/// is the document.
-fn is_dropped(tag: &str, in_sectioning: bool) -> bool {
-    match tag {
-        "script" | "style" | "nav" | "aside" | "noscript" | "link" | "meta" => true,
+/// is the document. An `<aside>` is a sidebar unless it carries an
+/// `epub:type` (EPUB 3 footnotes, endnotes and the like), in which case it
+/// is content.
+fn is_dropped(el: &Element, in_sectioning: bool) -> bool {
+    match el.name() {
+        "script" | "style" | "nav" | "noscript" | "link" | "meta" => true,
+        "aside" => el.attr("epub:type").is_none(),
         "header" | "footer" => !in_sectioning,
         _ => false,
     }
@@ -638,7 +706,7 @@ fn walk_html_node(element: &ElementRef, md: &mut String) {
                     Node::Fragment => dropped = Some(node.id()),
                     Node::Element(el) => {
                         let tag = el.name();
-                        if is_dropped(tag, sectioning > 0) {
+                        if is_dropped(el, sectioning > 0) {
                             dropped = Some(node.id());
                             continue;
                         }
@@ -850,6 +918,44 @@ mod tests {
         assert!(md.contains("the paper") && !md.contains("menu"), "{md}");
     }
 
+    #[test]
+    fn every_top_level_article_is_converted_in_document_order() {
+        let html = r#"<html><body>
+            <div>site menu</div>
+            <article><h1>First</h1><p>alpha</p>
+              <article><p>nested part</p></article></article>
+            <div>between chrome</div>
+            <article><h1>Second</h1><p>omega</p></article>
+            <aside><article><p>teaser from the sidebar</p></article></aside>
+            </body></html>"#;
+        let md = md(html);
+        let at = |needle: &str| {
+            md.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {md}"))
+        };
+        assert!(at("# First") < at("alpha"));
+        assert!(at("alpha") < at("nested part"));
+        assert!(at("nested part") < at("# Second"));
+        assert!(at("# Second") < at("omega"));
+        assert_eq!(md.matches("nested part").count(), 1, "{md}");
+        for chrome in ["site menu", "between chrome", "teaser from the sidebar"] {
+            assert!(!md.contains(chrome), "{chrome} leaked into {md}");
+        }
+    }
+
+    #[test]
+    fn an_aside_with_epub_type_is_content_and_other_asides_are_dropped() {
+        let html = r##"<html><body><article>
+            <p>Body text<a href="#n1">1</a></p>
+            <aside epub:type="footnote" id="n1"><p>Footnote one</p></aside>
+            <aside class="sidebar"><p>Related links</p></aside>
+            </article></body></html>"##;
+        let md = md(html);
+        assert!(md.contains("Body text"), "{md}");
+        assert!(md.contains("Footnote one"), "{md}");
+        assert!(!md.contains("Related links"), "{md}");
+    }
+
     // ── the walker and the bounded parser against scraper's own ─────
 
     /// The walker as it was before it became iterative (plus the context it
@@ -867,7 +973,7 @@ mod tests {
                 Node::Element(el) => {
                     let tag = el.name();
                     if let Some(child_ref) = ElementRef::wrap(child) {
-                        if is_dropped(tag, sectioning) {
+                        if is_dropped(el, sectioning) {
                             continue;
                         }
                         let inner = sectioning || is_sectioning(tag);
@@ -899,11 +1005,15 @@ mod tests {
 
     fn oracle_convert(html: &str) -> String {
         let doc = Html::parse_document(html);
-        let Some(root) = article_root(&doc) else {
+        let roots = article_roots(&doc);
+        if roots.is_empty() {
             return doc.root_element().text().collect::<Vec<_>>().join(" ");
-        };
+        }
         let mut md = String::new();
-        oracle_walk(&root, &mut md, root_is_sectioning(&root), false);
+        for root in &roots {
+            oracle_walk(root, &mut md, root_is_sectioning(root), false);
+            md.push_str("\n\n");
+        }
         clean_blank_lines(&md)
     }
 

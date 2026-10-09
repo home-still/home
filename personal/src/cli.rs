@@ -19,7 +19,10 @@ pub enum PersonalCmd {
         #[arg(long)]
         title: Option<String>,
 
-        /// Replace an existing document with the same stem.
+        /// Replace an existing document with the same stem or the same file
+        /// content (the old document, markdown, sidecar and vectors are
+        /// removed once the new ingest succeeds). Without it, a file whose
+        /// content is already stored is refused.
         #[arg(long)]
         force: bool,
     },

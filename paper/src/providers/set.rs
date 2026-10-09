@@ -54,8 +54,11 @@ pub struct ProviderSet {
     europe_pmc: Arc<dyn PaperProvider>,
     crossref: Arc<dyn PaperProvider>,
     core: Arc<dyn PaperProvider>,
-    /// CORE is only a download resolver when an API key is configured.
+    /// CORE answers only with an API key: it is a download resolver and an
+    /// aggregate member only when one is configured.
     core_has_key: bool,
+    /// The providers an aggregate fans out to (CORE only with a key).
+    members: Vec<Arc<dyn PaperProvider>>,
     /// Semantic Scholar's citation-graph endpoints: the raw provider plus the
     /// *same* guard the search/DOI wrapper above uses.
     s2_graph: Arc<SemanticScholarProvider>,
@@ -114,17 +117,20 @@ impl ProviderSet {
         let semantic_scholar: Arc<dyn PaperProvider> =
             Arc::new(ResilientProvider::new(s2_graph.clone(), s2_guard.clone()));
 
-        let aggregate = Arc::new(AggregateProvider::new(
-            vec![
-                arxiv.clone(),
-                openalex.clone(),
-                semantic_scholar.clone(),
-                europe_pmc.clone(),
-                crossref.clone(),
-                core.clone(),
-            ],
-            AGGREGATE_TIMEOUT,
-        ));
+        let core_has_key = p.core.api_key.is_some();
+        let mut members = vec![
+            arxiv.clone(),
+            openalex.clone(),
+            semantic_scholar.clone(),
+            europe_pmc.clone(),
+            crossref.clone(),
+        ];
+        if core_has_key {
+            members.push(core.clone());
+        } else {
+            tracing::info!("CORE provider disabled: no paper.providers.core.api_key");
+        }
+        let aggregate = Arc::new(AggregateProvider::new(members.clone(), AGGREGATE_TIMEOUT));
 
         Ok(Self {
             arxiv,
@@ -133,7 +139,8 @@ impl ProviderSet {
             europe_pmc,
             crossref,
             core,
-            core_has_key: p.core.api_key.is_some(),
+            core_has_key,
+            members,
             s2_graph,
             s2_guard,
             aggregate,
@@ -158,7 +165,7 @@ impl ProviderSet {
     /// its own progress callback (`AggregateProvider::on_provider_done`).
     /// Limiter and breaker state stay shared; only the callback is private.
     pub fn aggregate(&self) -> AggregateProvider {
-        AggregateProvider::new(self.members(), AGGREGATE_TIMEOUT)
+        AggregateProvider::new(self.members.clone(), AGGREGATE_TIMEOUT)
     }
 
     /// Providers consulted, in order, to find a PDF URL for a DOI:
@@ -188,17 +195,6 @@ impl ProviderSet {
     ) -> Result<CitationsResponse, PaperError> {
         self.s2_graph.citations(doi, opts, &self.s2_guard).await
     }
-
-    fn members(&self) -> Vec<Arc<dyn PaperProvider>> {
-        vec![
-            self.arxiv.clone(),
-            self.openalex.clone(),
-            self.semantic_scholar.clone(),
-            self.europe_pmc.clone(),
-            self.crossref.clone(),
-            self.core.clone(),
-        ]
-    }
 }
 
 fn guarded<P: PaperProvider + 'static>(
@@ -218,6 +214,7 @@ fn guarded<P: PaperProvider + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::SearchQuery;
     use wiremock::matchers::any;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -243,7 +240,7 @@ mod tests {
     #[test]
     fn a_fresh_aggregate_reuses_the_shared_members() {
         let set = ProviderSet::new(&Config::default()).unwrap();
-        assert_eq!(set.aggregate().provider_count(), 6);
+        assert_eq!(set.aggregate().provider_count(), 5, "keyless CORE sits out");
         // Same members, so same guards: the `Arc` strong count rises when an
         // aggregate holds them and falls when it is dropped.
         let before = Arc::strong_count(&set.arxiv);
@@ -274,6 +271,82 @@ mod tests {
                 "crossref"
             ]
         );
+    }
+
+    /// An aggregate search over a set whose providers all answer 503 from one
+    /// mock server; returns the failed provider names and the request paths.
+    async fn aggregate_search_against_a_down_server(
+        core_key: Option<&str>,
+    ) -> (Vec<String>, Vec<String>) {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let mut config = Config::default();
+        let p = &mut config.providers;
+        p.arxiv.base_url = server.uri();
+        p.openalex.base_url = server.uri();
+        p.semantic_scholar.base_url = server.uri();
+        p.europe_pmc.base_url = server.uri();
+        p.crossref.base_url = server.uri();
+        p.core.base_url = server.uri();
+        p.core.api_key = core_key.map(String::from);
+        p.arxiv.rate_limit_interval_ms = 1;
+        p.openalex.rate_limit_interval_ms = 1;
+        p.semantic_scholar.rate_limit_interval_ms = 1;
+        p.europe_pmc.rate_limit_interval_ms = 1;
+        p.crossref.rate_limit_interval_ms = 1;
+        p.core.rate_limit_interval_ms = 1;
+        config.resilience.retry_max_attempts = 0;
+        let set = ProviderSet::new(&config).unwrap();
+
+        let query = SearchQuery {
+            query: "transformers".into(),
+            search_type: crate::models::SearchType::Keywords,
+            max_results: 5,
+            offset: 0,
+            date_filter: None,
+            sort_by: crate::models::SortBy::Relevance,
+            min_citations: None,
+        };
+        let failed = match set
+            .provider(&ProviderArg::All)
+            .search_by_query(&query)
+            .await
+        {
+            Err(PaperError::ProvidersFailed { failures, .. }) => {
+                failures.into_iter().map(|f| f.provider).collect()
+            }
+            other => panic!("every provider is down, got {other:?}"),
+        };
+        let paths = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        (failed, paths)
+    }
+
+    #[tokio::test]
+    async fn a_keyless_core_is_neither_asked_nor_reported_as_failed() {
+        let (failed, paths) = aggregate_search_against_a_down_server(None).await;
+        assert!(!failed.iter().any(|n| n == "core"), "{failed:?}");
+        assert_eq!(failed.len(), 5, "{failed:?}");
+        assert!(
+            !paths.iter().any(|p| p.starts_with("/v3/")),
+            "CORE was queried without a key: {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_joins_the_aggregate_when_a_key_is_configured() {
+        let (failed, paths) = aggregate_search_against_a_down_server(Some("key")).await;
+        assert!(failed.iter().any(|n| n == "core"), "{failed:?}");
+        assert!(paths.iter().any(|p| p.starts_with("/v3/")), "{paths:?}");
     }
 
     #[test]

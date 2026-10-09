@@ -32,7 +32,9 @@ pub fn omnidocbench_composite(
     has_text_ref: bool,
 ) -> CompositeScore {
     // Official v1.5: if reference has tables/formulas, score must be computed.
-    // Missing hypothesis = score 0 (not excluded).
+    // Missing hypothesis = score 0 (not excluded). `teds_score` is `None`
+    // only for a reference with no parseable rows, which the dataset loaders
+    // reject (`reference_table_problem`), so no loaded sample drops out here.
     let teds = match (reference_table_html, hypothesis_table_html) {
         (Some(r), Some(h)) => teds_score(r, h),
         (Some(_), None) => Some(0.0), // ref has table, we extracted nothing

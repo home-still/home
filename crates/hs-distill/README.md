@@ -127,7 +127,7 @@ distill:
 | `servers` | none | Distill server URL(s), e.g. `[http://<host>:7434]`. There is no default: a command that needs a server fails naming this key |
 | `markdown_dir` | `{project_dir}/markdown` | Where to find `.md` files |
 | `catalog_dir` | `{project_dir}/catalog` | Where to find catalog `.yaml` files |
-| `index_timeout_secs` | `1800` | Deadline for one indexing request. With NATS events it must be at least 120 s below `events.nats.ack_wait_secs` (default 7200). |
+| `index_timeout_secs` | `1800` | Deadline for one indexing request. The event watcher heartbeats the broker while it runs, so it is independent of `events.nats.ack_wait_secs`. |
 | `concurrency` | hardware default | Documents `hs distill watch-events` indexes in parallel; at least 1 |
 
 The configured `distill.servers` list is the only source of server addresses; there is no service registry.
@@ -142,6 +142,19 @@ hs distill index --file doc1.md doc2.md # index specific files
 The client reads each `.md` file locally and sends its content to the server for chunking, embedding, and storage. Files are identified by their stem name (e.g., `paper.md` becomes doc_id `paper`). The server never reads documents from disk: a request without `content` is rejected with HTTP 400. Re-indexing a document replaces all of its chunks (including ones past the new end), and a document that is skipped (empty, an anti-bot stub, nothing passes the quality filter) has its old chunks removed.
 
 Indexing is also triggered automatically: `hs distill watch-events` (`hs serve distill-watch --install` runs it as a service) indexes each markdown object when a `scribe.completed` event arrives, so newly converted markdown is embedded without a separate manual step.
+
+### Paper abstracts
+
+```bash
+hs distill abstracts build              # embed entries without an abstract_embed stamp
+hs distill abstracts build --force      # re-extract and re-embed every entry
+hs distill abstracts reconcile          # same as build without --force (new papers only)
+hs distill abstracts status             # coverage by source (openalex / catalog / markdown)
+```
+
+Each paper's abstract comes from the OpenAlex catalog, then the catalog-stored abstract, then a heuristic extraction from the converted markdown. The markdown extractor ends an abstract at a markdown heading that starts with an IMRaD label (`## Results and Discussion`), at a **standalone** IMRaD label line (`Introduction`, `Background`, `Methods`, `Materials and Methods`, `Results`, `Discussion`, `Conclusion(s)` — optionally with `**` markers and a trailing `:`), or at a line starting `Keywords`/`References`/`Funding`/`Acknowledgements`. A structured abstract's own `Background: …` / `Results show …` lines no longer end it.
+
+`build` and `reconcile` skip entries that already carry an `abstract_embed` stamp, so abstracts that were truncated by the earlier, looser section-break rule are only repaired by `hs distill abstracts build --force`, which re-extracts and re-embeds every entry.
 
 ### 4. Search
 

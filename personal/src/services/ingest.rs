@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::converters;
 use crate::error::{PersonalError, Result};
 use crate::models::{Category, SourceFormat};
-use crate::services::{distill::PersonalDistill, naming};
+use crate::services::{catalog, distill::PersonalDistill, naming};
 use chrono::Utc;
 use hs_common::catalog::{CatalogEntry, ConversionMeta};
 use sha2::{Digest, Sha256};
@@ -48,6 +48,14 @@ pub async fn ingest(cfg: &Config, file: &Path, opts: IngestOptions) -> Result<In
     let bytes = std::fs::read(file)?;
     let sha = sha256_hex(&bytes);
     let size = bytes.len() as u64;
+
+    // The same content under a new LLM-picked title gets a new stem, so the
+    // stem check below cannot see it: compare content hashes with the stored
+    // sidecars instead, before the (possibly minutes-long) conversion.
+    let same_content = catalog::stems_with_sha256(cfg, &sha)?;
+    if let (false, Some(existing)) = (opts.force, same_content.first()) {
+        return Err(PersonalError::DuplicateContent(existing.clone()));
+    }
 
     // Convert first so the LLM has the actual extracted text, not raw bytes.
     let stem_hint = file
@@ -91,6 +99,18 @@ pub async fn ingest(cfg: &Config, file: &Path, opts: IngestOptions) -> Result<In
     let chunk_count = tokio::spawn(commit(job))
         .await
         .map_err(|e| PersonalError::Other(anyhow::anyhow!("ingest task failed: {e}")))??;
+
+    // `--force`: the new document is stored and indexed first (a failed
+    // ingest leaves the old one untouched), then every older document with
+    // the same content is removed — files, markdown, sidecar and vectors.
+    // The same stem was overwritten in place above and stays.
+    for old in same_content.iter().filter(|old| **old != stem) {
+        catalog::delete(cfg, old).await.map_err(|e| {
+            PersonalError::Other(anyhow::anyhow!(
+                "ingested as '{stem}' but could not remove the replaced document '{old}': {e}"
+            ))
+        })?;
+    }
 
     Ok(IngestOutcome {
         stem,
@@ -497,5 +517,92 @@ mod tests {
             !orig.exists() && !md.exists() && !sidecar.exists()
         })
         .await;
+    }
+
+    /// A store whose distill server accepts every index call.
+    async fn store_with_distill(
+        server: &mut mockito::Server,
+    ) -> (tempfile::TempDir, Config, mockito::Mock) {
+        let index = server
+            .mock("POST", "/distill")
+            .with_status(200)
+            .with_body(r#"{"doc_id":"d","chunks_indexed":2,"embedding_device":"Cuda"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            project_dir: dir.path().to_path_buf(),
+            distill_url: server.url(),
+            ..Config::default()
+        };
+        (dir, cfg, index)
+    }
+
+    fn titled(title: &str, force: bool) -> IngestOptions {
+        IngestOptions {
+            title_override: Some(title.into()),
+            category_override: Some("other".into()),
+            force,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_content_under_a_new_title_is_a_duplicate() {
+        let mut server = mockito::Server::new_async().await;
+        let (dir, cfg, _index) = store_with_distill(&mut server).await;
+        let note = dir.path().join("note.md");
+        std::fs::write(&note, "# A note\n\nBody text.").unwrap();
+
+        let first = ingest(&cfg, &note, titled("First Title", false))
+            .await
+            .unwrap();
+        let err = ingest(&cfg, &note, titled("Second Title", false))
+            .await
+            .unwrap_err();
+
+        match err {
+            PersonalError::DuplicateContent(existing) => assert_eq!(existing, first.stem),
+            other => panic!("expected DuplicateContent, got {other:?}"),
+        }
+        let listed = catalog::list_entries(&cfg, None, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn force_replaces_the_old_stem_with_the_new_ingest() {
+        let mut server = mockito::Server::new_async().await;
+        let (dir, cfg, _index) = store_with_distill(&mut server).await;
+        let note = dir.path().join("note.md");
+        std::fs::write(&note, "# A note\n\nBody text.").unwrap();
+
+        let first = ingest(&cfg, &note, titled("First Title", false))
+            .await
+            .unwrap();
+        let delete = server
+            .mock(
+                "DELETE",
+                mockito::Matcher::Regex(format!("^/doc/{}", first.stem)),
+            )
+            .with_status(200)
+            .with_body(r#"{"deleted":2}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let second = ingest(&cfg, &note, titled("Second Title", true))
+            .await
+            .unwrap();
+
+        assert_ne!(first.stem, second.stem);
+        delete.assert_async().await;
+        let listed = catalog::list_entries(&cfg, None, 10).unwrap();
+        assert_eq!(
+            listed.iter().map(|e| e.stem.as_str()).collect::<Vec<_>>(),
+            [second.stem.as_str()]
+        );
+        let (orig, md, sidecar) = store_paths(&cfg, &first.stem, SourceFormat::Markdown);
+        assert!(!orig.exists() && !md.exists() && !sidecar.exists());
+        let (orig, md, sidecar) = store_paths(&cfg, &second.stem, SourceFormat::Markdown);
+        assert!(orig.exists() && md.exists() && sidecar.exists());
     }
 }

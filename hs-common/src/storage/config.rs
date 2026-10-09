@@ -101,18 +101,15 @@ fn expand_with(s: &str, lookup: impl Fn(&str) -> Option<String>) -> anyhow::Resu
     Ok(out)
 }
 
-/// Expand a leading `~` to the home directory. A path that does not start
-/// with `~` never consults the home directory; one that does fails loudly
-/// when the home directory is unknown instead of becoming a relative path.
+/// Expand a leading `~` to the home directory and require an absolute
+/// result. A path that does not start with `~` never consults the home
+/// directory; one that does fails loudly when the home directory is unknown.
 fn expand_home(p: &std::path::Path) -> anyhow::Result<PathBuf> {
     let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("~/") {
-        return Ok(crate::home_dir()?.join(rest));
-    }
-    if s == "~" {
-        return Ok(crate::home_dir()?);
-    }
-    Ok(p.to_path_buf())
+    crate::config_file::expand_home_path("storage.local.root", &s, || {
+        crate::home_dir().map_err(|e| format!("{e:#}"))
+    })
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Build-time check that a required S3 setting is present.
@@ -206,6 +203,23 @@ s3:
         let cfg = StorageConfig::default();
         assert_eq!(cfg.backend, Backend::Local);
         let _storage = cfg.build().unwrap();
+    }
+
+    #[test]
+    fn a_relative_local_root_is_refused_naming_the_key() {
+        let cfg = StorageConfig {
+            backend: Backend::Local,
+            local: LocalConfig {
+                root: PathBuf::from("data/objects"),
+            },
+            s3: S3ConfigYaml::default(),
+        };
+        let err = cfg.build().err().expect("relative root must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("storage.local.root") && msg.contains("data/objects"),
+            "{msg}"
+        );
     }
 
     #[tokio::test]

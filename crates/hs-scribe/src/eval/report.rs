@@ -29,10 +29,12 @@ pub fn print_summary(results: &EvalResults) {
         "Avg Composite: {:.2} (higher is better, max 100)",
         results.avg_composite
     );
-    println!(
-        "Official v1.5: {:.2} (text+TEDS+CDM)/3",
-        results.official_overall
-    );
+    match results.official_overall {
+        Some(overall) => println!("Official v1.5: {overall:.2} (text+TEDS+CDM)/3"),
+        None => println!(
+            "Official v1.5: not available (text, TEDS and CDM each need at least one scored page)"
+        ),
+    }
     println!("---");
 
     if results.pages.len() <= 20 {

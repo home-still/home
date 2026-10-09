@@ -3,7 +3,7 @@ use super::dedup::DedupGroup;
 use super::merge::contributing_sources;
 use super::relevance;
 use super::types::RankedPaper;
-use crate::models::Paper;
+use crate::models::{Paper, SortBy};
 
 const RRF_K: f64 = 60.0;
 
@@ -70,6 +70,18 @@ pub fn rank_papers(groups: &[DedupGroup], merged: Vec<Paper>, query: &str) -> Ve
     });
 
     ranked
+}
+
+/// Impose the caller's requested order on papers already ranked and floored.
+/// `Relevance` keeps the blended score order; `Date` and `Citations` are a
+/// strict ordering (newest / most cited first, a paper with no value last),
+/// ties keeping their blended-score order (the sort is stable).
+pub fn order_by(ranked: &mut [RankedPaper], sort_by: &SortBy) {
+    match sort_by {
+        SortBy::Relevance => {}
+        SortBy::Date => ranked.sort_by_key(|rp| std::cmp::Reverse(rp.paper.publication_date)),
+        SortBy::Citations => ranked.sort_by_key(|rp| std::cmp::Reverse(rp.paper.cited_by_count)),
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +221,89 @@ mod tests {
             survivors[0].paper.title.contains("retrieval augmented"),
             "survivor should be the target paper, got: {:?}",
             survivors[0].paper.title
+        );
+    }
+
+    fn dated(title: &str, date: Option<(i32, u32, u32)>, cites: Option<u64>) -> Paper {
+        let mut p = make_paper(title, "openalex", cites);
+        p.publication_date =
+            date.map(|(y, m, d)| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap());
+        p
+    }
+
+    fn ranked_titles(papers: Vec<Paper>, sort_by: &SortBy) -> Vec<String> {
+        let groups: Vec<DedupGroup> = papers
+            .iter()
+            .map(|p| {
+                group_of(SourcedPaper {
+                    paper: p.clone(),
+                    rank: 0,
+                    source: "openalex".to_string(),
+                })
+            })
+            .collect();
+        let mut ranked = rank_papers(&groups, papers, "graph neural networks");
+        order_by(&mut ranked, sort_by);
+        ranked.into_iter().map(|rp| rp.paper.title).collect()
+    }
+
+    #[test]
+    fn date_sort_is_newest_first_with_undated_papers_last() {
+        // The old, highly cited, exact-title paper would win a blended
+        // ranking; a date sort must still put the newest first.
+        let papers = vec![
+            dated("graph neural networks", Some((2015, 3, 1)), Some(9_000)),
+            dated("graph neural networks survey", None, Some(50_000)),
+            dated(
+                "graph neural networks revisited",
+                Some((2024, 6, 2)),
+                Some(1),
+            ),
+            dated("graph neural networks again", Some((2024, 1, 9)), Some(10)),
+        ];
+        assert_eq!(
+            ranked_titles(papers, &SortBy::Date),
+            [
+                "graph neural networks revisited",
+                "graph neural networks again",
+                "graph neural networks",
+                "graph neural networks survey"
+            ]
+        );
+    }
+
+    #[test]
+    fn citation_sort_is_most_cited_first_with_unknown_counts_last() {
+        let papers = vec![
+            dated("graph neural networks", Some((2024, 1, 1)), Some(3)),
+            dated("graph neural networks survey", Some((2010, 1, 1)), None),
+            dated(
+                "graph neural networks revisited",
+                Some((2012, 1, 1)),
+                Some(900),
+            ),
+            dated("graph neural networks again", Some((2020, 1, 1)), Some(40)),
+        ];
+        assert_eq!(
+            ranked_titles(papers, &SortBy::Citations),
+            [
+                "graph neural networks revisited",
+                "graph neural networks again",
+                "graph neural networks",
+                "graph neural networks survey"
+            ]
+        );
+    }
+
+    #[test]
+    fn relevance_sort_keeps_the_blended_order() {
+        let papers = vec![
+            dated("ferroptosis in cancer cells", Some((2024, 6, 2)), Some(5)),
+            dated("graph neural networks", Some((2010, 1, 1)), Some(5)),
+        ];
+        assert_eq!(
+            ranked_titles(papers, &SortBy::Relevance)[0],
+            "graph neural networks"
         );
     }
 }

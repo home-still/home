@@ -151,10 +151,8 @@ pub struct AppConfig {
     /// Ceiling (seconds) on the per-request `X-Convert-Deadline-Secs` a
     /// caller may ask for. A larger request is clamped to this, so one
     /// client cannot pin a converter slot (and its temp file) for longer
-    /// than the operator allows. Must be at least `convert_deadline_secs`
-    /// and should match the event consumer's `ack_wait` (default 7200 s):
-    /// a conversion that outlives it is redelivered anyway. Override via
-    /// `HS_SCRIBE_MAX_CONVERT_DEADLINE_SECS`.
+    /// than the operator allows. Must be at least `convert_deadline_secs`.
+    /// Override via `HS_SCRIBE_MAX_CONVERT_DEADLINE_SECS`.
     pub max_convert_deadline_secs: u64,
     pub dpi: u16,
     /// Ceiling on the pixels of one rendered PDF page. A page whose
@@ -622,7 +620,6 @@ pub struct TimeoutPolicy {
     pub floor_secs: u64,
     /// Maximum deadline regardless of page count. Caps a truly huge
     /// book so a poison input can't hold a delivery slot for hours.
-    /// JetStream `ack_wait` must be ≥ this value.
     pub ceiling_secs: u64,
 }
 

@@ -198,6 +198,12 @@ impl PaperProvider for AggregateProvider {
             ranked
         };
 
+        // The caller's order is a strict ordering, applied after every floor
+        // above: `--sort date|citations` is not a blend with relevance (the
+        // blended score stays the tie-break; relevance sort keeps it as is).
+        let mut ranked = ranked;
+        ranking::order_by(&mut ranked, &query.sort_by);
+
         // Convert back to Papers, truncate to max_results
         let papers: Vec<Paper> = ranked
             .into_iter()
@@ -454,6 +460,45 @@ mod tests {
         ]);
         let result = a.search_by_query(&query()).await.unwrap();
         assert!(result.provider_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn date_and_citation_sorts_order_the_aggregate_strictly() {
+        let mk = |title: &str, doi: &str, year: i32, cites: u64| {
+            let mut p = paper(title, doi);
+            p.publication_date = chrono::NaiveDate::from_ymd_opt(year, 1, 1);
+            p.cited_by_count = Some(cites);
+            p
+        };
+        let provider = || {
+            ok(
+                "openalex",
+                vec![
+                    mk("Transformers for vision tasks", "10.1/a", 2019, 40),
+                    mk("Transformers in language models", "10.1/b", 2024, 3),
+                    mk("Transformers: a decade of attention", "10.1/c", 2012, 9_000),
+                ],
+            )
+        };
+        let titles = |sort_by| async move {
+            let q = SearchQuery { sort_by, ..query() };
+            agg(vec![provider()])
+                .search_by_query(&q)
+                .await
+                .unwrap()
+                .papers
+                .into_iter()
+                .map(|p| p.doi.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            titles(crate::models::SortBy::Date).await,
+            ["10.1/b", "10.1/a", "10.1/c"]
+        );
+        assert_eq!(
+            titles(crate::models::SortBy::Citations).await,
+            ["10.1/c", "10.1/a", "10.1/b"]
+        );
     }
 
     #[tokio::test]

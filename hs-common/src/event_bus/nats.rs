@@ -53,10 +53,11 @@ pub struct NatsTls {
 pub struct NatsConfig {
     pub url: String,
     /// Per-message processing deadline. Used as the JetStream consumer's
-    /// `ack_wait` — if the handler hasn't acked within this window, the
-    /// broker treats the delivery as lost and redelivers. Should be a
-    /// comfortable multiple of the expected handler runtime (for scribe:
-    /// `convert_timeout_secs * 2`).
+    /// `ack_wait` — if the broker gets neither an ack nor an
+    /// [`Event::in_progress`](super::Event::in_progress) heartbeat within
+    /// this window, it treats the delivery as lost and redelivers. The
+    /// watchers heartbeat every `ack_wait / 3`, so it need not cover a
+    /// whole handler run.
     pub ack_wait: Duration,
     /// After this many deliveries without an ack/term, JetStream gives
     /// up and drops the message. A malformed event that keeps NAK-ing
@@ -81,9 +82,8 @@ impl Default for NatsConfig {
     fn default() -> Self {
         // Mirror NatsYaml::default() in config.rs — the YAML path is what
         // every live consumer goes through, and two divergent defaults
-        // for the same coupled constant (ack_wait must stay ≥ the scribe
-        // timeout ceiling of 3600s) is how a slow book gets reclaimed
-        // mid-convert by whichever code path picked the stale one.
+        // for the same constant would leave consumers on different
+        // redelivery windows depending on which code path built the config.
         Self {
             url: "nats://localhost:4222".into(),
             ack_wait: Duration::from_secs(7200),

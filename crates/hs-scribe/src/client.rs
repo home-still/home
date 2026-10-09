@@ -98,9 +98,10 @@ pub struct ConversionResult {
 }
 
 impl ConversionResult {
-    /// Regions the server could not process (0-dim crop, JPEG encode
-    /// failure) and left out of the markdown. Any non-zero count means the
-    /// markdown has holes; QC refuses to record such a conversion.
+    /// Regions the server left out of the markdown: ones it could not
+    /// process (0-dim crop, JPEG encode failure) and ones the streaming
+    /// repetition detector aborted. Any non-zero count means the markdown
+    /// has holes; QC refuses to record such a conversion.
     pub fn skipped_regions(&self) -> usize {
         self.per_page_diags
             .iter()

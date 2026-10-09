@@ -2,12 +2,17 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use hmac::{Hmac, Mac};
-use object_store::{aws::AmazonS3Builder, ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{aws::AmazonS3Builder, ClientOptions, ObjectStore, ObjectStoreExt, PutPayload};
 use sha2::{Digest, Sha256};
 
 use super::{validate_key, validate_prefix, ObjectMeta, Storage};
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Total time one S3 request may take, body included. object_store's own
+/// default is 30 s, which fails large-object transfers on a slow link.
+/// Fixed, not configurable: large PDF transfers fit well inside it.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 pub struct S3Storage {
     inner: Box<dyn ObjectStore>,
@@ -61,6 +66,9 @@ impl S3Storage {
             .with_access_key_id(&cfg.access_key)
             .with_secret_access_key(&cfg.secret_key)
             .with_region(&cfg.region)
+            // `with_client_options` replaces every client option set before
+            // it, so it comes before `with_allow_http`.
+            .with_client_options(ClientOptions::new().with_timeout(REQUEST_TIMEOUT))
             .with_allow_http(cfg.allow_http)
             .with_virtual_hosted_style_request(false)
             .build()?;
@@ -375,5 +383,44 @@ mod tests {
         assert!(super::super::is_invalid_key(
             &s.list("../x").await.unwrap_err()
         ));
+    }
+
+    /// `allow_http` must survive the client options set for the request
+    /// timeout (`with_client_options` replaces every option set before it):
+    /// a plain-http endpoint, the garage deployment, must still be reachable.
+    #[tokio::test]
+    async fn a_plain_http_endpoint_is_reachable_when_allow_http_is_set() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        let s = S3Storage::new(S3Config {
+            endpoint: format!("http://{addr}"),
+            bucket: "b".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            region: "garage".into(),
+            allow_http: true,
+        })
+        .unwrap();
+        assert!(
+            s.head("absent.txt").await.unwrap().is_none(),
+            "a 404 from the server is an absent object"
+        );
     }
 }

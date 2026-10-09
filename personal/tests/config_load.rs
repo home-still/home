@@ -107,8 +107,16 @@ fn a_malformed_section_is_an_error_not_the_defaults() {
 
 #[test]
 fn the_store_lives_under_home_project_dir() {
-    let c = load_yaml(Some("home:\n  project_dir: /srv/hs\n"), &[]).unwrap();
-    assert_eq!(c.root_dir(), PathBuf::from("/srv/hs/personal"));
-    assert_eq!(c.markdown_dir(), PathBuf::from("/srv/hs/personal/markdown"));
-    assert_eq!(c.inbox_dir(), PathBuf::from("/srv/hs/personal/inbox"));
+    // `/srv/hs` has no drive on Windows, where a relative project dir is
+    // refused.
+    let project = if cfg!(windows) {
+        "C:/srv/hs"
+    } else {
+        "/srv/hs"
+    };
+    let c = load_yaml(Some(&format!("home:\n  project_dir: {project}\n")), &[]).unwrap();
+    let root = PathBuf::from(project).join("personal");
+    assert_eq!(c.root_dir(), root);
+    assert_eq!(c.markdown_dir(), root.join("markdown"));
+    assert_eq!(c.inbox_dir(), root.join("inbox"));
 }

@@ -237,6 +237,16 @@ PP-DocLayout-V3 detects 25 region classes. hs-scribe maps them to 6 processing t
 | **Figure** | image, chart, seal | Skipped (placeholder in output) |
 | **Skip** | header, footer, header_image, footer_image, number, formula_number | Omitted entirely |
 
+### Repetition loops and gaps
+
+A region whose VLM stream trips the repetition detector is aborted and left out of the page. The page continues, but the aborted region (a text region, or a single table cell, which is left empty) is counted as a skipped region, so the quality gate rejects the conversion as gapped and the tier chain escalates. The per-page diag keeps `repetition_aborted_regions` as its own counter.
+
+Repetition cleanup (`clean_repetitions`) runs on a page only when its longest repeated run reaches the QC loop floor (128 bytes, the same floor `qc_verdict` uses). Below it the page is stored as the OCR text, so code indentation, wide table rules, dot leaders and `| - | - |` rows are never rewritten.
+
+Table cell text from the VLM is HTML-escaped (`&`, `<`, `>`) before it goes into `<td>`.
+
+HTML and EPUB chapters: every outermost `<article>` is converted, in document order (an `<article>` inside a sidebar `<aside>`, `<nav>` or similar is dropped with it). An `<aside>` that carries an `epub:type` attribute (EPUB 3 footnotes) is content and kept; other `<aside>` elements are dropped.
+
 ## Build
 
 ```sh
@@ -255,6 +265,8 @@ cargo build --release -p hs-scribe --features server,cuda --bin hs-scribe-server
 # With evaluation harness (BLEU, TED, edit distance metrics)
 cargo build --release -p hs-scribe --features eval --bin hs-scribe-server
 ```
+
+The harness reports the official v1.5 overall (the mean of the text, TEDS and CDM averages) only when all three categories have scored pages; otherwise it prints "not available" and the JSON field is `null`. A dataset whose reference table has no parseable rows is rejected at load with an error naming the sample.
 
 ## Docker
 

@@ -747,6 +747,12 @@ pub async fn convert_and_upload(
 /// stuck-in-transient-loop message eventually surfaces as a permanent
 /// failure in operator logs.
 ///
+/// While a handler runs, the event is kept alive with an in-progress
+/// heartbeat every `ack_wait / 3` (`ack_wait` = `events.nats.ack_wait_secs`),
+/// so the broker does not redeliver a conversion that is still running and
+/// `ack_wait` need not exceed the whole tier chain. A failed heartbeat is
+/// logged at WARN and does not fail the handler.
+///
 /// This function returns only with an error. The message stream ends (or
 /// yields a delivery error) when the broker drops the consumer or the
 /// connection (a competing watcher deleting the durable, a broker restart,
@@ -829,6 +835,7 @@ pub async fn run_subscriber<F, Fut>(
     _storage: Arc<dyn Storage>,
     concurrency: usize,
     drain_timeout: Duration,
+    ack_wait: Duration,
     handler: F,
 ) -> Result<()>
 where
@@ -836,6 +843,7 @@ where
     Fut: Future<Output = Result<(), HandlerError>> + Send + 'static,
 {
     let mut stream = bus.consume(&specs::PAPERS_INGESTED).await?;
+    let progress = hs_common::event_bus::progress_interval(ack_wait);
     let concurrency = concurrency.max(1);
     tracing::info!(
         concurrency,
@@ -910,24 +918,29 @@ where
             let key = parsed.key.clone();
             tracing::info!(key = %key, "scribe received ingested event");
             // The guard wraps the call too: a panic before the handler's
-            // first await would otherwise escape it.
-            let result =
-                match hs_common::panic_guard::catch_panic(async move { handler(parsed).await })
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(panic) => {
-                        tracing::error!(
-                            key = %key,
-                            panic = %panic,
-                            "scribe handler PANICKED — terminating this event (will not redeliver)"
-                        );
-                        if let Err(e) = event.term().await {
-                            tracing::warn!(key = %key, error = %e, "term after panic failed");
-                        }
-                        return;
+            // first await would otherwise escape it. The heartbeat keeps the
+            // broker from redelivering the event while the handler runs
+            // (see `with_progress_heartbeat`); it ends with the handler.
+            let result = match hs_common::event_bus::with_progress_heartbeat(
+                &event,
+                progress,
+                hs_common::panic_guard::catch_panic(async move { handler(parsed).await }),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(panic) => {
+                    tracing::error!(
+                        key = %key,
+                        panic = %panic,
+                        "scribe handler PANICKED — terminating this event (will not redeliver)"
+                    );
+                    if let Err(e) = event.term().await {
+                        tracing::warn!(key = %key, error = %e, "term after panic failed");
                     }
-                };
+                    return;
+                }
+            };
             match result {
                 Ok(()) => {
                     if let Err(e) = event.ack().await {
@@ -1398,6 +1411,10 @@ mod tests {
         assert_eq!(ok, 7);
     }
 
+    /// `events.nats.ack_wait_secs` default: heartbeats never fire in tests
+    /// that do not ask for them.
+    const ACK_WAIT: Duration = Duration::from_secs(7200);
+
     async fn subscribe(
         events: Vec<Event>,
         concurrency: usize,
@@ -1412,6 +1429,7 @@ mod tests {
             storage,
             concurrency,
             Duration::from_secs(30),
+            ACK_WAIT,
             move |e| {
                 let seen = seen_in.clone();
                 async move {
@@ -1578,19 +1596,27 @@ mod tests {
         let handled = Arc::new(AtomicUsize::new(0));
         let handled_in = handled.clone();
         let started = std::time::Instant::now();
-        let result = run_subscriber(bus, storage, 2, Duration::from_secs(30), move |_event| {
-            let url = url.clone();
-            let handled = handled_in.clone();
-            async move {
-                handled.fetch_add(1, Ordering::SeqCst);
-                let client = ScribeClient::new_with_timeout(&url, Duration::from_secs(5)).unwrap();
-                client
-                    .convert_with_progress(pdf_with_pages(1), None, Some("one"), |_| {})
-                    .await
-                    .map(|_| ())
-                    .map_err(HandlerError::Transient)
-            }
-        })
+        let result = run_subscriber(
+            bus,
+            storage,
+            2,
+            Duration::from_secs(30),
+            ACK_WAIT,
+            move |_event| {
+                let url = url.clone();
+                let handled = handled_in.clone();
+                async move {
+                    handled.fetch_add(1, Ordering::SeqCst);
+                    let client =
+                        ScribeClient::new_with_timeout(&url, Duration::from_secs(5)).unwrap();
+                    client
+                        .convert_with_progress(pdf_with_pages(1), None, Some("one"), |_| {})
+                        .await
+                        .map(|_| ())
+                        .map_err(HandlerError::Transient)
+                }
+            },
+        )
         .await;
         let err = result.expect_err("a rejected token must end the watcher");
         assert!(format!("{err:#}").contains("HS_BACKEND_TOKEN"), "{err:#}");
@@ -1617,19 +1643,26 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         let handled = Arc::new(AtomicUsize::new(0));
         let handled_in = handled.clone();
-        let result = run_subscriber(bus, storage, 1, Duration::from_secs(5), move |_e| {
-            let handled = handled_in.clone();
-            async move {
-                handled.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                Err(HandlerError::Transient(anyhow::Error::new(
-                    crate::client::BackendUnauthorized {
-                        server: "http://s".into(),
-                        status: 401,
-                    },
-                )))
-            }
-        })
+        let result = run_subscriber(
+            bus,
+            storage,
+            1,
+            Duration::from_secs(5),
+            ACK_WAIT,
+            move |_e| {
+                let handled = handled_in.clone();
+                async move {
+                    handled.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Err(HandlerError::Transient(anyhow::Error::new(
+                        crate::client::BackendUnauthorized {
+                            server: "http://s".into(),
+                            status: 401,
+                        },
+                    )))
+                }
+            },
+        )
         .await;
         assert!(result.is_err());
         assert_eq!(
@@ -1679,14 +1712,21 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in = seen.clone();
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
-        let err = run_subscriber(bus, storage, 2, Duration::from_secs(30), move |e| {
-            let seen = seen_in.clone();
-            async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                seen.lock().unwrap().push(e.key);
-                Ok(())
-            }
-        })
+        let err = run_subscriber(
+            bus,
+            storage,
+            2,
+            Duration::from_secs(30),
+            ACK_WAIT,
+            move |e| {
+                let seen = seen_in.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    seen.lock().unwrap().push(e.key);
+                    Ok(())
+                }
+            },
+        )
         .await
         .expect_err("a delivery error must fail the subscriber");
         let shown = format!("{err:#}");
@@ -1710,16 +1750,23 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         // Concurrency 1: the permit the panicking task held must be released
         // or the event after it would never be dispatched.
-        let result = run_subscriber(bus, storage, 1, Duration::from_secs(30), move |e| {
-            let seen = seen_in.clone();
-            async move {
-                if e.key == "poison.pdf" {
-                    panic!("lopdf exploded on {}", e.key);
+        let result = run_subscriber(
+            bus,
+            storage,
+            1,
+            Duration::from_secs(30),
+            ACK_WAIT,
+            move |e| {
+                let seen = seen_in.clone();
+                async move {
+                    if e.key == "poison.pdf" {
+                        panic!("lopdf exploded on {}", e.key);
+                    }
+                    seen.lock().unwrap().push(e.key);
+                    Ok(())
                 }
-                seen.lock().unwrap().push(e.key);
-                Ok(())
-            }
-        })
+            },
+        )
         .await;
         assert!(result
             .unwrap_err()
@@ -1750,6 +1797,7 @@ mod tests {
             storage,
             2,
             Duration::from_millis(300),
+            ACK_WAIT,
             move |e| async move {
                 if e.key == "stuck.pdf" {
                     std::future::pending::<()>().await;
@@ -1773,6 +1821,45 @@ mod tests {
         use hs_common::event_bus::Settlement;
         assert_eq!(quick_log.decisions(), [Settlement::Ack]);
         assert!(stuck_log.decisions().is_empty());
+    }
+
+    /// One slow and one fast handler through the real dispatcher. With an
+    /// `ack_wait` of 150 ms the heartbeat interval is 50 ms.
+    #[tokio::test]
+    async fn a_slow_handler_is_kept_alive_with_heartbeats_and_a_fast_one_sends_none() {
+        use hs_common::event_bus::Settlement;
+        let bus = Arc::new(FakeBus::default());
+        let (slow, slow_log) =
+            Event::recording("papers.ingested", br#"{"key":"slow.pdf"}"#.to_vec());
+        let (fast, fast_log) =
+            Event::recording("papers.ingested", br#"{"key":"fast.pdf"}"#.to_vec());
+        *bus.to_consume.lock().unwrap() = vec![slow, fast];
+        *bus.then_fail.lock().unwrap() = Some("stream closed".into());
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
+        let _ = run_subscriber(
+            bus,
+            storage,
+            2,
+            Duration::from_secs(30),
+            Duration::from_millis(150),
+            move |e| async move {
+                if e.key == "slow.pdf" {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                Ok(())
+            },
+        )
+        .await;
+        let slow = slow_log.decisions();
+        assert_eq!(slow.last(), Some(&Settlement::Ack), "{slow:?}");
+        assert!(
+            slow[..slow.len() - 1]
+                .iter()
+                .all(|d| *d == Settlement::InProgress)
+                && slow.len() >= 2,
+            "a handler longer than the interval sends >= 1 heartbeat before its ack: {slow:?}"
+        );
+        assert_eq!(fast_log.decisions(), [Settlement::Ack]);
     }
 
     // ── against the real scribe server (olmocr mode, stand-in CLI) ─────

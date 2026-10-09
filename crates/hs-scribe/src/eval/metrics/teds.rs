@@ -465,18 +465,37 @@ pub fn teds_score(reference_html: &str, hypothesis_html: &str) -> Option<f64> {
     Some(total_score / ref_tables.len() as f64)
 }
 
+/// Normalize a table the way TEDS compares it and parse it. `None` when it
+/// has no parseable rows.
+/// Applies the official OmniDocBench normalization first (strips attributes,
+/// formatting tags), then turns header cells into data cells for a fair
+/// comparison (SLANet-Plus doesn't output `<th>`). The `<th>` replacement
+/// must be word-boundary-aware to avoid corrupting `<thead>` → `<tdead>`.
+fn parse_normalized_table(html: &str) -> Option<TreeNode> {
+    let clean = normalize_table_html(html);
+    parse_html_table(&normalize_th_to_td(&clean))
+}
+
+/// Why a reference table cannot be scored, or `None` when every table in
+/// it has parseable rows. A reference TEDS can't parse would score `None`
+/// and silently drop out of the TEDS average, so the dataset loaders refuse
+/// it instead.
+pub fn reference_table_problem(reference_html: &str) -> Option<String> {
+    let tables = split_tables(reference_html);
+    if tables.is_empty() {
+        return Some("it has no table markup".to_string());
+    }
+    let count = tables.len();
+    tables
+        .iter()
+        .position(|table| parse_normalized_table(table).is_none())
+        .map(|at| format!("table {} of {count} has no parseable rows", at + 1))
+}
+
 /// Compute TEDS for a single table pair.
-/// Normalizes `<th>` → `<td>` since SLANet-Plus doesn't output `<th>`.
 fn teds_score_single(reference_html: &str, hypothesis_html: &str) -> Option<f64> {
-    // Apply official OmniDocBench normalization first (strips attributes, formatting tags)
-    let ref_clean = normalize_table_html(reference_html);
-    let hyp_clean = normalize_table_html(hypothesis_html);
-    // Normalize header cells to data cells for fair comparison.
-    // Must use word-boundary-aware replacement to avoid corrupting <thead> → <tdead>.
-    let ref_normalized = normalize_th_to_td(&ref_clean);
-    let hyp_normalized = normalize_th_to_td(&hyp_clean);
-    let ref_tree = parse_html_table(&ref_normalized)?;
-    let hyp_tree = parse_html_table(&hyp_normalized);
+    let ref_tree = parse_normalized_table(reference_html)?;
+    let hyp_tree = parse_normalized_table(hypothesis_html);
 
     let hyp_tree = match hyp_tree {
         Some(t) => t,
