@@ -262,6 +262,12 @@ fn interpret_show_unit(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // A unit that is not loaded (a failed transient unit whose file is gone,
+    // or one masked to /dev/null) has no main command and cannot be running
+    // our binary: the same case as an empty `ExecStart=`.
+    if matches!(property(&stdout, "LoadState"), Some("not-found" | "masked")) {
+        return Ok(None);
+    }
     let Some(exec_start) = property(&stdout, "ExecStart") else {
         bail!("{name}: `{label} show` output has no ExecStart property");
     };
@@ -1388,6 +1394,22 @@ mod tests {
             interpret_show_unit(true, "hs-x.service", output(0, show, "")).unwrap(),
             None
         );
+    }
+
+    /// Found on the rc.362 rollout: a failed transient unit whose file is
+    /// gone (`not-found`) and a masked unit have no `ExecStart` property, and
+    /// one of them aborted the whole restart phase on two hosts.
+    #[cfg(unix)]
+    #[test]
+    fn show_unit_not_loaded_units_are_skipped_not_failed() {
+        for load_state in ["not-found", "masked"] {
+            let show = format!("LoadState={load_state}\nActiveState=failed\n");
+            assert_eq!(
+                interpret_show_unit(false, "hs-gone.service", output(0, &show, "")).unwrap(),
+                None,
+                "{load_state}"
+            );
+        }
     }
 
     #[cfg(unix)]
