@@ -1046,10 +1046,26 @@ async fn unpaywall_locations_are_tried_best_first_and_landing_pages_are_not_cand
 
 #[tokio::test]
 async fn doi_and_contact_email_are_percent_encoded_in_lookup_urls() {
+    // `?` cannot be part of a stored key on Windows (hs-common refuses it
+    // there before any lookup, tested below), so the Windows run encodes
+    // the remaining reserved characters only.
+    let (doi, unpaywall_path, idconv_ids) = if cfg!(windows) {
+        (
+            "10.1234/a b#d&e=f",
+            "/unpaywall/v2/10.1234/a%20b%23d&e=f?email=ops%40example.org",
+            "ids=10.1234%2Fa+b%23d%26e%3Df",
+        )
+    } else {
+        (
+            "10.1234/a b?c#d&e=f",
+            "/unpaywall/v2/10.1234/a%20b%3Fc%23d&e=f?email=ops%40example.org",
+            "ids=10.1234%2Fa+b%3Fc%23d%26e%3Df",
+        )
+    };
     let server = FakeServer::start(|_| Route::Status(404)).await;
     let rig = Rig::new(&server, &config(1_000_000), vec![]);
 
-    let _ = rig.dl.download_by_doi("10.1234/a b?c#d&e=f").await;
+    let _ = rig.dl.download_by_doi(doi).await;
 
     let hits = server.hits();
     let unpaywall = hits
@@ -1058,19 +1074,30 @@ async fn doi_and_contact_email_are_percent_encoded_in_lookup_urls() {
         .unwrap_or_else(|| panic!("{hits:?}"));
     // `?` and `#` in the DOI must not start a query/fragment; the email is
     // encoded in the one real query string.
-    assert!(
-        unpaywall.starts_with("/unpaywall/v2/10.1234/a%20b%3Fc%23d&e=f?email=ops%40example.org"),
-        "{unpaywall}"
-    );
+    assert!(unpaywall.starts_with(unpaywall_path), "{unpaywall}");
     let idconv = hits
         .iter()
         .find(|h| h.starts_with("/idconv/"))
         .unwrap_or_else(|| panic!("{hits:?}"));
-    assert!(
-        idconv.contains("ids=10.1234%2Fa+b%3Fc%23d%26e%3Df"),
-        "{idconv}"
-    );
+    assert!(idconv.contains(idconv_ids), "{idconv}");
     assert!(idconv.contains("email=ops%40example.org"), "{idconv}");
+}
+
+/// On Windows a DOI whose stem holds a character no file name may contain
+/// fails loudly at the storage boundary, before any network lookup.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_doi_unstorable_on_windows_fails_before_any_lookup() {
+    let server = FakeServer::start(|_| Route::Status(404)).await;
+    let rig = Rig::new(&server, &config(1_000_000), vec![]);
+
+    let err = rig.dl.download_by_doi("10.1234/a?b").await.unwrap_err();
+
+    assert!(
+        format!("{err}").contains("not storable on Windows"),
+        "{err}"
+    );
+    assert!(server.hits().is_empty(), "{:?}", server.hits());
 }
 
 #[tokio::test]

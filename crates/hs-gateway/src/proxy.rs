@@ -267,8 +267,9 @@ async fn forward_request(
             if e.is_connect() {
                 state.balancer.mark_failed(service, index);
             }
-            // The backend address is internal; log it, don't hand it to the client.
-            tracing::error!("backend request to {backend_url} failed: {e}");
+            // The backend address is internal; log it (with the transport
+            // cause, which reqwest's Display omits), don't hand it to the client.
+            tracing::error!("backend request to {backend_url} failed: {e:?}");
             return if e.is_timeout() {
                 (StatusCode::GATEWAY_TIMEOUT, "Backend timed out").into_response()
             } else {
@@ -815,8 +816,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_instance_that_refuses_connections_is_skipped_for_the_cooldown() {
-        let dead = unused_local_url().await;
+        // Live first: `unused_local_url` releases its port, and a backend
+        // bound after it could be handed that same port (seen on CI as
+        // `[200, 200]`). Bound first, the live port is never free to reuse.
         let live = spawn_backend(named_backend("live")).await;
+        let dead = unused_local_url().await;
         let state = test_state_with(
             &[("scribe", &dead), ("scribe", &live)],
             "backend_failure_cooldown_secs: 60",
