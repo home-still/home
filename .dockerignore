@@ -1,0 +1,18 @@
+# The scribe image is built from the repo root (`COPY . .` in
+# crates/hs-scribe/docker/Dockerfile). Keep local build output, runtime data and
+# private working directories out of the build context (and out of the layer
+# cache): only the workspace sources are needed.
+.git
+**/target
+data
+markdown
+logs
+imessages_db
+.fastembed_cache
+.ome-still
+docker-context
+skillz
+slop
+.claude
+.vscode
+*.log

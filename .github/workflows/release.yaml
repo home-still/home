@@ -93,10 +93,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
+      - name: Install Rust toolchain (version from rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -203,7 +204,10 @@ jobs:
             -Path "target\${env:TARGET}\release\${env:TOOL}.exe" `
             -DestinationPath "dist\$asset"
           $hash = (Get-FileHash "dist\$asset" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $asset" | Out-File -Encoding ascii "dist\$asset.sha256"
+          # LF, not Out-File's CRLF: `cat artifacts/*.sha256` builds
+          # checksums-sha256.txt, and `sha256sum -c` reads a CR as part of
+          # the file name.
+          [System.IO.File]::WriteAllText("$PWD\dist\$asset.sha256", "$hash  $asset`n")
           Get-ChildItem dist
 
       # Verify what is about to be published, not what the build step claims:

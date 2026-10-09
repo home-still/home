@@ -1,13 +1,15 @@
 # Rust build artifacts
 /target
 **/target
-debug
+/debug/
 **/*.rs.bk
 *.pdb
 **/mutants.out*/
 
 # Data directories
 data/
+# Runtime output of the scribe watcher; nothing here belongs in the repo.
+/markdown/
 downloads/*
 cache/*
 

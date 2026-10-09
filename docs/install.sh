@@ -45,27 +45,63 @@ if [ -z "${VERSION}" ]; then
     exit 1
 fi
 
-ARCHIVE="${TOOL}-${VERSION}-${TARGET}.tar.gz"
-URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+    echo "Neither sha256sum nor shasum found; cannot verify the download"
+    exit 1
+fi
+
+mkdir -p "${INSTALL_DIR}"
+# Staged inside INSTALL_DIR so the final mv is a same-filesystem rename: a
+# running binary is replaced atomically, and a failed download or checksum
+# leaves the previously installed binaries untouched.
+WORK="$(mktemp -d "${INSTALL_DIR}/.install.XXXXXX")"
+trap 'rm -rf "${WORK}"' EXIT
+
+# install_archive <binary> <required|optional>
+# Downloads <binary>-<version>-<target>.tar.gz and its .sha256, verifies the
+# archive against the digest, then installs the binary. An `optional` binary
+# that the release does not publish for this platform (HTTP 404) is skipped;
+# every other failure aborts the install.
+install_archive() {
+    bin="$1"
+    archive="${bin}-${VERSION}-${TARGET}.tar.gz"
+    base="https://github.com/${REPO}/releases/download/${VERSION}/${archive}"
+
+    code="$(curl -sSL -o "${WORK}/${archive}" -w '%{http_code}' "${base}")" \
+        || { echo "Download of ${archive} failed"; exit 1; }
+    if [ "${code}" = 404 ] && [ "$2" = optional ]; then
+        return 0
+    fi
+    [ "${code}" = 200 ] || { echo "Download of ${archive} failed: HTTP ${code}"; exit 1; }
+
+    code="$(curl -sSL -o "${WORK}/${archive}.sha256" -w '%{http_code}' "${base}.sha256")" \
+        || { echo "Download of ${archive}.sha256 failed"; exit 1; }
+    [ "${code}" = 200 ] || { echo "Download of ${archive}.sha256 failed: HTTP ${code}"; exit 1; }
+
+    # `<64 hex>  <archive name>`
+    expected="$(awk -v name="${archive}" '{ sub(/\r$/, "") } NF == 2 && $2 == name { print $1 }' "${WORK}/${archive}.sha256")"
+    actual="$(sha256_of "${WORK}/${archive}")"
+    if [ -z "${expected}" ] || [ "${expected}" != "${actual}" ]; then
+        echo "Checksum mismatch for ${archive}: expected '${expected}', got '${actual}'"
+        exit 1
+    fi
+
+    tar -xzf "${WORK}/${archive}" -C "${WORK}" "${bin}"
+    chmod +x "${WORK}/${bin}"
+    mv -f "${WORK}/${bin}" "${INSTALL_DIR}/${bin}"
+    echo "Installed ${bin} to ${INSTALL_DIR}/${bin}"
+}
 
 echo "Installing ${TOOL} ${VERSION} for ${TARGET}..."
-
-# Download and extract
-mkdir -p "${INSTALL_DIR}"
-curl -fsSL "${URL}" | tar -xz -C "${INSTALL_DIR}"
-chmod +x "${INSTALL_DIR}/${TOOL}"
-
-echo "Installed ${TOOL} to ${INSTALL_DIR}/${TOOL}"
+install_archive "${TOOL}" required
 
 # Install companion binaries if available for this platform
 for COMPANION in hs-distill-server hs-gateway hs-mcp; do
-    COMP_ARCHIVE="${COMPANION}-${VERSION}-${TARGET}.tar.gz"
-    COMP_URL="https://github.com/${REPO}/releases/download/${VERSION}/${COMP_ARCHIVE}"
-    if curl -fsSL -o /dev/null --head "${COMP_URL}" 2>/dev/null; then
-        curl -fsSL "${COMP_URL}" | tar -xz -C "${INSTALL_DIR}"
-        chmod +x "${INSTALL_DIR}/${COMPANION}"
-        echo "Installed ${COMPANION} to ${INSTALL_DIR}/${COMPANION}"
-    fi
+    install_archive "${COMPANION}" optional
 done
 
 # Check if INSTALL_DIR is in PATH

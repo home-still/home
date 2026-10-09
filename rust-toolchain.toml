@@ -1,0 +1,7 @@
+# Single source of truth for the Rust toolchain (local, CI, release, Docker).
+# To bump: edit `channel` below. Nothing else pins a version.
+# Cross-compile targets are added per CI job (release.yaml matrix), not here.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

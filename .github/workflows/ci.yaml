@@ -39,10 +39,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
+      - name: Install Rust toolchain (version from rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup show active-toolchain || rustup toolchain install
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
@@ -81,6 +81,12 @@ jobs:
       - run: cargo clippy --locked -p hs-scribe --features server --all-targets -- -D warnings
         if: matrix.os == 'ubuntu-24.04'
       - run: cargo test --locked -p hs-scribe --features server
+        if: matrix.os == 'ubuntu-24.04'
+      # `eval` (implies `server`) is the OCR benchmark harness; nothing ships
+      # it, so only its own modules' lints and tests are gated here.
+      - run: cargo clippy --locked -p hs-scribe --features eval --all-targets -- -D warnings
+        if: matrix.os == 'ubuntu-24.04'
+      - run: cargo test --locked -p hs-scribe --features eval --lib eval
         if: matrix.os == 'ubuntu-24.04'
       # Exactly the feature set release.yaml builds for hs-distill-server
       # (`--features cuda`, which implies `server`). Compiling is the point:
