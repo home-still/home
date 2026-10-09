@@ -148,6 +148,21 @@ impl Spool {
         self.state().path.clone()
     }
 
+    /// The current file's bytes, read through the lock-holding handle: on
+    /// Windows the exclusive lock is mandatory, so any other handle is
+    /// refused (os error 33). Appends always land at the end, so moving the
+    /// cursor here cannot misplace a later write.
+    #[cfg(test)]
+    pub fn current_contents(&self) -> io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let s = self.state();
+        let mut file = &s.file;
+        file.seek(SeekFrom::Start(0))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+
     pub fn dir(&self) -> PathBuf {
         self.state().dir.clone()
     }
@@ -382,8 +397,7 @@ mod tests {
 
         writer.write_all(b"world\n").unwrap();
         writer.flush().unwrap();
-        let current = spool.current_path();
-        assert_eq!(std::fs::read(&current).unwrap(), b"world\n");
+        assert_eq!(spool.current_contents().unwrap(), b"world\n");
     }
 
     #[test]
@@ -432,7 +446,7 @@ mod tests {
         daemon_writer.flush().unwrap();
         assert_eq!(std::fs::read(&cli_closed).unwrap(), b"cli\n");
         assert_eq!(
-            std::fs::read(daemon.current_path()).unwrap(),
+            daemon.current_contents().unwrap(),
             b"daemon-1\ndaemon-2\n",
             "the daemon's file is still its live current file"
         );
