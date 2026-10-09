@@ -8,10 +8,10 @@
 //! routing decisions, layout class lists, sampling params on the wire,
 //! the first 1 KB of raw VLM output, and the cleanup pass that fired.
 //!
-//! Records flow server → client over the streaming endpoint
-//! (`StreamLine::PageDiag`). Server-only emission was rejected because
-//! the QC verdict and post-processing breakdown are computed client-side
-//! and need to land in the same file.
+//! Records flow server → client in the streaming endpoint's `Result` line
+//! (`StreamLine::Result.per_page_diags`). Server-only emission was rejected
+//! because the QC verdict and post-processing breakdown are computed
+//! client-side and need to land in the same file.
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufWriter, Write};

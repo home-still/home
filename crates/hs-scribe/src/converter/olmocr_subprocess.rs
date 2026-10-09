@@ -77,11 +77,12 @@ pub async fn convert(pdf_path: &Path, source_pages: u32, config: &AppConfig) -> 
         .with_context(|| format!("spawning olmocr CLI at `{}`", config.olmocr_bin))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // The message becomes the wire `Error` line and the log line, so it
+        // carries the end of the CLI's account, not all of a long run's.
         return Err(anyhow!(
             "olmocr CLI exited with status {:?}: {}",
             output.status.code(),
-            stderr.trim()
+            stderr_tail(&String::from_utf8_lossy(&output.stderr))
         ));
     }
 
@@ -104,20 +105,12 @@ pub async fn convert(pdf_path: &Path, source_pages: u32, config: &AppConfig) -> 
     if let Err(failure) = check_page_accounting(completed, failed, source_pages) {
         // The workspace tempdir is about to be dropped; keep the CLI's own
         // account of what went wrong for the post-mortem.
-        let stderr_tail: String = stderr
-            .lines()
-            .rev()
-            .take(15)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
+        let tail = stderr_tail(&stderr);
         tracing::warn!(
             completed,
             failed,
             source_pages,
-            stderr_tail = %stderr_tail,
+            stderr_tail = %tail,
             "olmocr_subprocess: {failure} — escalating to next backend"
         );
         return Err(anyhow::Error::new(failure));
@@ -136,6 +129,27 @@ pub async fn convert(pdf_path: &Path, source_pages: u32, config: &AppConfig) -> 
         ));
     }
     Ok(markdown)
+}
+
+/// Most lines, and most bytes, of the CLI's stderr put in an error message or
+/// log line. A run over a long book logs per page; the failure is at the end.
+const STDERR_TAIL_LINES: usize = 15;
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
+
+/// The last [`STDERR_TAIL_LINES`] lines of `stderr`, cut to at most
+/// [`STDERR_TAIL_BYTES`] bytes (from the front, on a character boundary).
+fn stderr_tail(stderr: &str) -> String {
+    let mut lines: Vec<&str> = stderr.lines().rev().take(STDERR_TAIL_LINES).collect();
+    lines.reverse();
+    let tail = lines.join("\n");
+    if tail.len() <= STDERR_TAIL_BYTES {
+        return tail;
+    }
+    let mut start = tail.len() - STDERR_TAIL_BYTES;
+    while !tail.is_char_boundary(start) {
+        start += 1;
+    }
+    tail[start..].to_string()
 }
 
 /// Decide whether olmocr's end-of-run tally describes a complete
@@ -400,5 +414,46 @@ mod tests {
         let err = convert(&pdf, 1, &config).await.unwrap_err();
         assert_eq!(failure_code(&err), None);
         assert!(format!("{err:#}").contains("vllm unreachable"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_run_reports_the_end_of_its_stderr_not_all_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("loud.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho FIRST-LINE-MARKER >&2\n\
+             i=0; while [ $i -lt 5000 ]; do echo \"page $i done\" >&2; i=$((i+1)); done\n\
+             echo 'fatal: backend went away' >&2\nexit 3\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let pdf = dir.path().join("in.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let config = AppConfig {
+            olmocr_bin: script.to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
+        let message = format!("{:#}", convert(&pdf, 1, &config).await.unwrap_err());
+        assert!(message.contains("fatal: backend went away"), "{message}");
+        assert!(!message.contains("FIRST-LINE-MARKER"), "{message}");
+        assert!(
+            message.len() < STDERR_TAIL_BYTES + 200,
+            "{} bytes",
+            message.len()
+        );
+    }
+
+    #[test]
+    fn the_stderr_tail_is_bounded_even_for_one_enormous_multibyte_line() {
+        let line = "é".repeat(STDERR_TAIL_BYTES); // twice the byte cap
+        let tail = stderr_tail(&line);
+        assert!(tail.len() <= STDERR_TAIL_BYTES);
+        assert!(tail.chars().all(|c| c == 'é'));
+        assert_eq!(stderr_tail("a\nb\nc"), "a\nb\nc");
     }
 }

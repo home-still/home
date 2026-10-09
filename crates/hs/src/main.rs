@@ -362,21 +362,59 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> anyhow::Result
         .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))
 }
 
+/// Fill the prompted values into the config template. Values are written as
+/// double-quoted YAML scalars (JSON string syntax is valid YAML), so input
+/// containing `: `, `#` or a leading `*`/`&`/`!` still loads.
 fn generate_config(email: &str, core_key: &str) -> String {
     let mut content = DEFAULT_CONFIG.to_string();
     if !email.is_empty() {
         content = content.replace(
             "# unpaywall_email: you@example.com",
-            &format!("unpaywall_email: {}", email),
+            &format!("unpaywall_email: {}", yaml_quoted(email)),
         );
     }
     if !core_key.is_empty() {
         content = content.replace(
-            "# core_api_key: your-key-here",
-            &format!("core_api_key: {}", core_key),
+            "# core:\n    #   api_key: your-core-key-here",
+            &format!("core:\n      api_key: {}", yaml_quoted(core_key)),
         );
     }
     content
+}
+
+fn yaml_quoted(value: &str) -> String {
+    serde_json::to_string(value).expect("a str always serializes")
+}
+
+#[cfg(test)]
+mod config_template_tests {
+    use super::generate_config;
+
+    /// `hs config init` answers must land where the loaders read them, as
+    /// the exact strings entered, even when they look like YAML syntax.
+    #[test]
+    fn prompted_values_land_under_the_keys_the_loaders_read() {
+        let yaml = generate_config("me: x@example.com", "*key #1");
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        let paper = &doc["paper"];
+        assert_eq!(
+            paper["download"]["unpaywall_email"].as_str(),
+            Some("me: x@example.com")
+        );
+        assert_eq!(
+            paper["providers"]["core"]["api_key"].as_str(),
+            Some("*key #1")
+        );
+    }
+
+    /// With no CORE key entered the template must not carry an empty
+    /// `core:` section: it loads as null, which the paper config rejects.
+    #[test]
+    fn the_unanswered_template_has_no_empty_core_section() {
+        let yaml = generate_config("", "");
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(doc["paper"]["providers"].get("core").is_none());
+    }
 }
 
 #[cfg(all(test, unix))]

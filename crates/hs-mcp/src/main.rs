@@ -55,7 +55,7 @@ struct PaperSearchParams {
     )]
     min_citations: Option<u32>,
     #[schemars(
-        description = "Sort order: relevance, citations, date (default: relevance). Unknown values fall back to relevance."
+        description = "Sort order: relevance, citations, date (default: relevance). Unknown values are an error."
     )]
     sort: Option<String>,
 }
@@ -78,7 +78,9 @@ struct PaperCitationsParams {
     doi: String,
     #[schemars(description = "Maximum citations to return (default 100, max 1000)")]
     limit: Option<u32>,
-    #[schemars(description = "Optional minimum publication year filter (post-fetch)")]
+    #[schemars(
+        description = "Optional minimum publication year; applied while paging, so `limit` counts only citing papers from this year on"
+    )]
     year_from: Option<u16>,
     #[schemars(description = "Sort order: 'year' (default) or 'citations'")]
     sort: Option<String>,
@@ -310,9 +312,9 @@ struct CatalogRepairParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DedupeUrlEncodedParams {
     // rc.306 P0-6: field accepted for schema compatibility but ignored
-    // server-side; MCP always runs in dry-run. The apply path is CLI-only.
+    // server-side; MCP only reports. No command applies the report yet.
     #[schemars(
-        description = "Ignored by MCP (always dry-run). Use `hs catalog dedupe-url-encoded --apply` for the write path."
+        description = "Ignored: this tool only reports. No command applies the dedupe yet."
     )]
     #[serde(default = "default_true")]
     #[allow(dead_code)]
@@ -1075,7 +1077,7 @@ impl HomeStillMcp {
 
         let client = self
             .scribe_client()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or("No scribe server configured")?;
 
         let md_key = convert_and_upload(
@@ -1167,9 +1169,14 @@ impl HomeStillMcp {
             .transpose()?;
 
         let sort_by = match p.sort.as_deref() {
+            None | Some("relevance") => paper::models::SortBy::Relevance,
             Some("citations") => paper::models::SortBy::Citations,
             Some("date") => paper::models::SortBy::Date,
-            _ => paper::models::SortBy::Relevance,
+            Some(other) => {
+                return Err(format!(
+                    "Unknown sort {other:?}. Accepted: relevance, citations, date."
+                ));
+            }
         };
 
         let query = paper::models::SearchQuery {
@@ -1250,6 +1257,11 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<PaperCitationsParams>,
     ) -> Result<String, String> {
+        if let Some(sort) = p.sort.as_deref() {
+            if !matches!(sort, "year" | "citations") {
+                return Err(format!("Unknown sort {sort:?}. Accepted: year, citations."));
+            }
+        }
         let opts = paper::providers::semantic_scholar::CitationsOpts {
             limit: p.limit,
             year_from: p.year_from,
@@ -1402,7 +1414,7 @@ impl HomeStillMcp {
         let mut triples =
             hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
                 .await
-                .map_err(|e| format!("catalog list failed: {e}"))?;
+                .map_err(|e| format!("catalog list failed: {e:#}"))?;
         // Stable ordering by stem for deterministic pagination.
         triples.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -1473,7 +1485,7 @@ impl HomeStillMcp {
         let triples =
             hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
                 .await
-                .map_err(|e| format!("catalog list failed: {e}"))?;
+                .map_err(|e| format!("catalog list failed: {e:#}"))?;
 
         let include_repaired = p.include_repaired.unwrap_or(false);
 
@@ -1596,7 +1608,7 @@ impl HomeStillMcp {
             &p.stem,
         )
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))?
         {
             Some(entry) => to_json(&entry),
             None => Err(format!("No catalog entry found for '{}'", p.stem)),
@@ -1604,7 +1616,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Reports catalog ↔ storage reconciliation in seven directions (forward disk orphans, catalog_no_markdown, catalog_no_source phantoms, flag-drift, flag-drift-resync, md-path-drift, stuck-convert). DRY-RUN ONLY from MCP: the apply path was removed in rc.306 — use `hs distill reconcile --fix-stamps --reembed` or the planned `hs catalog repair --apply` CLI for the write path. Any `dry_run=false` argument is ignored with a notice in the response.",
+        description = "Reports catalog ↔ storage reconciliation in seven directions (forward disk orphans, catalog_no_markdown, catalog_no_source phantoms, flag-drift, flag-drift-resync, md-path-drift, stuck-convert). REPORT ONLY from MCP: the apply path was removed in rc.306 and no CLI command replaces it yet (`hs distill reconcile --fix-stamps --reembed` backfills embedding stamps; `hs pipeline catch-up` re-queues unconverted papers). Any `dry_run=false` argument is ignored with a notice in the response.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1656,7 +1668,7 @@ impl HomeStillMcp {
             on_fetch_progress,
         )
         .await
-        .map_err(|e| format!("snapshot build failed: {e}"))?;
+        .map_err(|e| format!("snapshot build failed: {e:#}"))?;
 
         // Per-phase progress ping so the client timer resets between scans
         // and the operator can see which phase is running. The scans
@@ -1851,7 +1863,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Reports URL-encoded duplicate stems (encoded-form + decoded-form pairs where the decoded twin is the one actually indexed). DRY-RUN ONLY from MCP: the apply path was removed in rc.306 — use the planned `hs catalog dedupe-url-encoded --apply` CLI for the write path. Any `dry_run=false` argument is ignored with a notice in the response.",
+        description = "Reports URL-encoded duplicate stems (encoded-form + decoded-form pairs where the decoded twin is the one actually indexed). REPORT ONLY: the apply path was removed in rc.306 and no CLI command replaces it yet. Any `dry_run=false` argument is ignored.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1865,15 +1877,13 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         // rc.306 P0-6: MCP is a read-only surface. The caller's dry_run
         // argument is intentionally ignored — this handler always reports
-        // without writing; the apply path lives in the (CLI-only) future
-        // `hs catalog dedupe-url-encoded --apply`.
-        let dry_run_forced = true;
+        // without writing, and no command applies the report yet.
         // Enumerate all markdown stems.
         let markdown = self
             .storage
             .list(&self.markdown_prefix)
             .await
-            .map_err(|e| format!("markdown list failed: {e}"))?;
+            .map_err(|e| format!("markdown list failed: {e:#}"))?;
 
         use std::collections::HashSet;
         let stems: HashSet<String> = markdown
@@ -1912,12 +1922,9 @@ impl HomeStillMcp {
             .map(|(e, d)| serde_json::json!({"encoded": e, "decoded": d}))
             .collect();
 
-        // rc.306 P0-6: apply path is CLI-only. MCP emits the report and stops.
-        let _ = dry_run_forced;
         to_json(&serde_json::json!({
             "dry_run": true,
             "mcp_forced_dry_run": true,
-            "apply_hint": "use `hs catalog dedupe-url-encoded --apply` (CLI-only) for the write path",
             "pairs_found": total,
             "would_delete_encoded_rows": total,
             "samples": samples,
@@ -1935,11 +1942,23 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    async fn markdown_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
+    async fn markdown_list(
+        &self,
+        Parameters(p): Parameters<ListParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        // One catalog read per listed document: an unpaginated call runs
+        // longer than the session idle timeout can tolerate without a
+        // progress signal; see `ProgressHeartbeat`.
+        let _heartbeat = ProgressHeartbeat::start(&context, "markdown_list".to_string());
+        self.list_markdown(p).await
+    }
+
+    async fn list_markdown(&self, p: ListParams) -> Result<String, String> {
         let mut metas =
             hs_common::markdown::list_markdown_meta_via(&*self.storage, &self.markdown_prefix)
                 .await
-                .map_err(|e| format!("markdown list failed: {e}"))?;
+                .map_err(|e| format!("markdown list failed: {e:#}"))?;
         metas.sort_by(|a, b| a.0.cmp(&b.0));
 
         let offset = p.offset.unwrap_or(0);
@@ -1956,7 +1975,7 @@ impl HomeStillMcp {
                 &stem,
             )
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .and_then(|c| c.conversion)
             .map(|cv| cv.total_pages)
             .unwrap_or(0);
@@ -2030,7 +2049,7 @@ impl HomeStillMcp {
         let triples =
             hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
                 .await
-                .map_err(|e| format!("catalog list failed: {e}"))?;
+                .map_err(|e| format!("catalog list failed: {e:#}"))?;
 
         // Candidates: row has a DOI and title is missing/empty.
         let candidates: Vec<(String, hs_common::catalog::CatalogEntry)> = triples
@@ -2152,7 +2171,7 @@ impl HomeStillMcp {
             .await
             {
                 Ok(()) => backfilled += 1,
-                Err(e) => errors.push(format!("{stem}: write failed: {e}")),
+                Err(e) => errors.push(format!("{stem}: write failed: {e:#}")),
             }
         }
 
@@ -2180,7 +2199,7 @@ impl HomeStillMcp {
     async fn scribe_health(&self) -> Result<String, String> {
         let client = self
             .scribe_client()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or("No scribe server configured")?;
 
         let (health, health_error) = split_result(client.health().await);
@@ -2232,7 +2251,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or("No distill server configured")?;
 
         let filters = hs_distill::client::SearchFilters {
@@ -2250,7 +2269,7 @@ impl HomeStillMcp {
                 let out = map_distill_search_hits(hits, include_text);
                 to_json(&out)
             }
-            Err(e) => Err(format!("Search failed: {e}")),
+            Err(e) => Err(format!("Search failed: {e:#}")),
         }
     }
 
@@ -2269,7 +2288,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or("No distill server configured")?;
 
         let filters = hs_distill::client::SearchFilters {
@@ -2292,7 +2311,7 @@ impl HomeStillMcp {
                 let out = map_distill_search_hits(hits, include_text);
                 to_json(&out)
             }
-            Err(e) => Err(format!("abstract_search failed: {e}")),
+            Err(e) => Err(format!("abstract_search failed: {e:#}")),
         }
     }
 
@@ -2308,7 +2327,7 @@ impl HomeStillMcp {
     async fn distill_status(&self) -> Result<String, String> {
         let client = self
             .distill_client()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or("No distill server configured")?;
 
         let (health, health_error) = split_result(client.health().await);
@@ -2337,7 +2356,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or("No distill server configured")?;
 
         match client.doc_exists(&p.doc_id).await {
@@ -2345,7 +2364,7 @@ impl HomeStillMcp {
                 "doc_id": p.doc_id,
                 "indexed": exists,
             })),
-            Err(e) => Err(format!("Check failed: {e}")),
+            Err(e) => Err(format!("Check failed: {e:#}")),
         }
     }
 
@@ -2364,7 +2383,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or("No distill server configured")?;
 
         let (key, catalog_entry) = self.existing_markdown(&p.stem).await?;
@@ -2397,14 +2416,23 @@ impl HomeStillMcp {
     async fn distill_reconcile(
         &self,
         Parameters(p): Parameters<DistillReconcileParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
+        // One markdown probe per indexed document: a scan of the whole
+        // collection runs longer than the session idle timeout can tolerate
+        // without a progress signal; see `ProgressHeartbeat`.
+        let _heartbeat = ProgressHeartbeat::start(&context, "distill_reconcile".to_string());
+        self.reconcile_orphans(p).await
+    }
+
+    async fn reconcile_orphans(&self, p: DistillReconcileParams) -> Result<String, String> {
         // rc.306 P0-6: MCP is read-only. The caller's dry_run argument
         // is ignored; the delete path lives in `hs distill reconcile`
         // (existing CLI) and `hs distill purge <doc_id>`.
         let _ = p.dry_run;
         let client = self
             .distill_client()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or("No distill server configured")?;
         // The client refuses a partial list (a missing id would read as a
         // document that was never indexed), so ask for everything the server
@@ -2463,7 +2491,7 @@ impl HomeStillMcp {
             .storage
             .list(&self.markdown_prefix)
             .await
-            .map_err(|e| format!("list({}) failed: {e}", self.markdown_prefix))?;
+            .map_err(|e| format!("list({}) failed: {e:#}", self.markdown_prefix))?;
 
         let mut scanned: usize = 0;
         let mut flagged: Vec<serde_json::Value> = Vec::new();
@@ -2539,7 +2567,7 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let client = self
             .distill_client()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or("No distill server configured")?;
 
         // Verify the markdown and read the fresh catalog row BEFORE talking
@@ -2579,7 +2607,7 @@ impl HomeStillMcp {
         let triples =
             hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
                 .await
-                .map_err(|e| format!("catalog list failed: {e}"))?;
+                .map_err(|e| format!("catalog list failed: {e:#}"))?;
 
         let candidates: Vec<String> = triples
             .into_iter()
@@ -2613,7 +2641,7 @@ impl HomeStillMcp {
 
         let client = self
             .distill_client()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or("No distill server configured")?;
 
         let mut indexed = 0u64;
@@ -2680,7 +2708,7 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<PersonalSearchParams>,
     ) -> Result<String, String> {
-        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let cfg = personal::config::Config::load().map_err(|e| format!("{e:#}"))?;
         let hits = personal::services::search::search(
             &cfg,
             &p.query,
@@ -2688,7 +2716,7 @@ impl HomeStillMcp {
             p.limit.unwrap_or(10),
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
         let json: Vec<serde_json::Value> = hits
             .into_iter()
             .map(|h| {
@@ -2717,13 +2745,13 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<PersonalListParams>,
     ) -> Result<String, String> {
-        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let cfg = personal::config::Config::load().map_err(|e| format!("{e:#}"))?;
         let entries = personal::services::catalog::list_entries(
             &cfg,
             p.category.as_deref(),
             p.limit.unwrap_or(50),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
         let json: Vec<serde_json::Value> = entries
             .into_iter()
             .map(|e| {
@@ -2751,8 +2779,8 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<PersonalReadParams>,
     ) -> Result<String, String> {
-        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
-        personal::services::catalog::read_markdown(&cfg, &p.stem).map_err(|e| e.to_string())
+        let cfg = personal::config::Config::load().map_err(|e| format!("{e:#}"))?;
+        personal::services::catalog::read_markdown(&cfg, &p.stem).map_err(|e| format!("{e:#}"))
     }
 
     #[tool(
@@ -2772,9 +2800,9 @@ impl HomeStillMcp {
         // Runs longer than the session idle timeout can tolerate without a
         // progress signal; see `ProgressHeartbeat`.
         let _heartbeat = ProgressHeartbeat::start(&context, "personal_add".to_string());
-        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let cfg = personal::config::Config::load().map_err(|e| format!("{e:#}"))?;
         let path = personal::services::inbox::resolve_inbox_path(&cfg, &p.filename)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
         let opts = personal::services::ingest::IngestOptions {
             category_override: p.category,
             title_override: p.title,
@@ -2782,7 +2810,7 @@ impl HomeStillMcp {
         };
         let outcome = personal::services::ingest::ingest(&cfg, &path, opts)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
         to_json(&serde_json::json!({
             "stem": outcome.stem,
             "title": outcome.title,
@@ -2805,10 +2833,10 @@ impl HomeStillMcp {
         &self,
         Parameters(p): Parameters<PersonalReindexParams>,
     ) -> Result<String, String> {
-        let cfg = personal::config::Config::load().map_err(|e| e.to_string())?;
+        let cfg = personal::config::Config::load().map_err(|e| format!("{e:#}"))?;
         let chunks = personal::services::catalog::reindex(&cfg, &p.stem)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
         to_json(&serde_json::json!({
             "stem": p.stem,
             "chunks_indexed": chunks,
@@ -2851,11 +2879,15 @@ impl HomeStillMcp {
         Parameters(p): Parameters<OpenAlexSearchParams>,
     ) -> Result<String, String> {
         let limit = p.max_results.unwrap_or(10).min(200) as i64;
-        let sort = p.sort.as_deref().unwrap_or("relevance");
-        let order_by = match sort {
-            "citations" => "ORDER BY cited_by_count DESC NULLS LAST, bm25 DESC",
-            "year" => "ORDER BY publication_year DESC NULLS LAST, bm25 DESC",
-            _ => "ORDER BY bm25 DESC",
+        let order_by = match p.sort.as_deref() {
+            None | Some("relevance") => "ORDER BY bm25 DESC",
+            Some("citations") => "ORDER BY cited_by_count DESC NULLS LAST, bm25 DESC",
+            Some("year") => "ORDER BY publication_year DESC NULLS LAST, bm25 DESC",
+            Some(other) => {
+                return Err(format!(
+                    "Unknown sort {other:?}. Accepted: relevance, citations, year."
+                ));
+            }
         };
         // `conjunctive := 1` requires every query term to appear in the doc.
         // Without it (default disjunctive), a multi-term query against a
@@ -3041,8 +3073,13 @@ impl HomeStillMcp {
     ) -> Result<String, String> {
         let limit = p.limit.unwrap_or(100).min(1000) as i64;
         let order_by = match p.sort.as_deref() {
+            None | Some("citations") => "ORDER BY w.cited_by_count DESC NULLS LAST",
             Some("year") => "ORDER BY w.publication_year DESC NULLS LAST",
-            _ => "ORDER BY w.cited_by_count DESC NULLS LAST",
+            Some(other) => {
+                return Err(format!(
+                    "Unknown sort {other:?}. Accepted: citations, year."
+                ));
+            }
         };
         let sql = format!(
             "SELECT w.openalex_id, w.doi, w.title, w.publication_year, w.cited_by_count
@@ -3264,10 +3301,15 @@ impl HomeStillMcp {
 
         // Scan the catalog once; reuse for both the pipeline failed-count
         // and the history panel so we don't pay to deserialize every YAML twice.
-        let catalog_triples =
-            hs_common::catalog::list_catalog_entries_via(&*self.storage, &self.catalog_prefix)
-                .await
-                .ok();
+        let (catalog_triples, catalog_error) = match hs_common::catalog::list_catalog_entries_via(
+            &*self.storage,
+            &self.catalog_prefix,
+        )
+        .await
+        {
+            Ok(triples) => (Some(triples), None),
+            Err(e) => (None, Some(format!("listing the catalog failed: {e:#}"))),
+        };
 
         // Count entries stamped `embedding_skip` so progress percentages
         // can exclude intentionally-skipped docs from the denominator.
@@ -3290,20 +3332,27 @@ impl HomeStillMcp {
         // Inbox queue — files waiting in `papers/manually_downloaded/` for
         // the next sweep tick. Filtered by the same whitelist the sweeper
         // applies, so the dashboard number tracks what the daemon will
-        // actually relocate. `.ok()` swallows storage blips — we'd rather
-        // show `Inbox ···` than fail the whole `system_status`.
+        // actually relocate. A listing failure is logged with its cause and
+        // leaves the count unknown (`Inbox ···`) rather than failing the
+        // whole `system_status`.
         let inbox_prefix = format!(
             "{}/manually_downloaded/",
             self.papers_prefix.trim_end_matches('/')
         );
-        let inbox_pending: Option<u64> = self.storage.list(&inbox_prefix).await.ok().map(|objs| {
-            objs.iter()
-                .filter(|o| {
-                    let fn_ = o.key.rsplit('/').next().unwrap_or("");
-                    hs_common::inbox::is_inbox_candidate_filename(fn_)
-                })
-                .count() as u64
-        });
+        let inbox_pending: Option<u64> = match self.storage.list(&inbox_prefix).await {
+            Ok(objs) => Some(
+                objs.iter()
+                    .filter(|o| {
+                        let fn_ = o.key.rsplit('/').next().unwrap_or("");
+                        hs_common::inbox::is_inbox_candidate_filename(fn_)
+                    })
+                    .count() as u64,
+            ),
+            Err(e) => {
+                tracing::warn!(prefix = %inbox_prefix, error = %e, "inbox listing failed; the inbox count is unknown");
+                None
+            }
+        };
 
         // A failed listing must not read as a fully converted, empty corpus:
         // mark the counts unavailable so `hs status` renders "unknown".
@@ -3330,6 +3379,9 @@ impl HomeStillMcp {
                 p
             }
         };
+        if let Some(reason) = &catalog_error {
+            pipeline.mark_unavailable(reason);
+        }
 
         // Pipeline drift: distinct source stems that haven't produced
         // markdown yet, less whatever is converting right now. Saturating
@@ -3691,7 +3743,7 @@ impl ServerHandler for HomeStillMcp {
                 &stem,
             )
             .await
-            .map_err(|e| ErrorData::internal_error(format!("catalog read: {e}"), None))?
+            .map_err(|e| ErrorData::internal_error(format!("catalog read: {e:#}"), None))?
             .ok_or_else(|| ErrorData::resource_not_found("catalog entry not found", None))?;
             let yaml = serde_json::to_string_pretty(&entry)
                 .map_err(|e| ErrorData::internal_error(format!("serialize error: {e}"), None))?;

@@ -19,7 +19,7 @@ Installs the `hs` binary to `~/.local/bin/`. Supports macOS (Intel + Apple Silic
 ```sh
 hs config init                                    # set up config + API keys
 hs paper search "transformer attention mechanisms" # search across 6 providers
-hs paper download "neural nets" -n 25              # download PDFs (auto-starts scribe + distill)
+hs paper download "neural nets" -n 25              # download PDFs (publishes papers.ingested for the watchers)
 hs serve scribe                                    # run scribe service on this machine
 hs serve distill                                   # run distill service on this machine
 hs distill search "attention mechanism"            # semantic search
@@ -108,7 +108,7 @@ All providers are queried in parallel when using `--provider all` (default). Res
 
 Convert academic PDFs into structured markdown using a two-stage pipeline:
 
-1. **Layout detection** -- PP-DocLayout-V3 via ONNX Runtime. Detects 10 region types: title, text, figures, tables, formulas, headers, footers, captions, references, equations.
+1. **Layout detection** -- PP-DocLayout-V3 via ONNX Runtime. Detects 25 region types (titles, paragraphs, figures, tables, formulas, headers, footers, captions, references, footnotes, and more).
 2. **VLM OCR** -- Sends detected regions to a vision-language model (GLM-OCR via Ollama) for text extraction.
 3. **Markdown assembly** -- Regions are ordered and assembled into section-aware markdown with heading hierarchy and table structure.
 
@@ -126,7 +126,7 @@ On **macOS Apple Silicon**, Ollama runs natively with Metal GPU acceleration. On
 
 ```sh
 hs scribe convert paper.pdf              # output to stdout
-hs scribe convert paper.pdf -o paper.md  # output to file
+hs scribe convert paper.pdf --out paper.md  # output to file
 ```
 
 ### Watch directory
@@ -301,22 +301,7 @@ See [crates/hs-gateway/README.md](crates/hs-gateway/README.md) for full document
 
 ## MCP Server
 
-home-still includes a [Model Context Protocol](https://modelcontextprotocol.io) server exposing the full read API as 13 tools:
-
-| Tool | Description |
-|------|-------------|
-| `paper_search` | Search academic papers across 6 providers |
-| `paper_get` | Look up a paper by DOI |
-| `catalog_list` | List all papers with conversion status |
-| `catalog_read` | Read full catalog metadata for a paper |
-| `markdown_list` | List converted markdown documents |
-| `markdown_read` | Read a markdown document (full or by page) |
-| `scribe_health` | Check scribe server status |
-| `scribe_convert` | Convert a PDF to markdown |
-| `distill_search` | Semantic search across indexed documents |
-| `distill_status` | Qdrant collection statistics |
-| `distill_exists` | Check if a document is indexed |
-| `system_status` | Full pipeline health and stats |
+home-still includes a [Model Context Protocol](https://modelcontextprotocol.io) server exposing the pipeline as 35 tools: paper search/download/citations (`paper_*`), catalog and markdown access (`catalog_*`, `markdown_*`), scribe (`scribe_health`, `scribe_convert`), distill (`distill_*`, `abstract_search`), personal documents (`personal_*`), `system_status`, and, once the local OpenAlex corpus is built, `openalex_*`. The full list with parameters is in [crates/hs-mcp/README.md](crates/hs-mcp/README.md).
 
 ### Local (stdio)
 
@@ -345,7 +330,7 @@ Remote clients connect via `https://cloud.example.com/mcp` using OAuth2. See [cr
 ## Configuration
 
 ```sh
-hs config init          # creates ~/.home-still/config.yaml (interactive)
+hs config init          # creates ~/.home-still/config.yaml (interactive; --force overwrites)
 hs config show          # prints resolved config
 hs config path          # prints config file path
 ```
@@ -371,10 +356,6 @@ scribe:
 distill:
   servers:
     - http://localhost:7434
-
-cloud:
-  role: client                         # or "gateway" on the tunnel host
-  gateway_url: https://cloud.example.com
 ```
 
 Override with environment variables: `HOME_STILL_PAPER_DOWNLOAD_PATH=/tmp/papers`
@@ -406,11 +387,11 @@ Available on all commands:
 ## Architecture
 
 ```
-crates/hs/          Unified CLI binary (paper, scribe, distill, serve, server, status, upgrade, cloud, config)
+crates/hs/          Unified CLI binary (paper, scribe, distill, personal, serve, status, restart, upgrade, mcp, cloud, pipeline, migrate, openalex, config)
 crates/hs-scribe/   PDF-to-markdown (ONNX layout detection + VLM OCR, client/server)
 crates/hs-distill/  Vector embedding + semantic search (ONNX embeddings, Qdrant, client/server)
 crates/hs-gateway/  Cloud access reverse proxy (OAuth2, token auth, service routing)
-crates/hs-mcp/      MCP server (13 tools, stdio + SSE transport)
+crates/hs-mcp/      MCP server (35 tools, stdio + streamable HTTP transport)
 paper/              Academic paper meta-search library (6 providers, aggregation)
 hs-common/          Shared infrastructure (reporter, service pool, catalog, auth, compose)
 ```

@@ -333,13 +333,18 @@ async fn install_user_service(
                 anyhow::bail!("systemctl --user daemon-reload failed");
             }
             let full_name = format!("hs-{service_name}.service");
-            let status = tokio::process::Command::new("systemctl")
-                .args(["--user", "enable", "--now", &full_name])
-                .status()
-                .await?;
-            if !status.success() {
-                anyhow::bail!("systemctl --user enable --now {full_name} failed");
-            }
+            run_checked(
+                tokio::process::Command::new("systemctl").args(["--user", "enable", &full_name]),
+                &format!("systemctl --user enable {full_name}"),
+            )
+            .await?;
+            // `enable --now` leaves an instance that is already running on
+            // the old unit; a re-install must pick up the rewritten one.
+            run_checked(
+                tokio::process::Command::new("systemctl").args(["--user", "restart", &full_name]),
+                &format!("systemctl --user restart {full_name}"),
+            )
+            .await?;
 
             reporter.finish(&format!(
                 "Installed and started {full_name}\n\
@@ -401,20 +406,24 @@ async fn uninstall_user_service(service_name: &str, reporter: &Arc<dyn Reporter>
         {
             let full_name = format!("hs-{service_name}.service");
             let unit_path = home_dir.join(".config/systemd/user").join(&full_name);
+            if !unit_path.exists() {
+                reporter.finish(&format!("{full_name} is not installed"));
+                return Ok(());
+            }
             reporter.status("Stop", &full_name);
-            let _ = tokio::process::Command::new("systemctl")
-                .args(["--user", "stop", &full_name])
-                .status()
-                .await;
-            let _ = tokio::process::Command::new("systemctl")
-                .args(["--user", "disable", &full_name])
-                .status()
-                .await;
-            let _ = std::fs::remove_file(&unit_path);
-            let _ = tokio::process::Command::new("systemctl")
-                .args(["--user", "daemon-reload"])
-                .status()
-                .await;
+            run_checked(
+                tokio::process::Command::new("systemctl")
+                    .args(["--user", "disable", "--now", &full_name]),
+                &format!("systemctl --user disable --now {full_name}"),
+            )
+            .await?;
+            std::fs::remove_file(&unit_path)
+                .with_context(|| format!("removing {}", unit_path.display()))?;
+            run_checked(
+                tokio::process::Command::new("systemctl").args(["--user", "daemon-reload"]),
+                "systemctl --user daemon-reload",
+            )
+            .await?;
             reporter.finish(&format!("Removed {full_name}"));
         }
 
@@ -424,13 +433,7 @@ async fn uninstall_user_service(service_name: &str, reporter: &Arc<dyn Reporter>
             let plist_path = home_dir
                 .join("Library/LaunchAgents")
                 .join(format!("{label}.plist"));
-            reporter.status("Unload", &label);
-            let _ = tokio::process::Command::new("launchctl")
-                .args(["unload", &plist_path.to_string_lossy()])
-                .status()
-                .await;
-            let _ = std::fs::remove_file(&plist_path);
-            reporter.finish(&format!("Removed {label}"));
+            remove_launch_agent(&label, &plist_path, reporter).await?;
         }
 
         Ok(())
@@ -573,6 +576,51 @@ async fn sudo_write_file(dest: &str, contents: &str) -> Result<()> {
     if !status.success() {
         anyhow::bail!("Failed to install {dest} (sudo tee exited {status})");
     }
+    Ok(())
+}
+
+/// Run `cmd` to completion. A spawn failure or a non-zero exit is an error
+/// naming `what`: install and uninstall must not report success over a
+/// `systemctl` / `sudo` that did nothing.
+#[cfg(target_os = "linux")]
+async fn run_checked(cmd: &mut tokio::process::Command, what: &str) -> Result<()> {
+    let status = cmd
+        .status()
+        .await
+        .with_context(|| format!("{what} could not run"))?;
+    if !status.success() {
+        anyhow::bail!("{what} failed ({status})");
+    }
+    Ok(())
+}
+
+/// Unload a LaunchAgent and delete its plist. A job that was not loaded makes
+/// `launchctl unload` fail harmlessly, so that is a warning; a plist that
+/// cannot be removed is an error. No plist at all means nothing is installed.
+#[cfg(target_os = "macos")]
+async fn remove_launch_agent(
+    label: &str,
+    plist_path: &std::path::Path,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    if !plist_path.exists() {
+        reporter.finish(&format!("{label} is not installed"));
+        return Ok(());
+    }
+    reporter.status("Unload", label);
+    let status = tokio::process::Command::new("launchctl")
+        .args(["unload", &plist_path.to_string_lossy()])
+        .status()
+        .await
+        .context("launchctl unload could not run")?;
+    if !status.success() {
+        reporter.warn(&format!(
+            "`launchctl unload` exited {status}; {label} may not have been loaded"
+        ));
+    }
+    std::fs::remove_file(plist_path)
+        .with_context(|| format!("removing {}", plist_path.display()))?;
+    reporter.finish(&format!("Removed {label}"));
     Ok(())
 }
 
@@ -781,13 +829,18 @@ async fn install_service(
                 anyhow::bail!("systemctl daemon-reload failed");
             }
 
-            let status = tokio::process::Command::new("sudo")
-                .args(["systemctl", "enable", "--now", &service_name])
-                .status()
-                .await?;
-            if !status.success() {
-                anyhow::bail!("systemctl enable --now failed");
-            }
+            run_checked(
+                tokio::process::Command::new("sudo").args(["systemctl", "enable", &service_name]),
+                &format!("sudo systemctl enable {service_name}"),
+            )
+            .await?;
+            // `enable --now` leaves an instance that is already running on
+            // the old unit; a re-install must pick up the rewritten one.
+            run_checked(
+                tokio::process::Command::new("sudo").args(["systemctl", "restart", &service_name]),
+                &format!("sudo systemctl restart {service_name}"),
+            )
+            .await?;
 
             reporter.finish(&format!(
                 "Installed and started {service_name}\n\
@@ -853,24 +906,32 @@ async fn uninstall_service(service_type: &str, reporter: &Arc<dyn Reporter>) -> 
         {
             let service_name = format!("hs-serve-{service_type}");
             let unit_path = format!("/etc/systemd/system/{service_name}.service");
+            if !std::path::Path::new(&unit_path).exists() {
+                reporter.finish(&format!("{service_name} is not installed"));
+                return Ok(());
+            }
 
             reporter.status("Stop", &service_name);
-            let _ = tokio::process::Command::new("sudo")
-                .args(["systemctl", "stop", &service_name])
-                .status()
-                .await;
-            let _ = tokio::process::Command::new("sudo")
-                .args(["systemctl", "disable", &service_name])
-                .status()
-                .await;
-            let _ = tokio::process::Command::new("sudo")
-                .args(["rm", "-f", &unit_path])
-                .status()
-                .await;
-            let _ = tokio::process::Command::new("sudo")
-                .args(["systemctl", "daemon-reload"])
-                .status()
-                .await;
+            run_checked(
+                tokio::process::Command::new("sudo").args([
+                    "systemctl",
+                    "disable",
+                    "--now",
+                    &service_name,
+                ]),
+                &format!("sudo systemctl disable --now {service_name}"),
+            )
+            .await?;
+            run_checked(
+                tokio::process::Command::new("sudo").args(["rm", "-f", &unit_path]),
+                &format!("sudo rm -f {unit_path}"),
+            )
+            .await?;
+            run_checked(
+                tokio::process::Command::new("sudo").args(["systemctl", "daemon-reload"]),
+                "sudo systemctl daemon-reload",
+            )
+            .await?;
 
             reporter.finish(&format!("Removed {service_name}"));
         }
@@ -881,15 +942,7 @@ async fn uninstall_service(service_type: &str, reporter: &Arc<dyn Reporter>) -> 
             let plist_path = hs_common::home_dir()?
                 .join("Library/LaunchAgents")
                 .join(format!("{label}.plist"));
-
-            reporter.status("Unload", &label);
-            let _ = tokio::process::Command::new("launchctl")
-                .args(["unload", &plist_path.to_string_lossy()])
-                .status()
-                .await;
-            let _ = std::fs::remove_file(&plist_path);
-
-            reporter.finish(&format!("Removed {label}"));
+            remove_launch_agent(&label, &plist_path, reporter).await?;
         }
 
         Ok(())

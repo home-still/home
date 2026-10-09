@@ -101,7 +101,8 @@ impl Endpoints {
             arxiv: "https://arxiv.org".to_string(),
             mdpi: "https://www.mdpi.com".to_string(),
             unpaywall: "https://api.unpaywall.org".to_string(),
-            ncbi_idconv: "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/".to_string(),
+            // The legacy `/pmc/utils/idconv/v1.0/` URL answers 301 to this one.
+            ncbi_idconv: "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/".to_string(),
             pmc: "https://pmc.ncbi.nlm.nih.gov".to_string(),
         }
     }

@@ -260,20 +260,30 @@ fn install_linux(reporter: &Arc<dyn Reporter>, exe: &std::path::Path) -> Result<
 }
 
 fn uninstall_linux(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", linux_unit_name()])
-        .status();
     let unit_path = linux_unit_path()?;
-    if unit_path.exists() {
-        std::fs::remove_file(&unit_path)
-            .with_context(|| format!("remove {}", unit_path.display()))?;
-        reporter.status("Removed", &unit_path.display().to_string());
-    } else {
+    if !unit_path.exists() {
         reporter.status("Not installed", linux_unit_name());
+        return Ok(());
     }
-    let _ = Command::new("systemctl")
+    let status = Command::new("systemctl")
+        .args(["--user", "disable", "--now", linux_unit_name()])
+        .status()
+        .context("systemctl disable --now")?;
+    if !status.success() {
+        anyhow::bail!(
+            "systemctl --user disable --now {} failed ({status})",
+            linux_unit_name()
+        );
+    }
+    std::fs::remove_file(&unit_path).with_context(|| format!("remove {}", unit_path.display()))?;
+    reporter.status("Removed", &unit_path.display().to_string());
+    let status = Command::new("systemctl")
         .args(["--user", "daemon-reload"])
-        .status();
+        .status()
+        .context("systemctl daemon-reload")?;
+    if !status.success() {
+        anyhow::bail!("systemctl --user daemon-reload failed ({status})");
+    }
     Ok(())
 }
 

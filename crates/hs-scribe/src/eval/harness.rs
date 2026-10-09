@@ -4,7 +4,7 @@ use crate::eval::metrics::composite::{omnidocbench_composite, CompositeScore};
 use crate::eval::metrics::edit_distance::normalized_edit_distance;
 use crate::ocr::region::RegionType;
 use crate::pipeline::processor::Processor;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,11 +63,17 @@ pub async fn run_eval(
     samples: &[GroundTruthSample],
     dataset_name: &str,
 ) -> Result<EvalResults> {
+    anyhow::ensure!(
+        !samples.is_empty(),
+        "no samples to evaluate for dataset '{dataset_name}'"
+    );
     let debug_dir = std::env::var("EVAL_DEBUG_DIR").ok();
-    let debug_threshold: f64 = std::env::var("EVAL_DEBUG_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(80.0);
+    let debug_threshold: f64 = match std::env::var("EVAL_DEBUG_THRESHOLD") {
+        Ok(s) => s
+            .parse()
+            .with_context(|| format!("EVAL_DEBUG_THRESHOLD is not a number: {s:?}"))?,
+        Err(_) => 80.0,
+    };
     if let Some(ref dir) = debug_dir {
         std::fs::create_dir_all(dir)?;
     }
@@ -160,8 +166,28 @@ pub async fn run_eval(
                     }
                 }
             }
+        } else if !sample.pdf_path.as_os_str().is_empty() {
+            // PDF-only samples (READoc): one conversion through the same
+            // Legacy path the server uses; scored on the whole markdown.
+            match sample.pdf_path.to_str() {
+                Some(pdf) => match processor.process_pdf_with_progress(pdf, |_| {}).await {
+                    Ok(conv) => Some((conv.markdown, Vec::new(), None, None)),
+                    Err(e) => {
+                        eprintln!("FAILED {}: pdf conversion error: {}", sample_id, e);
+                        None
+                    }
+                },
+                None => {
+                    eprintln!(
+                        "FAILED {}: pdf path is not valid UTF-8: {}",
+                        sample_id,
+                        sample.pdf_path.display()
+                    );
+                    None
+                }
+            }
         } else {
-            eprintln!("FAILED {}: no image path", sample_id);
+            eprintln!("FAILED {}: no image path or pdf path", sample_id);
             None
         };
 
@@ -245,7 +271,8 @@ pub async fn run_eval(
                     reference,
                     hypothesis
                 );
-                let _ = std::fs::write(&debug_path, &debug_content);
+                std::fs::write(&debug_path, &debug_content)
+                    .with_context(|| format!("Failed to write debug file {debug_path}"))?;
             }
         }
 

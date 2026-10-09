@@ -323,6 +323,22 @@ impl AppConfig {
                 );
             }
         }
+        // `Semaphore::new` panics above `MAX_PERMITS`: at start-up for
+        // `vlm_concurrency`, but for `page_parallel` / `parallel` inside every
+        // conversion, where the server's panic guard would fail each document
+        // permanently.
+        for (name, value) in [
+            ("vlm_concurrency", self.vlm_concurrency),
+            ("page_parallel", self.page_parallel),
+            ("parallel", self.parallel),
+        ] {
+            if value > tokio::sync::Semaphore::MAX_PERMITS {
+                anyhow::bail!(
+                    "scribe config: `{name}` ({value}) is above the {} permits a semaphore can hold",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                );
+            }
+        }
         if self.max_convert_deadline_secs < self.convert_deadline_secs {
             anyhow::bail!(
                 "scribe config: `max_convert_deadline_secs` ({}) is below `convert_deadline_secs` ({})",
@@ -353,6 +369,33 @@ impl AppConfig {
         Ok(())
     }
 
+    /// The olmocr converter needs its CLI to be runnable on this host. A
+    /// server whose binary is missing reports healthy and then fails every
+    /// conversion as a transient error until the event consumer gives up on
+    /// each document; refuse to start instead. A name with a path separator
+    /// is checked as that path, a bare name is looked up in `path_var` (the
+    /// process's `PATH` in production), as the spawn does.
+    pub fn check_olmocr_bin(&self, path_var: Option<&std::ffi::OsStr>) -> anyhow::Result<()> {
+        let bin = self.olmocr_bin.as_str();
+        let found = if bin.contains(std::path::MAIN_SEPARATOR) || bin.contains('/') {
+            is_executable_file(Path::new(bin))
+        } else {
+            path_var
+                .into_iter()
+                .flat_map(std::env::split_paths)
+                .any(|dir| is_executable_file(&dir.join(bin)))
+        };
+        if !found {
+            anyhow::bail!(
+                "scribe config: `olmocr_bin` (`{bin}`) is not an executable file{}; the converter \
+                 is olmocr. Set HS_SCRIBE_OLMOCR_BIN (or `olmocr_bin` in `scribe_server:`) to the \
+                 olmocr CLI",
+                if bin.contains('/') { "" } else { " on PATH" }
+            );
+        }
+        Ok(())
+    }
+
     /// Resolve a model filename to an absolute path.
     /// If already absolute and exists, use as-is.
     /// Otherwise look in `~/.home-still/models/`.
@@ -379,6 +422,25 @@ impl AppConfig {
 
     pub fn resolved_table_model_path(&self) -> PathBuf {
         Self::resolve_model_path(&self.table_model_path)
+    }
+}
+
+/// `path` is a regular file this process may execute.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -826,6 +888,25 @@ mod tests {
     }
 
     #[test]
+    fn a_concurrency_no_semaphore_can_hold_is_refused_not_a_panic_per_document() {
+        // `Semaphore::new` panics above MAX_PERMITS: for `page_parallel` and
+        // `parallel` inside every conversion, where the server's panic guard
+        // would fail each document permanently.
+        type Break = fn(&mut AppConfig);
+        let cases: [(&str, Break); 3] = [
+            ("vlm_concurrency", |c| c.vlm_concurrency = usize::MAX),
+            ("page_parallel", |c| c.page_parallel = usize::MAX),
+            ("parallel", |c| c.parallel = usize::MAX),
+        ];
+        for (key, break_it) in cases {
+            let mut c = AppConfig::default();
+            break_it(&mut c);
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains(key), "{key}: {err}");
+        }
+    }
+
+    #[test]
     fn an_ollama_request_cannot_outlive_the_longest_convert_deadline() {
         let ollama = AppConfig {
             backend: BackendChoice::Ollama,
@@ -899,6 +980,49 @@ mod tests {
         c.validate().unwrap();
         c.olmocr_bin = "  ".into();
         assert!(c.validate().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_olmocr_server_refuses_to_start_without_a_runnable_cli() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("olmocr");
+        std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = dir.path().join("plain-file");
+        std::fs::write(&plain, "not executable").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let with_bin = |bin: &str| AppConfig {
+            converter: ConverterMode::Olmocr,
+            olmocr_bin: bin.into(),
+            ..AppConfig::default()
+        };
+        let path_var = std::ffi::OsString::from(dir.path());
+
+        // An absolute path is checked as that path.
+        with_bin(&cli.to_string_lossy())
+            .check_olmocr_bin(None)
+            .unwrap();
+        for bad in [
+            plain.to_string_lossy().into_owned(),
+            dir.path().join("absent").to_string_lossy().into_owned(),
+            dir.path().to_string_lossy().into_owned(),
+        ] {
+            let err = with_bin(&bad)
+                .check_olmocr_bin(None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("olmocr_bin"), "{bad}: {err}");
+        }
+        // A bare name is looked up on PATH, as the spawn does.
+        with_bin("olmocr")
+            .check_olmocr_bin(Some(&path_var))
+            .unwrap();
+        assert!(with_bin("olmocr").check_olmocr_bin(None).is_err());
+        assert!(with_bin("plain-file")
+            .check_olmocr_bin(Some(&path_var))
+            .is_err());
     }
 
     /// RA-122: a misspelt key in `scribe:` or `scribe_server:` (at any depth)

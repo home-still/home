@@ -96,8 +96,14 @@ impl CoreProvider {
 
     fn build_search_url(&self, query: &SearchQuery) -> Result<String, PaperError> {
         let q = match query.search_type {
-            SearchType::Title => format!("title:\"{}\"", query.query),
-            SearchType::Author => format!("authors:\"{}\"", query.query),
+            SearchType::Title => format!(
+                "title:\"{}\"",
+                super::query_utils::escape_phrase(&query.query)
+            ),
+            SearchType::Author => format!(
+                "authors:\"{}\"",
+                super::query_utils::escape_phrase(&query.query)
+            ),
             _ => super::query_utils::maybe_quote_phrase(&query.query),
         };
 
@@ -187,7 +193,9 @@ impl PaperProvider for CoreProvider {
             .map(|w| self.core_work_to_paper(w))
             .collect();
 
-        let next_offset = query.offset + query.max_results.min(CORE_PAGE_MAX);
+        let next_offset = query
+            .offset
+            .saturating_add(query.max_results.min(CORE_PAGE_MAX));
         let next_offset = if next_offset < body.total_hits {
             Some(next_offset)
         } else {
@@ -205,7 +213,7 @@ impl PaperProvider for CoreProvider {
 
     async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
         let doi = crate::stem::normalize_doi(doi)?;
-        let phrase = format!("doi:\"{}\"", doi.replace('\\', "\\\\").replace('"', "\\\""));
+        let phrase = format!("doi:\"{}\"", super::query_utils::escape_phrase(&doi));
         let url = url::Url::parse_with_params(
             &format!("{}/v3/search/works", self.base_url),
             &[("q", phrase.as_str()), ("limit", "1")],

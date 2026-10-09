@@ -11,11 +11,24 @@
 //! [`SseBuffer::feed`] with each `Bytes` chunk and iterates the returned
 //! events. ~40 LoC + tests; no external SSE crate needed.
 
-/// A complete SSE event whose bytes cannot be decoded. Dropping it would
-/// silently lose part of the model's output, so it ends the stream.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("SSE event is not valid UTF-8")]
-pub struct SseError;
+/// Largest incomplete event the buffer holds. One chat-completions event is a
+/// token delta (a few hundred bytes); a stream that sends this much without
+/// a blank line is not SSE, and holding it all would let a misbehaving
+/// backend grow the buffer without bound (the read timeout only bounds
+/// silence, not a steady trickle).
+pub const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
+
+/// A stream the buffer refuses to decode. Dropping the offending bytes would
+/// silently lose part of the model's output, so either case ends the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SseError {
+    /// A complete event whose bytes cannot be decoded.
+    #[error("SSE event is not valid UTF-8")]
+    NotUtf8,
+    /// More than [`MAX_EVENT_BYTES`] arrived without an event terminator.
+    #[error("SSE event exceeds {MAX_EVENT_BYTES} bytes without a terminator")]
+    EventTooLarge,
+}
 
 /// Accumulator that yields complete SSE events as bytes arrive.
 ///
@@ -68,6 +81,9 @@ impl SseBuffer {
                 out.push(payload);
             }
         }
+        if self.buf.len() > MAX_EVENT_BYTES {
+            return Err(SseError::EventTooLarge);
+        }
         Ok(out)
     }
 }
@@ -98,7 +114,7 @@ fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
 /// non-`data:` directives are skipped; an event with no `data:` line at all
 /// is `Ok(None)`.
 fn parse_data_lines(event: &[u8]) -> Result<Option<String>, SseError> {
-    let text = std::str::from_utf8(event).map_err(|_| SseError)?;
+    let text = std::str::from_utf8(event).map_err(|_| SseError::NotUtf8)?;
     let mut payloads: Vec<&str> = Vec::new();
     for line in text.split('\n') {
         // Tolerate a trailing CR from CRLF-terminated streams.
@@ -202,7 +218,15 @@ mod tests {
     fn a_complete_event_that_is_not_utf8_is_an_error_not_a_skipped_event() {
         let mut b = SseBuffer::new();
         // 0xff is not valid UTF-8 in any position.
-        assert_eq!(b.feed(b"data: \xff\xfe\xfd\n\n"), Err(SseError));
+        assert_eq!(b.feed(b"data: \xff\xfe\xfd\n\n"), Err(SseError::NotUtf8));
+    }
+
+    #[test]
+    fn an_event_that_never_terminates_is_refused_instead_of_buffered_forever() {
+        let mut b = SseBuffer::new();
+        let chunk = vec![b'a'; MAX_EVENT_BYTES / 2 + 1];
+        assert!(b.feed(&chunk).unwrap().is_empty());
+        assert_eq!(b.feed(&chunk), Err(SseError::EventTooLarge));
     }
 
     #[test]

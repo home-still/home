@@ -86,7 +86,7 @@ pub fn load_omnidocbench_filtered(
             .to_string();
         let page_idx = page_info["page_no"].as_u64().map(|n| n as usize);
 
-        let image_path = resolve_image_path(&base, &image_name);
+        let image_path = resolve_image_path(&base, &image_name)?;
 
         let (text, text_blocks) = extract_text_annotations(entry);
         let table_html = extract_table_annotations(entry);
@@ -116,13 +116,21 @@ pub fn load_omnidocbench_filtered(
     Ok(samples)
 }
 
-fn resolve_image_path(base: &Path, image_name: &str) -> PathBuf {
-    let candidate = base.join("images").join(image_name);
-    if candidate.exists() {
-        return candidate;
-    }
-    // Fallback: try directly in base
-    base.join(image_name)
+/// Resolve `images/<image_name>`. The name comes from the annotation JSON, so
+/// anything that could leave the images directory (absolute path, `..`,
+/// drive prefix) is rejected rather than joined.
+fn resolve_image_path(base: &Path, image_name: &str) -> Result<PathBuf> {
+    let escapes = Path::new(image_name).components().any(|c| {
+        !matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    });
+    anyhow::ensure!(
+        !escapes,
+        "OmniDocBench image_path {image_name:?} must be a relative path inside images/"
+    );
+    Ok(base.join("images").join(image_name))
 }
 
 fn extract_text_annotations(entry: &serde_json::Value) -> (Option<String>, Option<Vec<String>>) {

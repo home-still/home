@@ -36,6 +36,24 @@ fn checked_page_count(count: usize) -> Result<usize> {
     Ok(count)
 }
 
+/// A conversion task that panicked. Its panic comes back from tokio as a
+/// `JoinError`; converting that with `?` would leave it untyped, so the
+/// client would treat it as transient and the same document would be run (and
+/// panic) again on every redelivery. The same bytes panic the same code:
+/// type it as the permanent `ConversionPanicked`, as `server::guarded_conversion`
+/// does for a panic in the conversion future itself. A task that was
+/// cancelled (runtime shutdown) says nothing about the document.
+fn join_failure(e: tokio::task::JoinError) -> anyhow::Error {
+    if e.is_panic() {
+        ConvertFailure::err(
+            FailureCode::ConversionPanicked,
+            format!("a conversion task panicked: {e}"),
+        )
+    } else {
+        anyhow::Error::new(e).context("a conversion task was cancelled")
+    }
+}
+
 /// A single region's OCR output with its layout classification.
 #[derive(Debug, Clone)]
 pub struct RegionResult {
@@ -510,7 +528,8 @@ impl Processor {
                     crate::pdfium::guarded_call(|| parser.page_count(&path))
                 })
             })
-            .await??;
+            .await
+            .map_err(join_failure)??;
             checked_page_count(counted)?
         };
         let total = page_count as u64;
@@ -568,7 +587,7 @@ impl Processor {
                     Arc::clone(&on_progress),
                 )
                 .await?;
-                render.await??;
+                render.await.map_err(join_failure)??;
 
                 // FullPage mode bypasses layout detection — no per-page region
                 // class info exists. Empty class lists tell QC "not bibliography",
@@ -675,7 +694,7 @@ impl Processor {
         )
         .await?;
 
-        stage1.await??;
+        stage1.await.map_err(join_failure)??;
 
         on_progress(ProgressEvent {
             stage: "done".into(),
@@ -719,7 +738,7 @@ async fn recognize_full_pages(
     let mut collected: Vec<(usize, String)> = Vec::with_capacity(total as usize);
     while let Some((i, page)) = rx.recv().await {
         while let Some(done) = tasks.try_join_next() {
-            collected.push(done??);
+            collected.push(done.map_err(join_failure)??);
         }
         let permit = Arc::clone(&page_sem)
             .acquire_owned()
@@ -762,7 +781,7 @@ async fn recognize_full_pages(
         });
     }
     while let Some(res) = tasks.join_next().await {
-        collected.push(res??);
+        collected.push(res.map_err(join_failure)??);
     }
     collected.sort_by_key(|(i, _)| *i);
     Ok(collected.into_iter().map(|(_, md)| md).collect())
@@ -802,7 +821,7 @@ async fn execute_prepared_pages(
 
     while let Some(prepared) = rx.recv().await {
         while let Some(done) = tasks.try_join_next() {
-            results.push(done??);
+            results.push(done.map_err(join_failure)??);
         }
         let page_permit = Arc::clone(&page_sem)
             .acquire_owned()
@@ -837,7 +856,7 @@ async fn execute_prepared_pages(
     }
 
     while let Some(res) = tasks.join_next().await {
-        results.push(res??);
+        results.push(res.map_err(join_failure)??);
     }
     results.sort_by_key(|(idx, _, _, _)| *idx);
     Ok(results)
@@ -1510,6 +1529,27 @@ mod tests {
             unique_id: 0,
             read_order: 0.0,
         }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_conversion_task_is_a_permanent_failure_not_a_transient_one() {
+        use crate::classify::{classify, failure_code, FailureClass};
+        let panicked = tokio::task::spawn_blocking(|| -> Result<()> { panic!("bad page") })
+            .await
+            .unwrap_err();
+        let err = join_failure(panicked);
+        assert_eq!(failure_code(&err), Some(FailureCode::ConversionPanicked));
+        assert!(
+            matches!(classify(&err), FailureClass::Permanent(_)),
+            "{err:#}"
+        );
+
+        // A task cancelled by the runtime says nothing about the document.
+        let pending = tokio::spawn(std::future::pending::<()>());
+        pending.abort();
+        let err = join_failure(pending.await.unwrap_err());
+        assert_eq!(failure_code(&err), None);
+        assert_eq!(classify(&err), FailureClass::Transient);
     }
 
     #[test]

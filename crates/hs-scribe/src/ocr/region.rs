@@ -48,12 +48,9 @@ impl RegionType {
             "header" | "footer" | "header_image" | "footer_image" | "number" | "formula_number" => {
                 RegionType::Skip
             }
-            // Legacy DocLayout-YOLO class names (fallback)
-            "title" | "plain text" | "figure_caption" | "table_caption" | "table_footnote"
-            | "formula_caption" => RegionType::Text,
-            "isolate_formula" => RegionType::Formula,
-            "figure" => RegionType::Figure,
-            "abandon" => RegionType::Skip,
+            // PP-DocLayout-V3 is the only layout model (`models::layout`
+            // rejects any class id outside its 25 classes), so these are
+            // the only names that reach here.
             _ => RegionType::Text,
         }
     }

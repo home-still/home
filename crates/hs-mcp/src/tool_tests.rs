@@ -98,11 +98,11 @@ mod reindex {
 mod reconcile {
     use super::*;
 
-    fn reconcile() -> Parameters<DistillReconcileParams> {
-        Parameters(DistillReconcileParams {
+    fn reconcile() -> DistillReconcileParams {
+        DistillReconcileParams {
             dry_run: true,
             limit: None,
-        })
+        }
     }
 
     /// RA-32: `exists().unwrap_or(false)` reported every document as an
@@ -123,7 +123,7 @@ mod reconcile {
         // fails, as when one S3 prefix times out.
         *storage.only_keys_containing.lock().unwrap() = Some("markdown/".into());
         FaultyStorage::set(&storage.fail_head, true);
-        let err = mcp.distill_reconcile(reconcile()).await.unwrap_err();
+        let err = mcp.reconcile_orphans(reconcile()).await.unwrap_err();
 
         assert!(err.contains("simulated storage outage"), "{err}");
     }
@@ -140,7 +140,7 @@ mod reconcile {
         let distill = FakeDistill::start(vec!["present".into(), "gone".into()]).await;
         let mcp = server(storage, Some(&distill));
 
-        let out = mcp.distill_reconcile(reconcile()).await.unwrap();
+        let out = mcp.reconcile_orphans(reconcile()).await.unwrap();
 
         let out: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(out["orphans"], serde_json::json!(["gone"]));
@@ -155,7 +155,7 @@ mod reconcile {
         let distill = FakeDistill::start(vec![]).await;
         let mcp = server(storage, Some(&distill));
 
-        mcp.distill_reconcile(reconcile()).await.unwrap();
+        mcp.reconcile_orphans(reconcile()).await.unwrap();
 
         let docs_requests: Vec<_> = distill
             .requests()
@@ -354,6 +354,25 @@ mod openalex {
         assert_eq!(ids(&recent), ["W2"], "a real filter still filters");
     }
 
+    /// A sort the tool does not offer is an error; it used to re-sort the
+    /// results by the default key and answer a different question.
+    #[tokio::test]
+    async fn an_unknown_sort_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = server_with_openalex(dir.path());
+
+        let err = mcp
+            .openalex_citations(Parameters(OpenAlexCitationsParams {
+                openalex_id: "W9".into(),
+                limit: None,
+                year_from: None,
+                sort: Some("citation".into()),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Unknown sort"), "{err}");
+    }
+
     #[tokio::test]
     async fn get_resolves_ids_and_normalizes_dois_on_the_query_side() {
         let dir = tempfile::tempdir().unwrap();
@@ -435,11 +454,11 @@ mod broker_outage {
 
         // Read-only: unaffected by the outage.
         let listed = mcp
-            .markdown_list(Parameters(crate::ListParams {
+            .list_markdown(crate::ListParams {
                 limit: None,
                 offset: None,
                 embedded: None,
-            }))
+            })
             .await
             .expect("read-only tools must not depend on the broker");
         assert!(listed.contains("paper-a"), "{listed}");
@@ -473,5 +492,30 @@ mod broker_outage {
                 .unwrap_or(false),
             "nothing may be stored"
         );
+    }
+}
+
+mod paper_search {
+    use super::*;
+    use crate::PaperSearchParams;
+
+    /// An unknown `sort` is refused before any provider is asked.
+    #[tokio::test]
+    async fn an_unknown_sort_is_refused() {
+        let mcp = server(FaultyStorage::new(), None);
+        let err = mcp
+            .paper_search(Parameters(PaperSearchParams {
+                query: "attention".into(),
+                max_results: None,
+                search_type: None,
+                date: None,
+                offset: None,
+                provider: None,
+                min_citations: None,
+                sort: Some("citation".into()),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Unknown sort"), "{err}");
     }
 }

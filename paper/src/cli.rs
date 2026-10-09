@@ -24,7 +24,7 @@ pub enum PaperCmd {
         date: Option<String>,
 
         /// Maximum number of results
-        #[arg(short = 'n', long, default_value = "10")]
+        #[arg(short = 'n', long, default_value = "10", value_parser = clap::value_parser!(u16).range(1..))]
         max_results: u16,
 
         /// Pagination offset. OpenAlex needs a multiple of the page size;
@@ -53,8 +53,9 @@ pub enum PaperCmd {
         #[arg(long)]
         doi: String,
 
-        /// Provider to query
-        #[arg(short, long, default_value = "arxiv")]
+        /// Provider to query. `all` (default) asks every provider; an arXiv
+        /// DOI goes to arXiv alone, since no other provider indexes it.
+        #[arg(short, long, default_value = "all")]
         provider: ProviderArg,
     },
     /// Download papers (search + download, or single DOI)
@@ -75,7 +76,7 @@ pub enum PaperCmd {
         doi: Option<String>,
 
         /// Maximum number of papers to download
-        #[arg(short = 'n', long, default_value = "10")]
+        #[arg(short = 'n', long, default_value = "10", value_parser = clap::value_parser!(u16).range(1..))]
         max_results: u16,
 
         /// Maximum concurrent downloads
@@ -124,13 +125,19 @@ pub enum SortByArg {
     Citations,
 }
 
+/// `--provider` values. Besides clap's lowercase variant names, each provider
+/// answers to the name the README, the MCP tools and the error messages use
+/// (`semantic_scholar`, `europe_pmc` / `europmc`), so a name copied from any
+/// of them works here.
 #[derive(ValueEnum, Clone, Debug)]
 #[value(rename_all = "lowercase")]
 pub enum ProviderArg {
     All,
     Arxiv,
     OpenAlex,
+    #[value(alias = "semantic_scholar", alias = "s2")]
     SemanticScholar,
+    #[value(alias = "europe_pmc", alias = "europmc", alias = "pmc")]
     EuropePmc,
     CrossRef,
     Core,
@@ -155,5 +162,37 @@ impl From<SortByArg> for crate::models::SortBy {
             SortByArg::Date => Self::Date,
             SortByArg::Citations => Self::Citations,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The README documents `semantic_scholar` and `europe_pmc`, the MCP tools
+    /// and rate-limit errors say `europmc`: clap's own spelling is
+    /// `semanticscholar` / `europepmc`, which used to be the only ones accepted.
+    #[test]
+    fn every_documented_provider_spelling_is_accepted() {
+        for name in [
+            "all",
+            "arxiv",
+            "openalex",
+            "semanticscholar",
+            "semantic_scholar",
+            "s2",
+            "europepmc",
+            "europe_pmc",
+            "europmc",
+            "pmc",
+            "crossref",
+            "core",
+        ] {
+            assert!(
+                <ProviderArg as ValueEnum>::from_str(name, false).is_ok(),
+                "{name}"
+            );
+        }
+        assert!(<ProviderArg as ValueEnum>::from_str("scholar", false).is_err());
     }
 }

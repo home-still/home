@@ -35,7 +35,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 #[derive(Parser)]
 #[command(name = "hs-gateway", version = env!("HS_VERSION"))]
 struct Args {
-    /// Override listen address (default: from config or 127.0.0.1:7440)
+    /// Override `cloud.gateway.listen` from config.yaml
     #[arg(long)]
     listen: Option<String>,
 

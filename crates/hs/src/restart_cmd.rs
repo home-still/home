@@ -9,7 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+use anyhow::{bail, Result};
 use hs_common::reporter::Reporter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +42,7 @@ struct ServiceUnit {
 /// daemon, and the compose containers. Called by `hs restart`.
 pub async fn run(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let binaries = installed_binaries();
-    let (mut restarted, mut failures) = restart_units(&binaries, reporter).await?;
+    let (mut restarted, mut failures) = restart_units(&binaries, reporter).await;
 
     match restart_index_daemon(reporter).await {
         Ok(true) => restarted += 1,
@@ -58,7 +60,7 @@ pub async fn run(reporter: &Arc<dyn Reporter>) -> Result<()> {
 /// Restart only the units running one of `replaced`. Called by `hs upgrade`
 /// once the new binaries are on disk.
 pub async fn after_upgrade(replaced: &[PathBuf], reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let (mut restarted, mut failures) = restart_units(replaced, reporter).await?;
+    let (mut restarted, mut failures) = restart_units(replaced, reporter).await;
 
     // The index daemon is started as a child of `hs`, so only a replaced `hs`
     // changes what it would exec.
@@ -116,23 +118,23 @@ fn installed_binaries() -> Vec<PathBuf> {
     binaries
 }
 
-async fn restart_units(
-    binaries: &[PathBuf],
-    reporter: &Arc<dyn Reporter>,
-) -> Result<(u32, Vec<String>)> {
-    let mut units = discover_system_units()
-        .await
-        .context("discovering system units")?;
-    units.extend(
-        discover_user_units()
-            .await
-            .context("discovering user units")?,
-    );
-    #[cfg(target_os = "macos")]
-    units.extend(discover_launchd_units().context("discovering launchd jobs")?);
-
+/// Restart the discovered units running one of `binaries`. A scope whose
+/// units cannot be listed (no user bus over ssh, `launchctl` failing) is a
+/// failure of its own, reported with the rest: the other scopes are still
+/// discovered and restarted, so one unreachable manager does not leave every
+/// unit on the old code.
+async fn restart_units(binaries: &[PathBuf], reporter: &Arc<dyn Reporter>) -> (u32, Vec<String>) {
     let mut restarted = 0u32;
     let mut failures = Vec::new();
+    let mut units = Vec::new();
+    let mut discovered = |what: &str, found: Result<Vec<ServiceUnit>>| match found {
+        Ok(found) => units.extend(found),
+        Err(e) => failures.push(format!("discovering {what}: {e:#}")),
+    };
+    discovered("system units", discover_system_units().await);
+    discovered("user units", discover_user_units().await);
+    #[cfg(target_os = "macos")]
+    discovered("launchd jobs", discover_launchd_units());
 
     for unit in select_units(units, binaries) {
         if !unit.active {
@@ -165,7 +167,7 @@ async fn restart_units(
         }
     }
 
-    Ok((restarted, failures))
+    (restarted, failures)
 }
 
 /// Units that must be bounced for `binaries`: running a replaced binary and

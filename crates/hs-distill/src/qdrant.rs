@@ -40,6 +40,28 @@ fn qerr(what: &str, e: impl std::fmt::Display) -> DistillError {
     DistillError::Qdrant(format!("{what}: {e}"))
 }
 
+/// Check the answer to a write sent with `wait(true)`: Qdrant applied it
+/// (`Completed`). Without `wait` it answers `Acknowledged` as soon as the
+/// operation is queued, so an application failure would be reported to
+/// nobody and the caller would stamp a document as indexed whose points
+/// never landed; any other status here (a lapsed wait, a rejected clock)
+/// means the change is not known to be applied.
+fn ensure_applied(
+    what: &str,
+    response: qdrant::PointsOperationResponse,
+) -> Result<(), DistillError> {
+    let status = response.result.map(|r| r.status);
+    if status == Some(qdrant::UpdateStatus::Completed as i32) {
+        return Ok(());
+    }
+    let status = status
+        .and_then(|s| qdrant::UpdateStatus::try_from(s).ok())
+        .map_or_else(|| "no status".to_string(), |s| format!("{s:?}"));
+    Err(DistillError::Qdrant(format!(
+        "{what}: Qdrant did not apply the change (status: {status})"
+    )))
+}
+
 // ── Collection setup ───────────────────────────────────────────
 
 /// What [`ensure_collection`] did.
@@ -386,11 +408,12 @@ impl VectorStore for QdrantStore {
             })
             .collect::<Result<Vec<_>, DistillError>>()?;
 
-        self.client
-            .upsert_points(UpsertPointsBuilder::new(collection, points))
+        let response = self
+            .client
+            .upsert_points(UpsertPointsBuilder::new(collection, points).wait(true))
             .await
             .map_err(|e| qerr("Failed to upsert", e))?;
-        Ok(())
+        ensure_applied("Failed to upsert", response)
     }
 
     async fn delete_chunks_from(
@@ -399,13 +422,16 @@ impl VectorStore for QdrantStore {
         doc_id: &str,
         from_chunk: u32,
     ) -> Result<(), DistillError> {
-        self.client
+        let response = self
+            .client
             .delete_points(
-                DeletePointsBuilder::new(collection).points(doc_filter(doc_id, from_chunk)),
+                DeletePointsBuilder::new(collection)
+                    .points(doc_filter(doc_id, from_chunk))
+                    .wait(true),
             )
             .await
             .map_err(|e| qerr("Failed to delete points", e))?;
-        Ok(())
+        ensure_applied("Failed to delete points", response)
     }
 
     async fn doc_chunks(&self, collection: &str, doc_id: &str) -> Result<u64, DistillError> {
@@ -680,10 +706,15 @@ pub async fn scrub_interstitial_chunks(
     let mut deleted: u64 = 0;
     if !dry_run && !matched_ids.is_empty() {
         for batch in matched_ids.chunks(DELETE_BATCH) {
-            client
-                .delete_points(DeletePointsBuilder::new(collection_name).points(batch.to_vec()))
+            let response = client
+                .delete_points(
+                    DeletePointsBuilder::new(collection_name)
+                        .points(batch.to_vec())
+                        .wait(true),
+                )
                 .await
                 .map_err(|e| qerr("delete failed", e))?;
+            ensure_applied("delete failed", response)?;
             deleted += batch.len() as u64;
         }
     }
@@ -910,6 +941,26 @@ mod tests {
             })
             .expect("chunk_index range");
         assert_eq!(range.gte, Some(3.0));
+    }
+
+    #[test]
+    fn a_write_counts_only_when_qdrant_reports_it_applied() {
+        let answer = |status: Option<qdrant::UpdateStatus>| qdrant::PointsOperationResponse {
+            result: status.map(|s| qdrant::UpdateResult {
+                operation_id: Some(1),
+                status: s as i32,
+            }),
+            ..Default::default()
+        };
+        ensure_applied("w", answer(Some(qdrant::UpdateStatus::Completed))).unwrap();
+        for not_applied in [
+            Some(qdrant::UpdateStatus::Acknowledged),
+            Some(qdrant::UpdateStatus::WaitTimeout),
+            None,
+        ] {
+            let err = ensure_applied("w", answer(not_applied)).unwrap_err();
+            assert!(matches!(err, DistillError::Qdrant(_)), "{not_applied:?}");
+        }
     }
 
     #[test]

@@ -529,8 +529,9 @@ fn split_tables(html: &str) -> Vec<String> {
 
 /// Decode common HTML entities in text content.
 fn decode_html_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
+    // `&amp;` last: decoding it first would turn the escaped text `&amp;lt;`
+    // into `&lt;` and then (wrongly) into `<`.
+    s.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#x27;", "'")
@@ -538,6 +539,7 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&apos;", "'")
         .replace("&#x2019;", "\u{2019}")
         .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
 }
 
 /// Official OmniDocBench table HTML normalization.
@@ -924,5 +926,16 @@ mod tests {
         let html_clean = "<table><tr><td>ζ-potential</td></tr></table>";
         let score = teds_score(html_with_sub, html_clean).unwrap();
         assert_eq!(score, 100.0, "sub stripping with Unicode should work");
+    }
+
+    #[test]
+    fn test_escaped_entity_text_is_not_double_decoded() {
+        // `&amp;lt;` is the literal text "&lt;", not "<".
+        let escaped = "<table><tr><td>a &amp;lt; b</td></tr></table>";
+        let literal = "<table><tr><td>a &lt; b</td></tr></table>";
+        let tree = parse_html_table(escaped).unwrap();
+        assert_eq!(tree.children[0].children[0].content, "a &lt; b");
+        let tree = parse_html_table(literal).unwrap();
+        assert_eq!(tree.children[0].children[0].content, "a < b");
     }
 }

@@ -215,4 +215,21 @@ impl Config {
             self.root_dir().join(p)
         }
     }
+
+    /// A category a caller named (`--category`, the MCP `category` argument)
+    /// as one of this store's: parsed case-insensitively and required to be
+    /// in `personal.categories`. A name outside it matches no document, so it
+    /// is an error, not an empty result.
+    pub fn resolve_category(&self, name: &str) -> Result<Category> {
+        let category: Category = name.trim().parse()?;
+        if self
+            .categories
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(category.as_str()))
+        {
+            Ok(category)
+        } else {
+            Err(PersonalError::UnknownCategory(name.trim().to_string()))
+        }
+    }
 }

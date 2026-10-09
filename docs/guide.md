@@ -137,7 +137,7 @@ Download what looks good:
 hs paper download "diffusion models for protein structure" -n 10
 ```
 
-The PDFs land in `~/home-still/papers/`. If you have `hs serve scribe` and `hs serve distill` running (locally or on another machine in your network), the conversion and indexing kick off automatically — no extra commands.
+The PDFs land in `~/home-still/papers/`. Each download publishes a `papers.ingested` event. If the servers (`hs serve scribe`, `hs serve distill`) and the event watchers (`hs serve scribe-watch`, `hs serve distill-watch`, with `events.backend: nats` configured) are running, conversion and indexing follow automatically — no extra commands.
 
 Watch the live dashboard:
 

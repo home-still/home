@@ -212,7 +212,7 @@ impl LayoutDetector {
                 break;
             }
 
-            let class_id = det_data[base] as usize;
+            let class_id_raw = det_data[base];
             let score = det_data[base + 1];
             let x1 = det_data[base + 2];
             let y1 = det_data[base + 3];
@@ -226,11 +226,8 @@ impl LayoutDetector {
                 continue;
             }
 
-            let class_name = if class_id < CLASS_NAMES.len() {
-                CLASS_NAMES[class_id].to_string()
-            } else {
-                format!("unknown_{}", class_id)
-            };
+            let class_id = class_index(class_id_raw)?;
+            let class_name = CLASS_NAMES[class_id].to_string();
 
             // Keep the pre-clamp values for diagnostic logging if the
             // post-clamp bbox turns out degenerate.
@@ -354,9 +351,25 @@ fn detection_count(shape: &[i64]) -> Result<usize> {
     }
 }
 
+/// Index into [`CLASS_NAMES`] for the class id a detection row carries. A
+/// row that passed the score gate with an id outside the 25-class taxonomy
+/// (or a non-integer one) comes from a model that is not PP-DocLayout-V3:
+/// mapping it to a made-up class would route its region to the VLM as plain
+/// text, so the page fails instead.
+fn class_index(raw: f32) -> Result<usize> {
+    if raw.fract() == 0.0 && raw >= 0.0 && (raw as usize) < CLASS_NAMES.len() {
+        Ok(raw as usize)
+    } else {
+        anyhow::bail!(
+            "layout model emitted class id {raw}, outside the {} PP-DocLayout-V3 classes",
+            CLASS_NAMES.len()
+        )
+    }
+}
+
 #[cfg(test)]
 mod shape_tests {
-    use super::detection_count;
+    use super::{class_index, detection_count, CLASS_NAMES};
 
     #[test]
     fn only_an_n_by_7_output_is_a_detection_table() {
@@ -364,6 +377,16 @@ mod shape_tests {
         assert_eq!(detection_count(&[12, 7]).unwrap(), 12);
         for bad in [vec![], vec![7], vec![12, 6], vec![1, 12, 7], vec![-1, 7]] {
             assert!(detection_count(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_class_id_outside_the_taxonomy_is_an_error_not_an_invented_class() {
+        assert_eq!(class_index(0.0).unwrap(), 0);
+        assert_eq!(class_index(22.0).unwrap(), 22);
+        assert_eq!(class_index((CLASS_NAMES.len() - 1) as f32).unwrap(), 24);
+        for bad in [CLASS_NAMES.len() as f32, -1.0, 3.5, f32::NAN, f32::INFINITY] {
+            assert!(class_index(bad).is_err(), "{bad}");
         }
     }
 }

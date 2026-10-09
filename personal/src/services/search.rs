@@ -17,8 +17,11 @@ pub async fn search(
     category: Option<&str>,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
+    let category = category.map(|c| cfg.resolve_category(c)).transpose()?;
     let distill = PersonalDistill::new(cfg)?;
-    let raw = distill.search(query, limit as u64, category).await?;
+    let raw = distill
+        .search(query, limit as u64, category.map(|c| c.as_str()))
+        .await?;
     Ok(raw
         .into_iter()
         .map(|h| SearchHit {

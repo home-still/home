@@ -501,24 +501,31 @@ fn clean_blank_lines(md: &str) -> String {
     cleaned.trim().to_string()
 }
 
-/// Append one text node's words. Whitespace at the node's edges survives as
-/// a single space, so `Hello <b>world</b> again` does not become
+/// Append one text node's words, runs of whitespace (source line wrapping
+/// and indentation included) collapsed to one space: indentation kept at
+/// the start of a continuation line would make a Markdown code block of a
+/// wrapped paragraph. Whitespace at the node's edges survives as a single
+/// space, so `Hello <b>world</b> again` does not become
 /// `Hello**world**again`; a node that is only whitespace (the separator in
 /// `<b>Hello</b> <i>world</i>`) adds one space unless `md` already ends in
 /// whitespace, e.g. after a block or a table cell.
 fn push_text(md: &mut String, text: &str) {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
+    let mut words = text.split_whitespace();
+    let Some(first) = words.next() else {
         if !text.is_empty() && !md.is_empty() && !md.ends_with(char::is_whitespace) {
             md.push(' ');
         }
         return;
-    }
+    };
     if text.starts_with(char::is_whitespace) && !md.is_empty() && !md.ends_with(char::is_whitespace)
     {
         md.push(' ');
     }
-    md.push_str(trimmed);
+    md.push_str(first);
+    for word in words {
+        md.push(' ');
+        md.push_str(word);
+    }
     if text.ends_with(char::is_whitespace) {
         md.push(' ');
     }
@@ -526,14 +533,19 @@ fn push_text(md: &mut String, text: &str) {
 
 /// Markdown written before and after the content of an element, or `None`
 /// for an element that is transparent (its children are walked, nothing is
-/// written for it).
+/// written for it). Every block-level element is separated from its
+/// neighbours, or `Intro<blockquote>Quote</blockquote>` would read
+/// `IntroQuote`.
 fn wrap(tag: &str) -> Option<(&'static str, &'static str)> {
     Some(match tag {
         "h1" => ("\n\n# ", "\n\n"),
         "h2" => ("\n\n## ", "\n\n"),
         "h3" => ("\n\n### ", "\n\n"),
         "h4" | "h5" | "h6" => ("\n\n#### ", "\n\n"),
-        "p" | "div" => ("\n\n", "\n\n"),
+        "p" | "div" | "section" | "article" | "main" | "header" | "footer" | "blockquote"
+        | "figure" | "figcaption" | "form" | "fieldset" | "legend" | "address" | "details"
+        | "summary" | "hgroup" | "table" | "caption" | "dl" | "hr" => ("\n\n", "\n\n"),
+        "dt" | "dd" => ("\n", "\n"),
         "strong" | "b" => ("**", "**"),
         "em" | "i" => ("_", "_"),
         "ul" | "ol" => ("\n", "\n"),
@@ -547,12 +559,53 @@ fn wrap(tag: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
-/// Elements whose whole subtree is dropped.
-fn is_dropped(tag: &str) -> bool {
-    matches!(
-        tag,
-        "script" | "style" | "nav" | "footer" | "header" | "aside" | "noscript" | "link" | "meta"
-    )
+/// Elements whose whole subtree is dropped. `header` and `footer` are page
+/// chrome only outside sectioning content: inside an `<article>`,
+/// `<main>` or `<section>` they are that section's own title block, which
+/// is the document.
+fn is_dropped(tag: &str, in_sectioning: bool) -> bool {
+    match tag {
+        "script" | "style" | "nav" | "aside" | "noscript" | "link" | "meta" => true,
+        "header" | "footer" => !in_sectioning,
+        _ => false,
+    }
+}
+
+fn is_sectioning(tag: &str) -> bool {
+    matches!(tag, "article" | "main" | "section")
+}
+
+/// Whether the walk starts inside sectioning content: any root but `<body>`
+/// is the article body itself.
+fn root_is_sectioning(root: &ElementRef) -> bool {
+    root.value().name() != "body"
+}
+
+/// Open a fenced code block for a `<pre>`; returns where its content starts.
+fn open_pre(md: &mut String) -> usize {
+    md.push_str("\n\n");
+    md.len()
+}
+
+/// Close the fenced block opened at `start`. The fence is one backtick
+/// longer than the longest run inside, so the content cannot end it early.
+fn close_pre(md: &mut String, start: usize) {
+    let (mut longest, mut run) = (0usize, 0usize);
+    for byte in md[start..].bytes() {
+        if byte == b'`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat(longest.max(2) + 1);
+    md.insert_str(start, &format!("{fence}\n"));
+    if !md.ends_with('\n') {
+        md.push('\n');
+    }
+    md.push_str(&fence);
+    md.push_str("\n\n");
 }
 
 /// Walk the children of `element` in document order, appending markdown.
@@ -562,6 +615,11 @@ fn walk_html_node(element: &ElementRef, md: &mut String) {
     let root_id = element.id();
     // While set, everything inside the dropped element with this id is skipped.
     let mut dropped: Option<ego_tree::NodeId> = None;
+    // The outermost open `<pre>` and where its content starts in `md`: its
+    // text is copied verbatim and its markup adds nothing.
+    let mut pre: Option<(ego_tree::NodeId, usize)> = None;
+    // Sectioning elements open around the current node, the root included.
+    let mut sectioning = usize::from(root_is_sectioning(element));
     for edge in element.traverse() {
         match edge {
             Edge::Open(node) => {
@@ -569,13 +627,30 @@ fn walk_html_node(element: &ElementRef, md: &mut String) {
                     continue;
                 }
                 match node.value() {
-                    Node::Text(text) => push_text(md, text),
+                    Node::Text(text) => {
+                        if pre.is_some() {
+                            md.push_str(text);
+                        } else {
+                            push_text(md, text);
+                        }
+                    }
                     // `<template>` contents are inert: never part of the text.
                     Node::Fragment => dropped = Some(node.id()),
                     Node::Element(el) => {
                         let tag = el.name();
-                        if is_dropped(tag) {
+                        if is_dropped(tag, sectioning > 0) {
                             dropped = Some(node.id());
+                            continue;
+                        }
+                        if is_sectioning(tag) {
+                            sectioning += 1;
+                        }
+                        if pre.is_some() {
+                            if tag == "br" {
+                                md.push('\n');
+                            }
+                        } else if tag == "pre" {
+                            pre = Some((node.id(), open_pre(md)));
                         } else if let Some((before, _)) = wrap(tag) {
                             md.push_str(before);
                         }
@@ -594,12 +669,138 @@ fn walk_html_node(element: &ElementRef, md: &mut String) {
                     continue;
                 }
                 if let Node::Element(el) = node.value() {
-                    if let Some((_, after)) = wrap(el.name()) {
+                    let tag = el.name();
+                    if is_sectioning(tag) {
+                        sectioning = sectioning.saturating_sub(1);
+                    }
+                    if let Some((id, start)) = pre {
+                        if node.id() == id {
+                            close_pre(md, start);
+                            pre = None;
+                        }
+                    } else if let Some((_, after)) = wrap(tag) {
                         md.push_str(after);
                     }
                 }
             }
         }
+    }
+}
+
+/// HTML elements that never have content: `<br/>` is already complete.
+const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "basefont", "bgsound", "br", "col", "embed", "frame", "hr", "img", "input",
+    "keygen", "link", "meta", "param", "source", "track", "wbr",
+];
+
+/// Index just past the first `terminator` at or after `from` (the end of the
+/// text when there is none).
+fn skip_past(s: &str, from: usize, terminator: &str) -> usize {
+    s[from..]
+        .find(terminator)
+        .map_or(s.len(), |at| from + at + terminator.len())
+}
+
+/// Index of the first `</name` (ASCII case-insensitive) at or after `from`,
+/// or the end of the text.
+fn find_close_tag(s: &str, from: usize, name: &str) -> usize {
+    let mut at = from;
+    while let Some(rel) = s[at..].find("</") {
+        let tag = at + rel;
+        let named = s.as_bytes()[tag + 2..]
+            .get(..name.len())
+            .is_some_and(|c| c.eq_ignore_ascii_case(name.as_bytes()));
+        if named {
+            return tag;
+        }
+        at = tag + 2;
+    }
+    s.len()
+}
+
+/// Spell out the empty-element tags of an XHTML document (`<title/>` →
+/// `<title></title>`) for the HTML parser, which ignores the slash on a
+/// non-void element: it reads `<title/>` as an open `<title>` whose text
+/// runs to the end of the file (the chapter vanishes), `<script src=".."/>`
+/// the same, and every `<div/>` as one more level of nesting. Void
+/// elements, comments, CDATA, processing instructions and the contents of
+/// `<script>`/`<style>` are left alone. One linear scan; the input is
+/// returned unchanged when there is nothing to rewrite.
+pub(crate) fn expand_xhtml_empty_elements(xhtml: &str) -> Cow<'_, str> {
+    let bytes = xhtml.as_bytes();
+    let mut rewritten: Option<String> = None;
+    // Everything before this index is already in `rewritten`.
+    let mut copied = 0usize;
+    let mut at = 0usize;
+    while let Some(rel) = xhtml[at..].find('<') {
+        let start = at + rel;
+        let rest = &xhtml[start..];
+        if rest.starts_with("<!--") {
+            at = skip_past(xhtml, start + 4, "-->");
+            continue;
+        }
+        if rest.starts_with("<![CDATA[") {
+            at = skip_past(xhtml, start + 9, "]]>");
+            continue;
+        }
+        if rest.starts_with("<?") {
+            at = skip_past(xhtml, start + 2, "?>");
+            continue;
+        }
+        if rest.starts_with("<!") || rest.starts_with("</") {
+            at = skip_past(xhtml, start + 2, ">");
+            continue;
+        }
+        if !bytes.get(start + 1).is_some_and(u8::is_ascii_alphabetic) {
+            at = start + 1;
+            continue;
+        }
+        let name_end = bytes[start + 1..]
+            .iter()
+            .position(|b| b.is_ascii_whitespace() || matches!(b, b'/' | b'>'))
+            .map_or(bytes.len(), |p| start + 1 + p);
+        // The tag ends at the first `>` outside a quoted attribute value.
+        let mut quote = 0u8;
+        let mut end = None;
+        for (i, &b) in bytes[name_end..].iter().enumerate() {
+            match quote {
+                0 => match b {
+                    b'"' | b'\'' => quote = b,
+                    b'>' => {
+                        end = Some(name_end + i);
+                        break;
+                    }
+                    _ => {}
+                },
+                q if b == q => quote = 0,
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        let name = &xhtml[start + 1..name_end];
+        let self_closing = bytes[end - 1] == b'/';
+        if self_closing {
+            if !VOID_ELEMENTS.iter().any(|v| v.eq_ignore_ascii_case(name)) {
+                let buf = rewritten.get_or_insert_with(|| String::with_capacity(xhtml.len() + 64));
+                buf.push_str(&xhtml[copied..end - 1]);
+                buf.push_str("></");
+                buf.push_str(name);
+                buf.push('>');
+                copied = end + 1;
+            }
+        } else if name.eq_ignore_ascii_case("script") || name.eq_ignore_ascii_case("style") {
+            // Raw text: what looks like markup in there is not markup.
+            at = find_close_tag(xhtml, end + 1, name);
+            continue;
+        }
+        at = end + 1;
+    }
+    match rewritten {
+        Some(mut buf) => {
+            buf.push_str(&xhtml[copied..]);
+            Cow::Owned(buf)
+        }
+        None => Cow::Borrowed(xhtml),
     }
 }
 
@@ -651,25 +852,43 @@ mod tests {
 
     // ── the walker and the bounded parser against scraper's own ─────
 
-    /// The walker as it was before it became iterative: the oracle the new
-    /// one must match byte for byte.
-    fn oracle_walk(element: &ElementRef, md: &mut String) {
+    /// The walker as it was before it became iterative (plus the context it
+    /// now carries): the oracle the new one must match byte for byte.
+    fn oracle_walk(element: &ElementRef, md: &mut String, sectioning: bool, in_pre: bool) {
         for child in element.children() {
             match child.value() {
-                Node::Text(text) => push_text(md, text),
+                Node::Text(text) => {
+                    if in_pre {
+                        md.push_str(text);
+                    } else {
+                        push_text(md, text);
+                    }
+                }
                 Node::Element(el) => {
                     let tag = el.name();
                     if let Some(child_ref) = ElementRef::wrap(child) {
-                        if is_dropped(tag) {
+                        if is_dropped(tag, sectioning) {
                             continue;
                         }
-                        match wrap(tag) {
-                            Some((before, after)) => {
-                                md.push_str(before);
-                                oracle_walk(&child_ref, md);
-                                md.push_str(after);
+                        let inner = sectioning || is_sectioning(tag);
+                        if in_pre {
+                            if tag == "br" {
+                                md.push('\n');
                             }
-                            None => oracle_walk(&child_ref, md),
+                            oracle_walk(&child_ref, md, inner, true);
+                        } else if tag == "pre" {
+                            let start = open_pre(md);
+                            oracle_walk(&child_ref, md, inner, true);
+                            close_pre(md, start);
+                        } else {
+                            match wrap(tag) {
+                                Some((before, after)) => {
+                                    md.push_str(before);
+                                    oracle_walk(&child_ref, md, inner, false);
+                                    md.push_str(after);
+                                }
+                                None => oracle_walk(&child_ref, md, inner, false),
+                            }
                         }
                     }
                 }
@@ -684,7 +903,7 @@ mod tests {
             return doc.root_element().text().collect::<Vec<_>>().join(" ");
         };
         let mut md = String::new();
-        oracle_walk(&root, &mut md);
+        oracle_walk(&root, &mut md, root_is_sectioning(&root), false);
         clean_blank_lines(&md)
     }
 
@@ -1133,6 +1352,77 @@ mod tests {
         assert_eq!(
             md("<html><body><p><span>John</span> <span>Smith</span></p></body></html>"),
             "John Smith"
+        );
+    }
+
+    /// `fragment` as the whole body of a page.
+    fn body_md(fragment: &str) -> String {
+        md(&format!("<html><body>{fragment}</body></html>"))
+    }
+
+    #[test]
+    fn source_line_wrapping_and_indentation_do_not_reach_the_markdown() {
+        // Four or more leading spaces on a continuation line would turn the
+        // rest of the paragraph into a Markdown code block.
+        let md = body_md("<p>\n        Some long\n        wrapped   text\n      </p>");
+        assert_eq!(md, "Some long wrapped text");
+    }
+
+    #[test]
+    fn block_elements_do_not_glue_their_neighbours_together() {
+        let md = body_md(
+            "Intro<blockquote>Quote</blockquote>Outro<dl><dt>Term</dt><dd>Meaning</dd></dl>",
+        );
+        let lines: Vec<&str> = md.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines,
+            ["Intro", "Quote", "Outro", "Term", "Meaning"],
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn pre_keeps_its_whitespace_in_a_fenced_block() {
+        let md =
+            body_md("<p>Before</p><pre><code>def f():\n    return 1\n</code></pre><p>After</p>");
+        assert!(md.contains("```\ndef f():\n    return 1\n```"), "{md}");
+        assert!(md.contains("Before") && md.contains("After"), "{md}");
+        // Markup inside is not Markdown, and the fence outgrows any in the code.
+        let md = body_md("<pre>x <b>y</b></pre>");
+        assert!(md.contains("```\nx y\n```"), "{md}");
+        let md = body_md("<pre>a ``` b</pre>");
+        assert!(md.contains("````\na ``` b\n````"), "{md}");
+    }
+
+    #[test]
+    fn a_header_inside_the_article_is_its_title_and_a_page_header_is_chrome() {
+        let article =
+            body_md("<article><header><h1>Paper Title</h1></header><p>Body</p></article>");
+        assert!(
+            article.contains("# Paper Title") && article.contains("Body"),
+            "{article}"
+        );
+        let page = body_md("<header>Site Menu</header><p>Body</p>");
+        assert!(
+            !page.contains("Site Menu") && page.contains("Body"),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn xhtml_empty_element_tags_are_spelled_out_for_the_html_parser() {
+        assert_eq!(
+            expand_xhtml_empty_elements("<p>a<br/><title/> <a href=\"x/\" /></p>"),
+            "<p>a<br/><title></title> <a href=\"x/\" ></a></p>"
+        );
+        assert!(matches!(
+            expand_xhtml_empty_elements("<p>x</p><!-- <i/> -->"),
+            Cow::Borrowed(_)
+        ));
+        // Script text is not markup.
+        assert_eq!(
+            expand_xhtml_empty_elements("<script>if (a<b/>c) {}</script><i/>"),
+            "<script>if (a<b/>c) {}</script><i></i>"
         );
     }
 }

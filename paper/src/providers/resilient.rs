@@ -51,9 +51,20 @@ impl PaperProvider for ResilientProvider {
             return Ok(doi_search_result(self.name(), paper));
         }
         let inner = &self.inner;
-        self.guard
+        let mut result = self
+            .guard
             .run(|| async move { inner.search_by_query(query).await })
-            .await
+            .await?;
+        // No provider filters by citation count itself, so a single-provider
+        // search honours `min_citations` here (an aggregate strips it from
+        // the member query and applies it once, to the merged papers). A
+        // paper whose count the provider does not report is kept.
+        if let Some(min) = query.min_citations {
+            result
+                .papers
+                .retain(|paper| paper.cited_by_count.is_none_or(|count| count >= min));
+        }
+        Ok(result)
     }
 
     async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
@@ -61,6 +72,10 @@ impl PaperProvider for ResilientProvider {
         self.guard
             .run(|| async move { inner.get_by_doi(doi).await })
             .await
+    }
+
+    fn note_timeout(&self) {
+        self.guard.record_timeout();
     }
 
     async fn health_check(&self) -> Result<(), PaperError> {
@@ -314,5 +329,72 @@ mod tests {
             ..ResilienceConfig::default()
         };
         assert!(Guard::new("x", Duration::from_millis(10), &inverted).is_err());
+    }
+
+    /// A provider whose search returns papers with the given citation counts.
+    struct Cited(Vec<Option<u64>>);
+
+    #[async_trait]
+    impl PaperProvider for Cited {
+        fn name(&self) -> &'static str {
+            "cited"
+        }
+        fn supported_search_types(&self) -> Vec<SearchType> {
+            vec![]
+        }
+        async fn search_by_query(&self, _q: &SearchQuery) -> Result<SearchResult, PaperError> {
+            let papers = self
+                .0
+                .iter()
+                .enumerate()
+                .map(|(i, count)| Paper {
+                    id: format!("p{i}"),
+                    title: format!("Paper number {i}"),
+                    authors: vec![],
+                    abstract_text: None,
+                    publication_date: None,
+                    doi: None,
+                    download_urls: vec![],
+                    cited_by_count: *count,
+                    source: "cited".into(),
+                })
+                .collect::<Vec<_>>();
+            Ok(SearchResult {
+                total_results: papers.len(),
+                papers,
+                next_offset: None,
+                provider: "cited".into(),
+                provider_failures: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_single_provider_search_honours_min_citations() {
+        // `--provider openalex --min-citations 100` used to ignore the flag:
+        // only the aggregate applied it.
+        let p = ResilientProvider::new(
+            Arc::new(Cited(vec![Some(500), Some(5), None, Some(100)])),
+            guard(1, &resilience(3)),
+        );
+        let mut query = SearchQuery {
+            query: "anything".into(),
+            search_type: SearchType::Keywords,
+            max_results: 10,
+            offset: 0,
+            date_filter: None,
+            sort_by: crate::models::SortBy::Relevance,
+            min_citations: Some(100),
+        };
+
+        let ids = |r: SearchResult| r.papers.into_iter().map(|p| p.id).collect::<Vec<_>>();
+        // The count at the bound passes; a paper with no reported count is kept.
+        assert_eq!(
+            ids(p.search_by_query(&query).await.unwrap()),
+            ["p0", "p2", "p3"]
+        );
+
+        query.min_citations = None;
+        assert_eq!(ids(p.search_by_query(&query).await.unwrap()).len(), 4);
     }
 }

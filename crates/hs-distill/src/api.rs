@@ -30,6 +30,13 @@ const READINESS_QDRANT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Hits returned when a search request names no `limit`.
 const DEFAULT_SEARCH_LIMIT: u64 = 10;
 
+/// Longest search query accepted, in bytes. The model reads at most
+/// `embedding.max_length` tokens (8192 at most, well under this even for
+/// 3-byte-per-token scripts); without a bound a single request could hand
+/// the tokenizer megabytes while holding an embedder slot, stalling every
+/// document being indexed behind it.
+pub const MAX_SEARCH_QUERY_BYTES: usize = 64 * 1024;
+
 /// Machine-readable code sent with a 500 caused by a panic in the index
 /// task (`x-hs-error-code` header; prefix of the NDJSON error line).
 pub const PANIC_CODE: &str = "index_panicked";
@@ -265,6 +272,12 @@ impl DistillServerState {
     pub async fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
         if req.query.trim().is_empty() {
             return Err(ApiError::bad_request("Search query cannot be empty"));
+        }
+        if req.query.len() > MAX_SEARCH_QUERY_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "search query is {} bytes; the maximum is {MAX_SEARCH_QUERY_BYTES}",
+                req.query.len()
+            )));
         }
         let collection = self.resolve_collection(req.collection.as_deref())?;
         let filter = SearchFilter::from_request(req.filters.as_ref())?;
@@ -753,6 +766,24 @@ mod tests {
             kind(h.state.search(search_req("  ", None, None)).await),
             ErrorKind::BadRequest
         );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_search_query_is_rejected_before_it_reaches_the_embedder() {
+        let h = harness();
+        let at_cap = "q".repeat(MAX_SEARCH_QUERY_BYTES);
+        h.state
+            .search(search_req(&at_cap, None, None))
+            .await
+            .unwrap();
+        assert_eq!(h.embedder.calls(), 1);
+
+        let over = "q".repeat(MAX_SEARCH_QUERY_BYTES + 1);
+        assert_eq!(
+            kind(h.state.search(search_req(&over, None, None)).await),
+            ErrorKind::BadRequest
+        );
+        assert_eq!(h.embedder.calls(), 1, "the oversized query was embedded");
     }
 
     #[tokio::test]

@@ -53,7 +53,11 @@ pub fn deduplicate(source_results: Vec<(String, Vec<Paper>)>) -> (Vec<DedupGroup
     }
 
     // Stage 2: Build groups from DOI matches
-    for (doi, papers) in doi_map {
+    // `HashMap` order is random per process: equal-scored results would swap
+    // places between runs of one query.
+    let mut doi_groups: Vec<(String, Vec<SourcedPaper>)> = doi_map.into_iter().collect();
+    doi_groups.sort_by(|a, b| a.0.cmp(&b.0));
+    for (doi, papers) in doi_groups {
         if papers.len() > 1 {
             stats.doi_matches += papers.len() - 1;
         }

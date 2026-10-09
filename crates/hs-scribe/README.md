@@ -25,7 +25,7 @@ The pipeline has two modes:
 hs serve scribe
 
 # Convert a PDF
-hs scribe convert paper.pdf -o paper.md
+hs scribe convert paper.pdf --out paper.md
 
 # Convert PDFs automatically as `papers.ingested` events arrive on the event bus
 hs scribe watch-events
@@ -44,17 +44,17 @@ Nothing provisions a scribe host for you: `hs serve scribe` starts the server an
 ### Requirements of a scribe host
 
 - **`HS_BACKEND_TOKEN`.** `hs-scribe-server` refuses to start unless `HS_BACKEND_TOKEN` (≥ 32 visible ASCII bytes, e.g. `openssl rand -hex 32`; the same value as the gateway and every client host) is set — put it in `~/.home-still/secrets.env`, on every scribe host (the macOS launchd one included) and on every host that runs a scribe client (`hs`, `hs-mcp`). Every route except `GET /health` and `GET /readiness` requires `Authorization: Bearer <token>`; anything else, including a path no route serves, gets a 401 with a JSON body. `ScribeClient` sends the token automatically from the same variable. There is no unauthenticated mode: this is the endpoint that parses untrusted PDFs and drives the GPU.
-- **libpdfium.** Every PDF is counted by pdfium before it is dispatched or converted, on every converter (olmocr included), and the watcher (`hs scribe watch-events`) counts the PDFs it dispatches the same way. `hs-scribe-server` and the watcher refuse to start when libpdfium cannot be bound. It is looked up in `./`, then `~/.local/lib` and `~/.home-still/dyld-libs`, then the system library path. Container images bundle it. `hs` and `hs-mcp` hosts need it too for `hs scribe convert` and the `scribe_convert` tool on PDFs (those fail with the same error when it is missing).
+- **libpdfium.** Every PDF is counted by pdfium before it is dispatched or converted, on every converter (olmocr included), and the watcher (`hs scribe watch-events`) counts the PDFs it dispatches the same way. `hs-scribe-server` and the watcher refuse to start when libpdfium cannot be bound. It is looked up in `~/.local/lib` and `~/.home-still/dyld-libs`, then the system library path (never the working directory). Container images bundle it. `hs` and `hs-mcp` hosts need it too for `hs scribe convert` and the `scribe_convert` tool on PDFs (those fail with the same error when it is missing).
 
 ### Platform behavior
 
 | Platform | VLM runs on | GPU acceleration |
 |---|---|---|
-| macOS Apple Silicon | Host (native Ollama) | Metal GPU |
-| Linux + NVIDIA | Container (Ollama) | CUDA |
-| Linux / macOS Intel | Container (Ollama) | CPU only |
+| macOS Apple Silicon | Native Ollama on the host | Metal GPU |
+| Linux + NVIDIA | Ollama (or an OpenAI-compatible server) you run | CUDA |
+| Linux / macOS Intel | Ollama you run | CPU only |
 
-On Apple Silicon, the scribe server runs in a container but connects back to Ollama on the host via `host.docker.internal:11434`. This gives the VLM access to Metal, which is dramatically faster than CPU inference inside a Linux VM.
+On Apple Silicon, run the server natively (`hs serve scribe`) next to a native Ollama so the VLM uses Metal. The optional Docker image (below) reaches a host Ollama via `host.docker.internal:11434`; Docker on macOS cannot use the GPU.
 
 ## Commands
 
@@ -62,7 +62,7 @@ On Apple Silicon, the scribe server runs in a container but connects back to Oll
 
 ```sh
 hs scribe convert paper.pdf              # markdown to stdout
-hs scribe convert paper.pdf -o paper.md  # markdown to file
+hs scribe convert paper.pdf --out paper.md  # markdown to file
 hs scribe convert paper.pdf --server http://remote:7433  # use a remote server
 ```
 
@@ -99,14 +99,14 @@ hs scribe convert paper.pdf
 ScribeClient (HTTP multipart upload to localhost:7433)
     |
     v
-hs-scribe-server (Docker container)
+hs-scribe-server (native process or Docker image)
     |--- PDF rendering (PDFium, configurable DPI)
     |--- Layout detection (ONNX: PP-DocLayout-V3, 25 region types)
     |--- Table structure (ONNX: SLANet-Plus, cell boundaries)
     |--- VLM OCR (Ollama / OpenAI-compat / Cloud)
     |         |
     |         +-- Metal GPU on macOS (native Ollama)
-    |         +-- CUDA on Linux (containerized Ollama)
+    |         +-- CUDA on Linux (your Ollama / llama-swap)
     |
     v
 NDJSON progress stream --> final markdown
@@ -190,7 +190,7 @@ Server-side settings use environment variables with the `HS_SCRIBE_` prefix (`HS
 | Variable | Default | Description |
 |---|---|---|
 | `HS_SCRIBE_VLM_CONCURRENCY` | host-class default (e.g. `4` on low-end Apple Silicon, `2` on a Pi) | Legacy: the shared VLM-call semaphore across all conversions, the number of conversions admitted at once (more get 503) and the `vlm_slots_total` `/readiness` advertises. olmocr: concurrent `olmocr` runs. In Legacy, PDF open/render/layout (stage 1) is serialized by pdfium-render's process-wide lock, so only the VLM stage overlaps between conversions; values > 1 are intended (they pipeline VLM work with the next render). A wedged pdfium call makes the watchdog exit the whole server, ending all in-flight conversions (see `docs/deployment.md`) |
-| `HS_SCRIBE_REGION_PARALLEL` | `4` | Max concurrent regions within one page |
+| `HS_SCRIBE_REGION_PARALLEL` | host-class default (`2` Pi, `3` low-end Apple Silicon and NVIDIA, `4` high-end Apple Silicon) | Max concurrent regions within one page |
 | `HS_SCRIBE_PARALLEL` | `1` | Max concurrent pages in FullPage mode |
 | `HS_SCRIBE_USE_CUDA` | `true` (`false` on macOS) | Enable CUDA for ONNX layout detection. `true` on macOS is a startup error: CUDA is not available there |
 | `HS_SCRIBE_MAX_IMAGE_DIM` | `1800` | Downscale images larger than this (pixels) |
@@ -202,7 +202,19 @@ Server-side settings use environment variables with the `HS_SCRIBE_` prefix (`HS
 | `HS_SCRIBE_LAYOUT_MODEL_PATH` | `pp-doclayoutv3.onnx` | PP-DocLayout-V3 ONNX model |
 | `HS_SCRIBE_TABLE_MODEL_PATH` | `slanet-plus.onnx` | SLANet-Plus ONNX model |
 
-Model paths are resolved relative to `~/.local/share/home-still/models/` if not absolute.
+A bare model filename is looked up in `~/.home-still/models/` (an existing path is used as given).
+
+### olmocr converter
+
+`HS_SCRIBE_CONVERTER=olmocr` makes the server shell out to the `olmocr` CLI instead of running the per-region pipeline. The server refuses to start when `olmocr_bin` is not an executable file (or not on `PATH`).
+
+| Variable | Default | Description |
+|---|---|---|
+| `HS_SCRIBE_CONVERTER` | `legacy` | `legacy` (per-region pipeline) or `olmocr` |
+| `HS_SCRIBE_OLMOCR_BIN` | `olmocr` | Path of the `olmocr` CLI (a bare name is looked up on `PATH`) |
+| `HS_SCRIBE_OLMOCR_ENDPOINT` | `http://localhost:8081/v1` | OpenAI-compatible endpoint the CLI talks to (llama-swap) |
+| `HS_SCRIBE_OLMOCR_MODEL` | `olmocr` | Model name the endpoint serves |
+| `HS_SCRIBE_VRAM_HEADROOM_MB` | `15000` | Free VRAM needed to cold-start the model; below it (and with the model not resident) `/health` and `/readiness` refuse work |
 
 ## Models
 
@@ -250,7 +262,7 @@ Multi-arch images (amd64 + arm64) are published to GHCR on every release:
 
 ```sh
 docker pull ghcr.io/home-still/hs-scribe-server:latest
-docker run -p 7433:7433 -v ~/.local/share/home-still/models:/models:ro \
+docker run -p 7433:7433 -v ~/.home-still/models:/models:ro \
   -e HS_BACKEND_TOKEN="$HS_BACKEND_TOKEN" \
   -e HS_SCRIBE_OLLAMA_URL=http://host.docker.internal:11434 \
   ghcr.io/home-still/hs-scribe-server:latest
@@ -281,4 +293,4 @@ curl -X POST http://localhost:7433/scribe/stream \
 # {"result":{"markdown":"# Title\n\nContent..."}}
 ```
 
-Max upload size: 256 MB.
+Max upload size: 256 MB. An upload that delivers no bytes for 60 s is refused with `408` and its slot is returned; a client that disconnects mid-conversion also frees its slot (and an `olmocr` run is killed).

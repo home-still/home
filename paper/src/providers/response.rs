@@ -44,12 +44,7 @@ pub async fn send_with_429_retry(
             // Body wasn't cloneable; surface the 429 for `check_response` to map.
             return Ok(response);
         };
-        let header_retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
+        let header_retry_after = retry_after(response.headers());
         let sleep = header_retry_after
             .unwrap_or_else(|| {
                 let jitter_ms = std::time::SystemTime::now()
@@ -76,14 +71,24 @@ pub async fn send_with_429_retry(
     Ok(req.send().await?)
 }
 
+/// The server's `Retry-After` directive in its delta-seconds form (`120`),
+/// whitespace-trimmed. Remote text: anything else (the HTTP-date form, junk,
+/// an overflowing number) is "no directive", never an error — the caller then
+/// applies its own backoff.
+pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
 pub fn check_response(response: &reqwest::Response, provider: &str) -> Result<(), PaperError> {
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(std::time::Duration::from_secs);
+        let retry_after = retry_after(response.headers());
         return Err(PaperError::RateLimited {
             provider: provider.to_string(),
             retry_after,

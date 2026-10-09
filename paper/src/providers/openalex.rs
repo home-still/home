@@ -307,7 +307,9 @@ impl PaperProvider for OpenAlexProvider {
             .map(|w| self.work_to_paper(w))
             .collect();
 
-        let next_offset = query.offset + query.max_results.min(OPENALEX_PAGE_MAX);
+        let next_offset = query
+            .offset
+            .saturating_add(query.max_results.min(OPENALEX_PAGE_MAX));
         let next_offset = if next_offset < body.meta.count && next_offset < 10_000 {
             Some(next_offset)
         } else {

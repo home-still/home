@@ -276,6 +276,35 @@ impl OpenAlexDb {
         }
     }
 
+    /// Refuse to load a partition that is newer than one already loaded.
+    ///
+    /// Every loader walks newest-first and keeps the first sighting of an ID,
+    /// so a partition arriving after an older one is `ok` (a snapshot
+    /// re-sync added a newer `updated_date`) would have each record that the
+    /// older partition already stored dropped as a "stale duplicate" while
+    /// the stored, older copy stayed: silently the wrong version. A normal
+    /// resume never trips this (the `ok` partitions are all newer than the
+    /// pending ones); the fix for a real conflict is to empty the entity's
+    /// table and its `_ingest_log` rows and load it again.
+    fn ensure_not_newer_than_loaded(&self, entity: &str, partition: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT partition FROM _ingest_log \
+             WHERE entity = ? AND status = 'ok' AND partition < ? \
+             ORDER BY partition LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![entity, partition])?;
+        if let Some(row) = rows.next()? {
+            let older: String = row.get(0)?;
+            bail!(
+                "{entity} partition {partition} is newer than the already loaded {older}: \
+                 loading it now would skip every record {older} stored and keep their older \
+                 versions. Empty the {entity} table and delete its `_ingest_log` rows, then \
+                 load all partitions again (newest-first)"
+            );
+        }
+        Ok(())
+    }
+
     fn log_partition(
         &self,
         entity: &str,
@@ -361,6 +390,7 @@ impl OpenAlexDb {
                 stats.skipped_partitions += 1;
                 continue;
             }
+            self.ensure_not_newer_than_loaded(table, &part_name)?;
             let loaded = self
                 .load_simple_partition(entity, &part, &mut seen)
                 .with_context(|| format!("insert {table} partition {part_name}"));
@@ -533,6 +563,7 @@ impl OpenAlexDb {
                 ..Default::default()
             });
         }
+        self.ensure_not_newer_than_loaded("works", &part_name)?;
 
         // Per-file processing keeps memory bounded on the giant 2025-11-06
         // partition (2.59 TB). Each JSONL file (~1 GB) gets its own staging
@@ -841,6 +872,7 @@ impl OpenAlexDb {
                 ..Default::default()
             });
         }
+        self.ensure_not_newer_than_loaded("authors", &part_name)?;
 
         let mut progress = PartitionProgress::default();
         let loaded = self

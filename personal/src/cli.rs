@@ -24,9 +24,9 @@ pub enum PersonalCmd {
         force: bool,
     },
 
-    /// List ingested documents.
+    /// List ingested documents, most recently ingested first.
     List {
-        /// Filter by category.
+        /// Filter by category (one of the configured categories; any case).
         #[arg(long)]
         category: Option<String>,
 
@@ -40,7 +40,7 @@ pub enum PersonalCmd {
         /// Query string.
         query: String,
 
-        /// Filter by category.
+        /// Filter by category (one of the configured categories; any case).
         #[arg(long)]
         category: Option<String>,
 

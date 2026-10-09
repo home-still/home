@@ -19,6 +19,7 @@ use axum::{
 };
 use hs_common::auth::backend::BackendToken;
 use hs_common::service::inflight::InFlightGuard;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +29,12 @@ use tokio_stream::wrappers::ReceiverStream;
 /// Largest request body the server reads: a maximal PDF plus the multipart
 /// framing around it.
 pub const MAX_UPLOAD_BODY_BYTES: usize = MAX_PDF_BYTES + 64 * 1024;
+
+/// Longest an upload may go without delivering a byte before the request is
+/// refused (408) and its admission slot returned. A live link delivers
+/// something every few seconds; the client sets a 30 s TCP keep-alive, so a
+/// minute of silence is a dead peer, not a slow one.
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Why a request's `X-Convert-Deadline-Secs` was refused.
 #[derive(Debug, PartialEq, Eq)]
@@ -417,6 +424,22 @@ fn multipart_refusal(e: axum::extract::multipart::MultipartError) -> Response {
     upload_refusal(e.status(), e.body_text())
 }
 
+/// Await one read of the upload, refusing with 408 when nothing arrives
+/// within `idle`. The upload is read while the request holds an admission
+/// slot, and a peer that stalls — a half-open connection nobody ever closes
+/// (the server sets no TCP keep-alive and hyper has no body-read timeout) —
+/// would otherwise hold that slot until the process restarts.
+#[allow(clippy::result_large_err)]
+async fn within_idle<T>(idle: Duration, read: impl Future<Output = T>) -> Result<T, Response> {
+    tokio::time::timeout(idle, read).await.map_err(|_| {
+        tracing::warn!(?idle, "upload stalled — refusing it; slot released");
+        upload_refusal(
+            StatusCode::REQUEST_TIMEOUT,
+            format!("no upload bytes received for {idle:?}"),
+        )
+    })
+}
+
 /// Stream the `pdf` field of a multipart upload into a temp file, once.
 ///
 /// The body never sits in memory: each chunk goes to disk as it arrives
@@ -427,9 +450,12 @@ fn multipart_refusal(e: axum::extract::multipart::MultipartError) -> Response {
 /// file keeps a `.pdf` suffix because the olmocr CLI picks inputs by it, and
 /// is deleted when the returned handle drops.
 #[allow(clippy::result_large_err)]
-async fn receive_pdf(mut multipart: Multipart) -> Result<tempfile::NamedTempFile, Response> {
+async fn receive_pdf(
+    mut multipart: Multipart,
+    idle: Duration,
+) -> Result<tempfile::NamedTempFile, Response> {
     loop {
-        let mut field = match multipart.next_field().await {
+        let mut field = match within_idle(idle, multipart.next_field()).await? {
             Ok(Some(field)) => field,
             Ok(None) => {
                 return Err(upload_refusal(
@@ -472,7 +498,7 @@ async fn receive_pdf(mut multipart: Multipart) -> Result<tempfile::NamedTempFile
         let mut head_checked = false;
         let mut total: usize = 0;
         loop {
-            let chunk = match field.chunk().await {
+            let chunk = match within_idle(idle, field.chunk()).await? {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(e) => return Err(multipart_refusal(e)),
@@ -526,10 +552,17 @@ fn wire_failure_code(err: &anyhow::Error) -> Option<FailureCode> {
     })
 }
 
+/// One NDJSON line for the stream. An encoding failure is logged, not
+/// swallowed: the line (possibly the conversion's result) never reaches the
+/// client, which then sees a stream that ended without one.
 fn ndjson(line: &StreamLine) -> Option<String> {
-    serde_json::to_string(line)
-        .ok()
-        .map(|json| format!("{json}\n"))
+    match serde_json::to_string(line) {
+        Ok(json) => Some(format!("{json}\n")),
+        Err(e) => {
+            tracing::error!(error = %e, "could not encode a stream line; it is not sent");
+            None
+        }
+    }
 }
 
 /// Emit a failed conversion: the typed code as a `FAILURE_STAGE` progress
@@ -587,7 +620,7 @@ async fn convert_pdf(
 /// the wire instead of a dropped connection the client retries.
 async fn guarded_conversion<T>(
     stem: &str,
-    conversion: impl std::future::Future<Output = anyhow::Result<T>>,
+    conversion: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
     match hs_common::panic_guard::catch_panic(conversion).await {
         Ok(result) => result,
@@ -648,7 +681,7 @@ async fn handle_scribe_stream(
     };
     let in_flight_guard = InFlightGuard::new(&state.in_flight);
 
-    let tmp = match receive_pdf(multipart).await {
+    let tmp = match receive_pdf(multipart, UPLOAD_IDLE_TIMEOUT).await {
         Ok(tmp) => tmp,
         Err(resp) => return resp,
     };
@@ -870,6 +903,39 @@ mod tests {
         );
     }
 
+    /// A multipart request whose body delivers `sent` and then never another
+    /// byte (a half-open connection the peer will not close).
+    async fn stalled_upload(sent: &'static [u8]) -> Multipart {
+        use axum::extract::FromRequest;
+        use futures::StreamExt;
+        let body = Body::from_stream(
+            futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(sent))])
+                .chain(futures::stream::pending()),
+        );
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=XB")
+            .body(body)
+            .unwrap();
+        Multipart::from_request(request, &()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_upload_that_stalls_is_refused_with_408_instead_of_holding_its_slot_forever() {
+        const PART_HEAD: &[u8] =
+            b"--XB\r\nContent-Disposition: form-data; name=\"pdf\"; filename=\"in.pdf\"\r\n\r\n";
+        const PART_START: &[u8] = b"--XB\r\nContent-Disposition: form-data; name=\"pdf\"; \
+                                    filename=\"in.pdf\"\r\n\r\n%PDF-1.4 and then the link died";
+        // Silent before any field, after a field's headers, and mid-file.
+        for sent in [&b"--XB\r\n"[..], PART_HEAD, PART_START] {
+            let upload = stalled_upload(sent).await;
+            let refused = receive_pdf(upload, Duration::from_millis(150))
+                .await
+                .unwrap_err();
+            assert_eq!(refused.status(), StatusCode::REQUEST_TIMEOUT, "{sent:?}");
+        }
+    }
+
     // ── the real router over loopback, olmocr mode with a stand-in CLI ──
 
     #[cfg(unix)]
@@ -904,6 +970,17 @@ mod tests {
             dir: tempfile::TempDir,
         }
 
+        /// Whether the process a stand-in CLI recorded in `<dir>/pid` still exists.
+        fn cli_is_alive(dir: &std::path::Path) -> bool {
+            let pid: libc::pid_t = std::fs::read_to_string(dir.join("pid"))
+                .expect("the stand-in CLI records its pid before it waits")
+                .trim()
+                .parse()
+                .unwrap();
+            // SAFETY: signal 0 only probes for existence.
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+
         impl Rig {
             /// The stand-in `olmocr` waits for `<dir>/release` to exist before
             /// it writes its markdown and tally, so a test can hold a
@@ -916,10 +993,11 @@ mod tests {
                 std::fs::write(
                     &script,
                     format!(
-                        "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n\
+                        "#!/bin/sh\necho $$ > '{pid}'\nwhile [ ! -e '{release}' ]; do sleep 0.05; done\n\
                          mkdir -p \"$1/markdown\" && printf '# T\\n\\n{md}' > \"$1/markdown/o.md\"\n\
                          echo 'Completed pages: 2' >&2; echo 'Failed pages: 0' >&2\n",
-                        release.display()
+                        pid = dir.path().join("pid").display(),
+                        release = release.display()
                     ),
                 )
                 .unwrap();
@@ -1086,6 +1164,64 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             assert!(recovered, "the slot must be released after the conversion");
+        }
+
+        /// A client that goes away mid-conversion takes its request with it:
+        /// the slot comes back at once, not when the (here: never finishing)
+        /// conversion would have ended.
+        #[tokio::test]
+        async fn a_client_that_disconnects_mid_conversion_frees_its_slot_and_kills_the_cli() {
+            skip_without_pdfium!("a_client_that_disconnects_mid_conversion_frees_its_slot");
+            // `release` is never written: the stand-in CLI would run for ever.
+            let rig = Rig::start(1, MAX_UPLOAD_BODY_BYTES).await;
+            let client = {
+                let (base, body) = (rig.base.clone(), pdf_with_pages(2));
+                tokio::spawn(async move {
+                    let form = reqwest::multipart::Form::new().part(
+                        "pdf",
+                        reqwest::multipart::Part::bytes(body).file_name("in.pdf"),
+                    );
+                    authed_client()
+                        .post(format!("{base}/scribe/stream"))
+                        .multipart(form)
+                        .send()
+                        .await
+                        .unwrap()
+                        .text()
+                        .await
+                })
+            };
+            let mut admitted = false;
+            for _ in 0..200 {
+                if rig.readiness().await["vlm_slots_available"] == 0 {
+                    admitted = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(admitted, "the conversion must take the slot");
+
+            client.abort(); // drops the response and closes the connection
+            let mut freed = false;
+            for _ in 0..200 {
+                let r = rig.readiness().await;
+                if r["vlm_slots_available"] == 1 && r["in_flight_conversions"] == 0 {
+                    freed = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(freed, "a disconnected client must not keep its slot");
+            // ... and the `olmocr` run is killed, not left hammering the backend.
+            let mut gone = false;
+            for _ in 0..100 {
+                if !cli_is_alive(rig.dir.path()) {
+                    gone = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(gone, "the olmocr subprocess must not outlive its request");
         }
 
         // ── backend token (the RA-24/26 mechanism, review F4) ───────────

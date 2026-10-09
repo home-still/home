@@ -306,11 +306,16 @@ pub fn split_suspect_at_gutter(bboxes: &mut Vec<BBox>, suspect_idx: usize, gutte
     // Tiny offsets so the page assembler's stable sort places left
     // before right when their nominal y-bands overlap.
     right.read_order = suspect.read_order + 0.5;
-    // unique_id collisions are fine for downstream code (the unique_id
-    // is the row in detection order, used only for read-order recovery
-    // post-VLM) but we keep the suspect's id on the left half and bump
-    // the right by one — trivial uniqueness within a page.
-    right.unique_id = suspect.unique_id.saturating_add(1);
+    // `unique_id` keys the read-order recovery after the VLM calls
+    // (`detection_order` → id→position map): the right half needs an id no
+    // other box on the page has. `suspect.unique_id + 1` is the NEXT box's id
+    // (ids are consecutive), which made the two share a position and left their
+    // relative order to whichever VLM call finished first.
+    right.unique_id = bboxes
+        .iter()
+        .map(|b| b.unique_id)
+        .max()
+        .map_or(0, |max| max.saturating_add(1));
     bboxes[suspect_idx] = left;
     bboxes.insert(suspect_idx + 1, right);
 }
@@ -642,6 +647,26 @@ mod tests {
         assert_eq!(bs[2].class_name, "text");
         // Right read_order is offset so stable-sort places left first.
         assert!(bs[2].read_order > bs[1].read_order);
+    }
+
+    /// The page's read order is recovered from a map keyed by `unique_id`; two
+    /// boxes sharing one are indistinguishable there, so which of them is
+    /// read first would depend on which VLM call finished first.
+    #[test]
+    fn a_split_leaves_every_box_on_the_page_with_its_own_unique_id() {
+        let mut bs = vec![
+            bbox("page_number", 470.0, 950.0, 530.0, 980.0),
+            bbox("text", 50.0, 100.0, 950.0, 900.0),
+            bbox("figure_title", 100.0, 920.0, 900.0, 940.0),
+        ];
+        for (i, b) in bs.iter_mut().enumerate() {
+            b.unique_id = i; // the layout detector numbers boxes consecutively
+        }
+        split_suspect_at_gutter(&mut bs, 1, 500);
+        let mut ids: Vec<usize> = bs.iter().map(|b| b.unique_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), bs.len(), "duplicate unique_id after the split");
     }
 
     #[test]

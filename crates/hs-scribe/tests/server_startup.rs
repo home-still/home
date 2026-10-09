@@ -68,3 +68,18 @@ fn a_server_without_the_backend_token_refuses_to_start() {
         "{err}"
     );
 }
+
+#[test]
+fn an_olmocr_server_without_its_cli_refuses_to_start() {
+    // The CLI is checked before the token, libpdfium or anything else.
+    let out = run(
+        "",
+        &[
+            ("HS_SCRIBE_CONVERTER", "olmocr"),
+            ("HS_SCRIBE_OLMOCR_BIN", "/nonexistent/olmocr"),
+        ],
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("olmocr_bin"), "{err}");
+}

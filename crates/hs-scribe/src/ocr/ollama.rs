@@ -1,4 +1,5 @@
 use super::region::RegionType;
+use crate::classify::{ConvertFailure, FailureCode};
 use anyhow::{Context, Result};
 use ollama_rs::{
     generation::completion::request::GenerationRequest, generation::images::Image,
@@ -75,7 +76,7 @@ impl OllamaBackend {
             .top_k(1)
             .repeat_penalty(1.10)
             .repeat_last_n(256)
-            .num_predict(4096)
+            .num_predict(NUM_PREDICT)
             .num_ctx(8192);
 
         let request = GenerationRequest::new(self.model.clone(), region_type.prompt().to_string())
@@ -90,8 +91,38 @@ impl OllamaBackend {
             )
         })?;
 
-        Ok(response.response)
+        completion_text(response)
     }
+}
+
+/// Generation cap sent as `num_predict`. A reply that used all of it was cut
+/// off by the cap.
+const NUM_PREDICT: i32 = 4096;
+
+/// The text of a finished, untruncated generation. `ollama-rs` does not
+/// surface `done_reason`, so a reply that spent the whole `num_predict`
+/// budget (`eval_count`) is the only visible sign the token limit cut it
+/// short; the OpenAI-compatible backend fails the same case on
+/// `finish_reason == "length"`. A region cut off mid-sentence must not be
+/// stamped as a conversion.
+fn completion_text(
+    response: ollama_rs::generation::completion::GenerationResponse,
+) -> Result<String> {
+    if !response.done {
+        return Err(ConvertFailure::err(
+            FailureCode::VlmTransportError,
+            "Ollama returned an unfinished generation for a non-streaming request",
+        ));
+    }
+    if let Some(tokens) = response.eval_count.filter(|&n| n >= NUM_PREDICT as u64) {
+        return Err(ConvertFailure::err(
+            FailureCode::VlmOutputTruncated,
+            format!(
+                "Ollama hit its token limit ({tokens} tokens generated, num_predict={NUM_PREDICT})"
+            ),
+        ));
+    }
+    Ok(response.response)
 }
 
 #[cfg(test)]
@@ -159,6 +190,49 @@ mod tests {
         );
         assert!(
             format!("{err:#}").contains("Ollama VLM request failed"),
+            "{err:#}"
+        );
+    }
+
+    fn reply(
+        done: bool,
+        eval_count: Option<u64>,
+    ) -> ollama_rs::generation::completion::GenerationResponse {
+        serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "created_at": "2026-01-01T00:00:00Z",
+            "response": "page text",
+            "done": done,
+            "eval_count": eval_count,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_finished_reply_under_the_token_cap_is_its_text() {
+        assert_eq!(
+            completion_text(reply(true, Some(120))).unwrap(),
+            "page text"
+        );
+        assert_eq!(completion_text(reply(true, None)).unwrap(), "page text");
+    }
+
+    #[test]
+    fn a_reply_that_spent_the_whole_token_budget_is_truncated_not_a_success() {
+        let err = completion_text(reply(true, Some(NUM_PREDICT as u64))).unwrap_err();
+        assert_eq!(
+            crate::classify::failure_code(&err),
+            Some(FailureCode::VlmOutputTruncated),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn an_unfinished_reply_is_a_transport_failure() {
+        let err = completion_text(reply(false, Some(10))).unwrap_err();
+        assert_eq!(
+            crate::classify::failure_code(&err),
+            Some(FailureCode::VlmTransportError),
             "{err:#}"
         );
     }

@@ -6,18 +6,43 @@
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| **paper_search** | query, max_results?, search_type?, date? | Search 6 academic providers |
+| **paper_search** | query, max_results?, search_type?, date?, offset?, provider?, min_citations?, sort? | Search 6 academic providers |
 | **paper_get** | doi | Look up a paper by DOI |
-| **catalog_list** | - | List all papers with titles and conversion status |
+| **paper_references** | doi | Structured reference list of a paper (Semantic Scholar) |
+| **paper_citations** | doi, limit?, year_from?, sort? | Papers that cite a DOI (default limit 100, max 1000) |
+| **paper_download** | doi | Download a paper PDF by DOI into the papers directory |
+| **catalog_list** | limit?, offset?, embedded? | Papers with titles, conversion and embedded status |
+| **catalog_recent** | limit?, include_repaired? | Most recent download/convert/embed events |
 | **catalog_read** | stem | Full catalog metadata (authors, DOI, conversion info) |
-| **markdown_list** | - | List converted documents with sizes and page counts |
+| **catalog_repair** | dry_run, limit? | Report catalog ↔ storage reconciliation |
+| **dedupe_url_encoded** | dry_run | Report URL-encoded duplicate stems (dry-run only) |
+| **catalog_backfill_title** | dry_run, limit? | Backfill empty catalog titles for rows with a DOI |
+| **markdown_list** | limit?, offset?, embedded? | Converted documents with sizes and page counts |
 | **markdown_read** | stem, page? | Read full document or a single page |
 | **scribe_health** | - | Scribe server health, readiness, version |
-| **scribe_convert** | pdf_path | Convert a PDF to markdown |
-| **distill_search** | query, limit?, year?, topic? | Semantic search with filters |
+| **scribe_convert** | stem | Convert a stored PDF/HTML/EPUB to markdown (same path as the scribe watcher) |
+| **distill_search** | query, limit?, year?, include_text? | Semantic search with filters |
+| **abstract_search** | query, limit?, year?, include_text? | Semantic search over paper abstracts |
 | **distill_status** | - | Qdrant collection stats and server health |
 | **distill_exists** | doc_id | Check if a document is indexed |
-| **system_status** | - | Full pipeline stats (PDFs, markdown, embedded, services) |
+| **distill_index** | stem | Index a converted markdown document |
+| **distill_reindex** | stem | Re-index a document in place with fresh catalog metadata |
+| **distill_reconcile** | dry_run, limit? | Report Qdrant doc_ids whose markdown is missing (dry-run only) |
+| **distill_scan_repetitions** | limit?, threshold? | Report documents with VLM repetition artifacts (read-only) |
+| **distill_backfill** | dry_run, limit?, retry_skipped | Index converted-but-not-embedded documents |
+| **personal_search** | query, limit?, category? | Semantic search over personal documents |
+| **personal_list** | limit?, category? | List ingested personal documents |
+| **personal_read** | stem | Read a personal document's markdown |
+| **personal_add** | filename, category?, title?, force | Ingest a file staged in the personal inbox |
+| **personal_reindex** | stem | Re-chunk and re-embed a personal document |
+| **system_status** | include_repaired? | Full pipeline stats (PDFs, markdown, embedded, services) |
+| **openalex_search** | query, max_results?, year_from?, year_to?, min_citations?, sort? | BM25 search of the local OpenAlex catalog* |
+| **openalex_get** | id_or_doi | One work from the local OpenAlex catalog* |
+| **openalex_references** | openalex_id, limit? | Works a given work cites* |
+| **openalex_citations** | openalex_id, limit?, year_from?, sort? | Works that cite a given work* |
+| **openalex_authors_by_topic** | topic_id, limit? | Top authors for an OpenAlex topic* |
+
+`?` marks an optional parameter. *The five `openalex_*` tools are listed only when the local OpenAlex corpus is built (`hs openalex build-fts`); restart the server after building it.
 
 ## Transport
 
@@ -37,7 +62,7 @@ For Claude Desktop or Claude Code running on the same machine as the MCP server:
 
 ### `hs serve mcp` (managed)
 
-The recommended way to run the MCP server remotely. Automatically registers with the gateway, manages lifecycle (heartbeat, deregistration on shutdown):
+Runs `hs-mcp --serve 0.0.0.0:<port>` (default port 7445) in the foreground (`--install` registers it as a service). It does not register with the gateway: the gateway reaches it through the `mcp` entry of `cloud.gateway.routes`.
 
 ```sh
 hs serve mcp

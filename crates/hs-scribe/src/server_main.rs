@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::sync::Arc;
 
-use hs_scribe::config::AppConfig;
+use hs_scribe::config::{AppConfig, ConverterMode};
 use hs_scribe::server::{app, ServerState};
 
 #[derive(Parser)]
@@ -41,6 +41,14 @@ async fn async_main() -> Result<()> {
     // value or a setting the server cannot run with stops the start (before
     // anything heavy is initialised).
     let config = AppConfig::load().context("loading the scribe server configuration")?;
+
+    // The olmocr converter shells out to its CLI: a host without it must not
+    // come up healthy and then fail every document.
+    if config.converter == ConverterMode::Olmocr {
+        config
+            .check_olmocr_bin(std::env::var_os("PATH").as_deref())
+            .context("checking the olmocr converter")?;
+    }
 
     // Every route but /health and /readiness requires this secret; there is
     // no unauthenticated mode, and the server binds all interfaces by

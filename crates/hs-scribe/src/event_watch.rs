@@ -135,9 +135,34 @@ fn parse_event_key(key: &str) -> Result<(String, String), HandlerError> {
     Ok((stem.to_string(), ext.to_ascii_lowercase()))
 }
 
+/// Largest source object the watcher reads into memory: the largest PDF the
+/// scribe server accepts. HTML and EPUB sources have tighter caps of their own
+/// on what they will parse.
+pub const MAX_SOURCE_BYTES: u64 = crate::pdf_meta::MAX_PDF_BYTES as u64;
+
+/// The failure code of an oversize source, by the converter that would have
+/// run on it.
+fn oversize_code(ext: &str) -> FailureCode {
+    match ext {
+        "pdf" => FailureCode::PdfParseError,
+        "epub" => FailureCode::EpubParseError,
+        "html" | "htm" => FailureCode::HtmlParseError,
+        _ => FailureCode::UnsupportedExtension,
+    }
+}
+
 pub async fn prepare_source(
     storage: &dyn Storage,
     event: &IngestedEvent,
+) -> Result<SourcePrep, HandlerError> {
+    prepare_source_capped(storage, event, MAX_SOURCE_BYTES).await
+}
+
+/// [`prepare_source`] with the size limit as a parameter.
+async fn prepare_source_capped(
+    storage: &dyn Storage,
+    event: &IngestedEvent,
+    max_source_bytes: u64,
 ) -> Result<SourcePrep, HandlerError> {
     let (stem, ext) = parse_event_key(&event.key)?;
     let md_key = hs_common::markdown::markdown_storage_key(&stem);
@@ -149,6 +174,25 @@ pub async fn prepare_source(
     if exists {
         tracing::info!(md_key = %md_key, "markdown already present; skipping");
         return Ok(SourcePrep::AlreadyConverted(md_key));
+    }
+
+    // The stored size is read first: `get` buffers the whole object, and an
+    // object far past anything convertible (a manual drop of a disk image
+    // renamed `.pdf`) would otherwise be loaded entire before any check ran.
+    // A missing object is left to `get`, which owns that verdict.
+    match storage.head(&event.key).await {
+        Ok(Some(meta)) if meta.size > max_source_bytes => {
+            tracing::warn!(key = %event.key, size = meta.size, "source object over the size limit");
+            return Err(permanent(
+                oversize_code(&ext),
+                format!(
+                    "{} is {} bytes, over the {max_source_bytes}-byte limit",
+                    event.key, meta.size
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => return Err(storage_failure(e, format!("head({}) failed", event.key))),
     }
 
     let raw_bytes = match storage.get(&event.key).await {
@@ -1073,6 +1117,40 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.conversion_failed.unwrap().reason, "source_missing");
+    }
+
+    #[tokio::test]
+    async fn a_source_over_the_size_limit_is_refused_before_it_is_read() {
+        let (_d, st) = storage();
+        for (key, code) in [
+            ("papers/ab/huge.pdf", FailureCode::PdfParseError),
+            ("papers/ab/huge.epub", FailureCode::EpubParseError),
+            ("papers/ab/huge.html", FailureCode::HtmlParseError),
+        ] {
+            st.put(key, vec![b'x'; 2048]).await.unwrap();
+            let err = prepare_source_capped(&st, &event(key), 1024)
+                .await
+                .err()
+                .expect(key);
+            assert_eq!(code_of(&err), ("permanent", Some(code)), "{key}");
+            assert!(
+                format!("{err}").contains("over the 1024-byte limit"),
+                "{err}"
+            );
+        }
+        // An object exactly at the limit is read and judged on its content
+        // (here: HTML in a `.pdf`), not refused for its size.
+        let mut at_limit = b"<html>".to_vec();
+        at_limit.resize(1024, b' ');
+        st.put("papers/ab/edge.pdf", at_limit).await.unwrap();
+        let err = prepare_source_capped(&st, &event("papers/ab/edge.pdf"), 1024)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            code_of(&err),
+            ("permanent", Some(FailureCode::UnsupportedContentTypeHtml))
+        );
     }
 
     #[tokio::test]

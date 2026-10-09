@@ -86,6 +86,13 @@ impl OpenAlexCmd {
             Self::Load { .. } | Self::LoadWorks { .. } | Self::BuildFts | Self::BuildIndexes
         )
     }
+
+    /// The subcommands refused on Windows: the writers, and `install-fts`
+    /// (its only consumer, `build-fts`, is refused there, so installing the
+    /// extension for it would be a step toward nothing).
+    fn refused_on_windows(&self) -> bool {
+        self.writes() || matches!(self, Self::InstallFts)
+    }
 }
 
 pub async fn dispatch(cmd: OpenAlexCmd) -> Result<()> {
@@ -98,7 +105,7 @@ fn run(cfg: &Config, cmd: OpenAlexCmd) -> Result<()> {
     // On Windows the next DuckDB call after a failed write never returns
     // (windows-2022 CI: a duplicate key or a failed merge, then a hang), so a
     // bad partition would wedge the loader instead of failing it (RA-149).
-    if cfg!(windows) && cmd.writes() {
+    if cfg!(windows) && cmd.refused_on_windows() {
         bail!(
             "`hs openalex` load and build commands are not supported on Windows: DuckDB hangs \
              after a failed write there (RA-149). Run OpenAlex ingest on Linux or macOS; \
@@ -171,12 +178,19 @@ fn run(cfg: &Config, cmd: OpenAlexCmd) -> Result<()> {
                 .as_ref()
                 .map(|s| s.column_names().into_iter().collect())
                 .ok_or_else(|| anyhow!("statement metadata unavailable after query"))?;
+            // The row is a JSON object keyed by column name: a repeated name
+            // would silently overwrite the earlier column's value.
+            for (i, name) in col_names.iter().enumerate() {
+                if col_names[..i].contains(name) {
+                    bail!("the query returns the column name {name:?} twice; alias one of them");
+                }
+            }
             let mut count = 0u64;
             while let Some(row) = rows.next()? {
                 let mut out = serde_json::Map::with_capacity(col_names.len());
                 for (idx, name) in col_names.iter().enumerate() {
                     let v: duckdb::types::Value = row.get(idx)?;
-                    out.insert(name.clone(), value_to_json(v));
+                    out.insert(name.clone(), value_to_json(v)?);
                 }
                 println!("{}", serde_json::to_string(&out)?);
                 count += 1;
@@ -302,10 +316,14 @@ fn seen_set_path(db_path: &Path) -> Result<PathBuf> {
         })
 }
 
-fn value_to_json(v: duckdb::types::Value) -> serde_json::Value {
+/// One DuckDB value as JSON for `hs openalex query`. Every variant has a
+/// faithful rendering (dates and timestamps as ISO text, lists/structs/maps
+/// as JSON arrays/objects, floats at their own precision); a value that
+/// cannot be rendered is an error, never a placeholder or a `null`.
+fn value_to_json(v: duckdb::types::Value) -> Result<serde_json::Value> {
     use duckdb::types::Value as V;
     use serde_json::Value as J;
-    match v {
+    Ok(match v {
         V::Null => J::Null,
         V::Boolean(b) => J::Bool(b),
         V::TinyInt(n) => J::from(n),
@@ -317,16 +335,73 @@ fn value_to_json(v: duckdb::types::Value) -> serde_json::Value {
         V::USmallInt(n) => J::from(n),
         V::UInt(n) => J::from(n),
         V::UBigInt(n) => J::from(n),
-        V::Float(f) => serde_json::Number::from_f64(f as f64)
-            .map(J::Number)
-            .unwrap_or(J::Null),
-        V::Double(f) => serde_json::Number::from_f64(f)
-            .map(J::Number)
-            .unwrap_or(J::Null),
-        V::Text(s) => J::String(s),
+        // A REAL column is f32: widening it to f64 would print 0.4 as
+        // 0.4000000059604645, so go through its shortest decimal form.
+        V::Float(f) => float_json(f.to_string().parse::<f64>()?, &f.to_string()),
+        V::Double(f) => float_json(f, &f.to_string()),
+        V::Decimal(d) => J::String(d.to_string()),
+        V::Text(s) | V::Enum(s) => J::String(s),
         V::Blob(b) => J::String(format!("<{} bytes>", b.len())),
-        other => J::String(format!("{:?}", other)),
-    }
+        V::Date32(days) => {
+            let date = days
+                .checked_add(719_163) // days from 0001-01-01 to 1970-01-01
+                .and_then(chrono::NaiveDate::from_num_days_from_ce_opt)
+                .ok_or_else(|| anyhow!("date {days} days from the Unix epoch is out of range"))?;
+            J::String(date.to_string())
+        }
+        V::Timestamp(unit, ticks) => {
+            let ts = chrono::DateTime::from_timestamp_micros(unit.to_micros(ticks))
+                .ok_or_else(|| anyhow!("timestamp {ticks} ({unit:?}) is out of range"))?;
+            J::String(ts.naive_utc().format("%Y-%m-%d %H:%M:%S%.f").to_string())
+        }
+        V::Time64(unit, ticks) => {
+            let micros = unit.to_micros(ticks);
+            let time = chrono::NaiveTime::from_num_seconds_from_midnight_opt(
+                u32::try_from(micros.div_euclid(1_000_000))?,
+                u32::try_from(micros.rem_euclid(1_000_000) * 1000)?,
+            )
+            .ok_or_else(|| anyhow!("time {ticks} ({unit:?}) is out of range"))?;
+            J::String(time.format("%H:%M:%S%.f").to_string())
+        }
+        V::Interval {
+            months,
+            days,
+            nanos,
+        } => serde_json::json!({ "months": months, "days": days, "nanos": nanos }),
+        V::List(items) | V::Array(items) => J::Array(
+            items
+                .into_iter()
+                .map(value_to_json)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        V::Struct(fields) => {
+            let mut out = serde_json::Map::new();
+            for (name, value) in fields.iter() {
+                out.insert(name.clone(), value_to_json(value.clone())?);
+            }
+            J::Object(out)
+        }
+        V::Map(entries) => J::Array(
+            entries
+                .iter()
+                .map(|(k, val)| {
+                    Ok(serde_json::json!({
+                        "key": value_to_json(k.clone())?,
+                        "value": value_to_json(val.clone())?,
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        V::Union(inner) => value_to_json(*inner)?,
+    })
+}
+
+/// A float as a JSON number, or its text (`NaN`, `inf`) when JSON has no
+/// number for it.
+fn float_json(f: f64, text: &str) -> serde_json::Value {
+    serde_json::Number::from_f64(f)
+        .map(serde_json::Value::Number)
+        .unwrap_or_else(|| serde_json::Value::String(text.to_string()))
 }
 
 #[cfg(test)]
@@ -492,7 +567,8 @@ mod tests {
     }
 
     /// `install-fts` is its own step in front of `build-fts`, and it is not a
-    /// database writer: it must not create the catalog or take its lock.
+    /// database writer: it must not create the catalog or take its lock. It is
+    /// still refused on Windows, like the commands that need it.
     #[test]
     fn install_fts_is_a_subcommand_that_never_opens_the_database() {
         use clap::Parser;
@@ -500,12 +576,65 @@ mod tests {
             .unwrap()
             .cmd;
         assert!(matches!(install, OpenAlexCmd::InstallFts));
+        assert!(install.refused_on_windows());
         assert!(!install.writes());
         let build = Wrapper::try_parse_from(["openalex", "build-fts"])
             .unwrap()
             .cmd;
         assert!(matches!(build, OpenAlexCmd::BuildFts));
         assert!(build.writes());
+    }
+
+    /// `query` prints what DuckDB holds: dates as dates, lists as arrays, a
+    /// REAL at its own precision. (These used to print as `Date32(18262)`,
+    /// `List([Int(1)])` and 0.4000000059604645.)
+    #[test]
+    fn query_values_render_as_their_json_form() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let v: duckdb::types::Value = conn
+            .query_row(
+                "SELECT {'date': DATE '2020-01-01', 'at': TIMESTAMP '2020-01-02 03:04:05', \
+                 'list': [1, 2], 'score': 0.4::FLOAT, 'nan': 'NaN'::DOUBLE, \
+                 'dec': 1.50::DECIMAL(4,2), 'map': MAP {'k': 1}}",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            value_to_json(v).unwrap(),
+            serde_json::json!({
+                "date": "2020-01-01",
+                "at": "2020-01-02 03:04:05",
+                "list": [1, 2],
+                "score": 0.4,
+                "nan": "NaN",
+                "dec": "1.50",
+                "map": [{"key": "k", "value": 1}],
+            })
+        );
+    }
+
+    /// A row is a JSON object keyed by column name; two columns of one name
+    /// must be an error, not one silently overwriting the other.
+    #[test]
+    fn query_with_a_repeated_column_name_is_refused() {
+        let env = env_with_partition(&[]);
+        OpenAlexDb::open(&env.cfg.db_path).unwrap();
+        let err = run(
+            &env.cfg,
+            OpenAlexCmd::Query {
+                sql: "SELECT 1 AS id, 2 AS id".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("twice"), "{err:#}");
+        run(
+            &env.cfg,
+            OpenAlexCmd::Query {
+                sql: "SELECT 1 AS a, 2 AS b".into(),
+            },
+        )
+        .unwrap();
     }
 
     #[cfg(not(windows))]
@@ -570,6 +699,7 @@ mod tests {
             load_works_cmd(None),
             OpenAlexCmd::BuildFts,
             OpenAlexCmd::BuildIndexes,
+            OpenAlexCmd::InstallFts,
         ];
         for cmd in writes {
             let err = run(&env.cfg, cmd).unwrap_err();

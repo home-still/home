@@ -46,21 +46,22 @@ pub fn load_fintabnet_samples(split: &str, limit: Option<usize>) -> Result<Vec<G
 
         // Image path: FinTabNet.c-Structure/images/{stem}.jpg
         let image_path = images_dir.join(format!("{}.jpg", stem));
-        if !image_path.exists() {
-            continue;
-        }
+        anyhow::ensure!(
+            image_path.exists(),
+            "FinTabNet image missing for {}: expected {}",
+            xml_path.display(),
+            image_path.display()
+        );
 
         // Derive page-level annotation JSON path and table index
         // XML stem: TICKER_YEAR_page_N_table_M -> annotation: TICKER_YEAR_page_N_tables.json, index M
-        let (page_stem, table_index) = derive_page_stem_and_index(&stem);
+        let (page_stem, table_index) = derive_page_stem_and_index(&stem)?;
         let annotation_path = annotations_dir.join(format!("{}_tables.json", page_stem));
 
-        let table_html = if annotation_path.exists() {
+        let table_html = Some(
             build_table_html(&annotation_path, table_index)
-                .with_context(|| format!("Failed to read {}", annotation_path.display()))?
-        } else {
-            None
-        };
+                .with_context(|| format!("Failed to read {}", annotation_path.display()))?,
+        );
 
         samples.push(GroundTruthSample {
             id: stem,
@@ -79,36 +80,43 @@ pub fn load_fintabnet_samples(split: &str, limit: Option<usize>) -> Result<Vec<G
 }
 
 /// Convert "TICKER_YEAR_page_N_table_M" to ("TICKER_YEAR_page_N", M)
-fn derive_page_stem_and_index(table_stem: &str) -> (String, usize) {
-    if let Some(idx) = table_stem.rfind("_table_") {
-        let page_stem = table_stem[..idx].to_string();
-        let table_index = table_stem[idx + 7..].parse::<usize>().unwrap_or(0);
-        (page_stem, table_index)
-    } else {
-        (table_stem.to_string(), 0)
-    }
+fn derive_page_stem_and_index(table_stem: &str) -> Result<(String, usize)> {
+    let idx = table_stem
+        .rfind("_table_")
+        .with_context(|| format!("FinTabNet file stem {table_stem:?} has no _table_<M> suffix"))?;
+    let table_index = table_stem[idx + 7..].parse::<usize>().with_context(|| {
+        format!("FinTabNet file stem {table_stem:?} has a non-numeric table index")
+    })?;
+    Ok((table_stem[..idx].to_string(), table_index))
 }
 
 /// Build proper HTML table from a FinTabNet annotation JSON file.
 /// Extracts the specific table at `table_index` from the page's array of tables.
-fn build_table_html(path: &PathBuf, table_index: usize) -> Result<Option<String>> {
+fn build_table_html(path: &PathBuf, table_index: usize) -> Result<String> {
     let content = std::fs::read_to_string(path)?;
     let tables: serde_json::Value = serde_json::from_str(&content)?;
     let tables = tables.as_array().context("Expected JSON array")?;
 
-    let table = match tables.get(table_index) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
+    let table = tables.get(table_index).with_context(|| {
+        format!(
+            "table index {table_index} out of range ({} tables) in {}",
+            tables.len(),
+            path.display()
+        )
+    })?;
 
-    let cells = match table["cells"].as_array() {
-        Some(c) => c,
-        None => return Ok(None),
-    };
+    let cells = table["cells"].as_array().with_context(|| {
+        format!(
+            "table {table_index} has no cells array in {}",
+            path.display()
+        )
+    })?;
 
-    if cells.is_empty() {
-        return Ok(None);
-    }
+    anyhow::ensure!(
+        !cells.is_empty(),
+        "table {table_index} has no cells in {}",
+        path.display()
+    );
 
     // Find grid dimensions
     let mut max_row: usize = 0;
@@ -130,8 +138,13 @@ fn build_table_html(path: &PathBuf, table_index: usize) -> Result<Option<String>
         }
     }
 
-    let num_rows = max_row + 1;
-    let num_cols = max_col + 1;
+    let num_rows = max_row.saturating_add(1);
+    let num_cols = max_col.saturating_add(1);
+    anyhow::ensure!(
+        num_rows.saturating_mul(num_cols) <= 1_000_000,
+        "FinTabNet table in {} has an implausible {num_rows}x{num_cols} grid",
+        path.display()
+    );
 
     // Track which cells are occupied (by spanning cells)
     let mut occupied = vec![vec![false; num_cols]; num_rows];
@@ -239,7 +252,7 @@ fn build_table_html(path: &PathBuf, table_index: usize) -> Result<Option<String>
     }
 
     html.push_str("</table>");
-    Ok(Some(html))
+    Ok(html)
 }
 
 fn html_escape(s: &str) -> String {

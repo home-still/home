@@ -41,12 +41,16 @@ paper:
       timeout_secs: 30
       rate_limit_interval_ms: 1100
 
+    # API key for CORE (https://core.ac.uk/services/api); without one CORE
+    # is not used to resolve downloads. (`core:` stays commented with its key:
+    # an empty `core:` section loads as null and fails the config.)
+    # core:
+    #   api_key: your-core-key-here
+
   # Download settings
   download:
     # Email for Unpaywall API
     # unpaywall_email: you@example.com
-    # API key for CORE (https://core.ac.uk/services/api)
-    # core_api_key: your-key-here
     max_concurrent: 4
     timeout_secs: 120
     # Hard cap on one downloaded file, enforced while streaming (default 256 MiB)
@@ -70,7 +74,7 @@ storage:
   local:
     root: ~/home-still
   # s3:
-  #   endpoint: http://four:3900
+  #   endpoint: http://<host>:3900
   #   bucket: home-still
   #   region: garage
   #   access_key: ${HS_S3_ACCESS_KEY}

@@ -48,7 +48,49 @@ fn build_prompt(categories: &[String], excerpt: &str) -> String {
     )
 }
 
+/// What the model said, with only its JSON shape checked. Each field is
+/// validated by the accessor that needs it, so a caller that pinned the title
+/// or the category (`--title`, `--category`) is not failed by a bad pick for
+/// the field it overrode.
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    title: String,
+    category: String,
+}
+
+impl Suggestion {
+    /// The model's title: non-empty and not absurdly long.
+    pub fn title(&self) -> Result<String> {
+        let title = self.title.trim().to_string();
+        if title.is_empty() {
+            return Err(PersonalError::Naming("model returned empty title".into()));
+        }
+        let title_chars = title.chars().count();
+        if title_chars > 200 {
+            return Err(PersonalError::Naming(format!(
+                "model returned over-long title ({title_chars} chars)"
+            )));
+        }
+        Ok(title)
+    }
+
+    /// The model's category, which must be in `personal.categories`.
+    pub fn category(&self, cfg: &Config) -> Result<Category> {
+        cfg.resolve_category(&self.category)
+    }
+}
+
+/// Both fields, each validated.
 pub async fn title_and_category(cfg: &Config, markdown: &str) -> Result<NameResult> {
+    let suggestion = suggest(cfg, markdown).await?;
+    Ok(NameResult {
+        title: suggestion.title()?,
+        category: suggestion.category(cfg)?,
+    })
+}
+
+/// Ask the model to name `markdown`.
+pub async fn suggest(cfg: &Config, markdown: &str) -> Result<Suggestion> {
     let excerpt = take_chars(markdown, cfg.naming.max_input_tokens.saturating_mul(4));
     let prompt = build_prompt(&cfg.categories, &excerpt);
 
@@ -97,27 +139,10 @@ pub async fn title_and_category(cfg: &Config, markdown: &str) -> Result<NameResu
         ))
     })?;
 
-    let title = parsed.title.trim().to_string();
-    if title.is_empty() {
-        return Err(PersonalError::Naming("model returned empty title".into()));
-    }
-    let title_chars = title.chars().count();
-    if title_chars > 200 {
-        return Err(PersonalError::Naming(format!(
-            "model returned over-long title ({title_chars} chars)"
-        )));
-    }
-
-    let category: Category = parsed.category.trim().parse()?;
-    if !cfg
-        .categories
-        .iter()
-        .any(|c| c.eq_ignore_ascii_case(category.as_str()))
-    {
-        return Err(PersonalError::UnknownCategory(category.to_string()));
-    }
-
-    Ok(NameResult { title, category })
+    Ok(Suggestion {
+        title: parsed.title,
+        category: parsed.category,
+    })
 }
 
 fn take_chars(s: &str, max: usize) -> String {

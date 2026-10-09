@@ -18,27 +18,43 @@ pub struct ListEntry {
     pub original_format: Option<String>,
 }
 
+/// Documents in the store, most recently ingested first (the order the MCP
+/// `personal_list` tool promises), at most `limit` of them. `category` is
+/// checked against the store's taxonomy (see [`Config::resolve_category`]).
 pub fn list_entries(cfg: &Config, category: Option<&str>, limit: usize) -> Result<Vec<ListEntry>> {
-    let mut out = Vec::new();
+    let category = category.map(|c| cfg.resolve_category(c)).transpose()?;
+    let mut found: Vec<(Option<String>, ListEntry)> = Vec::new();
     walk_sidecars(&cfg.root_dir(), &mut |path| {
         let stem = sidecar_stem(path);
         let entry = read_sidecar(path)?;
         if let Some(cat) = category {
-            if entry.category.as_deref() != Some(cat) {
+            let matches = entry
+                .category
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(cat.as_str()));
+            if !matches {
                 return Ok(());
             }
         }
-        out.push(ListEntry {
-            stem,
-            title: entry.title,
-            category: entry.category,
-            original_format: entry.original_format,
-        });
+        found.push((
+            entry.downloaded_at,
+            ListEntry {
+                stem,
+                title: entry.title,
+                category: entry.category,
+                original_format: entry.original_format,
+            },
+        ));
         Ok(())
     })?;
-    out.sort_by(|a, b| a.stem.cmp(&b.stem));
-    out.truncate(limit);
-    Ok(out)
+    // `downloaded_at` is the ingest time as RFC 3339 UTC, which orders as
+    // text; a sidecar without one sorts last. Ties break by stem.
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.stem.cmp(&b.1.stem)));
+    Ok(found
+        .into_iter()
+        .take(limit)
+        .map(|(_, entry)| entry)
+        .collect())
 }
 
 /// A stem names one document's files under the store: reject anything that
@@ -75,10 +91,18 @@ pub async fn delete(cfg: &Config, stem: &str) -> Result<u64> {
         hs_common::sharded_path(&cfg.root_dir(), stem, "catalog.yaml"),
         hs_common::sharded_path(&cfg.markdown_dir(), stem, "md"),
     ];
+    let mut removed_files = 0usize;
     for p in &candidates {
         if p.exists() {
             std::fs::remove_file(p)?;
+            removed_files += 1;
         }
+    }
+    // A stem that names nothing is a typo to report, not a deletion to confirm.
+    if removed == 0 && removed_files == 0 {
+        return Err(PersonalError::Other(anyhow::anyhow!(
+            "no personal document with stem '{stem}' (no vectors, no files)"
+        )));
     }
     Ok(removed)
 }
@@ -191,6 +215,70 @@ mod tests {
         assert!(err.to_string().contains("embedder down"), "{err}");
         index.assert_async().await;
         delete.assert_async().await;
+    }
+
+    fn write_sidecar(cfg: &Config, stem: &str, category: &str, downloaded_at: Option<&str>) {
+        let entry = CatalogEntry {
+            title: Some(format!("Title of {stem}")),
+            category: Some(category.to_string()),
+            downloaded_at: downloaded_at.map(str::to_string),
+            ..CatalogEntry::default()
+        };
+        let path = hs_common::sharded_path(&cfg.root_dir(), stem, "catalog.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_yaml_ng::to_string(&entry).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn list_is_most_recent_first_and_its_category_filter_ignores_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            project_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        write_sidecar(&cfg, "jan", "tax", Some("2026-01-05T10:00:00+00:00"));
+        write_sidecar(&cfg, "mar", "medical", Some("2026-03-05T10:00:00+00:00"));
+        write_sidecar(&cfg, "feb", "tax", Some("2026-02-05T10:00:00+00:00"));
+        write_sidecar(&cfg, "undated", "tax", None);
+        let stems = |entries: Vec<ListEntry>| -> Vec<String> {
+            entries.into_iter().map(|e| e.stem).collect()
+        };
+
+        assert_eq!(
+            stems(list_entries(&cfg, None, 10).unwrap()),
+            ["mar", "feb", "jan", "undated"]
+        );
+        // `limit` keeps the most recent ones, not the alphabetically first.
+        assert_eq!(stems(list_entries(&cfg, None, 1).unwrap()), ["mar"]);
+        // The stored category is lowercase; `--category Tax` must still match.
+        assert_eq!(
+            stems(list_entries(&cfg, Some("Tax"), 10).unwrap()),
+            ["feb", "jan", "undated"]
+        );
+        // A category outside the taxonomy matches nothing by construction.
+        let err = list_entries(&cfg, Some("payroll"), 10).unwrap_err();
+        assert!(matches!(err, PersonalError::UnknownCategory(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_stem_that_names_nothing_is_an_error() {
+        let mut distill = mockito::Server::new_async().await;
+        distill
+            .mock("DELETE", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"deleted":0}"#)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            project_dir: dir.path().to_path_buf(),
+            distill_url: distill.url(),
+            ..Config::default()
+        };
+
+        let err = delete(&cfg, "no-such-doc").await.unwrap_err();
+
+        assert!(err.to_string().contains("no personal document"), "{err}");
     }
 }
 

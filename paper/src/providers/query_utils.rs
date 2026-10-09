@@ -7,6 +7,13 @@ pub fn is_phrase_query(query: &str) -> bool {
         && !query.contains('"')
 }
 
+/// `text` made safe to sit between the double quotes of a Lucene phrase
+/// (`TITLE:"…"`, `doi:"…"`): a `"` in the text would otherwise close the
+/// phrase and turn the rest of the user's words into query syntax.
+pub fn escape_phrase(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 pub fn maybe_quote_phrase(query: &str) -> String {
     if is_phrase_query(query) {
         format!("\"{}\"", query)
@@ -58,5 +65,10 @@ mod tests {
             maybe_quote_phrase("neural AND networks"),
             "neural AND networks"
         );
+    }
+
+    #[test]
+    fn escape_phrase_keeps_a_quote_inside_the_phrase() {
+        assert_eq!(escape_phrase(r#"say "hi" \ bye"#), r#"say \"hi\" \\ bye"#);
     }
 }

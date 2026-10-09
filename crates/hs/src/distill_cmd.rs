@@ -993,7 +993,7 @@ pub async fn ensure_index_running() -> Result<bool> {
     }
 
     // Uses an HTTP health check so it works for both local and remote
-    // servers (e.g. big_mac → big).
+    // servers (e.g. a client host pointing at a remote distill host).
     let server_url = DistillClientConfig::load()?.require_servers()?[0].clone();
     let client = make_distill_client(&server_url)
         .await
@@ -1073,7 +1073,7 @@ const INDEX_DAEMON_ARGS: [&str; 3] = ["distill", "index", "--daemon-child"];
 
 /// Is `pid` a live index daemon? A PID file outlives its process and the
 /// kernel recycles PIDs, so a bare "is the PID alive" can name a stranger.
-fn is_index_daemon(pid: u32) -> Result<bool> {
+pub(crate) fn is_index_daemon(pid: u32) -> Result<bool> {
     Ok(crate::daemon::process_is(
         pid,
         &crate::daemon::current_exe_name()?,

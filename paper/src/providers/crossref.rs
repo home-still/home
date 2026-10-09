@@ -241,7 +241,9 @@ impl PaperProvider for CrossRefProvider {
             .map(|w| self.cr_work_to_paper(w))
             .collect();
 
-        let next_offset = query.offset + query.max_results.min(CROSSREF_PAGE_MAX);
+        let next_offset = query
+            .offset
+            .saturating_add(query.max_results.min(CROSSREF_PAGE_MAX));
         let next_offset = if next_offset < body.message.total_results {
             Some(next_offset)
         } else {

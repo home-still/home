@@ -144,6 +144,12 @@ pub struct CitationsOpts {
     pub sort: Option<String>,
 }
 
+/// Whether `entry` was published in `year_from` or later; with no floor,
+/// every entry. An entry with no year cannot be shown to pass a floor.
+fn published_since(entry: &CitationGraphEntry, year_from: Option<u16>) -> bool {
+    year_from.is_none_or(|floor| entry.year.is_some_and(|year| year >= floor))
+}
+
 fn s2_paper_to_entry(p: S2Paper) -> CitationGraphEntry {
     let semantic_scholar_id = p.paper_id.as_ref().filter(|s| !s.is_empty()).cloned();
     let authors: Vec<String> = p
@@ -387,6 +393,11 @@ impl SemanticScholarProvider {
     ) -> Result<CitationsResponse, PaperError> {
         let id = ss_identifier_for_doi(&crate::stem::normalize_doi(doi)?);
         let effective_limit = opts.limit.unwrap_or(100).min(1000) as usize;
+        if effective_limit == 0 {
+            return Err(PaperError::InvalidInput(
+                "citations limit must be at least 1".into(),
+            ));
+        }
 
         const PAGE_SIZE: u32 = 1000;
         // When sorting by citation count we must rank the global citing set,
@@ -405,7 +416,16 @@ impl SemanticScholarProvider {
         // 1000-edge pages is all Semantic Scholar will ever serve, so more
         // than this many requests means the cursor is not progressing.
         const MAX_CITATION_PAGES: u32 = 12;
-        let sort_by_citations = opts.sort.as_deref() == Some("citations");
+        let sort_by_citations = match opts.sort.as_deref() {
+            None | Some("year") => false,
+            Some("citations") => true,
+            // A typo (`"citation"`) used to fall through to the year order.
+            Some(other) => {
+                return Err(PaperError::InvalidInput(format!(
+                    "unknown citations sort {other:?}: use \"year\" or \"citations\""
+                )))
+            }
+        };
         let fetch_target = if sort_by_citations {
             MAX_CITATION_SORT_FETCH
         } else {
@@ -447,7 +467,11 @@ impl SemanticScholarProvider {
                 body.data
                     .into_iter()
                     .filter_map(|edge| edge.citing_paper)
-                    .map(s2_paper_to_entry),
+                    .map(s2_paper_to_entry)
+                    // Filtered as the pages arrive, so `limit` counts papers
+                    // that pass: filtering after a fetch that stopped at
+                    // `limit` edges returned fewer than were available.
+                    .filter(|entry| published_since(entry, opts.year_from)),
             );
 
             if entries.len() >= fetch_target {
@@ -472,25 +496,20 @@ impl SemanticScholarProvider {
             }
         }
 
-        if let Some(yf) = opts.year_from {
-            entries.retain(|e| e.year.map(|y| y >= yf).unwrap_or(false));
+        if sort_by_citations {
+            entries.sort_by_key(|e| std::cmp::Reverse(e.citation_count));
+        } else {
+            entries.sort_by_key(|e| std::cmp::Reverse(e.year));
         }
 
-        let sort_key = opts.sort.as_deref().unwrap_or("year");
-        match sort_key {
-            "citations" => entries.sort_by_key(|e| std::cmp::Reverse(e.citation_count)),
-            _ => entries.sort_by_key(|e| std::cmp::Reverse(e.year)),
-        }
-
-        if entries.len() > effective_limit {
-            entries.truncate(effective_limit);
-        }
+        let matched = entries.len();
+        entries.truncate(effective_limit);
 
         let total_returned = entries.len() as u32;
-        let truncated = match total_available {
-            Some(t) => t > total_returned,
-            None => hit_limit,
-        };
+        // More exists when the walk stopped before the end of the citing set
+        // (enough papers gathered, or Semantic Scholar's offset ceiling) or
+        // more papers matched than `limit` lets through.
+        let truncated = hit_limit || matched > effective_limit;
 
         Ok(CitationsResponse {
             citations: entries,
@@ -1313,6 +1332,117 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A page of `n` citing edges: the first `recent` published in `recent_year`,
+    /// the rest in 2000.
+    fn citing_edges(n: u32, recent: u32, recent_year: u16, id_prefix: &str) -> String {
+        let edges: Vec<String> = (0..n)
+            .map(|i| {
+                let year = if i < recent { recent_year } else { 2000 };
+                format!(
+                    r#"{{"citingPaper":{{"paperId":"{id_prefix}{i}","title":"Cite {id_prefix}{i}","year":{year},"externalIds":{{"DOI":"10.1/{id_prefix}{i}"}}}}}}"#
+                )
+            })
+            .collect();
+        edges.join(",")
+    }
+
+    #[tokio::test]
+    async fn year_from_keeps_fetching_until_limit_papers_pass_the_filter() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Page one holds 1000 edges but only 3 from 2024; the other 2 papers
+        // the caller wants (limit 5, year_from 2020) are on page two. The old
+        // loop stopped after page one (1000 edges >= limit) and filtered
+        // afterwards, returning 3.
+        let page1 = format!(
+            r#"{{"offset":0,"next":1000,"total":1010,"data":[{}]}}"#,
+            citing_edges(1000, 3, 2024, "a")
+        );
+        let page2 = format!(
+            r#"{{"offset":1000,"total":1010,"data":[{}]}}"#,
+            citing_edges(10, 10, 2023, "b")
+        );
+        let server = MockServer::start().await;
+        for (offset, body) in [("0", page1), ("1000", page2)] {
+            Mock::given(method("GET"))
+                .and(path("/graph/v1/paper/DOI:10.1/recent/citations"))
+                .and(query_param("offset", offset))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+        }
+
+        let resp = provider_pointing_at(&server.uri())
+            .citations(
+                "10.1/recent",
+                CitationsOpts {
+                    limit: Some(5),
+                    year_from: Some(2020),
+                    sort: None,
+                },
+                &test_guard(),
+            )
+            .await
+            .unwrap();
+
+        let years: Vec<Option<u16>> = resp.citations.iter().map(|c| c.year).collect();
+        assert_eq!(
+            years,
+            [Some(2024), Some(2024), Some(2024), Some(2023), Some(2023)]
+        );
+        assert!(resp.truncated, "more matching papers exist on page two");
+    }
+
+    #[tokio::test]
+    async fn a_complete_citing_set_within_the_limit_is_not_truncated() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // One short page, no `next`: nothing is left behind. `total` counts
+        // edges whose citing paper is unknown to Semantic Scholar (null
+        // `citingPaper`), which are never returned.
+        let page = format!(
+            r#"{{"total":9,"data":[{},{{"citingPaper":null}}]}}"#,
+            citing_edges(3, 3, 2022, "c")
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(page))
+            .mount(&server)
+            .await;
+
+        let resp = provider_pointing_at(&server.uri())
+            .citations("10.1/small", CitationsOpts::default(), &test_guard())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.total_returned, 3);
+        assert!(!resp.truncated);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_citations_sort_or_a_zero_limit_is_invalid_input() {
+        // No server: the request must be refused before anything is sent.
+        let provider = provider_pointing_at("http://127.0.0.1:9");
+        for opts in [
+            CitationsOpts {
+                sort: Some("citation".to_string()),
+                ..CitationsOpts::default()
+            },
+            CitationsOpts {
+                limit: Some(0),
+                ..CitationsOpts::default()
+            },
+        ] {
+            let err = provider
+                .citations("10.1/x", opts, &test_guard())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, PaperError::InvalidInput(_)), "{err:?}");
+        }
     }
 
     /// A three-page citing set, one edge per page, chained by `next`.

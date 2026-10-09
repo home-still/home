@@ -398,12 +398,15 @@ async fn cmd_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
     reporter.status("Gateway", &creds.gateway_url);
     reporter.status("Device", &creds.device_name);
 
-    // Try to refresh token to check connectivity
+    // Try to refresh token to check connectivity. A status command that
+    // finds the connection broken fails: scripts and `hs status` sweeps key
+    // on the exit code.
     let auth_client = hs_common::auth::client::AuthenticatedClient::new(creds)?;
-    match auth_client.get_access_token().await {
-        Ok(_) => reporter.status("Connection", "OK (token refreshed)"),
-        Err(e) => reporter.warn(&format!("Connection failed: {e}")),
-    }
+    auth_client
+        .get_access_token()
+        .await
+        .context("Connection failed")?;
+    reporter.status("Connection", "OK (token refreshed)");
 
     Ok(())
 }

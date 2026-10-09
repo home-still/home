@@ -77,11 +77,7 @@ pub fn filter_contained_regions(boxes: Vec<BBox>) -> Vec<BBox> {
 /// 2. Significant cross-class overlaps (IoU >= 0.7): Keep higher priority;
 ///    at same priority, keep higher confidence (already sorted descending)
 pub fn deduplicate_boxes(mut boxes: Vec<BBox>) -> Vec<BBox> {
-    boxes.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    boxes.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
     let mut result = Vec::new();
 
     for candidate in boxes {
@@ -124,10 +120,6 @@ fn class_priority(class: &str) -> u8 {
         "display_formula" | "inline_formula" => 3,
         "text" | "abstract" | "content" | "reference" | "reference_content" | "footnote"
         | "vision_footnote" | "aside_text" | "vertical_text" | "algorithm" => 4,
-        // Legacy YOLO names
-        "title" | "caption" | "section_header" => 1,
-        "figure" | "equation" => 2,
-        "plain text" | "paragraph" => 4,
         _ => 5,
     }
 }

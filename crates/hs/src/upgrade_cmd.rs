@@ -188,21 +188,38 @@ async fn plan_installs(
 // ── Version helpers ─────────────────────────────────────────────
 
 fn current_version() -> semver::Version {
-    let raw = env!("HS_VERSION");
-    // Try parsing as-is first (works for CI builds: "0.0.1-rc.99")
-    if let Ok(v) = semver::Version::parse(raw) {
-        return v;
+    describe_base_version(env!("HS_VERSION"))
+}
+
+/// The release a build is based on. A tagged build's `HS_VERSION` is the tag
+/// (`0.0.1-rc.99`); a development build's is `git describe` output
+/// (`0.0.1-rc.99-3-gabcdef`). That parses as semver too, with the commit count
+/// and hash glued onto the last pre-release identifier, which makes it
+/// alphanumeric and so *newer* than every later rc (`rc.360`): the stale
+/// development build would be told it is up to date. A describe with no tag
+/// at all (a bare hash) is based on no release: `0.0.0`, older than all of them.
+fn describe_base_version(raw: &str) -> semver::Version {
+    semver::Version::parse(strip_describe_suffix(raw))
+        .unwrap_or_else(|_| semver::Version::new(0, 0, 0))
+}
+
+/// `<tag>-<commits>-g<hash>` -> `<tag>`; anything else is returned unchanged.
+fn strip_describe_suffix(raw: &str) -> &str {
+    let Some((rest, hash)) = raw.rsplit_once('-') else {
+        return raw;
+    };
+    let Some((tag, commits)) = rest.rsplit_once('-') else {
+        return raw;
+    };
+    let is_hash = hash
+        .strip_prefix('g')
+        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+    let is_count = !commits.is_empty() && commits.bytes().all(|b| b.is_ascii_digit());
+    if is_hash && is_count {
+        tag
+    } else {
+        raw
     }
-    // git describe produces e.g. "0.0.1-rc.99-3-gabcdef" — try progressively
-    // shorter suffixes until we find valid semver.
-    let mut candidate = raw.to_string();
-    while let Some(pos) = candidate.rfind('-') {
-        candidate.truncate(pos);
-        if let Ok(v) = semver::Version::parse(&candidate) {
-            return v;
-        }
-    }
-    semver::Version::new(0, 0, 0)
 }
 
 fn parse_release_version(tag: &str) -> Result<semver::Version> {
@@ -485,6 +502,27 @@ mod tests {
         assert_eq!(url, "http://localhost:9911");
         assert!(local_service_url(["http://scribe-1.example.local:7433"], "scribe").is_err());
         assert!(local_service_url([], "distill").is_err());
+    }
+
+    /// `0.0.1-rc.358-47-gd4a0d79` is valid semver that outranks `rc.360`, so
+    /// an unstripped development build never saw a newer release.
+    #[test]
+    fn a_development_build_is_compared_by_the_release_it_is_based_on() {
+        let rc = |n: u64| semver::Version::parse(&format!("0.0.1-rc.{n}")).unwrap();
+        let dev = describe_base_version("0.0.1-rc.358-47-gd4a0d79");
+        assert_eq!(dev, rc(358));
+        assert!(dev < rc(360));
+
+        assert_eq!(describe_base_version("0.0.1-rc.360"), rc(360));
+        assert_eq!(
+            describe_base_version("0.0.1"),
+            semver::Version::new(0, 0, 1)
+        );
+        // No tag in the checkout: a bare hash is based on no release.
+        assert_eq!(
+            describe_base_version("d4a0d79"),
+            semver::Version::new(0, 0, 0)
+        );
     }
 
     #[tokio::test]

@@ -379,7 +379,12 @@ fn read_chapters(
             content.ok_or_else(|| spine_failure(&entry_name, "no such entry in the archive"))?;
         let xhtml = std::str::from_utf8(&content)
             .map_err(|_| spine_failure(&entry_name, "it is not valid UTF-8"))?;
-        on_chapter(xhtml, &mut budget)?;
+        // A content document is XHTML: its `<title/>` and `<div/>` mean what
+        // they say, which the HTML parser would not.
+        on_chapter(
+            &crate::html::expand_xhtml_empty_elements(xhtml),
+            &mut budget,
+        )?;
     }
     Ok(())
 }
@@ -942,5 +947,19 @@ mod tests {
         let outcomes = run_epub_cases(dir.path(), &[book]);
         assert!(outcomes[0].starts_with("err "), "{}", outcomes[0]);
         assert!(outcomes[0].contains("nest"), "{}", outcomes[0]);
+    }
+
+    #[test]
+    fn xhtml_empty_element_tags_do_not_swallow_or_nest_the_chapter() {
+        // `<title/>` and `<script src=".."/>` would open a raw-text element
+        // to the end of the file in the HTML parser (the chapter would
+        // vanish), and each `<div/>` would be one more level of nesting.
+        let xhtml = format!(
+            r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title/><script src="x.js" /></head><body><a id="p1"/>{}<p>Alpha survives</p></body></html>"#,
+            "<div/>".repeat(1_000)
+        );
+        let book = epub(&[("a.xhtml", xhtml.into_bytes())], &["c0"]);
+        let md = convert_epub_to_markdown_with(&book, &EpubLimits::default(), &NEVER).unwrap();
+        assert!(md.contains("Alpha survives"), "{md}");
     }
 }

@@ -856,6 +856,77 @@ fn a_dimension_record_with_a_malformed_id_fails_the_partition_and_names_it() {
     assert_eq!(s.rows_inserted, 1);
 }
 
+// ---- partition newer than what is already loaded --------------------------
+
+/// A snapshot re-sync can add a partition newer than one that is already
+/// loaded. Walking it now would drop every record the older partition
+/// stored as a "stale duplicate" and keep the older copy, silently: each
+/// loader must refuse it instead and leave the tables as they were.
+#[test]
+fn a_partition_newer_than_a_loaded_one_is_refused_and_changes_nothing() {
+    let f = fixture();
+    write_partition(&f.snap, OLD, &[work(1, "old1", None)]);
+    write_file(
+        &f.snap,
+        "authors",
+        OLD,
+        "part_0000.jsonl",
+        &[author_named(1, "old")],
+    );
+    write_file(
+        &f.snap,
+        "concepts",
+        OLD,
+        "part_0000.jsonl",
+        &[concept_named(1, "old")],
+    );
+    f.load().unwrap();
+    let opts = LoadOptions::default();
+    f.db.load_authors(&f.snap, &opts).unwrap();
+    f.db.load_simple_entity(SimpleEntity::Concepts, &f.snap)
+        .unwrap();
+
+    write_partition(&f.snap, NEW, &[work(1, "new1", None)]);
+    write_file(
+        &f.snap,
+        "authors",
+        NEW,
+        "part_0000.jsonl",
+        &[author_named(1, "new")],
+    );
+    write_file(
+        &f.snap,
+        "concepts",
+        NEW,
+        "part_0000.jsonl",
+        &[concept_named(1, "new")],
+    );
+
+    let errors = [
+        f.load().unwrap_err(),
+        f.db.load_authors(&f.snap, &opts).unwrap_err(),
+        f.db.load_simple_entity(SimpleEntity::Concepts, &f.snap)
+            .unwrap_err(),
+    ];
+    for e in errors {
+        let msg = format!("{e:#}");
+        assert!(msg.contains("is newer than the already loaded"), "{msg}");
+    }
+    assert_eq!(f.titles(), pairs(&[("W1", "old1")]));
+    assert_eq!(f.names("authors"), pairs(&[("A1", "old")]));
+    assert_eq!(f.names("concepts"), pairs(&[("C1", "old")]));
+    // The refusal is not a failed load of the partition: it is not stamped.
+    let stamped: u64 =
+        f.db.raw()
+            .query_row(
+                "SELECT COUNT(*) FROM _ingest_log WHERE partition = ?",
+                [NEW],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert_eq!(stamped, 0);
+}
+
 // ---- RA-109 ---------------------------------------------------------------
 
 #[test]

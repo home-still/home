@@ -16,7 +16,7 @@ The client reads markdown files locally and sends content to the server over HTT
 
 ## Server setup
 
-The server runs on the machine with compute resources (GPU or fast CPU). It needs Qdrant for vector storage.
+The server runs on the machine with the GPU. It needs an NVIDIA GPU with CUDA (there is no CPU path: the server refuses to start when the model does not land on the GPU) and Qdrant for vector storage.
 
 ### 1. Install
 
@@ -53,11 +53,15 @@ All fields have defaults and are optional. The server refuses to start on an inv
 | `embedding.max_length` | `1280` | Tokens the model sees per text (longer input is truncated by the tokenizer). `chunk_max_tokens + 48` must fit. Raising it costs VRAM per batch, so `embedding.batch_size` is capped at `128 x 512^2 / max_length^2` rows (32 rows at 1024, 20 at 1280). Max 8192. |
 | `embedding.batch_size` | `32` (capped) | Rows per forward pass; at least 1 |
 | `embedding.pool_size` | `1` | Model copies; at least 1 |
+| `embedding.adaptive_batch` | `true` | Tune the batch size in-process against observed throughput, starting from `batch_size` |
+| `embedding.idle_release_secs` | unset | Drop the model from GPU memory after this many idle seconds (at least 1); the next request reloads it (~10 s). Unset keeps it resident |
+| `embedding.vram_floor_mb` | `5000` | Free VRAM required before (re)loading the model; below it the load fails naming the GPU holders |
 | `hnsw.m` / `hnsw.ef_construct` | `16` / `100` | HNSW graph of **new** collections (`m: 0` is rejected) |
 | `hnsw.search_ef` | `128` | Candidates considered per query |
 | `hnsw.max_indexing_threads` | `4` | Index-build threads used by `POST /collection/hnsw` (1..=64) |
 | `chunk_max_tokens` | `1000` | Max tokens per chunk |
 | `chunk_overlap` | `100` | Token overlap between chunks (must be smaller than `chunk_max_tokens`) |
+| `qdrant_upsert_batch` / `qdrant_upsert_parallelism` | `1000` / `4` | Chunks per Qdrant upsert request / requests in flight per document; at least 1 each |
 | `llm_metadata` | `false` | Extract keywords/topics with Ollama (`ollama_url` incl. port, `metadata_model`, `ollama_timeout_secs: 120`); a failed call fails that document |
 
 Removed keys `embedding.model` and `embedding.sparse_enabled` have no effect (the model is fixed and embeddings are dense-only); the server logs a warning if they are still set.
@@ -120,10 +124,11 @@ distill:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `servers` | `["http://localhost:7434"]` | Distill server URL(s) |
+| `servers` | none | Distill server URL(s), e.g. `[http://<host>:7434]`. There is no default: a command that needs a server fails naming this key |
 | `markdown_dir` | `{project_dir}/markdown` | Where to find `.md` files |
 | `catalog_dir` | `{project_dir}/catalog` | Where to find catalog `.yaml` files |
 | `index_timeout_secs` | `1800` | Deadline for one indexing request. With NATS events it must be at least 120 s below `events.nats.ack_wait_secs` (default 7200). |
+| `concurrency` | hardware default | Documents `hs distill watch-events` indexes in parallel; at least 1 |
 
 The configured `distill.servers` list is the only source of server addresses; there is no service registry.
 
@@ -159,9 +164,9 @@ Shows Qdrant health, server status, collection name, point count, and document c
 Each markdown file goes through:
 
 1. **Chunking** -- split at sentence boundaries with configurable max tokens and overlap. Page-aware (respects `---` page separators from scribe).
-2. **Metadata extraction** -- pulls title, authors, DOI, year from catalog YAML + regex patterns. Optional LLM extraction for keywords/topics via Ollama.
+2. **Metadata extraction** -- title, authors, DOI, publication date and the other fields come from the catalog entry sent with the request; DOI and year are never regex-extracted from the body text (the first DOI or year in a paper is usually a citation). Without a catalog entry the chunks carry none of them. Optional LLM extraction for keywords/topics via Ollama.
 3. **Embedding** -- BGE-M3 via ONNX (fastembed) on CUDA. 1024-dimensional dense vectors. A panic inside ONNX Runtime poisons its model slot; `/health` reports it and the process exits so the supervisor restarts it.
-4. **Qdrant upsert** -- deterministic point IDs (xxhash + UUID v5) enable idempotent re-indexing; chunks past the document's new end are deleted after the upsert succeeds. Rich payload with full metadata for filtered search.
+4. **Qdrant upsert** -- deterministic point IDs (xxhash + UUID v5) enable idempotent re-indexing; every write waits until Qdrant has applied it, so a failed write is an error rather than a silent loss; chunks past the document's new end are deleted after the upsert succeeds. Rich payload with full metadata for filtered search.
 
 ## API endpoints
 
@@ -172,7 +177,7 @@ Each markdown file goes through:
 | `/status` | GET | Collection stats (points, documents, device); `documents_count_truncated` if the count hit 1,000,000 |
 | `/distill` | POST | Index a document (non-streaming). `content` is required |
 | `/distill/stream` | POST | Index with NDJSON streaming progress. `content` is required |
-| `/search` | POST | Semantic search with optional filters. `limit` defaults to 10 and is clamped to 200; an unparseable `year` filter is a 400 |
+| `/search` | POST | Semantic search with optional filters. `limit` defaults to 10 and is clamped to 200; `query` is at most 65,536 bytes (larger is a 400); an unparseable `year` filter is a 400 |
 | `/exists/{doc_id}`, `/docs` | GET | Per-document chunk count; distinct doc ids (`limit` up to 1,000,000, larger is a 400; `truncated` flags a partial list) |
 | `/doc/{doc_id}`, `/collection/reset`, `/scrub-interstitials` | DELETE / POST | Destructive maintenance |
 | `/collection/hnsw?collection=<name>` | POST | Enable HNSW on an existing collection with `hnsw.m`/`ef_construct`, capped at `hnsw.max_indexing_threads` (default 4). Returns immediately (Qdrant builds the graph in the background); a no-op that says so when already enabled. Never run at startup — use `hs distill hnsw enable --collection <name>` in a maintenance window |
@@ -190,6 +195,6 @@ export HS_RELEASE_TAG=v0.0.1-rc.NNN
 # Client only (lightweight, no ONNX deps)
 cargo build --release -p hs-distill
 
-# Server (requires ONNX runtime)
-cargo build --release -p hs-distill --features server
+# Server (needs the ONNX runtime and CUDA; the binary does not compile without `cuda`)
+cargo build --release -p hs-distill --features server,cuda --bin hs-distill-server
 ```

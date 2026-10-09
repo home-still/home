@@ -58,6 +58,7 @@ cloud:
     # backend_connect_timeout_secs: 10
     # backend_read_timeout_secs: 600        # stalled backend -> 504
     # backend_total_timeout_secs: 3600
+    # backend_failure_cooldown_secs: 10     # an instance that refused a connection is skipped this long
     # auth_rate_limit_per_minute: 30        # per endpoint: /cloud/enroll, /authorize, /token, /register
     # previous_secret_path: /home/<user>/.home-still/cloud-secret.key.prev   # key rotation only
 ```

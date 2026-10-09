@@ -28,6 +28,18 @@ hs paper get --doi "10.1038/s41586-024-07487-w"   # lookup metadata
 
 When using `--provider all` (default), all providers are queried in parallel. Results are deduplicated by DOI + fuzzy title matching and ranked with reciprocal rank fusion.
 
+`--provider` takes `all`, `arxiv`, `openalex`, `semantic_scholar` (or `s2`), `europe_pmc` (or `europmc`, `pmc`), `crossref`, `core`; clap's own spellings `semanticscholar` and `europepmc` work too.
+
+### Query syntax and paging
+
+- Plain multi-word text is searched as a phrase. On arXiv, `AND` / `OR` / `NOT` between terms are operators and `"quoted phrases"` stay together; two terms with no operator between them mean `AND`. An unclosed quote is an error.
+- `--offset` pages by result offset. OpenAlex pages by page number, so the offset must be a multiple of the page size (`-n`); Europe PMC pages by cursor and cannot take an offset (an error when searched alone, left out of `--provider all` when the offset is not 0). Other providers take any offset. `--provider all` never reports a next offset.
+- A DOI lookup (`paper get`, the `paper_get` MCP tool) accepts the bare DOI, `doi:` or a `https://doi.org/` URL, any case.
+
+### Citation graph (MCP `paper_references`, `paper_citations`)
+
+Both go through Semantic Scholar under the shared rate limiter and breaker (every page of a citing-set walk is one limited request). `paper_citations` takes `limit` (1–1000, default 100), `year_from` and `sort` (`year`, the default, or `citations`; anything else is an error). `year_from` is applied while the pages are fetched, so `limit` counts papers that pass it. `sort=citations` ranks the whole citing set Semantic Scholar will serve (its ceiling is about 9000 edges); `sort=year` orders only the first `limit` papers Semantic Scholar returns. `truncated: true` means more exist than were returned.
+
 ## As a library
 
 ```rust

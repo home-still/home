@@ -114,8 +114,14 @@ impl EuropePmcProvider {
 
     fn build_search_url(&self, query: &SearchQuery) -> String {
         let search_query = match query.search_type {
-            SearchType::Title => format!("TITLE:\"{}\"", query.query),
-            SearchType::Author => format!("AUTH:\"{}\"", query.query),
+            SearchType::Title => format!(
+                "TITLE:\"{}\"",
+                super::query_utils::escape_phrase(&query.query)
+            ),
+            SearchType::Author => format!(
+                "AUTH:\"{}\"",
+                super::query_utils::escape_phrase(&query.query)
+            ),
             _ => super::query_utils::maybe_quote_phrase(&query.query),
         };
 
@@ -219,7 +225,7 @@ impl PaperProvider for EuropePmcProvider {
         // A Lucene phrase: quoting keeps `:`, `(`, spaces and friends inside
         // a DOI from being parsed as query syntax; the whole query is then
         // percent-encoded by the URL builder.
-        let phrase = format!("DOI:\"{}\"", doi.replace('\\', "\\\\").replace('"', "\\\""));
+        let phrase = format!("DOI:\"{}\"", super::query_utils::escape_phrase(&doi));
         let mut url = url::Url::parse(&self.base_url)
             .map_err(|e| PaperError::InvalidInput(format!("bad Europe PMC base_url: {e}")))?;
         url.path_segments_mut()

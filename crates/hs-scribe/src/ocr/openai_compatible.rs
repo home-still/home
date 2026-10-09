@@ -126,10 +126,7 @@ impl OpenAiBackend {
                         continue;
                     }
                     if rejects_the_request(status) {
-                        let body = resp
-                            .text()
-                            .await
-                            .unwrap_or_else(|e| format!("<body unreadable: {e}>"));
+                        let body = rejection_body(resp).await;
                         return Err(ConvertFailure::err(
                             FailureCode::VlmRequestRejected,
                             format!(
@@ -163,6 +160,27 @@ impl OpenAiBackend {
 
 /// How much of a rejected request's response body goes into the error.
 const MAX_REJECTION_BODY: usize = 512;
+
+/// Largest completion the stream may accumulate. The request caps the model
+/// at 8192 tokens (tens of KB); a backend that streams past this is not
+/// honouring that cap, and the repetition detector only catches loops, not
+/// unbounded diverse output.
+const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// The start of a rejected request's response body, for the error message.
+/// Reading stops once the message has all it can show (plus the rest of the
+/// chunk in hand), so a backend cannot make an error path buffer its reply.
+async fn rejection_body(mut resp: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while body.len() < MAX_REJECTION_BODY {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) => break,
+            Err(e) => return format!("<body unreadable: {e}>"),
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
 
 /// `true` for a 4xx that is a verdict on this request and so repeats on
 /// every retry. 408 and 429 are the backend asking to be tried again; 401,
@@ -304,6 +322,11 @@ where
                 StreamEvent::Chunk { delta, finish } => {
                     if let Some(delta) = delta.filter(|d| !d.is_empty()) {
                         output.push_str(&delta);
+                        if output.len() > MAX_OUTPUT_BYTES {
+                            return Err(transport_failure(format!(
+                                "VLM stream produced more than {MAX_OUTPUT_BYTES} bytes of output"
+                            )));
+                        }
                         detector.feed(&delta);
                         if let Some(reason) = detector.check() {
                             let bytes_at_abort = output.len();

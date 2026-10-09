@@ -12,13 +12,31 @@ pub fn print_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// Remote text made safe to print on a terminal: control characters other
+/// than newline and tab (ESC and the C1 range start escape sequences — screen
+/// rewrites, clipboard writes) become spaces. A title or abstract is whatever
+/// the publisher registered.
+fn plain(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 fn format_authors(paper: &Paper) -> String {
-    paper
-        .authors
-        .iter()
-        .map(|a| a.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
+    plain(
+        &paper
+            .authors
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// Print search results as a human-readable list.
@@ -37,7 +55,13 @@ pub fn print_search_result(
     );
 
     for (i, paper) in result.papers.iter().enumerate() {
-        print_paper_row(i + offset + 1, paper, styles, show_abstract, query);
+        print_paper_row(
+            i.saturating_add(offset).saturating_add(1),
+            paper,
+            styles,
+            show_abstract,
+            query,
+        );
     }
 
     if let Some(offset) = result.next_offset {
@@ -104,21 +128,21 @@ fn print_paper_row(index: usize, paper: &Paper, styles: &Styles, show_abstract: 
     println!(
         "{}. {}",
         index,
-        highlight_keywords(&paper.title, query, styles)
+        highlight_keywords(&plain(&paper.title), query, styles)
     );
     println!("   {} ({})", authors, date.style(styles.date));
-    print!("   {}", paper.id);
+    print!("   {}", plain(&paper.id));
     if let Some(doi) = &paper.doi {
-        print!("  doi:{}", doi.style(styles.doi));
+        print!("  doi:{}", plain(doi).style(styles.doi));
     }
     println!();
     if let Some(url) = &paper.download_urls.first() {
-        println!("   {}", url.style(styles.url));
+        println!("   {}", plain(url).style(styles.url));
     }
     println!();
     if show_abstract {
         if let Some(abs) = &paper.abstract_text {
-            println!("   {}", abs);
+            println!("   {}", plain(abs));
         }
     }
 }
@@ -129,7 +153,7 @@ pub fn print_paper(paper: &Paper, styles: &Styles) {
     println!(
         "{} {}",
         "Title:".style(styles.label),
-        paper.title.style(styles.title)
+        plain(&paper.title).style(styles.title)
     );
     println!("{} {}", "Authors:".style(styles.label), authors);
     if let Some(date) = paper.publication_date {
@@ -139,15 +163,23 @@ pub fn print_paper(paper: &Paper, styles: &Styles) {
             date.style(styles.date)
         );
     }
-    println!("{} {}", "ID:".style(styles.label), paper.id);
+    println!("{} {}", "ID:".style(styles.label), plain(&paper.id));
     if let Some(doi) = &paper.doi {
-        println!("{} {}", "DOI:".style(styles.label), doi.style(styles.doi));
+        println!(
+            "{} {}",
+            "DOI:".style(styles.label),
+            plain(doi).style(styles.doi)
+        );
     }
     if let Some(url) = &paper.download_urls.first() {
-        println!("{} {}", "PDF:".style(styles.label), url.style(styles.url));
+        println!(
+            "{} {}",
+            "PDF:".style(styles.label),
+            plain(url).style(styles.url)
+        );
     }
     if let Some(abs) = &paper.abstract_text {
-        println!("\n{}", abs);
+        println!("\n{}", plain(abs));
     }
 }
 
@@ -254,5 +286,15 @@ mod tests {
         assert_eq!(fields[0], "A\\tB\\nC\\r\\\\D");
         assert_eq!(fields[1], "Smi\\tth\\nJ, Zhang Y");
         assert_eq!(fields[3], "10.1/x\\ty");
+    }
+
+    #[test]
+    fn terminal_escape_sequences_in_remote_text_are_neutralised() {
+        // A title is publisher-supplied: ESC, BEL and the 8-bit CSI must not
+        // reach the terminal, while line breaks in an abstract survive.
+        assert_eq!(plain("a\u{1b}[2Jb\u{7}c\u{9b}d\ne\tf"), "a [2Jb c d\ne\tf");
+        let mut paper = make_paper("t", None, None);
+        paper.authors[0].name = "Smith\u{1b}]52;c;Zm9v\u{7} J".into();
+        assert!(!format_authors(&paper).contains(['\u{1b}', '\u{7}']));
     }
 }

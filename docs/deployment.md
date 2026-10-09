@@ -41,7 +41,7 @@ Do these **before** restarting any service on the new binaries; each item names 
 
 ### 4. Scribe hosts
 
-* **libpdfium is required on every host that runs `hs-scribe-server` or a watcher (`hs scribe watch-events`), on every converter — olmocr hosts included** (they counted pages without it before): pdfium is the one PDF parser and counts the pages of every PDF before it is dispatched or converted. Both refuse to start when it cannot be bound, naming where they looked (`./`, `~/.local/lib`, `~/.home-still/dyld-libs`, then the system library path; macOS: `libpdfium.dylib`, see 6.7; container images bundle it). `hs scribe convert` and the `scribe_convert` MCP tool need it too, but fail per call instead. Check with `ldconfig -p | grep pdfium` (Linux) before upgrading. Legacy per-region hosts will not start without both ONNX models; check `/health` shows both loaded before upgrading.
+* **libpdfium is required on every host that runs `hs-scribe-server` or a watcher (`hs scribe watch-events`), on every converter — olmocr hosts included** (they counted pages without it before): pdfium is the one PDF parser and counts the pages of every PDF before it is dispatched or converted. Both refuse to start when it cannot be bound, naming where they looked (`~/.local/lib`, `~/.home-still/dyld-libs`, then the system library path — never the working directory; macOS: `libpdfium.dylib`, see 6.7; container images bundle it). `hs scribe convert` and the `scribe_convert` MCP tool need it too, but fail per call instead. Check with `ldconfig -p | grep pdfium` (Linux) before upgrading. Legacy per-region hosts will not start without both ONNX models; check `/health` shows both loaded before upgrading. An olmocr host will not start unless `olmocr_bin` (`HS_SCRIBE_OLMOCR_BIN`) is an executable file or on `PATH`.
 * A PDF pdfium cannot open, or that has no pages or more than 65 535, is refused for good (`pdf_parse_error`); a counter stuck behind a hostile document makes the callers behind it retry instead. A PDF the old parser rejected but pdfium renders is now converted.
 * **pdfium faults end the process.** A panic that unwinds through a live pdfium object poisons pdfium-render's process-wide lock, and a native pdfium call that never returns cannot be killed from inside the process. Both turn `/health` red (`status: pdfium_fault`, 503) and, after a 10 s grace, exit with status 70 so the supervisor restarts the unit (keep `Restart=always`/`RestartSec`). A panic during conversion is a typed permanent failure (`conversion_panicked`) on the wire, never a verdict about the PDF.
 * **Accepted residual: a PDF that keeps pdfium busy longer than its budget plus the grace period restarts the whole process.** The page count has a 60 s budget, each Legacy render/open call 120 s (`pdfium::guarded_call`), then a 10 s grace; past that the process exits 70 (`_exit`, so a wedged thread cannot block shutdown) and the supervisor restarts it, ending every conversion in flight on that host (up to `vlm_concurrency` of them). In-process recovery is impossible: pdfium holds a process-wide lock for the life of a call, a native call cannot be cancelled or killed from another thread, and a thread stuck inside it cannot be abandoned while the lock stays held. The only alternative is counting/rendering in a killable child process, which is deliberately not built. The document itself is refused for good (`pdf_parse_error`) on the count path, so it does not loop. The same restart follows a panic that poisons a layout/table ONNX slot (`DetectorPool`).
@@ -52,6 +52,8 @@ Do these **before** restarting any service on the new binaries; each item names 
 * A scribe client whose `HS_BACKEND_TOKEN` is rejected (401/403) stops the watcher with a non-zero exit and an ERROR naming the variable instead of NAK-looping every event.
 * EPUBs: one reader serves the watcher, `hs scribe inbox` and `hs personal add`, all under the configured `scribe.epub.*` limits (the inbox and personal ingest used the defaults before). `max_total_bytes` now counts bytes inflated **plus** bytes produced; a chapter the spine repeats is read once; package XML that is not well-formed or nests past 64 elements, and a chapter whose elements nest past 512, fail that book (HTML: `html_parse_error`).
 * Concurrency, dpi, timeout values must be >= 1 and `timeout_policy.floor_secs <= ceiling_secs`; `scribe.servers[].concurrency >= 1`.
+* The concurrency settings (`vlm_concurrency`, `page_parallel`, `parallel`) must also fit a semaphore (`Semaphore::MAX_PERMITS`); a larger value stops the server at start instead of panicking every conversion.
+* **Stalled and oversized inputs.** A scribe upload that delivers no bytes for 60 s is refused with `408` and gives its slot back (a half-open connection used to hold it until a restart). The watcher reads a stored source's size first and refuses one over 256 MiB for good (`pdf_parse_error` / `epub_parse_error` / `html_parse_error`) without loading it.
 * More Escalate/NAK traffic during VLM instability is expected: failed pages now fail the conversion instead of leaving holes.
 
 ### 5. Distill hosts
@@ -75,6 +77,7 @@ Do these **before** restarting any service on the new binaries; each item names 
 * `hs pipeline`, `hs migrate`, `hs distill abstracts` exit 1 on any per-item error.
 * `hs openalex` (hosts that keep the local OpenAlex catalog): the steps are `load` / `load-works` → `build-indexes` → `install-fts` → `build-fts`. `build-fts` no longer runs `INSTALL fts`; it only `LOAD`s the extension and, when it is missing, fails with "fts extension not installed — run `hs openalex install-fts` (needs network once)". Run `hs openalex install-fts` once per host (and again after a DuckDB version bump) on a host that can reach DuckDB's extension repository; it needs no catalog file and is a no-op when the extension is already in the running user's `~/.duckdb/extensions/`. A host where `build-fts` already ran under that user has the extension and needs nothing.
 * `hs openalex load <entity>` follows the same rule as `load-works` for every entity, the dimension tables (concepts, topics, domains, fields, subfields, sources, institutions, funders, publishers) and authors included: partitions are walked newest-first, a seen-set of integer ids gates each record, and the newest copy of an id wins; later copies are skipped silently and nothing uses `INSERT OR IGNORE`. A malformed id fails the partition (authors: counts against `--max-parse-errors`). Tables the SQL loaders filled before this release kept the *oldest* copy of an id that appears in several partitions, and their partitions are logged `ok` in `_ingest_log`, so a re-run does not touch them. To rebuild one with the new rule, stop the services that hold the catalog open, empty the table and its log rows with the DuckDB CLI (`DELETE FROM <table>; DELETE FROM _ingest_log WHERE entity = '<table>';`; `hs openalex query` is read-only), and run `hs openalex load <entity>` again.
+* `hs openalex load` / `load-works` refuse a partition that is *newer* than one already logged `ok` for that entity (a snapshot re-sync added a later `updated_date`): with the newest-wins rule its records would be skipped as "duplicates" while the older stored copies stayed. The error names both partitions; to take the new snapshot, empty the entity's table(s) and delete its `_ingest_log` rows (same recipe as above; for `works` also move `seen_set.bin` aside, or `load-works` refuses a checkpoint that lists IDs the emptied table no longer has), then load again. Resuming an interrupted load is unaffected.
 
 ---
 
@@ -102,24 +105,24 @@ Every machine in this guide is doing the smallest job that makes sense for the h
                           │ QUIC tunnel
                           ▼
    ┌──────────────────────────────────────────────────────────┐
-   │                    home LAN  (.0/24)                     │
+   │                         home LAN                         │
    │                                                          │
-   │   two (.102)        three (.103)      four (.104)        │
-   │   ─────────         ──────────        ─────────          │
+   │   two               three             four               │
+   │   ───               ─────             ────               │
    │   tunnel host       storage server    DB host            │
    │   cloudflared       NFS / Garage S3   Postgres 17        │
    │   hs-gateway        T7 SSD 1.8 TB     Qdrant             │
    │   Pi 4 8 GB         Pi 5 8 GB         Pi 5 16 GB / NVMe  │
    │                                                          │
-   │   one (.101)        big (.110)        five (.105)        │
-   │   ─────────         ─────────         ─────────          │
+   │   one               big               five               │
+   │   ───               ───               ────               │
    │   nginx / web       GPU compute       OFFLINE / spare    │
    │   Pi 5 8 GB         hs-scribe                            │
    │                     hs-distill                           │
    │                     CUDA, ≥8 GB VRAM                     │
    │                                                          │
-   │   big_mac (.111)    mac_air (.112)                       │
-   │   ──────────        ──────────                           │
+   │   big_mac           mac_air                              │
+   │   ───────           ───────                              │
    │   SSH jump host     daily-driver client                  │
    │   admin only        hs CLI, Claude                       │
    └──────────────────────────────────────────────────────────┘
@@ -576,8 +579,8 @@ scribe:
 For S3 mode, export the credentials before starting any service:
 
 ```bash
-set -Ux HS_S3_ACCESS_KEY GK351...
-set -Ux HS_S3_SECRET_KEY 7d37...
+set -Ux HS_S3_ACCESS_KEY <s3-access-key>
+set -Ux HS_S3_SECRET_KEY <s3-secret-key>
 ```
 
 **Install the servers and watchers as supervised services**
@@ -656,7 +659,7 @@ scribe.completed ─[queue: distill-workers]─▶ hs-distill-watch-events (this
 
 Each queue group guarantees exactly-one delivery per member, so adding a second scribe worker shares load without duplicating work.
 
-**Register with the gateway**
+**Route it through the gateway**
 
 ```bash
 hs cloud enroll --gateway https://cloud.example.com

@@ -83,6 +83,13 @@ impl Guard {
             }
         }
     }
+
+    /// Count a call that was abandoned for taking too long (its future was
+    /// dropped by a caller's deadline before the breaker saw an outcome) as a
+    /// failure of the provider.
+    pub fn record_timeout(&self) {
+        self.breaker.on_error();
+    }
 }
 
 fn counts_against_provider(err: &PaperError) -> bool {

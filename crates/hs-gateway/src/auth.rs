@@ -70,13 +70,13 @@ impl SigningKeys {
     }
 }
 
-/// The token in an `Authorization: Bearer <token>` header.
+/// The token in an `Authorization: Bearer <token>` header. The scheme is
+/// case-insensitive (RFC 9110 §11.1), as it is on the backend side
+/// (`BackendToken::check_authorization`).
 pub fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
 /// Authenticate the request's bearer token as a token of class `expected`.
@@ -164,6 +164,23 @@ mod tests {
             authenticate(&state, &bearer_headers("garbage"), TokenType::Access),
             Err(AuthError::Invalid)
         );
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive_and_other_schemes_are_not_bearer() {
+        for (value, want) in [
+            ("Bearer abc", Some("abc")),
+            ("bearer abc", Some("abc")),
+            ("BEARER abc", Some("abc")),
+            ("Basic abc", None),
+            ("Bearerabc", None),
+            ("Bearer", None),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, value.parse().unwrap());
+            assert_eq!(bearer(&headers), want, "{value}");
+        }
+        assert_eq!(bearer(&HeaderMap::new()), None);
     }
 
     #[tokio::test]

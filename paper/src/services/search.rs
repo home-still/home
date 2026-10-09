@@ -94,13 +94,27 @@ impl PaperProvider for AggregateProvider {
             )));
         }
 
+        // Members see the query without `min_citations`: the filter is applied
+        // once below, to the merged papers, whose counts are the best any
+        // source reported (a member-level filter would let a copy with no
+        // count vouch for a paper the merged count excludes).
+        let member_query = SearchQuery {
+            min_citations: None,
+            ..query.clone()
+        };
+        let member_query = &member_query;
+
         // Fan out to the remaining providers with timeout, collect as each completes
         let mut futs: FuturesUnordered<_> = members
             .into_iter()
             .map(|p| {
                 let timeout = self.timeout;
                 async move {
-                    let result = tokio::time::timeout(timeout, p.search_by_query(query)).await;
+                    let result =
+                        tokio::time::timeout(timeout, p.search_by_query(member_query)).await;
+                    if result.is_err() {
+                        p.note_timeout();
+                    }
                     (p.name(), timeout, result)
                 }
             })
@@ -144,6 +158,10 @@ impl PaperProvider for AggregateProvider {
                 failures,
             });
         }
+        // Completion order is nondeterministic, and the merge keeps the
+        // first-seen id / date / DOI: merge in a fixed (provider) order so one
+        // query always yields the same paper.
+        source_results.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Dedup --> merge --> rank
         let (groups, _stats) = dedup::deduplicate(source_results);
@@ -197,6 +215,12 @@ impl PaperProvider for AggregateProvider {
     }
 
     async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
+        // One bare spelling for every provider: `https://doi.org/10.48550/arXiv.…`
+        // is an arXiv DOI too (the check below must see it), and a malformed
+        // DOI is one `InvalidInput`, not six provider failures.
+        let doi = crate::stem::normalize_doi(doi)?;
+        let doi = doi.as_str();
+
         // arXiv DOIs (`10.48550/arXiv.*`) are registered with DataCite, not
         // Crossref — Crossref/OpenAlex/Semantic Scholar don't index them, so
         // fanning out is wasted work and returns the wrong answer (empty).
@@ -215,11 +239,11 @@ impl PaperProvider for AggregateProvider {
             .map(|p| {
                 let timeout = self.timeout;
                 async move {
-                    (
-                        p.name(),
-                        timeout,
-                        tokio::time::timeout(timeout, p.get_by_doi(doi)).await,
-                    )
+                    let result = tokio::time::timeout(timeout, p.get_by_doi(doi)).await;
+                    if result.is_err() {
+                        p.note_timeout();
+                    }
+                    (p.name(), timeout, result)
                 }
             })
             .collect();
@@ -610,5 +634,211 @@ mod tests {
         q.offset = 10;
         let err = a.search_by_query(&q).await.unwrap_err();
         assert!(matches!(err, PaperError::InvalidInput(_)), "{err}");
+    }
+
+    /// Records every DOI it is asked about and knows nothing.
+    struct Recorder {
+        name: &'static str,
+        asked: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn new(name: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                asked: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl PaperProvider for Recorder {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn supported_search_types(&self) -> Vec<SearchType> {
+            vec![]
+        }
+        async fn search_by_query(&self, _q: &SearchQuery) -> Result<SearchResult, PaperError> {
+            unreachable!("only DOI lookups are recorded")
+        }
+        async fn get_by_doi(&self, doi: &str) -> Result<Option<Paper>, PaperError> {
+            self.asked.lock().push(doi.to_string());
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_arxiv_doi_url_is_routed_to_arxiv_alone_as_a_bare_doi() {
+        // The router saw only the bare `10.48550/arXiv.` prefix, so the URL
+        // spelling fanned out to providers that do not index arXiv DOIs.
+        let arxiv = Recorder::new("arxiv");
+        let crossref = Recorder::new("crossref");
+        let a = agg(vec![arxiv.clone(), crossref.clone()]);
+
+        let found = a
+            .get_by_doi("https://doi.org/10.48550/arXiv.2005.11401")
+            .await
+            .unwrap();
+
+        assert!(found.is_none());
+        assert_eq!(arxiv.asked(), ["10.48550/arXiv.2005.11401"]);
+        assert!(crossref.asked().is_empty(), "{:?}", crossref.asked());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_doi_is_invalid_input_before_any_provider_is_asked() {
+        let crossref = Recorder::new("crossref");
+        let a = agg(vec![crossref.clone()]);
+
+        let err = a.get_by_doi("not-a-doi").await.unwrap_err();
+
+        assert!(matches!(err, PaperError::InvalidInput(_)), "{err}");
+        assert!(crossref.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_merged_paper_does_not_depend_on_which_provider_answered_first() {
+        // Two providers know one paper under different ids; the merge keeps
+        // the first-seen id, which used to be whoever finished first.
+        let provider = |name: &'static str, id: &str, delay_ms: u64| -> Arc<dyn PaperProvider> {
+            let found = Paper {
+                id: id.to_string(),
+                ..paper("Attention is all you need", "10.1/attention")
+            };
+            let papers = vec![found];
+            Arc::new(Fake {
+                name,
+                delay: Duration::from_millis(delay_ms),
+                search: Box::new(move || {
+                    Ok(SearchResult {
+                        total_results: papers.len(),
+                        papers: papers.clone(),
+                        next_offset: None,
+                        provider: name.to_string(),
+                        provider_failures: vec![],
+                    })
+                }),
+                lookup: Box::new(|| Ok(None)),
+            })
+        };
+
+        let mut ids = Vec::new();
+        for (arxiv_ms, crossref_ms) in [(0, 40), (40, 0)] {
+            let a = AggregateProvider::new(
+                vec![
+                    provider("arxiv", "arxiv-id", arxiv_ms),
+                    provider("crossref", "crossref-id", crossref_ms),
+                ],
+                Duration::from_secs(5),
+            );
+            let result = a.search_by_query(&query()).await.unwrap();
+            assert_eq!(result.papers.len(), 1, "one DOI is one paper");
+            ids.push(result.papers[0].id.clone());
+        }
+        assert_eq!(ids[0], ids[1], "{ids:?}");
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_keeps_timing_out_of_the_fan_out_opens_its_breaker() {
+        use crate::providers::resilient::ResilientProvider;
+        use crate::resilience::config::ResilienceConfig;
+        use crate::resilience::guard::Guard;
+
+        // The aggregate drops a slow provider's future, so the breaker inside
+        // the guard never saw an outcome: a provider that hangs was asked (and
+        // waited for) on every search, forever.
+        let config = ResilienceConfig {
+            cb_failure_threshold: 2,
+            cb_initial_backoff_secs: 30,
+            cb_max_backoff_secs: 60,
+            retry_max_attempts: 0,
+            retry_min_backoff_ms: 1,
+            retry_max_backoff_secs: 1,
+        };
+        let guard = Arc::new(Guard::new("core", Duration::from_millis(1), &config).unwrap());
+        let a = agg(vec![
+            ok("arxiv", vec![paper("Attention is all you need", "10.1/a")]),
+            Arc::new(ResilientProvider::new(hung("core"), guard)),
+        ]);
+
+        let mut errors = Vec::new();
+        for _ in 0..3 {
+            let result = a.search_by_query(&query()).await.unwrap();
+            assert_eq!(result.provider_failures.len(), 1);
+            errors.push(result.provider_failures[0].error.clone());
+        }
+
+        assert!(errors[0].contains("timed out"), "{errors:?}");
+        assert!(errors[1].contains("timed out"), "{errors:?}");
+        assert!(
+            errors[2].contains("Circuit breaker open"),
+            "the third search must not wait for the hung provider again: {errors:?}"
+        );
+    }
+
+    /// Answers every search with fixed papers and remembers the
+    /// `min_citations` each query carried.
+    struct Counting {
+        name: &'static str,
+        papers: Vec<Paper>,
+        saw_min: parking_lot::Mutex<Vec<Option<u64>>>,
+    }
+
+    #[async_trait]
+    impl PaperProvider for Counting {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn supported_search_types(&self) -> Vec<SearchType> {
+            vec![]
+        }
+        async fn search_by_query(&self, q: &SearchQuery) -> Result<SearchResult, PaperError> {
+            self.saw_min.lock().push(q.min_citations);
+            Ok(SearchResult {
+                total_results: self.papers.len(),
+                papers: self.papers.clone(),
+                next_offset: None,
+                provider: self.name.to_string(),
+                provider_failures: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn min_citations_is_applied_once_to_the_merged_papers_not_per_member() {
+        let cited = |count: Option<u64>| Paper {
+            cited_by_count: count,
+            ..paper("Attention is all you need", "10.1/attention")
+        };
+        // The same paper: 5 citations at one source, no count at the other.
+        // Merged, its count is 5 (< 100) and it is out. A per-member filter
+        // would drop the first copy and keep the second, which has no count.
+        let counted = Arc::new(Counting {
+            name: "openalex",
+            papers: vec![cited(Some(5))],
+            saw_min: parking_lot::Mutex::new(Vec::new()),
+        });
+        let uncounted = Arc::new(Counting {
+            name: "arxiv",
+            papers: vec![cited(None)],
+            saw_min: parking_lot::Mutex::new(Vec::new()),
+        });
+        let a = agg(vec![
+            counted.clone() as Arc<dyn PaperProvider>,
+            uncounted.clone(),
+        ]);
+        let mut q = query();
+        q.min_citations = Some(100);
+
+        let result = a.search_by_query(&q).await.unwrap();
+
+        assert!(result.papers.is_empty(), "{:?}", result.papers);
+        assert_eq!(*counted.saw_min.lock(), [None]);
+        assert_eq!(*uncounted.saw_min.lock(), [None]);
     }
 }

@@ -75,6 +75,39 @@ impl DashboardData {
         self.snapshot_received && self.queued_conversions.is_none() && self.queue_error.is_none()
     }
 
+    /// Fold a freshly collected frame into the one on screen. A count the new
+    /// collection could not produce keeps its previous value so the display
+    /// does not flicker; everything that must reflect "now" is replaced.
+    fn absorb(&mut self, new: DashboardData) {
+        self.doc_counts = new.doc_counts.or(self.doc_counts);
+        self.markdown_counts = new.markdown_counts.or(self.markdown_counts);
+        self.catalog_count = new.catalog_count.or(self.catalog_count);
+        self.corrupted_count = new.corrupted_count.or(self.corrupted_count);
+        self.inbox_pending = new.inbox_pending.or(self.inbox_pending);
+        self.in_flight_conversions = new.in_flight_conversions.or(self.in_flight_conversions);
+        // Not carried over: a stale "queue empty" would hide a broker outage.
+        self.queued_conversions = new.queued_conversions;
+        self.stalled_conversions = new.stalled_conversions;
+        self.queue_error = new.queue_error;
+        // Also replaced: `queue_server_too_old` keys on it, so a frame that
+        // never saw a server snapshot must not keep an older frame's verdict.
+        self.snapshot_received = new.snapshot_received;
+        // Always update network-sourced fields
+        self.scribe_servers = new.scribe_servers;
+        self.distill_servers = new.distill_servers;
+        self.qdrant_healthy = new.qdrant_healthy;
+        self.qdrant_url = new.qdrant_url;
+        self.qdrant_version = new.qdrant_version;
+        self.embedded_docs = new.embedded_docs;
+        self.embedded_chunks = new.embedded_chunks;
+        self.embedding_skipped = new.embedding_skipped;
+        self.watcher = new.watcher;
+        self.indexer = new.indexer;
+        self.history = new.history;
+        self.counts_error = new.counts_error;
+        self.loading = false;
+    }
+
     /// Nothing known yet: `loading` before the first collection, or the
     /// "could not collect" frame (`counts_error` says why).
     fn blank(loading: bool, counts_error: Option<String>) -> Self {
@@ -349,8 +382,10 @@ fn read_indexer_status() -> anyhow::Result<IndexerInfo> {
         })
         .unwrap_or(false);
 
+    // A bare "is this PID alive" names whatever process recycled the PID of a
+    // crashed indexer; only the real index daemon counts.
     let is_alive =
-        status_is_fresh || (status.pid > 0 && crate::daemon::is_process_alive(status.pid));
+        status_is_fresh || (status.pid > 0 && crate::distill_cmd::is_index_daemon(status.pid)?);
 
     if !is_alive {
         if status.done {
@@ -394,7 +429,7 @@ fn fmt_bytes(bytes: u64) -> String {
 
 fn fmt_ago(dt: &chrono::DateTime<chrono::Utc>) -> String {
     let now = chrono::Utc::now();
-    let secs = (now - *dt).num_seconds();
+    let secs = (now - *dt).num_seconds().max(0);
     if secs < 60 {
         format!("{secs}s ago")
     } else if secs < 3600 {
@@ -936,15 +971,25 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
 // give the same data through a non-TTY path so `hs status --output json` and
 // `hs status > status.txt` work everywhere.
 
-async fn run_oneshot_json() -> Result<()> {
+async fn run_oneshot_json(ndjson: bool) -> Result<()> {
     use serde_json::Value;
     let client = crate::mcp_client::McpClient::from_default_creds().await?;
     let called = client
         .call_tool("system_status", Value::Object(Default::default()))
         .await;
     client.close_logged().await;
-    println!("{}", serde_json::to_string_pretty(&called?)?);
+    println!("{}", status_json_text(&called?, ndjson)?);
     Ok(())
+}
+
+/// `--output json` is pretty-printed; `--output ndjson` is one record per
+/// line, so its single record must not span lines.
+fn status_json_text(snapshot: &serde_json::Value, ndjson: bool) -> Result<String> {
+    Ok(if ndjson {
+        serde_json::to_string(snapshot)?
+    } else {
+        serde_json::to_string_pretty(snapshot)?
+    })
 }
 
 async fn run_oneshot_text() -> Result<()> {
@@ -1049,7 +1094,8 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
     // The TUI is preserved as the default for interactive terminals.
     let interactive = io::stdout().is_terminal() && io::stdin().is_terminal();
     match global.output {
-        OutputFormat::Json | OutputFormat::Ndjson => return run_oneshot_json().await,
+        OutputFormat::Json => return run_oneshot_json(false).await,
+        OutputFormat::Ndjson => return run_oneshot_json(true).await,
         OutputFormat::Text if !interactive => return run_oneshot_text().await,
         OutputFormat::Text => {}
     }
@@ -1069,8 +1115,10 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
     // after a short grace period).
     let stop = crate::shutdown::cooperative();
 
-    // Setup terminal
+    // Setup terminal. From the moment raw mode is on, every exit — including
+    // a failed draw or poll below — restores the terminal (`TerminalRestore`).
     enable_raw_mode()?;
+    let mut restore = TerminalRestore { done: false };
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
@@ -1090,37 +1138,11 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
         }
 
         // Check if background collection finished
-        if let Some(ref task) = collect_task {
+        if let Some(task) = &collect_task {
             if task.is_finished() {
                 if let Some(task) = collect_task.take() {
                     if let Ok(new_data) = task.await {
-                        // For each directory: if the new scan succeeded, use it;
-                        // else keep the previous value so the display doesn't flicker.
-                        data.doc_counts = new_data.doc_counts.or(data.doc_counts);
-                        data.markdown_counts = new_data.markdown_counts.or(data.markdown_counts);
-                        data.catalog_count = new_data.catalog_count.or(data.catalog_count);
-                        data.corrupted_count = new_data.corrupted_count.or(data.corrupted_count);
-                        data.inbox_pending = new_data.inbox_pending.or(data.inbox_pending);
-                        data.in_flight_conversions = new_data
-                            .in_flight_conversions
-                            .or(data.in_flight_conversions);
-                        // Not carried over: a stale "queue empty" would hide a broker outage.
-                        data.queued_conversions = new_data.queued_conversions;
-                        data.stalled_conversions = new_data.stalled_conversions;
-                        data.queue_error = new_data.queue_error;
-                        // Always update network-sourced fields
-                        data.scribe_servers = new_data.scribe_servers;
-                        data.distill_servers = new_data.distill_servers;
-                        data.qdrant_healthy = new_data.qdrant_healthy;
-                        data.qdrant_url = new_data.qdrant_url;
-                        data.qdrant_version = new_data.qdrant_version;
-                        data.embedded_docs = new_data.embedded_docs;
-                        data.embedded_chunks = new_data.embedded_chunks;
-                        data.watcher = new_data.watcher;
-                        data.indexer = new_data.indexer;
-                        data.history = new_data.history;
-                        data.counts_error = new_data.counts_error;
-                        data.loading = false;
+                        data.absorb(new_data);
                     }
                 }
             }
@@ -1155,9 +1177,36 @@ pub async fn run(global: &GlobalArgs) -> Result<()> {
 
     // Restore terminal and panic hook
     let _ = std::panic::take_hook(); // remove our custom hook
-    disable_raw_mode()?;
-    io::stdout().execute(LeaveAlternateScreen)?;
+    restore.restore()?;
     Ok(())
+}
+
+/// Puts the terminal back (raw mode off, alternate screen left) exactly once,
+/// on the normal path via [`restore`](Self::restore) (which reports failure)
+/// and on every early `?` return via `Drop`.
+struct TerminalRestore {
+    done: bool,
+}
+
+impl TerminalRestore {
+    fn restore(&mut self) -> Result<()> {
+        if std::mem::replace(&mut self.done, true) {
+            return Ok(());
+        }
+        // Both are attempted: a failed raw-mode reset must not skip leaving
+        // the alternate screen.
+        let raw = disable_raw_mode();
+        let screen = io::stdout().execute(LeaveAlternateScreen).map(|_| ());
+        raw?;
+        screen?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 /// Shorten `s` to at most `max` characters, ending in `...` when it was cut.
@@ -1343,5 +1392,57 @@ mod tests {
             "{screen}"
         );
         assert!(!screen.contains("refused"), "{screen}");
+    }
+
+    /// The dashboard on screen is the loading frame with every collection
+    /// folded into it, so what a collection sets must survive `absorb`.
+    #[test]
+    fn the_old_server_verdict_reaches_the_screen_and_does_not_outlive_its_frame() {
+        let mut shown = DashboardData::blank(true, None);
+        shown.absorb(snapshot_to_dashboard(snapshot_with(None, None, None)));
+        assert!(shown.queue_server_too_old());
+        assert_eq!(draw(&shown).matches(QUEUE_SERVER_TOO_OLD).count(), 2);
+
+        shown.absorb(DashboardData::blank(
+            false,
+            Some("status unavailable: down".into()),
+        ));
+        assert!(!shown.queue_server_too_old());
+    }
+
+    /// Skipped rows are not embeddable: a fully embedded corpus reads 100%,
+    /// not permanently short by the skip count.
+    #[test]
+    fn skipped_embeddings_reach_the_screen_and_leave_the_percentage_denominator() {
+        let mut snap = snapshot_with(Some(0), Some(0), None);
+        snap.pipeline.documents = 200;
+        snap.pipeline.markdown = 100;
+        snap.pipeline.embedded_documents = Some(90);
+        snap.pipeline.embedding_skipped = Some(10);
+        let mut shown = DashboardData::blank(true, None);
+        shown.absorb(snapshot_to_dashboard(snap));
+        let screen = draw(&shown);
+        assert!(screen.contains("10 skipped"), "{screen}");
+        assert!(screen.contains("100.0%"), "{screen}");
+    }
+
+    #[test]
+    fn a_timestamp_ahead_of_this_clock_reads_as_now_not_negative() {
+        let ahead = chrono::Utc::now() + chrono::Duration::seconds(45);
+        assert_eq!(fmt_ago(&ahead), "0s ago");
+    }
+
+    /// NDJSON is one record per line: pretty-printing the status record
+    /// split it across lines for any line-oriented consumer.
+    #[test]
+    fn ndjson_status_is_one_line_and_json_status_is_pretty() {
+        let snapshot = serde_json::json!({"pipeline": {"documents": 1}, "history": []});
+        let ndjson = status_json_text(&snapshot, true).unwrap();
+        assert_eq!(ndjson.lines().count(), 1, "{ndjson}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ndjson).unwrap(),
+            snapshot
+        );
+        assert!(status_json_text(&snapshot, false).unwrap().lines().count() > 1);
     }
 }

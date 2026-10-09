@@ -7,7 +7,7 @@ use crate::config::ArxivConfig;
 use crate::error::PaperError;
 use crate::models::{Paper, SearchQuery, SearchResult, SearchType, SortBy};
 use crate::ports::provider::PaperProvider;
-use crate::providers::response::{check_response, status_error};
+use crate::providers::response::{retry_after, status_error};
 
 pub struct ArxivProvider {
     client: Client,
@@ -24,6 +24,58 @@ pub struct ArxivProvider {
 fn parse_published_date(s: &str) -> Option<chrono::NaiveDate> {
     let date = s.get(..10)?;
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
+/// Boolean operators arXiv's query language understands. They stay operators;
+/// only the terms between them get a field prefix.
+const OPERATORS: [&str; 4] = ["AND", "OR", "NOT", "ANDNOT"];
+
+/// `text` as an arXiv search expression over the field named by `prefix`
+/// (`all:`, `ti:`, `au:`).
+///
+/// Plain multi-word text is one quoted phrase. Otherwise every term gets the
+/// prefix, operators pass through untouched (prefixing one — `all:AND` — made
+/// arXiv reject the whole request), a `"quoted phrase"` stays one term, and
+/// two terms with no operator between them are joined by `AND`.
+fn field_expression(prefix: &str, text: &str) -> Result<String, PaperError> {
+    if super::query_utils::is_phrase_query(text) {
+        return Ok(format!("{prefix}\"{text}\""));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    // The words of a quoted phrase that has been opened and not yet closed.
+    let mut phrase: Vec<&str> = Vec::new();
+    let mut previous_was_term = false;
+    for word in text.split_whitespace() {
+        let term = if phrase.is_empty() {
+            if OPERATORS.contains(&word) {
+                parts.push(word.to_string());
+                previous_was_term = false;
+                continue;
+            }
+            if word.starts_with('"') && !(word.len() > 1 && word.ends_with('"')) {
+                phrase.push(word);
+                continue;
+            }
+            word.to_string()
+        } else {
+            phrase.push(word);
+            if !word.ends_with('"') {
+                continue;
+            }
+            std::mem::take(&mut phrase).join(" ")
+        };
+        if previous_was_term {
+            parts.push(String::from("AND"));
+        }
+        parts.push(format!("{prefix}{term}"));
+        previous_was_term = true;
+    }
+    if !phrase.is_empty() {
+        return Err(PaperError::InvalidInput(format!(
+            "unbalanced double quote in search query {text:?}"
+        )));
+    }
+    Ok(parts.join(" "))
 }
 
 impl ArxivProvider {
@@ -45,16 +97,40 @@ impl ArxivProvider {
     /// entry matches — callers that hit this via an arXiv-prefix DOI should
     /// treat `None` as "not found," not as an error.
     pub async fn get_by_arxiv_id(&self, id: &str) -> Result<Option<Paper>, PaperError> {
-        // Strip any arXiv version suffix (`v1`, `v2`...) — the id_list API
-        // accepts versioned IDs but the bare form is what our callers stash
-        // in their catalogs, so normalize to that on the way back.
         let url = url::Url::parse_with_params(&self.base_url, &[("id_list", id)])
             .map_err(|e| PaperError::InvalidInput(e.to_string()))?;
-        let response = self.client.get(url).send().await?;
-        check_response(&response, "arxiv")?;
-        let xml = response.text().await?;
+        let xml = self.get_feed(url.as_str()).await?;
         let (papers, _) = self.parse_atom_feed(&xml)?;
         Ok(papers.into_iter().next())
+    }
+
+    /// GET `url` and return the Atom body. arXiv throttles aggressively (429,
+    /// or 503 with a `Retry-After`); one bounded retry usually clears it, and
+    /// a second refusal is a `RateLimited` carrying the server's directive.
+    async fn get_feed(&self, url: &str) -> Result<String, PaperError> {
+        let throttled = |status: reqwest::StatusCode| {
+            matches!(
+                status,
+                reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            )
+        };
+        let mut response = self.client.get(url).send().await?;
+        if throttled(response.status()) {
+            let wait = retry_after(response.headers())
+                .unwrap_or(std::time::Duration::from_secs(2))
+                .min(std::time::Duration::from_secs(5));
+            tokio::time::sleep(wait).await;
+            response = self.client.get(url).send().await?;
+        }
+        if throttled(response.status()) {
+            return Err(PaperError::RateLimited {
+                provider: String::from("arxiv"),
+                retry_after: retry_after(response.headers()),
+            });
+        } else if !response.status().is_success() {
+            return Err(status_error("arxiv", response.status()));
+        }
+        Ok(response.text().await?)
     }
 
     fn build_search_url(&self, query: &SearchQuery) -> Result<String, PaperError> {
@@ -65,31 +141,27 @@ impl ArxivProvider {
             _ => "all:",
         };
 
-        let search_query = if super::query_utils::is_phrase_query(&query.query) {
-            // Send multi-wrd queries as a quoted phrase: all:"autistic female"
-            format!("{}\"{}\"", search_prefix, query.query)
+        let search_query = if matches!(query.search_type, SearchType::DOI) {
+            // An identifier, not search text: one quoted phrase, whatever
+            // punctuation (parentheses, colons) the DOI carries.
+            format!("{search_prefix}\"{}\"", query.query.replace('"', " "))
         } else {
-            // Single word or explicit boolean: split and prefix each term
-            query
-                .query
-                .split_whitespace()
-                .map(|term| format!("{}{}", search_prefix, term))
-                .collect::<Vec<_>>()
-                .join(" AND ")
+            field_expression(search_prefix, &query.query)?
         };
         let search_query = if let Some(ref df) = query.date_filter {
             let from = df
                 .after
-                .map(|d| format!("{}000000", d.format("%Y%m%d")))
+                .map(|d| format!("{}0000", d.format("%Y%m%d")))
                 .unwrap_or_else(|| "000001010000".to_string());
             let to = df
                 .before
                 .map(|d| {
                     let day_before = d - chrono::Duration::days(1);
-                    format!("{}235959", day_before.format("%Y%m%d"))
+                    format!("{}2359", day_before.format("%Y%m%d"))
                 })
                 .unwrap_or_else(|| "999912312359".to_string());
-            format!("{} AND submittedDate:[{} TO {}]", search_query, from, to)
+            // Parenthesised: `a OR b AND submittedDate:[…]` filters only `b`.
+            format!("({}) AND submittedDate:[{} TO {}]", search_query, from, to)
         } else {
             search_query
         };
@@ -252,44 +324,14 @@ impl PaperProvider for ArxivProvider {
 
     async fn search_by_query(&self, query: &SearchQuery) -> Result<SearchResult, PaperError> {
         let url = self.build_search_url(query)?;
-
-        let mut response = self.client.get(&url).send().await?;
-
-        // arXiv throttles aggressively; one bounded retry on 429/503 usually clears it.
-        if matches!(
-            response.status(),
-            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
-        ) {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(2)
-                .min(5);
-            tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
-            response = self.client.get(&url).send().await?;
-        }
-
-        if matches!(
-            response.status(),
-            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
-        ) {
-            return Err(PaperError::RateLimited {
-                provider: String::from("arxiv"),
-                retry_after: None,
-            });
-        } else if !response.status().is_success() {
-            return Err(status_error("arxiv", response.status()));
-        }
-
-        let xml = response.text().await?;
+        let xml = self.get_feed(&url).await?;
         let (papers, total_results) = self.parse_atom_feed(&xml)?;
 
         Ok(SearchResult {
             papers,
             total_results,
-            next_offset: Some(query.offset + query.max_results).filter(|&n| n < total_results),
+            next_offset: Some(query.offset.saturating_add(query.max_results))
+                .filter(|&n| n < total_results),
             provider: String::from("arxiv"),
             provider_failures: Vec::new(),
         })
@@ -305,10 +347,13 @@ impl PaperProvider for ArxivProvider {
             return self.get_by_arxiv_id(arxiv_id).await;
         }
 
+        // A non-arXiv DOI is looked up as text (arXiv has no DOI index), so
+        // the best text match is not necessarily that paper: only an entry
+        // that names this very DOI is the answer, anything else is "none".
         let query = SearchQuery {
-            query: doi,
+            query: doi.clone(),
             search_type: SearchType::DOI,
-            max_results: 1,
+            max_results: 5,
             offset: 0,
             date_filter: None,
             sort_by: SortBy::default(),
@@ -316,7 +361,13 @@ impl PaperProvider for ArxivProvider {
         };
 
         let result = self.search_by_query(&query).await?;
-        Ok(result.papers.into_iter().next())
+        Ok(result.papers.into_iter().find(|paper| {
+            paper
+                .doi
+                .as_deref()
+                .and_then(|d| crate::stem::normalize_doi(d).ok())
+                .is_some_and(|d| d.eq_ignore_ascii_case(&doi))
+        }))
     }
 }
 
@@ -346,6 +397,76 @@ mod tests {
         assert!(url.contains("search_query=ti%3A"));
         assert!(url.contains("max_results=10"));
         assert!(url.contains("start=0"));
+    }
+
+    /// The decoded `search_query` parameter the provider would send.
+    fn search_query_for(
+        search_type: SearchType,
+        text: &str,
+        date_filter: Option<crate::models::DateFilter>,
+    ) -> Result<String, PaperError> {
+        let query = SearchQuery {
+            query: text.to_string(),
+            search_type,
+            max_results: 10,
+            offset: 0,
+            date_filter,
+            sort_by: SortBy::default(),
+            min_citations: None,
+        };
+        let url = provider().build_search_url(&query)?;
+        let url = url::Url::parse(&url).expect("builder emits a valid URL");
+        let sent = url
+            .query_pairs()
+            .find(|(key, _)| key == "search_query")
+            .map(|(_, value)| value.into_owned())
+            .expect("search_query is always sent");
+        Ok(sent)
+    }
+
+    #[test]
+    fn boolean_operators_stay_operators_and_only_terms_get_the_field_prefix() {
+        // `all:neural AND all:AND AND all:networks` made arXiv answer with an
+        // error entry, so every boolean query failed on this provider.
+        let sent = |text: &str| search_query_for(SearchType::Keywords, text, None).unwrap();
+        assert_eq!(sent("neural AND networks"), "all:neural AND all:networks");
+        assert_eq!(
+            sent("cats OR dogs NOT mice"),
+            "all:cats OR all:dogs NOT all:mice"
+        );
+        assert_eq!(
+            search_query_for(SearchType::Title, "a AND b", None).unwrap(),
+            "ti:a AND ti:b"
+        );
+    }
+
+    #[test]
+    fn plain_text_and_quoted_phrases_keep_their_meaning() {
+        let sent = |text: &str| search_query_for(SearchType::Keywords, text, None).unwrap();
+        assert_eq!(sent("CRISPR"), "all:CRISPR");
+        assert_eq!(sent("deep learning"), "all:\"deep learning\"");
+        assert_eq!(
+            sent("\"deep learning\" attention"),
+            "all:\"deep learning\" AND all:attention"
+        );
+        assert_eq!(sent("\"exact\" OR loose"), "all:\"exact\" OR all:loose");
+    }
+
+    #[test]
+    fn an_unclosed_quote_is_invalid_input_not_a_malformed_request() {
+        let err = search_query_for(SearchType::Keywords, "\"deep learning", None).unwrap_err();
+        assert!(matches!(err, PaperError::InvalidInput(_)), "{err:?}");
+    }
+
+    #[test]
+    fn the_date_filter_binds_the_whole_expression_not_just_its_last_term() {
+        // `a OR b AND submittedDate:[…]` applies the range to `b` alone.
+        let filter = crate::models::DateFilter::parse(">=2024-01 <2024-02").unwrap();
+        let sent = search_query_for(SearchType::Keywords, "cats OR dogs", Some(filter)).unwrap();
+        assert_eq!(
+            sent,
+            "(all:cats OR all:dogs) AND submittedDate:[202401010000 TO 202401312359]"
+        );
     }
 
     #[test]
@@ -476,5 +597,54 @@ mod tests {
             matches!(&err, PaperError::InvalidInput(m) if m.contains("incorrect id format")),
             "{err:?}"
         );
+    }
+
+    fn doi_feed(entries: &[(&str, &str)]) -> String {
+        let entries: String = entries
+            .iter()
+            .map(|(id, doi)| {
+                format!(
+                    r#"<entry><id>http://arxiv.org/abs/{id}</id><title>Paper {id}</title><arxiv:doi>{doi}</arxiv:doi></entry>"#
+                )
+            })
+            .collect();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+              <feed xmlns="http://www.w3.org/2005/Atom"
+                    xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+                    xmlns:arxiv="http://arxiv.org/schemas/atom">
+                  <opensearch:totalResults>2</opensearch:totalResults>{entries}
+              </feed>"#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_text_hit_for_a_non_arxiv_doi_is_the_paper_only_if_it_names_that_doi() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // arXiv has no DOI index: the DOI is searched as text, so the top hit
+        // can be any paper that merely mentions it. The aggregate merged that
+        // paper into the answer for the DOI.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/query"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(doi_feed(&[
+                ("2001.00001v1", "10.1234/somebody-else"),
+                ("2001.00002v1", "10.1234/Wanted"),
+            ])))
+            .mount(&server)
+            .await;
+        let config = ArxivConfig {
+            base_url: format!("{}/api/query", server.uri()),
+            ..ArxivConfig::default()
+        };
+        let arxiv = ArxivProvider::new(&config).unwrap();
+
+        let found = arxiv.get_by_doi("10.1234/wanted").await.unwrap();
+        assert_eq!(found.map(|p| p.id), Some("2001.00002v1".to_string()));
+
+        let none = arxiv.get_by_doi("10.1234/unrelated").await.unwrap();
+        assert!(none.is_none(), "{none:?}");
     }
 }

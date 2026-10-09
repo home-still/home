@@ -411,10 +411,10 @@ pub(crate) async fn cmd_watch_events(
     //
     // rc.346 collapsed every server into ONE backend-blind pool: that
     // restored per-paper distribution but LOST the backend chain, because
-    // the pool re-picks purely by free-slot count. With big (olmocr, 12
-    // slots) outnumbering bmb (glm_ocr, 6 slots), every escalation re-picked
-    // big/olmocr again — scans olmocr can't render permanently failed and
-    // the glm-only host (bmb, which cannot run olmocr at all) was never
+    // the pool re-picks purely by free-slot count. With the olmocr host (12
+    // slots) outnumbering the glm_ocr host (6 slots), every escalation
+    // re-picked the olmocr host again — scans olmocr can't render permanently
+    // failed and the glm-only host (which cannot run olmocr at all) was never
     // dispatched to. Tiering keeps rc.346's intra-tier least-loaded while
     // restoring the config.rs-documented top-to-bottom backend escalation.
     let tier_order = backend_tier_order(&labelled_servers);
@@ -1185,8 +1185,8 @@ mod backend_tier_tests {
         // This is the escalation direction: olmocr_zero_pages falls through
         // to glm, never the reverse.
         let servers = vec![
-            s("http://big:7435", "olmocr", 2),
-            s("http://bmb:7433", "glm_ocr", 4),
+            s("http://olmocr-a.example.local:7435", "olmocr", 2),
+            s("http://glm-a.example.local:7433", "glm_ocr", 4),
         ];
         assert_eq!(backend_tier_order(&servers), vec!["olmocr", "glm_ocr"]);
     }
@@ -1199,9 +1199,9 @@ mod backend_tier_tests {
         // exactly the rc.346 regression this restores the fix for. Their
         // per-host concurrency caps sum into the one tier's ceiling.
         let servers = vec![
-            s("http://big:7435", "olmocr", 2),
-            s("http://big2:7435", "olmocr", 2),
-            s("http://bmb:7433", "glm_ocr", 4),
+            s("http://olmocr-a.example.local:7435", "olmocr", 2),
+            s("http://olmocr-b.example.local:7435", "olmocr", 2),
+            s("http://glm-a.example.local:7433", "glm_ocr", 4),
         ];
         assert_eq!(backend_tier_order(&servers), vec!["olmocr", "glm_ocr"]);
     }
@@ -1215,12 +1215,12 @@ mod backend_tier_tests {
 
     #[test]
     fn tier_cap_is_config_concurrency_not_advertised_slots() {
-        // big olmocr is capped at 2 even though the host advertises 12 VLM
+        // the olmocr host is capped at 2 even though it advertises 12 VLM
         // slots — the config cap is the dispatch ceiling, which is the whole
-        // point of P1-0. glm (bmb) caps at 4.
+        // point of P1-0. The glm host caps at 4.
         let servers = vec![
-            s("http://big:7435", "olmocr", 2),
-            s("http://bmb:7433", "glm_ocr", 4),
+            s("http://olmocr-a.example.local:7435", "olmocr", 2),
+            s("http://glm-a.example.local:7433", "glm_ocr", 4),
         ];
         assert_eq!(backend_tier_cap(&servers, "olmocr"), 2);
         assert_eq!(backend_tier_cap(&servers, "glm_ocr"), 4);
@@ -1230,9 +1230,9 @@ mod backend_tier_tests {
     fn tier_cap_sums_hosts_on_the_same_backend() {
         // Two olmocr hosts at 2 each → tier ceiling 4 (least-loaded within).
         let servers = vec![
-            s("http://big:7435", "olmocr", 2),
-            s("http://big2:7435", "olmocr", 2),
-            s("http://bmb:7433", "glm_ocr", 4),
+            s("http://olmocr-a.example.local:7435", "olmocr", 2),
+            s("http://olmocr-b.example.local:7435", "olmocr", 2),
+            s("http://glm-a.example.local:7433", "glm_ocr", 4),
         ];
         assert_eq!(backend_tier_cap(&servers, "olmocr"), 4);
     }

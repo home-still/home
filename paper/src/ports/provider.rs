@@ -26,6 +26,13 @@ pub trait PaperProvider: Send + Sync {
         Ok(None)
     }
 
+    /// A fan-out gave up on this provider because it overran its deadline.
+    /// The call's future was dropped mid-flight, so nothing inside it could
+    /// record the failure; a guarded provider counts it against its circuit
+    /// breaker here (otherwise a provider that hangs is retried at full
+    /// price forever). The default does nothing.
+    fn note_timeout(&self) {}
+
     async fn health_check(&self) -> Result<(), PaperError> {
         Ok(())
     }
