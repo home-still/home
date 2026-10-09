@@ -2263,7 +2263,24 @@ mod tests {
             std::thread::spawn(move || {
                 let mut reads = 0u32;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let text = std::fs::read_to_string(&path).expect("the file always exists");
+                    // The invariant is "never torn", not "every open wins":
+                    // while a writer renames over the target, Windows holds
+                    // it delete-pending and an open can fail with
+                    // PermissionDenied (seen on CI as "Access is denied").
+                    // The production reader treats that as "no status this
+                    // poll"; here it is a retry, never a pass.
+                    let text = match std::fs::read_to_string(&path) {
+                        Ok(text) => text,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(e) => panic!("reading the status file: {e}"),
+                    };
                     serde_json::from_str::<IndexStatus>(&text)
                         .unwrap_or_else(|e| panic!("observed a torn status file: {e}"));
                     reads += 1;
