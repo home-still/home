@@ -299,6 +299,26 @@ fn interpret_show_unit(
     }))
 }
 
+/// The `systemctl show` arguments for one listed unit: exactly the
+/// properties [`interpret_show_unit`] reads. A property that is not requested
+/// reads as absent — `LoadState` missing here made every masked unit look
+/// like garbled output on the rc.363 rollout.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn show_unit_args(name: &str) -> Vec<String> {
+    let mut args = vec!["show".to_string(), name.to_string()];
+    for property in [
+        "LoadState",
+        "ExecStart",
+        "ActiveState",
+        "UnitFileState",
+        "Type",
+    ] {
+        args.push("-p".to_string());
+        args.push(property.to_string());
+    }
+    args
+}
+
 #[cfg(target_os = "linux")]
 async fn discover_systemd_units(user_scope: bool) -> Result<Vec<ServiceUnit>> {
     let mut list = systemctl(user_scope);
@@ -315,18 +335,7 @@ async fn discover_systemd_units(user_scope: bool) -> Result<Vec<ServiceUnit>> {
     let mut units = Vec::with_capacity(names.len());
     for name in names {
         let mut show = systemctl(user_scope);
-        show.args([
-            "show",
-            &name,
-            "-p",
-            "ExecStart",
-            "-p",
-            "ActiveState",
-            "-p",
-            "UnitFileState",
-            "-p",
-            "Type",
-        ]);
+        show.args(show_unit_args(&name));
         if let Some(unit) = interpret_show_unit(user_scope, &name, show.output().await)? {
             units.push(unit);
         }
@@ -1424,6 +1433,20 @@ mod tests {
                 "{load_state}"
             );
         }
+    }
+
+    /// The rc.363 rollout bug: the not-loaded check above was right, but
+    /// `LoadState` was never requested, so real `systemctl show` output never
+    /// carried it and a masked unit still aborted the restart phase.
+    #[cfg(unix)]
+    #[test]
+    fn show_unit_args_request_the_load_state() {
+        let args = show_unit_args("hs-x.service");
+        assert_eq!(args[..2], ["show", "hs-x.service"]);
+        assert!(
+            args.windows(2).any(|w| w == ["-p", "LoadState"]),
+            "{args:?}"
+        );
     }
 
     #[cfg(unix)]
