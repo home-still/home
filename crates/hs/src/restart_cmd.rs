@@ -945,40 +945,54 @@ fn classify_compose_restart(
     }
 }
 
-/// Restart the compose stacks that exist on this host. Returns the number
-/// restarted and the per-stack failures; no compose files at all is `(0, [])`.
-async fn restart_compose_services(reporter: &Arc<dyn Reporter>) -> Result<(u32, Vec<String>)> {
-    use hs_common::compose::ComposeCmd;
-
-    let hidden = hs_common::hidden_dir()?;
-
-    let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
-
-    let mut compose_files: Vec<(&str, std::path::PathBuf)> = Vec::new();
-    if scribe_cfg.local_server {
-        compose_files.push(("scribe", hidden.join("docker-compose.yml")));
+/// The compose stacks `hs` manages on this host, in restart/upgrade order:
+/// the scribe stack only when `scribe.local_server` is on, the distill
+/// (Qdrant) stack always — and only files that exist.
+pub(crate) fn managed_compose_files(
+    hidden: &Path,
+    scribe_local_server: bool,
+) -> Vec<(&'static str, PathBuf)> {
+    let mut stacks: Vec<(&'static str, PathBuf)> = Vec::new();
+    if scribe_local_server {
+        stacks.push(("scribe", hidden.join("docker-compose.yml")));
     }
-    compose_files.push(("distill", hidden.join("docker-compose-distill.yml")));
+    stacks.push(("distill", hidden.join("docker-compose-distill.yml")));
+    stacks.retain(|(_, p)| p.exists());
+    stacks
+}
 
-    let active: Vec<_> = compose_files
-        .into_iter()
-        .filter(|(_, p)| p.exists())
-        .collect();
-
-    if active.is_empty() {
-        return Ok((0, Vec::new()));
-    }
-
-    let Some(compose) = ComposeCmd::detect().await else {
+/// The compose runtime for `files`. None installed is an error naming the
+/// files, so a stale file is distinguishable from a missing runtime.
+pub(crate) async fn compose_runtime_for(
+    files: &[(&'static str, PathBuf)],
+) -> Result<hs_common::compose::ComposeCmd> {
+    let Some(compose) = hs_common::compose::ComposeCmd::detect().await else {
         bail!(
-            "compose files exist ({}) but neither `docker compose` nor `docker-compose` is available",
-            active
+            "compose files exist ({}) but no compose runtime was found (docker compose, podman compose, docker-compose, podman-compose); install one, or remove the file if this host no longer runs those containers",
+            files
                 .iter()
                 .map(|(_, p)| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
     };
+    Ok(compose)
+}
+
+/// Restart the compose stacks that exist on this host. Returns the number
+/// restarted and the per-stack failures; no compose files at all is `(0, [])`.
+async fn restart_compose_services(reporter: &Arc<dyn Reporter>) -> Result<(u32, Vec<String>)> {
+    let hidden = hs_common::hidden_dir()?;
+
+    let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
+
+    let active = managed_compose_files(&hidden, scribe_cfg.local_server);
+
+    if active.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+
+    let compose = compose_runtime_for(&active).await?;
 
     let mut restarted = 0u32;
     let mut failures = Vec::new();
@@ -1674,5 +1688,31 @@ mod tests {
         let err = classify_compose_restart("distill", false, Some(1), "Error: no such service")
             .unwrap_err();
         assert!(err.contains("no such service"), "{err}");
+    }
+
+    #[test]
+    fn managed_compose_files_follow_local_server_and_existence() {
+        fn names(files: Vec<(&'static str, PathBuf)>) -> Vec<&'static str> {
+            files.into_iter().map(|(n, _)| n).collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let scribe = dir.path().join("docker-compose.yml");
+        let distill = dir.path().join("docker-compose-distill.yml");
+        std::fs::write(&scribe, "services: {}\n").unwrap();
+        std::fs::write(&distill, "services: {}\n").unwrap();
+
+        // A scribe file on a host with `local_server: false` is stale, not ours.
+        assert_eq!(names(managed_compose_files(dir.path(), false)), ["distill"]);
+        assert_eq!(
+            names(managed_compose_files(dir.path(), true)),
+            ["scribe", "distill"]
+        );
+
+        std::fs::remove_file(&distill).unwrap();
+        assert_eq!(names(managed_compose_files(dir.path(), true)), ["scribe"]);
+
+        std::fs::remove_file(&scribe).unwrap();
+        assert!(managed_compose_files(dir.path(), true).is_empty());
     }
 }

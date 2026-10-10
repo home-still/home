@@ -262,32 +262,16 @@ pub(crate) fn find_companion_binary(name: &str) -> Option<PathBuf> {
 async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
     let hidden = hs_common::hidden_dir()?;
-    let scribe_compose = hidden.join("docker-compose.yml");
-    let distill_compose = hidden.join("docker-compose-distill.yml");
+    let files = crate::restart_cmd::managed_compose_files(&hidden, scribe_cfg.local_server);
 
-    let has_scribe = scribe_cfg.local_server && scribe_compose.exists();
-    let has_distill = distill_compose.exists();
-
-    if !has_scribe && !has_distill {
+    if files.is_empty() {
         reporter.status("Skipped", "no Docker services on this host");
         return Ok(());
     }
 
-    let compose = ComposeCmd::detect().await.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Docker services are configured on this host but no compose runtime was found"
-        )
-    })?;
+    let compose = crate::restart_cmd::compose_runtime_for(&files).await?;
 
-    let compose_files: Vec<(&Path, &str)> = [
-        (scribe_compose.as_path(), "scribe"),
-        (distill_compose.as_path(), "distill"),
-    ]
-    .into_iter()
-    .filter(|(p, _)| p.exists())
-    .collect();
-
-    for (cf, name) in compose_files {
+    for (name, cf) in &files {
         upgrade_compose_service(&compose, cf, name, reporter).await?;
     }
     Ok(())
@@ -344,15 +328,15 @@ fn local_service_url<'a>(urls: impl IntoIterator<Item = &'a str>, service: &str)
 async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
     let hidden = hs_common::hidden_dir()?;
-    let scribe_compose = hidden.join("docker-compose.yml");
-    if scribe_cfg.local_server && scribe_compose.exists() {
+    let files = crate::restart_cmd::managed_compose_files(&hidden, scribe_cfg.local_server);
+    if files.iter().any(|(n, _)| *n == "scribe") {
         let url = local_service_url(scribe_cfg.servers.iter().map(|s| s.url.as_str()), "scribe")?;
         hs_common::compose::wait_for_url(&format!("{url}/health"), HEALTH_WAIT_SECS, "scribe")
             .await?;
         reporter.status("Health", "scribe: OK");
     }
 
-    if hidden.join("docker-compose-distill.yml").exists() {
+    if files.iter().any(|(n, _)| *n == "distill") {
         // That compose file (written by `hs distill init`) runs Qdrant only;
         // the distill server is always a native unit, checked below.
         let qdrant = crate::distill_cmd::qdrant_rest_url()?;

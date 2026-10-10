@@ -226,7 +226,8 @@ Measured on `big` after the rc.356 upgrade, card contended at 4938 MiB free: `cu
 **Change:** poll for the new pid for a bounded window before failing the restart.
 **Acceptance:** upgrading a host whose LaunchAgent needs two respawns reports success.
 
-**FIXED in working tree (2026-10-09, not yet released).** The launchd restart in `crates/hs/src/restart_cmd.rs` polls `launchctl print` for a pid for up to 45 s (500 ms interval) before it fails. This is macOS-only code, so it was reviewed but not compiled on Linux.
+**FIXED (2026-10-09, released in rc.362).** The launchd restart in `crates/hs/src/restart_cmd.rs` polls `launchctl print` for a pid for up to 45 s (500 ms interval) before it fails. This is macOS-only code, so it was reviewed but not compiled on Linux.
+**Verified fixed in rc.362 (2026-10-09):** mac_air's upgrade reported io.home-still.scribe-inbox restarted; the daemon was killed once during the respawn window and stayed up on the new binary.
 
 ---
 
@@ -1178,5 +1179,11 @@ Found by the workstreams and reviewers while fixing the above; each re-verified 
 ### P1-26. `hs upgrade` restart phase aborted on a not-found/masked unit (found rc.362 rollout, 2026-10-09)
 **Symptom:** on two (`hs-smoke-fail.service`, a failed transient unit from the rc.355 smoke test, file gone) and on big (`hs-serve-olmocr-vllm.service`, masked), `hs upgrade` swapped the binaries then died in the restart phase with `discovering system units: <unit>: systemctl show output has no ExecStart property`. No service was restarted; the old processes kept running on replaced binaries. Worked around by `systemctl reset-failed` on two and manual `systemctl restart` of the hs-serve-* units on big.
 **Cause:** `interpret_show_unit` (crates/hs/src/restart_cmd.rs) treated a missing `ExecStart` as garbled output for every listed unit. An unloaded unit (`LoadState=not-found|masked`) legitimately has none.
-**Fixed in rc.363 (commit pending release):** such units are skipped like an empty `ExecStart=`; genuinely garbled output still fails loudly. Test: `show_unit_not_loaded_units_are_skipped_not_failed`.
-**Residue:** the Apple Silicon hosts have not been upgraded to rc.362 yet; rc.362 on them may hit the same bug if they carry such a unit (launchd path differs, unverified).
+**Fixed in rc.363:** such units are skipped like an empty `ExecStart=`; genuinely garbled output still fails loudly. Test: `show_unit_not_loaded_units_are_skipped_not_failed`.
+**Residue:** none — the Apple Silicon hosts upgraded to rc.362 through the launchd path without hitting it.
+
+### P1-27. `hs upgrade` aborted on hosts with a stale compose file and no compose runtime (found rc.362 rollout, 2026-10-09)
+**Symptom:** bmb, mac_air and big_mac carried `~/.home-still/docker-compose*.yml` with no docker or podman installed. The rc.360 binary that ran the upgrade swapped the binaries first, then failed with `Docker services are configured on this host but no compose runtime was found`, without naming a file.
+**Cause:** two things. Stale files were left from an earlier container deployment. Upgrade and restart also each had their own copy of compose-stack selection; upgrade ignored `scribe.local_server` when iterating.
+**Fixed in rc.363:** rc.362's phase order already fails before any binary changes. rc.363 shares `restart_cmd::managed_compose_files` / `compose_runtime_for` between upgrade, restart and the post-upgrade health check, and the error names the files and both remedies. Test: `managed_compose_files_follow_local_server_and_existence`.
+**Residue:** the renamed files `~/.home-still/docker-compose*.yml.stale-*` on those three hosts can be deleted by the owner.
