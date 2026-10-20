@@ -474,8 +474,13 @@ fn getrandom(bytes: &mut [u8]) -> std::io::Result<()> {
 }
 
 /// Write a file with mode 0600, refusing to overwrite an existing one.
+///
+/// The mode is a Unix concept. On Windows the file is created with the
+/// default permissions and the "never overwrite" rule still holds —
+/// `create_new` is what enforces that, and it is what matters.
 fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
     if let Some(parent) = path.parent() {
