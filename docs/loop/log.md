@@ -336,7 +336,7 @@ finished the remainder without a failure.
 payload of existing points and adds one CLI command; it changes no wire
 format, no collection schema, and no vector.
 
-**Commit.** TBD — "feat(distill): backfill the missing titles onto the
+**Commit.** `6a3abe9` — "feat(distill): backfill the missing titles onto the
 indexed points".
 
 ### Top 5 remaining items
