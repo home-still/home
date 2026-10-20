@@ -521,17 +521,25 @@ forwards `Range`, `Content-Range`, `ETag` and `Accept-Ranges`
 untouched, so E2 costs almost nothing at the gateway and gives the LAN
 and remote URLs the same check with no "trusted LAN" bypass.
 
-**Version.** `v0.0.1-rc.369` — a patch-level bump. It adds a service
+**Version.** `v0.0.1-rc.370` — a patch-level bump. It adds a service
 and a command, changes no wire format, no collection schema and no
 stored data, and no vector is recomputed.
 
-**rc.368 was cut and failed its Windows gate**, on a `use
-std::os::unix::fs::OpenOptionsExt` that was outside the `#[cfg(unix)]`
-guarding the `mode(0o600)` call that needs it. Tags are immutable, so
-the fix went into rc.369 rather than into a retagged rc.368. The
-lesson is the usual one: a `#[cfg(unix)]` on the *call* is not a
-`#[cfg(unix)]` on the *import*, and only a platform that is not the
-one you develop on can tell you.
+**Two release candidates were lost to the Windows gate**, and both
+were real defects in the new code, not CI noise:
+
+- **rc.368** failed on a `use std::os::unix::fs::OpenOptionsExt` that
+  was outside the `#[cfg(unix)]` guarding the `mode(0o600)` call that
+  needs it. A `#[cfg(unix)]` on the *call* is not a `#[cfg(unix)]` on
+  the *import*.
+- **rc.369** failed a *test*: the loader path was joined with `:`,
+  which on Windows makes the whole path one malformed entry and every
+  library in it unfound. The separator is `;` on Windows and `:` on
+  Unix, and a test now asserts it is the platform's.
+
+Tags are immutable, so each fix went into the next rc rather than
+into a retagged one. The lesson is the same both times: only a
+platform you do not develop on can tell you that a path is a path.
 
 ### Top 5 remaining items
 

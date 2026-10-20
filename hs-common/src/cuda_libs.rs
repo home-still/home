@@ -149,7 +149,10 @@ mod tests {
         // A Windows loader path joined with `:` is one malformed entry,
         // and every library in it goes unfound.
         let path = cuda_ld_library_path("/one");
-        assert!(path.contains(if cfg!(windows) { ";" } else { ":" }), "{path}");
+        assert!(
+            path.contains(if cfg!(windows) { ";" } else { ":" }),
+            "{path}"
+        );
         assert!(path.starts_with("/one"), "{path}");
     }
 
