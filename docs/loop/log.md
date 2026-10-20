@@ -70,6 +70,18 @@ retrieval channel and does not alter any wire format, command surface,
 collection schema, or stored data; nothing existing is invalidated and
 no re-embed is needed.
 
+**Release.** `v0.0.1-rc.365`, published at
+<https://github.com/home-still/home/releases/tag/v0.0.1-rc.365>: 16
+platform binaries (5 targets × the `hs` CLI, plus `hs-gateway`,
+`hs-mcp`, `hs-scribe-server` and `hs-distill-server` where the target
+builds them), 16 `.sha256` files and a combined `checksums-sha256.txt`,
+plus the `ghcr.io/home-still/hs-scribe-server` images for both
+architectures. The CI run was green on all three gate platforms
+(macOS 14, Ubuntu 24.04, Windows 2022) and all five build targets. The
+published `hs-distill-server` binary was downloaded and checked: it
+carries the `0.0.1-rc.365` version marker and the new lexical-search
+code path.
+
 **Commit.** `8423777` — "feat(distill): hybrid dense + keyword retrieval,
 fused with RRF".
 
