@@ -120,9 +120,18 @@ mod tests {
     #[test]
     fn the_path_keeps_what_the_caller_already_had() {
         let path = cuda_ld_library_path("/opt/my/own/lib");
-        assert!(
-            path.starts_with("/opt/my/own/lib:"),
+        // The caller's own entry comes first, and the separator is the
+        // platform's — a test that hard-codes `:` fails on Windows for
+        // the wrong reason.
+        let mut entries = path.split(PATH_SEPARATOR);
+        assert_eq!(
+            entries.next(),
+            Some("/opt/my/own/lib"),
             "the caller's own path must come first: {path}"
+        );
+        assert!(
+            entries.next().is_some(),
+            "the path has more entries: {path}"
         );
     }
 
@@ -148,12 +157,12 @@ mod tests {
     fn the_path_is_joined_with_the_platform_separator() {
         // A Windows loader path joined with `:` is one malformed entry,
         // and every library in it goes unfound.
-        let path = cuda_ld_library_path("/one");
+        let path = cuda_ld_library_path("first");
         assert!(
             path.contains(if cfg!(windows) { ";" } else { ":" }),
             "{path}"
         );
-        assert!(path.starts_with("/one"), "{path}");
+        assert!(path.starts_with("first"), "{path}");
     }
 
     #[test]
