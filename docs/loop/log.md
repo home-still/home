@@ -521,9 +521,17 @@ forwards `Range`, `Content-Range`, `ETag` and `Accept-Ranges`
 untouched, so E2 costs almost nothing at the gateway and gives the LAN
 and remote URLs the same check with no "trusted LAN" bypass.
 
-**Version.** `v0.0.1-rc.368` — a patch-level bump. It adds a service
+**Version.** `v0.0.1-rc.369` — a patch-level bump. It adds a service
 and a command, changes no wire format, no collection schema and no
 stored data, and no vector is recomputed.
+
+**rc.368 was cut and failed its Windows gate**, on a `use
+std::os::unix::fs::OpenOptionsExt` that was outside the `#[cfg(unix)]`
+guarding the `mode(0o600)` call that needs it. Tags are immutable, so
+the fix went into rc.369 rather than into a retagged rc.368. The
+lesson is the usual one: a `#[cfg(unix)]` on the *call* is not a
+`#[cfg(unix)]` on the *import*, and only a platform that is not the
+one you develop on can tell you.
 
 ### Top 5 remaining items
 
