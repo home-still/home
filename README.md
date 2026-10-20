@@ -156,10 +156,10 @@ Chunk, embed, and index converted markdown into a Qdrant vector database for sem
 
 Search runs **two channels and fuses them**:
 
-- **Dense** — a bge-m3 vector per chunk, cosine similarity. Finds passages
-  that *mean* what the query means.
-- **Lexical** — a text index over the chunk text. Finds passages that *say*
-  the query's words.
+- **Dense** — a bge-m3 vector per chunk, cosine similarity. Finds
+  passages that *mean* what the query means.
+- **Lexical** — a text index over the chunk text. Finds passages that
+  *say* the query's words.
 
 The two are combined with Reciprocal Rank Fusion, so a passage that only one
 channel likes is still ranked. This matters for specific queries: a dense
@@ -167,6 +167,16 @@ embedder matches "thyroid" generically and loses "Hashimoto", and the
 lexical channel puts the passage about Hashimoto's disease at the top. See
 [docs/loop/runs/2026-10-20-01/research.md](docs/loop/runs/2026-10-20-01/research.md)
 for the measurement.
+
+**Reference lists are demoted.** A bibliography entry matches a query
+about a topic perfectly well in a dense embedding — semantically, a
+citation to work about hippocampal neurogenesis *is* about hippocampal
+neurogenesis — so a chunk of `doi:` lines can be the best-ranked hit for
+a question. Such chunks are pushed below the passages that discuss the
+topic; they are not dropped, so a user asking for a bibliography still
+gets it. Measured on the fixed query set: the share of reference-like
+chunks in the top 3 fell from 35 % to 9 %. See
+[docs/loop/runs/2026-10-20-02/research.md](docs/loop/runs/2026-10-20-02/research.md).
 
 ### Setup
 

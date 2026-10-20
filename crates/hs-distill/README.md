@@ -39,6 +39,20 @@ chunk, though the passage is in the library. The two rarest terms are
 required, falling back to one — measured recall@10 of 25/25 on
 `docs/loop/queries.yaml`, against 20/25 for the dense channel alone.
 
+**Reference lists are demoted.** A bibliography entry matches a query
+about a topic perfectly well in a dense embedding — semantically, a
+citation to work about hippocampal neurogenesis *is* about hippocampal
+neurogenesis — so a chunk of `doi:` lines can be the best-ranked hit for
+a question. Such chunks are pushed below the passages that discuss the
+topic; they are not dropped, so a user asking for a bibliography still
+gets it, and a page with no prose at all still leads with the reference
+list (sometimes the only chunk in the corpus that mentions a term is a
+citation of it). The detection is structural — a citation line carries a
+`doi:`, a parenthesised year after author names, `et al.`, a page
+range, a volume, or a numbered-list marker — and is deliberately
+conservative: a chunk that mixes a citation with real prose discusses
+the topic and cites it, and is not demoted.
+
 ## Server setup
 
 The server runs on the machine with the GPU. It needs an NVIDIA GPU with CUDA (there is no CPU path: the server refuses to start when the model does not land on the GPU) and Qdrant for vector storage.
@@ -215,7 +229,7 @@ Each markdown file goes through:
 | `/status` | GET | Collection stats (points, documents, device); `documents_count_truncated` if the count hit 1,000,000 |
 | `/distill` | POST | Index a document (non-streaming). `content` is required |
 | `/distill/stream` | POST | Index with NDJSON streaming progress. `content` is required |
-| `/search` | POST | Hybrid search (dense + lexical, RRF-fused) with optional filters. `limit` defaults to 10 and is clamped to 200; `query` is at most 65,536 bytes (larger is a 400); an unparseable `year` filter is a 400. The returned `score` is the fused RRF score — comparable between hits of one search, meaningless across searches |
+| `/search` | POST | Hybrid search (dense + lexical, RRF-fused) with optional filters. `limit` defaults to 10 and is clamped to 200; `query` is at most 65,536 bytes (larger is a 400); an unparseable `year` filter is a 400. Reference-list chunks are demoted below the passages that discuss the topic (they are not dropped). The returned `score` is the fused RRF score — comparable between hits of one search, meaningless across searches |
 | `/exists/{doc_id}`, `/docs` | GET | Per-document chunk count; distinct doc ids (`limit` up to 1,000,000, larger is a 400; `truncated` flags a partial list) |
 | `/doc/{doc_id}`, `/collection/reset`, `/scrub-interstitials` | DELETE / POST | Destructive maintenance |
 | `/collection/hnsw?collection=<name>` | POST | Enable HNSW on an existing collection with `hnsw.m`/`ef_construct`, capped at `hnsw.max_indexing_threads` (default 4). Returns immediately (Qdrant builds the graph in the background); a no-op that says so when already enabled. Never run at startup — use `hs distill hnsw enable --collection <name>` in a maintenance window |

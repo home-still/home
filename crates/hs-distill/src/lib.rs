@@ -14,6 +14,7 @@ pub mod metadata;
 pub mod pipeline;
 pub mod quality;
 pub mod reconcile;
+pub mod reference_list;
 pub mod store;
 pub mod text;
 pub mod types;

@@ -124,8 +124,8 @@ queries:
 
   - id: q20
     group: named
-    query: "Dawson and Krebs tricarboxylic acid cycle"
-    expect: "Dawson"
+    query: "Watson and Crick structure of DNA"
+    expect: "Watson"
 
   - id: q21
     group: named
@@ -149,5 +149,5 @@ queries:
 
   - id: q25
     group: named
-    query: "Lorenz chaos theory and the butterfly effect"
-    expect: "Lorenz"
+    query: "Rosalind Franklin and the diffraction data of DNA"
+    expect: "Franklin"

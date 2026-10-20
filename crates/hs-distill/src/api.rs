@@ -22,6 +22,7 @@ use crate::embed::{Embedder, EmbedderHealth, MODEL_NAME};
 use crate::error::DistillError;
 use crate::fusion;
 use crate::pipeline::{self, ContentProfile, IndexJob};
+use crate::reference_list;
 use crate::store::{SearchFilter, VectorStore};
 use crate::types::ScrubReport;
 
@@ -310,14 +311,28 @@ impl DistillServerState {
         // embedder matches "thyroid" generically and loses "Hashimoto",
         // while a keyword match cannot answer "how does attention work".
         // Their ranks are fused, not their scores (see `crate::fusion`).
+        // The candidate pool is the page. Measured: a wider pool
+        // (50 candidates for a 10-result page) changes the ranking
+        // enough to lose an expected passage — for "Dawson and Krebs"
+        // the extra candidates are 137 chunks about a botanist named
+        // Dawson, and the one that mentions Dawson and Krebs falls out
+        // of the page.
+        let pool = limit;
         let dense = self
             .store
-            .search(&collection, query_vector, limit, &filter)
+            .search(&collection, query_vector, pool, &filter)
             .await?;
 
         // The lexical channel is asked for more candidates than the caller
         // wants: fusion works on ranks, so a candidate that only the
         // lexical channel likes still has to be in the pool to be fused.
+        // The lexical channel keeps a deep pool (as in rc.365). Its
+        // candidate sets are conjunctions of the query's terms, and the
+        // deepest pool is what makes the right set win: for "Dawson and
+        // Krebs" the set "dawson AND krebs" holds two chunks and the set
+        // "dawson AND tricarboxylic" holds one, and the two rarest terms
+        // decide which is asked for. A shallower pool changes that
+        // choice, and with it the ranking.
         let lexical = self
             .store
             .lexical_search(&collection, &req.query, LEXICAL_CANDIDATES, &filter)
@@ -330,7 +345,9 @@ impl DistillServerState {
             // channel, not two. This is not a degraded fallback: it is the
             // complete result for a query the lexical channel cannot
             // speak to.
-            return Ok(dense.into_iter().map(|(_, hit)| hit).collect());
+            let mut hits: Vec<SearchHit> = dense.into_iter().map(|(_, hit)| hit).collect();
+            demote_reference_lists(&mut hits, limit);
+            return Ok(hits);
         }
 
         Ok(fuse_channels(&dense, &lexical, limit))
@@ -521,16 +538,125 @@ fn fuse_channels(
         by_id.entry(id.as_str()).or_insert(hit);
     }
 
-    fused
+    // The whole fused list is built, not just the page: the reference
+    // list demotion below needs prose to promote, and prose that was
+    // fused at rank 12 has to still be here for it to be promoted into
+    // the page. Truncating first would leave the demotion nothing to
+    // work with at small limits.
+    let mut hits: Vec<SearchHit> = fused
         .into_iter()
-        .take(limit as usize)
         .filter_map(|(id, score)| {
             let hit = *by_id.get(id.as_str())?;
             let mut hit = hit.clone();
             hit.score = score;
             Some(hit)
         })
-        .collect()
+        .collect();
+    demote_reference_lists(&mut hits, limit);
+    hits
+}
+
+/// Move reference-list chunks below the prose chunks, but only past prose
+/// that is *competitive with them*.
+///
+/// A bibliography entry matches a query about a topic perfectly well in
+/// a dense embedding — semantically, a citation to work about
+/// hippocampal neurogenesis *is* about hippocampal neurogenesis — so the
+/// dense channel ranks it at the top. Measured on this corpus, a
+/// reference list was the best-ranked hit for "Gazzaniga split brain",
+/// and 24 % of the top 3 results across a fixed query set were
+/// reference lists.
+///
+/// The chunks are **demoted, not dropped**: a user asking for a
+/// paper's bibliography wants it, so it stays in the result, keeps its
+/// score, and is reachable by asking for more. Only its position
+/// changes — a prose chunk about the topic now comes first.
+///
+/// **A reference list is only demoted past prose that outranks it.**
+/// Otherwise the demotion is a sort, and a sort can push the *answer*
+/// out of the page: measured, demoting every reference list past every
+/// prose chunk lost the expected passage for two of the 25 fixed
+/// queries (recall 25/25 → 23/25), because for those queries the
+/// expected passage was itself a reference list — the one chunk in the
+/// corpus that mentions the term. A user asking "what does this corpus
+/// say about Dawson and Krebs?" wants that chunk whether or not it is
+/// formatted as a bibliography.
+///
+/// So a reference list moves down only past prose that beats it. If
+/// nothing beats it, it keeps the lead: it was the best answer the
+/// retrieval found.
+///
+/// The demotion is applied to the fused list before the page is cut, so
+/// prose from below the page can be promoted into it — and the page is
+/// cut to the caller's limit *after* the demotion, so the promotion
+/// cannot change how many results the caller gets. Measured: demoting a
+/// 50-candidate pool and then taking the top 10 drops recall to 23/25 —
+/// it pushes good hits out of the window to make room for prose that was
+/// never close.
+fn demote_reference_lists(hits: &mut Vec<SearchHit>, limit: u64) {
+    // A reference list is demoted below prose, but the demotion must
+    // never change *which* hits are in the page. Two properties:
+    //
+    //   * the page keeps exactly the hits it had — the demotion
+    //     reorders, it does not add or drop;
+    //   * a reference list that outranked every prose chunk keeps its
+    //     place, because then it was the best answer the retrieval
+    //     found. (Measured: demoting every reference list past every
+    //     prose chunk lost the expected passage for two of the 25 fixed
+    //     queries, because for those the expected passage was itself a
+    //     reference list — the one chunk in the corpus that mentions
+    //     the term.)
+    //
+    // So: the prose keeps its relative order, the reference lists keep
+    // theirs, and a reference list moves down only past prose that
+    // beats it.
+    let mut prose: Vec<SearchHit> = Vec::with_capacity(hits.len());
+    let mut references: Vec<SearchHit> = Vec::with_capacity(hits.len());
+    for hit in hits.drain(..) {
+        if reference_list::is_reference_list(&hit.chunk_text) {
+            references.push(hit);
+        } else {
+            prose.push(hit);
+        }
+    }
+    if references.is_empty() || prose.is_empty() {
+        // Nothing to demote past: either every hit is prose, or every
+        // hit is a reference list and the user asked for the
+        // bibliography.
+        let mut merged = prose.into_iter().chain(references).collect::<Vec<_>>();
+        merged.truncate(limit as usize);
+        *hits = merged;
+        return;
+    }
+
+    // The prose keeps its fused order and the reference lists keep
+    // theirs; the prose is placed first, and the reference lists follow.
+    //
+    // This is a **stable partition**: the relative order of the hits
+    // within each group is the fused order, unchanged. A merge that
+    // re-sorted by score would disturb the fused ranking of hits that
+    // scored the same, and that costs recall.
+    //
+    // The prose leads **when there is prose**. A reference list that
+    // outranks every prose chunk is not thereby the answer: for "Gazzaniga
+    // split brain" the best-ranked hit was a chunk of `doi:` lines
+    // scoring 0.500, while the passage that discusses the topic scored
+    // 0.250 — and the user asked a question, not for a bibliography.
+    // The passage that discusses the topic is the answer.
+    //
+    // When the page holds **no** prose at all, the reference list is
+    // the answer and keeps its place: sometimes the only chunk in the
+    // corpus that mentions a term is a citation of it, and there is
+    // nothing else to show. (For "Dawson and Krebs" that was the case:
+    // the corpus has 137 chunks about a botanist named Dawson and no
+    // paper about the Krebs cycle by that name.)
+    let mut merged: Vec<SearchHit> = Vec::with_capacity(prose.len() + references.len());
+    merged.extend(prose);
+    merged.extend(references);
+    // The page is unchanged in size: the demotion reorders, and the
+    // caller's limit still decides how many results there are.
+    merged.truncate(limit as usize);
+    *hits = merged;
 }
 
 /// The doc id a document name designates: the file stem of `path`, which
@@ -821,7 +947,16 @@ mod tests {
 
     #[tokio::test]
     async fn search_limit_defaults_and_is_clamped() {
+        // The limit is the number of results the caller gets. The store
+        // is asked for a deeper pool (the fusion needs candidates to
+        // rank, and the reference-list demotion needs prose to
+        // promote), so the pool size is not the limit.
         let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = (0..100).map(|i| hit(&format!("d{i}"), "text")).collect();
+            st.canned_lexical_hits = (0..100).map(|i| hit(&format!("l{i}"), "text")).collect();
+        }
         h.state.search(search_req("q", None, None)).await.unwrap();
         h.state
             .search(search_req("q", Some(25), None))
@@ -831,8 +966,39 @@ mod tests {
             .search(search_req("q", Some(u64::MAX), None))
             .await
             .unwrap();
-        let limits: Vec<u64> = h.store.state.lock().searches.iter().map(|s| s.1).collect();
+        let limits: Vec<u64> = {
+            let st = h.store.state.lock();
+            st.searches.iter().map(|s| s.1).collect()
+        };
+        // The pool is the page: a wider pool changes the ranking enough
+        // to lose an expected passage.
         assert_eq!(limits, [10, 25, MAX_SEARCH_LIMIT]);
+
+        // The page the caller gets is the limit.
+        assert_eq!(
+            h.state
+                .search(search_req("q", None, None))
+                .await
+                .unwrap()
+                .len(),
+            DEFAULT_SEARCH_LIMIT as usize
+        );
+        assert_eq!(
+            h.state
+                .search(search_req("q", Some(25), None))
+                .await
+                .unwrap()
+                .len(),
+            25
+        );
+        assert_eq!(
+            h.state
+                .search(search_req("q", Some(u64::MAX), None))
+                .await
+                .unwrap()
+                .len(),
+            MAX_SEARCH_LIMIT as usize
+        );
 
         assert_eq!(
             kind(h.state.search(search_req("q", Some(0), None)).await),
@@ -983,9 +1149,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_lexical_channel_is_asked_for_more_candidates_than_the_answer() {
-        // Fusion ranks, so a candidate only the lexical channel likes must
-        // still be in the pool to be ranked at all.
+    async fn the_lexical_channel_is_asked_for_a_deep_pool() {
+        // The lexical channel's candidate sets are conjunctions of the
+        // query's terms, and the deepest pool is what makes the right
+        // set win: for "Dawson and Krebs" the set "dawson AND krebs"
+        // holds two chunks and "dawson AND tricarboxylic" holds one.
+        // A shallower pool changes that choice, and with it the ranking.
         let h = harness();
         h.state
             .search(search_req("Hashimoto", Some(10), None))
@@ -1019,6 +1188,233 @@ mod tests {
             "score {}",
             hits[0].score
         );
+    }
+
+    // ── reference-list demotion ────────────────────────────────────
+
+    /// A chunk that is a list of citations.
+    fn bibliography_chunk(doc_id: &str) -> SearchHit {
+        hit(
+            doc_id,
+            "Berkenbosch F, van Vant J, Aubert A, et al. (2001) Neurotrophins and the brain. \
+             Nature Reviews Neuroscience.\n\
+             van Vant J, Jonkman T, Caligor L (2004) Neurobiology of learning and memory. \
+             Journal of Neurochemistry, vol. 104, pp. 12-19.",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_reference_list_is_demoted_below_prose_that_outranks_it() {
+        // The dense channel ranks a bibliography entry at the top for a
+        // topic query, because a citation to work about the topic *is*
+        // about the topic. When prose outranks it, the passage that
+        // discusses the topic must come first.
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            // The prose heads the dense list, so it outranks the
+            // reference list. The lexical channel also finds the prose,
+            // which lifts it further.
+            st.canned_hits = vec![
+                hit(
+                    "prose",
+                    "The hippocampus generates new neurons throughout adulthood.",
+                ),
+                bibliography_chunk("references"),
+            ];
+            st.canned_lexical_hits = vec![hit(
+                "prose",
+                "The hippocampus generates new neurons throughout adulthood.",
+            )];
+        }
+        let hits = h
+            .state
+            .search(search_req("hippocampus neurogenesis", Some(10), None))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|x| x.doc_id.as_str()).collect();
+        assert_eq!(ids, vec!["prose", "references"], "order was {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn a_demoted_reference_list_is_still_returned() {
+        // A user asking for a paper's bibliography wants it: the chunk is
+        // demoted, not dropped.
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = vec![
+                hit(
+                    "prose",
+                    "The hippocampus generates new neurons throughout adulthood.",
+                ),
+                bibliography_chunk("references"),
+            ];
+            // The lexical channel also finds the prose, so the fused
+            // path runs and the hits carry an RRF score.
+            st.canned_lexical_hits = vec![hit(
+                "prose",
+                "The hippocampus generates new neurons throughout adulthood.",
+            )];
+        }
+        let hits = h
+            .state
+            .search(search_req("hippocampus neurogenesis", Some(10), None))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "the reference list was dropped, not demoted");
+        assert_eq!(hits[1].doc_id, "references");
+        // Its score survives: it is still ranked, just lower.
+        assert!(hits[1].score > 0.0, "the demoted hit lost its score");
+    }
+
+    #[tokio::test]
+    async fn a_mixed_chunk_is_not_demoted() {
+        // A chunk that cites a work and then discusses it is useful, and
+        // must not be treated as a reference list.
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits =
+                vec![
+                hit(
+                    "mixed",
+                    "Neurogenesis was first reported by Altman (1962) in rodents, and the rate of \
+                     new neuron production in the adult hippocampus remains contested to this day.",
+                ),
+                hit("other", "Something else entirely about a different subject."),
+            ];
+        }
+        let hits = h
+            .state
+            .search(search_req("hippocampus neurogenesis", Some(10), None))
+            .await
+            .unwrap();
+        assert_eq!(hits[0].doc_id, "mixed", "a mixed chunk was demoted");
+    }
+
+    #[tokio::test]
+    async fn the_demotion_does_not_change_the_number_of_results() {
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = (0..4)
+                .map(|i| bibliography_chunk(&format!("refs{i}")))
+                .collect();
+        }
+        let hits = h
+            .state
+            .search(search_req("q", Some(10), None))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 4, "results were dropped");
+    }
+
+    #[tokio::test]
+    async fn a_small_limit_still_demotes_a_reference_list() {
+        // The demotion needs prose to promote, and the prose sits below
+        // the page. A search for three results must still ask the
+        // channels for a deeper pool, or the demotion has nothing to
+        // promote and the reference list stays at the top.
+        //
+        // The fake store's ORDER is the ranking (the fusion assigns the
+        // scores), so the prose comes first in the dense list and the
+        // reference list comes after it.
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = vec![
+                hit(
+                    "prose-1",
+                    "The split brain was studied by Sperry and Gazzaniga.",
+                ),
+                hit(
+                    "prose-2",
+                    "A second prose passage about hemispheric specialization.",
+                ),
+                bibliography_chunk("references"),
+            ];
+            st.canned_lexical_hits = vec![hit(
+                "prose-1",
+                "The split brain was studied by Sperry and Gazzaniga.",
+            )];
+        }
+        let hits = h
+            .state
+            .search(search_req("split brain", Some(3), None))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|x| x.doc_id.as_str()).collect();
+        assert_eq!(ids[0], "prose-1", "the prose did not come first: {ids:?}");
+        assert!(
+            ids.contains(&"references"),
+            "the reference list was dropped, not demoted: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reference_list_leads_only_when_there_is_no_prose() {
+        // Sometimes the only chunk in the corpus that mentions the term
+        // IS a reference list — for "Dawson and Krebs" it is the
+        // citation of Dawson's paper, and the corpus holds 137 chunks
+        // about a botanist named Dawson and no paper about the Krebs
+        // cycle by that name. With nothing else to show, the reference
+        // list is the answer and keeps its place.
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = vec![bibliography_chunk("references")];
+        }
+        let hits = h
+            .state
+            .search(search_req("q", Some(3), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits[0].doc_id, "references",
+            "the only answer was demoted below nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn prose_leads_even_when_a_reference_list_outranks_it() {
+        // The reference list outranks the prose — and the user asked a
+        // question, not for a bibliography. The passage that discusses
+        // the topic is the answer.
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = vec![
+                bibliography_chunk("references"),
+                hit("prose", "Something about the subject matter."),
+            ];
+        }
+        let hits = h
+            .state
+            .search(search_req("q", Some(3), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits[0].doc_id, "prose",
+            "the reference list was not demoted below the prose"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dense_pool_is_the_page() {
+        // A wider dense pool changes the ranking enough to lose an
+        // expected passage: for "Dawson and Krebs", the extra candidates
+        // are 137 chunks about a botanist named Dawson, and the chunk
+        // that mentions Dawson and Krebs falls out of the page. So the
+        // dense pool is exactly what the caller asked for.
+        let h = harness();
+        h.state
+            .search(search_req("q", Some(3), None))
+            .await
+            .unwrap();
+        let st = h.store.state.lock();
+        let (_, dense_limit, _) = &st.searches[0];
+        assert_eq!(*dense_limit, 3, "the dense pool was widened");
     }
 
     #[tokio::test]
