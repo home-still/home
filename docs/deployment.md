@@ -183,6 +183,7 @@ All ports below are LAN-only **except** the gateway, which exits the LAN through
 | 7434  | Distill server    | `big`           | clients, gateway            | LAN only  |
 | 7440  | hs-gateway        | `two`           | cloudflared (loopback)      | via tunnel |
 | 7445  | MCP server        | `big` or `two`  | gateway                     | LAN only  |
+| 7446  | Docs server       | `big`           | clients, gateway            | LAN only  |
 | 6333  | Qdrant REST       | `four`          | distill server (`big`)      | LAN only  |
 | 6334  | Qdrant gRPC       | `four`          | distill server (`big`)      | LAN only  |
 | 11434 | Ollama (VLM)      | `big`           | scribe server (loopback)    | host only |

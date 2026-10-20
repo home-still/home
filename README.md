@@ -213,6 +213,40 @@ hs distill backfill-titles --apply        # write it
 Documents that neither source can title are reported by name, never given
 a placeholder that would look like a title.
 
+### Opening the documents (signed links)
+
+A search hit names a document; the docs service turns that name into a
+link a browser can follow. The link is signed and expiring: it opens one
+document, for a bounded time, and it stops working when the device it
+was minted for is revoked.
+
+```sh
+hs serve docs                             # the service (port 7446)
+hs serve docs --install                   # as a system service
+hs docs link 10.1371_journal.pone.0038469  # mint a link
+hs docs link 10.1371_journal.pone.0038469 --markdown --remote
+```
+
+Every tool that returns a document — `distill_search`,
+`abstract_search`, `catalog_read`, and `doc_link` — carries a `links`
+object with a LAN URL and a remote URL for the source document and for
+its markdown. The remote URL goes through the cloud gateway; the LAN URL
+goes straight to the service, so a large PDF never hairpins through the
+tunnel.
+
+Configure the base URLs in `~/.home-still/config.yaml`:
+
+```yaml
+docs:
+  lan_base_url: http://<host>:7446
+  remote_base_url: https://<public-host>
+  link_ttl_secs: 3600
+```
+
+The signing key lives in `~/.home-still/docs-link.key`, beside the other
+credentials. It is created with mode 0600 on first use and never
+overwritten.
+
 Output formats: `--output text` (default), `--output json`, `--output ndjson`.
 
 See [crates/hs-distill/README.md](crates/hs-distill/README.md) for full documentation.

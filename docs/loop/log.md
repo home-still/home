@@ -401,3 +401,160 @@ regression: it is not a scribe pool member.
    every tool returns every document. It is the prerequisite for #1's
    personal-document links and their short TTL, and it is what stops a
    personal document leaking through a general search.
+
+---
+
+## 2026-10-20-04 — signed, expiring links to the documents
+
+**Change.** A docs service that serves the corpus's documents over
+signed, expiring links, a CLI that mints them, a gateway route that
+proxies to the service, and MCP tools that hand them to agents.
+
+An agent that called `distill_search` got a passage and a `pdf_path`,
+and the `pdf_path` was a storage key on the server's disk
+(`papers/10/10.3390_s21103461.pdf`) — something no user and no remote
+agent can open. The passage was real; the user was one click short of
+the source with no way to close the gap. That is the wishlist's first
+item, and issue #7.
+
+- **`hs serve docs`** (port 7446) serves `/docs/v1/<stem>/source` and
+  `/docs/v1/<stem>/markdown`. The client never names a file: the stem
+  is validated and the service probes the same pdf → html → epub order
+  the MCP server uses. The bytes come from the same `Storage` trait
+  everything else reads through.
+- **The signature** is `HMAC-SHA256(key, "v1|stem|fmt|sub|iat|exp")`
+  and every field it covers is in the query string, so changing the
+  stem, the format, the subject or the expiry invalidates it. The key
+  lives in `~/.home-still/docs-link.key`, mode 0600, never
+  overwritten.
+- **Ranges** are answered: a PDF viewer seeking to a page sends a
+  `Range` and gets a 206 with the right `Content-Range`.
+- **The gateway** gets a `/docs` route that proxies without a bearer
+  token (the signature *is* the authorization) but with the same path
+  check, rate limit and concurrency cap as every other proxied path.
+  `docs` is routable but not scope-bearing, so `SERVICES` (grantable
+  scopes) and `ROUTABLE_SERVICES` (routable services) are now
+  separate lists.
+- **The links** are on `distill_search`, `abstract_search`,
+  `catalog_read` and the new `doc_link` tool, as a LAN URL and a
+  remote URL for the source and the markdown. `pdf_path` is **gone**
+  from the search hits: it was a storage key presented as if it were a
+  link, which it is not.
+
+**Why this ranked first.** Of the 250 hits of the fixed 25-query set,
+every one carried a `pdf_path` and not one of them could be opened.
+That is the wishlist's own first item, asked for twice by the user
+("whenever an agent calls search and pulls text, it also is given
+links to documents that the user of the agent can view"), and it is
+the precondition for the second half ("highlight the text in the
+document"), which needs the document to be servable at all. It beat
+the runner-up (cross-encoder reranking) because it needs no GPU — the
+3090 on `big` is shared with another agent's job — and because a
+document a user cannot open is a document they cannot check the
+answer against.
+
+**Evidence.**
+
+| | before | after |
+|---|---|---|
+| a search hit carries a link the user can open | **no** | **yes** |
+| `pdf_path` on a search hit (a storage key, unopenable) | present | **removed** |
+| RECALL@10 | 24/25 = 96 % | 24/25 = 96 % (unchanged) |
+| median latency | 138 ms | 143 ms (unchanged) |
+
+**Recall is unchanged**, which was the constraint: the change adds a
+link to a hit and removes a path from it. It adds no retrieval
+behaviour.
+
+**Verified end to end, on real documents**, against the live corpus:
+
+- A real PDF served with every header a viewer needs (`content-type:
+  application/pdf`, `content-disposition: inline`, `accept-ranges:
+  bytes`, `etag`, `last-modified`, `content-security-policy: sandbox`,
+  `x-content-type-options: nosniff`, `referrer-policy: no-referrer`,
+  `cache-control: private, max-age=…`).
+- A ranged request → `206` with `content-range: bytes 1000-1099/89310`.
+- The markdown link → `text/markdown; charset=utf-8`.
+- A tampered stem, a tampered expiry, a forged signature, a missing
+  signature, an expired link, a link for one format used on the other,
+  and a revoked subject → **403**, every one with the same body, so a
+  client learns nothing about the corpus.
+- A path-traversal stem → **400**, before storage is read.
+- **It streams**: the corpus's largest object is a 294 MB PDF, and a
+  full download of it grew the service's RSS by **0.4 MB** (51.7 →
+  52.1 MB), against an acceptance criterion of under 64 MB.
+- The whole chain, end to end: an agent calls `distill_search` over
+  MCP, gets a `links` object, and the URL in it fetches the actual
+  PDF (`%PDF-1.5`).
+
+**Two bugs the tests caught**, both in the link's own logic: the expiry
+comparison was `>` where it had to be `>=` (a link minted with a zero
+TTL lived for the rest of that second), and the link carried no issue
+time, so a revocation could not be applied to it. The link now carries
+`iat`, it is part of the signature, and the revocation is checked
+against it.
+
+**Also in this iteration — a release defect that had the scribe server
+crash-looping for six hours.** `hs-serve-scribe.service` on `big`
+restarted 370 times, each ending in "the execution provider could not
+be registered because its corresponding Cargo feature is not enabled".
+Two causes, neither visible to a gate: the release workflow built the
+scribe server with `--features server` while the distill server used
+`--features cuda` — the `cuda` feature is what registers the ONNX CUDA
+provider, and it was never enabled in any release — and the scribe
+server never got the `LD_LIBRARY_PATH` that the distill server has had
+since rc.267, so even with the feature the provider could not find the
+CUDA-12 runtime libraries a CUDA-13 host lacks. Both are fixed: the
+workflow carries a per-target `scribe_features`, the CI gate compiles
+and tests `--features cuda` the way it already does for
+`hs-distill --features cuda`, and both services now call one
+`hs_common::cuda_libs::cuda_ld_library_path`. The unit is stable with
+zero restarts and `/health` reports `layout_model: true`,
+`table_model: true` on the 3090.
+
+**Research.** `docs/loop/runs/2026-10-20-04/research.md` — the
+techniques considered (a storage key, a `file://` URL, a presigned S3
+URL, an unauthenticated browse service, a signed-link service), why
+the last one, and why the *signature is checked by the service that
+reads the bytes* rather than by the gateway: the gateway already
+forwards `Range`, `Content-Range`, `ETag` and `Accept-Ranges`
+untouched, so E2 costs almost nothing at the gateway and gives the LAN
+and remote URLs the same check with no "trusted LAN" bypass.
+
+**Version.** `v0.0.1-rc.368` — a patch-level bump. It adds a service
+and a command, changes no wire format, no collection schema and no
+stored data, and no vector is recomputed.
+
+### Top 5 remaining items
+
+1. **Highlight the text in the document (the wishlist's second half).**
+   The links exist; the anchor does not. The MCP hits already carry
+   `line_start`, `line_end` and `page`, so the data is there — what is
+   missing is a way to address a span in the served document: a
+   `#page=11` fragment for a PDF, and a text-fragment selector for the
+   markdown. The docs service serves a range today; a `page=N` query
+   on the markdown route is the smaller half and is not started.
+2. **Cross-encoder reranking.** The remaining 7 % reference-list noise
+   in the top 3 is the clearest remaining wrongness, and a cross-encoder
+   is what fixes it — it scores a query *against* a passage and can
+   tell a bibliography entry from a discussion. Our own `myelin` crate
+   already runs `bge-reranker-v2-m3` for exactly this, so the technique
+   is proven and the code is ours. Blocked on a second GPU service, and
+   on the 3090 being free.
+3. **Decide the async-nats crash-loop** (see
+   `needs-decision/async-nats-missed-idle-heartbeat.md`). Recommended
+   option A: catch `MissingHeartbeat` and recreate the pull stream
+   instead of exiting.
+4. **Fix the README drift.** The README describes OCR as "GLM-OCR via
+   Ollama" only (the code also has olmOCR, OpenAI-compatible and Cloud
+   backends) and omits `crates/openalex-ingest` and the `personal`
+   feature from the architecture list. Cheap, and it misleads anyone
+   choosing a backend. Two iterations have deferred it as "a docs
+   change, not a code change" — that reading is wrong: the rule is one
+   *change* per iteration, not one *kind* of change.
+5. **Source scopes (#4).** The MCP layer has no notion of which source
+   a document came from (academic, personal, internet, synthesis,
+   iMessages) and no per-source scope, so every tool returns every
+   document. It is the prerequisite for personal-document links with
+   their short TTL, and it is what stops a personal document leaking
+   through a general search.
