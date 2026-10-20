@@ -521,11 +521,11 @@ forwards `Range`, `Content-Range`, `ETag` and `Accept-Ranges`
 untouched, so E2 costs almost nothing at the gateway and gives the LAN
 and remote URLs the same check with no "trusted LAN" bypass.
 
-**Version.** `v0.0.1-rc.370` — a patch-level bump. It adds a service
+**Version.** `v0.0.1-rc.371` — a patch-level bump. It adds a service
 and a command, changes no wire format, no collection schema and no
 stored data, and no vector is recomputed.
 
-**Two release candidates were lost to the Windows gate**, and both
+**Three release candidates were lost to the Windows gate**, and both
 were real defects in the new code, not CI noise:
 
 - **rc.368** failed on a `use std::os::unix::fs::OpenOptionsExt` that
@@ -536,6 +536,10 @@ were real defects in the new code, not CI noise:
   which on Windows makes the whole path one malformed entry and every
   library in it unfound. The separator is `;` on Windows and `:` on
   Unix, and a test now asserts it is the platform's.
+- **rc.370** failed the *same* test, for the mirror reason: the test
+  compared against a hard-coded `:`. The path was right and the test
+  was wrong. The tests now split on the platform's separator, the same
+  one the code joins with.
 
 Tags are immutable, so each fix went into the next rc rather than
 into a retagged one. The lesson is the same both times: only a
