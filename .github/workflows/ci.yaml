@@ -82,6 +82,16 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
       - run: cargo test --locked -p hs-scribe --features server
         if: matrix.os == 'ubuntu-24.04'
+      # Exactly the feature set release.yaml builds for the Linux
+      # hs-scribe-server (`--features cuda`, which implies `server`).
+      # The `cuda` feature is what registers the CUDA execution provider
+      # for the layout and table models: without it the server starts and
+      # then dies loading the layout model, and no gate noticed because
+      # nothing compiled that feature set.
+      - run: cargo clippy --locked -p hs-scribe --features cuda --all-targets -- -D warnings
+        if: matrix.os == 'ubuntu-24.04'
+      - run: cargo test --locked -p hs-scribe --features cuda --lib
+        if: matrix.os == 'ubuntu-24.04'
       # `eval` (implies `server`) is the OCR benchmark harness; nothing ships
       # it, so only its own modules' lints and tests are gated here.
       - run: cargo clippy --locked -p hs-scribe --features eval --all-targets -- -D warnings

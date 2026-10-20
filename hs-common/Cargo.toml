@@ -49,6 +49,12 @@ auth = [
     "dep:http",
     "dep:subtle",
 ]
+# Signed, expiring document links: the signer, the verifier and the
+# revocation list. Builds on `auth` for the HMAC and the key handling.
+docs = [
+    "auth",
+    "dep:anyhow",
+]
 storage = [
     "dep:anyhow",
     "dep:async-trait",

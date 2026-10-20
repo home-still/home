@@ -60,6 +60,10 @@ jobs:
             runner: macos-14
             archive: tar.gz
             build_scribe: true
+            # macOS has no CUDA: the scribe server runs on Metal via
+            # Ollama, and the `cuda` feature would pull a CUDA ONNX
+            # Runtime that cannot run here.
+            scribe_features: server
             run_native: true
           # ubuntu-24.04, not ubuntu-latest: the runner image fixes the glibc
           # the x86_64 binaries require, and a floating image raises it
@@ -69,6 +73,13 @@ jobs:
             archive: tar.gz
             build_scribe: true
             build_distill: true
+            # The Linux scribe server runs the layout and table models on
+            # the GPU, and the `cuda` feature is what registers the CUDA
+            # execution provider. Without it the server starts, loads the
+            # layout model and dies with "the execution provider could not
+            # be registered" — which is what a scribe server built without
+            # it did on every Linux host.
+            scribe_features: cuda
             run_native: true
           # Cross-built on an x86_64 runner against glibc 2.28 by zigbuild;
           # not executed here (run_native: false).
@@ -128,7 +139,7 @@ jobs:
         run: >
           cargo build --locked --release
           --target ${{ matrix.target }}
-          -p hs-scribe --features server --bin hs-scribe-server
+          -p hs-scribe --features ${{ matrix.scribe_features }} --bin hs-scribe-server
 
       - name: Build distill server (native)
         if: matrix.build_distill

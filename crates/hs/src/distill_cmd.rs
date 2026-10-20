@@ -166,30 +166,6 @@ fn find_distill_binary() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Find the ort cache directory containing CUDA provider .so files.
-fn find_ort_cuda_libs() -> Option<String> {
-    let cache = dirs::home_dir()?.join(".cache/ort.pyke.io/dfbin");
-    if !cache.exists() {
-        return None;
-    }
-    // Walk into the platform-specific subdir to find libonnxruntime_providers_cuda.so
-    for entry in std::fs::read_dir(&cache).ok()?.flatten() {
-        let platform_dir = entry.path();
-        // A stray file beside the platform dirs is not a reason to stop
-        // looking; only an unreadable entry is skipped.
-        let Ok(hash_entries) = std::fs::read_dir(&platform_dir) else {
-            continue;
-        };
-        for hash_entry in hash_entries.flatten() {
-            let dir = hash_entry.path();
-            if dir.join("libonnxruntime_providers_cuda.so").exists() {
-                return Some(dir.to_string_lossy().to_string());
-            }
-        }
-    }
-    None
-}
-
 pub async fn dispatch(
     cmd: DistillCmd,
     global: &GlobalArgs,
@@ -958,45 +934,14 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let log_err = log_file.try_clone()?;
 
     // Ensure ONNX Runtime CUDA provider .so files can be found at runtime.
-    // They live in the ort cache dir alongside the static lib.
-    let mut ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    if let Some(cache_dir) = find_ort_cuda_libs() {
-        if !ld_path.contains(&cache_dir) {
-            if !ld_path.is_empty() {
-                ld_path.push(':');
-            }
-            ld_path.push_str(&cache_dir);
-        }
-    }
-    // Include standard CUDA and local lib paths
-    for extra in [
-        "/usr/local/lib",
-        "/opt/cuda/lib64",
-        "/opt/cuda/targets/x86_64-linux/lib",
-    ] {
-        if !ld_path.contains(extra) {
-            if !ld_path.is_empty() {
-                ld_path.push(':');
-            }
-            ld_path.push_str(extra);
-        }
-    }
-    // Include ~/.local/lib for user-created compat symlinks and the
-    // home-still CUDA-12 runtime-compat dir (rc.267: the pyke cu12 ort
-    // bundle needs cublas/cudart/cufft .so.12/.so.11 that a CUDA-13-only
-    // host lacks; NVIDIA's runtime-only wheels drop into this dir).
-    if let Some(home) = dirs::home_dir() {
-        for rel in [".local/lib", ".home-still/cuda12-libs"] {
-            let dir = home.join(rel);
-            let s = dir.to_string_lossy().to_string();
-            if !ld_path.contains(&s) {
-                if !ld_path.is_empty() {
-                    ld_path.push(':');
-                }
-                ld_path.push_str(&s);
-            }
-        }
-    }
+    // They live in the ort cache dir alongside the static lib. The scribe
+    // server gets the same path from the same place: a service that
+    // loads the CUDA provider and does not have this path fails to load
+    // it, and the failure reads as "the execution provider could not be
+    // registered", not as a missing loader path.
+    let ld_path = hs_common::cuda_libs::cuda_ld_library_path(
+        &std::env::var("LD_LIBRARY_PATH").unwrap_or_default(),
+    );
 
     let fastembed_cache = fastembed_cache_dir(&binary)?;
 
@@ -1116,39 +1061,9 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
     })?;
 
     // Build environment (same logic as cmd_server_start)
-    let mut ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    if let Some(cache_dir) = find_ort_cuda_libs() {
-        if !ld_path.contains(&cache_dir) {
-            if !ld_path.is_empty() {
-                ld_path.push(':');
-            }
-            ld_path.push_str(&cache_dir);
-        }
-    }
-    for extra in [
-        "/usr/local/lib",
-        "/opt/cuda/lib64",
-        "/opt/cuda/targets/x86_64-linux/lib",
-    ] {
-        if !ld_path.contains(extra) {
-            if !ld_path.is_empty() {
-                ld_path.push(':');
-            }
-            ld_path.push_str(extra);
-        }
-    }
-    if let Some(home) = dirs::home_dir() {
-        for rel in [".local/lib", ".home-still/cuda12-libs"] {
-            let dir = home.join(rel);
-            let s = dir.to_string_lossy().to_string();
-            if !ld_path.contains(&s) {
-                if !ld_path.is_empty() {
-                    ld_path.push(':');
-                }
-                ld_path.push_str(&s);
-            }
-        }
-    }
+    let ld_path = hs_common::cuda_libs::cuda_ld_library_path(
+        &std::env::var("LD_LIBRARY_PATH").unwrap_or_default(),
+    );
 
     let fastembed_cache = fastembed_cache_dir(&binary)?;
 

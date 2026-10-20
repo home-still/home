@@ -1,4 +1,5 @@
 pub mod config_file;
+pub mod cuda_libs;
 pub mod exit_codes;
 pub mod gpu;
 pub mod hardware_profile;
@@ -191,6 +192,9 @@ pub mod compose;
 
 #[cfg(feature = "auth")]
 pub mod auth;
+
+#[cfg(feature = "docs")]
+pub mod docs;
 
 #[cfg(test)]
 mod tests {

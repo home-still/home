@@ -1025,12 +1025,28 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
         &format!("running on port {port} (Ctrl+C to stop)"),
     );
 
+    // The scribe server loads the ONNX Runtime CUDA provider for its
+    // layout detector, and the provider is a shared library that needs
+    // the CUDA runtime libraries next to it to load at all. On a host
+    // whose CUDA toolkit is version 13, the provider — which wants
+    // `libcublasLt.so.12` and friends — cannot find them and the server
+    // dies with "the execution provider could not be registered".
+    //
+    // The distill server has had this path since rc.267; the scribe
+    // server did not, which is why one worked and the other crash-looped
+    // on the same host. Both get it from `hs_common::cuda_libs` now, so
+    // there is one implementation of the path.
+    let ld_path = hs_common::cuda_libs::cuda_ld_library_path(
+        &std::env::var("LD_LIBRARY_PATH").unwrap_or_default(),
+    );
+
     // Run in foreground — inherit stdout/stderr, block until exit.
     let status = tokio::process::Command::new(&binary)
         .arg("--host")
         .arg("0.0.0.0")
         .arg("--port")
         .arg(port.to_string())
+        .env("LD_LIBRARY_PATH", &ld_path)
         .stdin(std::process::Stdio::null())
         .status()
         .await
