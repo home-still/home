@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
-use object_store::{aws::AmazonS3Builder, ClientOptions, ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{
+    aws::AmazonS3Builder, ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt,
+    PutPayload,
+};
 use sha2::{Digest, Sha256};
 
 use super::{validate_key, validate_prefix, ObjectMeta, Storage};
@@ -210,6 +213,54 @@ fn path(key: &str) -> object_store::path::Path {
     object_store::path::Path::parse(key).unwrap_or_else(|_| object_store::path::Path::from(key))
 }
 
+/// The `GetOptions` that read exactly `range` of an object of `size` bytes.
+///
+/// The range is expressed the way `object_store` wants it: a bounded
+/// range is inclusive-start, exclusive-end, and a range with no end
+/// runs to the end of the object. A suffix range (the last N bytes)
+/// cannot be expressed as a bounded range without knowing the size, and
+/// the size is known here, so it is resolved into a bounded one.
+fn range_opts(range: Option<super::ByteRange>, size: u64) -> (GetOptions, usize) {
+    let Some(range) = range else {
+        return (GetOptions::new(), 0);
+    };
+    // The chunk size the backend should use. A range is usually small
+    // (a PDF viewer's byte range), so a modest chunk avoids buffering a
+    // whole segment.
+    let chunk = 64 * 1024usize;
+    match (range.start, range.end) {
+        (Some(start), end) => {
+            let end = end.map(|e| e + 1).unwrap_or(size);
+            (
+                GetOptions::new().with_range(Some(GetRange::Bounded(start..end))),
+                chunk,
+            )
+        }
+        (None, Some(n)) => {
+            // The last `n + 1` bytes (the suffix range's end is inclusive).
+            let start = size.saturating_sub(n + 1);
+            (
+                GetOptions::new().with_range(Some(GetRange::Bounded(start..size))),
+                chunk,
+            )
+        }
+        (None, None) => (GetOptions::new(), chunk),
+    }
+}
+
+impl S3Storage {
+    /// Read exactly `range` of an object, as bytes.
+    async fn read_range(&self, key: &str, range: super::ByteRange) -> anyhow::Result<bytes::Bytes> {
+        let size = match self.inner.head(&path(key)).await {
+            Ok(m) => m.size,
+            Err(e) => return Err(e.into()),
+        };
+        let (opts, _) = range_opts(Some(range), size);
+        let res = self.inner.get_opts(&path(key), opts).await?;
+        Ok(res.bytes().await?)
+    }
+}
+
 #[async_trait]
 impl Storage for S3Storage {
     async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
@@ -237,6 +288,36 @@ impl Storage for S3Storage {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    async fn get_range(&self, key: &str, range: super::ByteRange) -> anyhow::Result<Vec<u8>> {
+        validate_key(key)?;
+        let bytes = self.read_range(key, range).await?;
+        Ok(bytes.to_vec())
+    }
+
+    async fn get_stream(
+        &self,
+        key: &str,
+        range: Option<super::ByteRange>,
+    ) -> anyhow::Result<(
+        u64,
+        futures::stream::BoxStream<'static, anyhow::Result<Vec<u8>>>,
+    )> {
+        validate_key(key)?;
+        // The whole object's size, so the caller can set `Content-Length`
+        // even for a ranged response.
+        let size = match self.inner.head(&path(key)).await {
+            Ok(m) => m.size,
+            Err(e) => return Err(e.into()),
+        };
+        let (opts, _chunk_size) = range_opts(range, size);
+        let res = self.inner.get_opts(&path(key), opts).await?;
+        let stream = res
+            .into_stream()
+            .map_err(anyhow::Error::from)
+            .map_ok(|b| b.to_vec());
+        Ok((size, stream.boxed()))
     }
 
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {

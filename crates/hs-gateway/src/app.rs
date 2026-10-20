@@ -42,6 +42,11 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
             "/cloud/admin/revoke",
             post(admin::handle_admin_revoke).layer(DefaultBodyLimit::max(admin::MAX_ADMIN_BODY)),
         )
+        // The docs route: a document link carries its own signature, so
+        // this route does not require a bearer token. It is registered
+        // before the fallback so it is not caught by the authenticated
+        // proxy.
+        .route("/docs/{*rest}", get(proxy::docs_handler))
         // Authenticated proxy — catch all remaining paths
         .fallback(any(proxy::proxy_handler))
         .layer(middleware::from_fn_with_state(

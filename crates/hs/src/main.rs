@@ -9,6 +9,8 @@ mod cli;
 mod cloud_cmd;
 pub mod daemon;
 mod distill_cmd;
+mod docs_cmd;
+mod docs_service;
 mod installer;
 mod mcp_client;
 mod mcp_cmd;
@@ -134,6 +136,7 @@ fn main() -> ExitCode {
         TopCmd::Serve { .. } => |_| ExitCode::FAILURE,
         TopCmd::Scribe { .. } => |_| ExitCode::FAILURE,
         TopCmd::Distill { .. } => |_| ExitCode::FAILURE,
+        TopCmd::Docs { .. } => |_| ExitCode::FAILURE,
         TopCmd::Status => |_| ExitCode::FAILURE,
         TopCmd::Restart => |_| ExitCode::FAILURE,
         TopCmd::Upgrade { .. } => |_| ExitCode::FAILURE,
@@ -168,6 +171,7 @@ fn main() -> ExitCode {
                 TopCmd::Distill { command } => {
                     distill_cmd::dispatch(command, &cli.global, &reporter).await
                 }
+                TopCmd::Docs { command } => docs_cmd::dispatch(command, &reporter).await,
                 TopCmd::Status => status_cmd::run(&cli.global).await,
                 TopCmd::Restart => restart_cmd::run(&reporter).await,
                 TopCmd::Cloud { command } => cloud_cmd::dispatch(command, &reporter).await,

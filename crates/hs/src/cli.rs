@@ -49,6 +49,11 @@ pub enum TopCmd {
         #[command(subcommand)]
         command: hs_distill::cli::DistillCmd,
     },
+    /// Signed, expiring links to the documents in the corpus
+    Docs {
+        #[command(subcommand)]
+        command: super::docs_cmd::DocsCmd,
+    },
     /// Live dashboard — pipeline health, services, recent activity
     Status,
     /// Restart all running services (system services, daemons, containers)

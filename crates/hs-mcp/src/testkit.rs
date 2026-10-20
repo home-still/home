@@ -173,6 +173,8 @@ fn deps(
         paper_config: paper::config::Config::default(),
         distill_servers,
         openalex_db: None,
+        // The tests do not configure links, so the tools carry none.
+        link_minter: None,
     }
 }
 

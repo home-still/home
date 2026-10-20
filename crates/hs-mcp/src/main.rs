@@ -22,6 +22,7 @@ use rmcp::{
 use stem::Stem;
 
 mod http_app;
+mod links;
 mod stem;
 #[cfg(test)]
 mod testkit;
@@ -147,6 +148,16 @@ struct CatalogReadParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DocLinkParams {
+    #[schemars(description = "Paper stem name (filename without extension)")]
+    stem: Stem,
+    #[schemars(
+        description = "Which document to link: `source` (the original PDF, HTML or EPUB) or `markdown` (the converted text). Default: `source`"
+    )]
+    format: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ListParams {
     #[schemars(description = "Maximum items to return (default: all)")]
     limit: Option<usize>,
@@ -208,7 +219,10 @@ struct DistillSearchHitOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_text: Option<String>,
     score: f32,
-    pdf_path: Option<String>,
+    /// The links a user can open: the original document and the
+    /// markdown, on the LAN and away from home.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    links: Option<crate::links::DocumentLinks>,
     line_start: usize,
     line_end: usize,
     page: Option<usize>,
@@ -218,17 +232,18 @@ struct DistillSearchHitOut {
 fn map_distill_search_hits(
     hits: Vec<hs_distill::client::SearchHit>,
     include_text: bool,
+    minter: Option<&Arc<crate::links::LinkMinter>>,
 ) -> Vec<DistillSearchHitOut> {
     hits.into_iter()
         .map(|h| DistillSearchHitOut {
-            doc_id: h.doc_id,
+            doc_id: h.doc_id.clone(),
             title: h.title,
             authors: h.authors,
             year: h.year,
             doi: h.doi,
             chunk_text: include_text.then_some(h.chunk_text),
             score: h.score,
-            pdf_path: h.pdf_path,
+            links: minter.and_then(|m| m.mint(&h.doc_id)),
             line_start: h.line_start,
             line_end: h.line_end,
             page: h.page,
@@ -666,6 +681,9 @@ struct HomeStillMcp {
     /// is present in config and the file exists). `None` when the section is
     /// absent — `openalex_*` tools then return a configuration error.
     openalex_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
+    /// Mints the signed, expiring links that let a user open what an
+    /// agent found.
+    link_minter: Option<Arc<crate::links::LinkMinter>>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -682,6 +700,7 @@ struct Deps {
     paper_config: paper::config::Config,
     distill_servers: Vec<String>,
     openalex_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
+    link_minter: Option<Arc<crate::links::LinkMinter>>,
 }
 
 /// See [`HomeStillMcp::probe_markdown`].
@@ -695,6 +714,18 @@ struct MarkdownProbe {
 /// an empty "success".
 fn to_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, String> {
     serde_json::to_string_pretty(value).map_err(|e| format!("serializing the result failed: {e}"))
+}
+
+/// A catalog row, with the links a caller can open.
+///
+/// The row's own `pdf_path` is a storage key on this host. The links
+/// are what a caller can actually open.
+#[derive(serde::Serialize)]
+struct CatalogEntryWithLinks {
+    #[serde(flatten)]
+    entry: hs_common::catalog::CatalogEntry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    links: Option<crate::links::DocumentLinks>,
 }
 
 /// Sends `notifications/progress` about every 20 s while it is alive, so a
@@ -813,6 +844,18 @@ impl HomeStillMcp {
         let paper_config = paper::config::Config::load()
             .map_err(|e| anyhow::anyhow!("paper config invalid: {e:#}"))?;
 
+        let link_minter = Arc::new(crate::links::LinkMinter::from_config(&file));
+        if link_minter.is_enabled() {
+            tracing::info!("document links are enabled");
+        } else {
+            // A deployment without links still works; the tools simply
+            // carry no links. Saying so at startup is how the operator
+            // finds out why.
+            tracing::warn!(
+                "document links are not enabled: set `docs.lan_base_url` and \
+                 `docs.remote_base_url` in ~/.home-still/config.yaml"
+            );
+        }
         Self::from_deps(Deps {
             storage,
             events,
@@ -823,6 +866,7 @@ impl HomeStillMcp {
             distill_servers,
             openalex_db,
             paper_config,
+            link_minter: Some(link_minter),
         })
     }
 
@@ -837,6 +881,7 @@ impl HomeStillMcp {
             paper_config,
             distill_servers,
             openalex_db,
+            link_minter,
         } = deps;
 
         // One provider set for the life of the process: every request goes
@@ -905,6 +950,7 @@ impl HomeStillMcp {
             downloader,
             distill_servers,
             openalex_db,
+            link_minter,
             tool_router,
             prompt_router: Self::prompt_router(),
         })
@@ -1620,9 +1666,60 @@ impl HomeStillMcp {
         .await
         .map_err(|e| format!("{e:#}"))?
         {
-            Some(entry) => to_json(&entry),
+            Some(entry) => {
+                // The catalog row's `pdf_path` is a storage key on this
+                // host, not something the caller can open. The links are
+                // what a caller can open.
+                let links = self.link_minter.as_ref().and_then(|m| m.mint(&p.stem));
+                to_json(&CatalogEntryWithLinks { entry, links })
+            }
             None => Err(format!("No catalog entry found for '{}'", p.stem)),
         }
+    }
+
+    #[tool(
+        description = "Mint a fresh, signed, expiring link to a document in the corpus. The link opens the original document (PDF, HTML or EPUB) or its converted markdown, on the LAN and away from home. Use this when a link from a previous result has expired, or to get a link for a document you know the stem of but have not searched for.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn doc_link(&self, Parameters(p): Parameters<DocLinkParams>) -> Result<String, String> {
+        let minter = self
+            .link_minter
+            .as_ref()
+            .ok_or("Document links are not configured on this host")?;
+        if !minter.is_enabled() {
+            return Err(
+                "Document links are not configured on this host. Set `docs.lan_base_url` and \
+                 `docs.remote_base_url` in ~/.home-still/config.yaml."
+                    .to_string(),
+            );
+        }
+        let wanted = p.format.as_deref().unwrap_or("source");
+        let links = minter
+            .mint(&p.stem)
+            .ok_or_else(|| format!("'{}' is not a document stem", p.stem))?;
+        let pair = match wanted {
+            "source" => links.source.clone(),
+            "markdown" => links.markdown.clone(),
+            other => {
+                return Err(format!(
+                    "unknown format {other:?}: use `source` or `markdown`"
+                ))
+            }
+        };
+        let pair =
+            pair.ok_or_else(|| format!("no {wanted} link could be minted for '{}'", p.stem))?;
+        to_json(&serde_json::json!({
+            "stem": p.stem,
+            "format": wanted,
+            "lan": pair.lan,
+            "remote": pair.remote,
+            "expires_at": links.expires_at,
+        }))
     }
 
     #[tool(
@@ -2280,7 +2377,7 @@ impl HomeStillMcp {
         {
             Ok(hits) => {
                 let include_text = p.include_text.unwrap_or(true);
-                let out = map_distill_search_hits(hits, include_text);
+                let out = map_distill_search_hits(hits, include_text, self.link_minter.as_ref());
                 to_json(&out)
             }
             Err(e) => Err(format!("Search failed: {e:#}")),
@@ -2322,7 +2419,7 @@ impl HomeStillMcp {
         {
             Ok(hits) => {
                 let include_text = p.include_text.unwrap_or(true);
-                let out = map_distill_search_hits(hits, include_text);
+                let out = map_distill_search_hits(hits, include_text, self.link_minter.as_ref());
                 to_json(&out)
             }
             Err(e) => Err(format!("abstract_search failed: {e:#}")),
@@ -4159,6 +4256,7 @@ mod transport_tests {
 #[cfg(test)]
 mod distill_search_mapping_tests {
     use super::map_distill_search_hits;
+    use hs_common::docs::LinkKey;
     use hs_distill::client::SearchHit;
 
     fn fixture() -> Vec<SearchHit> {
@@ -4178,9 +4276,14 @@ mod distill_search_mapping_tests {
         }]
     }
 
+    fn minter() -> std::sync::Arc<crate::links::LinkMinter> {
+        let key = LinkKey::from_bytes(vec![5u8; 32]).unwrap();
+        crate::links::LinkMinter::for_test(key, "http://host:7446", "https://public.example")
+    }
+
     #[test]
     fn include_text_true_preserves_chunk_text() {
-        let out = map_distill_search_hits(fixture(), true);
+        let out = map_distill_search_hits(fixture(), true, None);
         let json = serde_json::to_string(&out).unwrap();
         assert!(json.contains("\"chunk_text\""), "json: {json}");
         assert!(json.contains("lorem ipsum"), "json: {json}");
@@ -4188,7 +4291,7 @@ mod distill_search_mapping_tests {
 
     #[test]
     fn include_text_false_omits_chunk_text_key() {
-        let out = map_distill_search_hits(fixture(), false);
+        let out = map_distill_search_hits(fixture(), false, None);
         let json = serde_json::to_string(&out).unwrap();
         assert!(
             !json.contains("\"chunk_text\""),
@@ -4204,9 +4307,38 @@ mod distill_search_mapping_tests {
     }
 
     #[test]
+    fn a_hit_carries_the_links_a_user_can_open() {
+        // The `pdf_path` on a hit is a storage key on this host. The
+        // links are what a caller can open, and they are what the tool
+        // returns instead.
+        let out = map_distill_search_hits(fixture(), true, Some(&minter()));
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"links\""), "json: {json}");
+        assert!(
+            json.contains("http://host:7446/docs/v1/10.1234_test/source?"),
+            "json: {json}"
+        );
+        assert!(
+            json.contains("https://public.example/docs/v1/10.1234_test/source?"),
+            "json: {json}"
+        );
+        assert!(
+            !json.contains("pdf_path"),
+            "the storage key should not be handed to a caller; got: {json}"
+        );
+    }
+
+    #[test]
+    fn a_hit_without_a_configured_minter_carries_no_links() {
+        let out = map_distill_search_hits(fixture(), true, None);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains("\"links\""), "json: {json}");
+    }
+
+    #[test]
     fn empty_input_round_trips() {
-        let full = serde_json::to_string(&map_distill_search_hits(vec![], true)).unwrap();
-        let lite = serde_json::to_string(&map_distill_search_hits(vec![], false)).unwrap();
+        let full = serde_json::to_string(&map_distill_search_hits(vec![], true, None)).unwrap();
+        let lite = serde_json::to_string(&map_distill_search_hits(vec![], false, None)).unwrap();
         assert_eq!(full, "[]");
         assert_eq!(lite, "[]");
     }

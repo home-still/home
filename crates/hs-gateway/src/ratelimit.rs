@@ -105,6 +105,10 @@ pub struct RateLimits {
     authorize: RateLimiter,
     token: RateLimiter,
     register: RateLimiter,
+    /// The docs route. A link is a signature, not a credential, so the
+    /// budget is spent by every request: the tunnel host is a
+    /// bandwidth bottleneck and a document is a large object.
+    docs: RateLimiter,
 }
 
 impl RateLimits {
@@ -114,10 +118,16 @@ impl RateLimits {
             authorize: RateLimiter::per_minute(per_minute),
             token: RateLimiter::per_minute(per_minute),
             register: RateLimiter::per_minute(per_minute),
+            docs: RateLimiter::per_minute(per_minute.saturating_mul(4).max(per_minute)),
         }
     }
 
     fn for_request(&self, method: &Method, path: &str) -> Option<(&RateLimiter, Policy)> {
+        // The docs route is a GET, and it is a prefix rather than an
+        // exact path: every `/docs/...` request counts.
+        if method == Method::GET && path.starts_with("/docs/") {
+            return Some((&self.docs, Policy::ChargeAlways));
+        }
         if method != Method::POST {
             return None;
         }

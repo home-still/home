@@ -8,6 +8,7 @@ use hs_common::reporter::Reporter;
 const DEFAULT_SCRIBE_PORT: u16 = 7433;
 const DEFAULT_DISTILL_PORT: u16 = 7434;
 const DEFAULT_MCP_PORT: u16 = 7445;
+const DEFAULT_DOCS_PORT: u16 = 7446;
 
 #[derive(Subcommand, Debug)]
 pub enum ServeCmd {
@@ -72,6 +73,19 @@ pub enum ServeCmd {
         #[arg(long, conflicts_with = "install")]
         uninstall: bool,
     },
+    /// Run the docs service: serves the corpus's documents over signed,
+    /// expiring links.
+    Docs {
+        /// Port to listen on
+        #[arg(long, default_value_t = DEFAULT_DOCS_PORT)]
+        port: u16,
+        /// Install as a system service and start it
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Stop and remove the system service
+        #[arg(long, conflicts_with = "install")]
+        uninstall: bool,
+    },
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -100,6 +114,11 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
             port,
             ..
         } => install_service("mcp", port, reporter).await,
+        ServeCmd::Docs {
+            install: true,
+            port,
+            ..
+        } => install_service("docs", port, reporter).await,
         ServeCmd::Scribe {
             uninstall: true, ..
         } => uninstall_service("scribe", reporter).await,
@@ -109,6 +128,9 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
         ServeCmd::Mcp {
             uninstall: true, ..
         } => uninstall_service("mcp", reporter).await,
+        ServeCmd::Docs {
+            uninstall: true, ..
+        } => uninstall_service("docs", reporter).await,
         ServeCmd::ScribeWatch { install: true, .. } => {
             install_user_service(
                 "scribe-watch-events",
@@ -166,6 +188,10 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
         ServeCmd::Mcp { port, .. } => {
             check_system_service_conflict("mcp")?;
             serve_mcp(port, reporter).await
+        }
+        ServeCmd::Docs { port, .. } => {
+            check_system_service_conflict("docs")?;
+            serve_docs(port, reporter).await
         }
     }
 }
@@ -266,6 +292,75 @@ async fn serve_mcp(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
 
     reporter.finish("mcp server stopped");
     Ok(())
+}
+
+// ── Docs ────────────────────────────────────────────────────────
+
+/// Run the docs service in the foreground.
+///
+/// The service runs inside `hs` itself: it needs the storage backend
+/// and the link key, and both are things `hs` already knows how to
+/// find. A companion binary would be one more release artifact to
+/// build, ship and keep in step for no gain.
+async fn serve_docs(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
+    reporter.status("Serve", &format!("docs on port {port}"));
+
+    let file = hs_common::config_file::ConfigFile::load()?;
+    let storage_cfg = file
+        .section::<hs_common::storage::StorageConfig>("storage")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the docs service requires a `storage:` section in ~/.home-still/config.yaml \
+                 (backend: local|s3)"
+            )
+        })?;
+    let storage = storage_cfg
+        .build()
+        .map_err(|e| anyhow::anyhow!("storage config invalid: {e:#}"))?;
+    storage
+        .ensure_ready()
+        .await
+        .map_err(|e| anyhow::anyhow!("storage ensure_ready failed: {e:#}"))?;
+
+    // The key the links are signed with. It is created on first use,
+    // with mode 0600, and never overwritten.
+    let key_path = hs_common::docs::default_key_path();
+    let key = hs_common::docs::load_or_create_key(&key_path)?;
+    reporter.status("Key", &format!("{}", key_path.display()));
+
+    // The revocation list the gateway also reads, so revoking a device
+    // revokes its links.
+    let revocations = hs_common::docs::Revocations::load(&revocation_path())?;
+
+    let state = Arc::new(crate::docs_service::DocsState {
+        storage,
+        key,
+        revocations,
+        papers_prefix: "papers".to_string(),
+        markdown_prefix: "markdown".to_string(),
+    });
+
+    let app = crate::docs_service::router(state);
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("binding {addr} failed: {e}"))?;
+    reporter.status("Listen", &format!("http://0.0.0.0:{port}"));
+
+    let stop = crate::shutdown::cooperative();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            stop.wait().await;
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("the docs service stopped: {e}"))?;
+    Ok(())
+}
+
+/// Where the revocation list lives: beside the gateway's signing
+/// secret, so the gateway and the docs service read one list.
+fn revocation_path() -> std::path::PathBuf {
+    hs_common::auth::token::default_secret_path().with_file_name("cloud-revoked.json")
 }
 
 // ── Watchers (user-level services) ──────────────────────────────

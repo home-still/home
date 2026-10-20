@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -46,6 +47,105 @@ pub struct ObjectMeta {
     pub etag: Option<String>,
 }
 
+/// A byte range within an object, as `HTTP Range` expresses it.
+///
+/// The range is **inclusive at both ends**, and `None` on either end
+/// means "to the end of the object" — the same shape RFC 9110 uses, so
+/// a caller can hand a request's `Range` header straight through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteRange {
+    /// The first byte to read, counting from zero.
+    pub start: Option<u64>,
+    /// The last byte to read, inclusive. `None` means "to the end".
+    pub end: Option<u64>,
+}
+
+impl ByteRange {
+    /// A range from `start` to `end`, inclusive.
+    pub fn new(start: u64, end: u64) -> Self {
+        Self {
+            start: Some(start),
+            end: Some(end),
+        }
+    }
+
+    /// A range from `start` to the end of the object.
+    pub fn from(start: u64) -> Self {
+        Self {
+            start: Some(start),
+            end: None,
+        }
+    }
+
+    /// Parse a `Range` header value.
+    ///
+    /// Only the `bytes=` form with a single range is understood, which is
+    /// what a browser's PDF viewer sends. A multiple-range request
+    /// (`bytes=0-99,200-299`) is refused rather than answered with the
+    /// first range: a client that asked for two ranges and got one would
+    /// render the wrong bytes, and the cost of multipart responses is
+    /// not worth it for this service.
+    pub fn parse(header: &str) -> Option<Self> {
+        let spec = header.trim().strip_prefix("bytes=")?;
+        if spec.contains(',') {
+            return None;
+        }
+        let (first, last) = spec.split_once('-')?;
+        let first = first.trim();
+        let last = last.trim();
+        if first.is_empty() {
+            // A suffix range: the last N bytes.
+            let n: u64 = last.parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            return Some(Self {
+                start: None,
+                end: Some(n - 1),
+            });
+        }
+        let start: u64 = first.parse().ok()?;
+        let end = if last.is_empty() {
+            None
+        } else {
+            Some(last.parse().ok()?)
+        };
+        if let Some(end) = end {
+            if end < start {
+                return None;
+            }
+        }
+        Some(Self {
+            start: Some(start),
+            end,
+        })
+    }
+
+    /// The number of bytes this range covers, given the object's size.
+    ///
+    /// `None` when the range is unsatisfiable against that size.
+    pub fn len(&self, object_size: u64) -> Option<u64> {
+        match (self.start, self.end) {
+            (Some(start), end) => {
+                if start >= object_size {
+                    return None;
+                }
+                let end = end.unwrap_or(object_size - 1).min(object_size - 1);
+                Some(end - start + 1)
+            }
+            // A suffix range: the last `end + 1` bytes.
+            (None, Some(n)) => Some(n.saturating_add(1).min(object_size)),
+            // The whole object.
+            (None, None) => Some(object_size),
+        }
+    }
+
+    /// Is this range empty? (Always false for a range that covers bytes.)
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>>;
@@ -53,6 +153,65 @@ pub trait Storage: Send + Sync {
     async fn head(&self, key: &str) -> anyhow::Result<Option<ObjectMeta>>;
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>>;
     async fn delete(&self, key: &str) -> anyhow::Result<()>;
+
+    /// Read a byte range of an object.
+    ///
+    /// A range that starts at or past the end of the object is an error
+    /// (`NotFound`), not an empty result: the caller asked for bytes
+    /// that do not exist. The returned bytes are exactly the range's, and
+    /// no more.
+    ///
+    /// The default implementation reads the whole object and slices it.
+    /// It is correct for every backend and is what a backend that cannot
+    /// read a range natively should keep; backends that *can* (S3) must
+    /// override it, because a 294 MB PDF read in full to serve 64 KB of
+    /// it is the difference between a service that streams and one that
+    /// does not.
+    async fn get_range(&self, key: &str, range: ByteRange) -> anyhow::Result<Vec<u8>> {
+        let bytes = self.get(key).await?;
+        let start = range.start.unwrap_or(0) as usize;
+        let end = range.end.unwrap_or(bytes.len().saturating_sub(1) as u64) as usize;
+        if start >= bytes.len() {
+            anyhow::bail!("range start {start} is past the end of {key}");
+        }
+        let end = end.min(bytes.len() - 1);
+        Ok(bytes[start..=end].to_vec())
+    }
+
+    /// The object as a stream of byte chunks, with the total size.
+    ///
+    /// A range is applied to the stream, so a caller that wants a
+    /// partial object never receives the whole one. The size is the
+    /// **whole** object's size, so the caller can set `Content-Length`
+    /// correctly; a ranged response needs the range's own length, which
+    /// the caller derives from the range and this size.
+    ///
+    /// The default implementation reads the whole object and yields it
+    /// in one chunk. Backends that can stream must override it.
+    async fn get_stream(
+        &self,
+        key: &str,
+        range: Option<ByteRange>,
+    ) -> anyhow::Result<(u64, BoxStream<'static, anyhow::Result<Vec<u8>>>)> {
+        let bytes = self.get(key).await?;
+        let size = bytes.len() as u64;
+        let out = match range {
+            None => bytes,
+            Some(range) => {
+                let start = range.start.unwrap_or(0) as usize;
+                if start >= bytes.len() {
+                    anyhow::bail!("range start {start} is past the end of {key}");
+                }
+                let end = range
+                    .end
+                    .unwrap_or(bytes.len().saturating_sub(1) as u64)
+                    .min(bytes.len() as u64 - 1) as usize;
+                bytes[start..=end].to_vec()
+            }
+        };
+        let stream = futures::stream::once(async move { Ok(out) });
+        Ok((size, Box::pin(stream)))
+    }
 
     async fn exists(&self, key: &str) -> anyhow::Result<bool> {
         Ok(self.head(key).await?.is_some())
@@ -506,6 +665,107 @@ mod tests {
         assert!(is_invalid_key(&err));
         assert!(!is_not_found(&err));
         assert!(!is_invalid_key(&anyhow::anyhow!("unrelated")));
+    }
+
+    #[test]
+    fn a_range_header_is_parsed_the_way_a_browser_sends_it() {
+        // The forms a PDF viewer sends.
+        assert_eq!(
+            ByteRange::parse("bytes=0-1023"),
+            Some(ByteRange::new(0, 1023))
+        );
+        assert_eq!(ByteRange::parse("bytes=100-"), Some(ByteRange::from(100)));
+        assert_eq!(
+            ByteRange::parse("bytes=-500"),
+            Some(ByteRange {
+                start: None,
+                end: Some(499)
+            })
+        );
+        // A multiple-range request is refused rather than answered with
+        // the first range: a client that asked for two and got one would
+        // render the wrong bytes.
+        assert_eq!(ByteRange::parse("bytes=0-99,200-299"), None);
+        // Nonsense is refused, not guessed at.
+        for header in [
+            "bytes=",
+            "bytes=abc",
+            "bytes=10-5",
+            "bytes=-0",
+            "items=0-10",
+            "0-10",
+            "bytes=1-2,3-4",
+        ] {
+            assert_eq!(ByteRange::parse(header), None, "{header:?}");
+        }
+    }
+
+    #[test]
+    fn a_range_knows_how_many_bytes_it_covers() {
+        assert_eq!(ByteRange::new(0, 99).len(1000), Some(100));
+        assert_eq!(ByteRange::new(900, 999).len(1000), Some(100));
+        // A range that runs past the end is clipped to the object.
+        assert_eq!(ByteRange::new(900, 5000).len(1000), Some(100));
+        // A range that starts past the end covers nothing.
+        assert_eq!(ByteRange::new(1000, 2000).len(1000), None);
+        // A suffix range is measured from the end.
+        assert_eq!(
+            ByteRange {
+                start: None,
+                end: Some(499)
+            }
+            .len(1000),
+            Some(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ranged_read_returns_exactly_the_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = LocalFsStorage::new(tmp.path());
+        s.put("a/x.bin", (0u8..=255).collect()).await.unwrap();
+
+        let got = s
+            .get_range("a/x.bin", ByteRange::new(10, 19))
+            .await
+            .unwrap();
+        assert_eq!(got, (10u8..=19).collect::<Vec<u8>>());
+
+        // A range past the end is an error, not an empty result.
+        let err = s
+            .get_range("a/x.bin", ByteRange::new(300, 400))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("past the end"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_read_yields_the_object_and_its_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = LocalFsStorage::new(tmp.path());
+        let body = (0u8..=255).collect::<Vec<u8>>();
+        s.put("a/x.bin", body.clone()).await.unwrap();
+
+        let (size, mut stream) = s.get_stream("a/x.bin", None).await.unwrap();
+        assert_eq!(size, 256);
+        let mut got = Vec::new();
+        while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+            got.extend(chunk.unwrap());
+        }
+        assert_eq!(got, body);
+
+        // A ranged stream carries the whole object's size, so the caller
+        // can compute the range's own length.
+        let (size, mut stream) = s
+            .get_stream("a/x.bin", Some(ByteRange::new(0, 9)))
+            .await
+            .unwrap();
+        assert_eq!(size, 256);
+        let mut got = Vec::new();
+        while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+            got.extend(chunk.unwrap());
+        }
+        assert_eq!(got, (0u8..=9).collect::<Vec<u8>>());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -11,8 +11,20 @@ use hs_common::auth::token::{self, TokenClaims, TokenError, TokenType};
 use crate::config::GatewayConfig;
 use crate::state::GatewayState;
 
-/// The services the gateway routes to, and the only scopes it will grant.
+/// The scopes a device may be granted.
+///
+/// A scope is a bearer-token permission. `docs` is **not** one: the
+/// docs route authorizes with a signed link's own signature, so a
+/// device never holds a `docs` scope and the gateway never checks one.
 pub const SERVICES: [&str; 3] = ["scribe", "distill", "mcp"];
+
+/// The services the gateway routes to.
+///
+/// This is every routable service, including `docs`, which is
+/// routable but not scope-bearing. The two lists are different on
+/// purpose: a route that authorizes with a signature must not also
+/// accept a bearer token, or the signature would be optional.
+pub const ROUTABLE_SERVICES: [&str; 4] = ["scribe", "distill", "mcp", "docs"];
 
 /// A refusal small enough to return by value: status plus a fixed message.
 /// Convert with `.into_response()` at the handler boundary.

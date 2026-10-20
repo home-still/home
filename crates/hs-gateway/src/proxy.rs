@@ -86,6 +86,50 @@ pub enum RouteError {
     NoSuchService,
 }
 
+/// Proxy handler for the docs route.
+///
+/// The docs service checks a signed, expiring link's signature itself,
+/// so this route does **not** require a bearer token: possession of a
+/// valid signature is the authorization. Everything else the proxy
+/// does still happens — the path is checked, the request is rate
+/// limited, the concurrency cap applies, and the body is streamed.
+///
+/// The request's `Range` header is forwarded, so a PDF viewer seeking
+/// to a page works through the gateway exactly as it does on the LAN.
+pub async fn docs_handler(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
+    // The path is checked here, exactly as in the authenticated proxy.
+    if check_path(req.uri().path()).is_err() {
+        return (StatusCode::BAD_REQUEST, "Malformed request path").into_response();
+    }
+
+    let Some(pick) = state.balancer.pick("docs") else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "No backend configured for service: docs",
+        )
+            .into_response();
+    };
+    let backend_base = pick.url.clone();
+
+    let permit = match state.proxy_permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            let mut resp = (StatusCode::SERVICE_UNAVAILABLE, "Gateway is busy").into_response();
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            return resp;
+        }
+    };
+
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| req.uri().path());
+    let backend_url = format!("{backend_base}{path_and_query}");
+
+    forward_request(&state, "docs", pick.index, req, backend_url, permit).await
+}
 /// Reject any path whose meaning could change between here and the backend:
 /// dot segments (raw or percent-encoded), empty segments, encoded or raw
 /// separators, NUL and control characters.

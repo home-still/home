@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context};
 use serde::Deserialize;
 
-use crate::auth::SERVICES;
+use crate::auth::ROUTABLE_SERVICES;
 use crate::backend_url;
 
 /// `cloud.gateway` keys that used to exist and no longer do. Deployed configs
@@ -201,11 +201,11 @@ impl GatewayConfig {
         }
         let mut routes = HashMap::new();
         for (service, urls) in &self.routes {
-            if !SERVICES.contains(&service.as_str()) {
+            if !ROUTABLE_SERVICES.contains(&service.as_str()) {
                 bail!(
                     "`cloud.gateway.routes.{service}` is not a routable service \
                      (must be one of: {})",
-                    SERVICES.join(", ")
+                    ROUTABLE_SERVICES.join(", ")
                 );
             }
             if urls.is_empty() {

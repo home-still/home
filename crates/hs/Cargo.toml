@@ -13,7 +13,9 @@ hs-distill = { path = "../hs-distill", features = ["client"] }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-hs-common = { workspace = true, features = ["cli", "service", "catalog", "compose", "auth", "storage", "storage-s3", "events", "events-nats", "logging"] }
+hs-common = { workspace = true, features = ["cli", "service", "catalog", "compose", "auth", "docs", "storage", "storage-s3", "events", "events-nats", "logging"] }
+axum = { workspace = true }
+gethostname = "0.5"
 owo-colors = { workspace = true }
 paper = { path = "../../paper" }
 personal = { path = "../../personal" }

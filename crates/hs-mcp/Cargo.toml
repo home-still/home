@@ -8,7 +8,7 @@ name = "hs-mcp"
 path = "src/main.rs"
 
 [dependencies]
-hs-common = { workspace = true, features = ["cli", "service", "catalog", "auth", "storage-s3", "logging", "catch-panic"] }
+hs-common = { workspace = true, features = ["cli", "service", "catalog", "auth", "docs", "storage-s3", "logging", "catch-panic"] }
 hs-scribe = { path = "../hs-scribe", features = ["client"] }
 hs-distill = { path = "../hs-distill", features = ["client"] }
 paper = { path = "../../paper" }
@@ -28,6 +28,7 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 chrono = "0.4"
+gethostname = "0.5"
 clap = { workspace = true }
 tracing = { workspace = true }
 percent-encoding = "2"
