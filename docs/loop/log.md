@@ -339,6 +339,30 @@ format, no collection schema, and no vector.
 **Commit.** `6a3abe9` — "feat(distill): backfill the missing titles onto the
 indexed points".
 
+**Release.** `v0.0.1-rc.367`, published at
+<https://github.com/home-still/home/releases/tag/v0.0.1-rc.367>: 33
+assets — 16 platform binaries (5 targets × the `hs` CLI, plus
+`hs-gateway`, `hs-mcp`, `hs-scribe-server` and `hs-distill-server`
+where the target builds them), their `.sha256` files and a combined
+`checksums-sha256.txt`, plus the `ghcr.io/home-still/hs-scribe-server`
+images for both architectures and the multi-arch manifest. The CI run
+was green on all three gate platforms (macOS 14, Ubuntu 24.04, Windows
+2022) and all five build targets. The published `hs-distill-server` and
+`hs` binaries were downloaded and checked: both carry the
+`0.0.1-rc.367` version marker, and the published CLI carries the new
+`hs distill backfill-titles` command.
+
+Deployed to the fleet with `hs upgrade --pre --yes`, in series: `big`,
+`two`, `bmb`, `mac_air`, `big_mac` — every host reports
+`hs 0.0.1-rc.367`, and every server binary on disk carries the rc.367
+marker. `big` restarted 7 services, `two` 1 (`hs-gateway`), `bmb` 1
+(`com.home-still.scribe`), `mac_air` 1 (`io.home-still.scribe-inbox`).
+`big`'s distill server came back on CUDA and `hs distill search` on the
+upgraded host returns titles. `five` was offline (unchanged); `one`,
+`three` and `four` run no home-still container. `mac_air` still has no
+`com.home-still.scribe` agent loaded — the pre-existing state, not a
+regression: it is not a scribe pool member.
+
 ### Top 5 remaining items
 
 1. **Links to the documents, and highlighting (issue #7).** The wishlist
