@@ -525,7 +525,7 @@ and remote URLs the same check with no "trusted LAN" bypass.
 and a command, changes no wire format, no collection schema and no
 stored data, and no vector is recomputed.
 
-**Three release candidates were lost to the Windows gate**, and both
+**Three release candidates were lost to the Windows gate**, and all three
 were real defects in the new code, not CI noise:
 
 - **rc.368** failed on a `use std::os::unix::fs::OpenOptionsExt` that
