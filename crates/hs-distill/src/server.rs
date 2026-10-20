@@ -36,7 +36,10 @@ pub fn app(state: Arc<DistillServerState>, token: BackendToken) -> Router {
         .route("/status", get(handle_status))
         .route("/exists/{doc_id}", get(handle_exists))
         .route("/doc/{doc_id}", axum::routing::delete(handle_delete_doc))
+        .route("/doc/{doc_id}/title", post(handle_set_title))
         .route("/docs", get(handle_list_docs))
+        .route("/docs/titles", get(handle_payload_titles))
+        .route("/docs/markdown-paths", get(handle_payload_markdown_paths))
         .route("/collection/reset", post(handle_reset_collection))
         .route("/collection/hnsw", post(handle_enable_hnsw))
         .route("/scrub-interstitials", post(handle_scrub_interstitials))
@@ -184,6 +187,53 @@ async fn handle_list_docs(
             .list_docs(q.limit, q.collection.as_deref())
             .await
             .map(|docs| serde_json::json!({"doc_ids": docs.doc_ids, "truncated": docs.truncated})),
+    )
+}
+
+async fn handle_payload_titles(
+    State(state): State<Arc<DistillServerState>>,
+    Query(q): Query<CollectionQuery>,
+) -> Response {
+    reply(
+        state
+            .payload_titles(q.collection.as_deref())
+            .await
+            .map(|titles| serde_json::json!({"titles": titles})),
+    )
+}
+
+async fn handle_payload_markdown_paths(
+    State(state): State<Arc<DistillServerState>>,
+    Query(q): Query<CollectionQuery>,
+) -> Response {
+    reply(
+        state
+            .payload_markdown_paths(q.collection.as_deref())
+            .await
+            .map(|paths| serde_json::json!({"paths": paths})),
+    )
+}
+
+/// The body of `POST /doc/{doc_id}/title`.
+#[derive(Deserialize)]
+struct SetTitleBody {
+    /// The title to write onto the document's points.
+    title: String,
+    /// Target a non-default collection.
+    #[serde(default)]
+    collection: Option<String>,
+}
+
+async fn handle_set_title(
+    State(state): State<Arc<DistillServerState>>,
+    Path(doc_id): Path<String>,
+    Json(body): Json<SetTitleBody>,
+) -> Response {
+    reply(
+        state
+            .set_title(&doc_id, &body.title, body.collection.as_deref())
+            .await
+            .map(|points| serde_json::json!({"doc_id": doc_id, "points_updated": points})),
     )
 }
 
@@ -949,5 +999,47 @@ mod tests {
             .status(),
             200
         );
+    }
+
+    #[tokio::test]
+    async fn the_markdown_paths_route_reports_each_documents_own_key() {
+        // The doc_id is NOT the markdown key: a book ingested from a
+        // download provider has a title-based doc_id while its markdown
+        // is keyed by a shard of the title. The backfill reads the key
+        // from the payload, so the route has to report it verbatim.
+        let h = start().await;
+        h.post(
+            "/distill",
+            serde_json::json!({"path":"a.md","content": prose(4)}),
+        )
+        .await;
+
+        let resp = h
+            .http
+            .get(h.url("/docs/markdown-paths"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let paths = body["paths"].as_object().expect("paths object");
+        assert!(!paths.is_empty(), "no markdown path was reported");
+        for (doc_id, path) in paths {
+            assert!(
+                path.as_str().unwrap().starts_with("markdown/"),
+                "the key for {doc_id} is not a storage key: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_markdown_paths_route_needs_the_backend_token() {
+        let h = start().await;
+        let resp = http_client(None)
+            .get(h.url("/docs/markdown-paths"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
     }
 }

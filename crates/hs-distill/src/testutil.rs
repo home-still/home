@@ -379,6 +379,52 @@ impl VectorStore for FakeStore {
             .collect())
     }
 
+    async fn payload_titles(
+        &self,
+        collection: &str,
+    ) -> Result<std::collections::BTreeMap<String, Option<String>>, DistillError> {
+        let st = self.state.lock();
+        let mut out = std::collections::BTreeMap::new();
+        for (c, doc) in st.docs.keys() {
+            if c == collection {
+                out.insert(doc.clone(), None);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn payload_markdown_paths(
+        &self,
+        collection: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, DistillError> {
+        let st = self.state.lock();
+        let mut out = std::collections::BTreeMap::new();
+        for (c, doc) in st.docs.keys() {
+            if c == collection {
+                out.insert(
+                    doc.clone(),
+                    format!("markdown/{}/{}.md", &doc[..2.min(doc.len())], doc),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn set_payload_title(
+        &self,
+        _collection: &str,
+        doc_id: &str,
+        _title: &str,
+    ) -> Result<u64, DistillError> {
+        let st = self.state.lock();
+        Ok(st
+            .docs
+            .iter()
+            .filter(|((_, d), _)| d == doc_id)
+            .map(|(_, chunks)| chunks.len() as u64)
+            .sum())
+    }
+
     async fn points_count(&self, collection: &str) -> Result<u64, DistillError> {
         Ok(self
             .state

@@ -475,6 +475,59 @@ impl DistillServerState {
         })
     }
 
+    /// Write a title onto every point of a document.
+    ///
+    /// A **payload** update: the vector is untouched, so this is not a
+    /// re-embed and needs no embedding model. It is how a document that
+    /// was indexed before its catalog row existed gets the title the
+    /// catalog now holds (see [`crate::backfill`]).
+    ///
+    /// The title is rejected if it is empty: a point with an empty title
+    /// is as useless as one with no title, and writing one would hide the
+    /// problem rather than fix it.
+    pub async fn set_title(
+        &self,
+        doc_id: &str,
+        title: &str,
+        collection: Option<&str>,
+    ) -> Result<u64, ApiError> {
+        validate_doc_id(doc_id)?;
+        if title.trim().is_empty() {
+            return Err(ApiError::bad_request("title cannot be empty"));
+        }
+        let collection = self.resolve_collection(collection)?;
+        Ok(self
+            .store
+            .set_payload_title(&collection, doc_id, title.trim())
+            .await?)
+    }
+
+    /// The title currently stored on each document's points.
+    ///
+    /// The input to the title backfill: a document maps to the title on
+    /// its points, or `None` when it has none.
+    pub async fn payload_titles(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<std::collections::BTreeMap<String, Option<String>>, ApiError> {
+        let collection = self.resolve_collection(collection)?;
+        Ok(self.store.payload_titles(&collection).await?)
+    }
+
+    /// The storage key of each document's markdown, as stored on its points.
+    ///
+    /// The doc_id is *not* the markdown key: a book ingested from Anna's
+    /// Archive has a title-based doc_id while its markdown is keyed by a
+    /// shard of the title. The payload carries the key itself, so the
+    /// backfill reads it from there rather than deriving it.
+    pub async fn payload_markdown_paths(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<std::collections::BTreeMap<String, String>, ApiError> {
+        let collection = self.resolve_collection(collection)?;
+        Ok(self.store.payload_markdown_paths(&collection).await?)
+    }
+
     /// Drop and recreate a served collection. Destructive; the route is behind
     /// the backend-token middleware (see `server.rs`).
     pub async fn reset_collection(

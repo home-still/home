@@ -196,6 +196,23 @@ hs distill status                        # collection stats
 
 Search results include title, authors, year, relevance score, and text snippets. Low-quality chunks (repetition loops, garbled text) are automatically filtered during indexing.
 
+### Repairing missing titles
+
+A document indexed before its catalog row existed was indexed with no
+title, and — because the corpus is not re-indexed — it stays that way. The
+backfill writes the title onto the points that lack it, from the catalog
+where the catalog has one and from the document's own text where it does
+not. It is a **payload update**: no vector is recomputed, no GPU is
+used.
+
+```sh
+hs distill backfill-titles               # dry run: report what it would write
+hs distill backfill-titles --apply        # write it
+```
+
+Documents that neither source can title are reported by name, never given
+a placeholder that would look like a title.
+
 Output formats: `--output text` (default), `--output json`, `--output ndjson`.
 
 See [crates/hs-distill/README.md](crates/hs-distill/README.md) for full documentation.

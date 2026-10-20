@@ -1,6 +1,7 @@
 pub mod abstracts;
 pub mod adaptive_batch;
 pub mod api;
+pub mod backfill;
 pub mod chunker;
 pub mod cli;
 pub mod client;

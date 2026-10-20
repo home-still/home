@@ -211,6 +211,13 @@ pub const DEFAULT_INDEX_TIMEOUT: Duration = Duration::from_secs(1800);
 /// without one.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How many times a title write is attempted before it is a failure.
+///
+/// A payload write can time out while the live indexer is writing to the
+/// same collection. The write is idempotent, so a retry is safe.
+const TITLE_WRITE_ATTEMPTS: usize = 3;
+
+#[derive(Clone)]
 pub struct DistillClient {
     http: AuthedHttp,
     server_url: String,
@@ -496,6 +503,93 @@ impl DistillClient {
             .context("Failed to reach distill server")?;
         let data: Deleted = json_or_server_error(resp, "delete").await?;
         Ok(data.deleted)
+    }
+
+    /// Write a title onto every point of a document.
+    ///
+    /// A **payload** update: the vector is untouched, so this is not a
+    /// re-embed and needs no embedding model. Returns the number of
+    /// points updated.
+    pub async fn set_title(&self, doc_id: &str, title: &str) -> Result<u64> {
+        #[derive(Deserialize)]
+        struct Set {
+            points_updated: u64,
+        }
+        let url = self.endpoint(&["doc", doc_id, "title"], &[])?;
+        // A write to Qdrant can time out while the live indexer is
+        // writing to the same collection. The write is a payload update
+        // and is idempotent — writing the same title twice is the same
+        // write — so a timed-out write is retried rather than reported
+        // as a failure.
+        let mut last: Option<String> = None;
+        for attempt in 1..=TITLE_WRITE_ATTEMPTS {
+            let resp = self
+                .http
+                .post(url.clone())
+                .json(&serde_json::json!({ "title": title }))
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await;
+            match resp {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        let data: Set = json_or_server_error(resp, "set_title").await?;
+                        return Ok(data.points_updated);
+                    }
+                    let body = resp.text().await.unwrap_or_default();
+                    last = Some(format!("{status}: {body}"));
+                }
+                Err(e) => last = Some(format!("{e:#}")),
+            }
+            if attempt < TITLE_WRITE_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+            }
+        }
+        anyhow::bail!(
+            "set_title({doc_id}) failed after {TITLE_WRITE_ATTEMPTS} attempts: {}",
+            last.unwrap_or_else(|| "unknown error".to_string())
+        )
+    }
+
+    /// The title currently stored on each document's points.
+    pub async fn payload_titles(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, Option<String>>> {
+        #[derive(Deserialize)]
+        struct Titles {
+            titles: std::collections::BTreeMap<String, Option<String>>,
+        }
+        let url = format!("{}/docs/titles", self.server_url);
+        let resp = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .context("Failed to reach distill server")?;
+        let data: Titles = json_or_server_error(resp, "payload_titles").await?;
+        Ok(data.titles)
+    }
+
+    /// The storage key of each document's markdown, as stored on its points.
+    pub async fn payload_markdown_paths(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        #[derive(Deserialize)]
+        struct Paths {
+            paths: std::collections::BTreeMap<String, String>,
+        }
+        let url = format!("{}/docs/markdown-paths", self.server_url);
+        let resp = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .context("Failed to reach distill server")?;
+        let data: Paths = json_or_server_error(resp, "payload_markdown_paths").await?;
+        Ok(data.paths)
     }
 
     /// Drop + recreate the Qdrant collection, wiping every vector.

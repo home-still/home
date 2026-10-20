@@ -93,6 +93,26 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Backfill missing titles onto indexed points from the catalog.
+    ///
+    /// A document's title is copied from its catalog row into the Qdrant
+    /// payload at index time, so a document indexed before its catalog row
+    /// existed was indexed with no title — and it stays that way, because
+    /// the corpus is not re-indexed. This writes the title the catalog now
+    /// holds onto the document's points. The **vector is untouched**: it is
+    /// a payload update, not a re-embed, so it needs no GPU and no
+    /// embedding model.
+    ///
+    /// Dry-run by default; `--apply` writes. Documents the catalog does
+    /// not know are reported as untitled, never given a placeholder.
+    BackfillTitles {
+        /// Write the titles. Without this, report what would change.
+        #[arg(long)]
+        apply: bool,
+        /// Override server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
     /// Delete every Qdrant chunk for a doc_id. CLI-only (no MCP) because
     /// this is a destructive write — use to clear orphaned vectors after
     /// markdown has been removed, or to force a clean re-index.

@@ -232,6 +232,9 @@ pub async fn dispatch(
             reembed,
             server,
         } => cmd_reconcile(fix_stamps, reembed, server.as_deref(), reporter).await,
+        DistillCmd::BackfillTitles { apply, server } => {
+            cmd_backfill_titles(apply, server.as_deref(), reporter).await
+        }
         DistillCmd::Purge { doc_id, server } => {
             cmd_purge(&doc_id, server.as_deref(), reporter).await
         }
@@ -245,6 +248,236 @@ pub async fn dispatch(
             hs_distill::cli::AbstractsCmd::Status => cmd_abstracts_status(reporter).await,
         },
     }
+}
+
+// ── Backfill titles (driver) ───────────────────────────────────────
+
+/// How many documents' markdown are read at once when deriving titles.
+///
+/// The corpus is ~15,000 documents; a serial read over S3 takes minutes,
+/// and the read is I/O-bound, so the concurrency is what makes the
+/// command usable.
+const MARKDOWN_FETCH_CONCURRENCY: usize = 24;
+
+/// How many documents' titles are written at once.
+///
+/// The write is one round trip to the distill server per document, so
+/// the backfill of thousands of documents takes hours when they are
+/// written one at a time. But the writes land in the same Qdrant
+/// collection the live indexer is writing to, and too many at once make
+/// Qdrant time out — measured, 16 concurrent writes produced 207
+/// timeouts, and 4 completed the same work without one.
+const TITLE_WRITE_CONCURRENCY: usize = 4;
+
+/// Write the titles the catalog holds onto the points that lack them.
+///
+/// A document's title is copied from its catalog row into the Qdrant
+/// payload at index time. A document indexed before its catalog row
+/// existed was indexed with no title, and it stays that way: the corpus is
+/// not re-indexed. This writes the catalog's title onto the document's
+/// points. The **vector is untouched** — it is a payload update, not a
+/// re-embed, so it needs no GPU and no embedding model.
+///
+/// Dry-run by default. Documents the catalog does not know are reported
+/// as untitled, never given a placeholder: a title that looks like a
+/// title but is not one is worse than no title.
+async fn cmd_backfill_titles(
+    apply: bool,
+    server_override: Option<&str>,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
+    use hs_distill::backfill::{plan, untitled};
+    use std::collections::BTreeMap;
+
+    let cfg = DistillClientConfig::load().context("loading distill client config")?;
+    let storage = cfg.build_storage().context("building storage backend")?;
+
+    let server_url = match server_override {
+        Some(s) => s.to_string(),
+        None => cfg.require_servers()?[0].clone(),
+    };
+    let distill = make_distill_client(&server_url).await?;
+
+    reporter.status("Scan", "reading the titles stored on the indexed points");
+    let payload: BTreeMap<String, Option<String>> = distill
+        .payload_titles()
+        .await
+        .context("reading the indexed points' titles")?;
+    reporter.status("Qdrant", &format!("{} indexed docs", payload.len()));
+
+    reporter.status("Scan", "reading the catalog");
+    let triples = hs_common::catalog::list_catalog_entries_via(&*storage, "catalog")
+        .await
+        .context("listing catalog entries")?;
+    let mut catalog: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (stem, _, entry) in triples {
+        catalog.insert(stem, entry.title);
+    }
+    reporter.status("Catalog", &format!("{} entries", catalog.len()));
+
+    // The catalog knows far fewer documents than the corpus holds (measured:
+    // 57 % of the title-less documents have no catalog row at all), so the
+    // document's own text is the second source. The catalog wins where it
+    // has a title — it is supplied, while the first line is a guess.
+    //
+    // Only the documents that need a title are read: the corpus is ~15,000
+    // documents, and reading all of them to fix the ~8,000 that have no
+    // title costs minutes for nothing.
+    reporter.status("Scan", "deriving titles from the documents' own text");
+    let mut derived: BTreeMap<String, Option<String>> = BTreeMap::new();
+    {
+        use futures::stream::{self, StreamExt};
+        use std::time::Duration;
+        let paths = distill.payload_markdown_paths().await?;
+        // The documents that need a title: those with none, and those
+        // whose stored title carries the converter's markup or is an
+        // artifact. A document the catalog can title needs no markdown
+        // read at all — the catalog is the source, and it is already
+        // in hand.
+        let needs_title: std::collections::BTreeSet<String> = payload
+            .iter()
+            .filter(|(doc_id, t)| {
+                let has_title = t.as_ref().is_some_and(|t| !t.trim().is_empty());
+                let improvable = t.as_ref().is_some_and(|t| {
+                    hs_distill::backfill::is_unusable_title(t)
+                        || hs_distill::metadata::has_markup(t)
+                });
+                if has_title && !improvable {
+                    return false;
+                }
+                // The catalog is enough for a document it knows.
+                !catalog
+                    .get(*doc_id)
+                    .and_then(|t| t.as_ref())
+                    .is_some_and(|t| !t.trim().is_empty())
+            })
+            .map(|(doc_id, _)| doc_id.clone())
+            .collect();
+        reporter.status(
+            "Scan",
+            &format!("{} documents need a title", needs_title.len()),
+        );
+        let mut stream = stream::iter(
+            paths
+                .into_iter()
+                .filter(|(doc_id, _)| needs_title.contains(doc_id))
+                .map(|(doc_id, path)| {
+                    let storage = storage.clone();
+                    async move {
+                        let res =
+                            tokio::time::timeout(Duration::from_secs(15), storage.get(&path)).await;
+                        (doc_id, res)
+                    }
+                }),
+        )
+        .buffer_unordered(MARKDOWN_FETCH_CONCURRENCY);
+        while let Some((doc_id, res)) = stream.next().await {
+            let title = match res {
+                Ok(Ok(bytes)) => {
+                    hs_distill::metadata::title_from_markdown(&String::from_utf8_lossy(&bytes))
+                }
+                // A document whose markdown cannot be read is reported as
+                // untitled, not as an error: the backfill's job is to fill
+                // what it can and name what it cannot.
+                _ => None,
+            };
+            derived.insert(doc_id, title);
+        }
+    }
+
+    // How good is the derived title? A title taken from the document's
+    // own first line is a guess, and a guess that reads like a body
+    // sentence is worse than no title: it puts a plausible-looking wrong
+    // value into every search result that cites the document. The share
+    // of titles that end in a full stop is the tell, so it is reported.
+    let derived_titles: Vec<&String> = derived.values().filter_map(|t| t.as_ref()).collect();
+    let sentence_like = derived_titles
+        .iter()
+        .filter(|t| t.trim_end().ends_with('.') && t.split_whitespace().count() > 6)
+        .count();
+
+    let planned = plan(&payload, &catalog, &derived);
+    let untitled = untitled(&payload);
+    let fixable = planned.len();
+    // Documents with no title that neither the catalog nor the document's
+    // own text can title.
+    let unfillable = untitled.len().saturating_sub(fixable);
+    // Where each written title comes from, so the report says which
+    // source did the work.
+    let from_catalog = planned
+        .iter()
+        .filter(|b| {
+            catalog
+                .get(&b.doc_id)
+                .and_then(|t| t.as_ref())
+                .is_some_and(|t| !t.trim().is_empty())
+        })
+        .count();
+    let from_document = fixable.saturating_sub(from_catalog);
+
+    reporter.status(
+        "Plan",
+        &format!(
+            "would fix {fixable} (catalog {from_catalog}, own text {from_document})  \
+             untitled-and-unfillable {unfillable}"
+        ),
+    );
+    reporter.status(
+        "Quality",
+        &format!(
+            "derived titles {sentence_like} of {} read as a body sentence, not a title",
+            derived_titles.len()
+        ),
+    );
+
+    if !apply {
+        let sample: Vec<&str> = planned.iter().take(10).map(|b| b.doc_id.as_str()).collect();
+        reporter.finish(&format!(
+            "Dry run: would set the title on {fixable} doc(s) ({from_catalog} from the \
+             catalog, {from_document} from the document's own text); {unfillable} doc(s) have \
+             no title in either source and stay untitled. Samples: {sample:?}. \
+             Pass --apply to write."
+        ));
+        return Ok(());
+    }
+
+    // Write concurrently: the corpus is thousands of documents and each
+    // write is a round trip to the server, so a serial loop takes hours.
+    use futures::stream::{self, StreamExt};
+    let mut written = 0u64;
+    let mut points = 0u64;
+    let mut failures: Vec<String> = Vec::new();
+    let mut stream = stream::iter(planned.iter().filter_map(|b| {
+        let title = b.title.as_deref()?;
+        let distill = distill.clone();
+        let doc_id = b.doc_id.clone();
+        Some(async move {
+            let res = distill.set_title(&doc_id, title).await;
+            (doc_id, res)
+        })
+    }))
+    .buffer_unordered(TITLE_WRITE_CONCURRENCY);
+    while let Some((doc_id, res)) = stream.next().await {
+        match res {
+            Ok(n) => {
+                written += 1;
+                points += n;
+            }
+            Err(e) => failures.push(format!("{doc_id}: {e:#}")),
+        }
+    }
+    failures.sort();
+
+    reporter.finish(&format!(
+        "Backfilled titles on {written} doc(s), {points} point(s). {unfillable} doc(s) remain \
+         untitled (no title in the catalog and none their own text yields).{}",
+        if failures.is_empty() {
+            String::new()
+        } else {
+            format!(" Failures: {}", failures.join("; "))
+        }
+    ));
+    Ok(())
 }
 
 async fn cmd_purge(doc_id: &str, server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {

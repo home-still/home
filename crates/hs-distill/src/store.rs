@@ -153,6 +153,39 @@ pub trait VectorStore: Send + Sync {
     /// Total points in the collection.
     async fn points_count(&self, collection: &str) -> Result<u64, DistillError>;
 
+    /// The title currently stored on each document's points.
+    ///
+    /// A document with no title on any point maps to `None`. This is the
+    /// input to the title backfill (see [`crate::backfill`]).
+    async fn payload_titles(
+        &self,
+        collection: &str,
+    ) -> Result<std::collections::BTreeMap<String, Option<String>>, DistillError>;
+
+    /// Write a title onto every point of a document.
+    ///
+    /// A **payload** update: the vector is not touched, so this is not a
+    /// re-embed and needs no embedding model. Returns the number of
+    /// points updated.
+    async fn set_payload_title(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        title: &str,
+    ) -> Result<u64, DistillError>;
+
+    /// The storage key of each document's markdown, as stored on its points.
+    ///
+    /// The doc_id is *not* the markdown key: a book ingested from Anna's
+    /// Archive has a title-based doc_id, while its markdown is keyed by a
+    /// shard of the title. The payload carries the key itself, so the
+    /// backfill reads it from there rather than deriving it (see
+    /// [`crate::backfill`]).
+    async fn payload_markdown_paths(
+        &self,
+        collection: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, DistillError>;
+
     /// Up to `limit` distinct document ids, flagging whether more exist.
     async fn doc_ids(&self, collection: &str, limit: u64) -> Result<DocIds, DistillError>;
 

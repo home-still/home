@@ -24,6 +24,9 @@ const NAMESPACE_UUID: Uuid = Uuid::from_bytes([
     0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]);
 
+/// Points read per scroll page when walking a whole collection.
+const SCROLL_PAGE: u32 = 4_096;
+
 /// Generate a deterministic point ID from doc_id and chunk_index.
 ///
 /// Collision bound: the ID is xxh3-64 of `"{doc_id}:{chunk_index}"` fed into
@@ -610,6 +613,80 @@ impl VectorStore for QdrantStore {
         points_count(&self.client, collection).await
     }
 
+    async fn payload_titles(
+        &self,
+        collection: &str,
+    ) -> Result<std::collections::BTreeMap<String, Option<String>>, DistillError> {
+        Ok(self
+            .scan_payload(collection, &["doc_id", "title"])
+            .await?
+            .into_iter()
+            .map(|(doc_id, fields)| {
+                let title = fields
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                (doc_id, title)
+            })
+            .collect())
+    }
+
+    async fn payload_markdown_paths(
+        &self,
+        collection: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, DistillError> {
+        Ok(self
+            .scan_payload(collection, &["doc_id", "markdown_path"])
+            .await?
+            .into_iter()
+            .filter_map(|(doc_id, fields)| {
+                let path = fields.get("markdown_path")?.as_str()?.to_string();
+                Some((doc_id, path))
+            })
+            .collect())
+    }
+
+    async fn set_payload_title(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        title: &str,
+    ) -> Result<u64, DistillError> {
+        // A payload update, not an upsert: the vector is untouched, so
+        // this needs no embedding model and cannot change what the
+        // document matches. Only the title is written.
+        //
+        // `wait` is off: the update is confirmed by Qdrant once it is
+        // accepted, and waiting for the disk on every document makes a
+        // backfill of thousands of documents take hours.
+        let mut payload = std::collections::HashMap::new();
+        payload.insert("title".to_string(), qdrant::Value::from(title.to_string()));
+        let request = qdrant::SetPayloadPoints {
+            collection_name: collection.to_string(),
+            wait: Some(false),
+            payload,
+            points_selector: Some(qdrant::PointsSelector {
+                points_selector_one_of: Some(qdrant::points_selector::PointsSelectorOneOf::Filter(
+                    doc_filter(doc_id, 0),
+                )),
+            }),
+            ordering: None,
+            shard_key_selector: None,
+            key: None,
+            timeout: None,
+        };
+        let response = self
+            .client
+            .set_payload(request)
+            .await
+            .map_err(|e| qerr("Failed to set the title payload", e))?;
+        // `set_payload` reports the operation status, not a count; the
+        // number of points written is the document's chunk count, which
+        // the caller already knows.
+        let _ = response;
+        Ok(self.doc_chunks(collection, doc_id).await?)
+    }
+
     async fn doc_ids(&self, collection: &str, limit: u64) -> Result<DocIds, DistillError> {
         // Ask for one more than `limit` so "exactly limit" and "more than
         // limit" are told apart.
@@ -709,6 +786,54 @@ impl VectorStore for QdrantStore {
 /// to, and these are how this particular store implements the lexical
 /// channel.
 impl QdrantStore {
+    /// One scroll over the whole collection, reading the named payload
+    /// fields of every point.
+    ///
+    /// Returns one entry per document (the first point seen for it), with
+    /// that point's payload fields. A document's points all carry the same
+    /// values, so the first one wins and the rest are skipped.
+    async fn scan_payload(
+        &self,
+        collection: &str,
+        fields: &[&str],
+    ) -> Result<
+        std::collections::BTreeMap<String, std::collections::HashMap<String, qdrant::Value>>,
+        DistillError,
+    > {
+        let mut out = std::collections::BTreeMap::new();
+        let mut offset: Option<qdrant::PointId> = None;
+        loop {
+            let mut builder = ScrollPointsBuilder::new(collection)
+                .limit(SCROLL_PAGE)
+                .with_payload(qdrant::with_payload_selector::SelectorOptions::Include(
+                    qdrant::PayloadIncludeSelector {
+                        fields: fields.iter().map(|f| f.to_string()).collect(),
+                    },
+                ))
+                .with_vectors(false);
+            if let Some(o) = offset {
+                builder = builder.offset(o);
+            }
+            let points = self
+                .client
+                .scroll(builder)
+                .await
+                .map_err(|e| qerr("Failed to scan the collection's payload", e))?;
+            let next = points.next_page_offset;
+            for p in points.result {
+                let Some(doc_id) = p.payload.get("doc_id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                out.entry(doc_id.to_string()).or_insert(p.payload);
+            }
+            match next {
+                Some(o) => offset = Some(o),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// The chunks whose text contains every one of `terms`.
     ///
     /// `None` means the query could not be run (Qdrant refused it), which

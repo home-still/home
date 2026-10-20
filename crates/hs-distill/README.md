@@ -182,6 +182,30 @@ The client reads each `.md` file locally and sends its content to the server for
 
 Indexing is also triggered automatically: `hs distill watch-events` (`hs serve distill-watch --install` runs it as a service) indexes each markdown object when a `scribe.completed` event arrives, so newly converted markdown is embedded without a separate manual step.
 
+### Repairing missing titles
+
+A document's title is copied from its catalog row into the Qdrant payload
+at index time, and a search hit reads it back out of the payload. A
+document indexed *before* its catalog row existed was therefore indexed
+with no title, and — because the corpus is not re-indexed — it stays that
+way.
+
+```bash
+hs distill backfill-titles               # dry run: report what it would write
+hs distill backfill-titles --apply        # write it
+```
+
+The title comes from the catalog where the catalog has one, and from the
+document's own text — its first heading, or its first plain line —
+where it does not. A document whose stored title is a converter artifact
+(the OCR emitted a table or a repeated line where the title page should
+be) has it replaced by the catalog's.
+
+The write is a **payload update**: the vector is untouched, so this is
+not a re-embed and needs no GPU and no embedding model. Documents that
+neither source can title are reported by name, never given a placeholder
+that would look like a title.
+
 ### Paper abstracts
 
 ```bash
@@ -231,6 +255,9 @@ Each markdown file goes through:
 | `/distill/stream` | POST | Index with NDJSON streaming progress. `content` is required |
 | `/search` | POST | Hybrid search (dense + lexical, RRF-fused) with optional filters. `limit` defaults to 10 and is clamped to 200; `query` is at most 65,536 bytes (larger is a 400); an unparseable `year` filter is a 400. Reference-list chunks are demoted below the passages that discuss the topic (they are not dropped). The returned `score` is the fused RRF score — comparable between hits of one search, meaningless across searches |
 | `/exists/{doc_id}`, `/docs` | GET | Per-document chunk count; distinct doc ids (`limit` up to 1,000,000, larger is a 400; `truncated` flags a partial list) |
+| `/docs/titles` | GET | The title stored on each document's points (a document with none maps to `null`) — the input to `hs distill backfill-titles` |
+| `/docs/markdown-paths` | GET | The storage key of each document's markdown, as carried on its points. The doc_id is *not* that key: a book ingested from Anna's Archive has a title-based doc_id while its markdown is keyed by a shard of the title |
+| `/doc/{doc_id}/title` | POST | Write a title onto a document's points. A **payload** update: the vector is untouched, so it is not a re-embed and needs no embedding model. An empty title is a 400 |
 | `/doc/{doc_id}`, `/collection/reset`, `/scrub-interstitials` | DELETE / POST | Destructive maintenance |
 | `/collection/hnsw?collection=<name>` | POST | Enable HNSW on an existing collection with `hnsw.m`/`ef_construct`, capped at `hnsw.max_indexing_threads` (default 4). Returns immediately (Qdrant builds the graph in the background); a no-op that says so when already enabled. Never run at startup — use `hs distill hnsw enable --collection <name>` in a maintenance window |
 
