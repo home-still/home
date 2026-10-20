@@ -9,6 +9,7 @@ pub mod config;
 pub mod embed;
 pub mod error;
 pub mod event_watch;
+pub mod fusion;
 pub mod metadata;
 pub mod pipeline;
 pub mod quality;

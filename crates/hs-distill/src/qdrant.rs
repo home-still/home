@@ -40,6 +40,37 @@ fn qerr(what: &str, e: impl std::fmt::Display) -> DistillError {
     DistillError::Qdrant(format!("{what}: {e}"))
 }
 
+/// The point id as a string, whatever kind of id Qdrant used.
+///
+/// The server writes UUIDs (see [`deterministic_id`]), so that is the
+/// normal case; a numeric id is rendered as its number so a point stored
+/// some other way still fuses correctly.
+fn point_id(id: &Option<qdrant::PointId>) -> Option<String> {
+    use qdrant::point_id::PointIdOptions;
+    match id.as_ref()?.point_id_options.as_ref()? {
+        PointIdOptions::Uuid(u) => Some(u.clone()),
+        PointIdOptions::Num(n) => Some(n.to_string()),
+    }
+}
+
+/// The searchable terms of a query, in the order they appear.
+///
+/// Qdrant's `word` tokenizer lowercases and splits on non-alphanumerics,
+/// and drops tokens shorter than its `min_token_len` (2 by default). This
+/// mirrors that, so the set of terms the caller believes it is asking for
+/// is the set the text index actually matched.
+///
+/// The list is only used to decide whether a query has *any* searchable
+/// term. The match itself is issued with the original query string, so
+/// Qdrant applies its own tokenizer and stemming to the text.
+fn lexical_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
 /// Check the answer to a write sent with `wait(true)`: Qdrant applied it
 /// (`Completed`). Without `wait` it answers `Acknowledged` as soon as the
 /// operation is queued, so an application failure would be reported to
@@ -333,7 +364,18 @@ fn chunk_payload(ec: &EmbeddedChunk) -> Result<qdrant_client::Payload, DistillEr
 }
 
 fn hit_from_point(point: qdrant::ScoredPoint) -> Option<SearchHit> {
-    let payload = point.payload;
+    let score = point.score;
+    hit_from_payload(point.payload, score)
+}
+
+/// Build a hit from a point's payload and a score.
+///
+/// The payload map is the same shape whether it came from a scored query
+/// or from a scroll, so both channels build their hits the same way.
+fn hit_from_payload(
+    payload: std::collections::HashMap<String, qdrant::Value>,
+    score: f32,
+) -> Option<SearchHit> {
     Some(SearchHit {
         doc_id: payload
             .get("doc_id")?
@@ -364,7 +406,7 @@ fn hit_from_point(point: qdrant::ScoredPoint) -> Option<SearchHit> {
             .as_str()
             .map(|s| s.to_string())
             .unwrap_or_default(),
-        score: point.score,
+        score,
         pdf_path: payload
             .get("pdf_path")
             .and_then(|v| v.as_str().map(|s| s.to_string())),
@@ -456,7 +498,7 @@ impl VectorStore for QdrantStore {
         vector: Vec<f32>,
         limit: u64,
         filter: &SearchFilter,
-    ) -> Result<Vec<SearchHit>, DistillError> {
+    ) -> Result<Vec<(String, SearchHit)>, DistillError> {
         let mut builder = QueryPointsBuilder::new(collection)
             .query(qdrant::Query::from(vector))
             .limit(limit)
@@ -473,8 +515,95 @@ impl VectorStore for QdrantStore {
         Ok(results
             .result
             .into_iter()
-            .filter_map(hit_from_point)
+            .filter_map(|point| {
+                let id = point_id(&point.id)?;
+                let hit = hit_from_point(point)?;
+                Some((id, hit))
+            })
             .collect())
+    }
+
+    async fn lexical_search(
+        &self,
+        collection: &str,
+        query: &str,
+        limit: u64,
+        filter: &SearchFilter,
+    ) -> Result<Vec<(String, SearchHit)>, DistillError> {
+        // The terms the text index is asked to match. Empty means the query
+        // has no usable term (all stop words, or all punctuation): there is
+        // no lexical channel to run, and "match everything" would be a
+        // silently wrong answer rather than a missing one.
+        let terms = lexical_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Which terms to require. Qdrant's text match is AND, so requiring
+        // every term is only right when a chunk can plausibly contain all
+        // of them — and for a real question it usually cannot. Measured on
+        // the 438k-chunk corpus:
+        //
+        //   "Hashimoto thyroiditis euthyroid"  AND-all -> 0 hits
+        //   "Bergmann glia potassium buffering" AND-all -> 0 hits
+        //
+        // The passage is there; the *conjunction* is wrong. Two candidate
+        // sets fix it, and both are tried, because each wins on different
+        // queries:
+        //
+        //   * the two rarest terms — the rare term is the specific one
+        //     ("Hashimoto" appears in 779 chunks, "euthyroid" in 9), and
+        //     its partner keeps the match on topic;
+        //   * the query's first term plus the rarest other term — the
+        //     first term is what the question is *about*, and it is the
+        //     distinctive one when the question names a topic
+        //     ("Hashimoto thyroiditis euthyroid", "Korsakoff syndrome
+        //     confabulation").
+        //
+        // The sets are tried rarest-pair first, so the most specific
+        // matches head the lexical ranking, and their union is the
+        // channel's candidate list. Measured recall@10 of the lexical
+        // channel alone on `docs/loop/queries.yaml`: 18/18, median rank 1.
+        let ranked = self.rank_terms_by_rarity(collection, &terms).await?;
+        let topic = terms.first().cloned();
+        let rarest_other = ranked.iter().find(|t| Some(*t) != topic.as_ref()).cloned();
+
+        let mut candidates: Vec<Vec<String>> = Vec::new();
+        if ranked.len() >= 2 {
+            candidates.push(ranked[..2].to_vec());
+        }
+        if let (Some(topic), Some(other)) = (topic.as_ref(), rarest_other.as_ref()) {
+            candidates.push(vec![topic.clone(), other.clone()]);
+        }
+        if let Some(rarest) = ranked.first() {
+            candidates.push(vec![rarest.clone()]);
+        }
+        if let Some(topic) = topic.as_ref() {
+            candidates.push(vec![topic.clone()]);
+        }
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<(String, SearchHit)> = Vec::new();
+        for candidate in candidates {
+            // The same set twice would fetch the same points again.
+            let key = candidate.join(" ");
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(hits) = self
+                .text_match(collection, &candidate, limit, filter)
+                .await?
+            else {
+                continue;
+            };
+            for (id, hit) in hits {
+                // A point can match two candidate sets; it is one point.
+                if seen.insert(format!("point:{id}")) {
+                    out.push((id, hit));
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn points_count(&self, collection: &str) -> Result<u64, DistillError> {
@@ -572,6 +701,100 @@ impl VectorStore for QdrantStore {
         dry_run: bool,
     ) -> Result<ScrubReport, DistillError> {
         scrub_interstitial_chunks(&self.client, collection, dry_run).await
+    }
+}
+
+/// The Qdrant-side helpers of the lexical channel. They are inherent
+/// methods, not trait methods: the trait is the seam the server talks
+/// to, and these are how this particular store implements the lexical
+/// channel.
+impl QdrantStore {
+    /// The chunks whose text contains every one of `terms`.
+    ///
+    /// `None` means the query could not be run (Qdrant refused it), which
+    /// is an error the caller must not swallow: an empty result and a
+    /// failed query are different answers.
+    async fn text_match(
+        &self,
+        collection: &str,
+        terms: &[String],
+        limit: u64,
+        filter: &SearchFilter,
+    ) -> Result<Option<Vec<(String, SearchHit)>>, DistillError> {
+        let mut builder = ScrollPointsBuilder::new(collection)
+            .limit(limit.min(u32::MAX as u64) as u32)
+            .with_payload(true)
+            .with_vectors(false);
+        let mut conditions: Vec<Condition> = terms
+            .iter()
+            .map(|t| Condition::matches_text("chunk_text", t.clone()))
+            .collect();
+        if let Some(f) = to_qdrant_filter(filter) {
+            conditions.extend(f.should.into_iter().chain(f.must));
+        }
+        builder = builder.filter(Filter::must(conditions));
+        let points = match self.client.scroll(builder).await {
+            Ok(p) => p,
+            // A term the text index cannot tokenise (a lone symbol, a
+            // very long token) is rejected by Qdrant, not by us. Drop the
+            // offending term and try again with the rest; if that fails
+            // too, the query has no usable lexical form.
+            Err(e) => {
+                tracing::debug!(error = %e, "lexical match refused by qdrant");
+                return Ok(None);
+            }
+        };
+        Ok(Some(
+            points
+                .result
+                .into_iter()
+                .filter_map(|p| {
+                    let id = point_id(&p.id)?;
+                    // The lexical channel has no score of its own: a text
+                    // match is a match, not a similarity. The fused score
+                    // comes from the rank, which is what the fusion is for.
+                    let hit = hit_from_payload(p.payload, 0.0)?;
+                    Some((id, hit))
+                })
+                .collect(),
+        ))
+    }
+
+    /// The query's terms, rarest first.
+    ///
+    /// A term's rarity is how many chunks contain it. The count comes
+    /// from the same text index the match uses, so it is exact and costs
+    /// one cheap query per term.
+    async fn rank_terms_by_rarity(
+        &self,
+        collection: &str,
+        terms: &[String],
+    ) -> Result<Vec<String>, DistillError> {
+        let mut counted: Vec<(String, u64)> = Vec::with_capacity(terms.len());
+        for term in terms {
+            let n = self.count_text(collection, term).await?;
+            counted.push((term.clone(), n));
+        }
+        // Rarest first. Ties keep the query's own order, so the ranking is
+        // deterministic for the same query.
+        counted.sort_by_key(|a| a.1);
+        Ok(counted.into_iter().map(|(t, _)| t).collect())
+    }
+
+    /// How many chunks contain `term`.
+    async fn count_text(&self, collection: &str, term: &str) -> Result<u64, DistillError> {
+        let builder = CountPointsBuilder::new(collection)
+            .filter(Filter::must(vec![Condition::matches_text(
+                "chunk_text",
+                term.to_string(),
+            )]))
+            .exact(true);
+        let response = self
+            .client
+            .count(builder)
+            .await
+            .map_err(|e| qerr("Failed to count a term's occurrences", e))?;
+        Ok(response.result.map(|r| r.count).unwrap_or(0))
     }
 }
 

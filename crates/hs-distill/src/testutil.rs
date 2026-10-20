@@ -242,6 +242,11 @@ pub(crate) struct StoreState {
     pub fail_delete: bool,
     pub down: bool,
     pub canned_hits: Vec<SearchHit>,
+    /// What the lexical channel returns, and every lexical query it was
+    /// asked. A test asserts on the queries to show the channel ran (or
+    /// did not) and on the hits to show what it contributed.
+    pub canned_lexical_hits: Vec<SearchHit>,
+    pub lexical_searches: Vec<(String, u64)>,
     /// Collections whose HNSW already matches the configured parameters.
     pub hnsw_enabled: BTreeSet<String>,
     /// Every chunk ever upserted, in order.
@@ -345,10 +350,33 @@ impl VectorStore for FakeStore {
         _vector: Vec<f32>,
         limit: u64,
         filter: &SearchFilter,
-    ) -> Result<Vec<SearchHit>, DistillError> {
+    ) -> Result<Vec<(String, SearchHit)>, DistillError> {
         let mut st = self.state.lock();
         st.searches.push((collection.into(), limit, filter.clone()));
-        Ok(st.canned_hits.clone())
+        // The point id is the doc id, so a hit the fake store returns in
+        // both channels is the same point — which is what lets a test show
+        // the two channels agreeing on one document.
+        Ok(st
+            .canned_hits
+            .iter()
+            .map(|h| (h.doc_id.clone(), h.clone()))
+            .collect())
+    }
+
+    async fn lexical_search(
+        &self,
+        _collection: &str,
+        query: &str,
+        limit: u64,
+        _filter: &SearchFilter,
+    ) -> Result<Vec<(String, SearchHit)>, DistillError> {
+        let mut st = self.state.lock();
+        st.lexical_searches.push((query.to_string(), limit));
+        Ok(st
+            .canned_lexical_hits
+            .iter()
+            .map(|h| (h.doc_id.clone(), h.clone()))
+            .collect())
     }
 
     async fn points_count(&self, collection: &str) -> Result<u64, DistillError> {

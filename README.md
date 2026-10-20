@@ -154,6 +154,20 @@ With multiple servers configured, PDFs are load-balanced across them based on se
 
 Chunk, embed, and index converted markdown into a Qdrant vector database for semantic search.
 
+Search runs **two channels and fuses them**:
+
+- **Dense** — a bge-m3 vector per chunk, cosine similarity. Finds passages
+  that *mean* what the query means.
+- **Lexical** — a text index over the chunk text. Finds passages that *say*
+  the query's words.
+
+The two are combined with Reciprocal Rank Fusion, so a passage that only one
+channel likes is still ranked. This matters for specific queries: a dense
+embedder matches "thyroid" generically and loses "Hashimoto", and the
+lexical channel puts the passage about Hashimoto's disease at the top. See
+[docs/loop/runs/2026-10-20-01/research.md](docs/loop/runs/2026-10-20-01/research.md)
+for the measurement.
+
 ### Setup
 
 ```sh

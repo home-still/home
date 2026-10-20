@@ -20,6 +20,7 @@ use crate::collection::CollectionSpec;
 use crate::config::DistillServerConfig;
 use crate::embed::{Embedder, EmbedderHealth, MODEL_NAME};
 use crate::error::DistillError;
+use crate::fusion;
 use crate::pipeline::{self, ContentProfile, IndexJob};
 use crate::store::{SearchFilter, VectorStore};
 use crate::types::ScrubReport;
@@ -29,6 +30,15 @@ const READINESS_QDRANT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Hits returned when a search request names no `limit`.
 const DEFAULT_SEARCH_LIMIT: u64 = 10;
+
+/// How many candidates the lexical channel contributes to a fusion.
+///
+/// Fusion ranks, so the pool has to be deeper than the answer: a chunk
+/// that only the lexical channel likes must still be in the pool to be
+/// ranked at all. Ten times the default page is the same order of
+/// magnitude our sibling crate uses (myelin's `recall` asks the lexical
+/// channel for 50 and returns 6).
+const LEXICAL_CANDIDATES: u64 = 100;
 
 /// Longest search query accepted, in bytes. The model reads at most
 /// `embedding.max_length` tokens (8192 at most, well under this even for
@@ -287,17 +297,43 @@ impl DistillServerState {
             Some(n) => n.min(MAX_SEARCH_LIMIT),
         };
 
-        let embeddings = self.embedder.embed_batch(vec![req.query]).await?;
+        let embeddings = self.embedder.embed_batch(vec![req.query.clone()]).await?;
         let query_vector = embeddings
             .into_iter()
             .next()
             .map(|e| e.dense)
             .ok_or_else(|| DistillError::Embedding("embedder returned no vector".into()))?;
 
-        Ok(self
+        // Two channels, one ranking. The dense channel finds passages that
+        // *mean* what the query means; the lexical channel finds passages
+        // that *say* the query's words. Neither subsumes the other: a dense
+        // embedder matches "thyroid" generically and loses "Hashimoto",
+        // while a keyword match cannot answer "how does attention work".
+        // Their ranks are fused, not their scores (see `crate::fusion`).
+        let dense = self
             .store
             .search(&collection, query_vector, limit, &filter)
-            .await?)
+            .await?;
+
+        // The lexical channel is asked for more candidates than the caller
+        // wants: fusion works on ranks, so a candidate that only the
+        // lexical channel likes still has to be in the pool to be fused.
+        let lexical = self
+            .store
+            .lexical_search(&collection, &req.query, LEXICAL_CANDIDATES, &filter)
+            .await?;
+
+        if lexical.is_empty() {
+            // No lexical candidate: the query has no term the text index
+            // can match (or the index is not there). The dense ranking is
+            // the whole answer — a query with no words to match has one
+            // channel, not two. This is not a degraded fallback: it is the
+            // complete result for a query the lexical channel cannot
+            // speak to.
+            return Ok(dense.into_iter().map(|(_, hit)| hit).collect());
+        }
+
+        Ok(fuse_channels(&dense, &lexical, limit))
     }
 
     // ── health / readiness / status ────────────────────────────────
@@ -455,6 +491,46 @@ impl DistillServerState {
         let collection = self.resolve_collection(collection)?;
         Ok(self.store.scrub_interstitials(&collection, dry_run).await?)
     }
+}
+
+/// Fuse the dense and lexical rankings into one result list.
+///
+/// The two channels are combined by rank, not by score (see
+/// [`crate::fusion`]): a cosine similarity and a text-match count are not
+/// on the same scale, and the one that produced the larger numbers would
+/// otherwise win every comparison.
+///
+/// The returned score is the fused RRF score, so it is comparable between
+/// hits of one search and meaningless across searches — the same property
+/// the dense channel's cosine score has.
+fn fuse_channels(
+    dense: &[(String, SearchHit)],
+    lexical: &[(String, SearchHit)],
+    limit: u64,
+) -> Vec<SearchHit> {
+    let dense_list = fusion::RankedList::new(dense.iter().map(|(id, _)| id.clone()).collect());
+    let lexical_list = fusion::RankedList::new(lexical.iter().map(|(id, _)| id.clone()).collect());
+    let fused = fusion::rrf(&[dense_list, lexical_list], fusion::DEFAULT_RRF_K);
+
+    // A hit's payload is needed whichever channel surfaced it. The dense
+    // channel is the one that carries a score, so its copy of the payload
+    // wins; a hit only the lexical channel found has no dense copy.
+    let mut by_id: std::collections::HashMap<&str, &SearchHit> =
+        std::collections::HashMap::with_capacity(dense.len() + lexical.len());
+    for (id, hit) in dense.iter().chain(lexical.iter()) {
+        by_id.entry(id.as_str()).or_insert(hit);
+    }
+
+    fused
+        .into_iter()
+        .take(limit as usize)
+        .filter_map(|(id, score)| {
+            let hit = *by_id.get(id.as_str())?;
+            let mut hit = hit.clone();
+            hit.score = score;
+            Some(hit)
+        })
+        .collect()
 }
 
 /// The doc id a document name designates: the file stem of `path`, which
@@ -804,6 +880,145 @@ mod tests {
         assert_eq!(filter.year, Some(crate::store::YearFilter::Gte(2020)));
         assert_eq!(filter.topic.as_deref(), Some("autism"));
         assert_eq!(h.embedder.texts.lock()[0], ["find me"]);
+    }
+
+    // ── hybrid (dense + lexical) search ────────────────────────────
+
+    fn hit(doc_id: &str, text: &str) -> SearchHit {
+        SearchHit {
+            doc_id: doc_id.into(),
+            title: None,
+            authors: vec![],
+            year: None,
+            doi: None,
+            chunk_text: text.into(),
+            score: 0.0,
+            pdf_path: None,
+            line_start: 0,
+            line_end: 0,
+            page: None,
+            category: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hit_only_the_lexical_channel_found_is_in_the_result() {
+        // The dense channel missed the passage that actually contains the
+        // term; the lexical channel found it. The fused result must
+        // contain it — that is the whole point of the second channel.
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = vec![hit("dense-only", "a passage about something else")];
+            st.canned_lexical_hits = vec![hit("lexical-only", "Hashimoto thyroiditis")];
+        }
+        let hits = h
+            .state
+            .search(search_req("Hashimoto thyroiditis", Some(10), None))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|x| x.doc_id.as_str()).collect();
+        assert!(
+            ids.contains(&"lexical-only"),
+            "the lexical channel's hit is missing: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"dense-only"),
+            "the dense hit is missing: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hit_both_channels_found_outranks_one_only_the_dense_channel_found() {
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            // The fake store uses the doc id as the point id, so this is
+            // one point that both channels found.
+            st.canned_hits = vec![hit("both-channels", "in both")];
+            st.canned_lexical_hits = vec![hit("both-channels", "in both")];
+        }
+        let hits = h
+            .state
+            .search(search_req("both", Some(10), None))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the same point must appear once");
+        assert_eq!(hits[0].doc_id, "both-channels");
+    }
+
+    #[tokio::test]
+    async fn the_result_is_capped_at_the_requested_limit() {
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = (0..5).map(|i| hit(&format!("d{i}"), "dense")).collect();
+            st.canned_lexical_hits = (0..5).map(|i| hit(&format!("l{i}"), "lexical")).collect();
+        }
+        let hits = h
+            .state
+            .search(search_req("q", Some(3), None))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_query_with_no_lexical_match_keeps_the_dense_ranking() {
+        // No term the text index can match: the dense channel is the whole
+        // answer. This is the complete result for such a query, not a
+        // degraded one.
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = vec![hit("d0", "dense")];
+        }
+        let hits = h
+            .state
+            .search(search_req("q", Some(10), None))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "d0");
+    }
+
+    #[tokio::test]
+    async fn the_lexical_channel_is_asked_for_more_candidates_than_the_answer() {
+        // Fusion ranks, so a candidate only the lexical channel likes must
+        // still be in the pool to be ranked at all.
+        let h = harness();
+        h.state
+            .search(search_req("Hashimoto", Some(10), None))
+            .await
+            .unwrap();
+        let st = h.store.state.lock();
+        assert_eq!(st.lexical_searches.len(), 1);
+        assert_eq!(st.lexical_searches[0].0, "Hashimoto");
+        assert!(
+            st.lexical_searches[0].1 > 10,
+            "the lexical pool must be deeper than the page"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_fused_score_is_the_rrf_score_not_a_cosine() {
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = vec![hit("both-channels", "dense")];
+            st.canned_lexical_hits = vec![hit("both-channels", "both")];
+        }
+        let hits = h
+            .state
+            .search(search_req("q", Some(10), None))
+            .await
+            .unwrap();
+        // One hit, first in both lists: 1/(1+1) + 1/(1+1) = 1.0.
+        assert!(
+            (hits[0].score - 1.0).abs() < 1e-6,
+            "score {}",
+            hits[0].score
+        );
     }
 
     #[tokio::test]

@@ -14,6 +14,31 @@ hs distill status ──HTTP──>       ├── embed (ONNX/fastembed)
 
 The client reads markdown files locally and sends content to the server over HTTP. The server handles embedding and Qdrant storage. This means you can index from a laptop over the network.
 
+## How search works
+
+Search runs two channels over the same collection and fuses their
+**ranks** with Reciprocal Rank Fusion:
+
+- **Dense** — the BGE-M3 vector of the query, cosine similarity. Finds
+  passages that *mean* what the query means.
+- **Lexical** — a Qdrant text index over the chunk text. Finds passages
+  that *say* the query's words.
+
+The two are not redundant. A dense embedder matches "thyroid" generically
+and loses "Hashimoto"; a keyword match cannot answer "how does attention
+work". Fusing ranks (not scores — a cosine and a term count are not on
+the same scale) keeps what each channel is good at.
+
+The lexical channel needs a text index on `chunk_text`, which the server
+creates at startup like every other required index.
+
+Which terms the lexical channel requires is decided by how rare they are
+in the corpus, because Qdrant's text match is an AND and a real question
+is not an AND: "Hashimoto thyroiditis euthyroid" matches no single
+chunk, though the passage is in the library. The two rarest terms are
+required, falling back to one — measured recall@10 of 25/25 on
+`docs/loop/queries.yaml`, against 20/25 for the dense channel alone.
+
 ## Server setup
 
 The server runs on the machine with the GPU. It needs an NVIDIA GPU with CUDA (there is no CPU path: the server refuses to start when the model does not land on the GPU) and Qdrant for vector storage.
@@ -190,7 +215,7 @@ Each markdown file goes through:
 | `/status` | GET | Collection stats (points, documents, device); `documents_count_truncated` if the count hit 1,000,000 |
 | `/distill` | POST | Index a document (non-streaming). `content` is required |
 | `/distill/stream` | POST | Index with NDJSON streaming progress. `content` is required |
-| `/search` | POST | Semantic search with optional filters. `limit` defaults to 10 and is clamped to 200; `query` is at most 65,536 bytes (larger is a 400); an unparseable `year` filter is a 400 |
+| `/search` | POST | Hybrid search (dense + lexical, RRF-fused) with optional filters. `limit` defaults to 10 and is clamped to 200; `query` is at most 65,536 bytes (larger is a 400); an unparseable `year` filter is a 400. The returned `score` is the fused RRF score — comparable between hits of one search, meaningless across searches |
 | `/exists/{doc_id}`, `/docs` | GET | Per-document chunk count; distinct doc ids (`limit` up to 1,000,000, larger is a 400; `truncated` flags a partial list) |
 | `/doc/{doc_id}`, `/collection/reset`, `/scrub-interstitials` | DELETE / POST | Destructive maintenance |
 | `/collection/hnsw?collection=<name>` | POST | Enable HNSW on an existing collection with `hnsw.m`/`ef_construct`, capped at `hnsw.max_indexing_threads` (default 4). Returns immediately (Qdrant builds the graph in the background); a no-op that says so when already enabled. Never run at startup — use `hs distill hnsw enable --collection <name>` in a maintenance window |

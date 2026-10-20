@@ -121,13 +121,34 @@ pub trait VectorStore: Send + Sync {
     /// Number of points stored for `doc_id`.
     async fn doc_chunks(&self, collection: &str, doc_id: &str) -> Result<u64, DistillError>;
 
+    /// The dense channel: nearest neighbours by vector similarity.
+    ///
+    /// Returns the hits with the store's point id, so the caller can fuse
+    /// this ranking with another channel's (see [`crate::fusion`]).
     async fn search(
         &self,
         collection: &str,
         vector: Vec<f32>,
         limit: u64,
         filter: &SearchFilter,
-    ) -> Result<Vec<SearchHit>, DistillError>;
+    ) -> Result<Vec<(String, SearchHit)>, DistillError>;
+
+    /// The lexical channel: chunks whose text contains the query's terms.
+    ///
+    /// Returns the matching points, best first, as `(point_id, hit)`. The
+    /// ordering is the store's own relevance order for the text match; the
+    /// caller fuses it with the dense ranking (see [`crate::fusion`]).
+    ///
+    /// An empty `query` yields an empty list without touching the store: a
+    /// query with no usable terms has no lexical candidates, and inventing
+    /// "all points" would be a silent, wrong answer.
+    async fn lexical_search(
+        &self,
+        collection: &str,
+        query: &str,
+        limit: u64,
+        filter: &SearchFilter,
+    ) -> Result<Vec<(String, SearchHit)>, DistillError>;
 
     /// Total points in the collection.
     async fn points_count(&self, collection: &str) -> Result<u64, DistillError>;

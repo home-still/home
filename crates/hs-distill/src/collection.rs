@@ -26,7 +26,7 @@ pub enum FieldKind {
 /// condition against the few points the first selects, so no index is
 /// needed, and building a new one over a multi-million-point collection
 /// inside a service restart would run past the startup timeout.
-pub const REQUIRED_INDEXES: [(&str, FieldKind); 11] = [
+pub const REQUIRED_INDEXES: [(&str, FieldKind); 12] = [
     ("doc_id", FieldKind::Keyword),
     ("authors", FieldKind::Keyword),
     ("topics", FieldKind::Keyword),
@@ -38,6 +38,10 @@ pub const REQUIRED_INDEXES: [(&str, FieldKind); 11] = [
     ("line_start", FieldKind::Integer),
     ("page", FieldKind::Integer),
     ("title", FieldKind::Text),
+    // The lexical channel's index. Without it the text match is a full
+    // scan of every chunk, which is far too slow to sit in a request path
+    // (measured: 8 ms with the index on a 438k-chunk collection).
+    ("chunk_text", FieldKind::Text),
 ];
 
 /// The schema a collection is created with and checked against.

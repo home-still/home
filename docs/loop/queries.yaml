@@ -1,0 +1,153 @@
+# Fixed evaluation query set for home-still retrieval.
+#
+# Every query names the passage it should find. `expect` is a substring of
+# the passage (case-insensitive). A query passes when the expected passage
+# appears in the top `limit` results.
+#
+# These are deliberately mixed:
+#   * `concept`  — meaning-based, where a dense embedder should win.
+#   * `literal`  — a specific technical term, where a keyword channel
+#                  should win and a pure dense embedder often misses.
+#   * `named`    — a proper noun / identifier, where dense retrieval is
+#                  known to be weakest.
+#
+# The expectations are grounded in the corpus: every `expect` term was
+# checked to occur in the chunk the query should reach. A term that only
+# appears in a reference list (an author surname, say) is NOT a valid
+# expectation, because the passage a user wants is then not in the
+# library at all and no retrieval method can find it.
+#
+# The `literal` and `named` groups are the ones that expose the gap
+# between home-still's dense-only search and a hybrid (dense + keyword)
+# one.
+
+queries:
+  # ── concept: dense retrieval should already handle these ─────────
+  - id: q01
+    group: concept
+    query: "how does a transformer attention mechanism work"
+    expect: "attention"
+
+  - id: q02
+    group: concept
+    query: "reinforcement learning policy optimization"
+    expect: "reinforcement learning"
+
+  - id: q03
+    group: concept
+    query: "risk factors for falls in elderly people"
+    expect: "fall"
+
+  - id: q04
+    group: concept
+    query: "bipolar disorder quality of life outcomes"
+    expect: "bipolar"
+
+  - id: q05
+    group: concept
+    query: "exercise and immune system function"
+    expect: "immune"
+
+  - id: q06
+    group: concept
+    query: "effect of ultraviolet radiation on Earth's climate"
+    expect: "climate"
+
+  - id: q07
+    group: concept
+    query: "lithium treatment for catatonia"
+    expect: "catatonia"
+
+  - id: q08
+    group: concept
+    query: "autism spectrum disorder heritability"
+    expect: "autism"
+
+  # ── literal: a specific technical term ───────────────────────────
+  # Each of these terms occurs in a document the corpus actually holds:
+  # the passage exists, so a keyword channel can reach it.
+  - id: q09
+    group: literal
+    query: "proximal humeral epiphyseal ossification"
+    expect: "epiphyseal"
+
+  - id: q10
+    group: literal
+    query: "juvenile idiopathic arthritis uveitis"
+    expect: "uveitis"
+
+  - id: q11
+    group: literal
+    query: "Korsakoff syndrome confabulation"
+    expect: "Korsakoff"
+
+  - id: q12
+    group: literal
+    query: "cerebellar Bergmann glia potassium buffering"
+    expect: "Bergmann"
+
+  - id: q13
+    group: literal
+    query: "gut microbiota composition and diversity"
+    expect: "microbiota"
+
+  - id: q14
+    group: literal
+    query: "hippocampal neurogenesis and adult memory"
+    expect: "hippocampus"
+
+  - id: q15
+    group: literal
+    query: "oxytocin social behaviour and vasopressin"
+    expect: "oxytocin"
+
+  - id: q16
+    group: literal
+    query: "cortisol stress response and the hypothalamic pituitary adrenal axis"
+    expect: "cortisol"
+
+  - id: q17
+    group: literal
+    query: "dopaminergic pathways in Parkinson disease"
+    expect: "Parkinson"
+
+  - id: q18
+    group: literal
+    query: "Turing test computation and machine intelligence"
+    expect: "Turing"
+
+  # ── named: a proper noun, dense retrieval's weakest case ─────────
+  - id: q19
+    group: named
+    query: "Kandel principles of neural science"
+    expect: "Kandel"
+
+  - id: q20
+    group: named
+    query: "Dawson and Krebs tricarboxylic acid cycle"
+    expect: "Dawson"
+
+  - id: q21
+    group: named
+    query: "Waddington epigenetic landscape"
+    expect: "Waddington"
+
+  - id: q22
+    group: named
+    query: "Gazzaniga split brain"
+    expect: "Gazzaniga"
+
+  - id: q23
+    group: named
+    query: "Einstein general relativity and the equivalence principle"
+    expect: "Einstein"
+
+  - id: q24
+    group: named
+    query: "Darwin natural selection and the origin of species"
+    expect: "Darwin"
+
+  - id: q25
+    group: named
+    query: "Lorenz chaos theory and the butterfly effect"
+    expect: "Lorenz"
