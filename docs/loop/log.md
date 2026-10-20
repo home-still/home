@@ -70,7 +70,8 @@ retrieval channel and does not alter any wire format, command surface,
 collection schema, or stored data; nothing existing is invalidated and
 no re-embed is needed.
 
-**Commit.** see `git log` for `v0.0.1-rc.365`.
+**Commit.** `8423777` — "feat(distill): hybrid dense + keyword retrieval,
+fused with RRF".
 
 **Also in this iteration:**
 
