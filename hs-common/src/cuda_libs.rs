@@ -60,6 +60,13 @@ pub fn ort_cuda_libs_dir() -> Option<PathBuf> {
     None
 }
 
+/// The separator between the entries of a loader path.
+///
+/// `:` on Unix, `;` on Windows. Getting this wrong is not a cosmetic
+/// problem: a Windows loader path joined with `:` is one malformed
+/// entry, and every library in it goes unfound.
+const PATH_SEPARATOR: &str = if cfg!(windows) { ";" } else { ":" };
+
 /// The loader path a CUDA-backed service needs.
 ///
 /// The result is the caller's existing `LD_LIBRARY_PATH` with the
@@ -74,7 +81,7 @@ pub fn cuda_ld_library_path(existing: &str) -> String {
 
     // Whatever the caller already had comes first: it is the caller's
     // own configuration and this module only adds to it.
-    for entry in existing.split(':') {
+    for entry in existing.split(PATH_SEPARATOR) {
         if !entry.is_empty() {
             parts.push(entry.to_string());
         }
@@ -96,7 +103,7 @@ pub fn cuda_ld_library_path(existing: &str) -> String {
         }
     }
 
-    parts.join(":")
+    parts.join(PATH_SEPARATOR)
 }
 
 /// Add a directory to the path, unless it is already there.
@@ -132,9 +139,18 @@ mod tests {
     fn the_path_has_no_repeated_directory() {
         let path = cuda_ld_library_path("/usr/local/lib");
         let mut seen = std::collections::HashSet::new();
-        for part in path.split(':') {
+        for part in path.split(PATH_SEPARATOR) {
             assert!(seen.insert(part.to_string()), "repeated {part} in {path}");
         }
+    }
+
+    #[test]
+    fn the_path_is_joined_with_the_platform_separator() {
+        // A Windows loader path joined with `:` is one malformed entry,
+        // and every library in it goes unfound.
+        let path = cuda_ld_library_path("/one");
+        assert!(path.contains(if cfg!(windows) { ";" } else { ":" }), "{path}");
+        assert!(path.starts_with("/one"), "{path}");
     }
 
     #[test]
