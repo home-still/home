@@ -103,14 +103,32 @@ fused with RRF".
    `needs-decision/async-nats-missed-idle-heartbeat.md`). Recommended
    option A: catch `MissingHeartbeat` and recreate the pull stream
    instead of exiting.
-4. **Fold `myelin` in.** `myelin-core` has hybrid retrieval (dense +
-   BM25 via Qdrant sparse vectors), RRF, and a reranker — all built
-   for this project and currently a separate crate with its own
-   service topology. It is worth deciding whether home-still depends on
-   `myelin-core` (and drops its own fusion) or whether the two stay
-   separate products. The BM25 channel there is sparse vectors, which
-   would need a re-embed of the corpus — the reason this iteration used
-   a payload text index instead.
+4. **Fold `myelin` in — decide, then do it in slices.**
+   `myelin-core` (github.com/home-still/myelin, MIT, "Copyright (c) 2026
+   Home Still") already has hybrid retrieval, RRF and a reranker, and it
+   is *ours*. Measured on 2026-10-20: it is a ~20k-line crate with 46
+   source files that depends on `sqlx`, `petgraph` and `schemars` —
+   dependencies home-still does not have and, for a document library,
+   mostly does not want. Two things it has that home-still does not:
+   a BM25 channel implemented as Qdrant **sparse vectors** (better than
+   this iteration's payload text index, but it needs every point to
+   carry a sparse vector — a full re-embed of 438,863 chunks), and a
+   cross-encoder reranker as a separate service.
+
+   The decision to make: does home-still depend on `myelin-core` (and
+   drop its own fusion), or do the two stay separate products that share
+   techniques and measurements? The honest answer today is **the
+   latter**, for one concrete reason: `myelin-core`'s retrieval is built
+   for agent memory (multi-tenant, scoped, token-budgeted, with a
+   graph channel and a write path), while home-still's is a document
+   library (single-tenant, page-cited, read-mostly). Pulling in a
+   memory engine to serve a book corpus is a step backwards.
+
+   The parts worth taking, in order of value per unit of coupling:
+   the cross-encoder rerank stage (item 2 above) as a *process* to copy,
+   and `myelin_core::pipeline::fuse::rrf` as ~15 lines of code if a
+   shared crate ever makes sense. Both are cheap because both are
+   small; the crate as a whole is not.
 5. **Score normalisation across the two channels.** The fused score is
    an RRF score, so it is comparable between hits of one search and
    meaningless across searches. The CLI prints it as `[score: 0.500]`,
