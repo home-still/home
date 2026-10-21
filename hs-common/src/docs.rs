@@ -1006,7 +1006,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// The collection is part of the signature, like the page.
     ///
     /// The corpus holds more than one store — the academic papers and
@@ -1088,6 +1087,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn page_zero_is_not_a_page() {
         // The pages are 1-based, so page 0 names no page.
         let k = key();
