@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use super::pool::{is_idle, SlotError, SlotPool};
-use super::{check_dimension, embed_in_batches, ComputeDevice, Embedder, EmbedderHealth};
+use super::{
+    check_dimension, embed_in_batches, is_out_of_memory, ComputeDevice, Embedder, EmbedderHealth,
+};
 use crate::adaptive_batch::{AdaptiveBatchController, AdaptiveConfig};
 use crate::config::{max_batch_rows, EmbeddingConfig};
 use crate::error::DistillError;
@@ -179,6 +181,69 @@ fn require_vram(floor_mb: u64) -> Result<(), DistillError> {
     Ok(())
 }
 
+/// The VRAM one row of a forward pass needs *beyond* the resident model:
+/// the attention scratch buffer.
+///
+/// The scratch is `rows × sequence² × heads × 4 bytes` — quadratic in
+/// the sequence length, linear in the rows. At the server's 20-row
+/// batch and 1280-token window it is 2.10 GB, and that is exactly the
+/// size the ONNX arena names when it fails to allocate
+/// (`2097152000`). A gate that only checks that the *model* fits
+/// (4.4 GB resident) passes on a card that cannot hold the *batch*.
+fn row_scratch_bytes(max_length: usize) -> u64 {
+    // bge-m3: 16 attention heads, fp32 scores.
+    const HEADS: u64 = 16;
+    const BYTES_PER_FP32: u64 = 4;
+    let len = max_length.max(1) as u64;
+    len * len * HEADS * BYTES_PER_FP32
+}
+
+/// The largest batch the card can hold right now.
+///
+/// `None` free-VRAM means no NVIDIA GPU is visible — no cap to apply,
+/// which keeps this a no-op on non-CUDA hosts.
+///
+/// The resident model is already on the card, so the free VRAM is what
+/// the *batch* has to work with. A card shared with another tenant can
+/// still hold a smaller batch, and the answer is to use less of the
+/// card rather than to fail the document.
+fn max_batch_that_fits(max_length: usize) -> Option<usize> {
+    let free = hs_common::gpu::free_vram_mb()?;
+    let per_row = row_scratch_bytes(max_length);
+    if per_row == 0 {
+        return None;
+    }
+    let free_bytes = free.saturating_mul(1024 * 1024);
+    Some((free_bytes / per_row).max(1) as usize)
+}
+
+/// The batch to use: the configured one, capped by what the card holds.
+///
+/// The cap is applied *before* the attempt, so a shared card produces a
+/// smaller batch rather than an arena failure. A card that cannot hold
+/// even one row is a different thing: there is no batch to shrink to,
+/// so the error names the holders and the operator can act.
+fn fit_batch_to_vram(configured: usize, max_length: usize) -> Result<usize, DistillError> {
+    let Some(cap) = max_batch_that_fits(max_length) else {
+        return Ok(configured);
+    };
+    if cap < configured {
+        tracing::info!(
+            configured,
+            cap,
+            "the card cannot hold the configured batch; using a smaller one for this pass"
+        );
+    }
+    if cap == 0 {
+        return Err(DistillError::Embedding(format!(
+            "gpu busy: the card cannot hold even one row of the embedder's attention \
+             scratch; holders: {}",
+            hs_common::gpu::compute_apps_summary()
+        )));
+    }
+    Ok(configured.min(cap))
+}
+
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -299,6 +364,11 @@ impl Embedder for OnnxEmbedder {
                     Ok(m)
                 },
                 |model| {
+                    // The batch is capped by what the card can hold
+                    // *before* the attempt, so a shared card produces a
+                    // smaller batch rather than an arena failure inside
+                    // ONNX.
+                    let batch_size = fit_batch_to_vram(batch_size, max_length)?;
                     embed_in_batches(&texts, batch_size, |rows| {
                         model
                             .embed(rows, None)
@@ -311,7 +381,17 @@ impl Embedder for OnnxEmbedder {
 
         let vectors = match joined {
             Ok(Ok(vectors)) => vectors,
-            Ok(Err(SlotError::Failed(e))) => return Err(e),
+            Ok(Err(SlotError::Failed(e))) => {
+                // A batch the accelerator could not allocate teaches the
+                // controller to use a smaller one. Without this the
+                // controller stays at the size that fails, and every
+                // redelivery of the same document fails identically —
+                // measured on `big` 2026-10-21.
+                if is_out_of_memory(&e) {
+                    self.batch_ctrl.observe_failure();
+                }
+                return Err(e);
+            }
             Ok(Err(SlotError::Poisoned { slot })) => exit_on_unusable_embedder(&format!(
                 "model slot {slot} poisoned by an earlier panic"
             )),

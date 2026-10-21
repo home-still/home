@@ -1139,3 +1139,172 @@ rc.374's change.
    option A: catch `MissingHeartbeat` and recreate the pull stream
    instead of exiting. Not ours to make — it is a change to a vendored
    crate.
+## 2026-10-21-08 — the indexer that cannot index a document
+
+**Change.** The distill indexer was **stuck**. On `big`, the event
+watcher was in a 30-second backoff loop, redelivering the same three
+documents over and over, and they never indexed. The server's log named
+the cause exactly: `Failed to allocate memory for requested buffer of
+size 2097152000`.
+
+That number is not a mystery — it is the **attention scratch buffer**
+of one forward pass, `rows × sequence² × heads × 4 bytes`:
+
+```
+20 rows × 1280² × 16 heads × 4 bytes = 2,097,152,000 bytes = 2.10 GB
+```
+
+precisely the `2097152000` in the log (the 1.15 GB and 1.47 GB
+allocations are the same formula at 14 and 18 rows). The server asked
+the shared card for a 2.10 GB block and could not have it.
+
+Three separate defects each made the failure permanent:
+
+1. **The VRAM gate measured the wrong thing.** `require_vram` runs
+   *before the model is loaded* and checks that the **model** fits
+   (5000 MB, "bge-m3 needs ~4.4 GB resident"). The **batch's** 2.10 GB
+   scratch is allocated later, during the forward pass, at a moment the
+   gate has already passed.
+2. **The adaptive batch controller learned from successes only.**
+   `observe()` is called on the success path, so a batch that fails to
+   allocate taught it nothing — it stayed at the size that failed, and
+   every redelivery failed identically.
+3. **The watcher redelivered forever.** A 500 is classified
+   *transient* (only an invalid key or a 400/413/422 is permanent), so
+   the event was NAKed with a 30-second backoff and asked for again,
+   indefinitely.
+
+**Why this ranked first.** It beat the runner-up — **cross-encoder
+reranking**, the backlog's first item, whose GPU blocker has now
+cleared — on the user's own ranking of harm. A cross-encoder
+**reorders** results; measured on the fixed query set it moved the
+expected passage's rank on **4 queries better and 3 worse**, for a
+**5× latency increase** (162 ms → 776 ms median) and a new GPU
+service, a new model and a new failure mode. The indexer failure means
+a document is **not in the library at all**: the user asks a question
+about it and gets nothing. That is a tier above a reordering. The
+cross-encoder's own prior art predicted the null — our sibling crate's
+M37 measured **+0.78 points, 95 % CI [−3.14, +4.71]** — and this
+iteration measured the same null on home-still's own corpus.
+
+**The change, in three parts.**
+
+* **The embedder retries at a smaller batch.** An ONNX allocation
+  failure halves the batch and retries, down to a floor of one row. The
+  descent is *per chunk*, so a batch that dropped to 3 descends again
+  for its remainder. The retry is safe because the caller upserts by
+  `(doc_id, chunk_index)`: a row embedded twice lands on the same key
+  with the same vector.
+* **The controller learns from failures.** `observe_failure()` steps
+  the batch down and clears a "converged" verdict — the missing half
+  of the controller.
+* **The batch is sized to the card, before the attempt.** The free
+  VRAM is divided by the scratch one row needs, and the batch is capped
+  by the result, so a shared card produces a smaller batch rather than
+  an arena failure.
+
+**The evidence.** The cap is **live and visible in the server's log** —
+the new server, run against the live corpus with the card deliberately
+crowded by three extra `llama-server` processes, logged:
+
+```
+INFO the card cannot hold the configured batch; using a smaller one for
+     this pass configured=20 cap=17
+INFO … configured=20 cap=2
+INFO … configured=20 cap=5
+INFO … configured=20 cap=11
+```
+
+and the three documents the watcher was redelivering — fetched from S3
+the way the watcher fetches them, and indexed with the same `/distill`
+request — **all indexed**, with the card at 212 MB free:
+
+| document | the live server (rc.373) | the new server (rc.376) |
+|---|---|---|
+| `10.1136_amiajnl-2011-000089` | OK in 24,823 ms | OK in 20,294 ms |
+| `10.1016_j.brat.2014.06.007` | OK in 21,611 ms | OK in 10,770 ms |
+| `10.51380_gujr-40-04-10` | OK in 11,172 ms | OK in 12,509 ms |
+
+**The honest statement of what was measured.** The cap is observed
+working in the live server's log. The retry is covered by unit tests
+against the real `embed_in_batches`. The live failures were
+*intermittent* — 24 in the watcher's journal over the day, on 8
+distinct stems — and could not be forced on demand with a synthetic
+tenant, because ONNX's arena grows to fit rather than failing. What is
+not in doubt is the arithmetic: the allocation the arena names is
+exactly the attention scratch of the configured batch, and the new code
+computes that number and sizes the batch to it before the attempt.
+
+**One finding that changed the design.** The free VRAM is *not* what
+the arena needs: at 12.6 GB free, 126 rows would fit by the free-VRAM
+arithmetic, and yet the arena could not get a **contiguous** 2.1 GB
+block, because the card was fragmented by three other processes. So a
+free-VRAM cap alone would **not** have prevented these failures. The
+cap is the cheap, preventive half; the **retry** is the half that
+covers the residual, and it is the half that must be there.
+
+**The tests.** Five for the retry, in
+`crates/hs-distill/src/embed/mod.rs`: the ONNX message is recognised
+(and a failure that is *not* an allocation failure is not, so a
+malformed input is not hidden behind a batch-size story); the batch
+halves and completes; **the order is preserved and every row is
+embedded exactly once** (the invariant that matters — a shrunk batch
+must not reorder or drop a row); a non-allocation failure is not
+retried; and at the floor the error is the real one. Three for the
+controller, in `crates/hs-distill/src/adaptive_batch.rs`: a failure
+steps the batch down; a failure at the smallest candidate stays there
+and says so; and a failure clears a "converged" controller.
+
+**Research.**
+`docs/loop/runs/2026-10-21-08/research.md` — the problem measured,
+the arithmetic, the three defects, the corpus's prior art (the
+idempotence and "just crash" passages from *Designing Data-Intensive
+Applications* and *A Philosophy of Software Design*), and the technique
+chosen. `docs/loop/runs/2026-10-21-08/eval.md` — the before/after, the
+end-to-end evidence, the timings, and the tests.
+
+**Version.** `v0.0.1-rc.376` — a patch-level bump. It changes how the
+embedder sizes a batch and what it does when the accelerator refuses
+one. It touches no stored data, no collection schema, no search
+behaviour and no wire format.
+
+**Not deployed.** The live services were not upgraded: this iteration's
+rules say not to run `hs upgrade` on live services. The new binary was
+run on an alternate port against the same Qdrant and the same CUDA
+device, with the live service on `:7434` untouched.
+
+
+### Top 5 remaining items
+
+1. **Cross-encoder reranking.** The GPU blocker has cleared, but the
+   reranker is **not in home-still at all**: no code path, no client, no
+   service, no endpoint. Measured on this corpus, 2026-10-21: it moved
+   the expected passage's rank on **4 queries better and 3 worse** for
+   a **5× latency increase** (162 → 776 ms median) — and the sibling
+   crate's own M37 measured the same null (+0.78 points, CI
+   [−3.14, +4.71]). It needs a *process* as much as a model: a serving
+   path, a latency budget, and a decision about where it runs.
+2. **The `personal` store behind `Storage`.** The personal store sits
+   on the local filesystem outside `Storage`, so the docs service
+   cannot serve a personal document — which is also why issue #7's
+   "personal documents get links" is not started. Moving it behind
+   `Storage` (a `hs migrate personal-to-storage`) would let one read
+   path serve every document the corpus holds.
+3. **Source scopes (#4).** The MCP layer has no notion of which source
+   a document came from (academic, personal, internet, synthesis,
+   iMessages) and no per-source scope, so every tool returns every
+   document. It is what stops a personal document leaking through a
+   general search, and it is what would give a personal document a
+   shorter link TTL.
+4. **Fix the README drift.** The README describes OCR as "GLM-OCR via
+   Ollama" only (the code also has olmOCR, OpenAI-compatible and Cloud
+   backends) and omits `crates/openalex-ingest` and the `personal`
+   feature from the architecture list. Cheap, and it misleads anyone
+   choosing a backend. Two iterations have deferred it as "a docs
+   change, not a code change" — that reading is wrong: the rule is one
+   *change* per iteration, not one *kind* of change.
+5. **Decide the async-nats crash-loop** (see
+   `needs-decision/async-nats-missed-idle-heartbeat.md`). Recommended
+   option A: catch `MissingHeartbeat` and recreate the pull stream
+   instead of exiting. Not ours to make — it is a change to a vendored
+   crate.

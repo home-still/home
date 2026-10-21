@@ -238,6 +238,48 @@ impl AdaptiveBatchController {
         Decision::Noop
     }
 
+    /// Record that the current batch **failed**, and step down.
+    ///
+    /// The controller learns from successes only: `observe` is called on
+    /// the success path, so a batch that fails teaches it nothing and it
+    /// stays at the size that fails. Measured on `big` 2026-10-21: the
+    /// controller converged at 16 rows, the accelerator could not
+    /// allocate that batch's scratch buffer while another tenant held
+    /// the card, and every redelivery of the affected documents failed
+    /// identically — forever.
+    ///
+    /// A failure is the strongest signal there is: the batch does not
+    /// fit, so the next one must be smaller. The step is to the next
+    /// candidate *below* the current one, and the controller leaves
+    /// "converged" state, because the thing it converged on is now known
+    /// to be wrong.
+    pub fn observe_failure(&self) -> Decision {
+        let mut s = self.state.lock();
+        let from = self.cfg.candidates[s.current_idx];
+        if s.current_idx == 0 {
+            // Already at the smallest candidate: there is nowhere to go.
+            // The caller reports the error; the controller has nothing to
+            // add.
+            return Decision::Noop;
+        }
+        s.current_idx -= 1;
+        s.direction = -1;
+        s.converged = false;
+        s.plateau_count = 0;
+        // The best rate was measured at a size that failed, so it is not
+        // a rate to return to.
+        s.best_rate = None;
+        s.best_idx = s.current_idx;
+        s.ewma_rate = None;
+        let to = self.cfg.candidates[s.current_idx];
+        tracing::warn!(
+            from,
+            to,
+            "adaptive_batch: the batch failed; stepped down so the next attempt is smaller"
+        );
+        Decision::Reverted { from, to }
+    }
+
     #[cfg(test)]
     pub fn snapshot_rate(&self) -> Option<f64> {
         self.state.lock().ewma_rate
@@ -406,5 +448,63 @@ mod tests {
             ctrl.observe(100, 1.0 / (1.0 + i as f64));
             assert!(ctrl.current() <= 20);
         }
+    }
+
+    // ── the failure path ───────────────────────────────────────────
+
+    #[test]
+    fn a_failure_steps_the_batch_down() {
+        // Measured on `big` 2026-10-21: the controller converged at 16
+        // rows, the accelerator could not allocate that batch's scratch
+        // buffer while another tenant held the card, and every
+        // redelivery of the affected documents failed identically — the
+        // controller only ever learned from successes, so it stayed at
+        // the size that failed.
+        let ctrl = AdaptiveBatchController::new(cfg(vec![8, 16, 32]));
+        ctrl.observe(10, 1.0);
+        ctrl.observe(10, 1.0);
+        ctrl.observe(10, 1.0);
+        let before = ctrl.current();
+        assert!(before > 8, "the controller should have stepped up first");
+
+        let decision = ctrl.observe_failure();
+        assert_eq!(
+            decision,
+            Decision::Reverted {
+                from: before,
+                to: before / 2
+            }
+        );
+        assert_eq!(ctrl.current(), before / 2, "the batch must shrink");
+    }
+
+    #[test]
+    fn a_failure_at_the_smallest_candidate_stays_there() {
+        let ctrl = AdaptiveBatchController::new(cfg(vec![8, 16]));
+        ctrl.observe(10, 1.0);
+        ctrl.observe(10, 1.0);
+        ctrl.observe_failure();
+        assert_eq!(ctrl.current(), 8);
+        // There is nowhere smaller to go: the controller says so rather
+        // than pretending it did something.
+        assert_eq!(ctrl.observe_failure(), Decision::Noop);
+        assert_eq!(ctrl.current(), 8);
+    }
+
+    #[test]
+    fn a_failure_clears_a_converged_controller() {
+        // "Converged" means the controller believed the current size was
+        // the best it could do. A failure proves that belief wrong, so
+        // the controller must be free to move again.
+        let mut c = cfg(vec![8, 16, 32]);
+        c.converge_after_stable = 1;
+        let ctrl = AdaptiveBatchController::new(c);
+        ctrl.observe(10, 1.0);
+        ctrl.observe(10, 1.0);
+        ctrl.observe(10, 1.0);
+        ctrl.observe(10, 1.0);
+        let before = ctrl.current();
+        ctrl.observe_failure();
+        assert_eq!(ctrl.current(), before / 2);
     }
 }

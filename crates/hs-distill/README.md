@@ -92,7 +92,7 @@ All fields have defaults and are optional. The server refuses to start on an inv
 | `embedding.max_length` | `1280` | Tokens the model sees per text (longer input is truncated by the tokenizer). `chunk_max_tokens + 48` must fit. Raising it costs VRAM per batch, so `embedding.batch_size` is capped at `128 x 512^2 / max_length^2` rows (32 rows at 1024, 20 at 1280). Max 8192. |
 | `embedding.batch_size` | `32` (capped) | Rows per forward pass; at least 1 |
 | `embedding.pool_size` | `1` | Model copies; at least 1 |
-| `embedding.adaptive_batch` | `true` | Tune the batch size in-process against observed throughput, starting from `batch_size` |
+| `embedding.adaptive_batch` | `true` | Tune the batch size in-process against observed throughput, starting from `batch_size`. A batch the accelerator **cannot allocate** also tunes it — down, not up: the card is busy, and a smaller batch is the answer |
 | `embedding.idle_release_secs` | unset | Drop the model from GPU memory after this many idle seconds (at least 1); the next request reloads it (~10 s). Unset keeps it resident |
 | `embedding.vram_floor_mb` | `5000` | Free VRAM required before (re)loading the model; below it the load fails naming the GPU holders |
 | `hnsw.m` / `hnsw.ef_construct` | `16` / `100` | HNSW graph of **new** collections (`m: 0` is rejected) |
@@ -242,6 +242,17 @@ Each markdown file goes through:
 1. **Chunking** -- split at sentence boundaries with configurable max tokens and overlap. Page-aware (respects `---` page separators from scribe).
 2. **Metadata extraction** -- title, authors, DOI, publication date and the other fields come from the catalog entry sent with the request; DOI and year are never regex-extracted from the body text (the first DOI or year in a paper is usually a citation). Without a catalog entry the chunks carry none of them. Optional LLM extraction for keywords/topics via Ollama.
 3. **Embedding** -- BGE-M3 via ONNX (fastembed) on CUDA. 1024-dimensional dense vectors. A panic inside ONNX Runtime poisons its model slot; `/health` reports it and the process exits so the supervisor restarts it.
+
+   **On a shared card**, the batch is sized to what the card can hold
+   *before* each forward pass, and a batch the accelerator cannot
+   allocate is retried at half the size (down to one row). The scratch
+   buffer a pass needs is `rows x sequence^2 x heads x 4` bytes --
+   quadratic in the sequence length -- so at 20 rows and a 1280-token
+   window it is 2.10 GB, and that is exactly the size ONNX's arena
+   names when it fails. Without this, a busy card made the server
+   return 500 forever: the batch controller only learned from
+   successes, and the watcher redelivered the affected documents every
+   30 seconds, indefinitely.
 4. **Qdrant upsert** -- deterministic point IDs (xxhash + UUID v5) enable idempotent re-indexing; every write waits until Qdrant has applied it, so a failed write is an error rather than a silent loss; chunks past the document's new end are deleted after the upsert succeeds. Rich payload with full metadata for filtered search.
 
 ## API endpoints
