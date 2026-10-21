@@ -1031,6 +1031,14 @@ and the reason: *"not running (no answer at http://127.0.0.1:1/health:
 … Connection refused)"*. The search path is untouched — the same new
 server served searches while the status was taken.
 
+**The query set is unchanged by this change**, as it must be — it adds
+a field to a health response and changes what a status command reports.
+Re-run on the new server (which carries rc.374's demoter fix as well):
+RECALL@10 **25/25 = 100 %**, the first hit a reference list in 1/25, the
+same as rc.374 measured. On the still-deployed rc.373 server the same
+query set gives 24/25 and 7/25 — the difference is rc.374, not this
+change.
+
 **The tests.** Three, in `crates/hs/src/distill_cmd.rs::status_tests`,
 on the project's `FakeServer`: a server that answers is reported as
 running and its PID is shown; a server that does not answer is reported

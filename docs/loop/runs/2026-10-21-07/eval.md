@@ -149,6 +149,18 @@ $ hs distill search "oxytocin social behaviour" --server http://127.0.0.1:7437
    CNS-16-e92:295-301 (page 14)
 ```
 
+**The fixed query set does not move**, as it must not: this change adds
+a field to a health response and changes what a status command reports.
+
+| | the live rc.373 server | the new rc.375 server |
+|---|---|---|
+| RECALL@10 | 24/25 = 96 % | **25/25 = 100 %** |
+| the first hit is a reference list | 7/25 = 28 % | **1/25 = 4 %** |
+
+The difference is **rc.374's demoter fix**, which is in the new server
+and not in the deployed one — not this change. Measured on the same
+corpus, the same query set, both servers on CUDA.
+
 ## Timings
 
 The status command now makes **one** HTTP request to the server
