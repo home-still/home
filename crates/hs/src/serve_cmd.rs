@@ -82,8 +82,11 @@ pub enum ServeCmd {
         /// Install as a system service and start it
         #[arg(long, conflicts_with = "uninstall")]
         install: bool,
-        /// Stop and remove the system service
-        #[arg(long, conflicts_with = "install")]
+        /// Install as a user service and start it
+        #[arg(long, conflicts_with_all = ["install", "uninstall"])]
+        install_user: bool,
+        /// Stop and remove the service
+        #[arg(long, conflicts_with_all = ["install", "install_user"])]
         uninstall: bool,
     },
 }
@@ -119,6 +122,19 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
             port,
             ..
         } => install_service("docs", port, reporter).await,
+        ServeCmd::Docs {
+            install_user: true,
+            port,
+            ..
+        } => {
+            install_user_service(
+                "serve-docs",
+                &["serve", "docs", "--port", &port.to_string()],
+                "Home-Still docs server (signed, expiring links to the corpus's documents)",
+                reporter,
+            )
+            .await
+        }
         ServeCmd::Scribe {
             uninstall: true, ..
         } => uninstall_service("scribe", reporter).await,
@@ -130,7 +146,13 @@ pub async fn dispatch(cmd: ServeCmd, reporter: &Arc<dyn Reporter>) -> Result<()>
         } => uninstall_service("mcp", reporter).await,
         ServeCmd::Docs {
             uninstall: true, ..
-        } => uninstall_service("docs", reporter).await,
+        } => {
+            // A docs service may be installed as a system service or as
+            // a user service. Both are removed, and a missing one is not
+            // an error: the operator asked for the service to be gone.
+            uninstall_service("docs", reporter).await?;
+            uninstall_user_service("serve-docs", reporter).await
+        }
         ServeCmd::ScribeWatch { install: true, .. } => {
             install_user_service(
                 "scribe-watch-events",
