@@ -26,6 +26,11 @@ pub struct DocsLinkArgs {
     #[arg(long)]
     pub markdown: bool,
 
+    /// The page to open, 1-based. The link opens that page and points
+    /// at it.
+    #[arg(long)]
+    pub page: Option<u32>,
+
     /// The subject the link is bound to. Defaults to this machine.
     #[arg(long)]
     pub subject: Option<String>,
@@ -101,7 +106,7 @@ async fn link(args: DocsLinkArgs, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let key_path = hs_common::docs::default_key_path();
     let key = load_key(&key_path)?;
 
-    let params = hs_common::docs::mint(&key, &args.stem, format, &subject, ttl)
+    let params = hs_common::docs::mint(&key, &args.stem, format, &subject, args.page, ttl)
         .map_err(|e| anyhow::anyhow!("minting the link failed: {e}"))?;
 
     let lan = link_url(&base_url, &params);
@@ -136,10 +141,20 @@ pub struct DocsConfig {
 }
 
 /// The URL for a link's parameters.
+///
+/// A link that names a page carries the page twice: in the query
+/// string, which the server checks (and which the signature covers),
+/// and in the fragment, which the *browser* uses to scroll to it. The
+/// fragment is never sent to the server, so it cannot be signed — which
+/// is why the page is in the query as well.
 fn link_url(base: &str, params: &hs_common::docs::LinkParams) -> String {
     let base = base.trim_end_matches('/');
+    let fragment = params
+        .page
+        .map(hs_common::docs::pdf_page_fragment)
+        .unwrap_or_default();
     format!(
-        "{base}/docs/v1/{}/{}?{}",
+        "{base}/docs/v1/{}/{}?{}{fragment}",
         params.stem,
         params.format.as_str(),
         params.to_query()
@@ -174,7 +189,8 @@ mod tests {
     fn a_link_url_carries_the_stem_the_format_and_the_signature() {
         let key = LinkKey::from_bytes(vec![3u8; 32]).unwrap();
         let params =
-            hs_common::docs::mint(&key, "10.1234_abcd", LinkFormat::Source, "laptop", 60).unwrap();
+            hs_common::docs::mint(&key, "10.1234_abcd", LinkFormat::Source, "laptop", None, 60)
+                .unwrap();
         let url = link_url("http://host:7446/", &params);
         assert!(url.starts_with("http://host:7446/docs/v1/10.1234_abcd/source?"));
         assert!(url.contains("sub=laptop"));
@@ -185,9 +201,15 @@ mod tests {
     #[test]
     fn a_link_url_for_the_markdown_says_so() {
         let key = LinkKey::from_bytes(vec![3u8; 32]).unwrap();
-        let params =
-            hs_common::docs::mint(&key, "10.1234_abcd", LinkFormat::Markdown, "laptop", 60)
-                .unwrap();
+        let params = hs_common::docs::mint(
+            &key,
+            "10.1234_abcd",
+            LinkFormat::Markdown,
+            "laptop",
+            None,
+            60,
+        )
+        .unwrap();
         let url = link_url("http://host:7446", &params);
         assert!(url.contains("/markdown?"));
     }

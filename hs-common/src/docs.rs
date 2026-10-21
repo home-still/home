@@ -109,6 +109,9 @@ pub enum LinkError {
     BadStem,
     /// The format is not one this service serves.
     BadFormat,
+    /// The page is not a page: the pages are 1-based, so page 0 names
+    /// no page.
+    BadPage,
     /// A required query parameter is missing.
     MissingParameter(&'static str),
     /// The link key is unusable (too short, or missing).
@@ -134,6 +137,12 @@ pub struct LinkParams {
     pub format: LinkFormat,
     /// The subject the link was minted for.
     pub subject: String,
+    /// The page the link opens, 1-based.
+    ///
+    /// The page is part of the *request*, not part of the document, so
+    /// it is signed: a link minted for page 11 opens page 11 and
+    /// nothing else. `None` means the whole document.
+    pub page: Option<u32>,
     /// When the link was minted, as a Unix timestamp in seconds.
     ///
     /// The link carries this so a revocation can be applied to it: a
@@ -148,31 +157,16 @@ pub struct LinkParams {
 }
 
 impl LinkParams {
-    /// The exact string the signature is computed over.
-    ///
-    /// The order and the separators are fixed: a verifier and a signer
-    /// that disagree here would disagree silently.
-    fn signed_payload(
-        stem: &str,
-        format: LinkFormat,
-        subject: &str,
-        issued_at: u64,
-        expires_at: u64,
-    ) -> String {
-        format!(
-            "{LINK_VERSION}|{stem}|{}|{subject}|{issued_at}|{expires_at}",
-            format.as_str()
-        )
-    }
-
     /// The query string, without a leading `?`.
     pub fn to_query(&self) -> String {
+        let page = self.page.map_or_else(String::new, |p| format!("&page={p}"));
         format!(
-            "iat={}&exp={}&sub={}&fmt={}&sig={}",
+            "iat={}&exp={}&sub={}&fmt={}{}&sig={}",
             self.issued_at,
             self.expires_at,
             url_encode(&self.subject),
             self.format.as_str(),
+            page,
             self.signature
         )
     }
@@ -287,24 +281,76 @@ pub fn mint(
     stem: &str,
     format: LinkFormat,
     subject: &str,
+    page: Option<u32>,
     ttl_secs: u64,
 ) -> Result<LinkParams, LinkError> {
     crate::validate_stem(stem).map_err(|_| LinkError::BadStem)?;
     if subject.is_empty() {
         return Err(LinkError::MissingParameter("sub"));
     }
+    // Page 0 is not a page: the pages are 1-based, and a link that
+    // named page 0 would be a link to a page that does not exist.
+    if page == Some(0) {
+        return Err(LinkError::BadPage);
+    }
     let issued_at = now_secs();
     let expires_at = issued_at.saturating_add(ttl_secs);
-    let payload = LinkParams::signed_payload(stem, format, subject, issued_at, expires_at);
-    let signature = key.sign(&payload);
-    Ok(LinkParams {
+    let fields = SignedFields {
         stem: stem.to_string(),
         format,
         subject: subject.to_string(),
+        page,
         issued_at,
         expires_at,
+    };
+    let signature = key.sign(&fields.signed_payload());
+    Ok(LinkParams {
+        stem: fields.stem,
+        format: fields.format,
+        subject: fields.subject,
+        page: fields.page,
+        issued_at: fields.issued_at,
+        expires_at: fields.expires_at,
         signature,
     })
+}
+
+/// The fields of a link that the signature covers.
+///
+/// They travel together, so they are checked together: a verifier
+/// cannot accidentally check one and forget another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedFields {
+    /// The document stem.
+    pub stem: String,
+    /// Which document the link opens.
+    pub format: LinkFormat,
+    /// The subject the link was minted for.
+    pub subject: String,
+    /// The page the link opens. `None` means the whole document.
+    pub page: Option<u32>,
+    /// When the link was minted, as a Unix timestamp in seconds.
+    pub issued_at: u64,
+    /// When the link stops working, as a Unix timestamp in seconds.
+    pub expires_at: u64,
+}
+
+impl SignedFields {
+    /// The exact string the signature is computed over.
+    ///
+    /// The order and the separators are fixed: a verifier and a signer
+    /// that disagree here would disagree silently.
+    fn signed_payload(&self) -> String {
+        format!(
+            "{LINK_VERSION}|{}|{}|{}|{}|{}|{}",
+            self.stem,
+            self.format.as_str(),
+            self.subject,
+            self.page.map_or_else(|| "-".to_string(), |p| p.to_string()),
+            self.issued_at,
+            self.expires_at,
+        )
+    }
 }
 
 /// Verify a link's signature and expiry.
@@ -312,29 +358,19 @@ pub fn mint(
 /// The stem is checked by the caller, because the stem decides which
 /// object is read: this function only decides whether the link is
 /// genuine.
-pub fn verify(
-    key: &LinkKey,
-    stem: &str,
-    format: LinkFormat,
-    subject: &str,
-    issued_at: u64,
-    expires_at: u64,
-    signature: &str,
-) -> Result<(), LinkError> {
+pub fn verify(key: &LinkKey, fields: &SignedFields, signature: &str) -> Result<(), LinkError> {
     // A link whose expiry has arrived has expired. The comparison is
     // `>=`, not `>`: a link minted with a zero TTL expires at once, and
     // `>` would let it live for the rest of that second.
-    if now_secs() >= expires_at {
+    if now_secs() >= fields.expires_at {
         return Err(LinkError::Expired);
     }
     // A link cannot be issued in the future: that would let a link
     // outlive its own expiry.
-    if issued_at > now_secs() {
+    if fields.issued_at > now_secs() {
         return Err(LinkError::BadSignature);
     }
-    let expected = key.sign(&LinkParams::signed_payload(
-        stem, format, subject, issued_at, expires_at,
-    ));
+    let expected = key.sign(&fields.signed_payload());
     // Constant-time comparison: a link's signature is public, but a
     // timing side channel would let an attacker forge one a byte at a
     // time.
@@ -356,6 +392,91 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// The URL fragment that points a browser at a page of a PDF.
+///
+/// A PDF viewer honours `#page=N` and scrolls to that page. The
+/// fragment is never sent to the server, so the page that the *server*
+/// serves is named separately in the query string — the query is what
+/// the signature covers.
+pub fn pdf_page_fragment(page: u32) -> String {
+    format!("#page={page}")
+}
+
+/// The longest text a fragment quotes, in characters.
+///
+/// The text-fragment spec asks for a *short* distinctive snippet, and
+/// a URL has a practical length limit. Measured over the corpus's own
+/// passages, the first line of a chunk averages 308 characters and
+/// reaches 878 — too long for a URL a user has to read, and longer
+/// than the browser needs to find the passage.
+const MAX_FRAGMENT_CHARS: usize = 120;
+
+/// The URL fragment that points a browser at a span of text.
+///
+/// This is the W3C **Text Fragments** form, `#:~:text=`: the browser
+/// finds the quoted text in the document it loaded, scrolls to it and
+/// selects it. It needs nothing from the server — the fragment is
+/// resolved in the client, against the bytes the server sent.
+///
+/// The quoted text is the beginning of the passage, cut at a word
+/// boundary: long enough to be distinctive, short enough for a URL.
+/// The first line of the passage is the right snippet for a second
+/// reason — it is the passage's `line_start`, so the service can find
+/// it by line number without searching the text.
+pub fn text_fragment(line: &str) -> String {
+    format!("#:~:text={}", url_encode_fragment(clip(line)))
+}
+
+/// Cut a snippet to [`MAX_FRAGMENT_CHARS`], at a word boundary.
+///
+/// The cut is at a word boundary because a snippet that ends
+/// mid-word is not a substring of the document, and the browser
+/// matches on a substring: it would find nothing.
+fn clip(line: &str) -> &str {
+    let trimmed = line.trim();
+    if trimmed.chars().count() <= MAX_FRAGMENT_CHARS {
+        return trimmed;
+    }
+    let cut = trimmed
+        .char_indices()
+        .nth(MAX_FRAGMENT_CHARS)
+        .map(|(i, _)| i)
+        .unwrap_or(trimmed.len());
+    // Back up to the last space, so the snippet ends on a word.
+    let end = trimmed[..cut].rfind(' ').unwrap_or(cut);
+    trimmed[..end].trim_end()
+}
+
+/// Percent-encode a value for a URL fragment.
+///
+/// The text-fragment syntax gives `&`, `#` and `=` meaning, so they
+/// are encoded; the rest of the punctuation a line contains is left
+/// readable, because a fragment a human can read is a fragment a human
+/// can check.
+fn url_encode_fragment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'!'
+            | b'*'
+            | b'('
+            | b')' => out.push(b as char),
+            // `'` is encoded: the text-fragment syntax treats it as a
+            // delimiter, and a passage with an apostrophe in it is
+            // common enough to be worth getting right.
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// The parameters of a link, read out of a query string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkQuery {
@@ -367,6 +488,8 @@ pub struct LinkQuery {
     pub subject: String,
     /// The format.
     pub format: LinkFormat,
+    /// The page the link opens. `None` means the whole document.
+    pub page: Option<u32>,
     /// The signature.
     pub signature: String,
 }
@@ -381,6 +504,7 @@ impl LinkQuery {
         let mut expires_at: Option<u64> = None;
         let mut subject: Option<String> = None;
         let mut format: Option<LinkFormat> = None;
+        let mut page: Option<u32> = None;
         let mut signature: Option<String> = None;
 
         for pair in query.split('&') {
@@ -409,6 +533,15 @@ impl LinkQuery {
                 "fmt" => {
                     format = Some(LinkFormat::parse(value).ok_or(LinkError::BadFormat)?);
                 }
+                "page" => {
+                    let parsed: u32 = value
+                        .parse()
+                        .map_err(|_| LinkError::MissingParameter("page"))?;
+                    if parsed == 0 {
+                        return Err(LinkError::BadPage);
+                    }
+                    page = Some(parsed);
+                }
                 "sig" => {
                     signature = Some(url_decode(value).ok_or(LinkError::BadSignature)?);
                 }
@@ -420,6 +553,7 @@ impl LinkQuery {
             expires_at: expires_at.ok_or(LinkError::MissingParameter("exp"))?,
             subject: subject.ok_or(LinkError::MissingParameter("sub"))?,
             format: format.ok_or(LinkError::BadFormat)?,
+            page,
             signature: signature.ok_or(LinkError::MissingParameter("sig"))?,
         })
     }
@@ -572,14 +706,17 @@ mod tests {
     #[test]
     fn a_minted_link_verifies() {
         let k = key();
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", 3600).unwrap();
+        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", None, 3600).unwrap();
         verify(
             &k,
-            "10.1234_abcd",
-            LinkFormat::Source,
-            "laptop",
-            link.issued_at,
-            link.expires_at,
+            &SignedFields {
+                stem: "10.1234_abcd".to_string(),
+                format: LinkFormat::Source,
+                subject: "laptop".to_string(),
+                page: link.page,
+                issued_at: link.issued_at,
+                expires_at: link.expires_at,
+            },
             &link.signature,
         )
         .unwrap();
@@ -588,53 +725,50 @@ mod tests {
     #[test]
     fn a_tampered_stem_format_subject_or_expiry_does_not_verify() {
         let k = key();
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", 3600).unwrap();
+        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", None, 3600).unwrap();
         // Any field the signature covers, changed, invalidates it.
-        assert_eq!(
+        let tampered = |stem: &str, format: LinkFormat, subject: &str, expires_at: u64| {
             verify(
                 &k,
+                &SignedFields {
+                    stem: stem.to_string(),
+                    format,
+                    subject: subject.to_string(),
+                    page: link.page,
+                    issued_at: link.issued_at,
+                    expires_at,
+                },
+                &link.signature,
+            )
+        };
+        assert_eq!(
+            tampered(
                 "10.1234_other",
                 LinkFormat::Source,
                 "laptop",
-                link.issued_at,
-                link.expires_at,
-                &link.signature
+                link.expires_at
             ),
             Err(LinkError::BadSignature)
         );
         assert_eq!(
-            verify(
-                &k,
+            tampered(
                 "10.1234_abcd",
                 LinkFormat::Markdown,
                 "laptop",
-                link.issued_at,
-                link.expires_at,
-                &link.signature
+                link.expires_at
             ),
             Err(LinkError::BadSignature)
         );
         assert_eq!(
-            verify(
-                &k,
-                "10.1234_abcd",
-                LinkFormat::Source,
-                "phone",
-                link.issued_at,
-                link.expires_at,
-                &link.signature
-            ),
+            tampered("10.1234_abcd", LinkFormat::Source, "phone", link.expires_at),
             Err(LinkError::BadSignature)
         );
         assert_eq!(
-            verify(
-                &k,
+            tampered(
                 "10.1234_abcd",
                 LinkFormat::Source,
                 "laptop",
-                link.issued_at,
-                link.expires_at + 1,
-                &link.signature
+                link.expires_at + 1
             ),
             Err(LinkError::BadSignature)
         );
@@ -644,16 +778,19 @@ mod tests {
     fn a_link_signed_with_another_key_does_not_verify() {
         let a = key();
         let b = LinkKey::from_bytes(vec![9u8; 32]).unwrap();
-        let link = mint(&a, "10.1234_abcd", LinkFormat::Source, "laptop", 3600).unwrap();
+        let link = mint(&a, "10.1234_abcd", LinkFormat::Source, "laptop", None, 3600).unwrap();
         assert_eq!(
             verify(
                 &b,
-                "10.1234_abcd",
-                LinkFormat::Source,
-                "laptop",
-                link.issued_at,
-                link.expires_at,
-                &link.signature
+                &SignedFields {
+                    stem: "10.1234_abcd".to_string(),
+                    format: LinkFormat::Source,
+                    subject: "laptop".to_string(),
+                    page: link.page,
+                    issued_at: link.issued_at,
+                    expires_at: link.expires_at,
+                },
+                &link.signature,
             ),
             Err(LinkError::BadSignature)
         );
@@ -664,16 +801,19 @@ mod tests {
         let k = key();
         // A link minted in the past is already expired.
         let expires_at = now_secs() - 1;
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", 0).unwrap();
+        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", None, 0).unwrap();
         assert_eq!(
             verify(
                 &k,
-                "10.1234_abcd",
-                LinkFormat::Source,
-                "laptop",
-                link.issued_at,
-                expires_at,
-                &link.signature
+                &SignedFields {
+                    stem: "10.1234_abcd".to_string(),
+                    format: LinkFormat::Source,
+                    subject: "laptop".to_string(),
+                    page: link.page,
+                    issued_at: link.issued_at,
+                    expires_at,
+                },
+                &link.signature,
             ),
             Err(LinkError::Expired)
         );
@@ -683,7 +823,15 @@ mod tests {
     #[test]
     fn a_query_string_round_trips() {
         let k = key();
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "lap top", 3600).unwrap();
+        let link = mint(
+            &k,
+            "10.1234_abcd",
+            LinkFormat::Source,
+            "lap top",
+            None,
+            3600,
+        )
+        .unwrap();
         let query = link.to_query();
         let parsed = LinkQuery::parse(&query).unwrap();
         assert_eq!(parsed.expires_at, link.expires_at);
@@ -726,7 +874,7 @@ mod tests {
         let k = key();
         for stem in ["../etc/passwd", "a/b", "", "..", "a\\b"] {
             assert_eq!(
-                mint(&k, stem, LinkFormat::Source, "laptop", 3600).unwrap_err(),
+                mint(&k, stem, LinkFormat::Source, "laptop", None, 3600).unwrap_err(),
                 LinkError::BadStem,
                 "{stem:?}"
             );
@@ -754,6 +902,165 @@ mod tests {
     }
 
     #[test]
+    fn a_page_is_signed() {
+        // A link minted for page 11 must open page 11 and nothing
+        // else: the page is part of the request, and the request is
+        // what the signature covers.
+        let k = key();
+        let link = mint(
+            &k,
+            "10.1234_abcd",
+            LinkFormat::Source,
+            "laptop",
+            Some(11),
+            3600,
+        )
+        .unwrap();
+        verify(
+            &k,
+            &SignedFields {
+                stem: "10.1234_abcd".to_string(),
+                format: LinkFormat::Source,
+                subject: "laptop".to_string(),
+                page: Some(11),
+                issued_at: link.issued_at,
+                expires_at: link.expires_at,
+            },
+            &link.signature,
+        )
+        .unwrap();
+
+        // The same signature with a different page does not verify.
+        assert_eq!(
+            verify(
+                &k,
+                &SignedFields {
+                    stem: "10.1234_abcd".to_string(),
+                    format: LinkFormat::Source,
+                    subject: "laptop".to_string(),
+                    page: Some(12),
+                    issued_at: link.issued_at,
+                    expires_at: link.expires_at,
+                },
+                &link.signature,
+            ),
+            Err(LinkError::BadSignature)
+        );
+        // And neither does the same link with no page.
+        assert_eq!(
+            verify(
+                &k,
+                &SignedFields {
+                    stem: "10.1234_abcd".to_string(),
+                    format: LinkFormat::Source,
+                    subject: "laptop".to_string(),
+                    page: None,
+                    issued_at: link.issued_at,
+                    expires_at: link.expires_at,
+                },
+                &link.signature,
+            ),
+            Err(LinkError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn page_zero_is_not_a_page() {
+        // The pages are 1-based, so page 0 names no page.
+        let k = key();
+        assert_eq!(
+            mint(
+                &k,
+                "10.1234_abcd",
+                LinkFormat::Source,
+                "laptop",
+                Some(0),
+                3600
+            )
+            .unwrap_err(),
+            LinkError::BadPage
+        );
+        assert_eq!(
+            LinkQuery::parse("iat=1&exp=2&sub=laptop&fmt=source&page=0&sig=ab").unwrap_err(),
+            LinkError::BadPage
+        );
+    }
+
+    #[test]
+    fn a_query_string_carries_the_page() {
+        let k = key();
+        let link = mint(
+            &k,
+            "10.1234_abcd",
+            LinkFormat::Source,
+            "laptop",
+            Some(11),
+            3600,
+        )
+        .unwrap();
+        let query = link.to_query();
+        assert!(query.contains("page=11"), "{query}");
+        let parsed = LinkQuery::parse(&query).unwrap();
+        assert_eq!(parsed.page, Some(11));
+        assert_eq!(parsed.signature, link.signature);
+    }
+
+    #[test]
+    fn a_link_with_no_page_has_no_page_in_its_query() {
+        let k = key();
+        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", None, 3600).unwrap();
+        assert!(!link.to_query().contains("page="), "{}", link.to_query());
+        assert_eq!(LinkQuery::parse(&link.to_query()).unwrap().page, None);
+    }
+
+    #[test]
+    fn a_pdf_fragment_points_at_the_page() {
+        assert_eq!(crate::docs::pdf_page_fragment(11), "#page=11");
+    }
+
+    #[test]
+    fn a_text_fragment_quotes_the_passage() {
+        // The text fragment is the browser-native way to point at a span
+        // of text: it names the text, and the browser finds it.
+        let fragment = crate::docs::text_fragment("The rapid acquisition of memory");
+        assert!(fragment.starts_with("#:~:text="), "{fragment}");
+        // The text is percent-encoded, as the spec requires: a space is
+        // %20 and the characters that would end the fragment early are
+        // encoded too.
+        assert!(fragment.contains("%20"), "{fragment}");
+        let fragment = crate::docs::text_fragment("a & b = c?");
+        assert!(fragment.contains("%26"), "{fragment}");
+        assert!(fragment.contains("%3F"), "{fragment}");
+        // Ordinary words stay readable.
+        let fragment = crate::docs::text_fragment("plain words here");
+        assert!(fragment.contains("plain%20words%20here"), "{fragment}");
+    }
+
+    #[test]
+    fn a_text_fragment_is_short_enough_for_a_url() {
+        // The corpus's passages run to hundreds of characters on their
+        // first line, and a URL has a practical length limit.
+        let long = "During acute stress, the limbic system and thalamus are activated by the \
+                     cerebral cortex through the reticular activating system, which subsequently \
+                     activates the hypothalamus, triggering an autonomic nervous system and \
+                     endocrine response, resulting in catecholamine and cortisol secretion.";
+        let fragment = crate::docs::text_fragment(long);
+        let quoted = crate::docs::url_decode(fragment.trim_start_matches("#:~:text=")).unwrap();
+        assert!(
+            quoted.chars().count() <= 120,
+            "the snippet is {} chars: {quoted}",
+            quoted.chars().count()
+        );
+        // And it ends on a word, so the browser's substring match finds
+        // it: a snippet cut mid-word is not in the document.
+        assert!(!quoted.ends_with(' '), "{quoted}");
+        assert!(
+            long.contains(&quoted),
+            "the snippet is not a substring: {quoted}"
+        );
+    }
+
+    #[test]
     fn a_refused_link_says_nothing_about_why() {
         // A client that learns why a link failed learns something about
         // the corpus. Every reason reads the same.
@@ -763,6 +1070,7 @@ mod tests {
             LinkError::Revoked,
             LinkError::BadStem,
             LinkError::BadFormat,
+            LinkError::BadPage,
             LinkError::MissingParameter("exp"),
             LinkError::BadKey,
         ];

@@ -194,6 +194,14 @@ All ports below are LAN-only **except** the gateway, which exits the LAN through
 | 3903  | Garage admin/health | `three`       | `hs status`, monitoring     | LAN only  |
 | 4222  | NATS (optional)   | `three`         | scribe / distill watchers   | LAN only  |
 
+The docs server (7446) serves the corpus's documents over signed,
+expiring links: `GET /docs/v1/<stem>/source` and
+`/docs/v1/<stem>/markdown`, with `?page=N` for one page and `Range`
+support so a PDF viewer can seek. It runs as a user service
+(`hs serve docs --install-user`,
+`~/.config/systemd/user/hs-serve-docs.service`) because it is a
+service the operator runs on their own machine.
+
 (Cross-check against the "Network ports" table in the root README — they should agree.)
 
 A LAN firewall rule that only permits traffic *between* `<lan-subnet>` hosts is enough. The tunnel host is the only one that needs outbound 443 to `*.cloudflare.com`.

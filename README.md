@@ -234,6 +234,15 @@ its markdown. The remote URL goes through the cloud gateway; the LAN URL
 goes straight to the service, so a large PDF never hairpins through the
 tunnel.
 
+A link that names a passage points at it: the PDF link carries
+`#page=N`, and the markdown link carries a W3C text fragment that
+selects the passage. The page is part of the signed link, so a link
+minted for one page opens that page and nothing else.
+
+```sh
+hs docs link 10.1371_journal.pone.0038469 --page 11
+```
+
 Configure the base URLs in `~/.home-still/config.yaml`:
 
 ```yaml

@@ -612,3 +612,115 @@ on :7446, and a link minted with the released CLI opens a real PDF.
    document. It is the prerequisite for personal-document links with
    their short TTL, and it is what stops a personal document leaking
    through a general search.
+
+---
+
+## 2026-10-21-05 — the link points at the passage
+
+**Change.** A document link can now name **the page** the passage is
+on, and the passage itself.
+
+- The **PDF** link carries `#page=N`. Every PDF viewer honours it and
+  scrolls to that page.
+- The **markdown** link carries a W3C **Text Fragment**,
+  `#:~:text=<the passage>`. The browser finds the quoted text in the
+  document it loaded, scrolls to it and selects it. It is resolved in
+  the *client*, against the bytes the server sent — the server serves
+  the document, unchanged.
+- The **markdown route** takes `?page=N` and serves that one page.
+
+The page is **signed**: it is part of the request, so a link minted for
+page 11 opens page 11 and nothing else, and a tampered page is a 403
+exactly like a tampered stem.
+
+**Why this ranked first.** The previous iteration gave an agent's hit
+a link the user can open — at the *top* of the document. The user's
+question is "show me *this* passage", and the answer was a PDF at page
+1 with three thousand pages of paper around it. This is the
+wishlist's second half, stated in one line: *"a really cool feature
+would be able to highlight the text in the document when all this needs
+to be served remotely."* It beat the runner-up (cross-encoder
+reranking) because the anchor data was **already in the corpus** — 90 %
+of hits carry a page number — so the whole change is a URL and a
+signature field, with no re-index and no GPU.
+
+**Evidence.**
+
+| | before | after |
+|---|---|---|
+| a search hit's link points at the passage | **no** | **yes** |
+| the PDF link names the page | no | **yes** (`#page=N`) |
+| the markdown link quotes the passage | no | **yes** (`#:~:text=…`) |
+| the markdown link serves one page | no | **yes** (`?page=N`) |
+| RECALL@10 | 24/25 = 96 % | 24/25 = 96 % (unchanged) |
+| median latency | 158 ms | 174 ms (unchanged) |
+
+**Recall is unchanged**: the change adds a URL to a link and a page to
+a route. It touches no retrieval behaviour and no stored data.
+
+**Verified end to end, on real documents.** The markdown of
+`10.1677_joe.1.06233` is 73,923 bytes over 17 pages; the link that
+names page 15 serves 7,453 bytes, starting with the reference list,
+and answers `content-location: #page=15`. The browser's match works:
+**for every sampled hit, the quoted snippet is a substring of the page
+its link serves** (84–110 characters, three of three).
+
+**Two things measured rather than assumed.**
+
+- **How long a snippet should be.** The first implementation quoted the
+  passage's whole first line: over the corpus's own passages that
+  averages **308 characters** and reaches **878** — too long for a URL
+  a user has to read. The snippet is now cut at a **word boundary** at
+  120 characters, which keeps it a substring of the document (a
+  snippet cut mid-word is not, and the browser would find nothing).
+- **Whether the markdown's pages are the PDF's pages.** They are, and
+  the code says so: the scribe renders the PDF's pages in order, sorts
+  the concurrent results back by page index, and joins them with a
+  **reserved** separator, so markdown page N *is* source page N.
+  Verified on a real 17-page document: 17 markdown pages, 17 PDF pages,
+  and the markdown's page 15 is on the PDF's page 15. The one case
+  where it does not hold is a single-page markdown for a multi-page
+  source (the olmocr backend's flat output), where the catalog row
+  records no page offsets and the chunk has no page — the link is
+  still correct, it just names the whole document, because there is
+  nothing better to point at.
+
+**Research.** `docs/loop/runs/2026-10-21-05/research.md` — the
+techniques considered (a `#page=N` fragment, a text fragment, a
+server-side `<mark>` injection, all three), and why the *client* does
+the highlighting: a server that rewrites the document it serves
+cannot also be the thing an agent reads, and the highlight belongs
+where the browser can resolve it.
+
+### Top 5 remaining items
+
+1. **Cross-encoder reranking.** The remaining 7 % reference-list noise
+   in the top 3 is the clearest remaining wrongness, and a cross-encoder
+   is what fixes it — it scores a query *against* a passage and can
+   tell a bibliography entry from a discussion. Our own `myelin` crate
+   already runs `bge-reranker-v2-m3` for exactly this, so the technique
+   is proven and the code is ours. Blocked on a second GPU service, and
+   on the 3090 being free.
+2. **Decide the async-nats crash-loop** (see
+   `needs-decision/async-nats-missed-idle-heartbeat.md`). Recommended
+   option A: catch `MissingHeartbeat` and recreate the pull stream
+   instead of exiting.
+3. **Fix the README drift.** The README describes OCR as "GLM-OCR via
+   Ollama" only (the code also has olmOCR, OpenAI-compatible and Cloud
+   backends) and omits `crates/openalex-ingest` and the `personal`
+   feature from the architecture list. Cheap, and it misleads anyone
+   choosing a backend. Two iterations have deferred it as "a docs
+   change, not a code change" — that reading is wrong: the rule is one
+   *change* per iteration, not one *kind* of change.
+4. **Source scopes (#4).** The MCP layer has no notion of which source
+   a document came from (academic, personal, internet, synthesis,
+   iMessages) and no per-source scope, so every tool returns every
+   document. It is what stops a personal document leaking through a
+   general search, and it is what would give a personal document a
+   shorter link TTL.
+5. **The `personal` store behind `Storage`.** The personal store sits
+   on the local filesystem outside `Storage`, so the docs service
+   cannot serve a personal document — which is also why issue #7's
+   "personal documents get links" is not started. Moving it behind
+   `Storage` (a `hs migrate personal-to-storage`) would let one read
+   path serve every document the corpus holds.

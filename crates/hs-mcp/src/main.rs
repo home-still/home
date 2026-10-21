@@ -155,6 +155,10 @@ struct DocLinkParams {
         description = "Which document to link: `source` (the original PDF, HTML or EPUB) or `markdown` (the converted text). Default: `source`"
     )]
     format: Option<String>,
+    #[schemars(
+        description = "The page to open, 1-based. The link opens that page and points at it. The markdown's pages are the source document's pages."
+    )]
+    page: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -235,19 +239,26 @@ fn map_distill_search_hits(
     minter: Option<&Arc<crate::links::LinkMinter>>,
 ) -> Vec<DistillSearchHitOut> {
     hits.into_iter()
-        .map(|h| DistillSearchHitOut {
-            doc_id: h.doc_id.clone(),
-            title: h.title,
-            authors: h.authors,
-            year: h.year,
-            doi: h.doi,
-            chunk_text: include_text.then_some(h.chunk_text),
-            score: h.score,
-            links: minter.and_then(|m| m.mint(&h.doc_id)),
-            line_start: h.line_start,
-            line_end: h.line_end,
-            page: h.page,
-            category: h.category,
+        .map(|h| {
+            // The passage's first line is what a text fragment quotes,
+            // so the browser can select the passage the agent found.
+            let passage = h.chunk_text.lines().next().map(str::trim).map(String::from);
+            let links = minter
+                .and_then(|m| m.mint(&h.doc_id, h.page.map(|p| p as u32), passage.as_deref()));
+            DistillSearchHitOut {
+                doc_id: h.doc_id.clone(),
+                title: h.title,
+                authors: h.authors,
+                year: h.year,
+                doi: h.doi,
+                chunk_text: include_text.then_some(h.chunk_text),
+                score: h.score,
+                links,
+                line_start: h.line_start,
+                line_end: h.line_end,
+                page: h.page,
+                category: h.category,
+            }
         })
         .collect()
 }
@@ -1670,7 +1681,10 @@ impl HomeStillMcp {
                 // The catalog row's `pdf_path` is a storage key on this
                 // host, not something the caller can open. The links are
                 // what a caller can open.
-                let links = self.link_minter.as_ref().and_then(|m| m.mint(&p.stem));
+                let links = self
+                    .link_minter
+                    .as_ref()
+                    .and_then(|m| m.mint(&p.stem, None, None));
                 to_json(&CatalogEntryWithLinks { entry, links })
             }
             None => Err(format!("No catalog entry found for '{}'", p.stem)),
@@ -1700,7 +1714,7 @@ impl HomeStillMcp {
         }
         let wanted = p.format.as_deref().unwrap_or("source");
         let links = minter
-            .mint(&p.stem)
+            .mint(&p.stem, p.page, None)
             .ok_or_else(|| format!("'{}' is not a document stem", p.stem))?;
         let pair = match wanted {
             "source" => links.source.clone(),

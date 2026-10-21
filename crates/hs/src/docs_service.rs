@@ -29,6 +29,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use hs_common::docs::{LinkFormat, LinkKey, LinkQuery, Revocations};
 use hs_common::storage::{ByteRange, Storage};
@@ -38,6 +39,15 @@ use hs_common::storage::{ByteRange, Storage};
 /// The same order the MCP server's `find_source_key` uses, so a link
 /// and a tool agree on which file a stem means.
 const SOURCE_EXTENSIONS: [&str; 3] = ["pdf", "html", "epub"];
+
+/// The separator between the pages of a converted markdown.
+///
+/// It is **reserved** by the scribe pipeline
+/// (`crates/hs-scribe/src/pipeline/markdown_generator.rs`): a `---` a
+/// model emits inside a page is rewritten to `***` first, so this exact
+/// byte sequence only ever appears between two pages. The markdown's
+/// page N is therefore the source document's page N.
+const PAGE_SEPARATOR: &str = "\n\n---\n\n";
 
 /// What the service needs to answer a request.
 pub struct DocsState {
@@ -150,11 +160,14 @@ async fn serve(
     }
     if hs_common::docs::verify(
         &state.key,
-        &stem,
-        format,
-        &params.subject,
-        params.issued_at,
-        params.expires_at,
+        &hs_common::docs::SignedFields {
+            stem: stem.clone(),
+            format,
+            subject: params.subject.clone(),
+            page: params.page,
+            issued_at: params.issued_at,
+            expires_at: params.expires_at,
+        },
         &params.signature,
     )
     .is_err()
@@ -172,10 +185,12 @@ async fn serve(
     }
 
     // The key: where this stem's object lives. The client never says.
-    let (key, content_type, extension) = match format {
+    // `body` is `Some` when the link names a page of the markdown: that
+    // page is served in place of the whole document.
+    let (key, content_type, extension, body) = match format {
         LinkFormat::Source => {
             match find_source_key(&*state.storage, &state.papers_prefix, &stem).await {
-                Some(found) => found,
+                Some((key, content_type, extension)) => (key, content_type, extension, None),
                 None => return not_found(),
             }
         }
@@ -188,10 +203,34 @@ async fn serve(
             if state.storage.head(&key).await.ok().flatten().is_none() {
                 return not_found();
             }
+            // A link that names a page serves that page: the markdown's
+            // pages are the source's pages, and the separator between
+            // them is a reserved byte sequence, so splitting on it is
+            // splitting on the document's own page boundaries.
+            let body = match params.page {
+                None => None,
+                Some(page) => {
+                    let bytes = match state.storage.get(&key).await {
+                        Ok(bytes) => bytes,
+                        Err(e) if hs_common::storage::is_not_found(&e) => return not_found(),
+                        Err(_) => return not_found(),
+                    };
+                    let text = String::from_utf8_lossy(&bytes);
+                    let pages: Vec<&str> = text.split(PAGE_SEPARATOR).collect();
+                    // The pages are 1-based. A page the document does
+                    // not have is a 404, not an empty page: the link
+                    // named something that is not there.
+                    if page == 0 || page as usize > pages.len() {
+                        return not_found();
+                    }
+                    Some(pages[page as usize - 1].to_string())
+                }
+            };
             (
                 key,
                 "text/markdown; charset=utf-8".to_string(),
                 "md".to_string(),
+                body,
             )
         }
     };
@@ -212,20 +251,32 @@ async fn serve(
         }
     }
 
-    let (size, stream) = match state.storage.get_stream(&key, range).await {
-        Ok(pair) => pair,
-        Err(e) if hs_common::storage::is_not_found(&e) => return not_found(),
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                "the document could not be read",
-            )
-                .into_response()
+    // The bytes that are sent: the whole object, the range's part, or
+    // the one page the link named.
+    let (size, stream): (u64, BoxStream<'static, anyhow::Result<Vec<u8>>>) = match body {
+        // A page of the markdown was already extracted.
+        Some(page) => {
+            let bytes = page.into_bytes();
+            let len = bytes.len() as u64;
+            let stream = futures::stream::once(async move { Ok(bytes) }).boxed();
+            (len, stream)
         }
+        None => match state.storage.get_stream(&key, range).await {
+            Ok(pair) => pair,
+            Err(e) if hs_common::storage::is_not_found(&e) => return not_found(),
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    "the document could not be read",
+                )
+                    .into_response()
+            }
+        },
     };
 
-    // The response's own length: the whole object, or the range's part.
+    // The response's own length: the whole object, the range's part, or
+    // the page.
     let body_len = match range {
         Some(range) => range.len(size).unwrap_or(0),
         None => size,
@@ -271,6 +322,15 @@ async fn serve(
             HeaderValue::from_str(&format!("bytes {start}-{end}/{size}"))
                 .unwrap_or(HeaderValue::from_static("bytes 0-0/0")),
         );
+    }
+    // Where in the document the bytes that were sent are. A client
+    // that fetched a page knows which page it is looking at, and a
+    // client that fetched the whole document can point at the page the
+    // link named.
+    if let Some(page) = params.page {
+        if let Ok(value) = HeaderValue::from_str(&format!("#page={page}")) {
+            headers.insert(header::CONTENT_LOCATION, value);
+        }
     }
     // An HTML source is an untrusted page: it is served in a sandbox,
     // with no scripts and no same-origin access.
@@ -569,7 +629,7 @@ mod tests {
         format: LinkFormat,
         subject: &str,
     ) -> String {
-        let params = hs_common::docs::mint(key, stem, format, subject, 3600).unwrap();
+        let params = hs_common::docs::mint(key, stem, format, subject, None, 3600).unwrap();
         format!("/docs/v1/{stem}/{format}?{}", params.to_query())
     }
 
@@ -640,7 +700,8 @@ mod tests {
 
         // A link whose expiry is in the past.
         let params =
-            hs_common::docs::mint(&key, "10.1234_test", LinkFormat::Source, "laptop", 0).unwrap();
+            hs_common::docs::mint(&key, "10.1234_test", LinkFormat::Source, "laptop", None, 0)
+                .unwrap();
         let uri = format!("/docs/v1/10.1234_test/source?{}", params.to_query());
         assert_eq!(call(&app, &uri, None).await.status, 403);
     }
@@ -726,6 +787,90 @@ mod tests {
             Some("text/markdown; charset=utf-8")
         );
         assert!(String::from_utf8_lossy(&resp.body).starts_with("# 10.1234_test"));
+    }
+
+    #[tokio::test]
+    async fn a_link_naming_a_page_serves_that_page() {
+        // The markdown's pages are the source's pages, and the
+        // separator between them is reserved, so a link that names
+        // page 2 serves the second page and not the whole document.
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, key, _state) = service(tmp.path()).await;
+        put_document(tmp.path(), "10.1234_test", b"%PDF-1.5 pretend").await;
+
+        // A two-page document.
+        let storage = LocalFsStorage::new(tmp.path());
+        storage
+            .put(
+                &format!("markdown/{}", hs_common::sharded_key("10.1234_test", "md")),
+                b"page one text\n\n---\n\npage two text".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let params = hs_common::docs::mint(
+            &key,
+            "10.1234_test",
+            LinkFormat::Markdown,
+            "laptop",
+            Some(2),
+            3600,
+        )
+        .unwrap();
+        let uri = format!("/docs/v1/10.1234_test/markdown?{}", params.to_query());
+        let resp = call(&app, &uri, None).await;
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8_lossy(&resp.body).to_string();
+        assert!(body.contains("page two text"), "{body}");
+        assert!(!body.contains("page one text"), "{body}");
+        // The response says where in the document the bytes are.
+        assert_eq!(resp.header("content-location"), Some("#page=2"));
+    }
+
+    #[tokio::test]
+    async fn a_link_naming_a_page_the_document_does_not_have_is_a_404() {
+        // The link was good; the page is not there. That is a 404, not a
+        // 403 and not an empty page.
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, key, _state) = service(tmp.path()).await;
+        put_document(tmp.path(), "10.1234_test", b"%PDF-1.5 pretend").await;
+
+        let params = hs_common::docs::mint(
+            &key,
+            "10.1234_test",
+            LinkFormat::Markdown,
+            "laptop",
+            Some(99),
+            3600,
+        )
+        .unwrap();
+        let uri = format!("/docs/v1/10.1234_test/markdown?{}", params.to_query());
+        assert_eq!(call(&app, &uri, None).await.status, 404);
+    }
+
+    #[tokio::test]
+    async fn a_tampered_page_is_refused() {
+        // The page is part of the request, so changing it in the URL
+        // invalidates the signature: a link for page 2 cannot be
+        // edited into a link for page 3.
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, key, _state) = service(tmp.path()).await;
+        put_document(tmp.path(), "10.1234_test", b"%PDF-1.5 pretend").await;
+
+        let params = hs_common::docs::mint(
+            &key,
+            "10.1234_test",
+            LinkFormat::Source,
+            "laptop",
+            Some(2),
+            3600,
+        )
+        .unwrap();
+        let uri = format!("/docs/v1/10.1234_test/source?{}", params.to_query());
+        assert_eq!(call(&app, &uri, None).await.status, 200);
+        // The same signature, a different page.
+        let tampered = uri.replace("page=2", "page=3");
+        assert_eq!(call(&app, &tampered, None).await.status, 403);
     }
 
     #[tokio::test]

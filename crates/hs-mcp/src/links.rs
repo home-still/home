@@ -80,7 +80,17 @@ impl LinkMinter {
     ///
     /// `None` when links are not configured, or when the document's
     /// stem is not a stem: a document with no valid stem has no link.
-    pub fn mint(&self, stem: &str) -> Option<DocumentLinks> {
+    ///
+    /// `page` is the page the passage is on, and `passage` is its
+    /// first line. The page is what a PDF viewer scrolls to; the first
+    /// line is what a text fragment quotes, so the browser selects the
+    /// passage itself.
+    pub fn mint(
+        &self,
+        stem: &str,
+        page: Option<u32>,
+        passage: Option<&str>,
+    ) -> Option<DocumentLinks> {
         let key = self.key.as_ref()?;
         let lan_base = self.lan_base_url.as_ref()?;
         let remote_base = self.remote_base_url.as_ref()?;
@@ -96,14 +106,26 @@ impl LinkMinter {
             (LinkFormat::Markdown, &mut out.markdown),
         ] {
             let Ok(params) =
-                hs_common::docs::mint(key, stem, format, &self.subject, self.link_ttl_secs)
+                hs_common::docs::mint(key, stem, format, &self.subject, page, self.link_ttl_secs)
             else {
                 continue;
             };
             expires_at = expires_at.max(params.expires_at);
+            // The source is a PDF or an HTML page: the browser can only
+            // scroll it to a page. The markdown is text: the browser can
+            // select the passage in it.
+            let fragment = match format {
+                LinkFormat::Source => params
+                    .page
+                    .map(hs_common::docs::pdf_page_fragment)
+                    .unwrap_or_default(),
+                LinkFormat::Markdown => passage
+                    .map(hs_common::docs::text_fragment)
+                    .unwrap_or_default(),
+            };
             *slot = Some(LinkPair {
-                lan: url(lan_base, &params),
-                remote: url(remote_base, &params),
+                lan: url(lan_base, &params, &fragment),
+                remote: url(remote_base, &params, &fragment),
             });
         }
         if out.source.is_none() && out.markdown.is_none() {
@@ -135,10 +157,14 @@ pub struct DocsConfig {
 pub const DEFAULT_TTL_SECS: u64 = 3600;
 
 /// The URL for a link's parameters.
-fn url(base: &str, params: &hs_common::docs::LinkParams) -> String {
+///
+/// The fragment points the browser at the passage: a page for a PDF, a
+/// quoted line for the markdown. The page is *also* in the query
+/// string, where the signature covers it.
+fn url(base: &str, params: &hs_common::docs::LinkParams, fragment: &str) -> String {
     let base = base.trim_end_matches('/');
     format!(
-        "{base}/docs/v1/{}/{}?{}",
+        "{base}/docs/v1/{}/{}?{}{fragment}",
         params.stem,
         params.format.as_str(),
         params.to_query()
@@ -184,7 +210,7 @@ mod tests {
 
     #[test]
     fn a_minted_link_carries_both_urls_and_an_expiry() {
-        let links = minter().mint("10.1234_abcd").unwrap();
+        let links = minter().mint("10.1234_abcd", None, None).unwrap();
         let source = links.source.unwrap();
         assert!(source
             .lan
@@ -198,9 +224,40 @@ mod tests {
     }
 
     #[test]
+    fn a_link_names_the_page_and_points_at_it() {
+        // The PDF link scrolls to the page: the page is in the query
+        // (where the signature covers it) and in the fragment (where
+        // the browser reads it).
+        let links = minter().mint("10.1234_abcd", Some(11), None).unwrap();
+        let source = links.source.unwrap();
+        assert!(source.lan.contains("page=11"), "{}", source.lan);
+        assert!(source.lan.ends_with("#page=11"), "{}", source.lan);
+        assert!(source.remote.ends_with("#page=11"), "{}", source.remote);
+    }
+
+    #[test]
+    fn a_markdown_link_quotes_the_passage() {
+        // The markdown link selects the passage: a text fragment names
+        // the text, and the browser finds it in the document it
+        // loaded.
+        let links = minter()
+            .mint("10.1234_abcd", Some(11), Some("The passage's first line"))
+            .unwrap();
+        let markdown = links.markdown.unwrap();
+        assert!(markdown.lan.contains("#:~:text="), "{}", markdown.lan);
+        assert!(
+            markdown.lan.contains("The%20passage%27s%20first%20line"),
+            "{}",
+            markdown.lan
+        );
+        // The PDF link points at a page, not at text.
+        assert!(links.source.unwrap().lan.ends_with("#page=11"));
+    }
+
+    #[test]
     fn a_stem_that_is_not_a_stem_has_no_link() {
-        assert!(minter().mint("../etc/passwd").is_none());
-        assert!(minter().mint("").is_none());
+        assert!(minter().mint("../etc/passwd", None, None).is_none());
+        assert!(minter().mint("", None, None).is_none());
     }
 
     #[test]
@@ -213,6 +270,6 @@ mod tests {
             subject: "test".to_string(),
         };
         assert!(!m.is_enabled());
-        assert!(m.mint("10.1234_abcd").is_none());
+        assert!(m.mint("10.1234_abcd", None, None).is_none());
     }
 }
