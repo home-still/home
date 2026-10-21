@@ -181,8 +181,9 @@ The detector recognises the citation styles the corpus actually uses: a
 list, an ALL-CAPS APA list, a full given name, a reference number of
 any size, a page range, a volume, and a bulleted author list. Measured
 on the fixed query set: the share of queries whose **first** hit is a
-bibliography fell from 28 % to 0 %, and the reference-list share of the
-page from 21.6 % to 3.6 %, with recall unchanged. See
+bibliography fell from 28 % to 4 %, the reference-like hits in the top 3
+from 24 % to 4 %, and recall rose from 96 % to 100 % — a bibliography
+that outranked the answer had pushed it out of the page. See
 [docs/loop/runs/2026-10-21-06/research.md](docs/loop/runs/2026-10-21-06/research.md).
 
 ### Setup
