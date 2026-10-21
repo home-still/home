@@ -1470,6 +1470,14 @@ refused by a newer one, and the other way round. The links are
 short-lived (an hour by default), so the window is small — but the
 docs service and the MCP server must be upgraded **together**.
 
+**The migration has been run; the fleet has not been upgraded.** The
+321 files are in the bucket — `aws s3 ls s3://home-still/` now lists
+the `personal/` prefix, and the store is shared by every host and
+covered by the backup. The *binaries* are still rc.373 on all five
+hosts, so the live `personal_search` still returns no links until the
+MCP server is upgraded. The rules say not to run `hs upgrade` on live
+services, so that is the operator's step.
+
 
 ### Top 5 remaining items
 
