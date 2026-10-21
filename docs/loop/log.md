@@ -872,7 +872,9 @@ design: the signal is the **author list**, not the punctuation, and a
 **Research.**
 `docs/loop/runs/2026-10-21-06/research.md` — the problem measured,
 the root cause, the literature, the technique chosen, and the expected
-effect.
+effect. `docs/loop/runs/2026-10-21-06/eval.md` — the before/after
+numbers, the precision measurement, the three bugs the tests caught,
+and how the numbers were produced.
 
 **What this is not.** Not a re-index: no vector is recomputed, no chunk
 is re-cut, the demotion happens at query time. Not a corpus change:
