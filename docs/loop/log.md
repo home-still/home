@@ -692,6 +692,25 @@ the highlighting: a server that rewrites the document it serves
 cannot also be the thing an agent reads, and the highlight belongs
 where the browser can resolve it.
 
+**Version.** `v0.0.1-rc.373` — a patch-level bump. The change adds a
+query parameter and a URL fragment: it changes no wire format's shape,
+no collection schema and no stored data, and no vector is recomputed.
+
+**Release.** `v0.0.1-rc.373`, published at
+<https://github.com/home-still/home/releases/tag/v0.0.1-rc.373>: 33
+assets, the same five build targets and both Docker images. The
+published `hs` binary was downloaded and checked: it carries the
+`0.0.1-rc.373` marker and the `hs docs link --page` flag.
+
+**Deployed** with `hs upgrade --pre --yes`, in series: `big`, `two`,
+`bmb`, `mac_air`, `big_mac` — every host reports `hs 0.0.1-rc.373`.
+`big` restarted 9 services, including `hs-serve-docs`. Verified on
+the deployed release: a link naming page 15 of
+`10.1677_joe.1.06233` serves that page (7,453 bytes of a 73,923-byte
+document, starting with the reference list) and answers
+`content-location: #page=15`; the PDF link answers the same; and a
+link whose page was edited from 15 to 3 is a **403**.
+
 ### Top 5 remaining items
 
 1. **Cross-encoder reranking.** The remaining 7 % reference-list noise
