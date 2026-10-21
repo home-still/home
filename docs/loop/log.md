@@ -1458,6 +1458,12 @@ to a signed link and one collection to the docs service's
 configuration. It touches no stored data's *content* (the migration
 copies, it does not rewrite) and no search behaviour.
 
+**Commit.** `5b9532b` — "feat(docs): a personal document the agent can
+show the user", with `e7fca05` fixing two test attributes clippy
+caught.
+
+**Release.** `v0.0.1-rc.377`, tagged from `5b9532b` on `main`.
+
 **Note for whoever deploys it.** The link's signature shape changed:
 the collection is now in it. A link minted by an **older** service is
 refused by a newer one, and the other way round. The links are
