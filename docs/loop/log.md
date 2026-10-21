@@ -558,6 +558,27 @@ needs no sudo, and `--uninstall` removes both forms. Two `conflicts_with`
 attributes on one argument means the second replaces the first, so the
 conflicts are declared with `conflicts_with_all`.
 
+**Release.** `v0.0.1-rc.372`, published at
+<https://github.com/home-still/home/releases/tag/v0.0.1-rc.372>: 33
+assets, the same five build targets and both Docker images. The
+published `hs` binary was downloaded and checked: it carries the
+`0.0.1-rc.372` marker and the `hs serve docs --install-user` flag.
+
+One build failed on the way there — `aarch64-apple-darwin`, on a
+GitHub **artifact-upload** timeout, after the build itself had
+succeeded ("Finished `release` profile in 6m 15s"). That is CI
+infrastructure, not the code: the job was re-run and passed. The
+distinction matters, and the log says which it was.
+
+**Deployed** with `hs upgrade --pre --yes`, in series: `big`, `two`,
+`bmb`, `mac_air`, `big_mac` — every host reports `hs 0.0.1-rc.372`.
+`big` restarted 8 services, the others 1 each. The scribe server on
+`big` came back from the *released* artifact with `layout_model: true`
+and `table_model: true` and **zero restarts** — the crash-loop is gone
+from the release, not just from a hand-built binary. The docs service
+runs as `hs-serve-docs.service` under the user's systemd, answering
+on :7446, and a link minted with the released CLI opens a real PDF.
+
 ### Top 5 remaining items
 
 1. **Highlight the text in the document (the wishlist's second half).**
