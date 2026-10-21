@@ -891,7 +891,18 @@ presence.
 **Commit.** `5bad869` — "feat(distill): the demoter can see the corpus's
 bibliographies".
 
-**Release.** `v0.0.1-rc.374`, tagged from `3e45f18` on `main`.
+**Release.** `v0.0.1-rc.374`, tagged from `3e45f18` on `main`:
+<https://github.com/home-still/home/releases/tag/v0.0.1-rc.374> — 33
+assets, the same five build targets and both Docker images, all twelve
+jobs green. The published `hs` binary was downloaded and checked: it
+reports `hs 0.0.1-rc.374`, carries the `0.0.1-rc.374` version marker
+and is x86-64; the published `hs-distill-server` — the binary that
+carries the fix — carries the same marker.
+
+**Not deployed.** The live services on `big` were not upgraded: this
+iteration's rules say not to run `hs upgrade` on live services. The
+A/B was run instead with the new binary on an alternate port against
+the same Qdrant, with the live service on `:7434` untouched.
 
 ### Top 5 remaining items
 
