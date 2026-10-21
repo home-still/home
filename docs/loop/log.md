@@ -521,7 +521,7 @@ forwards `Range`, `Content-Range`, `ETag` and `Accept-Ranges`
 untouched, so E2 costs almost nothing at the gateway and gives the LAN
 and remote URLs the same check with no "trusted LAN" bypass.
 
-**Version.** `v0.0.1-rc.371` — a patch-level bump. It adds a service
+**Version.** `v0.0.1-rc.372` — a patch-level bump. It adds a service
 and a command, changes no wire format, no collection schema and no
 stored data, and no vector is recomputed.
 
@@ -544,6 +544,19 @@ were real defects in the new code, not CI noise:
 Tags are immutable, so each fix went into the next rc rather than
 into a retagged one. The lesson is the same both times: only a
 platform you do not develop on can tell you that a path is a path.
+
+**rc.371 shipped and was deployed**: all three gates green, 33 assets,
+and the published `hs-scribe-server` carries the CUDA provider — the
+scribe server on `big` came back with `layout_model: true` and
+`table_model: true` and zero restarts, from the *released* artifact
+rather than a hand-built one. Every host is on rc.371.
+
+**rc.372** adds `hs serve docs --install-user`: the docs service is a
+service the operator runs on their own machine, and `--install` writes
+a systemd unit under /etc, which needs root. The user-service form
+needs no sudo, and `--uninstall` removes both forms. Two `conflicts_with`
+attributes on one argument means the second replaces the first, so the
+conflicts are declared with `conflicts_with_all`.
 
 ### Top 5 remaining items
 
