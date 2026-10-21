@@ -1268,6 +1268,17 @@ embedder sizes a batch and what it does when the accelerator refuses
 one. It touches no stored data, no collection schema, no search
 behaviour and no wire format.
 
+**Commit.** `23a1cf6` — "fix(embed): a batch the card cannot hold is
+retried smaller".
+
+**The query set does not move.** The change is in the embedder's batch
+loop and the controller, not in retrieval. Re-run on the new server:
+RECALL@10 **25/25 = 100 %** — the same as rc.374 measured, and the
+live rc.373 server gives 24/25 (the difference is rc.374's demoter
+fix, which is in the new server and not in the deployed one).
+
+**Release.** `v0.0.1-rc.376`, tagged from `23a1cf6` on `main`.
+
 **Not deployed.** The live services were not upgraded: this iteration's
 rules say not to run `hs upgrade` on live services. The new binary was
 run on an alternate port against the same Qdrant and the same CUDA
