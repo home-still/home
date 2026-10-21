@@ -884,7 +884,14 @@ backlog; this is the 80 % that needs no GPU.
 
 **Version.** `v0.0.1-rc.374` — a patch-level bump. It changes the
 *order* of results, not which results, and touches no wire format,
-command surface, collection schema or stored data.
+command surface, collection schema or stored data. A patch bump, like
+rc.366 — the same kind of change: a search result's *position*, not its
+presence.
+
+**Commit.** `5bad869` — "feat(distill): the demoter can see the corpus's
+bibliographies".
+
+**Release.** `v0.0.1-rc.374`, tagged from `3e45f18` on `main`.
 
 ### Top 5 remaining items
 
