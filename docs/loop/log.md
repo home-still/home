@@ -1077,6 +1077,32 @@ optional field to a health response and changes what a status command
 reports. It touches no stored data, no collection schema and no search
 behaviour.
 
+**Release.** `v0.0.1-rc.375`, tagged from `3034253` on `main`:
+<https://github.com/home-still/home/releases/tag/v0.0.1-rc.375> — 33
+assets, the same five build targets and both Docker images, all twelve
+jobs green. The published `hs` binary was downloaded and checked: it
+reports `hs 0.0.1-rc.375`, carries the `0.0.1-rc.375` version marker
+and is x86-64; the published `hs-distill-server` — the binary that
+carries the fix — carries the same marker.
+
+**Commit.** `bf62884` — "fix(status): the server's own answer says
+whether it is running", with `62cedb9` fixing the test CI caught.
+
+**Not deployed.** The live services were not upgraded: this iteration's
+rules say not to run `hs upgrade` on live services. The fleet is still
+on rc.373 (`big`, `two`, `bmb`, `mac_air`, `big_mac` all report
+`hs 0.0.1-rc.373`), so the live `hs distill status` still reads the
+stale PID file until the fleet is upgraded. The A/B was run instead with
+the new binary on an alternate port against the same Qdrant, with the
+live service on `:7434` untouched.
+
+**Note for whoever deploys it.** rc.374 and rc.375 are two independent
+changes and the fleet is on neither. rc.374 fixed the reference-list
+demoter (the first hit of a query is prose, not a bibliography, and
+RECALL@10 rose from 96 % to 100 %); rc.375 fixed the status command's
+liveness report. Upgrading to rc.375 gets both, because rc.375 contains
+rc.374's change.
+
 
 ### Top 5 remaining items
 
