@@ -1277,7 +1277,13 @@ RECALL@10 **25/25 = 100 %** — the same as rc.374 measured, and the
 live rc.373 server gives 24/25 (the difference is rc.374's demoter
 fix, which is in the new server and not in the deployed one).
 
-**Release.** `v0.0.1-rc.376`, tagged from `23a1cf6` on `main`.
+**Release.** `v0.0.1-rc.376`, tagged from `23a1cf6` on `main`:
+<https://github.com/home-still/home/releases/tag/v0.0.1-rc.376> — 33
+assets, the same five build targets and both Docker images, all twelve
+jobs green. The published `hs` binary was downloaded and checked: it
+reports `hs 0.0.1-rc.376`, carries the `0.0.1-rc.376` version marker
+and is x86-64; the published `hs-distill-server` — the binary that
+carries the fix — carries the same marker.
 
 **Not deployed.** The live services were not upgraded: this iteration's
 rules say not to run `hs upgrade` on live services. The new binary was
