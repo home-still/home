@@ -2871,9 +2871,10 @@ impl HomeStillMcp {
                 // signature, so the link is a capability for this
                 // document and not for another store's.
                 let passage = h.snippet.lines().next().map(str::trim);
-                let links = self.link_minter.as_ref().and_then(|m| {
-                    m.mint(&h.stem, "personal", None, passage)
-                });
+                let links = self
+                    .link_minter
+                    .as_ref()
+                    .and_then(|m| m.mint(&h.stem, "personal", None, passage));
                 serde_json::json!({
                     "stem": h.stem,
                     "title": h.title,

@@ -739,7 +739,16 @@ mod tests {
     #[test]
     fn a_minted_link_verifies() {
         let k = key();
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 3600).unwrap();
+        let link = mint(
+            &k,
+            "10.1234_abcd",
+            LinkFormat::Source,
+            "laptop",
+            "academic",
+            None,
+            3600,
+        )
+        .unwrap();
         verify(
             &k,
             &SignedFields {
@@ -759,7 +768,16 @@ mod tests {
     #[test]
     fn a_tampered_stem_format_subject_or_expiry_does_not_verify() {
         let k = key();
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 3600).unwrap();
+        let link = mint(
+            &k,
+            "10.1234_abcd",
+            LinkFormat::Source,
+            "laptop",
+            "academic",
+            None,
+            3600,
+        )
+        .unwrap();
         // Any field the signature covers, changed, invalidates it.
         let tampered = |stem: &str, format: LinkFormat, subject: &str, expires_at: u64| {
             verify(
@@ -813,7 +831,16 @@ mod tests {
     fn a_link_signed_with_another_key_does_not_verify() {
         let a = key();
         let b = LinkKey::from_bytes(vec![9u8; 32]).unwrap();
-        let link = mint(&a, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 3600).unwrap();
+        let link = mint(
+            &a,
+            "10.1234_abcd",
+            LinkFormat::Source,
+            "laptop",
+            "academic",
+            None,
+            3600,
+        )
+        .unwrap();
         assert_eq!(
             verify(
                 &b,
@@ -837,7 +864,16 @@ mod tests {
         let k = key();
         // A link minted in the past is already expired.
         let expires_at = now_secs() - 1;
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 0).unwrap();
+        let link = mint(
+            &k,
+            "10.1234_abcd",
+            LinkFormat::Source,
+            "laptop",
+            "academic",
+            None,
+            0,
+        )
+        .unwrap();
         assert_eq!(
             verify(
                 &k,
@@ -912,7 +948,16 @@ mod tests {
         let k = key();
         for stem in ["../etc/passwd", "a/b", "", "..", "a\\b"] {
             assert_eq!(
-                mint(&k, stem, LinkFormat::Source, "laptop", "academic", None, 3600).unwrap_err(),
+                mint(
+                    &k,
+                    stem,
+                    LinkFormat::Source,
+                    "laptop",
+                    "academic",
+                    None,
+                    3600
+                )
+                .unwrap_err(),
                 LinkError::BadStem,
                 "{stem:?}"
             );
@@ -1105,7 +1150,8 @@ mod tests {
             LinkError::BadPage
         );
         assert_eq!(
-            LinkQuery::parse("iat=1&exp=2&sub=laptop&col=academic&fmt=source&page=0&sig=ab").unwrap_err(),
+            LinkQuery::parse("iat=1&exp=2&sub=laptop&col=academic&fmt=source&page=0&sig=ab")
+                .unwrap_err(),
             LinkError::BadPage
         );
     }
@@ -1133,7 +1179,16 @@ mod tests {
     #[test]
     fn a_link_with_no_page_has_no_page_in_its_query() {
         let k = key();
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 3600).unwrap();
+        let link = mint(
+            &k,
+            "10.1234_abcd",
+            LinkFormat::Source,
+            "laptop",
+            "academic",
+            None,
+            3600,
+        )
+        .unwrap();
         assert!(!link.to_query().contains("page="), "{}", link.to_query());
         assert_eq!(LinkQuery::parse(&link.to_query()).unwrap().page, None);
     }

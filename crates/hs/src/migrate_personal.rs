@@ -67,7 +67,12 @@ pub async fn run_personal_to_storage(
     let root = personal_cfg.root_dir();
     let markdown = personal_cfg.markdown_dir();
     let mut sources = Vec::new();
-    collect_files(&root, &root, &mut sources, &["pdf", "html", "epub", "docx", "txt", "catalog.yaml"])?;
+    collect_files(
+        &root,
+        &root,
+        &mut sources,
+        &["pdf", "html", "epub", "docx", "txt", "catalog.yaml"],
+    )?;
     let mut texts = Vec::new();
     collect_files(&markdown, &markdown, &mut texts, &["md"])?;
 

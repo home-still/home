@@ -204,9 +204,16 @@ mod tests {
     #[test]
     fn a_link_url_carries_the_stem_the_format_and_the_signature() {
         let key = LinkKey::from_bytes(vec![3u8; 32]).unwrap();
-        let params =
-            hs_common::docs::mint(&key, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 60)
-                .unwrap();
+        let params = hs_common::docs::mint(
+            &key,
+            "10.1234_abcd",
+            LinkFormat::Source,
+            "laptop",
+            "academic",
+            None,
+            60,
+        )
+        .unwrap();
         let url = link_url("http://host:7446/", &params);
         assert!(url.starts_with("http://host:7446/docs/v1/10.1234_abcd/source?"));
         assert!(url.contains("sub=laptop"));

@@ -221,7 +221,9 @@ mod tests {
 
     #[test]
     fn a_minted_link_carries_both_urls_and_an_expiry() {
-        let links = minter().mint("10.1234_abcd", "academic", None, None).unwrap();
+        let links = minter()
+            .mint("10.1234_abcd", "academic", None, None)
+            .unwrap();
         let source = links.source.unwrap();
         assert!(source
             .lan
@@ -239,7 +241,9 @@ mod tests {
         // The PDF link scrolls to the page: the page is in the query
         // (where the signature covers it) and in the fragment (where
         // the browser reads it).
-        let links = minter().mint("10.1234_abcd", "academic", Some(11), None).unwrap();
+        let links = minter()
+            .mint("10.1234_abcd", "academic", Some(11), None)
+            .unwrap();
         let source = links.source.unwrap();
         assert!(source.lan.contains("page=11"), "{}", source.lan);
         assert!(source.lan.ends_with("#page=11"), "{}", source.lan);
@@ -252,7 +256,12 @@ mod tests {
         // the text, and the browser finds it in the document it
         // loaded.
         let links = minter()
-            .mint("10.1234_abcd", "academic", Some(11), Some("The passage's first line"))
+            .mint(
+                "10.1234_abcd",
+                "academic",
+                Some(11),
+                Some("The passage's first line"),
+            )
             .unwrap();
         let markdown = links.markdown.unwrap();
         assert!(markdown.lan.contains("#:~:text="), "{}", markdown.lan);
@@ -267,7 +276,9 @@ mod tests {
 
     #[test]
     fn a_stem_that_is_not_a_stem_has_no_link() {
-        assert!(minter().mint("../etc/passwd", "academic", None, None).is_none());
+        assert!(minter()
+            .mint("../etc/passwd", "academic", None, None)
+            .is_none());
         assert!(minter().mint("", "academic", None, None).is_none());
     }
 

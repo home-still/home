@@ -786,9 +786,16 @@ mod tests {
         put_document(tmp.path(), "10.1234_test", b"%PDF-1.5 pretend").await;
 
         // A link whose expiry is in the past.
-        let params =
-            hs_common::docs::mint(&key, "10.1234_test", LinkFormat::Source, "laptop", "academic", None, 0)
-                .unwrap();
+        let params = hs_common::docs::mint(
+            &key,
+            "10.1234_test",
+            LinkFormat::Source,
+            "laptop",
+            "academic",
+            None,
+            0,
+        )
+        .unwrap();
         let uri = format!("/docs/v1/10.1234_test/source?{}", params.to_query());
         assert_eq!(call(&app, &uri, None).await.status, 403);
     }
@@ -880,7 +887,10 @@ mod tests {
         );
         let resp = call(&app, &uri, None).await;
         assert_eq!(resp.status, 200);
-        assert_eq!(resp.header("content-type"), Some("text/markdown; charset=utf-8"));
+        assert_eq!(
+            resp.header("content-type"),
+            Some("text/markdown; charset=utf-8")
+        );
         let body = String::from_utf8_lossy(&resp.body);
         assert!(
             body.contains("the personal body"),
