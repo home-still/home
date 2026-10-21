@@ -1462,7 +1462,13 @@ copies, it does not rewrite) and no search behaviour.
 show the user", with `e7fca05` fixing two test attributes clippy
 caught.
 
-**Release.** `v0.0.1-rc.377`, tagged from `5b9532b` on `main`.
+**Release.** `v0.0.1-rc.377`, tagged from `6d0a191` on `main`:
+<https://github.com/home-still/home/releases/tag/v0.0.1-rc.377> — 33
+assets, the same five build targets and both Docker images, all twelve
+jobs green. The published `hs` binary was downloaded and checked: it
+reports `hs 0.0.1-rc.377`, carries the `0.0.1-rc.377` version marker
+and is x86-64; the published `hs-mcp` — the binary that mints the links
+— carries the same marker.
 
 **Note for whoever deploys it.** The link's signature shape changed:
 the collection is now in it. A link minted by an **older** service is
