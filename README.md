@@ -174,9 +174,16 @@ citation to work about hippocampal neurogenesis *is* about hippocampal
 neurogenesis — so a chunk of `doi:` lines can be the best-ranked hit for
 a question. Such chunks are pushed below the passages that discuss the
 topic; they are not dropped, so a user asking for a bibliography still
-gets it. Measured on the fixed query set: the share of reference-like
-chunks in the top 3 fell from 35 % to 9 %. See
-[docs/loop/runs/2026-10-20-02/research.md](docs/loop/runs/2026-10-20-02/research.md).
+gets it.
+
+The detector recognises the citation styles the corpus actually uses: a
+`doi:`, an `et al.`, a parenthesised **or bare** year after an author
+list, an ALL-CAPS APA list, a full given name, a reference number of
+any size, a page range, a volume, and a bulleted author list. Measured
+on the fixed query set: the share of queries whose **first** hit is a
+bibliography fell from 28 % to 0 %, and the reference-list share of the
+page from 21.6 % to 3.6 %, with recall unchanged. See
+[docs/loop/runs/2026-10-21-06/research.md](docs/loop/runs/2026-10-21-06/research.md).
 
 ### Setup
 

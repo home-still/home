@@ -1454,6 +1454,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bibliography_in_a_bare_year_style_is_demoted_below_prose() {
+        // The style the old rules missed: the year is not in
+        // parentheses. Measured 2026-10-21, this shape was the first
+        // hit for 6 of the 25 fixed queries and was not demoted.
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = vec![
+                hit(
+                    "bibliography",
+                    "Sundralingham, P. 1983 Responses of potted seedlings of Dryobalanops \
+                     aromatica to shading. Malaysian Forester.\n\
+                     Tanner, E. V. J., Vitousek, P. M. & Cuevas, E. 1998 Experimental \
+                     investigation of nutrient limitation. Ecology 79:744-52.\n\
+                     Trenberth, K. E. 1997 The definition of El Nino. Bull. Am. Meteorol. Soc.",
+                ),
+                hit("prose", "Something about the subject matter."),
+            ];
+        }
+        let hits = h
+            .state
+            .search(search_req("q", Some(3), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits[0].doc_id, "prose",
+            "the bare-year bibliography was not demoted below the prose"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bibliography_in_a_numbered_style_is_demoted_below_prose() {
+        // The other style the old rules missed: the reference number is
+        // not "1." or "2.", and the entry is not in parentheses.
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = vec![
+                hit(
+                    "bibliography",
+                    "59. Ferguson JN, Aldag JM, Insel TR, Young LJ. Oxytocin in the medial \
+                     amygdala is essential for social recognition. J Neurosci 2009.\n\
+                     71. Melis MR, Succu S, Mascia MS, Cortis L, Argiolas A. Extra-cellular \
+                     dopamine increases in the paraventricular nucleus. Neurosci Lett 2003.\n\
+                     72. Waldherr M, Neumann ID. Centrally released oxytocin mediates mating-induced \
+                     anxiolysis in male rats. Proc Natl Acad Sci 2007.",
+                ),
+                hit("prose", "Something about the subject matter."),
+            ];
+        }
+        let hits = h
+            .state
+            .search(search_req("q", Some(3), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits[0].doc_id, "prose",
+            "the numbered bibliography was not demoted below the prose"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_numbered_prose_paragraph_is_not_demoted() {
+        // "22. The idea of the series is, in itself, important …" is a
+        // numbered footnote, not a bibliography. Demoting it would hide
+        // prose from the user.
+        let h = harness();
+        {
+            let mut st = h.store.state.lock();
+            st.canned_hits = vec![hit(
+                "prose",
+                "22. The idea of the series is, in itself, important to Eisenman's early \
+                     development. Sandra Kaji-O'Gorman explores the relationship in detail.\n\
+                     19. Eisenman is in an interesting tension with Bergson here, as he often was \
+                     in his writings about the nature of form.",
+            )];
+        }
+        let hits = h
+            .state
+            .search(search_req("q", Some(3), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits[0].doc_id, "prose",
+            "a numbered prose paragraph was wrongly demoted"
+        );
+    }
+
+    #[tokio::test]
     async fn the_dense_pool_is_the_page() {
         // A wider dense pool changes the ranking enough to lose an
         // expected passage: for "Dawson and Krebs", the extra candidates

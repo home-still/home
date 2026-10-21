@@ -743,3 +743,176 @@ link whose page was edited from 15 to 3 is a **403**.
    "personal documents get links" is not started. Moving it behind
    `Storage` (a `hs migrate personal-to-storage`) would let one read
    path serve every document the corpus holds.
+## 2026-10-21-06 — the demoter that cannot see the corpus's bibliographies
+
+**Change.** The search path already demoted reference lists below the
+passages that discuss the topic (rc.366). The demoter was wired in and
+correct — but its **detector could not see the bibliographies this
+corpus actually contains**, so 7 of the 25 fixed queries opened with a
+bibliography and the user got a list of citations instead of a passage.
+
+The detector now recognises the four styles the corpus really uses:
+a **bare year** after an author list (`Sundralingham, P. 1983 …`), an
+**ALL-CAPS APA** list (`ALBERG, D., LAST, M., AND KANDEL, A. 2012. …`),
+a **full given name** (`Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua
+Bengio. 2015. …`), and a **reference number other than 1 or 2**
+(`59. Ferguson JN, …`, `(34) Lewis, J. A. …`).
+
+**Why this ranked first.** It beat the runner-up (cross-encoder
+reranking) for three reasons, all measured:
+
+1. **The noise is the largest remaining wrongness.** The cross-encoder
+   is the right long-term answer, but it is *blocked*: it needs a second
+   GPU service and the 3090 on `big` is shared — at the time of
+   measurement it had 22.4 of 24.6 GB used, with a 12 GB VLLM tenant on
+   it. This fix needs no GPU at all.
+2. **It is a bug, not a tuning problem.** The demoter exists and is
+   correct; the rule set is wrong. A user asking a question gets a
+   bibliography for 28 % of the fixed query set, and the passage that
+   answers the question is *in the results* — behind it. Nothing is
+   missing from the corpus and nothing needs re-indexing.
+3. **It is one file.** The whole change is
+   `crates/hs-distill/src/reference_list.rs` plus its tests. The
+   cross-encoder is a new service, a new model on disk, a new latency
+   budget, and a new failure mode.
+
+**The evidence.** Measured on the live corpus, 2026-10-21, **A/B on the
+same corpus and the same query set**: the running rc.373 server on
+`:7434` and the new rc.374 server on `:7436`, both reading the same
+Qdrant collection, both on CUDA. The judge is **independent** — the
+eval harness carries its own detector, so the metric does not depend on
+the code under test:
+
+| | rc.373 (before) | rc.374 (after) |
+|---|---|---|
+| the **first** hit is a reference list | **7/25 = 28 %** | **1/25 = 4 %** |
+| reference-like hits in the top 3 | 18/75 = 24 % | **3/75 = 4 %** |
+| reference-list share of the page | 54/250 = 22 % | **30/250 = 12 %** |
+| RECALL@10 | 24/25 = 96 % | **25/25 = 100 %** |
+| median latency | 149 ms | 150 ms |
+
+**Recall went up, not down** — from 96 % to 100 %. The constraint was
+"must not drop"; it improved, and the reason is the same mechanism as
+the fix: for `q25` ("Rosalind Franklin and the diffraction data of
+DNA") the expected passage was at rank 11 of the page, pushed out of
+the top 10 by a bibliography that outranked it. Demoting the
+bibliography promoted the passage back into the page — it now sits at
+rank 9. The six queries whose first hit changed all changed the same
+way: from a bibliography to prose.
+
+**The one query that still opens with a bibliography** is `q14`
+("hippocampal neurogenesis and adult memory"), and it is a **mixed
+chunk** — a citation list with a line of prose attached, at a share
+just under 0.5. The threshold is deliberately conservative: a chunk
+that mixes a citation with real prose discusses the topic and cites it,
+and demoting it would hide the prose. The one remaining case is the
+right trade.
+
+**End to end on the live corpus, with timings.** The same three
+queries through both servers:
+
+| query | rc.373's first hit | rc.374's first hit |
+|---|---|---|
+| "oxytocin social behaviour and vasopressin" | a 12-entry bibliography of neuroscience citations (1,890 ms) | *Human endogenous oxytocin and its neural correlates show adaptive responses to social touch…* (1,263 ms) |
+| "nutrient limitation of tropical forest growth" | a bibliography (285 ms) | the paper that discusses it (199 ms) |
+| "3D printing of controlled release pharmaceutical bilayer tablets" | a table chunk (352 ms) | the same table chunk (300 ms) — **a table is not a bibliography, and it is not demoted** |
+
+**The root cause, read off the code.** `is_citation_line` is
+*disjunctive*: a `doi:`, an `et al.`, a parenthesised year, a `pp.`, a
+`vol.`, a `[n]`, a bare URL, a retrieval phrase, or a bulleted author
+list makes a line a citation. That set covers the formats the rule was
+written against. It misses the corpus's, because it looks for a
+**parenthesised** year and the corpus writes a **bare** one, and because
+`is_numbered_entry` only strips `1.` and `2.` while the corpus numbers
+its references into the hundreds.
+
+The new rules are **conjunctive** — an author list **and** a year, or a
+reference number **and** an author — which is what lets them be
+recognisable without catching prose. A prose sentence has a year, or a
+number, but it does not have a capitalised surname followed by initials.
+
+**Every crossing was inspected.** The new rules can only *add*
+detections, so the precision question is: of the chunks they newly call
+reference lists, how many are not bibliographies? Measured on a
+**761-chunk** pool (every distinct chunk the fixed query set returns at
+a deep limit, 50 per query), the new rules call **91 (12.0 %)** a
+reference list, and **all 91 were read by eye: every one is a genuine
+bibliography**. Zero false positives. The one that looked like prose at
+first — a paper's conclusion followed by its `References` section — is a
+chunk that is *mostly* bibliography, and the 0.5 threshold is what
+decides that correctly.
+
+**The three bugs the tests caught.** The first implementation of the new
+rules was wrong three times, and the tests found each:
+
+* `has_author_list_shape` split the line on commas, so `Sundralingham,
+  P.` — a surname and an initial separated by a comma — never matched.
+  The scan is over **author pairs**, not whitespace-separated tokens.
+* `has_standalone_bare_year` claimed `Genes Dev. 2009, 23, 939-950`,
+  which is a journal, a volume and a page range, not a bare year.
+* the initials check accepted only *one* initial, so `Tinetti ME` — two
+  — did not match.
+
+**The literature, and the corpus's own prior art.** Searched the corpus
+first. `10.1007_s10648-025-10073-9` describes its own preprocessing:
+*"we then removed the abstract and references from the output using
+regular expressions"* — rule-based reference removal is the published
+practice, not a heuristic invented here. *A Hybrid Approach and Unified
+Framework for Bibliographic Reference Extraction* (arXiv 1912.07266)
+states the standard heuristic and its limit directly: *"adopted
+heuristics will look for comma-separated author names at the start of
+the reference string. The drawback … is that it will not be able to
+detect a reference if it does not comply with defined heuristics …
+Every domain has its unique referencing style and sometimes multiple
+referencing styles exist within one domain, making simple approaches
+unsuitable for this complex task."* Two things follow, and they are the
+design: the signal is the **author list**, not the punctuation, and a
+**rule set** is needed because the styles coexist.
+
+**Research.**
+`docs/loop/runs/2026-10-21-06/research.md` — the problem measured,
+the root cause, the literature, the technique chosen, and the expected
+effect.
+
+**What this is not.** Not a re-index: no vector is recomputed, no chunk
+is re-cut, the demotion happens at query time. Not a corpus change:
+nothing is rebuilt, purged or re-embedded. Not a cross-encoder: that
+remains the right long-term answer and stays the first item of the
+backlog; this is the 80 % that needs no GPU.
+
+**Version.** `v0.0.1-rc.374` — a patch-level bump. It changes the
+*order* of results, not which results, and touches no wire format,
+command surface, collection schema or stored data.
+
+### Top 5 remaining items
+
+1. **Cross-encoder reranking.** Still the right long-term answer for
+   the rest of the ranking wrongness — and still **blocked**: it needs a
+   second GPU service, and the 3090 on `big` is shared. Measured
+   2026-10-21 at 22.4 of 24.6 GB used, with a 12 GB VLLM tenant on it
+   for part of the day. The reference-list noise is now 4 % of the
+   first hits; what is left is the *order* of the prose.
+2. **Decide the async-nats crash-loop** (see
+   `needs-decision/async-nats-missed-idle-heartbeat.md`). Recommended
+   option A: catch `MissingHeartbeat` and recreate the pull stream
+   instead of exiting. Not ours to make — it is a change to a vendored
+   crate.
+3. **Fix the README drift.** The README describes OCR as "GLM-OCR via
+   Ollama" only (the code also has olmOCR, OpenAI-compatible and Cloud
+   backends) and omits `crates/openalex-ingest` and the `personal`
+   feature from the architecture list. Cheap, and it misleads anyone
+   choosing a backend. Two iterations have deferred it as "a docs
+   change, not a code change" — that reading is wrong: the rule is one
+   *change* per iteration, not one *kind* of change.
+4. **Source scopes (#4).** The MCP layer has no notion of which source
+   a document came from (academic, personal, internet, synthesis,
+   iMessages) and no per-source scope, so every tool returns every
+   document. It is what stops a personal document leaking through a
+   general search, and it is what would give a personal document a
+   shorter link TTL.
+5. **The `personal` store behind `Storage`.** The personal store sits
+   on the local filesystem outside `Storage`, so the docs service
+   cannot serve a personal document — which is also why issue #7's
+   "personal documents get links" is not started. Moving it behind
+   `Storage` (a `hs migrate personal-to-storage`) would let one read
+   path serve every document the corpus holds.

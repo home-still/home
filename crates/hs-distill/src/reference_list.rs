@@ -85,6 +85,28 @@ pub fn is_citation_line(line: &str) -> bool {
     if is_bulleted_author_list(s) {
         return true;
     }
+    // "Sundralingham, P. 1983 Responses of potted seedlings of
+    // Dryobalanops aromatica ..." — an author list and a **bare** year.
+    // The rules above only see a year in parentheses, and a large part
+    // of this corpus writes it bare: `Ferguson JN, Aldag JM, Insel TR,
+    // Young LJ. Oxytocin in the medial amygdala is essential for social
+    // recognition. J Neurosci 2009;29:1487-93.`
+    if is_author_list_with_bare_year(s) {
+        return true;
+    }
+    // "59. Ferguson JN, ..." / "(34) Lewis, J. A. ..." — a reference
+    // number followed by an author. `is_numbered_entry` above only
+    // strips `1.` and `2.`, because a number alone does not make a
+    // citation: "22. The idea of the series is, in itself, important
+    // to Eisenman's early development" is a numbered footnote.
+    if is_numbered_author_entry(s) {
+        return true;
+    }
+    // "- 5.Tinetti ME, Speechley M, Ginter SF. Risk factors for falls …"
+    // — a bullet holding a *numbered* reference entry.
+    if is_bulleted_numbered_author_entry(s) {
+        return true;
+    }
     false
 }
 
@@ -288,6 +310,377 @@ fn is_surname_with_initials(token: &str) -> bool {
     )
 }
 
+// ── the bare-year and numbered-author rules ──────────────────────────
+//
+// The rules above are *disjunctive*: one pattern is enough. That is
+// what keeps them conservative, and it is also why they miss a large
+// part of this corpus. The rules below are *conjunctive*: they need two
+// signals at once — an author list **and** a year, or a reference
+// number **and** an author — so they can afford a looser notion of
+// "author list" without catching prose.
+//
+// Measured on the live corpus, 2026-10-21: the rules above scored the
+// first hit of 6 of the 25 fixed queries at 0.00–0.43 — below the 0.5
+// threshold — so those six queries opened with a bibliography. The
+// shapes they missed all share the two signals below. See
+// `docs/loop/runs/2026-10-21-06/research.md`.
+
+/// Is there a year standing alone as a token?
+///
+/// A four-digit year between 1950 and 2029, bounded by whitespace or
+/// punctuation, so that `2000>VPD` (a comparison) and `2013;44(4)756`
+/// (a volume and a page range) do not count. The year must be in the
+/// first 160 characters: a bibliography line names its year early, while
+/// a prose sentence that happens to end with a year names it late.
+///
+/// A year that is *followed* by a volume and a page range is not one:
+/// `Genes Dev. 2009, 23, 939-950` is a journal, a volume and a page
+/// range, and the 2009 is the year of the volume — but the line is
+/// already caught by the rules above, so the bare-year rule must not
+/// claim it as well.
+fn has_standalone_bare_year(s: &str) -> bool {
+    let head: String = s.chars().take(160).collect();
+    let bytes = head.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = head[i..].find(|c: char| c.is_ascii_digit()) {
+        let start = i + rel;
+        // A year is four digits: the ones that are not four are a
+        // measurement, a volume, a page number.
+        let digits: String = head[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if digits.len() == 4 {
+            let year: u32 = digits.parse().unwrap_or(0);
+            if (1950..=2029).contains(&year) {
+                let before = if start == 0 {
+                    ' '
+                } else {
+                    bytes[start - 1] as char
+                };
+                let after = bytes.get(start + 4).map(|b| *b as char).unwrap_or(' ');
+                // The year is a token of its own: whitespace or
+                // punctuation on both sides.
+                let boundary = |c: char| {
+                    c.is_whitespace() || matches!(c, ',' | '.' | ')' | '(' | '[' | ']' | ';' | ':')
+                };
+                if boundary(before) && boundary(after) {
+                    // "Genes Dev. 2009, 23, 939-950" is a journal, a
+                    // volume and a page range, not a bare year: the
+                    // year is followed by a volume and a page range.
+                    // The pattern is a year, a comma, a number, a
+                    // comma, a page range.
+                    let rest = &head[start + 4..];
+                    let is_volume_then_pages = {
+                        let mut parts = rest.trim_start_matches([' ', ',']).splitn(2, ',');
+                        let first = parts.next().unwrap_or("").trim();
+                        let second = parts.next().unwrap_or("");
+                        first.chars().all(|c| c.is_ascii_digit())
+                            && !first.is_empty()
+                            && second.contains('-')
+                            && second
+                                .split('-')
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .chars()
+                                .all(|c| c.is_ascii_digit())
+                    };
+                    if !is_volume_then_pages {
+                        return true;
+                    }
+                }
+            }
+        }
+        // Move past this digit run.
+        i = start + digits.len().max(1);
+        if i >= head.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Does the line name its authors?
+///
+/// The author-list shape is the signal every referencing style shares —
+/// the literature's own description of the standard heuristic ("look for
+/// comma-separated author names at the start of the reference string",
+/// arXiv 1912.07266). The styles that differ — initials, an ALL-CAPS
+/// APA list, a full given name — are variations on it, so all four are
+/// recognised here.
+///
+/// The scan is over **author pairs**, not over whitespace-separated
+/// tokens: "Sundralingham, P." is a surname and an initial separated by
+/// a comma, so a token that is split on the comma loses the pair.
+fn has_author_list_shape(s: &str) -> bool {
+    // "Ferguson JN, Aldag JM, Insel TR" — a capitalised surname followed
+    // by one or two capitalised initials, with no comma between them.
+    if s.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .any(is_surname_with_initials)
+    {
+        return true;
+    }
+    // "Sundralingham, P. 1983" — a capitalised surname, a comma, a
+    // single initial. And the APA style, where the surname is ALL CAPS:
+    // "ALBERG, D., LAST, M., AND KANDEL, A. 2012."
+    //
+    // The pair is read across the comma: the surname is what comes
+    // before it and the initial what comes after.
+    for (before, after) in s.split(',').zip(s.split(',').skip(1)) {
+        let surname = before.split_whitespace().last().unwrap_or("");
+        let surname = surname.trim_matches(|c: char| c == '(' || c == ')' || c == '.');
+        if surname.is_empty() {
+            continue;
+        }
+        let named = surname.chars().next().is_some_and(|c| c.is_uppercase());
+        if !named {
+            continue;
+        }
+        // The next token is a single initial: "P." or "D."
+        let initial = after.split_whitespace().next().unwrap_or("");
+        let initial = initial.trim_end_matches('.');
+        if initial.len() == 1 && initial.chars().all(|c| c.is_uppercase()) {
+            return true;
+        }
+    }
+    // "Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua Bengio. 2015." — the
+    // full given-name style: two capitalised words, then a comma.
+    if let Some(pos) = s.find(", ") {
+        let head = &s[..pos];
+        let mut words = head.split_whitespace().rev();
+        if let (Some(surname), Some(given)) = (words.next(), words.next()) {
+            let is_name = |w: &str| {
+                let core = w.trim_matches(|c: char| c == ',' || c == '.');
+                !core.is_empty()
+                    && core.chars().next().is_some_and(|c| c.is_uppercase())
+                    && core.chars().filter(|c| c.is_alphabetic()).count() > 1
+            };
+            if is_name(surname) && is_name(given) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// An author list and a bare year in the same line — the conjunction
+/// that makes the rule safe.
+///
+/// "Sundralingham, P. 1983 Responses of potted seedlings of
+/// Dryobalanops aromatica and Dryobalanops oblongifolia to shading."
+///
+/// A prose sentence has a year, or a number, but it does not have a
+/// capitalised surname followed by initials; that is why both signals
+/// are required.
+fn is_author_list_with_bare_year(s: &str) -> bool {
+    has_standalone_bare_year(s) && has_author_list_shape(s)
+}
+
+/// The text after a leading reference number, if there is one.
+///
+/// "(34) Lewis, J. A. ..." — a parenthesised number; "59. Ferguson JN,
+/// ..." and "180 Daban C, ..." — a number followed by a stop or a space.
+fn strip_reference_number(s: &str) -> Option<&str> {
+    if let Some(rest) = s.strip_prefix('(') {
+        let (number, rest) = rest.split_once(')')?;
+        if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) {
+            return Some(rest.trim_start());
+        }
+        return None;
+    }
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 3 {
+        return None;
+    }
+    let after = &s[digits.len()..];
+    let after = after.strip_prefix('.').unwrap_or(after);
+    if after.is_empty() {
+        return None;
+    }
+    Some(after.trim_start())
+}
+
+/// A reference number followed by an author-shaped token.
+///
+/// "59. Ferguson JN, Aldag JM, ..." and "(34) Lewis, J. A. Direct ink
+/// writing of 3D functional materials."
+///
+/// The number alone is not enough: "22. The idea of the series is, in
+/// itself, important to Eisenman's early development" is a numbered
+/// footnote, and demoting it would be wrong. The token after the number
+/// has to name an author.
+fn is_numbered_author_entry(s: &str) -> bool {
+    let rest = strip_reference_number(s);
+    let Some(rest) = rest else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    // The first token names an author.
+    let first = rest.split_whitespace().next().unwrap_or("");
+    let first = first.trim_matches(|c: char| c == '(' || c == ')');
+    if is_surname_with_initials(first) {
+        return true;
+    }
+    // "Tinetti ME, …" / "Ferguson JN, …" — a surname and the initials
+    // that follow it.
+    if starts_with_surname_then_initials(rest) {
+        return true;
+    }
+    // "Sundralingham, P." — a surname and a single initial.
+    let mut parts = rest.split_whitespace();
+    if let (Some(surname), Some(initial)) = (parts.next(), parts.next()) {
+        let surname = surname.trim_end_matches(',');
+        let initial = initial.trim_end_matches('.');
+        if surname.chars().next().is_some_and(|c| c.is_uppercase())
+            && initial.len() == 1
+            && initial.chars().all(|c| c.is_uppercase())
+        {
+            return true;
+        }
+    }
+    // "Eisenman, Peter." — a surname and a full given name.
+    let mut parts = rest.splitn(2, ',');
+    if let (Some(surname), Some(given)) = (parts.next(), parts.next()) {
+        let given = given.trim_start();
+        let given_word = given.split_whitespace().next().unwrap_or("");
+        if surname.chars().next().is_some_and(|c| c.is_uppercase())
+            && given_word.chars().next().is_some_and(|c| c.is_uppercase())
+            && given_word.chars().filter(|c| c.is_alphabetic()).count() > 1
+        {
+            return true;
+        }
+    }
+    // "Douglas R. Hofstadter, Gödel, Escher, Bach" — a given name, an
+    // initial and a surname.
+    let mut parts = rest.split_whitespace();
+    if let (Some(given), Some(initial), Some(surname)) = (parts.next(), parts.next(), parts.next())
+    {
+        if given.chars().next().is_some_and(|c| c.is_uppercase())
+            && initial.trim_end_matches('.').len() == 1
+            && surname.chars().next().is_some_and(|c| c.is_uppercase())
+        {
+            return true;
+        }
+    }
+    // "René Descartes, A Discourse on the Method, translated by …" —
+    // a given name and a surname, then a comma. The pair is read
+    // across the comma: the given name before it, the surname after.
+    //
+    // The comma is not necessarily the first one: "Robert E.
+    // Ulanowicz, A Third Window: …" has the initial between the given
+    // name and the surname, so the pair is looked for across *each* of
+    // the first few commas.
+    let is_name = |w: &str| {
+        !w.is_empty()
+            && w.chars().next().is_some_and(|c| c.is_uppercase())
+            && w.chars().filter(|c| c.is_alphabetic()).count() > 1
+    };
+    let mut parts = rest.splitn(4, ',');
+    let mut before = parts.next().unwrap_or("");
+    for _ in 0..3 {
+        let Some(after) = parts.next() else {
+            break;
+        };
+        let given = before.split_whitespace().next().unwrap_or("");
+        let surname = after.split_whitespace().next().unwrap_or("");
+        if is_name(given) && is_name(surname) {
+            return true;
+        }
+        before = after;
+    }
+    // "Douglas R. Hofstadter, Gödel, Escher, Bach: An Eternal Golden
+    // Braid" — the given name and the surname are separated by an
+    // initial, and the *surname* is the last word before the comma.
+    if let Some((before, _)) = rest.split_once(',') {
+        let words: Vec<&str> = before.split_whitespace().collect();
+        if words.len() >= 3 {
+            let given = words[0];
+            let initial = words[1].trim_end_matches('.');
+            let surname = words[2];
+            if given.chars().next().is_some_and(|c| c.is_uppercase())
+                && initial.len() == 1
+                && initial.chars().all(|c| c.is_uppercase())
+                && surname.chars().next().is_some_and(|c| c.is_uppercase())
+            {
+                return true;
+            }
+        }
+    }
+    // "1. 2002. A.L.I.C.E. Foundation website. (2002). Retrieved …" — a
+    // numbered entry whose *year comes first*, with no author at all.
+    // The number and the year are the signal: a reference list that
+    // cites a web page names the year it was retrieved or published.
+    // A numbered prose paragraph does not open with a year.
+    if let Some(year) = rest.split_whitespace().next() {
+        let year = year.trim_end_matches('.');
+        if year.len() == 4 {
+            if let Ok(y) = year.parse::<u32>() {
+                if (1950..=2029).contains(&y) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// A markdown bullet holding a *numbered* reference entry.
+///
+/// "- 5.Tinetti ME, Speechley M, Ginter SF. Risk factors for falls …"
+///
+/// The existing bulleted-author-list rule needs the bullet to be
+/// followed by an author list, but this style puts a reference number
+/// between the bullet and the authors. The number and the author list
+/// are both required.
+fn is_bulleted_numbered_author_entry(s: &str) -> bool {
+    let Some(rest) = s
+        .strip_prefix("- ")
+        .or_else(|| s.strip_prefix("* "))
+        .or_else(|| s.strip_prefix("• "))
+    else {
+        return false;
+    };
+    let Some(rest) = strip_reference_number(rest) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    // The text after the number names an author: "Tinetti ME, …" or
+    // "Centers for Disease Control and Prevention, …".
+    if starts_with_surname_then_initials(rest) {
+        return true;
+    }
+    false
+}
+
+/// Does the text open with a surname followed by one or two initials?
+///
+/// "Tinetti ME, …" — a capitalised surname and the initials that
+/// follow it, with no given name. The initials are one or two
+/// capitalised letters: "Tinetti ME" and "Lewis JA" are both authors,
+/// "Sundralingham P" is one.
+fn starts_with_surname_then_initials(s: &str) -> bool {
+    let mut parts = s.split_whitespace();
+    let Some(surname) = parts.next() else {
+        return false;
+    };
+    let surname = surname.trim_end_matches(',');
+    if !surname.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return false;
+    }
+    let Some(initials) = parts.next() else {
+        return false;
+    };
+    let initials = initials.trim_end_matches(',').trim_end_matches('.');
+    (initials.len() == 1 || initials.len() == 2)
+        && initials.chars().all(|c| c.is_uppercase())
+        && !initials.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +836,142 @@ mod tests {
             "Smith, J. (2020). Title. Journal.", "Doe, A. (2021). Other. Press."
         );
         assert!(is_reference_list(&chunk));
+    }
+
+    // ── the bare-year rule ─────────────────────────────────────────
+
+    #[test]
+    fn an_author_list_with_a_bare_year_is_a_citation() {
+        // Real lines from this corpus, measured 2026-10-21. The year is
+        // not in parentheses, which the rules above required.
+        assert!(is_citation_line(
+            "Sundralingham, P. 1983 Responses of potted seedlings of Dryobalanops aromatica \
+             to shading. Malaysian Forester 46, 324-328."
+        ));
+        assert!(is_citation_line(
+            "ALBERG, D., LAST, M., AND KANDEL, A. 2012. Knowledge discovery in data streams \
+             with regression tree methods. Workshop on Data Streams."
+        ));
+        assert!(is_citation_line(
+            "Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua Bengio. 2015. Neural machine \
+             translation by jointly learning to align and translate. ICLR."
+        ));
+        assert!(is_citation_line(
+            "Ferguson JN, Aldag JM, Insel TR, Young LJ. Oxytocin in the medial amygdala is \
+             essential for social recognition. J Neurosci 2009;29:1487-93."
+        ));
+        assert!(is_citation_line(
+            "Usunier, N.; Synnaeve, G.; Lin, Z.; and Chintala, S. 2016. Episodic exploration \
+             for deep deterministic RL. ICLR."
+        ));
+    }
+
+    #[test]
+    fn a_bare_year_without_an_author_list_is_not_a_citation() {
+        // The conjunction is the point: a year alone is prose.
+        assert!(!is_citation_line(
+            "Neurogenesis continues throughout adulthood in rodents, a finding first reported in 1962."
+        ));
+        assert!(!is_citation_line(
+            "The metal content of the alloy was measured across all specimens in 1994 and 1995."
+        ));
+    }
+
+    #[test]
+    fn a_year_that_is_not_a_token_is_not_a_bare_year() {
+        // A comparison, a volume and a page range: the digits are there
+        // but they are not a year standing on its own.
+        assert!(!has_standalone_bare_year(
+            "the flow was 2000>VPD in all treatments"
+        ));
+        assert!(!has_standalone_bare_year(
+            "Genes Dev. 2009, 23, 939-950. [CrossRef]"
+        ));
+        assert!(has_standalone_bare_year(
+            "Sundralingham, P. 1983 Responses of seedlings."
+        ));
+    }
+
+    #[test]
+    fn a_year_outside_the_plausible_range_is_not_a_bare_year() {
+        assert!(!has_standalone_bare_year(
+            "The paper was cited 1200 times by 1847 readers"
+        ));
+        assert!(!has_standalone_bare_year(
+            "Revision 2035 of the standard is pending"
+        ));
+    }
+
+    // ── the numbered-author rule ───────────────────────────────────
+
+    #[test]
+    fn a_numbered_reference_entry_with_an_author_is_a_citation() {
+        // The rules above only stripped "1." and "2."; this corpus
+        // numbers its references up into the hundreds.
+        assert!(is_citation_line(
+            "59. Ferguson JN, Aldag JM, Insel TR, Young LJ. Oxytocin in the medial amygdala \
+             is essential for social recognition."
+        ));
+        assert!(is_citation_line(
+            "180 Daban C, Vieta E, Mackin P, Young AH. Hypothalamic-pituitary-adrenal axis \
+             and bipolar disorder."
+        ));
+        assert!(is_citation_line(
+            "(34) Lewis, J. A. Direct ink writing of 3D functional materials. Adv. Funct. Mater."
+        ));
+        assert!(is_citation_line(
+            "22. Eisenman, Peter. House X. New York: Rizzoli International."
+        ));
+    }
+
+    #[test]
+    fn a_numbered_prose_line_is_not_a_citation() {
+        // A number alone does not make a citation: this is a numbered
+        // footnote, and demoting it would be wrong.
+        assert!(!is_citation_line(
+            "22. The idea of the series is, in itself, important to Eisenman's early development."
+        ));
+        assert!(!is_citation_line(
+            "19. Eisenman is in an interesting tension with Bergson here, as he often was."
+        ));
+    }
+
+    // ── the chunks the new rules catch ─────────────────────────────
+
+    #[test]
+    fn a_bibliography_in_the_bare_year_style_is_detected() {
+        // The chunk that led the results for "nutrient limitation of
+        // tropical forest growth" on 2026-10-21, scored 0.04 before.
+        let chunk = "Sundralingham, P. 1983 Responses of potted seedlings of Dryobalanops \
+                     aromatica to shading. Malaysian Forester.\n\
+                     Tanner, E. V. J., Vitousek, P. M. & Cuevas, E. 1998 Experimental \
+                     investigation of nutrient limitation. Ecology 79:744-52.\n\
+                     Trenberth, K. E. 1997 The definition of El Nino. Bull. Am. Meteorol. Soc.";
+        assert!(is_reference_list(chunk));
+    }
+
+    #[test]
+    fn a_bibliography_in_the_numbered_style_is_detected() {
+        // The chunk that led the results for "3D printing of controlled
+        // release pharmaceutical bilayer tablets" on 2026-10-21, scored
+        // 0.00 before.
+        let chunk = "(32) Hull, C. W. Apparatus for production of three-dimensional objects \
+                     by stereolithography. Patent US4575330A.\n\
+                     (33) Lewis, J. A.; Smay, J. E. Direct ink writing of three-dimensional \
+                     ceramic structures. J. Am. Ceram. Soc.\n\
+                     (34) Lewis, J. A. Direct ink writing of 3D functional materials. Adv. \
+                     Funct. Mater. 2006, 16 (17), 2193.";
+        assert!(is_reference_list(chunk));
+    }
+
+    #[test]
+    fn a_bibliography_in_the_apa_all_caps_style_is_detected() {
+        let chunk = "ALBERG, D., LAST, M., AND KANDEL, A. 2012. Knowledge discovery in data \
+                     streams with regression tree methods. Workshop on Data Streams.\n\
+                     ANG, H., GOPALKRISHNAN, V., AND HOI, S. 2012. Predictive handling of \
+                     asynchronous concurrent streams. PVLDB.\n\
+                     BABCOCK, B., BABU, S., DATAR, M., MOTWANI, R., AND WIDOM, J. 2002. \
+                     Models and issues in data stream systems. PODC.";
+        assert!(is_reference_list(chunk));
     }
 }
