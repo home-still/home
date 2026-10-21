@@ -57,10 +57,52 @@ pub struct DocsState {
     pub key: LinkKey,
     /// The subjects whose links are revoked.
     pub revocations: Revocations,
+    /// The collections this service serves, and where each one's objects
+    /// live.
+    ///
+    /// The corpus holds more than one store: the academic papers and the
+    /// personal documents are separate, and a stem can name a document in
+    /// either. The collection is part of the link's signature, so a link
+    /// names one document in one store and cannot be edited into a
+    /// document in another. A collection the service does not serve is a
+    /// 404 — there is one path, and it is the one this list names.
+    pub collections: Vec<CollectionLayout>,
+}
+
+/// Where one collection's objects live.
+#[derive(Debug, Clone)]
+pub struct CollectionLayout {
+    /// The collection's name, as it appears in a link.
+    pub name: String,
     /// The prefix the source objects live under.
     pub papers_prefix: String,
     /// The prefix the markdown lives under.
     pub markdown_prefix: String,
+}
+
+impl CollectionLayout {
+    /// The academic corpus: the sources under `papers/`, the converted
+    /// text under `markdown/`.
+    pub fn academic(papers_prefix: &str, markdown_prefix: &str) -> Self {
+        Self {
+            name: "academic".to_string(),
+            papers_prefix: papers_prefix.to_string(),
+            markdown_prefix: markdown_prefix.to_string(),
+        }
+    }
+
+    /// The personal store.
+    ///
+    /// Its layout is the corpus's layout, one prefix deeper: the
+    /// sources are under `<prefix>/<shard>/<stem>.pdf` and the
+    /// converted text under `<prefix>/markdown/<shard>/<stem>.md`.
+    pub fn personal(prefix: &str) -> Self {
+        Self {
+            name: "personal".to_string(),
+            papers_prefix: prefix.to_string(),
+            markdown_prefix: format!("{}/markdown", prefix.trim_end_matches('/')),
+        }
+    }
 }
 
 /// Build the service's router.
@@ -164,6 +206,7 @@ async fn serve(
             stem: stem.clone(),
             format,
             subject: params.subject.clone(),
+            collection: params.collection.clone(),
             page: params.page,
             issued_at: params.issued_at,
             expires_at: params.expires_at,
@@ -174,6 +217,16 @@ async fn serve(
     {
         return refused();
     }
+    // The collection decides where the objects live. A collection this
+    // service does not serve is a 404: the link is genuine, but it
+    // names a store this host does not have.
+    let Some(layout) = state
+        .collections
+        .iter()
+        .find(|c| c.name == params.collection)
+    else {
+        return not_found();
+    };
     // A link minted before its subject was revoked is refused. The
     // link carries its issue time, so a subject that was revoked and
     // then re-enrolled gets fresh links.
@@ -189,7 +242,7 @@ async fn serve(
     // page is served in place of the whole document.
     let (key, content_type, extension, body) = match format {
         LinkFormat::Source => {
-            match find_source_key(&*state.storage, &state.papers_prefix, &stem).await {
+            match find_source_key(&*state.storage, &layout.papers_prefix, &stem).await {
                 Some((key, content_type, extension)) => (key, content_type, extension, None),
                 None => return not_found(),
             }
@@ -197,7 +250,7 @@ async fn serve(
         LinkFormat::Markdown => {
             let key = format!(
                 "{}/{}",
-                state.markdown_prefix.trim_end_matches('/'),
+                layout.markdown_prefix.trim_end_matches('/'),
                 hs_common::sharded_key(&stem, "md")
             );
             if state.storage.head(&key).await.ok().flatten().is_none() {
@@ -543,8 +596,10 @@ mod tests {
             storage,
             key: key.clone(),
             revocations: Revocations::default(),
-            papers_prefix: "papers".to_string(),
-            markdown_prefix: "markdown".to_string(),
+            collections: vec![
+                CollectionLayout::academic("papers", "markdown"),
+                CollectionLayout::personal("personal"),
+            ],
         });
         (router(state.clone()), key, state)
     }
@@ -629,8 +684,40 @@ mod tests {
         format: LinkFormat,
         subject: &str,
     ) -> String {
-        let params = hs_common::docs::mint(key, stem, format, subject, None, 3600).unwrap();
+        link_in(key, stem, format, subject, "academic")
+    }
+
+    /// The link for a document in a named collection.
+    fn link_in(
+        key: &hs_common::docs::LinkKey,
+        stem: &str,
+        format: LinkFormat,
+        subject: &str,
+        collection: &str,
+    ) -> String {
+        let params =
+            hs_common::docs::mint(key, stem, format, subject, collection, None, 3600).unwrap();
         format!("/docs/v1/{stem}/{format}?{}", params.to_query())
+    }
+
+    /// A personal document: a source under `personal/` and its markdown
+    /// under `personal/markdown/`.
+    async fn put_personal_document(dir: &std::path::Path, stem: &str, body: &[u8]) {
+        let storage = LocalFsStorage::new(dir);
+        storage
+            .put(
+                &format!("personal/{}", hs_common::sharded_key(stem, "pdf")),
+                body.to_vec(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                &format!("personal/markdown/{}", hs_common::sharded_key(stem, "md")),
+                format!("# {stem}\n\nthe personal body\n").into_bytes(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -700,7 +787,7 @@ mod tests {
 
         // A link whose expiry is in the past.
         let params =
-            hs_common::docs::mint(&key, "10.1234_test", LinkFormat::Source, "laptop", None, 0)
+            hs_common::docs::mint(&key, "10.1234_test", LinkFormat::Source, "laptop", "academic", None, 0)
                 .unwrap();
         let uri = format!("/docs/v1/10.1234_test/source?{}", params.to_query());
         assert_eq!(call(&app, &uri, None).await.status, 403);
@@ -734,8 +821,7 @@ mod tests {
             storage: state.storage.clone(),
             key: state.key.clone(),
             revocations,
-            papers_prefix: state.papers_prefix.clone(),
-            markdown_prefix: state.markdown_prefix.clone(),
+            collections: state.collections.clone(),
         });
         let app = router(state);
         assert_eq!(call(&app, &uri, None).await.status, 403);
@@ -770,6 +856,86 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (app, key, _state) = service(tmp.path()).await;
         let uri = link(&key, "10.9999_missing", LinkFormat::Source, "laptop");
+        assert_eq!(call(&app, &uri, None).await.status, 404);
+    }
+
+    /// A personal document is served by the same service, with the same
+    /// signed links.
+    ///
+    /// Measured 2026-10-21: `personal_search` returned **0 of 5** hits
+    /// with a link, because the personal store was outside the
+    /// `Storage` the docs service reads.
+    #[tokio::test]
+    async fn a_personal_document_is_served_by_its_own_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, key, _state) = service(tmp.path()).await;
+        put_personal_document(tmp.path(), "annual-checkup-abc123", b"%PDF-1.5 pretend").await;
+
+        let uri = link_in(
+            &key,
+            "annual-checkup-abc123",
+            LinkFormat::Markdown,
+            "laptop",
+            "personal",
+        );
+        let resp = call(&app, &uri, None).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.header("content-type"), Some("text/markdown; charset=utf-8"));
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(
+            body.contains("the personal body"),
+            "the personal document's body was not served: {body}"
+        );
+    }
+
+    /// The collection is part of the signature: a link for a personal
+    /// document cannot be edited into a link for an academic one, and
+    /// the other way round.
+    #[tokio::test]
+    async fn a_link_cannot_be_edited_from_one_collection_to_the_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, key, _state) = service(tmp.path()).await;
+        // The same stem, in both stores.
+        put_document(tmp.path(), "shared-abc123", b"%PDF-1.5 academic").await;
+        put_personal_document(tmp.path(), "shared-abc123", b"%PDF-1.5 personal").await;
+
+        let personal = link_in(
+            &key,
+            "shared-abc123",
+            LinkFormat::Source,
+            "laptop",
+            "personal",
+        );
+        let resp = call(&app, &personal, None).await;
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(
+            body.starts_with("%PDF-1.5 personal"),
+            "the personal link served the academic document: {body}"
+        );
+
+        // Editing the collection in the query string breaks the
+        // signature: the link is refused, not re-pointed.
+        let edited = personal.replace("col=personal", "col=academic");
+        assert_ne!(edited, personal, "the collection is not in the query");
+        assert_eq!(call(&app, &edited, None).await.status, 403);
+    }
+
+    /// A collection the service does not serve is a 404: the link is
+    /// genuine, but it names a store this host does not have.
+    #[tokio::test]
+    async fn a_collection_the_service_does_not_serve_is_a_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, key, _state) = service(tmp.path()).await;
+        put_document(tmp.path(), "10.1234_test", b"%PDF-1.5 pretend").await;
+
+        let uri = link_in(
+            &key,
+            "10.1234_test",
+            LinkFormat::Source,
+            "laptop",
+            "nosuchcollection",
+        );
         assert_eq!(call(&app, &uri, None).await.status, 404);
     }
 
@@ -813,6 +979,7 @@ mod tests {
             "10.1234_test",
             LinkFormat::Markdown,
             "laptop",
+            "academic",
             Some(2),
             3600,
         )
@@ -840,6 +1007,7 @@ mod tests {
             "10.1234_test",
             LinkFormat::Markdown,
             "laptop",
+            "academic",
             Some(99),
             3600,
         )
@@ -862,6 +1030,7 @@ mod tests {
             "10.1234_test",
             LinkFormat::Source,
             "laptop",
+            "academic",
             Some(2),
             3600,
         )

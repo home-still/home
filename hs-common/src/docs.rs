@@ -107,6 +107,8 @@ pub enum LinkError {
     Revoked,
     /// The stem is not a valid document stem.
     BadStem,
+    /// The collection is not a valid collection name.
+    BadCollection,
     /// The format is not one this service serves.
     BadFormat,
     /// The page is not a page: the pages are 1-based, so page 0 names
@@ -137,6 +139,10 @@ pub struct LinkParams {
     pub format: LinkFormat,
     /// The subject the link was minted for.
     pub subject: String,
+    /// The collection the document is in.
+    ///
+    /// Signed, like the page: a link names one document in one store.
+    pub collection: String,
     /// The page the link opens, 1-based.
     ///
     /// The page is part of the *request*, not part of the document, so
@@ -161,10 +167,11 @@ impl LinkParams {
     pub fn to_query(&self) -> String {
         let page = self.page.map_or_else(String::new, |p| format!("&page={p}"));
         format!(
-            "iat={}&exp={}&sub={}&fmt={}{}&sig={}",
+            "iat={}&exp={}&sub={}&col={}&fmt={}{}&sig={}",
             self.issued_at,
             self.expires_at,
             url_encode(&self.subject),
+            url_encode(&self.collection),
             self.format.as_str(),
             page,
             self.signature
@@ -281,6 +288,7 @@ pub fn mint(
     stem: &str,
     format: LinkFormat,
     subject: &str,
+    collection: &str,
     page: Option<u32>,
     ttl_secs: u64,
 ) -> Result<LinkParams, LinkError> {
@@ -288,6 +296,12 @@ pub fn mint(
     if subject.is_empty() {
         return Err(LinkError::MissingParameter("sub"));
     }
+    if collection.is_empty() {
+        return Err(LinkError::MissingParameter("col"));
+    }
+    // The collection is part of the signature, so it has to be a name
+    // the verifier can check — the same rule as the stem.
+    crate::validate_stem(collection).map_err(|_| LinkError::BadCollection)?;
     // Page 0 is not a page: the pages are 1-based, and a link that
     // named page 0 would be a link to a page that does not exist.
     if page == Some(0) {
@@ -299,6 +313,7 @@ pub fn mint(
         stem: stem.to_string(),
         format,
         subject: subject.to_string(),
+        collection: collection.to_string(),
         page,
         issued_at,
         expires_at,
@@ -308,6 +323,7 @@ pub fn mint(
         stem: fields.stem,
         format: fields.format,
         subject: fields.subject,
+        collection: fields.collection,
         page: fields.page,
         issued_at: fields.issued_at,
         expires_at: fields.expires_at,
@@ -327,6 +343,15 @@ pub struct SignedFields {
     pub format: LinkFormat,
     /// The subject the link was minted for.
     pub subject: String,
+    /// The collection the document is in.
+    ///
+    /// The corpus holds more than one: the academic papers and the
+    /// personal documents are separate stores with separate objects, and
+    /// a stem can name a document in either. The collection is part of
+    /// the signature, so a link for a personal document cannot be
+    /// edited into a link for an academic one — it is a capability for
+    /// one document in one store, not for a stem.
+    pub collection: String,
     /// The page the link opens. `None` means the whole document.
     pub page: Option<u32>,
     /// When the link was minted, as a Unix timestamp in seconds.
@@ -342,10 +367,11 @@ impl SignedFields {
     /// that disagree here would disagree silently.
     fn signed_payload(&self) -> String {
         format!(
-            "{LINK_VERSION}|{}|{}|{}|{}|{}|{}",
+            "{LINK_VERSION}|{}|{}|{}|{}|{}|{}|{}",
             self.stem,
             self.format.as_str(),
             self.subject,
+            self.collection,
             self.page.map_or_else(|| "-".to_string(), |p| p.to_string()),
             self.issued_at,
             self.expires_at,
@@ -486,6 +512,8 @@ pub struct LinkQuery {
     pub expires_at: u64,
     /// The subject the link was minted for.
     pub subject: String,
+    /// The collection the document is in.
+    pub collection: String,
     /// The format.
     pub format: LinkFormat,
     /// The page the link opens. `None` means the whole document.
@@ -503,6 +531,7 @@ impl LinkQuery {
         let mut issued_at: Option<u64> = None;
         let mut expires_at: Option<u64> = None;
         let mut subject: Option<String> = None;
+        let mut collection: Option<String> = None;
         let mut format: Option<LinkFormat> = None;
         let mut page: Option<u32> = None;
         let mut signature: Option<String> = None;
@@ -530,6 +559,9 @@ impl LinkQuery {
                 "sub" => {
                     subject = Some(url_decode(value).ok_or(LinkError::BadSignature)?);
                 }
+                "col" => {
+                    collection = Some(url_decode(value).ok_or(LinkError::BadSignature)?);
+                }
                 "fmt" => {
                     format = Some(LinkFormat::parse(value).ok_or(LinkError::BadFormat)?);
                 }
@@ -552,6 +584,7 @@ impl LinkQuery {
             issued_at: issued_at.ok_or(LinkError::MissingParameter("iat"))?,
             expires_at: expires_at.ok_or(LinkError::MissingParameter("exp"))?,
             subject: subject.ok_or(LinkError::MissingParameter("sub"))?,
+            collection: collection.ok_or(LinkError::MissingParameter("col"))?,
             format: format.ok_or(LinkError::BadFormat)?,
             page,
             signature: signature.ok_or(LinkError::MissingParameter("sig"))?,
@@ -706,13 +739,14 @@ mod tests {
     #[test]
     fn a_minted_link_verifies() {
         let k = key();
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", None, 3600).unwrap();
+        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 3600).unwrap();
         verify(
             &k,
             &SignedFields {
                 stem: "10.1234_abcd".to_string(),
                 format: LinkFormat::Source,
                 subject: "laptop".to_string(),
+                collection: "academic".to_string(),
                 page: link.page,
                 issued_at: link.issued_at,
                 expires_at: link.expires_at,
@@ -725,7 +759,7 @@ mod tests {
     #[test]
     fn a_tampered_stem_format_subject_or_expiry_does_not_verify() {
         let k = key();
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", None, 3600).unwrap();
+        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 3600).unwrap();
         // Any field the signature covers, changed, invalidates it.
         let tampered = |stem: &str, format: LinkFormat, subject: &str, expires_at: u64| {
             verify(
@@ -734,6 +768,7 @@ mod tests {
                     stem: stem.to_string(),
                     format,
                     subject: subject.to_string(),
+                    collection: "academic".to_string(),
                     page: link.page,
                     issued_at: link.issued_at,
                     expires_at,
@@ -778,7 +813,7 @@ mod tests {
     fn a_link_signed_with_another_key_does_not_verify() {
         let a = key();
         let b = LinkKey::from_bytes(vec![9u8; 32]).unwrap();
-        let link = mint(&a, "10.1234_abcd", LinkFormat::Source, "laptop", None, 3600).unwrap();
+        let link = mint(&a, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 3600).unwrap();
         assert_eq!(
             verify(
                 &b,
@@ -786,6 +821,7 @@ mod tests {
                     stem: "10.1234_abcd".to_string(),
                     format: LinkFormat::Source,
                     subject: "laptop".to_string(),
+                    collection: "academic".to_string(),
                     page: link.page,
                     issued_at: link.issued_at,
                     expires_at: link.expires_at,
@@ -801,7 +837,7 @@ mod tests {
         let k = key();
         // A link minted in the past is already expired.
         let expires_at = now_secs() - 1;
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", None, 0).unwrap();
+        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 0).unwrap();
         assert_eq!(
             verify(
                 &k,
@@ -809,6 +845,7 @@ mod tests {
                     stem: "10.1234_abcd".to_string(),
                     format: LinkFormat::Source,
                     subject: "laptop".to_string(),
+                    collection: "academic".to_string(),
                     page: link.page,
                     issued_at: link.issued_at,
                     expires_at,
@@ -828,6 +865,7 @@ mod tests {
             "10.1234_abcd",
             LinkFormat::Source,
             "lap top",
+            "academic",
             None,
             3600,
         )
@@ -843,28 +881,28 @@ mod tests {
     #[test]
     fn a_query_string_missing_a_parameter_is_refused() {
         assert_eq!(
-            LinkQuery::parse("iat=1&sub=laptop&fmt=source&sig=ab").unwrap_err(),
+            LinkQuery::parse("iat=1&sub=laptop&col=academic&fmt=source&sig=ab").unwrap_err(),
             LinkError::MissingParameter("exp")
         );
         assert_eq!(
-            LinkQuery::parse("exp=1&sub=laptop&fmt=source&sig=ab").unwrap_err(),
+            LinkQuery::parse("exp=1&sub=laptop&col=academic&fmt=source&sig=ab").unwrap_err(),
             LinkError::MissingParameter("iat")
         );
         assert_eq!(
-            LinkQuery::parse("iat=1&exp=1&fmt=source&sig=ab").unwrap_err(),
+            LinkQuery::parse("iat=1&exp=1&col=academic&fmt=source&sig=ab").unwrap_err(),
             LinkError::MissingParameter("sub")
         );
         assert_eq!(
-            LinkQuery::parse("iat=1&exp=1&sub=laptop&sig=ab").unwrap_err(),
+            LinkQuery::parse("iat=1&exp=1&sub=laptop&col=academic&sig=ab").unwrap_err(),
             LinkError::BadFormat
         );
         assert_eq!(
-            LinkQuery::parse("iat=1&exp=1&sub=laptop&fmt=source").unwrap_err(),
+            LinkQuery::parse("iat=1&exp=1&sub=laptop&col=academic&fmt=source").unwrap_err(),
             LinkError::MissingParameter("sig")
         );
         // An unknown format is refused, not guessed at.
         assert_eq!(
-            LinkQuery::parse("iat=1&exp=1&sub=laptop&fmt=pdf&sig=ab").unwrap_err(),
+            LinkQuery::parse("iat=1&exp=1&sub=laptop&col=academic&fmt=pdf&sig=ab").unwrap_err(),
             LinkError::BadFormat
         );
     }
@@ -874,7 +912,7 @@ mod tests {
         let k = key();
         for stem in ["../etc/passwd", "a/b", "", "..", "a\\b"] {
             assert_eq!(
-                mint(&k, stem, LinkFormat::Source, "laptop", None, 3600).unwrap_err(),
+                mint(&k, stem, LinkFormat::Source, "laptop", "academic", None, 3600).unwrap_err(),
                 LinkError::BadStem,
                 "{stem:?}"
             );
@@ -912,6 +950,7 @@ mod tests {
             "10.1234_abcd",
             LinkFormat::Source,
             "laptop",
+            "academic",
             Some(11),
             3600,
         )
@@ -922,6 +961,7 @@ mod tests {
                 stem: "10.1234_abcd".to_string(),
                 format: LinkFormat::Source,
                 subject: "laptop".to_string(),
+                collection: "academic".to_string(),
                 page: Some(11),
                 issued_at: link.issued_at,
                 expires_at: link.expires_at,
@@ -938,6 +978,7 @@ mod tests {
                     stem: "10.1234_abcd".to_string(),
                     format: LinkFormat::Source,
                     subject: "laptop".to_string(),
+                    collection: "academic".to_string(),
                     page: Some(12),
                     issued_at: link.issued_at,
                     expires_at: link.expires_at,
@@ -954,6 +995,7 @@ mod tests {
                     stem: "10.1234_abcd".to_string(),
                     format: LinkFormat::Source,
                     subject: "laptop".to_string(),
+                    collection: "academic".to_string(),
                     page: None,
                     issued_at: link.issued_at,
                     expires_at: link.expires_at,
@@ -965,6 +1007,87 @@ mod tests {
     }
 
     #[test]
+    /// The collection is part of the signature, like the page.
+    ///
+    /// The corpus holds more than one store — the academic papers and
+    /// the personal documents — and a stem can name a document in
+    /// either. A link is a capability for one document in one store, so
+    /// changing the collection invalidates it.
+    #[test]
+    fn a_tampered_collection_does_not_verify() {
+        let k = key();
+        let link = mint(
+            &k,
+            "10.1234_abcd",
+            LinkFormat::Source,
+            "laptop",
+            "personal",
+            None,
+            3600,
+        )
+        .unwrap();
+        verify(
+            &k,
+            &SignedFields {
+                stem: "10.1234_abcd".to_string(),
+                format: LinkFormat::Source,
+                subject: "laptop".to_string(),
+                collection: "personal".to_string(),
+                page: link.page,
+                issued_at: link.issued_at,
+                expires_at: link.expires_at,
+            },
+            &link.signature,
+        )
+        .unwrap();
+
+        // The same signature with a different collection does not.
+        assert_eq!(
+            verify(
+                &k,
+                &SignedFields {
+                    stem: "10.1234_abcd".to_string(),
+                    format: LinkFormat::Source,
+                    subject: "laptop".to_string(),
+                    collection: "academic".to_string(),
+                    page: link.page,
+                    issued_at: link.issued_at,
+                    expires_at: link.expires_at,
+                },
+                &link.signature,
+            ),
+            Err(LinkError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn a_link_without_a_collection_is_refused() {
+        // A missing parameter is an error, never a default: a link that
+        // cannot be checked is a link that is not served.
+        assert_eq!(
+            LinkQuery::parse("iat=1&exp=2&sub=laptop&fmt=source&sig=ab").unwrap_err(),
+            LinkError::MissingParameter("col")
+        );
+    }
+
+    #[test]
+    fn a_collection_that_is_not_a_stem_is_refused() {
+        let k = key();
+        assert_eq!(
+            mint(
+                &k,
+                "10.1234_abcd",
+                LinkFormat::Source,
+                "laptop",
+                "../etc",
+                None,
+                3600
+            )
+            .unwrap_err(),
+            LinkError::BadCollection
+        );
+    }
+
     fn page_zero_is_not_a_page() {
         // The pages are 1-based, so page 0 names no page.
         let k = key();
@@ -974,6 +1097,7 @@ mod tests {
                 "10.1234_abcd",
                 LinkFormat::Source,
                 "laptop",
+                "academic",
                 Some(0),
                 3600
             )
@@ -981,7 +1105,7 @@ mod tests {
             LinkError::BadPage
         );
         assert_eq!(
-            LinkQuery::parse("iat=1&exp=2&sub=laptop&fmt=source&page=0&sig=ab").unwrap_err(),
+            LinkQuery::parse("iat=1&exp=2&sub=laptop&col=academic&fmt=source&page=0&sig=ab").unwrap_err(),
             LinkError::BadPage
         );
     }
@@ -994,6 +1118,7 @@ mod tests {
             "10.1234_abcd",
             LinkFormat::Source,
             "laptop",
+            "academic",
             Some(11),
             3600,
         )
@@ -1008,7 +1133,7 @@ mod tests {
     #[test]
     fn a_link_with_no_page_has_no_page_in_its_query() {
         let k = key();
-        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", None, 3600).unwrap();
+        let link = mint(&k, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 3600).unwrap();
         assert!(!link.to_query().contains("page="), "{}", link.to_query());
         assert_eq!(LinkQuery::parse(&link.to_query()).unwrap().page, None);
     }

@@ -7,6 +7,14 @@ use sha2::{Digest, Sha256};
 
 use crate::shutdown::Shutdown;
 
+/// Move the personal store into the corpus's storage.
+///
+/// The implementation lives in its own module: it is a different
+/// subject from the file-layout migrations below, and it has a rule of
+/// its own — **nothing is deleted**, because the local files are the
+/// only copy until the operator removes them.
+pub use crate::migrate_personal::run_personal_to_storage;
+
 /// Migrate flat file directories to 2-character prefix sharded layout.
 ///
 /// Moves files from `dir/stem.ext` to `dir/XX/stem.ext` where XX is the

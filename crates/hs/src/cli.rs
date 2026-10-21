@@ -136,6 +136,23 @@ pub enum MigrateAction {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Move the personal store into the corpus's storage, under the
+    /// `personal/` prefix.
+    ///
+    /// The personal store writes through the local filesystem, so it is
+    /// on one host, not in the bucket, and not in the backup — and the
+    /// docs service cannot serve it, so an agent's `personal_search` hit
+    /// comes back with no link the user can open. This moves the objects
+    /// into the same store the corpus uses, with their names unchanged.
+    /// The local files are left in place.
+    PersonalToStorage {
+        /// Preview without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Cap on files to move in this run (for staged migration)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Scan `papers/XX/*.pdf` for content-type mismatches (paywall HTML
     /// renamed `.pdf`, truncated downloads). HTML is renamed in place to
     /// `.html` so the existing html-parser path picks it up; other

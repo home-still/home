@@ -243,11 +243,11 @@ hs docs link 10.1371_journal.pone.0038469 --markdown --remote
 ```
 
 Every tool that returns a document — `distill_search`,
-`abstract_search`, `catalog_read`, and `doc_link` — carries a `links`
-object with a LAN URL and a remote URL for the source document and for
-its markdown. The remote URL goes through the cloud gateway; the LAN URL
-goes straight to the service, so a large PDF never hairpins through the
-tunnel.
+`abstract_search`, `personal_search`, `catalog_read`, and `doc_link` —
+carries a `links` object with a LAN URL and a remote URL for the source
+document and for its markdown. The remote URL goes through the cloud
+gateway; the LAN URL goes straight to the service, so a large PDF never
+hairpins through the tunnel.
 
 A link that names a passage points at it: the PDF link carries
 `#page=N`, and the markdown link carries a W3C text fragment that
@@ -257,6 +257,21 @@ minted for one page opens that page and nothing else.
 ```sh
 hs docs link 10.1371_journal.pone.0038469 --page 11
 ```
+
+**The collection is part of the link.** The corpus holds more than one
+store: the academic papers and the personal documents are separate, and
+a stem can name a document in either. A link names the store it is for,
+and the name is signed — so a link for a personal document cannot be
+edited into a link for an academic one, or the other way round.
+
+```sh
+hs docs link annual-checkup-notes-e564ee61 --collection personal
+```
+
+The personal store reaches the docs service through the corpus's own
+storage, under the `personal/` prefix. `hs migrate personal-to-storage
+--dry-run` previews the move; the personal objects keep their names, and
+the local files are left in place.
 
 Configure the base URLs in `~/.home-still/config.yaml`:
 

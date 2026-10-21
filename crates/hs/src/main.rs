@@ -15,6 +15,7 @@ mod installer;
 mod mcp_client;
 mod mcp_cmd;
 mod migrate_cmd;
+mod migrate_personal;
 mod openalex_cmd;
 mod pipeline_cmd;
 mod restart_cmd;
@@ -183,6 +184,9 @@ fn main() -> ExitCode {
                     cli::MigrateAction::Sharding => migrate_cmd::run_sharding(&reporter).await,
                     cli::MigrateAction::MoveRootOrphans { dry_run, limit } => {
                         migrate_cmd::run_move_root_orphans(&reporter, dry_run, limit).await
+                    }
+                    cli::MigrateAction::PersonalToStorage { dry_run, limit } => {
+                        migrate_cmd::run_personal_to_storage(&reporter, dry_run, limit).await
                     }
                     cli::MigrateAction::QuarantineBadContent { dry_run, limit } => {
                         migrate_cmd::run_quarantine_bad_content(&reporter, dry_run, limit).await

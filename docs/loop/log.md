@@ -1325,3 +1325,179 @@ device, with the live service on `:7434` untouched.
    option A: catch `MissingHeartbeat` and recreate the pull stream
    instead of exiting. Not ours to make — it is a change to a vendored
    crate.
+## 2026-10-21-09 — a personal document the agent cannot show you
+
+**Change.** The wishlist says: *"whenever an agent calls search and
+pulls text, it is also given links to documents that the user of the
+agent can view"*, and *"a really cool feature would be able to highlight
+the text in the document when all this needs to be served remotely"*.
+
+**That was already true for the academic corpus, and false for the
+personal store.** Measured by driving `hs-mcp` over stdio the way
+Claude Desktop does, 2026-10-21:
+
+| the tool | hits that carry links (before) |
+|---|---|
+| `distill_search` | **5/5** ✓ |
+| `abstract_search` | **5/5** ✓ |
+| `personal_search` | **0/5** ✗ |
+
+A `personal_search` hit came back with only `stem`, `title`,
+`category`, `snippet`, `score` — the agent had the text and **nothing
+the user could open**.
+
+**Three causes, all measured.**
+
+1. **The personal store is outside `Storage`.** It writes through raw
+   `std::fs` (`personal/src/services/catalog.rs:91`, `:203`;
+   `personal/src/services/ingest.rs:48`). The docs service reads
+   *everything* through one `Storage`
+   (`crates/hs/src/docs_service.rs:55`).
+2. **The personal store is not in the bucket.** `aws s3 ls
+   s3://home-still/` on `big` lists `.heartbeats/`, `10/`, `catalog/`,
+   `corrupted/`, `markdown/`, `papers/`, `research/` — and **no
+   `personal/`**.
+3. **It is on one host.** `two`, `bmb` and `mac_air` have **0**
+   personal files; `big` has 52. A medical record lived in one
+   directory on one machine.
+
+**The change, in four parts.**
+
+* **The link carries the collection.** The signed payload gains a
+  `collection` field, so a link names *which* store it is for. It is
+  signed like the page: a link for a personal document cannot be
+  edited into a link for an academic one.
+* **The docs service resolves the collection** to the prefixes that
+  serve it. A collection it does not serve is a **404** — the link is
+  genuine, but it names a store this host does not have.
+* **`hs migrate personal-to-storage`** moves the personal objects into
+  the corpus's own store, under the `personal/` prefix. **Dry-run by
+  default**, and it **deletes nothing**: the local files stay where
+  they are.
+* **`personal_search` mints links**, the way `distill_search` does.
+
+**The key observation that made it one change and not three.** The
+personal store's on-disk layout is *already* the corpus's layout, one
+prefix deeper: the sources are `personal/<shard>/<stem>.pdf` and the
+converted text `personal/markdown/<shard>/<stem>.md`. The docs service
+already serves any stem through `Storage`; it just did not look under
+a third prefix. So the backlog's items 2 and 3 — "the personal store
+behind `Storage`" and "source scopes" — are **one** change, and the
+wishlist's gap is the same change seen from the user's side.
+
+**The evidence.**
+
+| | before | after |
+|---|---|---|
+| `personal_search` hits carrying a link | **0/5** | **5/5** |
+| the personal link serves the document | — | **200**, 8,721 bytes of the real record |
+| a personal document's source | — | **200**, 1,028,277 bytes, `%PDF-1.4` |
+| the same stem in the wrong collection | — | **404** (not the other store's document) |
+| a link whose collection was edited in the query | — | **403 link refused** (the collection is signed) |
+| the personal store in the bucket | **no `personal/` prefix** | **321 files moved** |
+| the personal store on the other hosts | **0 files** | the same bucket |
+
+**The migration, run against the live store** — the dry run first, as
+the rules require:
+
+```
+$ hs migrate personal-to-storage --dry-run
+Plan: 321 personal file(s) found; 321 planned this run (dry-run)
+Sample: personal/a-/a-beginners-guide-to-dual-quaternions-0287e220.pdf
+Dry-run: 321 file(s) would be written under personal/
+
+$ hs migrate personal-to-storage
+Moved: 321
+Skipped: 0
+The personal store is now under personal/ in the corpus's storage. The local files were left in place.
+```
+
+**Why this ranked first.** It beat the runner-up — **cross-encoder
+reranking**, the backlog's first item, whose GPU blocker has cleared —
+on the user's own ranking of harm. A cross-encoder *reorders* the
+results of a search that works: measured on this corpus, 2026-10-21, it
+moved the expected passage's rank on **4 queries better and 3 worse**
+for a **5× latency increase** (162 → 776 ms median), and the sibling
+crate's own M37 measured the same null (+0.78 points, CI [−3.14,
++4.71]). This fixes the other half: a search that works but whose
+results the user **cannot open**. The user's own words put it first.
+
+**The research, in the corpus.** The multi-tenancy table in *Reusing
+empirical knowledge during cloud computing adoption* states the
+requirement as a cloud adoption obstacle, T10 "Isolate tenant":
+*"define tenant-based identification and hierarchical access control for
+tenants and (ii) separate tenant data using authorization and
+authentication mechanisms."* The two halves are exactly what was
+missing: the personal store had **neither** a tenant identification in
+its links nor its data in the shared storage. And *Model Context
+Protocol (MCP): Landscape, Security Threats, and Future Research
+Directions* names the risk class the change walks into — MCP's
+openness "exposes new attack surfaces, such as … tool poisoning", and
+*"an AI agent can only act upon malicious instructions, when it has
+tools to act"*. A link the agent hands the user is a *capability*: it
+must grant access to one document, in one store, for a bounded time.
+Putting the collection in the signature is what makes it one.
+
+**The tests.** Three for the link (`hs-common/src/docs.rs`): a
+tampered collection does not verify; a link without a collection is
+refused; a collection that is not a stem is refused. Three for the
+service (`crates/hs/src/docs_service.rs`): a personal document is
+served by its own link; a link cannot be edited from one collection to
+the other; a collection the service does not serve is a 404. One for
+the migration (`crates/hs/src/migrate_personal.rs`): the files keep
+their names under the new prefix.
+
+**Research.**
+`docs/loop/runs/2026-10-21-09/research.md` — the problem measured,
+the three causes, the corpus's prior art, and the technique chosen.
+`docs/loop/runs/2026-10-21-09/eval.md` — the before/after, the
+end-to-end evidence, the timings, and the tests.
+
+**Version.** `v0.0.1-rc.377` — a patch-level bump. It adds one field
+to a signed link and one collection to the docs service's
+configuration. It touches no stored data's *content* (the migration
+copies, it does not rewrite) and no search behaviour.
+
+**Note for whoever deploys it.** The link's signature shape changed:
+the collection is now in it. A link minted by an **older** service is
+refused by a newer one, and the other way round. The links are
+short-lived (an hour by default), so the window is small — but the
+docs service and the MCP server must be upgraded **together**.
+
+
+### Top 5 remaining items
+
+1. **Cross-encoder reranking.** The GPU blocker has cleared, but the
+   reranker is **not in home-still at all**: no code path, no client,
+   no service, no endpoint. Measured on this corpus, 2026-10-21: it
+   moved the expected passage's rank on **4 queries better and 3 worse**
+   for a **5× latency increase** (162 → 776 ms median) — and the
+   sibling crate's own M37 measured the same null (+0.78 points, CI
+   [−3.14, +4.71]). It needs a *process* as much as a model: a serving
+   path, a latency budget, and a decision about where it runs.
+2. **The personal store's *reads* behind `Storage`.** The objects now
+   live in the corpus's store (rc.377) and the docs service serves
+   them, but the personal crate still reads and writes its own
+   catalog through `std::fs` — so a personal document can be in the
+   bucket and still not be found by `hs personal read` on a host whose
+   disk does not have it. The migration moved the *data*; the *code
+   path* is the rest of the work.
+3. **Source scopes (#4), the rest of it.** The links now name a
+   collection, so a link is a capability for one store. What is still
+   missing is the other half: a *search* that says which stores it
+   looks in, so a general search does not return a game-engine book
+   for "risk factors for falls in elderly people" — measured
+   2026-10-21, the personal collection answers that query with *The
+   Base Class for Game Objects in SSN67*.
+4. **Fix the README drift.** The README describes OCR as "GLM-OCR via
+   Ollama" only (the code also has olmOCR, OpenAI-compatible and Cloud
+   backends) and omits `crates/openalex-ingest` and the `personal`
+   feature from the architecture list. Cheap, and it misleads anyone
+   choosing a backend. Two iterations have deferred it as "a docs
+   change, not a code change" — that reading is wrong: the rule is one
+   *change* per iteration, not one *kind* of change.
+5. **Decide the async-nats crash-loop** (see
+   `needs-decision/async-nats-missed-idle-heartbeat.md`). Recommended
+   option A: catch `MissingHeartbeat` and recreate the pull stream
+   instead of exiting. Not ours to make — it is a change to a vendored
+   crate.

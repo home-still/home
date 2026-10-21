@@ -159,6 +159,10 @@ struct DocLinkParams {
         description = "The page to open, 1-based. The link opens that page and points at it. The markdown's pages are the source document's pages."
     )]
     page: Option<u32>,
+    #[schemars(
+        description = "The collection the document is in: `academic` (the default) or `personal`. The collection is part of the link's signature, so a link for one store cannot be edited into a link for the other."
+    )]
+    collection: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -243,8 +247,14 @@ fn map_distill_search_hits(
             // The passage's first line is what a text fragment quotes,
             // so the browser can select the passage the agent found.
             let passage = h.chunk_text.lines().next().map(str::trim).map(String::from);
-            let links = minter
-                .and_then(|m| m.mint(&h.doc_id, h.page.map(|p| p as u32), passage.as_deref()));
+            let links = minter.and_then(|m| {
+                m.mint(
+                    &h.doc_id,
+                    "academic",
+                    h.page.map(|p| p as u32),
+                    passage.as_deref(),
+                )
+            });
             DistillSearchHitOut {
                 doc_id: h.doc_id.clone(),
                 title: h.title,
@@ -1684,7 +1694,7 @@ impl HomeStillMcp {
                 let links = self
                     .link_minter
                     .as_ref()
-                    .and_then(|m| m.mint(&p.stem, None, None));
+                    .and_then(|m| m.mint(&p.stem, "academic", None, None));
                 to_json(&CatalogEntryWithLinks { entry, links })
             }
             None => Err(format!("No catalog entry found for '{}'", p.stem)),
@@ -1713,8 +1723,9 @@ impl HomeStillMcp {
             );
         }
         let wanted = p.format.as_deref().unwrap_or("source");
+        let collection = p.collection.as_deref().unwrap_or("academic");
         let links = minter
-            .mint(&p.stem, p.page, None)
+            .mint(&p.stem, collection, p.page, None)
             .ok_or_else(|| format!("'{}' is not a document stem", p.stem))?;
         let pair = match wanted {
             "source" => links.source.clone(),
@@ -2854,12 +2865,22 @@ impl HomeStillMcp {
         let json: Vec<serde_json::Value> = hits
             .into_iter()
             .map(|h| {
+                // The personal documents are served by the same docs
+                // service as the academic ones, under their own
+                // collection: the collection is part of the link's
+                // signature, so the link is a capability for this
+                // document and not for another store's.
+                let passage = h.snippet.lines().next().map(str::trim);
+                let links = self.link_minter.as_ref().and_then(|m| {
+                    m.mint(&h.stem, "personal", None, passage)
+                });
                 serde_json::json!({
                     "stem": h.stem,
                     "title": h.title,
                     "category": h.category,
                     "snippet": h.snippet,
                     "score": h.score,
+                    "links": links,
                 })
             })
             .collect();

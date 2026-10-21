@@ -26,6 +26,14 @@ pub struct DocsLinkArgs {
     #[arg(long)]
     pub markdown: bool,
 
+    /// The collection the document is in. The corpus holds more than
+    /// one: the academic papers and the personal documents are separate
+    /// stores, and a stem can name a document in either. The collection
+    /// is part of the link's signature, so a link for one cannot be
+    /// edited into a link for the other.
+    #[arg(long, default_value = "academic")]
+    pub collection: String,
+
     /// The page to open, 1-based. The link opens that page and points
     /// at it.
     #[arg(long)]
@@ -106,8 +114,16 @@ async fn link(args: DocsLinkArgs, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let key_path = hs_common::docs::default_key_path();
     let key = load_key(&key_path)?;
 
-    let params = hs_common::docs::mint(&key, &args.stem, format, &subject, args.page, ttl)
-        .map_err(|e| anyhow::anyhow!("minting the link failed: {e}"))?;
+    let params = hs_common::docs::mint(
+        &key,
+        &args.stem,
+        format,
+        &subject,
+        &args.collection,
+        args.page,
+        ttl,
+    )
+    .map_err(|e| anyhow::anyhow!("minting the link failed: {e}"))?;
 
     let lan = link_url(&base_url, &params);
     reporter.finish(&lan);
@@ -189,7 +205,7 @@ mod tests {
     fn a_link_url_carries_the_stem_the_format_and_the_signature() {
         let key = LinkKey::from_bytes(vec![3u8; 32]).unwrap();
         let params =
-            hs_common::docs::mint(&key, "10.1234_abcd", LinkFormat::Source, "laptop", None, 60)
+            hs_common::docs::mint(&key, "10.1234_abcd", LinkFormat::Source, "laptop", "academic", None, 60)
                 .unwrap();
         let url = link_url("http://host:7446/", &params);
         assert!(url.starts_with("http://host:7446/docs/v1/10.1234_abcd/source?"));
@@ -206,6 +222,7 @@ mod tests {
             "10.1234_abcd",
             LinkFormat::Markdown,
             "laptop",
+            "academic",
             None,
             60,
         )

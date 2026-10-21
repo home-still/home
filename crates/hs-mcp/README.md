@@ -30,7 +30,7 @@
 | **distill_reconcile** | dry_run, limit? | Report Qdrant doc_ids whose markdown is missing (dry-run only) |
 | **distill_scan_repetitions** | limit?, threshold? | Report documents with VLM repetition artifacts (read-only) |
 | **distill_backfill** | dry_run, limit?, retry_skipped | Index converted-but-not-embedded documents |
-| **personal_search** | query, limit?, category? | Semantic search over personal documents |
+| **personal_search** | query, limit?, category? | Semantic search over personal documents; each hit carries a `links` object like the academic tools |
 | **personal_list** | limit?, category? | List ingested personal documents |
 | **personal_read** | stem | Read a personal document's markdown |
 | **personal_add** | filename, category?, title?, force | Ingest a file staged in the personal inbox |
