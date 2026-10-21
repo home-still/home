@@ -2907,6 +2907,7 @@ impl HomeStillMcp {
             p.category.as_deref(),
             p.limit.unwrap_or(50),
         )
+        .await
         .map_err(|e| format!("{e:#}"))?;
         let json: Vec<serde_json::Value> = entries
             .into_iter()
@@ -2936,7 +2937,9 @@ impl HomeStillMcp {
         Parameters(p): Parameters<PersonalReadParams>,
     ) -> Result<String, String> {
         let cfg = personal::config::Config::load().map_err(|e| format!("{e:#}"))?;
-        personal::services::catalog::read_markdown(&cfg, &p.stem).map_err(|e| format!("{e:#}"))
+        personal::services::catalog::read_markdown(&cfg, &p.stem)
+            .await
+            .map_err(|e| format!("{e:#}"))
     }
 
     #[tool(

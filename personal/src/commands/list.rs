@@ -2,7 +2,7 @@ use crate::error::Result;
 
 pub async fn run(category: Option<String>, limit: usize) -> Result<()> {
     let cfg = crate::config::Config::load()?;
-    let entries = crate::services::catalog::list_entries(&cfg, category.as_deref(), limit)?;
+    let entries = crate::services::catalog::list_entries(&cfg, category.as_deref(), limit).await?;
     for e in &entries {
         println!(
             "{:60}  {:14}  {}",

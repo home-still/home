@@ -5,8 +5,10 @@ use figment::{
     Figment,
 };
 use hs_common::config_file::{env_key_path, unknown_env_names, ConfigError, ConfigFile};
+use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Prefix of the environment variables that override config keys.
 const ENV_PREFIX: &str = "HOME_STILL_";
@@ -38,6 +40,14 @@ pub struct Config {
     /// `personal:` key: set by [`Config::load`] from the `home:` section.
     #[serde(skip)]
     pub project_dir: PathBuf,
+    /// Storage backend (local filesystem or Garage/S3).
+    ///
+    /// Loaded from the top-level `storage:` section of the config file,
+    /// the same section the corpus uses — so the personal store and the
+    /// academic corpus are read through **one** implementation, and
+    /// they cannot drift apart.
+    #[serde(skip)]
+    pub storage: StorageConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +75,7 @@ impl Default for Config {
                 .map(|c| c.as_str().to_string())
                 .collect(),
             project_dir: hs_common::default_project_dir(),
+            storage: StorageConfig::default(),
         }
     }
 }
@@ -126,6 +137,13 @@ impl Config {
         let keys = known_keys()?;
         let mut figment = Figment::new().merge(Serialized::default("personal", Self::default()));
         for file in [system, user] {
+            // The `storage:` section is the corpus's, not the personal
+            // store's: it says where *all* the data lives, and it is
+            // merged here so the personal store and the corpus are
+            // built from one section of one file.
+            if let Some(section) = file.section_json("storage").map_err(config_error)? {
+                figment = figment.merge(Serialized::default("storage", section));
+            }
             if let Some(section) = file.section_json("personal").map_err(config_error)? {
                 // A stale or misspelt `personal:` key is ignored; say so.
                 hs_common::config_file::warn_unknown_keys(
@@ -165,6 +183,28 @@ impl Config {
         })?;
         // A `personal:` key cannot move the project directory.
         cfg.project_dir = project_dir;
+        // The storage backend comes from the top-level `storage:`
+        // section — the same one the corpus uses — not from a
+        // `personal:` key, so there is one place that says where the
+        // data lives.
+        //
+        // `default_storage()` is the shared helper: it roots the
+        // default at `home.project_dir` and refuses an implicit root
+        // that would put the data somewhere else.
+        cfg.storage = if figment.contains("storage") {
+            figment
+                .clone()
+                .focus("storage")
+                .extract::<StorageConfig>()
+                .map_err(|e| {
+                    PersonalError::Config(format!(
+                        "{}: invalid `storage` section: {e}",
+                        user.path().display()
+                    ))
+                })?
+        } else {
+            user.default_storage().map_err(config_error)?
+        };
 
         if cfg.collection_name.trim().is_empty() {
             return Err(PersonalError::Config(
@@ -197,6 +237,16 @@ impl Config {
     /// project directory the config was loaded with.
     pub fn root_dir(&self) -> PathBuf {
         self.project_dir.join(&self.storage_dir)
+    }
+
+    /// Build the store's storage.
+    ///
+    /// The same `Storage` the corpus uses, from the same `storage:`
+    /// section of the config file. One implementation, so the personal
+    /// store and the academic corpus cannot be read through different
+    /// code and drift apart.
+    pub fn build_storage(&self) -> anyhow::Result<Arc<dyn Storage>> {
+        self.storage.build()
     }
 
     pub fn markdown_dir(&self) -> PathBuf {

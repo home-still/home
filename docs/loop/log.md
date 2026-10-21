@@ -1521,3 +1521,166 @@ services, so that is the operator's step.
    option A: catch `MissingHeartbeat` and recreate the pull stream
    instead of exiting. Not ours to make — it is a change to a vendored
    crate.
+## 2026-10-21-10 — the document that is in the bucket and cannot be read
+
+**Change.** The previous iteration (rc.377) moved the personal store's
+**objects** into the corpus's storage, under the `personal/` prefix, and
+the docs service now serves them with signed links. The *data* moved.
+The **code path** did not: the personal crate still read and wrote its
+catalog through raw `std::fs`.
+
+Measured on the fleet, with the objects already in the bucket:
+
+```
+$ hs personal read casey-brittain-medical-history-overview-65004350
+  big       patient: Casey Brittain …        (the local files are here)
+  two       error: no markdown found for stem 'casey-brittain-…'
+  bmb       error: no markdown found for stem 'casey-brittain-…'
+  mac_air   patient: Casey Brittain …        (it has its own copy)
+
+$ hs personal list
+  two       0 entries shown
+```
+
+**So a personal document was in the bucket, was served by the docs
+service, was findable by the *search* (which goes through the distill
+server) — and still could not be *read* or *listed* on two of the five
+hosts.** The store was half in the corpus and half on one machine, and
+the half that was on one machine was the half that answered "what do
+you have?".
+
+**Why this ranked first.** It beat the runner-up — **cross-encoder
+reranking**, the backlog's first item, whose GPU blocker has cleared —
+on the user's own ranking of harm. A cross-encoder *reorders* the
+results of a search that works: measured on this corpus, 2026-10-21, it
+moved the expected passage's rank on **4 queries better and 3 worse**
+for a **5× latency increase** (162 → 776 ms median) and a new GPU
+service, a new model and a new failure mode; the sibling crate's own
+M37 measured the same null (+0.78 points, CI [−3.14, +4.71]). This is
+a **document that is not there**: the user asks an agent about their
+medical history, the agent finds the passage, and then the agent cannot
+open the document it found — on two of the five hosts. That is a tier
+above a reordering.
+
+It is also the **other half of rc.377's own change**. The migration
+moved the data and this moves the code path that reads it; the two are
+one piece of work, and the first was done without the second, which is
+why the store was in the bucket and out of reach.
+
+**The change.** The personal store's catalog goes through `Storage`, the
+way the paper crate's has for a long time:
+
+* `Config` gains a `storage:` section, read from the **top-level**
+  `storage:` section of the config file — the same one the corpus uses
+  — and a `build_storage()` that returns `Arc<dyn Storage>`.
+* The catalog's reads and writes go through `Storage`, at the keys the
+  migration already produced: `personal/<shard>/<stem>.catalog.yaml` and
+  `personal/markdown/<shard>/<stem>.md`.
+* The **ingest** writes its objects to the store too, so a newly
+  ingested document lands where the readers look.
+* The **inbox stays local, on purpose**: it is a *drop folder*, the
+  one place an external agent may introduce bytes, and the config
+  documents it as such ("absolute values are taken as-is so a user can
+  point the inbox at, e.g., an NFS drop folder shared with a phone
+  scanner"). That is a local path by design, and it stays one.
+
+**The proof, by removing the local files.** On `big`, the local
+personal store was moved aside (reversibly) and both binaries were
+asked for the same document:
+
+```
+$ mv /mnt/home-still/personal /mnt/home-still/personal-local-backup
+
+$ hs personal read casey-brittain-medical-history-overview-65004350   # rc.373
+error: Error: no markdown found for stem 'casey-brittain-medical-history-overview-65004350'
+$ hs personal list                                                   # rc.373
+0 entries shown
+
+$ hs personal read casey-brittain-medical-history-overview-65004350   # rc.378
+---
+patient: Casey Brittain
+source: Epic MyChart EHI export (received 2025-04-17)
+domain: medical/overview
+$ hs personal list                                                   # rc.378
+Effects Techniques in Uncharted 3       other   effects-techniques-in-uncharted-3-3302b34d
+LBP Engine Requirements and Lighting …  other   lbp-engine-requirements-and-lighting-9a90548d
+…
+```
+
+**With the local files gone, the old binary finds nothing and the new
+one finds everything** — from the bucket, over the network, with the
+same command. The local store was then moved back and the old binary
+works again, so nothing was lost.
+
+**A configuration that would have silently split the store is now
+refused.** The shared `ConfigFile::default_storage()` refuses an
+implicit storage root that differs from `home.project_dir`, and the
+error names the fix.
+
+**The tests.** The personal crate's 51 tests pass, and they were
+updated to write through the store — the helpers put their objects at
+the storage keys the readers use, so a test that passes is a test of
+the real layout. The configuration test now asserts the store's paths
+*and* the storage's root, and a new one asserts that a project
+directory without a `storage:` section is refused. The four behaviours
+that had to survive — the same content under a new title is a
+duplicate, a failing index call does not cost the document its
+vectors, an abandoned ingest cleans up after itself, `--force` replaces
+the old stem — are the ones that caught this change being wrong while
+it was being written.
+
+**Research.**
+`docs/loop/runs/2026-10-21-10/research.md` — the problem measured,
+the three causes, the corpus's prior art (the interface-versus-
+implementation and pass-through-methods passages from *A Philosophy of
+Software Design*), and the technique chosen.
+`docs/loop/runs/2026-10-21-10/eval.md` — the before/after, the proof,
+the timings, and the tests.
+
+**Version.** `v0.0.1-rc.378` — a patch-level bump. It changes where
+the personal store's catalog is read from and written to. It touches no
+stored data's content, no collection schema and no search behaviour.
+
+**Note for whoever deploys it.** The personal store's config must have
+a `storage:` section, or `home.project_dir` must be the default root.
+`two` and `bmb` already have the S3 section; `big` has the local
+backend rooted at the project directory. The error names the fix when
+it is missing.
+
+
+### Top 5 remaining items
+
+1. **Cross-encoder reranking.** The GPU blocker has cleared, but the
+   reranker is **not in home-still at all**: no code path, no client,
+   no service, no endpoint. Measured on this corpus, 2026-10-21: it
+   moved the expected passage's rank on **4 queries better and 3 worse**
+   for a **5× latency increase** (162 → 776 ms median) — and the
+   sibling crate's own M37 measured the same null (+0.78 points, CI
+   [−3.14, +4.71]). It needs a *process* as much as a model: a serving
+   path, a latency budget, and a decision about where it runs.
+2. **Source scopes (#4).** The links now name a collection, so a link
+   is a capability for one store, and the personal store is now read
+   through the corpus's storage. What is still missing is the other
+   half: a *search* that says which stores it looks in, so a general
+   search does not return a game-engine book for "risk factors for
+   falls in elderly people" — measured 2026-10-21, the personal
+   collection answers that query with *The Base Class for Game Objects
+   in SSN67*.
+3. **The personal store's *ingest* through `Storage`.** The catalog
+   now reads and writes the store (rc.378); the **ingest** still reads
+   the source from the local inbox and converts it there. The inbox is
+   a local drop folder by design, but the *conversion* could be a
+   server-side job, so a host that cannot reach the scribe server could
+   still hand a document over.
+4. **Fix the README drift.** The README describes OCR as "GLM-OCR via
+   Ollama" only (the code also has olmOCR, OpenAI-compatible and Cloud
+   backends) and omits `crates/openalex-ingest` and the `personal`
+   feature from the architecture list. Cheap, and it misleads anyone
+   choosing a backend. Two iterations have deferred it as "a docs
+   change, not a code change" — that reading is wrong: the rule is one
+   *change* per iteration, not one *kind* of change.
+5. **Decide the async-nats crash-loop** (see
+   `needs-decision/async-nats-missed-idle-heartbeat.md`). Recommended
+   option A: catch `MissingHeartbeat` and recreate the pull stream
+   instead of exiting. Not ours to make — it is a change to a vendored
+   crate.

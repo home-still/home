@@ -13,7 +13,7 @@ use crate::services::{catalog, distill::PersonalDistill, naming};
 use chrono::Utc;
 use hs_common::catalog::{CatalogEntry, ConversionMeta};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Default, Clone)]
 pub struct IngestOptions {
@@ -52,7 +52,7 @@ pub async fn ingest(cfg: &Config, file: &Path, opts: IngestOptions) -> Result<In
     // The same content under a new LLM-picked title gets a new stem, so the
     // stem check below cannot see it: compare content hashes with the stored
     // sidecars instead, before the (possibly minutes-long) conversion.
-    let same_content = catalog::stems_with_sha256(cfg, &sha)?;
+    let same_content = catalog::stems_with_sha256(cfg, &sha).await?;
     if let (false, Some(existing)) = (opts.force, same_content.first()) {
         return Err(PersonalError::DuplicateContent(existing.clone()));
     }
@@ -72,9 +72,31 @@ pub async fn ingest(cfg: &Config, file: &Path, opts: IngestOptions) -> Result<In
         resolve_name_and_category(cfg, &markdown, title_override, category_override).await?;
 
     let stem = build_stem(&title, &sha);
-    let (dest_orig, dest_md, dest_cat) = store_paths(cfg, &stem, format);
+    let (dest_orig, dest_md, dest_cat) = store_keys(cfg, &stem, format);
 
-    let already_stored = dest_orig.exists() || dest_md.exists() || dest_cat.exists();
+    // The store is the corpus's storage, so "is this document already
+    // here?" is a question about the store, not about this host's disk.
+    let storage = cfg.build_storage().map_err(|e| {
+        PersonalError::Other(anyhow::anyhow!(
+            "the personal store could not be opened: {e:#}"
+        ))
+    })?;
+    let mut already_stored = false;
+    for key in [&dest_orig, &dest_md, &dest_cat] {
+        if storage
+            .head(key)
+            .await
+            .map_err(|e| {
+                PersonalError::Other(anyhow::anyhow!(
+                    "the personal store could not be read: {e:#}"
+                ))
+            })?
+            .is_some()
+        {
+            already_stored = true;
+            break;
+        }
+    }
     if !opts.force && already_stored {
         return Err(PersonalError::DuplicateStem(stem));
     }
@@ -120,12 +142,18 @@ pub async fn ingest(cfg: &Config, file: &Path, opts: IngestOptions) -> Result<In
     })
 }
 
-/// `(original, markdown, sidecar)` paths of one stem in the store.
-fn store_paths(cfg: &Config, stem: &str, format: SourceFormat) -> (PathBuf, PathBuf, PathBuf) {
+/// `(original, markdown, sidecar)` **keys** of one stem in the store.
+///
+/// The store's objects live in the corpus's storage, at the keys the
+/// migration produced: the source and the sidecar under
+/// `{prefix}/{shard}/`, the converted text under
+/// `{prefix}/markdown/{shard}/`.
+fn store_keys(cfg: &Config, stem: &str, format: SourceFormat) -> (String, String, String) {
+    let prefix = cfg.storage_dir.trim_end_matches('/');
     (
-        hs_common::sharded_path(&cfg.root_dir(), stem, format.as_str()),
-        hs_common::sharded_path(&cfg.markdown_dir(), stem, "md"),
-        hs_common::sharded_path(&cfg.root_dir(), stem, "catalog.yaml"),
+        format!("{prefix}/{}", hs_common::sharded_key(stem, format.as_str())),
+        format!("{prefix}/markdown/{}", hs_common::sharded_key(stem, "md")),
+        format!("{prefix}/{}", hs_common::sharded_key(stem, "catalog.yaml")),
     )
 }
 
@@ -165,12 +193,23 @@ async fn commit(job: Commit) -> Result<u32> {
         markdown,
         already_stored,
     } = job;
-    let (dest_orig, dest_md, dest_cat) = store_paths(&cfg, &stem, format);
+    let (dest_orig, dest_md, dest_cat) = store_keys(&cfg, &stem, format);
+    let storage = cfg.build_storage().map_err(|e| {
+        PersonalError::Other(anyhow::anyhow!(
+            "the personal store could not be opened: {e:#}"
+        ))
+    })?;
 
     let mut index_attempted = false;
     let stored = async {
-        write_atomic(&dest_orig, &bytes)?;
-        write_atomic(&dest_md, markdown.as_bytes())?;
+        storage
+            .put(&dest_orig, bytes.clone())
+            .await
+            .map_err(|e| PersonalError::Other(anyhow::anyhow!("writing {dest_orig}: {e:#}")))?;
+        storage
+            .put(&dest_md, markdown.as_bytes().to_vec())
+            .await
+            .map_err(|e| PersonalError::Other(anyhow::anyhow!("writing {dest_md}: {e:#}")))?;
 
         let entry = build_catalog(&CatalogInput {
             stem: &stem,
@@ -179,12 +218,15 @@ async fn commit(job: Commit) -> Result<u32> {
             category,
             size,
             sha: &sha,
-            orig_path: &dest_orig,
-            md_path: &dest_md,
+            orig_key: &dest_orig,
+            md_key: &dest_md,
         });
         let yaml = serde_yaml_ng::to_string(&entry)
             .map_err(|e| PersonalError::Other(anyhow::anyhow!("catalog yaml: {e}")))?;
-        write_atomic(&dest_cat, yaml.as_bytes())?;
+        storage
+            .put(&dest_cat, yaml.into_bytes())
+            .await
+            .map_err(|e| PersonalError::Other(anyhow::anyhow!("writing {dest_cat}: {e:#}")))?;
 
         let distill = PersonalDistill::new(&cfg)?;
         index_attempted = true;
@@ -210,14 +252,14 @@ async fn commit(job: Commit) -> Result<u32> {
                         );
                     }
                 }
-                for path in [&dest_cat, &dest_md, &dest_orig] {
-                    match std::fs::remove_file(path) {
+                for key in [&dest_cat, &dest_md, &dest_orig] {
+                    match storage.delete(key).await {
                         Ok(()) => {}
-                        Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(rm) if hs_common::storage::is_not_found(&rm) => {}
                         Err(rm) => tracing::warn!(
-                            path = %path.display(),
+                            key = %key,
                             error = %rm,
-                            "could not remove file after failed ingest"
+                            "could not remove the object after a failed ingest"
                         ),
                     }
                 }
@@ -289,31 +331,6 @@ pub(crate) fn build_stem(title: &str, sha: &str) -> String {
     format!("{buf}-{suffix}")
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|s| s.to_str()).unwrap_or("part")
-    ));
-    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
-    if let Err(e) = written {
-        // A half-written or unrenamed temp file would sit in the store.
-        match std::fs::remove_file(&tmp) {
-            Ok(()) => {}
-            Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
-            Err(rm) => tracing::warn!(
-                path = %tmp.display(),
-                error = %rm,
-                "could not remove temp file after failed write"
-            ),
-        }
-        return Err(e.into());
-    }
-    Ok(())
-}
-
 struct CatalogInput<'a> {
     stem: &'a str,
     format: SourceFormat,
@@ -321,16 +338,18 @@ struct CatalogInput<'a> {
     category: Category,
     size: u64,
     sha: &'a str,
-    orig_path: &'a Path,
-    md_path: &'a Path,
+    /// The **storage key** of the source object.
+    orig_key: &'a str,
+    /// The **storage key** of the converted text.
+    md_key: &'a str,
 }
 
 fn build_catalog(i: &CatalogInput<'_>) -> CatalogEntry {
     let now = Utc::now().to_rfc3339();
     CatalogEntry {
         title: Some(i.title.to_string()),
-        pdf_path: Some(i.orig_path.display().to_string()),
-        markdown_path: Some(i.md_path.display().to_string()),
+        pdf_path: Some(i.orig_key.to_string()),
+        markdown_path: Some(i.md_key.to_string()),
         downloaded_at: Some(now.clone()),
         file_size_bytes: Some(i.size),
         sha256: Some(i.sha.to_string()),
@@ -353,6 +372,7 @@ fn build_catalog(i: &CatalogInput<'_>) -> CatalogEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::catalog::storage_at;
 
     #[test]
     fn build_stem_sanitizes_punctuation_and_appends_hash() {
@@ -475,9 +495,16 @@ mod tests {
         format!("http://{addr}")
     }
 
-    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    /// Wait for a condition. The condition is async: the store is a
+    /// network object now, so "has it been written?" is a question
+    /// about the store, not about this host's disk.
+    async fn wait_until<F, Fut>(what: &str, mut done: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
         for _ in 0..200 {
-            if done() {
+            if done().await {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -495,12 +522,13 @@ mod tests {
         let cfg = Config {
             project_dir: dir.path().to_path_buf(),
             distill_url,
+            storage: storage_at(dir.path()),
             ..Config::default()
         };
         let note = dir.path().join("note.md");
         std::fs::write(&note, "# A note\n\nBody text.").unwrap();
         let stem = build_stem("My Note", &sha256_hex(&std::fs::read(&note).unwrap()));
-        let (orig, md, sidecar) = store_paths(&cfg, &stem, SourceFormat::Markdown);
+        let (orig, md, sidecar) = store_keys(&cfg, &stem, SourceFormat::Markdown);
         let opts = IngestOptions {
             title_override: Some("My Note".into()),
             category_override: Some("other".into()),
@@ -509,12 +537,37 @@ mod tests {
 
         let caller_cfg = cfg.clone();
         let caller = tokio::spawn(async move { ingest(&caller_cfg, &note, opts).await });
-        // The unit has written its files and is waiting on the index call.
-        wait_until("the files to be written", || sidecar.exists()).await;
+        // The unit has written its objects and is waiting on the index
+        // call. The store is the corpus's storage, so "written?" is a
+        // question about the store, not about this host's disk.
+        wait_until("the objects to be written", || {
+            let cfg = cfg.clone();
+            let sidecar = sidecar.clone();
+            async move {
+                cfg.build_storage()
+                    .unwrap()
+                    .head(&sidecar)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+            }
+        })
+        .await;
         caller.abort();
 
         wait_until("the abandoned ingest to clean up after itself", || {
-            !orig.exists() && !md.exists() && !sidecar.exists()
+            let cfg = cfg.clone();
+            let keys = vec![orig.clone(), md.clone(), sidecar.clone()];
+            async move {
+                let storage = cfg.build_storage().unwrap();
+                for key in &keys {
+                    if storage.head(key).await.ok().flatten().is_some() {
+                        return false;
+                    }
+                }
+                true
+            }
         })
         .await;
     }
@@ -534,6 +587,7 @@ mod tests {
         let cfg = Config {
             project_dir: dir.path().to_path_buf(),
             distill_url: server.url(),
+            storage: storage_at(dir.path()),
             ..Config::default()
         };
         (dir, cfg, index)
@@ -565,7 +619,7 @@ mod tests {
             PersonalError::DuplicateContent(existing) => assert_eq!(existing, first.stem),
             other => panic!("expected DuplicateContent, got {other:?}"),
         }
-        let listed = catalog::list_entries(&cfg, None, 10).unwrap();
+        let listed = catalog::list_entries(&cfg, None, 10).await.unwrap();
         assert_eq!(listed.len(), 1);
     }
 
@@ -595,14 +649,27 @@ mod tests {
 
         assert_ne!(first.stem, second.stem);
         delete.assert_async().await;
-        let listed = catalog::list_entries(&cfg, None, 10).unwrap();
+        let listed = catalog::list_entries(&cfg, None, 10).await.unwrap();
         assert_eq!(
             listed.iter().map(|e| e.stem.as_str()).collect::<Vec<_>>(),
             [second.stem.as_str()]
         );
-        let (orig, md, sidecar) = store_paths(&cfg, &first.stem, SourceFormat::Markdown);
-        assert!(!orig.exists() && !md.exists() && !sidecar.exists());
-        let (orig, md, sidecar) = store_paths(&cfg, &second.stem, SourceFormat::Markdown);
-        assert!(orig.exists() && md.exists() && sidecar.exists());
+        let (orig, md, sidecar) = store_keys(&cfg, &first.stem, SourceFormat::Markdown);
+        let present = |key: &str| {
+            let cfg = cfg.clone();
+            let key = key.to_string();
+            async move {
+                cfg.build_storage()
+                    .unwrap()
+                    .head(&key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+            }
+        };
+        assert!(!present(&orig).await && !present(&md).await && !present(&sidecar).await);
+        let (orig, md, sidecar) = store_keys(&cfg, &second.stem, SourceFormat::Markdown);
+        assert!(present(&orig).await && present(&md).await && present(&sidecar).await);
     }
 }

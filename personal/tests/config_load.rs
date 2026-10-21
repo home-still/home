@@ -114,9 +114,39 @@ fn the_store_lives_under_home_project_dir() {
     } else {
         "/srv/hs"
     };
-    let c = load_yaml(Some(&format!("home:\n  project_dir: {project}\n")), &[]).unwrap();
+    // The store's objects live in the corpus's storage, so the config
+    // must say where that is: a `home.project_dir` on its own would
+    // leave the objects under the default root and the project
+    // directory somewhere else — two places, and the store would not
+    // find its own documents.
+    let c = load_yaml(
+        Some(&format!(
+            "home:\n  project_dir: {project}\nstorage:\n  backend: local\n  local:\n    root: {project}\n"
+        )),
+        &[],
+    )
+    .unwrap();
     let root = PathBuf::from(project).join("personal");
     assert_eq!(c.root_dir(), root);
     assert_eq!(c.markdown_dir(), root.join("markdown"));
     assert_eq!(c.inbox_dir(), root.join("inbox"));
+    // And the store reads and writes the corpus's storage, rooted where
+    // the project directory is.
+    assert_eq!(c.storage.local.root, PathBuf::from(project));
+}
+
+#[test]
+fn a_project_dir_without_a_storage_section_is_refused() {
+    // The objects would be stored under the default root while the
+    // project directory is somewhere else: the store would not find its
+    // own documents. The error names the fix.
+    let project = if cfg!(windows) {
+        "C:/srv/hs"
+    } else {
+        "/srv/hs"
+    };
+    let err = load_yaml(Some(&format!("home:\n  project_dir: {project}\n")), &[])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("storage:"), "{err}");
 }

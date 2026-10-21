@@ -273,6 +273,14 @@ storage, under the `personal/` prefix. `hs migrate personal-to-storage
 --dry-run` previews the move; the personal objects keep their names, and
 the local files are left in place.
 
+The personal store's **catalog** — its documents' metadata and their
+converted text — is read and written through the same `storage:` section
+as the rest of the corpus, so a personal document is found on every host
+that can reach the store, not only on the one whose disk holds a copy.
+The one exception is the **ingest inbox**, which is a local drop folder
+by design: it is where an external agent may introduce bytes, and it
+takes a filename, never a path.
+
 Configure the base URLs in `~/.home-still/config.yaml`:
 
 ```yaml

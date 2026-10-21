@@ -1,14 +1,22 @@
 //! Catalog operations on the personal store: list, read, delete, reindex.
-//! Sidecars are flat YAML files at `{root}/{prefix}/{stem}.catalog.yaml`. We
-//! walk the tree directly rather than maintain a separate index — the corpus
-//! is small (personal records, not 200M papers), and a single source of truth
+//!
+//! The catalog is read and written through the corpus's `Storage` — the
+//! same one the academic corpus uses, from the same `storage:` section
+//! of the config file. One implementation, so a personal document that
+//! is in the corpus is in the corpus for every host, not only for the
+//! one whose disk happens to hold a copy.
+//!
+//! The sidecars are YAML objects at `{prefix}/{shard}/{stem}.catalog.yaml`
+//! and the converted text at `{prefix}/markdown/{shard}/{stem}.md`. The
+//! catalog is walked rather than indexed separately — the store is small
+//! (personal records, not 200M papers), and a single source of truth
 //! keeps the one-path discipline.
 
 use crate::config::Config;
 use crate::error::{PersonalError, Result};
 use crate::services::distill::PersonalDistill;
 use hs_common::catalog::CatalogEntry;
-use std::path::Path;
+use hs_common::storage::Storage;
 
 #[derive(Debug, Clone)]
 pub struct ListEntry {
@@ -18,22 +26,57 @@ pub struct ListEntry {
     pub original_format: Option<String>,
 }
 
+/// A storage rooted at `dir`.
+///
+/// The store's objects and the code that reads them must agree on where
+/// they live: a store whose objects are written under one root and
+/// read from another is a store that cannot find its own documents.
+#[cfg(test)]
+pub(crate) fn storage_at(dir: &std::path::Path) -> hs_common::storage::StorageConfig {
+    let mut storage = hs_common::storage::StorageConfig::default();
+    storage.local.root = dir.to_path_buf();
+    storage
+}
+
+/// The key of a document's catalog sidecar.
+fn sidecar_key(prefix: &str, stem: &str) -> String {
+    format!(
+        "{}/{}",
+        prefix.trim_end_matches('/'),
+        hs_common::sharded_key(stem, "catalog.yaml")
+    )
+}
+
+/// The prefix the store's converted text lives under.
+///
+/// The corpus keeps the academic markdown in `markdown/` and the
+/// personal markdown in `personal/markdown/` — the same sharded layout,
+/// one prefix deeper, which is what the migration produced.
+fn markdown_prefix(prefix: &str) -> String {
+    format!("{}/markdown", prefix.trim_end_matches('/'))
+}
+
 /// Documents in the store, most recently ingested first (the order the MCP
 /// `personal_list` tool promises), at most `limit` of them. `category` is
 /// checked against the store's taxonomy (see [`Config::resolve_category`]).
-pub fn list_entries(cfg: &Config, category: Option<&str>, limit: usize) -> Result<Vec<ListEntry>> {
+pub async fn list_entries(
+    cfg: &Config,
+    category: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ListEntry>> {
     let category = category.map(|c| cfg.resolve_category(c)).transpose()?;
+    let storage = cfg.build_storage().map_err(storage_error)?;
     let mut found: Vec<(Option<String>, ListEntry)> = Vec::new();
-    walk_sidecars(&cfg.root_dir(), &mut |path| {
-        let stem = sidecar_stem(path);
-        let entry = read_sidecar(path)?;
+    for key in sidecar_keys(&*storage, &cfg.storage_dir).await? {
+        let stem = sidecar_stem(&key);
+        let entry = read_sidecar(&*storage, &key).await?;
         if let Some(cat) = category {
             let matches = entry
                 .category
                 .as_deref()
                 .is_some_and(|c| c.eq_ignore_ascii_case(cat.as_str()));
             if !matches {
-                return Ok(());
+                continue;
             }
         }
         found.push((
@@ -45,8 +88,7 @@ pub fn list_entries(cfg: &Config, category: Option<&str>, limit: usize) -> Resul
                 original_format: entry.original_format,
             },
         ));
-        Ok(())
-    })?;
+    }
     // `downloaded_at` is the ingest time as RFC 3339 UTC, which orders as
     // text; a sidecar without one sorts last. Ties break by stem.
     found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.stem.cmp(&b.1.stem)));
@@ -57,16 +99,31 @@ pub fn list_entries(cfg: &Config, category: Option<&str>, limit: usize) -> Resul
         .collect())
 }
 
+/// Every catalog sidecar's key, under `prefix`.
+async fn sidecar_keys(storage: &dyn Storage, prefix: &str) -> Result<Vec<String>> {
+    let root = prefix.trim_end_matches('/');
+    let mut keys: Vec<String> = storage
+        .list(&format!("{root}/"))
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(|o| o.key)
+        .filter(|k| k.ends_with(".catalog.yaml"))
+        .collect();
+    keys.sort();
+    Ok(keys)
+}
+
 /// Stems (sorted) of every stored document whose source file has this
 /// SHA-256 (lowercase hex), read from the sidecars. Empty when none does.
-pub fn stems_with_sha256(cfg: &Config, sha256: &str) -> Result<Vec<String>> {
+pub async fn stems_with_sha256(cfg: &Config, sha256: &str) -> Result<Vec<String>> {
+    let storage = cfg.build_storage().map_err(storage_error)?;
     let mut stems = Vec::new();
-    walk_sidecars(&cfg.root_dir(), &mut |path| {
-        if read_sidecar(path)?.sha256.as_deref() == Some(sha256) {
-            stems.push(sidecar_stem(path));
+    for key in sidecar_keys(&*storage, &cfg.storage_dir).await? {
+        if read_sidecar(&*storage, &key).await?.sha256.as_deref() == Some(sha256) {
+            stems.push(sidecar_stem(&key));
         }
-        Ok(())
-    })?;
+    }
     stems.sort();
     Ok(stems)
 }
@@ -80,15 +137,15 @@ fn check_stem(stem: &str) -> Result<()> {
         .map_err(|e| PersonalError::Other(anyhow::anyhow!("invalid stem {stem:?}: {e}")))
 }
 
-pub fn read_markdown(cfg: &Config, stem: &str) -> Result<String> {
+/// A document's converted text, read from the store.
+pub async fn read_markdown(cfg: &Config, stem: &str) -> Result<String> {
     check_stem(stem)?;
-    let path = hs_common::sharded_path(&cfg.markdown_dir(), stem, "md");
-    if !path.exists() {
-        return Err(PersonalError::Other(anyhow::anyhow!(
-            "no markdown found for stem '{stem}'"
-        )));
-    }
-    Ok(std::fs::read_to_string(&path)?)
+    let storage = cfg.build_storage().map_err(storage_error)?;
+    let text =
+        hs_common::markdown::read_markdown_via(&*storage, &markdown_prefix(&cfg.storage_dir), stem)
+            .await
+            .map_err(storage_error)?;
+    text.ok_or_else(|| PersonalError::Other(anyhow::anyhow!("no markdown found for stem '{stem}'")))
 }
 
 pub async fn delete(cfg: &Config, stem: &str) -> Result<u64> {
@@ -96,19 +153,25 @@ pub async fn delete(cfg: &Config, stem: &str) -> Result<u64> {
     let distill = PersonalDistill::new(cfg)?;
     let removed = distill.delete(stem).await?;
 
+    let storage = cfg.build_storage().map_err(storage_error)?;
+    let prefix = cfg.storage_dir.trim_end_matches('/');
     let candidates = [
-        hs_common::sharded_path(&cfg.root_dir(), stem, "pdf"),
-        hs_common::sharded_path(&cfg.root_dir(), stem, "epub"),
-        hs_common::sharded_path(&cfg.root_dir(), stem, "docx"),
-        hs_common::sharded_path(&cfg.root_dir(), stem, "md"),
-        hs_common::sharded_path(&cfg.root_dir(), stem, "txt"),
-        hs_common::sharded_path(&cfg.root_dir(), stem, "catalog.yaml"),
-        hs_common::sharded_path(&cfg.markdown_dir(), stem, "md"),
+        format!("{prefix}/{}", hs_common::sharded_key(stem, "pdf")),
+        format!("{prefix}/{}", hs_common::sharded_key(stem, "epub")),
+        format!("{prefix}/{}", hs_common::sharded_key(stem, "docx")),
+        format!("{prefix}/{}", hs_common::sharded_key(stem, "md")),
+        format!("{prefix}/{}", hs_common::sharded_key(stem, "txt")),
+        sidecar_key(prefix, stem),
+        format!(
+            "{}/{}",
+            markdown_prefix(prefix),
+            hs_common::sharded_key(stem, "md")
+        ),
     ];
     let mut removed_files = 0usize;
-    for p in &candidates {
-        if p.exists() {
-            std::fs::remove_file(p)?;
+    for key in candidates {
+        if storage.head(&key).await.map_err(storage_error)?.is_some() {
+            storage.delete(&key).await.map_err(storage_error)?;
             removed_files += 1;
         }
     }
@@ -123,9 +186,9 @@ pub async fn delete(cfg: &Config, stem: &str) -> Result<u64> {
 
 pub async fn reindex(cfg: &Config, stem: &str) -> Result<u32> {
     check_stem(stem)?;
-    let entry_path = hs_common::sharded_path(&cfg.root_dir(), stem, "catalog.yaml");
-    let entry = read_sidecar(&entry_path)?;
-    let md = read_markdown(cfg, stem)?;
+    let storage = cfg.build_storage().map_err(storage_error)?;
+    let entry = read_sidecar(&*storage, &sidecar_key(&cfg.storage_dir, stem)).await?;
+    let md = read_markdown(cfg, stem).await?;
     let distill = PersonalDistill::new(cfg)?;
     // Indexing replaces a document in place (new chunks upserted, stale tail
     // removed after success), so nothing is deleted first: a failed index
@@ -134,74 +197,67 @@ pub async fn reindex(cfg: &Config, stem: &str) -> Result<u32> {
     Ok(result.chunks_indexed)
 }
 
-fn read_sidecar(path: &Path) -> Result<CatalogEntry> {
-    let raw = std::fs::read_to_string(path)?;
-    serde_yaml_ng::from_str(&raw).map_err(|e| {
-        PersonalError::Other(anyhow::anyhow!(
-            "sidecar {} is malformed: {e}",
-            path.display()
-        ))
-    })
+/// A document's catalog sidecar, read from the store.
+async fn read_sidecar(storage: &dyn Storage, key: &str) -> Result<CatalogEntry> {
+    let raw = storage.get(key).await.map_err(storage_error)?;
+    serde_yaml_ng::from_str(&String::from_utf8_lossy(&raw))
+        .map_err(|e| PersonalError::Other(anyhow::anyhow!("sidecar {key} is malformed: {e}")))
 }
 
-fn sidecar_stem(path: &Path) -> String {
-    // path looks like `{root}/{prefix}/{stem}.catalog.yaml`. Strip both
-    // ".yaml" and ".catalog" so the stem is what `build_stem` produced.
-    let s = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    s.strip_suffix(".catalog.yaml").unwrap_or(s).to_string()
+/// A storage failure, named.
+fn storage_error(e: anyhow::Error) -> PersonalError {
+    PersonalError::Other(anyhow::anyhow!(
+        "the personal store could not be read: {e:#}"
+    ))
 }
 
-fn walk_sidecars(root: &Path, f: &mut dyn FnMut(&Path) -> Result<()>) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            // Skip the markdown subtree — sidecars live next to originals,
-            // not under markdown/.
-            if path.file_name().and_then(|s| s.to_str()) == Some("markdown") {
-                continue;
-            }
-            walk_sidecars(&path, f)?;
-        } else if path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| s.ends_with(".catalog.yaml"))
-        {
-            f(&path)?;
-        }
-    }
-    Ok(())
+/// The stem a sidecar's key names.
+///
+/// The key looks like `{prefix}/{shard}/{stem}.catalog.yaml`. Strip both
+/// ".yaml" and ".catalog" so the stem is what `build_stem` produced.
+fn sidecar_stem(key: &str) -> String {
+    let name = key.rsplit('/').next().unwrap_or(key);
+    name.strip_suffix(".catalog.yaml")
+        .unwrap_or(name)
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn store_with_document(server_url: &str) -> (tempfile::TempDir, Config) {
+    async fn store_with_document(server_url: &str) -> (tempfile::TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             project_dir: dir.path().to_path_buf(),
             distill_url: server_url.to_string(),
+            storage: storage_at(dir.path()),
             ..Config::default()
         };
-        let sidecar = hs_common::sharded_path(&cfg.root_dir(), "record", "catalog.yaml");
-        let md = hs_common::sharded_path(&cfg.markdown_dir(), "record", "md");
-        for (path, body) in [
-            (
-                sidecar,
-                serde_yaml_ng::to_string(&CatalogEntry::default()).unwrap(),
-            ),
-            (md, "# Record\n\nBody.".to_string()),
-        ] {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, body).unwrap();
-        }
+        // The store's objects live in the storage, at the keys the
+        // migration produced: `personal/<shard>/<stem>.catalog.yaml` and
+        // `personal/markdown/<shard>/<stem>.md`.
+        let storage = cfg.build_storage().unwrap();
+        storage
+            .put(
+                &sidecar_key(&cfg.storage_dir, "record"),
+                serde_yaml_ng::to_string(&CatalogEntry::default())
+                    .unwrap()
+                    .into_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                &format!(
+                    "{}/{}",
+                    markdown_prefix(&cfg.storage_dir),
+                    hs_common::sharded_key("record", "md")
+                ),
+                "# Record\n\nBody.".to_string().into_bytes(),
+            )
+            .await
+            .unwrap();
         (dir, cfg)
     }
 
@@ -222,7 +278,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let (_dir, cfg) = store_with_document(&distill.url());
+        let (_dir, cfg) = store_with_document(&distill.url()).await;
 
         let err = reindex(&cfg, "record").await.unwrap_err();
 
@@ -231,46 +287,54 @@ mod tests {
         delete.assert_async().await;
     }
 
-    fn write_sidecar(cfg: &Config, stem: &str, category: &str, downloaded_at: Option<&str>) {
+    /// Write a document's sidecar into the store, where the readers
+    /// look for it.
+    async fn write_sidecar(cfg: &Config, stem: &str, category: &str, downloaded_at: Option<&str>) {
         let entry = CatalogEntry {
             title: Some(format!("Title of {stem}")),
             category: Some(category.to_string()),
             downloaded_at: downloaded_at.map(str::to_string),
             ..CatalogEntry::default()
         };
-        let path = hs_common::sharded_path(&cfg.root_dir(), stem, "catalog.yaml");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, serde_yaml_ng::to_string(&entry).unwrap()).unwrap();
+        let storage = cfg.build_storage().unwrap();
+        storage
+            .put(
+                &sidecar_key(&cfg.storage_dir, stem),
+                serde_yaml_ng::to_string(&entry).unwrap().into_bytes(),
+            )
+            .await
+            .unwrap();
     }
 
-    #[test]
-    fn list_is_most_recent_first_and_its_category_filter_ignores_case() {
+    #[tokio::test]
+    async fn list_is_most_recent_first_and_its_category_filter_ignores_case() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             project_dir: dir.path().to_path_buf(),
+            storage: storage_at(dir.path()),
             ..Config::default()
         };
-        write_sidecar(&cfg, "jan", "tax", Some("2026-01-05T10:00:00+00:00"));
-        write_sidecar(&cfg, "mar", "medical", Some("2026-03-05T10:00:00+00:00"));
-        write_sidecar(&cfg, "feb", "tax", Some("2026-02-05T10:00:00+00:00"));
-        write_sidecar(&cfg, "undated", "tax", None);
+        write_sidecar(&cfg, "jan", "tax", Some("2026-01-05T10:00:00+00:00")).await;
+        write_sidecar(&cfg, "mar", "medical", Some("2026-03-05T10:00:00+00:00")).await;
+        write_sidecar(&cfg, "feb", "tax", Some("2026-02-05T10:00:00+00:00")).await;
+        write_sidecar(&cfg, "undated", "tax", None).await;
         let stems = |entries: Vec<ListEntry>| -> Vec<String> {
             entries.into_iter().map(|e| e.stem).collect()
         };
 
         assert_eq!(
-            stems(list_entries(&cfg, None, 10).unwrap()),
+            stems(list_entries(&cfg, None, 10).await.unwrap()),
             ["mar", "feb", "jan", "undated"]
         );
         // `limit` keeps the most recent ones, not the alphabetically first.
-        assert_eq!(stems(list_entries(&cfg, None, 1).unwrap()), ["mar"]);
+        assert_eq!(stems(list_entries(&cfg, None, 1).await.unwrap()), ["mar"]);
         // The stored category is lowercase; `--category Tax` must still match.
         assert_eq!(
-            stems(list_entries(&cfg, Some("Tax"), 10).unwrap()),
+            stems(list_entries(&cfg, Some("Tax"), 10).await.unwrap()),
             ["feb", "jan", "undated"]
         );
         // A category outside the taxonomy matches nothing by construction.
-        let err = list_entries(&cfg, Some("payroll"), 10).unwrap_err();
+        let err = list_entries(&cfg, Some("payroll"), 10).await.unwrap_err();
         assert!(matches!(err, PersonalError::UnknownCategory(_)), "{err:?}");
     }
 
@@ -307,13 +371,14 @@ mod stem_boundary_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             project_dir: dir.path().to_path_buf(),
+            storage: storage_at(dir.path()),
             ..Config::default()
         };
         let outside = dir.path().join("secret.md");
         std::fs::write(&outside, "secret").unwrap();
 
         for stem in ["../../secret", "..", "a/b", "", "a\\b"] {
-            assert!(read_markdown(&cfg, stem).is_err(), "read {stem:?}");
+            assert!(read_markdown(&cfg, stem).await.is_err(), "read {stem:?}");
             assert!(delete(&cfg, stem).await.is_err(), "delete {stem:?}");
             assert!(reindex(&cfg, stem).await.is_err(), "reindex {stem:?}");
         }
