@@ -1047,6 +1047,18 @@ not contradict itself** — that third one asserts the *invariant* the
 old output violated, not the shape of the new output, so it is the test
 that would have caught this bug.
 
+**CI caught a flaw in the first version of that test**, on all three
+platforms at once: it asserted that a live server produced *no* error,
+but the status command also probes Qdrant, which is not running in CI —
+so the test was asserting about the environment as well as about the
+code under test. The assertion now checks what the test is about — that
+the report does not say the server is down — and nothing else. Verified
+with Qdrant deliberately unreachable
+(`HS_DISTILL_QDRANT_URL=http://localhost:6399`), which is CI's
+condition: all three pass. A test that fails on *every* platform at
+once is the test's own fault, and a local green run proves nothing when
+the local host has the dependency CI does not.
+
 **Checked and found not to be wrong.** The `scribe` enum's `Status`
 variant looked like a declared-but-never-dispatched branch — a command
 advertised in `--help` that does not exist. It is not: the variant
