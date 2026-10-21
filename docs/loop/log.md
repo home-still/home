@@ -1641,6 +1641,15 @@ the timings, and the tests.
 the personal store's catalog is read from and written to. It touches no
 stored data's content, no collection schema and no search behaviour.
 
+**The query set does not move**, as it must not: the change is in the
+personal store's catalog, not in retrieval. Re-run on the live server:
+RECALL@10 **24/25 = 96 %** — the same as before this change.
+
+**Commit.** `db196c4` — "fix(personal): the store's catalog goes through
+the corpus's storage".
+
+**Release.** `v0.0.1-rc.378`, tagged from `db196c4` on `main`.
+
 **Note for whoever deploys it.** The personal store's config must have
 a `storage:` section, or `home.project_dir` must be the default root.
 `two` and `bmb` already have the S3 section; `big` has the local
