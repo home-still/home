@@ -199,10 +199,17 @@ hs serve distill start                   # start Qdrant + distill server
 hs distill index                         # index all markdown files
 hs distill search "attention mechanism"  # semantic search
 hs distill search "neural nets" --year ">2020" --limit 5
-hs distill status                        # collection stats
+hs distill status                        # server liveness + collection stats
 ```
 
 Search results include title, authors, year, relevance score, and text snippets. Low-quality chunks (repetition loops, garbled text) are automatically filtered during indexing.
+
+`hs distill status` reports the server's liveness by **asking the
+server** — its `/health` endpoint answers for itself, and the reply
+carries the server's own PID. It is not a PID-file check: a server
+started by systemd writes no PID file, and a PID file records the PID
+of a *previous* launch, so a file-based check reports a healthy server
+as dead.
 
 ### Repairing missing titles
 

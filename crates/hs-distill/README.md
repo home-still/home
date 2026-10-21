@@ -136,7 +136,7 @@ Starts both the Qdrant container and the native `hs-distill-server` process. Log
 ```bash
 hs serve distill stop     # stop the distill server
 hs status                 # health of the configured distill servers
-hs distill status          # show Qdrant health, server PID, collection info
+hs distill status          # show Qdrant health, server liveness + PID, collection info
 ```
 
 ## Client setup
@@ -248,7 +248,7 @@ Each markdown file goes through:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | 200 with server status; 503 if the embedder is unusable or Qdrant is unreachable |
+| `/health` | GET | 200 with server status, the server's own `pid`, its device, collection and versions; 503 if the embedder is unusable or Qdrant is unreachable. The `pid` is the server's own process id — the only party that knows it, whether systemd, launchd or a hand-typed command started it |
 | `/readiness` | GET | `ready` (embedder healthy and Qdrant answering), `capacity` (embedder slots), `in_flight`, `reason`; 503 when not ready |
 | `/status` | GET | Collection stats (points, documents, device); `documents_count_truncated` if the count hit 1,000,000 |
 | `/distill` | POST | Index a document (non-streaming). `content` is required |

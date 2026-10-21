@@ -373,6 +373,7 @@ impl DistillServerState {
             version: env!("HS_VERSION").to_string(),
             qdrant_version,
             embed_model: MODEL_NAME.into(),
+            pid: std::process::id(),
         })
     }
 

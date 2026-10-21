@@ -1171,20 +1171,47 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
         reporter.error(&format!("Qdrant: not reachable at {qdrant_rest}"));
     }
 
-    // Distill server PID
-    let pid_path = distill_pid_path()?;
-    match crate::daemon::read_pid(&pid_path) {
-        Some(pid) if crate::daemon::process_is(pid, DISTILL_SERVER_EXE, &[]) => {
-            reporter.status("Server", &format!("running (PID {pid})"));
+    // The distill server's liveness.
+    //
+    // The signal is a **ping**: the server's own `/health` endpoint
+    // answers for itself, and only the server knows whether it is
+    // running. A PID file is not that signal — the live server on
+    // `big` runs under systemd and writes no PID file, so a PID-file
+    // check reported "not running" for a server that was up and
+    // serving (the file that was there dated from April, naming a dead
+    // PID). The project's own rule says the same: liveness is
+    // heartbeat-based, not PID-file-based.
+    //
+    // The PID is still worth *reporting* — it is what an operator needs
+    // in order to act — and it comes from the server, which is the only
+    // party that knows it. It is extra information, never the verdict.
+    let servers = resolve_servers(server).await?;
+    let client = make_distill_client(&servers[0]).await?;
+
+    let health = client.health().await;
+    match &health {
+        Ok(h) => {
+            // The server reports its own PID: it is the only party that
+            // knows it, whether systemd, launchd or a hand-typed
+            // command started it.
+            let running = if h.pid > 0 {
+                format!("running (PID {})", h.pid)
+            } else {
+                "running".to_string()
+            };
+            reporter.status("Server", &running);
+            reporter.status("Address", &servers[0]);
+            reporter.status("Version", &h.version);
         }
-        _ => {
-            reporter.status("Server", "not running");
+        Err(e) => {
+            reporter.error(&format!(
+                "Server: not running (no answer at {}/health: {e:#})",
+                servers[0]
+            ));
         }
     }
 
     // Collection info (if server is reachable)
-    let servers = resolve_servers(server).await?;
-    let client = make_distill_client(&servers[0]).await?;
     match client.status().await {
         Ok(status) => {
             reporter.status("Collection", &status.collection);
@@ -2448,6 +2475,161 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use crate::test_http::{FakeServer, Response};
+
+    /// A reporter that keeps what it was told, so a test can read the
+    /// command's verdict.
+    #[derive(Default)]
+    struct Capturing {
+        statuses: std::sync::Mutex<Vec<(String, String)>>,
+        errors: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Reporter for Capturing {
+        fn status(&self, verb: &str, message: &str) {
+            self.statuses
+                .lock()
+                .unwrap()
+                .push((verb.to_string(), message.to_string()));
+        }
+        fn warn(&self, _message: &str) {}
+        fn error(&self, message: &str) {
+            self.errors.lock().unwrap().push(message.to_string());
+        }
+        fn begin_stage(
+            &self,
+            _name: &str,
+            _total: Option<u64>,
+        ) -> Box<dyn hs_common::reporter::StageHandle> {
+            Box::new(hs_common::reporter::NoopStageHandle)
+        }
+        fn finish(&self, _summary: &str) {}
+    }
+
+    impl Capturing {
+        fn server_line(&self) -> Option<String> {
+            self.statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(verb, _)| verb == "Server")
+                .map(|(_, message)| message.clone())
+        }
+    }
+
+    /// The reporter, as the command takes it, plus a handle to read it.
+    fn capturing() -> (Arc<Capturing>, Arc<dyn Reporter>) {
+        let captured = Arc::new(Capturing::default());
+        let as_trait: Arc<dyn Reporter> = captured.clone();
+        (captured, as_trait)
+    }
+
+    /// A server that answers `/health` with the given body and `/status`
+    /// with the collection's numbers.
+    async fn live_server(pid: u32) -> FakeServer {
+        FakeServer::start(move |req| match req.path.as_str() {
+            "/health" => Response::json(
+                200,
+                &serde_json::json!({
+                    "status": "ok",
+                    "compute_device": "Cuda",
+                    "collection": "academic_papers",
+                    "version": "0.0.1-rc.374",
+                    "qdrant_version": "1.19.2",
+                    "embed_model": "bge-m3",
+                    "pid": pid,
+                }),
+            ),
+            "/status" => Response::json(
+                200,
+                &serde_json::json!({
+                    "collection": "academic_papers",
+                    "points_count": 445451,
+                    "compute_device": "Cuda",
+                    "qdrant_url": "http://localhost:6334",
+                }),
+            ),
+            _ => Response::json(404, &serde_json::json!({})),
+        })
+        .await
+    }
+
+    /// The server's liveness is the server's own answer, not a PID file.
+    ///
+    /// Measured 2026-10-21 on `big`: the live server runs under systemd
+    /// and writes no PID file, and the file that was there dated from
+    /// April and named a dead PID — so the command reported "not
+    /// running" for a server that was up, and contradicted itself one
+    /// line later by reporting the point count it had just fetched
+    /// *from that server*.
+    #[tokio::test]
+    async fn a_server_that_answers_is_reported_as_running() {
+        let server = live_server(4242).await;
+        let (reporter, as_trait) = capturing();
+        cmd_status(Some(&server.base), &as_trait).await.unwrap();
+
+        let line = reporter.server_line().expect("a Server line");
+        assert!(
+            line.starts_with("running"),
+            "the server answered /health but was reported as {line:?}"
+        );
+        assert!(
+            line.contains("4242"),
+            "the server's own PID was not reported: {line:?}"
+        );
+        assert!(
+            reporter.errors.lock().unwrap().is_empty(),
+            "a live server produced an error: {:?}",
+            reporter.errors.lock().unwrap()
+        );
+    }
+
+    /// A server that does not answer is reported as down, and the report
+    /// says where it looked — so the operator can act.
+    #[tokio::test]
+    async fn a_server_that_does_not_answer_is_reported_as_not_running() {
+        // A port nothing listens on: the server is gone.
+        let base = "http://127.0.0.1:1";
+        let (reporter, as_trait) = capturing();
+        cmd_status(Some(base), &as_trait).await.unwrap();
+
+        let errors = reporter.errors.lock().unwrap().clone();
+        assert!(
+            errors.iter().any(|e| e.contains("not running")),
+            "a dead server was not reported as down: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains(base)),
+            "the report does not say where it looked: {errors:?}"
+        );
+    }
+
+    /// The report must not contradict itself: a server that is not
+    /// running cannot also be the source of the collection's numbers.
+    #[tokio::test]
+    async fn the_report_does_not_contradict_itself() {
+        let base = "http://127.0.0.1:1";
+        let (reporter, as_trait) = capturing();
+        cmd_status(Some(base), &as_trait).await.unwrap();
+
+        let statuses = reporter.statuses.lock().unwrap().clone();
+        let says_down = reporter
+            .errors
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.contains("not running"));
+        let reports_points = statuses.iter().any(|(verb, _)| verb == "Points");
+        assert!(
+            !(says_down && reports_points),
+            "the report says the server is down and still reports its numbers: {statuses:?}"
+        );
     }
 }
 

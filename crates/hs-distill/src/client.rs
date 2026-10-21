@@ -79,6 +79,15 @@ pub struct HealthResponse {
     pub qdrant_version: String,
     #[serde(default)]
     pub embed_model: String,
+    /// The server's own process id.
+    ///
+    /// The server knows it; a client that has to guess (from a PID file
+    /// or a process scan) guesses wrong when the server was started by
+    /// systemd, by launchd, or by hand — a PID file records the PID of
+    /// a *previous* launch and is not rewritten. `0` when the platform
+    /// does not say.
+    #[serde(default)]
+    pub pid: u32,
 }
 
 /// Readiness response from the distill server.

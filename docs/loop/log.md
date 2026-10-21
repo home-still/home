@@ -936,3 +936,160 @@ the same Qdrant, with the live service on `:7434` untouched.
    "personal documents get links" is not started. Moving it behind
    `Storage` (a `hs migrate personal-to-storage`) would let one read
    path serve every document the corpus holds.
+## 2026-10-21-07 — the status that said "not running" about a running server
+
+**Change.** `hs distill status` reported the distill server's liveness
+from a **PID file**. The live server on `big` runs under **systemd**, so
+no PID file is written for it — and the file that was there is from
+**April 14**, naming a PID that no longer exists. The command therefore
+reported a healthy, serving server as **dead**, and contradicted itself
+one line later.
+
+The liveness signal is now the server's **own answer**: the status
+command pings `/health` — the request it was already making, one line
+later, to fetch the collection and the point count — and that answer
+is the verdict. The server now also reports **its own PID** in
+`/health`, so the report can name the process without the client
+guessing it: the server is the only party that knows its PID, whether
+systemd, launchd or a hand-typed command started it.
+
+**Why this ranked first.** It beat the runner-up — **cross-encoder
+reranking**, the backlog's first item, whose GPU blocker has just
+cleared (18 GB of 24.6 GB free on `big`) — on two counts. The
+reranker is **not in home-still at all**: no code path, no client, no
+service, no endpoint; the model is on disk but nothing serves it.
+Building it is a new GPU service, a new serving path and a new latency
+budget, on a GPU another agent's job took 12 GB of earlier today.
+And the status wrongness is a **definite bug** rather than a tuning
+problem: a command that operators use in the deployment runbook's own
+verification step tells them a healthy server is down, and the wrong
+answer is worse than no answer, because it sends them to restart a
+server that is serving.
+
+**The evidence.** Measured on the live server on `big`, 2026-10-21,
+reading the real 445,451-point collection:
+
+```
+$ hs distill status                          # before
+Qdrant: OK (http://localhost:6333)
+Server: not running          <-- WRONG
+Collection: academic_papers
+Points: 445451               <-- fetched FROM that server, one line later
+Device: Cuda
+```
+
+The live server was real: PID 2227527,
+`/home/ladvien/.local/bin/hs-distill-server`, started by
+`hs-serve-distill.service`, answering `/health` with `{"status":"ok"}`.
+
+| | before | after |
+|---|---|---|
+| the live server's liveness | **"not running"** (wrong) | **"running"** |
+| the PID reported | none (a stale file was read) | **the server's own PID** |
+| a dead server's report | "not running", no address | "not running", **with the address and the reason** |
+| the report contradicts itself | **yes** | **no** |
+| the command's median duration | 372 ms (through ssh) | 392 ms |
+
+**The project already had the rule.** `CLAUDE.md`: *"Watcher liveness is
+heartbeat-based, not PID-file-based. When diagnosing 'is the watcher
+alive?' check `last_tick_seconds_ago` from status, not `/var/run/*.pid`."*
+The rule was written for the watchers; the distill server's *status
+command* used the pattern the rule forbids, with the same consequence.
+And `hs status` — the main dashboard — already probes each service's
+health endpoint and already reported the distill server correctly. It
+was only the per-service command that was wrong, which is what made the
+inconsistency so easy to miss.
+
+**The technique, from the corpus.** Searched home-still on itself first.
+*Software Architecture in Practice*, 4th edition (in the corpus), in
+the section on system monitoring, names the tactic: *"**Ping/echo.** An
+asynchronous request/response message pair is exchanged between nodes;
+it is used to determine reachability… In addition, the echo indicates
+that the pinged component is alive. The ping is often sent by a system
+monitor."* And on the watchdog variant: *"the process being monitored
+will periodically reset the watchdog counter/timer as part of its signal
+that it's working correctly."* The stale PID file is a watchdog that
+was never reset, because the process that would have reset it is not
+the one running.
+
+**The signal is one path.** There is no "if the PID file says X and
+the health check says Y, prefer Y" — the health check *is* the
+verdict, because it is the only signal that is about the service rather
+than about a file. The PID file is not consulted for liveness at all.
+
+**The wire format grows by one optional field.** `HealthResponse` gains
+`pid: u32` with `#[serde(default)]`, so a new client reads an old
+server's health and an old client reads a new server's health. The
+`/health` contract is otherwise untouched, and `/health` is
+unauthenticated — it says *that* a dependency is down, never why.
+
+**Verified end to end, on the live corpus.** The new CLI against the
+live server reports `running`; against the new server (which reports
+its own PID) it reports `running (PID 2257468)`, and that PID was
+checked against the process table. The failure path names the address
+and the reason: *"not running (no answer at http://127.0.0.1:1/health:
+… Connection refused)"*. The search path is untouched — the same new
+server served searches while the status was taken.
+
+**The tests.** Three, in `crates/hs/src/distill_cmd.rs::status_tests`,
+on the project's `FakeServer`: a server that answers is reported as
+running and its PID is shown; a server that does not answer is reported
+as down *and the report says where it looked*; and **the report does
+not contradict itself** — that third one asserts the *invariant* the
+old output violated, not the shape of the new output, so it is the test
+that would have caught this bug.
+
+**Checked and found not to be wrong.** The `scribe` enum's `Status`
+variant looked like a declared-but-never-dispatched branch — a command
+advertised in `--help` that does not exist. It is not: the variant
+belongs to `InboxAction`, it is dispatched, and `hs scribe inbox status`
+works, asking systemd for the unit's state — the right signal. Checked
+rather than assumed; it changed nothing.
+
+**Research.**
+`docs/loop/runs/2026-10-21-07/research.md` — the problem measured, the
+root cause, the literature, the technique chosen.
+`docs/loop/runs/2026-10-21-07/eval.md` — the before/after, the
+end-to-end evidence, the timings, and the tests.
+
+**Version.** `v0.0.1-rc.375` — a patch-level bump. It adds one
+optional field to a health response and changes what a status command
+reports. It touches no stored data, no collection schema and no search
+behaviour.
+
+
+### Top 5 remaining items
+
+1. **Cross-encoder reranking.** The GPU blocker has cleared — 18 GB of
+   the 24.6 GB on `big` was free on 2026-10-21 — but the reranker is
+   **not in home-still at all**: no code path, no client, no service, no
+   endpoint. The model is on disk
+   (`~/models/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf`) and
+   nothing serves it. This is the next *large* piece of work: a GPU
+   service, a serving path, a client, a latency budget, and a new
+   failure mode. It is the right long-term answer for the *order* of
+   the prose — the reference-list noise is now 4 % of the first hits.
+2. **Fix the README drift.** The README describes OCR as "GLM-OCR via
+   Ollama" only (the code also has olmOCR, OpenAI-compatible and Cloud
+   backends) and omits `crates/openalex-ingest` and the `personal`
+   feature from the architecture list. Cheap, and it misleads anyone
+   choosing a backend. Two iterations have deferred it as "a docs
+   change, not a code change" — that reading is wrong: the rule is one
+   *change* per iteration, not one *kind* of change.
+3. **Source scopes (#4).** The MCP layer has no notion of which source
+   a document came from (academic, personal, internet, synthesis,
+   iMessages) and no per-source scope, so every tool returns every
+   document. It is what stops a personal document leaking through a
+   general search, and it is what would give a personal document a
+   shorter link TTL.
+4. **The `personal` store behind `Storage`.** The personal store sits
+   on the local filesystem outside `Storage`, so the docs service
+   cannot serve a personal document — which is also why issue #7's
+   "personal documents get links" is not started. Moving it behind
+   `Storage` (a `hs migrate personal-to-storage`) would let one read
+   path serve every document the corpus holds.
+5. **Decide the async-nats crash-loop** (see
+   `needs-decision/async-nats-missed-idle-heartbeat.md`). Recommended
+   option A: catch `MissingHeartbeat` and recreate the pull stream
+   instead of exiting. Not ours to make — it is a change to a vendored
+   crate.
