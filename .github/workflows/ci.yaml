@@ -18,7 +18,7 @@ env:
 jobs:
   check:
     name: Check (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'big' && fromJSON('["self-hosted","big"]') || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +33,9 @@ jobs:
         # build dies in cc-rs (`cl.exe` exit 2). Every crate but
         # hs-scribe pulls duckdb, so the whole leg failed. release.yaml
         # pinned the same runner for the same reason (rc.336/rc.337).
-        os: [ubuntu-24.04, macos-14, windows-2022]
+        # big is the self-hosted Ubuntu 24.04 runner (labels self-hosted, big) with a
+        # persistent cargo cache; it stands in for ubuntu-24.04 on this matrix.
+        os: [big, macos-14, windows-2022]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -45,6 +47,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: matrix.os != 'big'
 
       # hs-scribe's pdfium-backed tests print SKIPPED without libpdfium, and
       # the scribe server needs it at startup. Same release the scribe image
@@ -53,7 +56,7 @@ jobs:
       #   gh api repos/bblanchon/pdfium-binaries/releases/tags/chromium%2F7749 \
       #     --jq '.assets[]|select(.name=="pdfium-linux-x64.tgz")|.digest'
       - name: Install libpdfium (linux-x64)
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.os == 'big'
         env:
           PDFIUM_URL: https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F7749/pdfium-linux-x64.tgz
           PDFIUM_SHA256: 735abb28af7deab720dc54c8df3673a0a2a57bae9a0b16288842695fbd90a4b9
@@ -79,9 +82,9 @@ jobs:
       # builds the distill server; the scribe server is also checked on macOS
       # below because release.yaml ships it from there too.
       - run: cargo clippy --locked -p hs-scribe --features server --all-targets -- -D warnings
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.os == 'big'
       - run: cargo test --locked -p hs-scribe --features server
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.os == 'big'
       # Exactly the feature set release.yaml builds for the Linux
       # hs-scribe-server (`--features cuda`, which implies `server`).
       # The `cuda` feature is what registers the CUDA execution provider
@@ -89,23 +92,23 @@ jobs:
       # then dies loading the layout model, and no gate noticed because
       # nothing compiled that feature set.
       - run: cargo clippy --locked -p hs-scribe --features cuda --all-targets -- -D warnings
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.os == 'big'
       - run: cargo test --locked -p hs-scribe --features cuda --lib
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.os == 'big'
       # `eval` (implies `server`) is the OCR benchmark harness; nothing ships
       # it, so only its own modules' lints and tests are gated here.
       - run: cargo clippy --locked -p hs-scribe --features eval --all-targets -- -D warnings
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.os == 'big'
       - run: cargo test --locked -p hs-scribe --features eval --lib eval
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.os == 'big'
       # Exactly the feature set release.yaml builds for hs-distill-server
       # (`--features cuda`, which implies `server`). Compiling is the point:
       # it needs no GPU, but it does need the pyke ORT CUDA bundle download
       # that the release build also performs.
       - run: cargo clippy --locked -p hs-distill --features cuda --all-targets -- -D warnings
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.os == 'big'
       - run: cargo test --locked -p hs-distill --features server --lib
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.os == 'big'
       # The macOS scribe server release artifact (aarch64-apple-darwin).
       - run: cargo check --locked -p hs-scribe --features server --bin hs-scribe-server
         if: matrix.os == 'macos-14'
