@@ -444,14 +444,30 @@ fn fmt_ago(dt: &chrono::DateTime<chrono::Utc>) -> String {
 // ── TUI rendering ───────────────────────────────────────────────
 
 fn render(frame: &mut Frame, data: &DashboardData) {
+    // A status that refuses work carries a diagnosis longer than one
+    // line, and it wraps — so the Services block must be tall enough to
+    // show all of it. The height is one line per service, plus the
+    // extra lines the longest status needs, plus the block's two border
+    // rows and the Qdrant row.
+    let status_width = services_status_width(
+        &data.scribe_servers,
+        &data.distill_servers,
+        frame.area().width.saturating_sub(4),
+    );
+    let status_lines =
+        services_status_lines(&data.scribe_servers, &data.distill_servers, status_width);
+    let services_height = (data.scribe_servers.len() + data.distill_servers.len()) as u16
+        + status_lines.saturating_sub(1)
+        + 3;
+
     let outer = Layout::vertical([
-        Constraint::Length(1),  // title
+        Constraint::Length(1),               // title
         Constraint::Length(14), // pipeline: header + Documents/Markdown/Cataloged/Embedded/In-flight/Queued/Stalled/Inbox/Corrupted/Watcher/Indexer rows + 2 border rows
         Constraint::Length(1),  // spacer
-        Constraint::Length((data.scribe_servers.len() + data.distill_servers.len() + 3) as u16), // services
-        Constraint::Length(1), // spacer
-        Constraint::Min(4),    // recent
-        Constraint::Length(1), // footer
+        Constraint::Length(services_height), // services
+        Constraint::Length(1),  // spacer
+        Constraint::Min(4),     // recent
+        Constraint::Length(1),  // footer
     ])
     .split(frame.area());
 
@@ -822,6 +838,23 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
 
     let mut rows = Vec::new();
 
+    // The Status column's width comes from its **content**: a short label
+    // ("running", "idle", "3 converting") needs 24 characters, but the
+    // VRAM-gate diagnosis is 167 characters and must not be cut back to
+    // "backend unavailable: 12." — that truncation throws away exactly
+    // the part that tells the operator what to do. The width is the
+    // longest status line, clamped so the URL (which the operator also
+    // reads) always has room; a diagnosis longer than the terminal wraps
+    // onto more lines and the row gets taller, which is the honest
+    // rendering.
+    let status_width =
+        services_status_width(&data.scribe_servers, &data.distill_servers, inner.width);
+    let status_lines =
+        services_status_lines(&data.scribe_servers, &data.distill_servers, status_width);
+    // The URL is never truncated: the operator needs to know which tier
+    // the row is about, and `http://scribe.exa` does not say that.
+    let url_width = services_url_width(&data.scribe_servers, &data.distill_servers, inner.width);
+
     for svc in &data.scribe_servers {
         let (indicator, ind_style) = if svc.healthy {
             ("●", Style::default().fg(Color::Green))
@@ -829,14 +862,17 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
             ("○", Style::default().fg(Color::Red))
         };
         let status_text = format_status_activity(svc.healthy, "running", &svc.activity);
-        rows.push(Row::new(vec![
+        let row = Row::new(vec![
             Cell::from("Scribe"),
             Cell::from(indicator).style(ind_style),
-            Cell::from(status_text),
+            status_cell(&status_text, status_width),
             Cell::from(svc.url.clone()),
             Cell::from(svc.detail.clone()).style(Style::default().fg(Color::DarkGray)),
             Cell::from(svc.version.clone()).style(Style::default().fg(Color::DarkGray)),
-        ]));
+        ]);
+        // A ratatui row is ONE line tall unless told otherwise, so a
+        // wrapped diagnosis would be cut at the first line.
+        rows.push(row.height(status_lines));
     }
 
     for svc in &data.distill_servers {
@@ -846,14 +882,15 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
             ("○", Style::default().fg(Color::Red))
         };
         let status_text = format_status_activity(svc.healthy, "running", &svc.activity);
-        rows.push(Row::new(vec![
+        let row = Row::new(vec![
             Cell::from("Distill"),
             Cell::from(indicator).style(ind_style),
-            Cell::from(status_text),
+            status_cell(&status_text, status_width),
             Cell::from(svc.url.clone()),
             Cell::from(svc.detail.clone()).style(Style::default().fg(Color::DarkGray)),
             Cell::from(svc.version.clone()).style(Style::default().fg(Color::DarkGray)),
-        ]));
+        ]);
+        rows.push(row.height(status_lines));
     }
 
     let (q_indicator, q_style) = if data.qdrant_healthy {
@@ -883,16 +920,163 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(8),  // Name
-            Constraint::Length(2),  // Indicator
-            Constraint::Length(24), // Status + Activity ("running · 12 converting", "backend unavailable")
-            Constraint::Fill(3),    // URL — gets 3/5 of remaining
-            Constraint::Fill(2),    // Detail — gets 2/5 of remaining
-            Constraint::Length(16), // Version
+            Constraint::Length(8),            // Name
+            Constraint::Length(2),            // Indicator
+            Constraint::Length(status_width), // Status + Activity
+            Constraint::Length(url_width),    // URL — never truncated
+            Constraint::Length(12),           // Detail (the compute device)
+            Constraint::Length(16),           // Version
         ],
     );
 
     frame.render_widget(table, inner);
+}
+
+/// The Status cell of the Services table.
+///
+/// A tier that is refusing work carries a **diagnosis** — the free VRAM,
+/// the headroom it needs and who is holding the card — which is far
+/// longer than the column's old fixed 24 characters. Truncating it back
+/// to `backend unavailable: 12.` would throw away exactly the part that
+/// tells the operator what to do.
+///
+/// A ratatui table cell **truncates** its text rather than wrapping it,
+/// so the text is wrapped here, at the column's width, into the lines
+/// the cell holds. A short label (`running`, `idle`, `3 converting`) is
+/// one line, as before.
+fn status_cell(text: &str, width: u16) -> Cell<'static> {
+    let lines: Vec<Line<'static>> = wrap_text(text, width).into_iter().map(Line::from).collect();
+    Cell::from(Text::from(lines))
+}
+
+/// Break `text` into lines of at most `width` characters, on word
+/// boundaries where there is one.
+///
+/// A word longer than the width (a path, a URL) is broken rather than
+/// allowed to overflow: the point of the column is that the whole
+/// diagnosis is readable.
+fn wrap_text(text: &str, width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        if wlen > width {
+            // A single word longer than the line: flush what we have and
+            // break the word itself.
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut rest: Vec<char> = word.chars().collect();
+            while rest.len() > width {
+                lines.push(rest[..width].iter().collect());
+                rest = rest[width..].to_vec();
+            }
+            current = rest.into_iter().collect();
+            continue;
+        }
+        let candidate = if current.is_empty() {
+            wlen
+        } else {
+            current.chars().count() + 1 + wlen
+        };
+        if candidate > width {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        } else if current.is_empty() {
+            current = word.to_string();
+        } else {
+            current.push(' ');
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// How wide the Services table's Status column should be.
+///
+/// The floor is the old 24 characters, so a short label looks exactly as
+/// it always did. A longer status — the VRAM-gate diagnosis — takes the
+/// room it needs, up to what the terminal can give it while leaving the
+/// URL whole. Beyond that the diagnosis wraps onto more lines rather than
+/// being cut, and the row grows taller.
+fn services_status_width(
+    scribe: &[ServiceStatus],
+    distill: &[ServiceStatus],
+    terminal_width: u16,
+) -> u16 {
+    const FLOOR: u16 = 24;
+    /// Name(8) + Indicator(2) + URL + Detail(12) + Version(16) + the
+    /// block's borders and padding.
+    const OTHER_COLUMNS: u16 = 8 + 2 + 12 + 16 + 4;
+
+    let longest = scribe
+        .iter()
+        .chain(distill.iter())
+        .map(|svc| {
+            format_status_activity(svc.healthy, "running", &svc.activity)
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0) as u16;
+
+    // What the terminal can give the Status column, keeping the URL whole.
+    let room = terminal_width
+        .saturating_sub(OTHER_COLUMNS + services_url_width(scribe, distill, terminal_width));
+    longest.max(FLOOR).min(room.max(FLOOR))
+}
+
+/// How wide the Services table's URL column should be.
+///
+/// The URL is **never truncated**: the operator needs to know which tier
+/// a row is about, and `http://scribe.exa` does not say that. The width
+/// is the longest URL, and the Status column gives way if the terminal
+/// cannot hold both.
+fn services_url_width(
+    scribe: &[ServiceStatus],
+    distill: &[ServiceStatus],
+    terminal_width: u16,
+) -> u16 {
+    const FLOOR: u16 = 21;
+    /// Name(8) + Indicator(2) + Detail(12) + Version(16) + the block's
+    /// borders and padding.
+    const OTHER_COLUMNS: u16 = 8 + 2 + 12 + 16 + 4;
+
+    let longest = scribe
+        .iter()
+        .chain(distill.iter())
+        .map(|svc| svc.url.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+
+    // The URL may take everything the other columns do not need, but
+    // never more than the terminal has.
+    let room = terminal_width.saturating_sub(OTHER_COLUMNS);
+    longest.max(FLOOR).min(room.max(FLOOR))
+}
+
+/// How many lines the Services table's Status column needs.
+///
+/// A wrapped diagnosis takes more than one line, and the table's row
+/// grows with it, so the block must be tall enough to show the whole
+/// thing.
+fn services_status_lines(scribe: &[ServiceStatus], distill: &[ServiceStatus], width: u16) -> u16 {
+    scribe
+        .iter()
+        .chain(distill.iter())
+        .map(|svc| {
+            let text = format_status_activity(svc.healthy, "running", &svc.activity);
+            wrap_text(&text, width).len() as u16
+        })
+        .max()
+        .unwrap_or(1)
 }
 
 /// An unhealthy server is not necessarily a stopped one: the server's own
@@ -1323,6 +1507,83 @@ mod tests {
     fn the_dashboard_says_why_the_status_is_unavailable() {
         let data = DashboardData::blank(false, Some("status unavailable: gateway refused".into()));
         assert!(draw(&data).contains("gateway refused"));
+    }
+
+    /// The Services Status cell was a fixed 24 columns, so the VRAM-gate
+    /// **diagnosis** — 167 characters naming the free VRAM, the headroom
+    /// needed and every holder of the card — was cut to
+    /// `backend unavailable: 12.`, throwing away exactly the part that
+    /// tells the operator what to do. The cell must carry the whole text.
+    #[test]
+    fn the_dashboard_shows_the_whole_vram_diagnosis_not_a_truncated_label() {
+        let diagnosis = "backend unavailable: 12.9 GiB free, needs 13.2 GiB; \
+                         held by pid=2227527 7534MB hs-distill-server; \
+                         pid=1737565 2596MB hs-scribe-server; \
+                         pid=2615361 591MB bench_elements";
+        let mut data = DashboardData::blank(false, None);
+        data.scribe_servers.push(ServiceStatus {
+            url: "http://scribe.example.local:7435".into(),
+            healthy: false,
+            detail: String::new(),
+            activity: diagnosis.into(),
+            version: String::new(),
+            error: None,
+        });
+        let screen = draw(&data);
+        // The diagnosis is wrapped on word boundaries, so a line break can
+        // fall inside a phrase. What must survive is every **word** of it,
+        // and the two numbers that make it actionable.
+        for part in [
+            "backend",
+            "unavailable:",
+            "12.9",
+            "GiB",
+            "free,",
+            "needs",
+            "13.2",
+            "held",
+            "by",
+            "pid=2227527",
+            "7534MB",
+            "hs-distill-server;",
+            "pid=1737565",
+            "2596MB",
+            "hs-scribe-server;",
+            "pid=2615361",
+            "591MB",
+            "bench_elements",
+        ] {
+            assert!(screen.contains(part), "the diagnosis lost `{part}`");
+        }
+        // And the URL is still whole: the operator must know which tier
+        // the row is about.
+        assert!(
+            screen.contains("http://scribe.example.local:7435"),
+            "the URL was truncated"
+        );
+    }
+
+    /// Giving the Status column the room it needs must not take the room
+    /// from the URL: the operator reads the URL to know which tier a row
+    /// is about, and `http://scribe.exa` does not say that.
+    #[test]
+    fn a_long_diagnosis_does_not_truncate_the_url() {
+        let mut data = DashboardData::blank(false, None);
+        data.scribe_servers.push(ServiceStatus {
+            url: "http://scribe.example.local:7435".into(),
+            healthy: false,
+            detail: String::new(),
+            activity: "backend unavailable: 12.9 GiB free, needs 13.2 GiB; \
+                       held by pid=2227527 7534MB hs-distill-server"
+                .into(),
+            version: "0.0.1-rc.379".into(),
+            error: None,
+        });
+        let screen = draw(&data);
+        assert!(
+            screen.contains("http://scribe.example.local:7435"),
+            "the URL was truncated to make room for the diagnosis"
+        );
     }
 
     fn snapshot_with(
