@@ -1,5 +1,9 @@
 use crate::models::layout::BBox;
 
+/// The byte sequence that separates pages in every markdown document this
+/// crate produces. See [`join_pages`] for why it is reserved.
+pub const PAGE_SEPARATOR: &str = "\n\n---\n\n";
+
 /// Join per-page markdown strings into a single document.
 ///
 /// The page separator (`\n\n---\n\n`) is RESERVED: every downstream
@@ -17,7 +21,7 @@ use crate::models::layout::BBox;
 /// line beats silently corrupting QC for the whole document. One
 /// invariant, enforced at the one place pages are joined.
 pub fn join_pages(pages: &[String]) -> String {
-    const SEPARATOR: &str = "\n\n---\n\n";
+    const SEPARATOR: &str = PAGE_SEPARATOR;
     const HR_EQUIVALENT: &str = "\n\n***\n\n";
     // One `replace` pass is not enough: consecutive rules (`---` blank
     // `---`) share their blank line, so the first pass leaves a fresh

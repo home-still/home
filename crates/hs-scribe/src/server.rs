@@ -1003,11 +1003,16 @@ mod tests {
                 let release = dir.path().join("release");
                 let script = dir.path().join("olmocr.sh");
                 let md = "Converted text that is long enough to be indexable. ".repeat(4);
+                let page_texts = crate::converter::olmocr_subprocess::test_support::pages(2, &md);
+                let refs: Vec<&str> = page_texts.iter().map(String::as_str).collect();
+                let result = crate::converter::olmocr_subprocess::test_support::write_result(
+                    &crate::converter::olmocr_subprocess::test_support::result_document(&refs),
+                );
                 std::fs::write(
                     &script,
                     format!(
                         "#!/bin/sh\necho $$ > '{pid}'\nwhile [ ! -e '{release}' ]; do sleep 0.05; done\n\
-                         mkdir -p \"$1/markdown\" && printf '# T\\n\\n{md}' > \"$1/markdown/o.md\"\n\
+                         {result}\n\
                          echo 'Completed pages: 2' >&2; echo 'Failed pages: 0' >&2\n",
                         pid = dir.path().join("pid").display(),
                         release = release.display()

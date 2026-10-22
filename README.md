@@ -254,6 +254,11 @@ A link that names a passage points at it: the PDF link carries
 selects the passage. The page is part of the signed link, so a link
 minted for one page opens that page and nothing else.
 
+The page comes from the converter's page boundaries. Every converter
+keeps them, including olmocr since rc.383; a document olmocr converted
+before then is one flat page, so its hits carry no `page` and its PDF
+link opens at the first page.
+
 ```sh
 hs docs link 10.1371_journal.pone.0038469 --page 11
 ```

@@ -257,9 +257,10 @@ pub struct PageAccounting {
 /// Reconcile the two independent page signals a conversion produces.
 ///
 /// - `md_pages`: how many `\n\n---\n\n`-delimited pages the backend emitted
-///   (see [`compute_page_offsets`]). Only backends that assemble output via
-///   `join_pages` produce these; the olmocr subprocess returns one flat
-///   blob, so this is 1 for a 52 KB, 14-page paper.
+///   (see [`compute_page_offsets`]). Every converter now assembles its
+///   output via `join_pages`, olmocr included (it is cut at olmocr's own
+///   per-page spans since rc.383); markdown converted by olmocr before that
+///   is one flat blob, so this is 1 for a 52 KB, 14-page paper.
 /// - `source_pages`: the PDF's own page count, read by pdfium at ingest to
 ///   size the conversion timeout.
 ///

@@ -1875,12 +1875,18 @@ mod tests {
         const TOKEN: &str = "event-watch-served-token-0123456789abcdef";
 
         fn fake_olmocr(dir: &std::path::Path, tally: &str) -> std::path::PathBuf {
+            use crate::converter::olmocr_subprocess::test_support::{
+                completed_in, pages, result_document, write_result,
+            };
             let script = dir.join("olmocr.sh");
             let md = "A page of real converted text, long enough to be indexable. ".repeat(4);
+            let page_texts = pages(completed_in(tally), &md);
+            let refs: Vec<&str> = page_texts.iter().map(String::as_str).collect();
             std::fs::write(
                 &script,
                 format!(
-                    "#!/bin/sh\nmkdir -p \"$1/markdown\" && printf '# Title\\n\\n{md}' > \"$1/markdown/o.md\"\n{tally}\n"
+                    "#!/bin/sh\n{}\n{tally}\n",
+                    write_result(&result_document(&refs))
                 ),
             )
             .unwrap();
