@@ -1648,7 +1648,12 @@ RECALL@10 **24/25 = 96 %** — the same as before this change.
 **Commit.** `db196c4` — "fix(personal): the store's catalog goes through
 the corpus's storage".
 
-**Release.** `v0.0.1-rc.378`, tagged from `db196c4` on `main`.
+**Release.** `v0.0.1-rc.378`, tagged from `39864a7` on `main`:
+<https://github.com/home-still/home/releases/tag/v0.0.1-rc.378> — 33
+assets, the same five build targets and both Docker images, all twelve
+jobs green. The published `hs` binary was downloaded and checked: it
+reports `hs 0.0.1-rc.378`, carries the `0.0.1-rc.378` version marker
+and is x86-64.
 
 **Note for whoever deploys it.** The personal store's config must have
 a `storage:` section, or `home.project_dir` must be the default root.
