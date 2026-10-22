@@ -2301,5 +2301,58 @@ list.
 error message. It touches no stored data, no collection schema, no
 search behaviour and no wire format.
 
-**Not deployed to the live fleet yet**: this rc is cut after rc.380 was
-deployed, and the fleet is on rc.380 until this one is released.
+**Deployed.** All eight reachable hosts are on rc.381 (`five` is
+offline). The refusal was exercised on the live host with the deployed
+binary — see the deployment record below.
+
+---
+
+## The rc.381 deployment (2026-10-22, Gates 5-6)
+
+**Gate 5.** `hs upgrade --pre --yes`, in series, on all eight reachable
+hosts: `big`, `bmb`, `mac_air`, `big_mac`, `two`, `three`, `one`,
+`four`. All now report **rc.381**; `five` is offline. On `big` the
+upgrade restarted 9 services and reported `Health: Qdrant: OK` — the
+P0-25 timeout did **not** recur this time, so the wait is marginal
+rather than reliably wrong.
+
+**Gate 6 — the changed surface, exercised on the live host.** The
+deployed scribe server was started with a headroom the card cannot meet
+(so its real gate refuses), and the deployed `hs scribe convert` was
+pointed at it:
+
+```
+  the tier's /health:
+    status: backend_unavailable
+    free: 17661  headroom: 1048576
+    holders: pid=1096335 3386MB hs-distill-server; pid=1091802 2340MB
+             hs-scribe-server; pid=1092561 585MB bench_elements
+
+  hs scribe convert, against the refusing tier:
+    error: Error: scribe server at http://127.0.0.1:7439 reports
+      backend_unavailable: 17661 MB VRAM free, needs 1048576 MB; held by
+      pid=1096335 3386MB hs-distill-server; pid=1091802 2340MB
+      hs-scribe-server; pid=1092561 585MB bench_elements,
+      backend_reachable=true — free GPU memory or wait for the current
+      tenant
+```
+
+**Before rc.381** that message ended at `17661 MB VRAM free,
+backend_reachable=true` — the headroom and the holders were gone, and
+the operator had to read the server's journal to find them.
+
+**The live `hs status` on `big` after the rollout:**
+
+```
+  ● scribe   http://192.168.1.110:7435            1 converting   0.0.1-rc.381
+  ● scribe   http://bmb.local:7433                1 converting   0.0.1-rc.381
+  ● distill  http://192.168.1.110:7434            idle (Cuda)  0.0.1-rc.381
+  ● qdrant   http://localhost:6334 → academic_papers  1.20.0
+```
+
+Both tiers converting, distill on CUDA, Qdrant healthy.
+
+**One P0, already logged: P0-23** — the expired cloud enrollment that
+makes `hs status` fail on `bmb`, `mac_air`, `big_mac` and `two`. It
+needs an operator-issued invite code; the local services on those hosts
+were verified directly instead.
