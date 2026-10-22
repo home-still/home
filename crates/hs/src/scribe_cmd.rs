@@ -7,6 +7,31 @@ use hs_scribe::config::ScribeConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Describe, in one clause, why a scribe tier refused the work.
+///
+/// The tier's health payload carries the free VRAM, the headroom the
+/// gate wants and the holders of the card. Naming all three turns "the
+/// backend is unavailable" into an action: free the card, or lower the
+/// headroom. A body without the numbers still says what it can and
+/// guesses nothing.
+fn describe_the_refusal(h: &hs_scribe::client::HealthResponse) -> String {
+    let mut why = format!(
+        "{} MB VRAM free",
+        h.backend_vram_free_mb
+            .map(|mb| mb.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    );
+    if let Some(headroom) = h.backend_vram_headroom_mb {
+        why.push_str(&format!(", needs {headroom} MB"));
+    }
+    if let Some(holders) = h.backend_vram_holders.as_deref() {
+        if !holders.trim().is_empty() {
+            why.push_str(&format!("; held by {holders}"));
+        }
+    }
+    why
+}
+
 /// Create a ScribeClient, with auth headers if the URL is a cloud gateway.
 /// `convert_timeout` caps each PDF conversion so a stuck server can't
 /// pin the caller. The cloud path honors it as the client's overall timeout
@@ -713,15 +738,17 @@ async fn cmd_convert(
             // A 503 from the admission gate still deserializes, so an
             // `Ok` here is not "usable". Bail with the reason instead of
             // dispatching a conversion the backend cannot start.
+            //
+            // The message names the shortfall and who is holding the card,
+            // so the operator does not have to go and read the server's
+            // journal on another host to learn what to do.
             Ok(h) if h.status != "ok" => {
                 check_stage.finish_failed("backend unavailable");
                 anyhow::bail!(
-                    "scribe server at {url} reports {}: {} MB VRAM free, backend_reachable={} \
+                    "scribe server at {url} reports {}: {}, backend_reachable={} \
                      — free GPU memory or wait for the current tenant",
                     h.status,
-                    h.backend_vram_free_mb
-                        .map(|mb| mb.to_string())
-                        .unwrap_or_else(|| "unknown".into()),
+                    describe_the_refusal(&h),
                     h.backend_reachable
                         .map(|r| r.to_string())
                         .unwrap_or_else(|| "n/a".into()),
@@ -1357,5 +1384,70 @@ mod resolve_servers_tests {
             resolve_servers(Some("http://flag:1"), &cfg).unwrap(),
             vec!["http://flag:1".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use hs_scribe::client::HealthResponse;
+
+    fn health(free: Option<u64>, headroom: Option<u64>, holders: Option<&str>) -> HealthResponse {
+        HealthResponse {
+            status: "backend_unavailable".into(),
+            layout_model: false,
+            table_model: false,
+            layout_model_reason: None,
+            table_model_reason: None,
+            version: "0.0.1-rc.380".into(),
+            gpu_name: Some("NVIDIA GeForce RTX 3090".into()),
+            gpu_utilization_pct: Some(36.0),
+            gpu_memory_used_mb: Some(10_919),
+            last_conversion_at: None,
+            total_conversions: 0,
+            backend_reachable: Some(true),
+            backend_model_resident: Some(false),
+            backend_vram_free_mb: free,
+            backend_vram_headroom_mb: headroom,
+            backend_vram_holders: holders.map(|h| h.to_string()),
+            backend_checked_at: Some("2026-10-22T12:50:15.955Z".into()),
+        }
+    }
+
+    /// The refusal must name the shortfall **and** who is holding the
+    /// card: "the backend is unavailable" leaves the operator with no
+    /// next step.
+    #[test]
+    fn the_refusal_names_the_shortfall_and_the_holders() {
+        let why = describe_the_refusal(&health(
+            Some(13_251),
+            Some(13_500),
+            Some("pid=2227527 7534MB hs-distill-server; pid=2615361 591MB bench_elements"),
+        ));
+        assert!(why.contains("13251 MB VRAM free"), "{why}");
+        assert!(why.contains("needs 13500 MB"), "{why}");
+        assert!(
+            why.contains("pid=2227527 7534MB hs-distill-server"),
+            "{why}"
+        );
+        assert!(why.contains("pid=2615361 591MB bench_elements"), "{why}");
+    }
+
+    /// A body with no numbers still says what it can — and **guesses
+    /// nothing**: no headroom it was not told, no holders it was not
+    /// given.
+    #[test]
+    fn a_body_with_no_numbers_says_only_what_it_knows() {
+        let why = describe_the_refusal(&health(None, None, None));
+        assert_eq!(why, "unknown MB VRAM free");
+        assert!(!why.contains("needs"), "{why}");
+        assert!(!why.contains("held by"), "{why}");
+    }
+
+    /// An empty holders string is not a holder list.
+    #[test]
+    fn an_empty_holder_list_is_not_reported() {
+        let why = describe_the_refusal(&health(Some(100), Some(200), Some("   ")));
+        assert_eq!(why, "100 MB VRAM free, needs 200 MB");
     }
 }

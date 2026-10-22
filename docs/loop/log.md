@@ -2259,3 +2259,47 @@ deployed, and the fleet is on rc.379 until this one is released.
    option A: catch `MissingHeartbeat` and recreate the pull stream
    instead of exiting. Not ours to make — it is a change to a vendored
    crate.
+
+---
+
+## 2026-10-22-04 — the last site that dropped the diagnosis
+
+**Change.** The release skill's Gate 7 — a regression-class sweep for
+the pattern the rc fixed — found one site left: `hs scribe convert`'s
+**pre-flight refusal**. It reported the free VRAM but not the headroom
+the gate wants, and not **who is holding the card**, so the operator
+still had to go and read the server's journal on another host.
+
+```
+  before:  scribe server at http://big:7435 reports backend_unavailable:
+           13251 MB VRAM free, backend_reachable=true — free GPU memory
+           or wait for the current tenant
+  after:   scribe server at http://big:7435 reports backend_unavailable:
+           13251 MB VRAM free, needs 13500 MB; held by pid=2227527
+           7534MB hs-distill-server; pid=2615361 591MB bench_elements,
+           backend_reachable=true — free GPU memory or wait for the
+           current tenant
+```
+
+**The sweep, run over the whole tree.** Three sites mention the
+symptom, and after this change **none of them drops the reason**:
+
+| the site | what it reports |
+|---|---|
+| `crates/hs-mcp/src/main.rs` — the status line | the shortfall, the headroom and the holders (rc.379) |
+| `crates/hs/src/status_cmd.rs` — the TUI's Services row | the same, wrapped, with the URL whole (rc.380) |
+| `crates/hs/src/scribe_cmd.rs` — the conversion refusal | the same (this rc) |
+| `crates/hs-scribe/src/server.rs:222` — the refusal log | already carried `free_vram_mb`, `headroom_mb` and the `holders` |
+
+**Three tests**, in `crates/hs/src/scribe_cmd.rs::refusal_tests`: the
+shortfall and the holders are named; a body with no numbers says only
+what it knows and **guesses nothing** (no headroom it was not told, no
+holders it was not given); an empty holders string is not a holder
+list.
+
+**Version.** `v0.0.1-rc.381` — a patch-level bump. It changes one
+error message. It touches no stored data, no collection schema, no
+search behaviour and no wire format.
+
+**Not deployed to the live fleet yet**: this rc is cut after rc.380 was
+deployed, and the fleet is on rc.380 until this one is released.
