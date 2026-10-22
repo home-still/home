@@ -98,6 +98,30 @@ journal on another host.
 through the *same* code — the CLI calls the MCP's `system_status` tool
 (`crates/hs/src/status_cmd.rs:242`) — so both carry the diagnosis.
 
+**At the CLI surface, end to end** — a local `hs-mcp --serve`, a fake
+scribe server, and the real `hs status` binary pointed at it with
+`HS_MCP_URL`:
+
+```
+=== the new scribe server (the server sends the new payload)
+  ○ scribe   http://127.0.0.1:33613    backend unavailable: 12.9 GiB free,
+           needs 13.2 GiB; held by pid=2227527 7534MB hs-distill-server;
+           pid=1737565 2596MB hs-scribe-server; pid=2615361 591MB
+           bench_elements   0.0.1-rc.379
+
+=== the live rc.373 scribe server (the server sends the old payload)
+  ○ scribe   http://127.0.0.1:33987    backend unavailable: 12.9 GiB free
+           0.0.1-rc.379
+```
+
+**The second line is the mixed pair.** The MCP and the scribe server
+must be upgraded together for the whole diagnosis to appear: the MCP
+asks the server for the headroom, and an older server does not send
+it. The fallback is not the old bare symptom — the old payload *does*
+carry `backend_vram_free_mb`, so the free VRAM is still reported. The
+line says what it knows and **guesses nothing**: no headroom it was not
+told, no holders it was not given.
+
 **A model that is already resident needs no room to start**, so no
 headroom is reported against it: the gate's free-VRAM half does not
 apply then, and reporting a shortfall that is not one would be a lie
