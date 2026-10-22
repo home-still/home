@@ -1835,6 +1835,15 @@ optional fields to a health response and changes one status line. It
 touches no stored data, no collection schema, no search behaviour and
 no wire format's meaning.
 
+**The query set does not move**, as it must not: the change is in what
+the status reports, not in retrieval. Re-run on the live server:
+RECALL@10 **24/25 = 96 %** — the same as before this change.
+
+**Commit.** `ba36f36` — "feat(status): the scribe's VRAM gate says why,
+not just that".
+
+**Release.** `v0.0.1-rc.379`, tagged from `ba36f36` on `main`.
+
 **Not deployed.** The live services were not upgraded: this iteration's
 rules say not to run `hs upgrade` on live services. The new scribe
 server was run on `:7439` and the new MCP by hand, against the same
