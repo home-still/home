@@ -2356,3 +2356,180 @@ Both tiers converting, distill on CUDA, Qdrant healthy.
 makes `hs status` fail on `bmb`, `mac_air`, `big_mac` and `two`. It
 needs an operator-issued invite code; the local services on those hosts
 were verified directly instead.
+
+---
+
+## 2026-10-22-05 — the remote document links were 100 % dead
+
+**Change.** The gateway now **refuses to start** when a service it can
+route has no backend, and **reports at startup** which of its backends
+it cannot reach. The wishlist's second half — *"highlight the text in
+the document when all this needs to be served remotely"* — did not work
+at all, and nothing in the system said so.
+
+**The evidence.** Ten real links (five documents × source + markdown)
+fetched on the live host:
+
+| the path | the result |
+|---|---|
+| **LAN** | **10 / 10 work** — `206 Partial Content` (the `Range` header honoured) |
+| **Remote** | **0 / 10 work** — `403` (Cloudflare's error page) |
+
+**Every remote document link the corpus's agents hand to a user was
+dead.** The text fragment — the *highlighting* — was on **100 %** of
+the markdown links (80 hits, 8 queries), so the feature was complete
+and unreachable at the same time.
+
+**The cause, in two independent host-configuration faults.**
+
+1. **The gateway on `two` had no `docs` route.** Asked directly, it
+   answered `502 No backend configured for service: docs` — a request
+   the user only makes by clicking a document link. Its
+   `cloud.gateway.routes` listed `scribe`, `distill` and `mcp` only.
+2. **`big`'s firewall drops TCP 7446.** `ufw`'s default input policy
+   is `DROP` and `grep -c 7446 /etc/ufw/user.rules` is **0** — the
+   rules allow 7433, 7434, 7435, 7440, 7445, 6333, 6334, 8080, 8081,
+   11434 and others, but not the docs port. From `two`,
+   `curl http://192.168.1.110:7446/health` → `000` after **7.0 s**
+   (the signature of a dropped packet) on **every** host in the fleet.
+
+**The trap that makes the second fault subtle.** The docs service is
+**perfectly healthy on its own host**: `/health` answers `200` in
+0.76 s on `192.168.1.110:7446` from `big` itself. Every local check
+passes while the service is unreachable from everywhere else. **A
+self-probe cannot detect it.** Only a probe from another host can, and
+the only component that lives on another host and actually proxies is
+the **gateway**.
+
+**Why it ranked first.** The retrieval is in excellent shape — the
+fixed query set scores **RECALL@10 25/25 = 100 %** (concept 8/8,
+literal 10/10, named 7/7), median latency 236 ms, and only 4 % of
+first hits are a reference list. So the corpus's answers are right and
+its *links* are dead: an agent that finds the right passage and hands
+the user a link that shows a Cloudflare error page. That is the worst
+possible failure of the wishlist's promise — the answer is right and
+the way to check it is broken. It beats the runner-up (cross-encoder
+reranking) because reranking improves results that are **already
+100 % correct on the query set**, while this breaks the delivery of
+every result to every user.
+
+**The change.**
+
+* **The gateway refuses to start** with an unroutable service, naming
+  the key to add:
+
+  ```
+  Error: /home/ladvien/.home-still/config.yaml: invalid `cloud.gateway` section
+
+  Caused by:
+      `cloud.gateway.routes` has no backend for `docs` — every request to it
+      would fail with 502. Add the key(s) to `cloud.gateway.routes`, e.g.
+      `docs: http://<docs-host>:7446`
+  ```
+
+  `GatewayConfig::validate` used to check the routes in one direction
+  only: a **configured** unknown service was an error, an
+  **unconfigured known** service was silent. This is *"define errors
+  out of existence"* applied to a configuration — the request-time
+  error is eliminated by refusing the misconfiguration where it can
+  still be read.
+
+* **The gateway reports unreachable backends** at startup, from its own
+  host. A backend that is down is **not** fatal — one host rebooting
+  must not take the other services down with it — so it reports and
+  starts:
+
+  ```
+  WARN  docs backend http://192.168.1.110:9 is not reachable (connection refused
+        — nothing is listening on that port) — every request to `docs` will fail until it is
+  WARN  mcp backend http://192.168.1.110:7445 answered HTTP 401 on /health — it is not healthy
+  ```
+
+  The reason names the **action**: a timeout means a dropped packet
+  (a firewall), a refusal means nothing is listening.
+
+**The tests.** Eight, in `crates/hs-gateway`:
+
+* `config.rs` — the error names the service **and** the key; every
+  missing service is named; a route for every routable service is
+  valid; and the existing route tests, updated to configure every
+  service (they were passing before and must keep passing for the
+  right reason).
+* `backend_health.rs` — the reason names what to look at; a `401` is a
+  different problem from an unreachable host; a healthy backend is
+  reachable; the report names the service and the backend.
+* The test helper now fills in the services a test does not name: a
+  test about `scribe` is not about `docs`, and should not have to say
+  so.
+
+**Timings.** The probe adds one HTTP request per backend at startup
+(5 s timeout each). On the live host the whole check took **0.26 s**
+for four backends. A request's cost is unchanged.
+
+**What was done on the fleet, and what needs the operator.** The
+`docs` route was added to `two`'s config (backup at
+`~/.home-still/config.yaml.bak.pre-docs-route`) and the gateway
+restarted — `Routes: ["docs", "mcp", "distill", "scribe"]`. The
+**firewall rule on `big` needs the operator's sudo** and is logged as
+**P0-26**:
+
+```bash
+sudo ufw allow from 192.168.1.0/24 to any port 7446 proto tcp
+```
+
+Until that is done the remote links still 504 — and now the gateway
+**says so at startup**, which is the point of this change.
+
+**Version.** `v0.0.1-rc.382` — a patch-level bump. It changes the
+gateway's startup validation and adds a startup probe. It touches no
+stored data, no collection schema, no search behaviour and no wire
+format's meaning.
+
+**Not deployed to the live fleet yet**: this rc is cut after rc.381 was
+deployed, and the fleet is on rc.381 until this one is released.
+
+### Top 5 remaining items
+
+1. **The page map: 27.5 % of search hits carry no page.** Measured
+   over 80 hits from 8 queries: **72.5 %** of hits have a `page` (so a
+   `#page=` fragment on the source link) and **27.5 %** do not, so
+   their link opens page 1 of a 30-page paper. The cause is measured:
+   the **olmocr backend emits one flat blob** with no page separators,
+   so `compute_page_offsets` finds one page for the whole document, and
+   `resolve_page_accounting` marks the offsets untrustworthy (a lone
+   offset would report page 1 for every chunk). **58.3 %** of the
+   corpus's markdown objects have no separator; **45.0 %** of catalog
+   rows have a usable page map; **36.7 %** have a page *count* but no
+   map. The fix is to recover the byte→page map for a flat blob —
+   the PDF's text layer is the obvious source — which is a real piece
+   of work, not a config change.
+2. **The embedder's `idle_release_secs`.** The card cannot host the
+   olmocr backend and a resident embedder at once: 14,446 MB free
+   against a 13,500 MB headroom is a **946 MB surplus**, smaller than
+   the `bench_elements` process another agent runs. Measured again on
+   2026-10-22 during the rc.379 deploy: the card had **18,171 MB**
+   free and both tiers were healthy — the surplus appears and vanishes
+   with the other tenants. `vram_floor_mb` already exists as a key;
+   letting the embedder *yield* under contention would give the
+   converter the room it needs.
+3. **Cross-encoder reranking.** The GPU blocker has cleared, but the
+   reranker is **not in home-still at all**: no code path, no client,
+   no service, no endpoint. Measured on this corpus, 2026-10-21: it
+   moved the expected passage's rank on **4 queries better and 3 worse**
+   for a **5× latency increase** (162 → 776 ms median) — and the
+   sibling crate's own M37 measured the same null (+0.78 points, CI
+   [−3.14, +4.71]). It needs a *process* as much as a model.
+4. **Source scopes (#4), the base for the personal links.** The MCP
+   layer has no notion of which source a document came from (academic,
+   personal, internet, synthesis, iMessages) and no per-source scope,
+   so every tool returns every document. It is the prerequisite for
+   personal-document links and their short TTL, and it is what stops a
+   personal document leaking through a general search — measured
+   2026-10-21, the personal collection answers "risk factors for
+   falls in elderly people" with *The Base Class for Game Objects in
+   SSN67*.
+5. **Decide the async-nats crash-loop** (see
+   `needs-decision/async-nats-missed-idle-heartbeat.md`). Recommended
+   option A: catch `MissingHeartbeat` and recreate the pull stream
+   instead of exiting. Not ours to make — it is a change to a vendored
+   crate.
