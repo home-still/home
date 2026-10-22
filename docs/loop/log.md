@@ -1913,3 +1913,76 @@ today's behaviour rather than breaking.
    option A: catch `MissingHeartbeat` and recreate the pull stream
    instead of exiting. Not ours to make — it is a change to a vendored
    crate.
+
+## 2026-10-22-03 — the diagnosis the dashboard threw away
+
+**Change.** rc.379 made the scribe's VRAM gate say *why* it was refusing
+work. rc.380 fixes the dashboard that was throwing the answer away: the
+Services table's Status cell was a **fixed 24 characters**, so the
+167-character diagnosis — the free VRAM, the headroom needed and every
+holder of the card — was cut to `backend unavailable: 12.`.
+
+**How it was found.** The release skill's Gate 7 (a regression-class
+sweep: grep for the pattern the rc fixed, confirm zero remaining sites)
+found the second site. The text rendering (`hs status > file`) was
+correct; the **TUI** was not, and the TUI is what an operator actually
+looks at.
+
+**Measured.** The diagnosis is 167 characters; the cell was 24. **143
+characters were lost** — every number and every holder.
+
+```
+  before:  backend unavailable: 12.
+  after:   backend unavailable: 12.9 GiB free, needs 13.2 GiB; held by
+           pid=2227527 7534MB hs-distill-server; pid=1737565 2596MB
+           hs-scribe-server; pid=2615361 591MB bench_elements
+```
+
+**Three ratatui facts the fix turned on**, each found by reading the
+widget's source rather than guessing:
+
+1. **A table cell truncates; it does not wrap.** `Cell::from(Text)`
+   with a long string is cut at the cell's width. The text is wrapped
+   into `Vec<Line>` here, at the column's width, on word boundaries.
+2. **A row is ONE line tall unless told otherwise.** `Row::height`
+   defaults to `1` (`ratatui-0.29.0/src/widgets/table/row.rs:108`), so
+   a wrapped cell is cut after its first line. The row's height is set
+   to the wrapped line count.
+3. **`Constraint::Min(24)` is a floor, not a claim.** The layout's
+   cassowary solver hands the surplus to the `Fill` constraints, so the
+   Status column stayed at 24. The width is therefore **computed from
+   the content** (`services_status_width`), not negotiated.
+
+**A second defect the fix exposed.** Giving the Status column the room
+it needs took the room from the URL: the rendered row showed
+`http://scribe.exa`. The URL column is now sized from its content too
+(`services_url_width`) and is **never truncated** — the operator reads
+the URL to know which tier a row is about.
+
+**The layout.** The Status column's width is the longest status line,
+with a 24-character floor (so a short label looks exactly as it always
+did) and a ceiling that leaves the URL whole. A diagnosis longer than
+the terminal wraps onto more lines and the row gets taller — the honest
+rendering, since the Services block's height is computed from the
+wrapped line count.
+
+**The tests.** Two, in `crates/hs/src/status_cmd.rs`:
+
+* `the_dashboard_shows_the_whole_vram_diagnosis_not_a_truncated_label` —
+  every **word** of the diagnosis survives, and the URL beside it is
+  whole. (The assertion is on words, not on the whole phrase: wrapping
+  legitimately breaks a phrase at a word boundary, and a test that
+  demanded a contiguous substring would be testing the wrap width
+  rather than the content.)
+* `a_long_diagnosis_does_not_truncate_the_url` — the URL survives a long
+  diagnosis.
+
+**Both failed before the fix and pass after it** — the first one failed
+twice, which is how the URL defect and the row-height defect were found.
+
+**Version.** `v0.0.1-rc.380` — a patch-level bump. It changes how the
+TUI lays out one table. It touches no stored data, no collection schema,
+no search behaviour and no wire format.
+
+**Not deployed to the live fleet yet**: this rc is cut after rc.379 was
+deployed, and the fleet is on rc.379 until this one is released.
