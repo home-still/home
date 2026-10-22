@@ -2485,8 +2485,58 @@ gateway's startup validation and adds a startup probe. It touches no
 stored data, no collection schema, no search behaviour and no wire
 format's meaning.
 
-**Not deployed to the live fleet yet**: this rc is cut after rc.381 was
-deployed, and the fleet is on rc.381 until this one is released.
+**Deployed.** All eight reachable hosts are on rc.382 (`five` is
+offline). See the deployment record below.
+
+---
+
+## The rc.382 deployment (2026-10-22, Gates 5-6)
+
+**Gate 5 — `hs upgrade --pre --yes`, in series.** All eight reachable
+hosts are on **rc.382**: `big`, `two`, `three`, `one`, `four`, `bmb`,
+`mac_air`, `big_mac`. `five` is **offline** (`No route to host`).
+
+**P0-25 recurred on `big`**: the upgrade ended with `Error: Timed out
+waiting for Qdrant at http://localhost:6333/healthz (90s)`. Qdrant was
+**recovering its collections** (15,933 documents across three) and
+answered 200 about seven minutes later. The host was healthy
+throughout. **This is the third time**: the 90-second wait is shorter
+than the recovery the upgrade itself causes, and it will expire on
+every rollout until the wait is fixed.
+
+**Gate 6 — the changed surface, on the live fleet.** The gateway on
+`two` was restarted with the new binary, and it reported the firewall
+gap that has been silently breaking the remote document links:
+
+```
+INFO  Routes: ["scribe", "docs", "mcp", "distill"]
+WARN  mcp backend http://192.168.1.110:7445 answered HTTP 401 on /health — it is not healthy
+WARN  docs backend http://192.168.1.110:7446 is not reachable (timed out
+      — the host did not answer (a firewall that drops the port?)) — every
+      request to `docs` will fail until it is
+```
+
+**That warning is the change working.** Before rc.382 the only symptom
+was a `403` in a browser; now the gateway names the service, the
+address, the reason and the consequence — and points at the firewall.
+
+**The links after the deployment**, measured over 10 real links:
+
+| the path | the result |
+|---|---|
+| LAN | **10 / 10 work** (`206 Partial Content`) |
+| Remote | **0 / 10 work** (`403`) |
+
+**The remote path still needs the firewall rule on `big`**, which
+needs the operator's sudo (`ufw` is not in `big`'s passwordless list).
+It is **P0-26**, with the exact command:
+
+```bash
+sudo ufw allow from 192.168.1.0/24 to any port 7446 proto tcp
+```
+
+Until it is applied the remote links stay dead — and now the fleet
+**says so at startup**, which is what this rc bought.
 
 ### Top 5 remaining items
 
