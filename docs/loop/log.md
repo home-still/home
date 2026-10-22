@@ -1993,8 +1993,86 @@ twice, which is how the URL defect and the row-height defect were found.
 TUI lays out one table. It touches no stored data, no collection schema,
 no search behaviour and no wire format.
 
-**Not deployed to the live fleet yet**: this rc is cut after rc.379 was
-deployed, and the fleet is on rc.379 until this one is released.
+**Deployed.** All eight reachable hosts are on rc.380 (`five` is
+offline). See the deployment record below.
+
+---
+
+## The rc.380 deployment (2026-10-22, Gates 5-6)
+
+**Gate 5 — `hs upgrade --pre --yes`, in series.** The same command as
+rc.379, on the same eight hosts, all now on **rc.380**.
+
+| the host | the result |
+|---|---|
+| `big` | rc.379 → **rc.380**, 9 services restarted |
+| `bmb`, `mac_air`, `big_mac` | rc.379 → **rc.380** |
+| `two`, `three`, `one` | rc.379 → **rc.380** |
+| `four` | rc.379 → **rc.380** (see the transient below) |
+| `five` | **offline** (`No route to host`) |
+
+**Two real findings in the rollout**, both on `big` and `four`:
+
+1. **The upgrade's Qdrant health wait is too short for a recovery.**
+   `big`'s upgrade ended with `Error: Timed out waiting for Qdrant at
+   http://localhost:6333/healthz (90s)`. The container was **up and
+   healthy** — it was **recovering its collections** (`Recovering shard
+   ./storage/collections/academic_papers/0`) and needed longer than the
+   90-second wait. Qdrant answered 200 about seven minutes later, and
+   the host was fully healthy. **The upgrade reported a failure on a
+   healthy system**: the wait is `HEALTH_WAIT_SECS = 90`
+   (`crates/hs/src/upgrade_cmd.rs:14`), and a corpus of 15,933 documents
+   in three collections cannot be recovered in 90 s. The wait should be
+   longer, or the message should say "still recovering" rather than
+   "timed out". **Logged as a P0** — an upgrade that reports failure
+   for a healthy host trains the operator to ignore it.
+2. **`four` failed the release lookup twice, then succeeded.**
+   `Error: No releases found` — with the GitHub API reachable from that
+   host (a direct `curl` of the same URL returned rc.380, 10 releases,
+   715,713 bytes, and the same `hs/0.0.1-rc.379` user agent made no
+   difference). The third attempt worked. So the API path from `four`
+   is **flaky**, and the installer's "No releases found" message does
+   not say that: it says the *server* returned nothing, when the truth
+   is that the request failed. **Logged as a P1.**
+
+**Gate 6 — the changed surface, exercised on the live fleet.**
+
+The card was contended again during the rollout, so the tier was
+refusing work — which made the live fleet exercise the diagnosis for
+real, with no test rig:
+
+```
+$ hs status          (the text rendering, on `big`, live)
+  ○ scribe   http://192.168.1.110:7435   backend unavailable: 12.9 GiB free,
+            needs 13.2 GiB; held by pid=749175 7734MB hs-distill-server;
+            pid=715494 2464MB hs-scribe-server; pid=760998 585MB
+            bench_elements   0.0.1-rc.380
+  ● scribe   http://bmb.local:7433       idle   0.0.1-rc.380
+  ● distill  http://192.168.1.110:7434   idle (Cuda)  0.0.1-rc.380
+  ● qdrant   http://localhost:6334 → academic_papers  1.20.0
+```
+
+**And the TUI — the surface this rc fixed — on the same live data:**
+
+```
+  Scribe   ○  backend unavailable: 12.9 GiB free, needs 13.2 GiB; held by
+           pid=749175 7734MB
+           hs-distill-server; pid=715494 2464MB
+           ...                       http://192.168.1.110:7435   0.0.1-rc.380
+```
+
+The diagnosis wraps across lines, the **URL is whole**
+(`http://192.168.1.110:7435`, not `http://192.168.1`), and the version
+is beside it. **Before rc.380 that row read `backend unavailable: 12.`
+** — the free VRAM, the headroom and every holder were gone.
+
+**One P0, already logged: P0-23.** `hs status` on `bmb`, `mac_air`,
+`big_mac` and `two` fails with `gateway rejected the refresh token
+(401)` — the **expired cloud enrollment**, not these rcs. It is in
+`BACKLOG.md` as P0-23 and it needs an operator-issued invite code to
+re-enroll, which an agent cannot do. The local services on those hosts
+were verified directly instead (`bmb`'s scribe server: rc.380, `ok`;
+`two`'s gateway: `/health` → 200).
 
 ---
 
