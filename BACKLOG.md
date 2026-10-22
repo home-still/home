@@ -261,7 +261,21 @@ this is a logging concern taking down the entire CLI, including the one command
 
 ---
 
+### P0-25. `hs upgrade` reports a failure on a healthy host: the Qdrant health wait is shorter than a collection recovery (found rc.380 deploy, 2026-10-22)
+**Symptom:** the rc.380 upgrade on `big` replaced every binary and restarted all nine services successfully, then failed with `Error: Timed out waiting for Qdrant at http://localhost:6333/healthz (90s)` and exited non-zero. The container was **up and healthy** — it was **recovering its collections**: `docker logs home-still_qdrant_1` showed `Recovering shard ./storage/collections/academic_papers/0: 0/1 (0%)` and then `Recovered collection academic_papers: 1/1 (100%)`. Qdrant answered `200` about seven minutes later, and every service on the host was healthy.
+**Cause:** `HEALTH_WAIT_SECS = 90` (`crates/hs/src/upgrade_cmd.rs:14`) is used for the Qdrant `/healthz` wait. A corpus of 15,933 documents across three collections (`academic_papers`, `personal_docs`, `imessages`) cannot be recovered in 90 s, so the wait is guaranteed to expire on a large corpus.
+**Change:** the Qdrant wait must exceed a collection recovery — or, better, it must distinguish "not answering yet" from "still recovering": poll the container's state and say which. A host whose services are all up must not have its upgrade reported as failed. The upgrade already restarts the container (`down` then `up -d`), so the recovery is **caused by the upgrade**; the wait belongs to the same operation.
+**Acceptance:** `hs upgrade --pre --yes` on a host with a 15,933-document corpus exits 0, and a Qdrant that is genuinely down still fails the upgrade with a message that names Qdrant.
+
+---
+
 ## P1 — Reliability (panics and silent failures in hot paths)
+
+### P1-26. `hs upgrade` says "No releases found" when the response was empty, which is not the same as there being no releases (found rc.380 deploy, 2026-10-22)
+**Symptom:** the rc.380 upgrade on `four` failed twice with `Error: No releases found` and succeeded on the third attempt. The GitHub API was **reachable** from that host throughout: a direct `curl` of the same URL (`https://api.github.com/repos/home-still/home/releases?per_page=10`) returned HTTP 200, 10 releases including `v0.0.1-rc.380`, 715,713 bytes — and the same `hs/0.0.1-rc.379` user agent the installer sends made no difference.
+**What the message actually means.** `Installer::latest_release_including_pre` (`crates/hs/src/installer.rs:186-203`) parses the body into `Vec<Release>` and, when that vector is empty, says `No releases found`. Because a body that is not a JSON array fails the parse with `Failed to parse releases JSON`, the message proves the response **parsed as an empty array** — the API answered 200 with `[]`. A 200-with-`[]` is what a rate-limited or edge-cached response looks like, and it is indistinguishable, to the operator, from "this repository has no releases". The installer's own 403 check handles the documented rate-limit case, but only for a **403** status; a 200 carrying an error body does not reach it.
+**Change:** do not report "No releases found" for a response that carried no releases **in a body that was not a release list**. Keep the transport error and the parse error distinct from the genuinely-empty case, and retry a 200-with-`[]` once before giving up — the third attempt succeeding on this host is exactly the signature of a transient. The message must say which of the three happened.
+**Acceptance:** a host that cannot reach `api.github.com` gets a message naming the transport failure; a host that receives a 200 with `[]` is retried and, if it persists, gets a message naming the empty response — not "no releases exist"; a host that sees `v0.0.1-rc.NNN` upgrades to it. A regression test feeds a 200 with `[]` and asserts the retry and the message.
 
 ### P1-0. distill server embeds 0 chunks for some glm_ocr docs whose markdown chunks fine locally
 **ROOT CAUSE FOUND + FIXED 2026-08-10 (awaiting rc.350 deploy).** Not glm_ocr-specific
