@@ -311,6 +311,21 @@ Live TUI showing:
 
 Refreshes every 3 seconds. Press `q` to quit.
 
+**A tier that is refusing work says why.** When a scribe tier's VRAM
+gate refuses to dispatch, the line names the shortfall and who is
+holding the card, instead of reporting only that the backend is
+unavailable:
+
+```
+○ scribe   http://big:7435   backend unavailable: 12.9 GiB free, needs 13.2 GiB;
+           held by pid=2227527 7534MB hs-distill-server; pid=1737565 2596MB
+           hs-scribe-server   0.0.1-rc.379
+```
+
+So the next step is visible from the dashboard: free the card, or lower
+the headroom. Before, the same condition read `backend unavailable`
+and the reason had to be found in the tier's journal on another host.
+
 ## Service Deployment (Serve)
 
 Run a service on the current machine in the foreground (`start` / `stop` run it in the background; `--install` makes it a systemd / launchd service).

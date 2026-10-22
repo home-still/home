@@ -35,7 +35,7 @@
 | **personal_read** | stem | Read a personal document's markdown |
 | **personal_add** | filename, category?, title?, force | Ingest a file staged in the personal inbox |
 | **personal_reindex** | stem | Re-chunk and re-embed a personal document |
-| **system_status** | include_repaired? | Full pipeline stats (PDFs, markdown, embedded, services) |
+| **system_status** | include_repaired? | Full pipeline stats (PDFs, markdown, embedded, services). A scribe tier that is refusing work reports **why** — the free VRAM, the headroom it needs, and who is holding the card |
 | **openalex_search** | query, max_results?, year_from?, year_to?, min_citations?, sort? | BM25 search of the local OpenAlex catalog* |
 | **openalex_get** | id_or_doi | One work from the local OpenAlex catalog* |
 | **openalex_references** | openalex_id, limit? | Works a given work cites* |

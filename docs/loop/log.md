@@ -1842,7 +1842,26 @@ RECALL@10 **24/25 = 96 %** — the same as before this change.
 **Commit.** `ba36f36` — "feat(status): the scribe's VRAM gate says why,
 not just that".
 
-**Release.** `v0.0.1-rc.379`, tagged from `ba36f36` on `main`.
+**Release.** `v0.0.1-rc.379`, tagged from `ba36f36` on `main`. The
+CI gate is green on ubuntu-24.04, macos-14 and windows-2022, and the
+release published at 12:33:11Z.
+
+**The artifacts, checked.** The `hs-version-marker` is the thing rc.359
+shipped without on darwin, so it is the first thing to look at:
+
+| the artifact | the marker | the arch |
+|---|---|---|
+| `hs` (aarch64-apple-darwin) | `hs-version-marker:0.0.1-rc.379:end` | arm64 Mach-O |
+| `hs-mcp` (aarch64-apple-darwin) | `hs-version-marker:0.0.1-rc.379:end` | arm64 Mach-O |
+| `hs-scribe-server` (aarch64-apple-darwin) | `hs-version-marker:0.0.1-rc.379:end` | arm64 Mach-O |
+| `hs` (x86_64-unknown-linux-gnu) | `hs-version-marker:0.0.1-rc.379:end` | x86-64 ELF |
+| `hs-mcp` (x86_64-unknown-linux-gnu) | `hs-version-marker:0.0.1-rc.379:end` | x86-64 ELF |
+| `hs-distill-server` (x86_64-unknown-linux-gnu) | `hs-version-marker:0.0.1-rc.379:end` | x86-64 ELF |
+
+`hs --version` prints `hs 0.0.1-rc.379` and `hs-mcp --version` prints
+`hs-mcp 0.0.1-rc.379` from the published tarball. The checksums verify
+against `checksums-sha256.txt` (16 entries). **rc.359's failure mode did
+not recur.**
 
 **Not deployed.** The live services were not upgraded: this iteration's
 rules say not to run `hs upgrade` on live services. The new scribe
