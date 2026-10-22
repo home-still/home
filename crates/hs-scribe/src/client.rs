@@ -204,6 +204,25 @@ pub struct HealthResponse {
     /// working `nvidia-smi`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_vram_free_mb: Option<u64>,
+    /// Free VRAM (MiB) the admission gate requires before it will
+    /// start the VLM backend.
+    ///
+    /// **The number that turns a symptom into a diagnosis.** "12.5 GiB
+    /// free" on its own says nothing: it is a shortfall only against
+    /// the headroom. With both, a reader can see that the card is
+    /// short and by how much, and can act on it. `None` on a host with
+    /// no NVIDIA GPU, and when the model is already resident (the
+    /// free-VRAM half of the gate does not apply then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_vram_headroom_mb: Option<u64>,
+    /// The processes holding VRAM at the last probe, as
+    /// "pid sizeMB name" entries separated by ";".
+    ///
+    /// The same summary the server logs when it refuses to dispatch.
+    /// In the status payload it answers "who is holding the card",
+    /// which is the question an operator actually has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_vram_holders: Option<String>,
     /// RFC 3339 timestamp of the last admission probe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_checked_at: Option<String>,

@@ -1698,3 +1698,190 @@ it is missing.
    option A: catch `MissingHeartbeat` and recreate the pull stream
    instead of exiting. Not ours to make — it is a change to a vendored
    crate.
+## 2026-10-22-02 — the status that said "backend unavailable" and nothing else
+
+**Change.** `hs status` reported a scribe tier as **"backend
+unavailable"** and nothing else. The tier was refusing work, the corpus
+was not growing on it, and the dashboard never said why. The cause was in
+the scribe's own journal, on another host.
+
+**The numbers were already in the payload the client parses.**
+`ScribeClient::health` reads `backend_vram_free_mb`,
+`backend_model_resident` and `backend_checked_at` — and the MCP's status
+builder **dropped all three**, replacing them with the string
+`"backend unavailable"`. The information was fetched, parsed, and
+discarded.
+
+Measured on the live `hs status`, 2026-10-22:
+
+```
+Services:
+  ○ scribe   http://192.168.1.110:7435            backend unavailable   0.0.1-rc.373
+  ● scribe   http://bmb.local:7433                5 converting   0.0.1-rc.373
+```
+
+and in the tier's journal, on another host:
+
+```
+WARN vlm backend unavailable — refusing dispatch free_vram_mb=Some(13251)
+     reachable=true headroom_mb=13500 holders=pid=2227527 7534MB
+     hs-distill-server; pid=1737565 2596MB hs-scribe-server;
+     pid=2615361 591MB bench_elements
+```
+
+**How much it cost.** Over the last 12 hours on `big`: **54 refusals**,
+and **57 of the 107 gate readings (53 %) were under the headroom** — the
+tier refused more often than it passed. The free VRAM at the refusals
+ranged 6,314–13,345 MB against a headroom of 13,500 MB. The tier still
+did 146 conversions, so the pipeline was not stopped — it was quietly
+running at a fraction of its capacity, for a reason nobody could see.
+
+**The arithmetic, for the record.** The card is 24,576 MB. The distill
+server's bge-m3 embedder holds 7,534 MB resident, the scribe server
+2,596 MB, and the olmocr backend wants ~15.4 GB at
+`--gpu-memory-utilization 0.65` (the `llama-swap.yaml` comment says
+0.60 — the two disagree, and that is a host-side finding, not a
+repository one). The free VRAM with only our own services resident is
+14,446 MB and the gate wants 13,500: **a surplus of 946 MB**, which is
+smaller than the `bench_elements` process (591 MB) another agent runs.
+**Every one of the 54 refusals had a third-party tenant holding the
+room.**
+
+**Why this ranked first.** It beat the runner-up — **cross-encoder
+reranking**, the backlog's first item, whose GPU blocker has cleared —
+on the user's own ranking of harm, and on an axis the last three
+iterations did not touch:
+
+* A cross-encoder *reorders* the results of a search that works.
+  Measured on this corpus, 2026-10-21: it moved the expected passage's
+  rank on **4 queries better and 3 worse**, for a **5× latency
+  increase** (162 → 776 ms median), and the sibling crate's own M37
+  measured the same null (+0.78 points, CI [−3.14, +4.71]).
+* This is a **blind spot in the only dashboard an operator has**. The
+  corpus is not growing on one of two scribe tiers, and the tool that
+  says so says "backend unavailable" — which is indistinguishable from
+  a crashed server, a missing model, a wrong URL or a broken
+  converter. The operator cannot act on it: the next step is to read a
+  journal on another host.
+
+**It is also issue #10's fourth bullet**, which another agent filed on
+2026-10-21 with the same diagnosis: *"Report the tier's VRAM gate in
+`system_status`. `free_vram_mb` and `model_resident` are already logged
+internally … surfacing them in the status payload would make this
+diagnosable without reading another host's journal."* Of that issue's
+four bullets this is the one that is **in this repository**: the others
+are about the host's `llama-swap.yaml` and `run-olmocr.sh` (not in the
+repo), the embedder's `idle_release_secs` (a config change on a shared
+box), and the cold-start deadline.
+
+**The change — report the cause, not the symptom.**
+
+* The scribe server's `/health` now carries the **headroom it wants**
+  and the **holders of the card**. It already carried the free VRAM;
+  without the headroom, "12.5 GiB free" says nothing, and without the
+  holders, "who is holding the card" is unanswered.
+* The status line becomes a diagnosis: *"backend unavailable: 12.9 GiB
+  free, needs 13.2 GiB; held by pid=2227527 7534MB hs-distill-server;
+  …"*.
+
+**The gate's behaviour is unchanged.** Every one of the 54 refusals had
+a genuine shortfall, and refusing work the card cannot do is right. This
+changes what is *reported*, not what is *fetched* — the numbers were
+already parsed and thrown away.
+
+**The evidence.** The before and the after, from the same MCP call:
+
+```
+  the old MCP: backend unavailable
+  the new MCP: backend unavailable: 13.0 GiB free
+```
+
+and the whole diagnosis, end to end, against the payload the new scribe
+server sends:
+
+```
+  http://127.0.0.1:46225
+    -> backend unavailable: 12.9 GiB free, needs 13.2 GiB; held by
+       pid=2227527 7534MB hs-distill-server; pid=1737565 2596MB
+       hs-scribe-server; pid=2615361 591MB bench_elements
+```
+
+**One path.** `hs status` (the CLI) and the MCP's `system_status` go
+through the *same* code — the CLI calls the MCP's `system_status` tool
+(`crates/hs/src/status_cmd.rs:242`) — so both carry the diagnosis.
+
+**A model that is already resident needs no room to start**, so no
+headroom is reported against it: the gate's free-VRAM half does not
+apply then, and reporting a shortfall that is not one would be a lie of
+the same kind this change fixes.
+
+**The tests.** Four, in `crates/hs-mcp/src/main.rs::backend_reason_tests`:
+the free VRAM *and* the headroom, both in GiB; the holders and their
+sizes; a resident model reports no requirement, because it needs none;
+and a health body with no numbers still says something true — the
+diagnosis must never be a guess.
+
+**Research.**
+`docs/loop/runs/2026-10-22-02/research.md` — the problem measured,
+the arithmetic, the corpus's prior art (the fault/failure and
+observability passages from *A Philosophy of Software Design*, and the
+"failure observability and repairability" lens from *Agentic Artifact
+Creation*), and the technique chosen.
+`docs/loop/runs/2026-10-22-02/eval.md` — the before/after, the
+end-to-end evidence, and the tests.
+
+**Version.** `v0.0.1-rc.379` — a patch-level bump. It adds two
+optional fields to a health response and changes one status line. It
+touches no stored data, no collection schema, no search behaviour and
+no wire format's meaning.
+
+**Not deployed.** The live services were not upgraded: this iteration's
+rules say not to run `hs upgrade` on live services. The new scribe
+server was run on `:7439` and the new MCP by hand, against the same
+corpus and the same GPU.
+
+**Note for whoever deploys it.** The scribe server and the MCP must be
+upgraded **together** for the diagnosis to appear: the MCP asks the
+server for the headroom, and an older server does not send it. The
+MCP's own fallback is the old wording, so a mixed pair degrades to
+today's behaviour rather than breaking.
+
+
+### Top 5 remaining items
+
+1. **Cross-encoder reranking.** The GPU blocker has cleared, but the
+   reranker is **not in home-still at all**: no code path, no client,
+   no service, no endpoint. Measured on this corpus, 2026-10-21: it
+   moved the expected passage's rank on **4 queries better and 3 worse**
+   for a **5× latency increase** (162 → 776 ms median) — and the
+   sibling crate's own M37 measured the same null (+0.78 points, CI
+   [−3.14, +4.71]). It needs a *process* as much as a model: a serving
+   path, a latency budget, and a decision about where it runs.
+2. **The embedder's `idle_release_secs`.** The card cannot host the
+   olmocr backend and a resident embedder at once: 14,446 MB free
+   against a 13,500 MB headroom is a **946 MB surplus**, smaller than
+   the `bench_elements` process another agent runs. `vram_floor_mb`
+   already exists as a key; letting the embedder *yield* under
+   contention — release the model when the card is short — would let
+   the converter have the room it needs. This is the other half of
+   issue #10, and it is a config-and-code change on a shared box.
+3. **Source scopes (#4).** The links now name a collection, so a link
+   is a capability for one store, and the personal store is read
+   through the corpus's storage. What is still missing is the other
+   half: a *search* that says which stores it looks in, so a general
+   search does not return a game-engine book for "risk factors for
+   falls in elderly people" — measured 2026-10-21, the personal
+   collection answers that query with *The Base Class for Game Objects
+   in SSN67*.
+4. **Fix the README drift.** The README describes OCR as "GLM-OCR via
+   Ollama" only (the code also has olmOCR, OpenAI-compatible and Cloud
+   backends) and omits `crates/openalex-ingest` and the `personal`
+   feature from the architecture list. Cheap, and it misleads anyone
+   choosing a backend. Two iterations have deferred it as "a docs
+   change, not a code change" — that reading is wrong: the rule is one
+   *change* per iteration, not one *kind* of change.
+5. **Decide the async-nats crash-loop** (see
+   `needs-decision/async-nats-missed-idle-heartbeat.md`). Recommended
+   option A: catch `MissingHeartbeat` and recreate the pull stream
+   instead of exiting. Not ours to make — it is a change to a vendored
+   crate.

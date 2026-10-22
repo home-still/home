@@ -346,6 +346,17 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoRespon
     let pdfium_fault = crate::pdfium::healthy().err();
     let admits = backend.as_ref().is_none_or(|b| b.admits()) && pdfium_fault.is_none();
     let models_reason = state.models_reason();
+    // The gate's own numbers, so a reader can tell a shortfall from a
+    // comfortable margin. The headroom only applies when the model is
+    // NOT resident: a resident model needs no room to start.
+    let gate_applies = backend
+        .as_ref()
+        .is_some_and(|b| b.reachable && !b.model_resident);
+    let holders = if admits {
+        None
+    } else {
+        Some(hs_common::gpu::compute_apps_summary_async().await)
+    };
     let body = HealthResponse {
         status: if pdfium_fault.is_some() {
             "pdfium_fault"
@@ -368,6 +379,8 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoRespon
         backend_reachable: backend.as_ref().map(|b| b.reachable),
         backend_model_resident: backend.as_ref().map(|b| b.model_resident),
         backend_vram_free_mb: backend.as_ref().and_then(|b| b.free_vram_mb),
+        backend_vram_headroom_mb: gate_applies.then_some(state.config.vram_headroom_mb),
+        backend_vram_holders: holders,
         backend_checked_at: backend.as_ref().map(|b| b.checked_at.clone()),
     };
     if admits {

@@ -577,6 +577,49 @@ fn join_call_errors(calls: &[(&str, &Option<String>)]) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
+/// Why a scribe tier is refusing work, in one line.
+///
+/// "backend unavailable" is a symptom: it is what a crashed server, a
+/// missing model, a wrong URL and a broken converter all look like.
+/// The tier's admission gate is a *measurement*, and the measurement is
+/// already in the health payload — the free VRAM, the headroom it
+/// wants, and who is holding the card. This turns the symptom into a
+/// diagnosis, and a diagnosis into an action.
+fn backend_unavailable_reason(health: Option<&hs_scribe::client::HealthResponse>) -> String {
+    let Some(h) = health else {
+        return "backend unavailable".to_string();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if h.backend_reachable == Some(false) {
+        parts.push("the VLM backend is unreachable".to_string());
+    }
+    if let Some(free) = h.backend_vram_free_mb {
+        match h.backend_vram_headroom_mb {
+            Some(headroom) if free < headroom => parts.push(format!(
+                "{:.1} GiB free, needs {:.1} GiB",
+                free as f64 / 1024.0,
+                headroom as f64 / 1024.0
+            )),
+            Some(headroom) => parts.push(format!(
+                "{:.1} GiB free, {:.1} GiB needed",
+                free as f64 / 1024.0,
+                headroom as f64 / 1024.0
+            )),
+            None => parts.push(format!("{:.1} GiB free", free as f64 / 1024.0)),
+        }
+    }
+    if let Some(holders) = h.backend_vram_holders.as_deref() {
+        if !holders.trim().is_empty() {
+            parts.push(format!("held by {holders}"));
+        }
+    }
+    if parts.is_empty() {
+        "backend unavailable".to_string()
+    } else {
+        format!("backend unavailable: {}", parts.join("; "))
+    }
+}
+
 /// A private read-only handle for one request. The shared connection is
 /// locked only long enough to clone it, so a slow query (a BM25 search) never
 /// blocks the others; a poisoned lock or a failed clone is an error that
@@ -3431,7 +3474,12 @@ impl HomeStillMcp {
                 None => (0, None, None),
             };
             let activity = if backend_unavailable {
-                "backend unavailable".to_string()
+                // A diagnosis, not a symptom. "backend unavailable"
+                // is indistinguishable from a crashed server, a missing
+                // model, a wrong URL or a broken converter — and the
+                // operator's next step is to read a journal on another
+                // host. The gate's own numbers turn it into an action.
+                backend_unavailable_reason(health.as_ref())
             } else if !healthy {
                 format!(
                     "unhealthy: {}",
@@ -4106,6 +4154,81 @@ async fn install_logging(is_sse: bool) -> hs_common::logging::LoggingHandle {
         .start_shipping(sections.storage.as_ref(), &sections.logs.bucket)
         .await;
     handle
+}
+
+#[cfg(test)]
+mod backend_reason_tests {
+    use super::*;
+
+    fn health(
+        free: Option<u64>,
+        headroom: Option<u64>,
+        holders: Option<&str>,
+        resident: Option<bool>,
+    ) -> hs_scribe::client::HealthResponse {
+        hs_scribe::client::HealthResponse {
+            status: "backend_unavailable".into(),
+            layout_model: false,
+            table_model: false,
+            layout_model_reason: None,
+            table_model_reason: None,
+            version: "0.0.1-rc.374".into(),
+            gpu_name: None,
+            gpu_utilization_pct: None,
+            gpu_memory_used_mb: None,
+            last_conversion_at: None,
+            total_conversions: 0,
+            backend_reachable: Some(true),
+            backend_model_resident: resident,
+            backend_vram_free_mb: free,
+            backend_vram_headroom_mb: headroom,
+            backend_vram_holders: holders.map(str::to_string),
+            backend_checked_at: None,
+        }
+    }
+
+    /// The report must name the shortfall: a free-VRAM number on its
+    /// own says nothing, and "backend unavailable" says even less.
+    #[test]
+    fn a_shortfall_is_reported_with_both_numbers() {
+        let h = health(Some(13251), Some(13500), None, Some(false));
+        let reason = backend_unavailable_reason(Some(&h));
+        assert!(reason.contains("12.9 GiB free"), "{reason}");
+        assert!(reason.contains("13.2 GiB"), "{reason}");
+    }
+
+    /// The holders are the question an operator actually has: who is
+    /// holding the card.
+    #[test]
+    fn the_holders_are_named() {
+        let h = health(
+            Some(13251),
+            Some(13500),
+            Some("pid=2227527 7534MB hs-distill-server; pid=1737565 2596MB hs-scribe-server"),
+            Some(false),
+        );
+        let reason = backend_unavailable_reason(Some(&h));
+        assert!(reason.contains("hs-distill-server"), "{reason}");
+        assert!(reason.contains("7534MB"), "{reason}");
+    }
+
+    /// A model that is already resident needs no room to start, so no
+    /// headroom is reported against it.
+    #[test]
+    fn a_resident_model_reports_no_headroom_requirement() {
+        let h = health(Some(6000), None, None, Some(true));
+        let reason = backend_unavailable_reason(Some(&h));
+        assert!(!reason.contains("needs"), "{reason}");
+        assert!(reason.contains("5.9 GiB free"), "{reason}");
+    }
+
+    /// A health body with no numbers at all still says something true.
+    #[test]
+    fn a_body_with_no_numbers_falls_back_to_the_symptom() {
+        let h = health(None, None, None, None);
+        assert_eq!(backend_unavailable_reason(Some(&h)), "backend unavailable");
+        assert_eq!(backend_unavailable_reason(None), "backend unavailable");
+    }
 }
 
 #[cfg(test)]

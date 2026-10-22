@@ -291,6 +291,25 @@ curl http://localhost:7433/health
 # {"status":"ok","layout_model":true,"table_model":true}
 ```
 
+**When the VRAM gate refuses work**, the body says why, so the reason
+does not have to be found in a journal on another host:
+
+```sh
+curl http://localhost:7433/health
+# {"status":"backend_unavailable",
+#  "backend_vram_free_mb":13251,
+#  "backend_vram_headroom_mb":13500,
+#  "backend_vram_holders":"pid=2227527 7534MB hs-distill-server; …",
+#  "backend_model_resident":false, …}
+```
+
+`backend_vram_free_mb` is what the card had, `backend_vram_headroom_mb`
+is what the gate needs, and `backend_vram_holders` says who is holding
+the rest. The headroom is reported only when the model is **not**
+already resident — a resident model needs no room to start, so there is
+no shortfall to report. `hs status` and the MCP's `system_status` carry
+the same numbers.
+
 ### Streaming API
 
 ```sh
