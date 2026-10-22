@@ -58,11 +58,21 @@ pub async fn test_state_with(routes: &[(&str, &str)], extra: &str) -> TestState 
     if routes.is_empty() {
         yaml.push_str("      mcp: http://127.0.0.1:9\n");
     }
-    let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut grouped: Vec<(&str, Vec<String>)> = Vec::new();
     for (service, url) in routes {
         match grouped.iter_mut().find(|(s, _)| s == service) {
-            Some((_, urls)) => urls.push(url),
-            None => grouped.push((service, vec![url])),
+            Some((_, urls)) => urls.push(url.to_string()),
+            None => grouped.push((service, vec![url.to_string()])),
+        }
+    }
+    // The gateway requires a backend for **every** service it can route,
+    // so a test that names only the service it exercises still needs a
+    // backend for the rest. Fill them in with a backend that answers
+    // nothing: a test about `scribe` is not about `docs`, and should not
+    // have to say so.
+    for service in crate::auth::ROUTABLE_SERVICES {
+        if !grouped.iter().any(|(s, _)| *s == service) {
+            grouped.push((service, vec!["http://127.0.0.1:9".to_string()]));
         }
     }
     for (service, urls) in grouped {

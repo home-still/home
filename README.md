@@ -290,6 +290,27 @@ docs:
   link_ttl_secs: 3600
 ```
 
+The **remote** links go through the cloud gateway, so the gateway needs
+a `docs` route and the docs host's firewall must allow the port:
+
+```yaml
+# on the gateway host, in ~/.home-still/config.yaml
+cloud:
+  gateway:
+    routes:
+      docs: http://<host>:7446
+```
+
+```bash
+# on the host that serves the docs service
+sudo ufw allow from 192.168.1.0/24 to any port 7446 proto tcp
+```
+
+The gateway refuses to start when a service it can route has no route,
+and reports a backend it cannot reach — so a missing route or a
+firewall that drops the port is visible at startup rather than as a
+dead link in a browser.
+
 The signing key lives in `~/.home-still/docs-link.key`, beside the other
 credentials. It is created with mode 0600 on first use and never
 overwritten.

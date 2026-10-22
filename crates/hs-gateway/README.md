@@ -48,10 +48,11 @@ cloud:
     secret_path: /home/<user>/.home-still/cloud-secret.key   # admin key + revocation list live beside it
     token_ttl_secs: 14400      # 4 hours
     refresh_ttl_secs: 604800   # 7 days
-    routes:                    # keys: scribe, distill, mcp; a URL or a list of URLs
+    routes:                    # keys: scribe, distill, mcp, docs; a URL or a list of URLs
       scribe: http://gpu-server.example.local:7433
       distill: http://gpu-server.example.local:7434
       mcp: http://127.0.0.1:7445
+      docs: http://gpu-server.example.local:7446   # the document links
     # Optional limits (defaults shown):
     # max_concurrent_proxy_requests: 64     # excess requests get 503
     # max_request_body_bytes: 268435456     # 256 MiB, streamed (never buffered)
@@ -64,6 +65,41 @@ cloud:
 ```
 
 The gateway's public URL is **not** read from the config: pass it with `--gateway-url`. It must be an explicit `https://` origin; startup fails otherwise, because the value is published as the OAuth issuer and authorization endpoint.
+
+**Every routable service needs a backend.** The gateway refuses to start
+when a service it can route has no route, and names the key to add:
+
+```
+`cloud.gateway.routes` has no backend for `docs` — every request to it
+would fail with 502. Add the key(s) to `cloud.gateway.routes`, e.g.
+`docs: http://<docs-host>:7446`
+```
+
+The check is deliberate. A service with no route is otherwise a
+**silent** hole: the gateway starts, passes its own validation, and
+answers `502 No backend configured for service: docs` to every request
+that reaches it — a request the user only makes by clicking a document
+link the corpus's own agents handed them. The `docs` route is what
+makes the signed, expiring document links work from off the LAN.
+
+**The gateway also checks that its backends are reachable**, at startup,
+from its own host — the only vantage point from which "can a client
+reach the backend?" is the same question:
+
+```
+WARN  docs backend http://192.168.1.110:7446 is not reachable (timed out
+      — the host did not answer (a firewall that drops the port?)) — every
+      request to `docs` will fail until it is
+WARN  mcp backend http://192.168.1.110:7445 answered HTTP 401 on /health — it is not healthy
+```
+
+A backend that is down is **not** fatal: the gateway's job is to proxy,
+and one host rebooting must not take the other services down with it.
+So the gateway reports and starts. Note that the check is made from the
+**gateway's** host, not the backend's: a backend that answers its own
+`/health` on its own host proves nothing, because a firewall that drops
+the port leaves the service perfectly healthy in place and unreachable
+from everywhere else.
 
 ### 3. Add Cloudflare tunnel ingress
 

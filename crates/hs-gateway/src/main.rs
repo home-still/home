@@ -9,6 +9,7 @@ use clap::Parser;
 mod admin;
 mod app;
 mod auth;
+mod backend_health;
 mod backend_url;
 mod balancer;
 mod config;
@@ -77,6 +78,23 @@ async fn async_main() -> anyhow::Result<()> {
 
     tracing::info!("Starting gateway on {listen} (public URL {gateway_url})");
     tracing::info!("Routes: {:?}", config.routes.keys().collect::<Vec<_>>());
+
+    // Are the backends actually reachable? The gateway proxies to other
+    // hosts, and a backend it cannot reach makes every request to that
+    // service fail — with a `502` or a `504` in a browser and nothing
+    // anywhere saying why. The gateway's own host is the only vantage
+    // point from which "can a client reach the backend?" is the same
+    // question: a backend that answers its own `/health` on its own
+    // host proves nothing, because a firewall that drops the port
+    // leaves the service perfectly healthy in place and unreachable
+    // from everywhere else.
+    //
+    // A backend that is down is **not** fatal: the gateway's job is to
+    // proxy, and one host rebooting must not take the other services
+    // down with it. So this reports, loudly, and the gateway starts.
+    for line in backend_health::report(&config.routes).await {
+        tracing::warn!("{line}");
+    }
 
     let state = Arc::new(GatewayState::new(
         config,

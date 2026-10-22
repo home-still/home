@@ -224,6 +224,45 @@ impl GatewayConfig {
         }
         self.routes = routes;
 
+        // Every service the gateway can route needs a backend. A service
+        // with no route is a **silent** hole: the gateway starts, passes
+        // this validation, and answers `502 No backend configured for
+        // service: <name>` to every request that reaches it — a request
+        // the user only makes by clicking a link the corpus's own agents
+        // handed them. That is the failure this check exists to prevent:
+        // the configuration error is raised at the boundary, where it
+        // can still be read, instead of at request time, where it is
+        // only a 502 in a browser.
+        //
+        // The error names the key to add and the address to add it to,
+        // because a message that names only the service sends the
+        // operator looking for the service rather than for the key.
+        let missing: Vec<&str> = ROUTABLE_SERVICES
+            .iter()
+            .copied()
+            .filter(|service| !self.routes.contains_key(*service))
+            .collect();
+        if !missing.is_empty() {
+            let mut msg = format!(
+                "`cloud.gateway.routes` has no backend for {} — every request to it \
+                 would fail with 502. Add the key(s) to `cloud.gateway.routes`, e.g. \
+                 `docs: http://<docs-host>:7446`",
+                missing
+                    .iter()
+                    .map(|s| format!("`{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if missing.len() > 1 {
+                msg.push_str(&format!(
+                    " ({} services are missing: {})",
+                    missing.len(),
+                    missing.join(", ")
+                ));
+            }
+            bail!(msg);
+        }
+
         for (name, value) in [
             ("token_ttl_secs", self.token_ttl_secs),
             ("refresh_ttl_secs", self.refresh_ttl_secs),
@@ -318,13 +357,13 @@ mod tests {
 
     #[test]
     fn missing_listen_is_an_error() {
-        let msg = err_of("cloud:\n  gateway:\n    routes:\n      mcp: http://127.0.0.1:7445\n");
+        let msg = err_of("cloud:\n  gateway:\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n");
         assert!(msg.contains("listen"), "{msg}");
     }
 
     #[test]
     fn a_retired_key_is_stripped_and_reported() {
-        let yaml = "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    key_rotation_days: 90\n    routes:\n      mcp: http://127.0.0.1:7445\n";
+        let yaml = "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    key_rotation_days: 90\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n";
         assert!(GatewayConfig::from_yaml(yaml, Path::new(PATH)).is_ok());
         let mut section =
             serde_yaml_ng::from_str::<serde_json::Value>(yaml).unwrap()["cloud"]["gateway"].clone();
@@ -334,21 +373,21 @@ mod tests {
 
     #[test]
     fn an_unknown_key_is_an_error_naming_it() {
-        let msg = err_of("cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    max_concurrent_proxy_request: 5\n    routes:\n      mcp: http://127.0.0.1:7445\n");
+        let msg = err_of("cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    max_concurrent_proxy_request: 5\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n");
         assert!(msg.contains("max_concurrent_proxy_request"), "{msg}");
     }
 
     #[test]
     fn valid_section_parses() {
         let config = GatewayConfig::from_yaml(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n",
             Path::new(PATH),
         )
         .expect("valid section");
 
         assert_eq!(config.listen, "127.0.0.1:7440");
         assert_eq!(config.routes["mcp"], ["http://127.0.0.1:7445"]);
-        assert_eq!(config.routes.len(), 3);
+        assert_eq!(config.routes.len(), 4);
         assert_eq!(config.token_ttl_secs, 14400);
         assert_eq!(
             config.secret_path,
@@ -370,7 +409,7 @@ mod tests {
     #[test]
     fn routes_are_normalized() {
         let config = GatewayConfig::from_yaml(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://big.example.local:7433/\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://big.example.local:7433/\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n",
             Path::new(PATH),
         )
         .unwrap();
@@ -380,7 +419,7 @@ mod tests {
     #[test]
     fn a_route_may_be_a_single_url_or_a_list() {
         let config = GatewayConfig::from_yaml(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe:\n        - http://gpu-a.example.local:7433\n        - http://gpu-b.example.local:7433/\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      scribe:\n        - http://gpu-a.example.local:7433\n        - http://gpu-b.example.local:7433/\n",
             Path::new(PATH),
         )
         .unwrap();
@@ -412,10 +451,52 @@ mod tests {
         }
     }
 
+    /// A service the gateway can route but has no backend for is a
+    /// **silent** hole: the gateway starts, passes validation, and
+    /// answers `502 No backend configured for service: docs` to every
+    /// user who clicks a document link. The configuration error must be
+    /// raised where it can still be read — at startup — and the message
+    /// must name the key to add.
+    #[test]
+    fn a_routable_service_with_no_backend_is_an_error_naming_the_key() {
+        let msg = err_of(
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      distill: http://127.0.0.1:7434\n      mcp: http://127.0.0.1:7445\n",
+        );
+        assert!(msg.contains("docs"), "{msg}");
+        assert!(msg.contains("cloud.gateway.routes"), "{msg}");
+        // The message must name the key to add, not only the service:
+        // a message that names only the service sends the operator
+        // looking for the service rather than for the key.
+        assert!(msg.contains("`docs`"), "{msg}");
+    }
+
+    /// The check names **every** missing service, not just the first.
+    #[test]
+    fn every_missing_service_is_named() {
+        let msg = err_of(
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n",
+        );
+        for service in ["distill", "mcp", "docs"] {
+            assert!(msg.contains(service), "the message lost `{service}`: {msg}");
+        }
+    }
+
+    /// A route for every routable service is a valid configuration.
+    #[test]
+    fn a_route_for_every_routable_service_is_valid() {
+        let config = GatewayConfig::from_yaml(
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      distill: http://127.0.0.1:7434\n      mcp: http://127.0.0.1:7445\n      docs: http://127.0.0.1:7446\n",
+            Path::new(PATH),
+        )
+        .expect("every routable service has a backend");
+        assert_eq!(config.routes.len(), 4);
+        assert_eq!(config.routes["docs"], ["http://127.0.0.1:7446"]);
+    }
+
     #[test]
     fn a_route_that_can_never_be_reached_is_an_error() {
         let msg = err_of(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      searhc: http://127.0.0.1:7434\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      searhc: http://127.0.0.1:7434\n",
         );
         assert!(msg.contains("searhc"), "{msg}");
     }
@@ -423,7 +504,7 @@ mod tests {
     #[test]
     fn a_malformed_route_url_is_an_error() {
         let msg = err_of(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: ftp://host\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: ftp://host\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n",
         );
         assert!(msg.contains("scribe"), "{msg}");
     }
@@ -431,7 +512,7 @@ mod tests {
     #[test]
     fn zero_limits_are_errors() {
         let msg = err_of(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    max_concurrent_proxy_requests: 0\n    routes:\n      mcp: http://127.0.0.1:7445\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    max_concurrent_proxy_requests: 0\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n",
         );
         assert!(msg.contains("max_concurrent_proxy_requests"), "{msg}");
     }

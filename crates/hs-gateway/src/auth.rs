@@ -268,7 +268,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let prev = dir.join("cloud-secret.key.prev");
         let yaml = format!(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:0\n    secret_path: {}/cloud-secret.key\n    previous_secret_path: {}\n    routes:\n      mcp: http://127.0.0.1:9\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:0\n    secret_path: {}/cloud-secret.key\n    previous_secret_path: {}\n    routes:\n      mcp: http://127.0.0.1:9\n      scribe: http://127.0.0.1:9\n      distill: http://127.0.0.1:9\n      docs: http://127.0.0.1:9\n",
             dir.display(),
             prev.display()
         );

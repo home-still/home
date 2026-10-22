@@ -206,6 +206,30 @@ service the operator runs on their own machine.
 
 A LAN firewall rule that only permits traffic *between* `<lan-subnet>` hosts is enough. The tunnel host is the only one that needs outbound 443 to `*.cloudflare.com`.
 
+**Every port in the table above needs a firewall rule on the host that
+serves it.** A host with `ufw`'s default `DROP` policy silently drops
+the ports it has no rule for, and the symptom is a **7-second timeout**
+on the client and a healthy service on the server: the service answers
+`/health` on its own host, so every local check passes while the
+service is unreachable from everywhere else. The docs server's port
+(7446) is the one most easily missed, because nothing but the gateway
+and the user's browser uses it:
+
+```bash
+# on the host that serves the docs server
+sudo ufw allow from 192.168.1.0/24 to any port 7446 proto tcp
+```
+
+The gateway now **reports an unreachable backend at startup**, naming
+the service, the address and the reason, so a missing rule is visible
+without having to guess which hop is dropping the packet:
+
+```
+WARN  docs backend http://192.168.1.110:7446 is not reachable (timed out
+      — the host did not answer (a firewall that drops the port?)) — every
+      request to `docs` will fail until it is
+```
+
 ## 6. Per-host setup recipes
 
 All recipes use the convention **"Run as: sudo bash"** or **"Run as: bash"** at the top of any script handed off, so there's no ambiguity about privileges.
@@ -282,7 +306,15 @@ cloud:
       scribe:  http://big:7433
       distill: http://big:7434
       mcp:     http://127.0.0.1:7445
+      docs:    http://big:7446
 ```
+
+**Every routable service needs a backend.** The gateway refuses to start
+when one of `scribe`, `distill`, `mcp` or `docs` has no route, and
+names the key to add. The `docs` route is what makes the signed,
+expiring document links work from off the LAN; without it the gateway
+would start and answer `502 No backend configured for service: docs` to
+every user who clicks one.
 
 The gateway's public URL is **not** read from this file — it is the required `--gateway-url https://…` flag below. Startup fails if it is missing or not `https://`. `hs cloud invite` / `hs cloud revoke` only work on this host: they authenticate with `cloud-admin.key`.
 

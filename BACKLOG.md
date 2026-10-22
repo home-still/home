@@ -269,6 +269,17 @@ this is a logging concern taking down the entire CLI, including the one command
 
 ---
 
+### P0-26. The docs service's port (7446) has no firewall rule on `big`, so every remote document link is dead (found 2026-10-22, rc.382 iteration)
+**Symptom:** every **remote** document link the corpus's agents hand to a user fails. Measured over 10 real links (5 documents × source + markdown) fetched on the live host: **LAN 10/10 work** (`206 Partial Content`, the `Range` header honoured), **remote 0/10 work** (`403` from Cloudflare, which renders the gateway's `502`/`504` as an error page). The LAN path works because the docs service is on the same host as the fetcher.
+**Cause — two independent blockers, both host configuration:**
+1. **The gateway on `two` had no `docs` route.** `cloud.gateway.routes` listed `scribe`, `distill` and `mcp` only, so the gateway answered `502 No backend configured for service: docs`. **Fixed in this session**: `docs: http://192.168.1.110:7446` added to `two`'s config (backup at `~/.home-still/config.yaml.bak.pre-docs-route`) and the gateway restarted — `Routes: ["docs", "mcp", "distill", "scribe"]`. The **code** half is rc.382: the gateway now refuses to start when a service it can route has no backend, and reports an unreachable backend at startup.
+2. **`big`'s firewall drops TCP 7446.** `ufw`'s `DEFAULT_INPUT_POLICY` is `DROP` and `grep -c 7446 /etc/ufw/user.rules` is **0** — the rules allow 7433, 7434, 7435, 7440, 7445, 6333, 6334, 8080, 8081, 11434 and others, but not the docs port. Measured from `two`: `curl http://192.168.1.110:7446/health` → `000` after **7.0 s** (the signature of a dropped packet) on **every** host in the fleet (`two`, `bmb`, `mac_air`, `big_mac`), while from `big` itself the same URL answers `200` in 0.76 s.
+**The trap that makes this one subtle:** the docs service is **perfectly healthy on its own host** — `/health` answers `200` on `192.168.1.110:7446` from `big` — so every local check passes while the service is unreachable from everywhere else. A self-probe **cannot** detect it. Only a probe from another host can, and the only component that lives on another host and actually proxies is the gateway, which is why rc.382's check runs there.
+**Change (operator step; needs the sudo password on `big`):** `sudo ufw allow from 192.168.1.0/24 to any port 7446 proto tcp`. The other service ports have exactly this shape.
+**Acceptance:** `curl http://192.168.1.110:7446/health` from `two` answers 200 in under a second, and the remote document links fetch 206 like the LAN ones. The rc.382 gateway check then reports nothing for `docs`.
+
+---
+
 ## P1 — Reliability (panics and silent failures in hot paths)
 
 ### P1-26. `hs upgrade` says "No releases found" when the response was empty, which is not the same as there being no releases (found rc.380 deploy, 2026-10-22)
