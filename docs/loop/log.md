@@ -2838,3 +2838,74 @@ neither rc.385's fix nor this one is live.
    remote document links are still dead.
 5. **P1-27: olmocr cold starts fail whole documents** — wait for
    llama-swap to report the model ready before invoking olmocr.
+
+## 2026-10-23-03 — catch-up never re-queues a failed conversion
+
+**Change.** `hs pipeline catch-up` skips documents stamped
+`conversion_failed`, reports them by kind and points at `hs pipeline
+reconvert-failed` (which selects by what a retry can do and clears the
+stamp first). `hs status`'s Stalled counts only unconverted documents with
+no failure stamp — what catch-up queues; `pipeline_drift` still counts
+all of them. Without the catalog, catch-up fails and Stalled is unknown.
+
+**Evidence.**
+
+* All **87** documents the scribe watchers terminated in a 6 h window
+  were already stamped failed that morning (attempts 2–8; one
+  `pdf_parse_error` at 40). Nothing new was being converted.
+* The `PAPERS` work queue (FIFO) was read message by message without
+  consuming it: of 1,197 pending, **1,086** came from one catch-up run on
+  2026-10-21 (published in 13 s) — 1,010 retryable failures, 60 sources
+  that can never convert, 13 already converted, **3** real work. 101 new
+  downloads queued after it had waited two days.
+* `hs status` showed Stalled 888 — all stamped failures — with the note
+  "run `hs pipeline catch-up`", the command that caused the backlog.
+* Literature (in the corpus): *Enterprise Integration Patterns* — a
+  message that makes its recipient fail "would just fail right away
+  again", so it belongs on its own channel; Bass et al. — FIFO assigns
+  priority by arrival alone, so a bulk re-publish outranks every later
+  arrival.
+
+**Before / after** (same live store, dry runs only;
+`runs/2026-10-23-03/eval.md`):
+
+| | rc.382 | rc.387 |
+|---|---|---|
+| catch-up would republish | 2,152 | **144** |
+| failed conversions skipped (and reported) | 0 | **2,008** (1,888 retryable, 120 not) |
+| Stalled | 888 | **0** |
+| `pipeline_drift` | 2,144 | 2,145 (one new download) |
+| catch-up `--dry-run` wall time | 1.7 s | 6.8 s (reads the catalog) |
+| RECALL@10 (query set) | 25/25 | 25/25 |
+
+Stalled 0 is true: the queue holds exactly the 144 unstamped,
+unconverted stems catch-up would queue.
+
+**Why it ranked first.** It was the measured reason the scribe tiers
+were converting nothing new (rank 1: documents stuck): known failures
+were being re-fed ahead of new downloads, and the dashboard told the
+operator to do it again. It beat P0-27 (olmocr VRAM gate) because that
+outage is down to an operator action (stop big's idle `:7433` scribe).
+
+**Version.** `v0.0.1-rc.387` — catch-up's selection narrows and Stalled
+changes meaning; no wire or schema change beyond rc.386. Release workflow green (Gate on big, macOS and Windows; 5 builds; Docker), 33 assets; downloaded `hs` (x86-64, arm64 Mach-O) and `hs-mcp` (x86-64) pass their checksums, carry the rc.387 marker and report `0.0.1-rc.387`. Commit `c8332b5`.
+
+**Fleet gap.** big, bmb and two run **rc.382** — five releases behind
+(rc.383 was withdrawn). None of rc.385–387 is live.
+
+**Found on the way.** The 1,070 failure events already queued need no
+action beyond the rc.385 deploy on bmb; re-publishing them again would
+double them (BACKLOG P0-28 note). Gates: workspace 1,581 / hs-scribe 378 /
+hs-common (all features) 374 tests pass; rustdoc unchanged at 30 warnings.
+
+### Top 5 remaining items
+
+1. **Operator: upgrade bmb (rc.385 stops the gapped drops), stop big's
+   idle `hs-serve-scribe`** (frees the olmocr tier), then upgrade big and
+   two.
+2. **P0-28: recover the retryable documents** — the 1,010 already queued
+   retry on their own after 1; then `hs pipeline reconvert-failed
+   --dry-run` for what is still stamped.
+3. **P0-27: derive the olmocr VRAM gate from vLLM's real requirement.**
+4. **P0-26: the docs port firewall rule on big** (operator, sudo).
+5. **P1-27: olmocr cold starts fail whole documents.**
