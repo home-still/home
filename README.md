@@ -106,13 +106,17 @@ All providers are queried in parallel when using `--provider all` (default). Res
 
 ## PDF-to-Markdown (Scribe)
 
-Convert academic PDFs into structured markdown using a two-stage pipeline:
+Convert academic PDFs into structured markdown. A scribe server runs one of two converters:
+
+**Layout pipeline** (the default):
 
 1. **Layout detection** -- PP-DocLayout-V3 via ONNX Runtime. Detects 25 region types (titles, paragraphs, figures, tables, formulas, headers, footers, captions, references, footnotes, and more).
-2. **VLM OCR** -- Sends detected regions to a vision-language model (GLM-OCR via Ollama) for text extraction.
+2. **VLM OCR** -- Sends each detected region (each table cell, for tables) to a vision-language model, GLM-OCR by default, for text extraction. The backend is chosen with `HS_SCRIBE_BACKEND`: `Ollama` (the default), `OpenAi` for any OpenAI-compatible server (llama-server, llama-swap, vLLM; URL in `HS_SCRIBE_OPENAI_URL`), or `Cloud`.
 3. **Markdown assembly** -- Regions are ordered and assembled into section-aware markdown with heading hierarchy and table structure.
 
-Converted output is post-processed with repetition detection to clean VLM generation loops.
+**olmocr** (`HS_SCRIBE_CONVERTER=olmocr`): runs the olmOCR CLI against a vLLM-served model; it renders and transcribes whole pages itself.
+
+A region whose VLM output falls into a loop (the same unit repeated back to back) is aborted mid-stream, and a conversion with aborted or unprocessable regions is refused rather than stored with holes. Stored output is also cleaned of long repeated runs.
 
 ### Setup
 
@@ -120,7 +124,7 @@ Converted output is post-processed with repetition detection to clean VLM genera
 hs serve scribe    # run the scribe server in the foreground (needs models, libpdfium and HS_BACKEND_TOKEN; see crates/hs-scribe/README.md)
 ```
 
-On **macOS Apple Silicon**, Ollama runs natively with Metal GPU acceleration. On **Linux with NVIDIA GPU**, CUDA acceleration is auto-detected. On **CPU-only** systems, inference runs in software mode.
+With the Ollama backend on **macOS Apple Silicon**, Ollama runs natively with Metal GPU acceleration. Layout detection uses CUDA on **Linux with an NVIDIA GPU** when `HS_SCRIBE_USE_CUDA` is on (the default) and fails to start if CUDA cannot be used; set `HS_SCRIBE_USE_CUDA=false` to run it on the CPU, as Apple Silicon hosts must.
 
 ### Convert
 
@@ -545,7 +549,7 @@ Available on all commands:
 | **7445** | MCP server | Gateway -> MCP | Model Context Protocol (SSE) |
 | **6333** | Qdrant REST | Server internal | Vector DB HTTP API |
 | **6334** | Qdrant gRPC | Server internal | Vector DB gRPC |
-| **11434** | Ollama | Server internal | VLM for OCR |
+| **11434** | Ollama | Server internal | VLM for OCR with the `Ollama` backend (an `OpenAi` backend uses its own server's port) |
 
 ## Architecture
 

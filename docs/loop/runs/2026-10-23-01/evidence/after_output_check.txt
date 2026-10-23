@@ -1,0 +1,6 @@
+== 10.1016_j.eurpsy.2012.03.001: most back-to-back copies 2.0 (period 11): 'td td td β td td se td td p td td td td β td td se td td p td'
+   prose blocks 157, of which the old rule aborts 0
+== 10.1016_j.eplepsyres.2007.12.015: most back-to-back copies 2.0 (period 4): 'non epileptic attack disorder non epileptic attack disorder'
+   prose blocks 139, of which the old rule aborts 2
+   - 4-gram 'data were analysed using' x3: …non-parametric Mann—Whitney U test and Spearman correlations. Normal data were analysed using independent t-tests. Categorical data were analysed using Chi-squared test. A conservative critical p
+   - 4-gram 'negative view of self' x3: …in the literature, but as NEAD is considered a psychological disorder, the findings appear consistent with previously demonstrated associations between a negative view of self

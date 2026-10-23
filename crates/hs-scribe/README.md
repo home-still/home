@@ -243,6 +243,8 @@ PP-DocLayout-V3 detects 25 region classes. hs-scribe maps them to 6 processing t
 
 A region whose VLM stream trips the repetition detector is aborted and left out of the page. The page continues, but the aborted region (a text region, or a single table cell, which is left empty) is counted as a skipped region, so the quality gate rejects the conversion as gapped and the tier chain escalates. The per-page diag keeps `repetition_aborted_regions` as its own counter.
 
+The detector fires only on a **consecutive** loop: the stream's tail is at least 3 back-to-back copies of one unit of up to 128 words, spanning at least 32 words ("and relationship and relationship …", or a sentence replayed). A phrase that merely recurs — an affiliation list, a citation run, a paper repeating its key term — is left alone; since one aborted region costs the whole document, the detector waits for an unambiguous signal, which a real loop always produces because it never stops. Near-copy loops and units over 128 words run to the token limit and are left to repetition cleanup.
+
 Repetition cleanup (`clean_repetitions`) runs on a page only when its longest repeated run reaches the QC loop floor (128 bytes, the same floor `qc_verdict` uses). Below it the page is stored as the OCR text, so code indentation, wide table rules, dot leaders and `| - | - |` rows are never rewritten.
 
 Table cell text from the VLM is HTML-escaped (`&`, `<`, `>`) before it goes into `<td>`.

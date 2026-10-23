@@ -286,6 +286,23 @@ this is a logging concern taking down the entire CLI, including the one command
 **Change:** derive the headroom from the backend's real requirement (utilization × card memory, plus vLLM's margin) rather than a hand-set number, or refuse to start the tier when the configured headroom is below it. The two numbers live in two files today (`run-olmocr.sh`, the unit's env), which is how they drifted.
 **Acceptance:** with free VRAM between the old headroom and vLLM's requirement, `/readiness` refuses work and names both numbers; with enough free VRAM, olmocr starts and converts.
 
+### P0-28. Documents the old repetition detector dropped as `gapped_conversion` are terminal and need a re-ingest decision (found 2026-10-23, rc.385 iteration)
+**Symptom:** in the 24 h before rc.385, **176/176** documents the two scribe watchers received ended `terminating (will not redeliver)`; **154** of them as `gapped_conversion` from bmb's glm_ocr tier ("converted with N region(s) the server could not process").
+**Cause (fixed in rc.385):** the streaming repetition detector counted n-grams anywhere in a 256-word window and aborted ordinary prose (affiliation lists, citation runs); it aborted ≥1 block in 96.4 % of accepted olmocr documents. Each abort made the conversion gapped, and gapped is permanent. rc.385 fires only on consecutive repetition (0 % on accepted glm_ocr text, 3.6 % olmocr — those mostly real loops). See `docs/loop/runs/2026-10-23-01/research.md`.
+**Change (needs a decision):** the dropped documents are still in `papers/` with a `gapped_conversion` failure stamp in their catalog rows and no markdown. Re-publishing their convert events after rc.385 is deployed recovers them; it is a bulk re-conversion, which this loop may not start on its own. Enumerate them by the catalog stamp (the watcher journals rotate after ~1 day).
+**Acceptance:** after the rc.385 deploy and the re-publish, the enumerated stems have markdown, and no new `gapped_conversion` cites a repetition-detector abort on ordinary text.
+
+### P1-29. Accepted markdown contains verbatim repetition loops (found 2026-10-23, rc.385 iteration)
+**Symptom:** replaying the rc.385 detector over 200 seeded accepted documents found ≥3 back-to-back copies of one unit in **24 documents** (scribe-vlm 21/72, olmocr 3/83, glm_ocr 0/43), e.g. `W4281571214`: "to be used to be used to be used …", "The study was conducted in a controlled environment." ×4. 63 of the 78 flagged blocks are verbatim loops.
+**Cause:** these were converted before the streaming detector existed (or by olmocr, which never passes through it); `clean_repetitions` only rewrites runs past its 128-byte floor.
+**Change (needs a decision):** re-convert the affected documents once P0-27 / P0-28 make conversion reliable; the detector's rule (`RepetitionDetector`) can enumerate them offline from the stored markdown.
+**Acceptance:** a scan of the stored markdown with the rc.385 rule finds no verbatim loop outside tables.
+
+### P1-30. bmb's `com.home-still.scribe-autotune` crash-loops and two logs grow without bound (found 2026-10-23)
+**Symptom:** the LaunchAgent runs a subcommand the binary no longer has (`unrecognized subcommand 'autotune'`); `/tmp/hs-scribe-autotune.log` is 42 MB / 1.8 M lines. `/tmp/hs-scribe.log` (the scribe server's stdout/stderr) is 1.1 GB with no rotation.
+**Change:** remove the autotune LaunchAgent (the subcommand is gone; see also P1-D3) and give the scribe LaunchAgent a rotated log.
+**Acceptance:** `launchctl list | grep autotune` is empty on bmb; the scribe log stays bounded.
+
 ---
 
 ## P1 — Reliability (panics and silent failures in hot paths)
@@ -888,7 +905,7 @@ rc.341 removed the orphaned `OLLAMA_NUM_PARALLEL` autotuner, the native-ollama s
 
 1. **`vlm_concurrency` (12) now oversubscribes llama-server `--parallel 8`.** rc.341 deleted `resolve_effective_vlm_concurrency`, which used to clamp the scribe server's page-parallelism semaphore down to a detected `OLLAMA_NUM_PARALLEL`. That clamp only ever applied to the (unused) ollama path, so removing it is correct — BUT the GLM scribe (`:7433`) now sends up to `config.vlm_concurrency=12` concurrent page requests to `llama-server-glm-ocr` which runs `--parallel 8`, so 4 queue. GLM is escalation-only (rare), so low blast radius, but consider setting the GLM scribe's `vlm_concurrency` to match `--parallel` (8) in config, OR raise llama-server `--parallel`. Tuning only — no rebuild.
 2. **Leftover disabled unit file on `big`.** `/etc/systemd/system/hs-serve-scribe-autotune.service` still exists (now `disabled`, inert — rc.341 no longer generates it). Harmless, but `sudo rm` it + `daemon-reload` for cleanliness whenever convenient.
-3. **GLM escalations on repetition-loop papers struggle.** Papers that escalate olmocr→glm_ocr via `reason=vlm_repetition_loop` (e.g. `10.3389_fphys.2021.677581`) also trip GLM's 4-gram-cycle repetition detector; some exhaust the chain (`scribe convert failed`) and stay unconverted. This is the same root theme as **P0-12** (decode-time repetition prevention) — both backends loop on the same pathological PDFs. Track under P0-12, not separately.
+3. **GLM escalations on repetition-loop papers struggle.** Papers that escalate olmocr→glm_ocr via `reason=vlm_repetition_loop` (e.g. `10.3389_fphys.2021.677581`) also trip GLM's 4-gram-cycle repetition detector; some exhaust the chain (`scribe convert failed`) and stay unconverted. This is the same root theme as **P0-12** (decode-time repetition prevention) — both backends loop on the same pathological PDFs. Track under P0-12, not separately. **2026-10-23 (rc.385):** many of these "4-gram-cycle" aborts were the detector misfiring on ordinary prose, not loops — it aborted ≥1 block in 96 % of accepted olmocr documents. rc.385 fires only on consecutive repetition; see **P0-28**.
 
 ---
 
