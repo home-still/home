@@ -433,23 +433,18 @@ mod tests {
 
     use super::test_support::result_document;
     #[cfg(unix)]
-    use super::test_support::{completed_in, pages, write_result};
+    use super::test_support::{completed_in, install_stand_in, pages, write_result};
     use crate::pipeline::markdown_generator::PAGE_SEPARATOR;
     #[cfg(unix)]
     use std::path::PathBuf;
 
     #[cfg(unix)]
     fn fake_olmocr(dir: &Path, tally: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let script = dir.join("fake-olmocr.sh");
         let page_texts = pages(completed_in(tally), "body text");
         let refs: Vec<&str> = page_texts.iter().map(String::as_str).collect();
-        let body = format!(
-            "#!/bin/sh\n{}\n{tally}\n",
-            write_result(&result_document(&refs))
-        );
-        std::fs::write(&script, body).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let body = format!("{}\n{tally}", write_result(&result_document(&refs)));
+        install_stand_in(&script, &body);
         script
     }
 
@@ -588,7 +583,11 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(failure_code(&err), Some(FailureCode::OlmocrIncompletePages));
+        assert_eq!(
+            failure_code(&err),
+            Some(FailureCode::OlmocrIncompletePages),
+            "{err:#}"
+        );
     }
 
     #[cfg(unix)]
@@ -600,7 +599,11 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(failure_code(&err), Some(FailureCode::OlmocrIncompletePages));
+        assert_eq!(
+            failure_code(&err),
+            Some(FailureCode::OlmocrIncompletePages),
+            "{err:#}"
+        );
     }
 
     #[cfg(unix)]
@@ -609,7 +612,11 @@ mod tests {
         let err = run_fake("echo 'something unrelated' >&2", 4)
             .await
             .unwrap_err();
-        assert_eq!(failure_code(&err), Some(FailureCode::OlmocrZeroPages));
+        assert_eq!(
+            failure_code(&err),
+            Some(FailureCode::OlmocrZeroPages),
+            "{err:#}"
+        );
     }
 
     #[cfg(unix)]
@@ -617,11 +624,7 @@ mod tests {
     async fn a_nonzero_exit_is_an_untyped_transient_failure() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("boom.sh");
-        std::fs::write(&script, "#!/bin/sh\necho 'vllm unreachable' >&2\nexit 3\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        install_stand_in(&script, "echo 'vllm unreachable' >&2\nexit 3");
         let pdf = dir.path().join("in.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         let config = AppConfig {
@@ -638,17 +641,12 @@ mod tests {
     async fn a_failed_run_reports_the_end_of_its_stderr_not_all_of_it() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("loud.sh");
-        std::fs::write(
+        install_stand_in(
             &script,
-            "#!/bin/sh\necho FIRST-LINE-MARKER >&2\n\
+            "echo FIRST-LINE-MARKER >&2\n\
              i=0; while [ $i -lt 5000 ]; do echo \"page $i done\" >&2; i=$((i+1)); done\n\
-             echo 'fatal: backend went away' >&2\nexit 3\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+             echo 'fatal: backend went away' >&2\nexit 3",
+        );
         let pdf = dir.path().join("in.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         let config = AppConfig {
@@ -679,6 +677,45 @@ mod tests {
 /// CLI (here, `event_watch` and `server`).
 #[cfg(test)]
 pub(crate) mod test_support {
+    /// Write `body` as an executable shell script at `path` and return only
+    /// once it can be exec'd.
+    ///
+    /// A script written by one test thread can be inherited, still open for
+    /// writing, by a child another thread forks at that moment; until that
+    /// child execs, exec'ing the script fails with ETXTBSY ("Text file
+    /// busy"). Observed in CI: `spawning olmocr CLI at …/fake-olmocr.sh:
+    /// Text file busy (os error 26)`, 4 runs in 60 inside the runner image.
+    /// One successful exec proves no writer is left, and none can appear
+    /// again (the file is never reopened), so the script is probed with
+    /// `--hs-ready` — which it answers by exiting — until an exec succeeds.
+    #[cfg(unix)]
+    pub(crate) fn install_stand_in(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\n[ \"$1\" = --hs-ready ] && exit 0\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..1000 {
+            match std::process::Command::new(path).arg("--hs-ready").status() {
+                Ok(status) => {
+                    assert!(
+                        status.success(),
+                        "{}: readiness probe {status}",
+                        path.display()
+                    );
+                    return;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("{}: {e}", path.display()),
+            }
+        }
+        panic!("{}: still busy after 1000 exec attempts", path.display());
+    }
+
     /// The result document olmocr's `build_dolma_document` writes for these
     /// page texts: every page but the last followed by "\n", and each page's
     /// span counted in characters.

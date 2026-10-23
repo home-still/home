@@ -1,6 +1,6 @@
 # Evaluation — olmocr conversions keep their pages
 
-**Date:** 2026-10-22 · **Version:** v0.0.1-rc.383
+**Date:** 2026-10-22 · **Version:** v0.0.1-rc.384
 
 ## 1. Before: the measured gap
 
@@ -21,8 +21,11 @@ olmocr CLI on `big`'s GPU (109 s). Its real output (result JSONL + the
 `hs-scribe-server` binary over real HTTP** (`POST /scribe/stream`) by a
 stand-in CLI that refuses any PDF but the captured one (sha256-checked).
 The live GPU could not be used for the second pass: see §5.
+(The measured binary was a local build of this converter code, stamped
+rc.383; that tag's CI gate failed on a pre-existing test race (§6) and
+was withdrawn before publishing, so the change ships as rc.384.)
 
-| | rc.382 (deployed) | rc.383 |
+| | rc.382 (deployed) | rc.384 |
 |---|---|---|
 | pages in the returned markdown | **1** | **6** |
 | pages identical to olmocr's own spans | 0 / 6 | **6 / 6** |
@@ -40,7 +43,7 @@ catalog (`compute_page_offsets` → `resolve_page_accounting` → keep the
 map only if `offsets_trustworthy`) and chunked by the real
 `hs_distill::chunker::chunk_markdown` with its default config:
 
-| | rc.382 | rc.383 |
+| | rc.382 | rc.384 |
 |---|---|---|
 | `offsets_trustworthy` | false | **true** |
 | page-map entries in the catalog | 0 | **6** |
@@ -48,7 +51,7 @@ map only if `offsets_trustworthy`) and chunked by the real
 | **chunks with a `page`** | **0 (0 %)** | **11 (100 %)** |
 | chunks per page | — | 1, 2, 2, 2, 2, 2 |
 
-Every chunk of an rc.383 olmocr conversion carries a page, so every
+Every chunk of an rc.384 olmocr conversion carries a page, so every
 search hit from it carries `#page=N` on its source link. (One more chunk:
 chunks no longer straddle a page boundary — the same rule the layout
 pipeline's documents already follow.)
@@ -88,3 +91,32 @@ construction (it returned the flat file: one page).
    gate admits work at a **13,500 MB** headroom. The gate is set below
    what the backend needs (~15,718 MB), so it admits documents that then
    fail.
+
+## 6. The release gate's test race (pre-existing; fixed to release)
+
+The rc.383 tag's gate failed on the self-hosted `big` runner, and so had
+the `main` build after rc.382 (on rc.382 code): stand-in-`olmocr` tests
+returned an error with no failure code. Not reproducible on the host
+(0/25 plain, 0/48 six-way contention, 0/180 with a fork storm, 0/40 with
+`TMPDIR` on btrfs, 0/6 under a 2,048-task cap; peak 213 tasks).
+Reproduced **inside the runner's own image** (`localhost/gh-runner-rust`,
+rootless podman, the runner's flags): the CI binaries failed **6/30**;
+rebuilt there with assertions that print the error, **4/60**:
+
+```
+spawning olmocr CLI at `/tmp/.tmp…/fake-olmocr.sh`: Text file busy (os error 26)
+```
+
+ETXTBSY: a test writes its stand-in script while a sibling thread forks;
+the child holds the inherited write fd until it execs, and exec'ing a
+file with a writer fails. The fix (`test_support::install_stand_in`)
+writes the script, then execs it with `--hs-ready` (answered by exiting)
+until one exec succeeds, retrying only on ETXTBSY — one successful exec
+proves no writer remains, and none can reappear. Every hs-scribe test
+that execs a fresh script uses it. The same runs exposed a second race:
+the disconnect test read the stand-in's pid file before it was written
+(the slot is taken before the CLI starts); the stand-in now writes it
+atomically and the test waits for it before aborting.
+
+After the fix, inside the runner image: stand-in tests **0/60**, full
+suite **0/10**.

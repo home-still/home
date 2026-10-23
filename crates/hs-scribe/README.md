@@ -208,7 +208,7 @@ A bare model filename is looked up in `~/.home-still/models/` (an existing path 
 
 `HS_SCRIBE_CONVERTER=olmocr` makes the server shell out to the `olmocr` CLI instead of running the per-region pipeline. The server refuses to start when `olmocr_bin` is not an executable file (or not on `PATH`).
 
-The markdown keeps the PDF's pages: the server reads olmocr's result document (`results/output_*.jsonl`) and cuts its text at olmocr's own per-page spans (`attributes.pdf_page_numbers`), joining the pages with the same `\n\n---\n\n` separator every converter uses. That separator is what the catalog's page map, every search hit's `page` and every document link's `#page=N` come from. A result whose spans do not account for every page of the PDF is refused like an incomplete run (`olmocr_incomplete_pages`) and escalated, never stored without its pages. Documents converted by olmocr before rc.383 are one flat page; their hits carry no `page` until they are converted again.
+The markdown keeps the PDF's pages: the server reads olmocr's result document (`results/output_*.jsonl`) and cuts its text at olmocr's own per-page spans (`attributes.pdf_page_numbers`), joining the pages with the same `\n\n---\n\n` separator every converter uses. That separator is what the catalog's page map, every search hit's `page` and every document link's `#page=N` come from. A result whose spans do not account for every page of the PDF is refused like an incomplete run (`olmocr_incomplete_pages`) and escalated, never stored without its pages. Documents converted by olmocr before rc.384 are one flat page; their hits carry no `page` until they are converted again.
 
 | Variable | Default | Description |
 |---|---|---|

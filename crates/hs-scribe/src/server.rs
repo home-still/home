@@ -955,7 +955,6 @@ mod tests {
     mod http {
         use super::*;
         use crate::pdf_meta::tests::{pdf_with_pages, skip_without_pdfium};
-        use std::os::unix::fs::PermissionsExt;
 
         pub(super) const TOKEN: &str = "scribe-test-backend-token-0123456789abcdef";
 
@@ -983,13 +982,23 @@ mod tests {
             dir: tempfile::TempDir,
         }
 
-        /// Whether the process a stand-in CLI recorded in `<dir>/pid` still exists.
-        fn cli_is_alive(dir: &std::path::Path) -> bool {
-            let pid: libc::pid_t = std::fs::read_to_string(dir.join("pid"))
-                .expect("the stand-in CLI records its pid before it waits")
-                .trim()
-                .parse()
-                .unwrap();
+        /// The pid the stand-in CLI recorded in `<dir>/pid`, once it has
+        /// started. A slot is taken before the CLI runs, so a test that
+        /// needs the CLI alive must wait for this rather than assume it.
+        async fn cli_pid(dir: &std::path::Path) -> libc::pid_t {
+            for _ in 0..400 {
+                if let Ok(text) = std::fs::read_to_string(dir.join("pid")) {
+                    if let Ok(pid) = text.trim().parse() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the stand-in CLI never recorded its pid");
+        }
+
+        /// Whether process `pid` still exists.
+        fn is_alive(pid: libc::pid_t) -> bool {
             // SAFETY: signal 0 only probes for existence.
             unsafe { libc::kill(pid, 0) == 0 }
         }
@@ -1008,18 +1017,16 @@ mod tests {
                 let result = crate::converter::olmocr_subprocess::test_support::write_result(
                     &crate::converter::olmocr_subprocess::test_support::result_document(&refs),
                 );
-                std::fs::write(
+                crate::converter::olmocr_subprocess::test_support::install_stand_in(
                     &script,
-                    format!(
-                        "#!/bin/sh\necho $$ > '{pid}'\nwhile [ ! -e '{release}' ]; do sleep 0.05; done\n\
+                    &format!(
+                        "echo $$ > '{pid}.tmp' && mv '{pid}.tmp' '{pid}'\nwhile [ ! -e '{release}' ]; do sleep 0.05; done\n\
                          {result}\n\
-                         echo 'Completed pages: 2' >&2; echo 'Failed pages: 0' >&2\n",
+                         echo 'Completed pages: 2' >&2; echo 'Failed pages: 0' >&2",
                         pid = dir.path().join("pid").display(),
                         release = release.display()
                     ),
-                )
-                .unwrap();
-                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                );
                 // Stand-in llama-swap: the admission gate probes `<endpoint>/running`,
                 // so the rig must not depend on whatever backend the host runs.
                 let swap = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1218,6 +1225,9 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             assert!(admitted, "the conversion must take the slot");
+            // The slot is taken before the CLI runs: wait for it to start, so
+            // the abort below tests killing a running CLI, not racing its spawn.
+            let pid = cli_pid(rig.dir.path()).await;
 
             client.abort(); // drops the response and closes the connection
             let mut freed = false;
@@ -1233,7 +1243,7 @@ mod tests {
             // ... and the `olmocr` run is killed, not left hammering the backend.
             let mut gone = false;
             for _ in 0..100 {
-                if !cli_is_alive(rig.dir.path()) {
+                if !is_alive(pid) {
                     gone = true;
                     break;
                 }

@@ -280,7 +280,7 @@ this is a logging concern taking down the entire CLI, including the one command
 
 ---
 
-### P0-27. The olmocr tier's VRAM gate admits work the backend cannot start for: headroom 13,500 MB, vLLM needs ~15,718 MB (found 2026-10-22, rc.383 iteration; the measured cause of issue #10)
+### P0-27. The olmocr tier's VRAM gate admits work the backend cannot start for: headroom 13,500 MB, vLLM needs ~15,718 MB (found 2026-10-22, rc.384 iteration; the measured cause of issue #10)
 **Symptom:** vLLM refused to start on `big`, in its own log (`/tmp/vllm-child.log`): `Free memory on device (14.53/23.61 GiB) on startup is less than desired GPU memory utilization (0.65, 15.35 GiB)`. llama-swap then reported `olmocr` as `starting` for 10+ minutes with no vLLM process, and every olmocr conversion failed and escalated to `bmb`.
 **Cause:** `run-olmocr.sh` starts vLLM with `--gpu-memory-utilization 0.65` — 0.65 × 23.61 GiB = **15.35 GiB (~15,718 MB)** of *free* memory required. The tier's admission gate (`hs-serve-scribe-olmocr`'s `HS_SCRIBE_VRAM_HEADROOM_MB=13500`; code default 15000, whose doc comment still says utilization 0.60) admits work at 13,500 MB free. Between 13,500 and 15,718 MB free — 14,530 MB at the time, with distill's embedder at 6,462 MB — the gate says yes and the backend cannot start: the gate does not protect anything in exactly the band where it is needed.
 **Change:** derive the headroom from the backend's real requirement (utilization × card memory, plus vLLM's margin) rather than a hand-set number, or refuse to start the tier when the configured headroom is below it. The two numbers live in two files today (`run-olmocr.sh`, the unit's env), which is how they drifted.
@@ -290,7 +290,7 @@ this is a logging concern taking down the entire CLI, including the one command
 
 ## P1 — Reliability (panics and silent failures in hot paths)
 
-### P1-27. An olmocr cold start fails whole documents: llama-swap proxies to a vLLM port that is not listening yet (found 2026-10-22, rc.383 iteration)
+### P1-27. An olmocr cold start fails whole documents: llama-swap proxies to a vLLM port that is not listening yet (found 2026-10-22, rc.384 iteration)
 **Symptom:** after the model's 60 s `ttl` unload, the next document's six page requests got `500` from llama-swap (`proxy error: dial tcp 127.0.0.1:5801: connect: connection refused`) while vLLM was still loading; olmocr exhausted its per-page retries in ~20 s and reported `Completed pages: 0, Failed pages: 6`. The same PDF converted cleanly (6/6 pages, 109 s) when the model was warm.
 **Cause:** llama-swap hands requests to the upstream before it answers; olmocr's retry budget is shorter than vLLM's load time.
 **Change:** the cold start belongs to one place. Either the scribe server waits for llama-swap to report the model `ready` before invoking olmocr (it already probes `/running` for the gate), or llama-swap holds requests until its health check passes. Do not lengthen olmocr's retries as a substitute.

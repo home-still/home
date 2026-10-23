@@ -1870,27 +1870,21 @@ mod tests {
         use crate::config::{AppConfig, ConverterMode};
         use crate::server::{app, ServerState};
         use hs_common::auth::backend::BackendToken;
-        use std::os::unix::fs::PermissionsExt;
 
         const TOKEN: &str = "event-watch-served-token-0123456789abcdef";
 
         fn fake_olmocr(dir: &std::path::Path, tally: &str) -> std::path::PathBuf {
             use crate::converter::olmocr_subprocess::test_support::{
-                completed_in, pages, result_document, write_result,
+                completed_in, install_stand_in, pages, result_document, write_result,
             };
             let script = dir.join("olmocr.sh");
             let md = "A page of real converted text, long enough to be indexable. ".repeat(4);
             let page_texts = pages(completed_in(tally), &md);
             let refs: Vec<&str> = page_texts.iter().map(String::as_str).collect();
-            std::fs::write(
+            install_stand_in(
                 &script,
-                format!(
-                    "#!/bin/sh\n{}\n{tally}\n",
-                    write_result(&result_document(&refs))
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                &format!("{}\n{tally}", write_result(&result_document(&refs))),
+            );
             script
         }
 
