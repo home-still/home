@@ -2753,3 +2753,88 @@ one that matters. Not deployed (`hs upgrade` is the operator's call).
    remote document link is still dead.
 5. **P1-27: olmocr cold starts fail whole documents** — wait for
    llama-swap to report the model ready before invoking olmocr.
+
+## 2026-10-23-02 — failed conversions are reported by what a retry can do
+
+**Change.** `hs status` no longer calls every `conversion_failed` stamp a
+"Corrupted PDF". Each stamp's reason maps, through the chain's own
+classification (`FailureCode::class`), to **retryable** (a backend failed
+on the document), **bad source** (it can never convert) or
+**unclassified**. The dashboard's "Failed, retry" row shows the retryable
+count, the recovery command and the top reason; the conversion progress
+leaves out only bad sources; `system_status` carries the breakdown and
+`catalog_list` each row's `{reason, kind}`. `hs pipeline
+reconvert-failed` re-queues retryable stamps by default, and `--reason`
+selects exact reasons.
+
+**Evidence.**
+
+* The status said **"Corrupted PDFs 2208"**; an operator's check read it
+  as a static count of bad files. On a read-only copy of the catalog, the
+  2,208 stamps are **2,053 retryable** (1,583 `gapped_conversion`, 432
+  `vlm_transport_error`, 21 `vlm_repetition_loop`, 17 untyped
+  escalations) and **155 bad sources**.
+* The gapped stamps grew 59 → 187 → 109 → 357 → **472** per day
+  (10-17 … 10-22), 397 more by noon 10-23, under a label that said the
+  input was broken. The progress bar subtracted them: it read **100.0 %**.
+* Literature (in the corpus): *Enterprise Integration Patterns* keeps
+  unprocessable messages and undeliverable ones on separate, monitored
+  channels; Avižienis et al. make detectability — signaling a failure to
+  someone who can act — a dimension of every failure mode.
+
+**Before / after** (same live catalog; `runs/2026-10-23-02/eval.md`):
+
+| | rc.382 | rc.386 |
+|---|---|---|
+| failure row | "Corrupted PDFs 2208" | "Failed, retry 2053" + `hs pipeline reconvert-failed --dry-run` + "gapped_conversion 1583 · 155 bad source" |
+| conversion progress | 100.0 % (capped) | **88.9 %** |
+| `reconvert-failed` default selection | 2,208 (155 bad sources re-queued for nothing) | **2,053** (155 left) |
+| a typo'd `--reason gapped` | n/a | exit 1, names the reasons present |
+| `hs status` latency (median, n=5) | 8.77 s | 8.27 s |
+| RECALL@10 (query set) | 25/25 | 25/25 |
+
+The live split equals the offline prediction (2,053 / 155 / 0). The
+first cut of the row, at 110 columns, truncated to `hs pipeline
+reconvert-failed` — the live bulk command without `--dry-run`; the row
+now holds the command alone and a test pins both widths.
+
+**Why it ranked first.** The live data loss (rank 1) is already fixed in
+rc.385 and needs only the bmb deploy, which no code can replace; what
+remained was the reason a week of it went unnoticed and the recovery
+tool that could not be aimed at it. It beat P0-27 because that outage is
+now diagnosed down to a one-line operator action (below).
+
+**Version.** `v0.0.1-rc.386` — minor: `system_status.pipeline.
+corrupted_pdfs` is replaced by `failed_conversions`, `catalog_list`'s
+`corrupted` by `conversion_failed`, and `reconvert-failed`'s default
+selection narrows. `hs status` needs the CLI and the MCP server on rc.386
+(an older server leaves the row unknown). Release workflow green (Gate on big, macOS and Windows; 5 builds; Docker), 33 assets; downloaded `hs` (x86-64) and `hs-mcp` (x86-64 and arm64 Mach-O) pass their checksums, carry the rc.386 marker and report `0.0.1-rc.386`. Commit `e1e52ea`.
+
+**Fleet gap.** big, bmb and two run **rc.382** (four releases behind):
+neither rc.385's fix nor this one is live.
+
+**Found on the way.**
+
+* **What starves the olmocr tier (P0-27):** big's `hs-serve-scribe`
+  (`:7433`) — disabled, not in the pool, 0 conversions — has run since an
+  accidental start on 2026-10-02 and holds **2,340 MiB**; without it
+  16,417 MB would be free, above vLLM's ~15,718 MB. Stopping it is the
+  operator's one-line fix (`needs-decision/gapped-drops-and-dead-olmocr.md`,
+  C.0).
+* `vlm_transport_error`: 423 of 432 stamps came from one incident on
+  2026-10-17; retryable, recovered by the same command.
+
+### Top 5 remaining items
+
+1. **Deploy rc.385/386 to bmb, and stop big's idle `:7433` scribe**
+   (operator). Until bmb runs rc.385, ~19 documents an hour are dropped
+   as gapped; until `:7433` stops, the olmocr tier cannot start.
+2. **P0-28: recover the 2,053 retryable documents** after 1 —
+   `hs pipeline reconvert-failed --dry-run`, then staged runs.
+3. **P0-27: derive the olmocr VRAM gate from vLLM's real requirement**,
+   so the gate refuses honestly instead of admitting work the backend
+   cannot start.
+4. **P0-26: the docs port firewall rule on big** (operator, sudo):
+   remote document links are still dead.
+5. **P1-27: olmocr cold starts fail whole documents** — wait for
+   llama-swap to report the model ready before invoking olmocr.
