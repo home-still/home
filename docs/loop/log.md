@@ -2662,3 +2662,94 @@ for 7446 on `big`) still needs the operator.
    start on its own). Every page-less hit today is one of these.
 5. **Cross-encoder reranking.** Unchanged: 4 better / 3 worse on the
    query set for 5× latency; needs a serving decision.
+
+## 2026-10-23-01 — the repetition detector stopped dropping documents
+
+**Change.** The scribe server's streaming repetition detector fires only
+on a **consecutive** loop: the stream's tail is ≥ 3 back-to-back copies
+of one unit of ≤ 128 words, spanning ≥ 32 words. It used to count n-grams
+anywhere in a 256-word window (a 4–6-gram three times, a trigram five, a
+bigram ten), which ordinary prose does.
+
+**Evidence.**
+
+* In the 24 h before the change, **176/176** documents the two scribe
+  watchers received ended `terminating (will not redeliver)`; **154** as
+  `gapped_conversion` from bmb's glm_ocr tier. The gaps were the
+  detector's aborts (`4-gram-cycle` 2,655, `trigram-cycle` 556 in bmb's
+  log), and gapped is permanent.
+* Replaying the detector over 200 seeded **accepted** documents, it
+  aborted ≥ 1 block in 96.4 % of olmocr documents (text it never vetted),
+  90.3 % of scribe-vlm, 72.1 % of glm_ocr. The blocks were affiliation
+  lists, citation runs, a key phrase said three times.
+* Research: Xu et al. 2022 (consecutive sentence repetition is ~0.02 % of
+  human text, and repetition self-reinforces), Nougat (OCR decoders repeat
+  the last sentence), Holtzman et al. 2020; all in the corpus.
+
+**Before / after** (same data; `runs/2026-10-23-01/eval.md`):
+
+| | rc.384 | rc.385 |
+|---|---|---|
+| glm_ocr docs with an abort on accepted text | 72.1 % | **0 %** |
+| olmocr docs with an abort on accepted text | 96.4 % | **3.6 %** (mostly real stored loops) |
+| recall, 2-word loop from real text | 88.7 % | **98.8 %** |
+| recall, last sentence repeated | 88.3 % | **95.6 %** |
+| recall, paragraph replayed | 88.4 % | **94.3 %** |
+| `10.1016_j.eurpsy.2012.03.001` (dropped in prod, 6 gaps) | refused, 6 gaps | **stored**, 6/6 pages |
+| `10.1016_j.eplepsyres.2007.12.015` (dropped in prod, 14 gaps) | refused, 14 gaps | **stored**, 6/6 pages |
+| detector cost per word | 439 ns | **211 ns** |
+| RECALL@10 (query set) | 25/25 | 25/25 |
+
+The old server reproduced production's gap counts exactly (6, 14), so the
+end-to-end is the production failure. The new outputs contain no loop
+(at most 2 back-to-back copies of anything). The cost is aborting a real
+loop later: ~29 words into a 2-word loop instead of ~6.
+
+**Why it ranked first.** It was destroying essentially every document
+the glm_ocr tier converted, permanently, which is rank 1 (data loss). The
+runner-up, P0-27 (the olmocr tier's VRAM gate), stops one tier, and that
+tier's documents then escalate into this one, where they were dropped
+too, so this fix is the one that stops the loss.
+
+**Version.** `v0.0.1-rc.385` — patch: changes which streams the detector
+aborts; no wire, schema or config change (`LoopReason` keeps its form).
+Release workflow green (Gate on big, macOS and Windows; 5 builds; Docker),
+33 assets; downloaded `hs` (x86-64) and `hs-scribe-server` (arm64 Mach-O)
+pass their checksums and carry the rc.385 marker. Commit `621afa6`
+(change), `c9f8f99` (the `/build-loop` command).
+
+**Fleet gap.** big (both scribe tiers, `hs`), bmb and two run **rc.382**.
+The fix takes effect only on a scribe server that runs it; **bmb** is the
+one that matters. Not deployed (`hs upgrade` is the operator's call).
+
+**Found on the way.**
+
+* **Conversion has stored nothing for 14 h** (an operator's status check,
+  2026-10-23): 274 terminal, 266 gapped, 0 stored. Two causes: the bug
+  fixed here (bmb), and **P0-27** on big — vLLM exits at startup
+  (`Engine core initialization failed`, 14,077 MB free < ~15,718 MB
+  needed, gate at 13,500 MB), so olmocr runs cycle against a dead backend
+  and escalate into bmb's drops. A scribe restart would not help. Written
+  up in `needs-decision/gapped-drops-and-dead-olmocr.md`.
+* BACKLOG **P0-28** (re-ingest the dropped documents), **P1-29** (verbatim
+  loops already stored in 24 of 200 sampled documents), **P1-30** (bmb's
+  autotune agent crash-loops; its scribe log is 1.1 GB).
+* The test gate: under a bare `unshare -rn` the loopback interface is
+  down, and 72 tests that bind a local server fail with `os error 101`.
+  Run it as `unshare -rn sh -c 'ip link set lo up && cargo test …'`.
+* rustdoc has 30 pre-existing warnings, so `-D warnings` fails on code
+  this change does not touch.
+
+### Top 5 remaining items
+
+1. **Deploy rc.385 to bmb** (operator: `hs upgrade --pre --yes` there).
+   Until then ~19 documents an hour are dropped as gapped.
+2. **P0-27: the olmocr tier cannot start.** Derive the VRAM gate from
+   vLLM's real requirement (utilization × card memory) so the two cannot
+   drift; interim config: gate at ~15,800 MB, or utilization ~0.55.
+3. **P0-28: recover the documents dropped as gapped** (needs a decision:
+   a dry-run enumeration by catalog stamp, then re-publish, after 1).
+4. **P0-26: the docs port firewall rule on big** (operator, sudo): every
+   remote document link is still dead.
+5. **P1-27: olmocr cold starts fail whole documents** — wait for
+   llama-swap to report the model ready before invoking olmocr.
