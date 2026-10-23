@@ -2583,3 +2583,82 @@ Until it is applied the remote links stay dead — and now the fleet
    option A: catch `MissingHeartbeat` and recreate the pull stream
    instead of exiting. Not ours to make — it is a change to a vendored
    crate.
+
+---
+
+## 2026-10-22-06 — olmocr conversions keep their pages
+
+**Change.** The olmocr converter reads olmocr's result document
+(`results/output_<hash>.jsonl`) instead of its flattened `.md`, cuts the
+text at olmocr's own per-page spans (`attributes.pdf_page_numbers`) and
+joins the pages with `join_pages`. The catalog then gets a trustworthy
+page map, every chunk a `page`, and every hit's source link `#page=N`.
+
+**Evidence.**
+
+* 27.5 % of search hits (80 hits, 8 queries) carried no `page`, so the
+  PDF link opened page 1.
+* Seeded 100-row cross-tab of converter × markdown shape: **olmocr 0
+  separated / 39 flat**; layout pipeline 25 / 2 (single-page), GLM 7 / 1,
+  HTML 0 / 4 (no pages, correct). The flat documents are olmocr's.
+* olmocr's pipeline (`build_dolma_document`) records exact spans; the
+  `.md` it writes is the same text joined by `"\n"`. A real 6-page run
+  confirmed it: 1 result document, contiguous spans, `.md` byte-identical
+  to `text` with 0 separators, and spans in **characters** (33,420 chars,
+  33,602 bytes).
+
+**Before / after** (same real olmocr output, real server binary over
+HTTP; real chunker on the result):
+
+| | rc.382 | rc.384 |
+|---|---|---|
+| pages in the markdown | 1 | **6** |
+| pages equal to olmocr's spans | 0/6 | **6/6** |
+| catalog page map trusted | no | **yes** |
+| chunks with a `page` | **0/10** | **11/11** |
+| RECALL@10 (query set) | 25/25 | 25/25 |
+
+**Why it ranked first.** It was the top remaining item and the
+measured cause of 27.5 % of hits opening at the wrong page — the
+wishlist's "link the user can view" delivered at the wrong place. It
+beat the runner-up (the embedder yielding VRAM, now P0-27) because that
+one is a backend-capacity problem whose fix spans two config files on a
+shared box, while this was a self-contained converter defect with a
+single authoritative source of truth.
+
+**Version.** `v0.0.1-rc.384` — patch: converter output for new
+documents only; no schema, wire or search change. **rc.383 was
+withdrawn unpublished**: its CI gate failed on a pre-existing ETXTBSY
+race in hs-scribe's stand-in-CLI tests, reproduced inside the runner's
+image (4/60) and fixed (0/60) — `test_support::install_stand_in`.
+Commits `7838894` (the change), `d4dc178` (the race).
+
+**Scope.** Existing flat olmocr documents keep no pages until
+re-converted (no corpus rebuilds). Not deployed (`hs upgrade` is not run
+by this loop).
+
+**Found on the way (logged).** llama-swap was wedged (restart cleared
+it); **P0-27** the olmocr tier's VRAM gate admits at 13,500 MB while vLLM
+needs ~15,718 MB (vLLM's own log: 14.53 GiB free < 15.35 GiB wanted) —
+the measured cause of issue #10, now commented there; **P1-27** a cold
+start fails whole documents (llama-swap proxies to a vLLM not yet
+listening; 6/6 pages failed in ~20 s); **P1-28** `hs paper download
+<doi>` searches for the DOI and downloads 10 papers. P0-26 (firewall rule
+for 7446 on `big`) still needs the operator.
+
+### Top 5 remaining items
+
+1. **P0-27: the olmocr VRAM gate is below vLLM's requirement.** Derive
+   the headroom from `--gpu-memory-utilization` × card memory, or refuse
+   a configured headroom below it. Today the tier admits documents it
+   cannot convert whenever 13.5–15.7 GB is free.
+2. **P1-27: olmocr cold starts fail whole documents.** Wait for
+   llama-swap to report the model `ready` before invoking olmocr (the
+   server already probes `/running`).
+3. **P0-26: the docs port firewall rule on `big`** (operator, sudo):
+   every remote document link is still dead.
+4. **Re-convert flat olmocr documents** (needs a decision: it is a
+   targeted re-conversion of ~half the corpus, which this loop may not
+   start on its own). Every page-less hit today is one of these.
+5. **Cross-encoder reranking.** Unchanged: 4 better / 3 worse on the
+   query set for 5× latency; needs a serving decision.
