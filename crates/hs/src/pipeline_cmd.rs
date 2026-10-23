@@ -118,13 +118,14 @@ pub enum PipelineCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Bulk-trigger `hs scribe reconvert` on every catalog row stamped
-    /// `conversion_failed` (any reason). Clears the failure stamp and
-    /// republishes `papers.ingested` so scribe + distill re-process the
-    /// paper with the current binary's logic. Use after deploying a
-    /// scribe-side fix (Phase 3 streaming abort, postprocess change, new
-    /// VLM, etc.) to measure the fix's recovery rate at corpus scale.
-    /// Honors --dry-run for a count-only inventory.
+    /// Re-queue documents whose conversion was given up on. By default only
+    /// **retryable** stamps — a backend failed on the document (a gapped or
+    /// looping conversion, a dead VLM stream), so a fixed or different
+    /// backend can convert it. `--reason` selects exactly the named reasons
+    /// instead, of any kind (e.g. a parse error, after a parser fix). Clears
+    /// each selected row's failure stamp and republishes `papers.ingested`.
+    /// Run after deploying the fix that makes them convertible. Honors
+    /// --dry-run for an inventory of what is selected and what is left.
     ReconvertFailed {
         /// Report what would be reconverted without touching anything.
         #[arg(long)]
@@ -137,6 +138,10 @@ pub enum PipelineCmd {
         /// full corpus). Default: all.
         #[arg(long)]
         limit: Option<usize>,
+        /// Re-queue exactly the rows stamped with this reason (repeatable),
+        /// whatever its kind, instead of every retryable one.
+        #[arg(long = "reason", value_name = "REASON")]
+        reasons: Vec<String>,
     },
 }
 
@@ -165,7 +170,8 @@ pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<
             dry_run,
             yes,
             limit,
-        } => cmd_reconvert_failed(dry_run, yes, limit, reporter).await,
+            reasons,
+        } => cmd_reconvert_failed(dry_run, yes, limit, &reasons, reporter).await,
     }
 }
 
@@ -1153,10 +1159,57 @@ async fn cmd_purge_poisoned_chunks(
     Ok(())
 }
 
+/// Catalog rows stamped `conversion_failed`, as `(stem, reason)`.
+type StampedRows = Vec<(String, String)>;
+
+/// Which stamped rows a reconvert run re-queues: exactly the rows whose
+/// reason is named in `reasons`, or — when none is named — every retryable
+/// one ([`hs_scribe::classify::stamp_kind`]). Returns `(selected, left)`. A
+/// named reason that no row carries is an error that lists the reasons
+/// present: a typo must not quietly select nothing.
+fn select_for_reconvert(
+    stamped: StampedRows,
+    reasons: &[String],
+) -> Result<(StampedRows, StampedRows)> {
+    use hs_common::status::FailureKind;
+    if let Some(missing) = reasons
+        .iter()
+        .find(|want| !stamped.iter().any(|(_, r)| r == *want))
+    {
+        let present: std::collections::BTreeSet<&str> =
+            stamped.iter().map(|(_, r)| r.as_str()).collect();
+        anyhow::bail!(
+            "no catalog row is stamped with reason `{missing}`; reasons present: {}",
+            present.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(stamped.into_iter().partition(|(_, reason)| {
+        if reasons.is_empty() {
+            hs_scribe::classify::stamp_kind(reason) == FailureKind::Retryable
+        } else {
+            reasons.iter().any(|want| want == reason)
+        }
+    }))
+}
+
+/// `n × reason` lines, largest first.
+fn report_reasons(reporter: &Arc<dyn Reporter>, label: &str, rows: &[(String, String)]) {
+    let mut by_reason: std::collections::BTreeMap<&str, usize> = Default::default();
+    for (_, reason) in rows {
+        *by_reason.entry(reason.as_str()).or_default() += 1;
+    }
+    let mut by_reason: Vec<(&str, usize)> = by_reason.into_iter().collect();
+    by_reason.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    for (r, n) in by_reason {
+        reporter.status(label, &format!("{n:>5} × {r}"));
+    }
+}
+
 async fn cmd_reconvert_failed(
     dry_run: bool,
     yes: bool,
     limit: Option<usize>,
+    reasons: &[String],
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
     const PAPERS_PREFIX: &str = "papers";
@@ -1171,7 +1224,7 @@ async fn cmd_reconvert_failed(
         .await
         .context("list catalog entries")?;
 
-    let mut victims: Vec<(String, String)> = triples
+    let stamped: Vec<(String, String)> = triples
         .into_iter()
         .filter_map(|(stem, _obj, entry)| {
             entry
@@ -1180,7 +1233,9 @@ async fn cmd_reconvert_failed(
                 .map(|f| (stem, f.reason.clone()))
         })
         .collect();
-    let total_found = victims.len();
+    let total_found = stamped.len();
+    let (mut victims, left) = select_for_reconvert(stamped, reasons)?;
+    let selected = victims.len();
     if let Some(n) = limit {
         victims.truncate(n);
     }
@@ -1188,25 +1243,23 @@ async fn cmd_reconvert_failed(
     reporter.status(
         "Found",
         &format!(
-            "{total_found} papers with conversion_failed stamp{}",
+            "{total_found} papers with conversion_failed stamp; {selected} selected ({}){}",
+            if reasons.is_empty() {
+                "retryable".to_string()
+            } else {
+                format!("reason {}", reasons.join(", "))
+            },
             if let Some(n) = limit {
-                format!(" (limiting to {n})")
+                format!(", limiting to {n}")
             } else {
                 String::new()
             }
         ),
     );
-
-    // Group by reason so the operator can spot a single dominant failure
-    // mode at a glance before kicking off the bulk republish.
-    let mut by_reason: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
-    for (_, reason) in &victims {
-        *by_reason.entry(reason.clone()).or_default() += 1;
-    }
-    for (r, n) in &by_reason {
-        reporter.status("Reason", &format!("{n:>4} × {r}"));
-    }
+    // Grouped by reason so the operator sees the dominant failure mode, and
+    // what stays stamped, before the bulk republish.
+    report_reasons(reporter, "Selected", &victims);
+    report_reasons(reporter, "Left", &left);
 
     if victims.is_empty() {
         reporter.finish("Nothing to reconvert.");
@@ -1772,5 +1825,54 @@ mod tests {
         let out = publish_papers_ingested(&bus, &keys, "test", &stop, &reporter()).await;
         assert_eq!(out.published, 0);
         assert!(out.interrupted);
+    }
+
+    fn stamped() -> Vec<(String, String)> {
+        [
+            ("a", "gapped_conversion"),
+            ("b", "vlm_transport_error"),
+            ("c", "permanent_convert_failure"),
+            ("d", "paywall_html"),
+            ("e", "pdf_parse_error"),
+            ("f", "a_reason_from_the_future"),
+        ]
+        .into_iter()
+        .map(|(s, r)| (s.to_string(), r.to_string()))
+        .collect()
+    }
+
+    fn stems(rows: &[(String, String)]) -> Vec<&str> {
+        rows.iter().map(|(s, _)| s.as_str()).collect()
+    }
+
+    #[test]
+    fn by_default_only_retryable_failures_are_requeued() {
+        let (selected, left) = select_for_reconvert(stamped(), &[]).unwrap();
+        assert_eq!(stems(&selected), ["a", "b", "c"]);
+        // Bad sources and reasons this build does not know stay stamped.
+        assert_eq!(stems(&left), ["d", "e", "f"]);
+    }
+
+    #[test]
+    fn a_named_reason_selects_exactly_its_rows_whatever_their_kind() {
+        let (selected, left) =
+            select_for_reconvert(stamped(), &["pdf_parse_error".to_string()]).unwrap();
+        assert_eq!(stems(&selected), ["e"]);
+        assert_eq!(left.len(), 5);
+        let (selected, _) = select_for_reconvert(
+            stamped(),
+            &["gapped_conversion".to_string(), "paywall_html".to_string()],
+        )
+        .unwrap();
+        assert_eq!(stems(&selected), ["a", "d"]);
+    }
+
+    #[test]
+    fn a_reason_no_row_carries_is_an_error_naming_the_ones_that_exist() {
+        let err = select_for_reconvert(stamped(), &["gapped".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`gapped`"), "{err}");
+        assert!(err.contains("gapped_conversion"), "{err}");
     }
 }

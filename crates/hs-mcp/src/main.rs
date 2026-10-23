@@ -1514,7 +1514,7 @@ impl HomeStillMcp {
     // ── Catalog Tools ──────────────────────────────────────────
 
     #[tool(
-        description = "List all papers in the catalog with titles, conversion status, and embedded-in-Qdrant status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed. Flag semantics: `converted` is true iff markdown exists (converters don't write failure rows — errors propagate and leave no catalog record). `embedded` is true only when Qdrant actually received chunks (`chunks_indexed > 0`).",
+        description = "List all papers in the catalog with titles, conversion status, and embedded-in-Qdrant status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed. Flag semantics: `converted` is true iff markdown exists. `conversion_failed` is null, or `{reason, kind}` when the conversion was given up on: `kind` is `retryable` (a backend failed on the document; `hs pipeline reconvert-failed` re-queues it), `bad_source` (the source can never convert) or `unclassified`. `embedded` is true only when Qdrant actually received chunks (`chunks_indexed > 0`).",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1555,18 +1555,19 @@ impl HomeStillMcp {
             .map(|(stem, _meta, cat)| {
                 let title = cat.title.unwrap_or_default();
                 let downloaded = cat.downloaded_at.is_some();
-                // `converted` means markdown exists. Converters don't stamp
-                // failure rows — errors propagate and no catalog record is
-                // written, so `conversion.is_some()` is always truthful.
+                // `converted` means markdown exists (the success stamp).
                 let converted = cat.conversion.is_some();
                 let embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
                 let embedding_skipped = cat.embedding_skip.is_some();
                 let repaired = cat.repair.is_some();
-                // `corrupted` mirrors the `corrupted_pdfs` counter in
-                // system_status — the catalog row was stamped
-                // `conversion_failed` because the source bytes are not a
-                // valid PDF (paywall HTML stub, truncated download, etc.).
-                let corrupted = cat.conversion_failed.is_some();
+                // The reason a conversion was given up on, and what a retry
+                // can do about it (the same kinds `system_status` counts).
+                let conversion_failed = cat.conversion_failed.as_ref().map(|f| {
+                    serde_json::json!({
+                        "reason": f.reason,
+                        "kind": hs_scribe::classify::stamp_kind(&f.reason),
+                    })
+                });
                 let doi = cat.doi.clone().unwrap_or_default();
                 serde_json::json!({
                     "stem": stem,
@@ -1577,7 +1578,7 @@ impl HomeStillMcp {
                     "embedded": embedded,
                     "embedding_skipped": embedding_skipped,
                     "repaired": repaired,
-                    "corrupted": corrupted,
+                    "conversion_failed": conversion_failed,
                 })
             })
             .collect();
@@ -3530,13 +3531,16 @@ impl HomeStillMcp {
                 .count() as u64
         });
 
-        // Same pass — catalog rows stamped `conversion_failed` surface as
-        // the Corrupted PDFs count in `hs status`.
-        let corrupted_pdfs: Option<u64> = catalog_triples.as_ref().map(|triples| {
-            triples
-                .iter()
-                .filter(|(_, _, entry)| entry.conversion_failed.is_some())
-                .count() as u64
+        // Same pass — catalog rows stamped `conversion_failed`, by what a
+        // retry can do (`hs status` renders them as the Failed row).
+        let failed_conversions = catalog_triples.as_ref().map(|triples| {
+            hs_common::status::FailedConversions::tally(
+                triples
+                    .iter()
+                    .filter_map(|(_, _, entry)| entry.conversion_failed.as_ref())
+                    .map(|f| f.reason.as_str()),
+                hs_scribe::classify::stamp_kind,
+            )
         });
 
         // Inbox queue — files waiting in `papers/manually_downloaded/` for
@@ -3607,7 +3611,7 @@ impl HomeStillMcp {
         //
         // By design, catalog rows stamped `conversion_failed` that still
         // sit in the live papers tree (surfaced separately as
-        // `corrupted_pdfs`) are NOT subtracted — drift is meant to surface
+        // `failed_conversions`) are NOT subtracted — drift is meant to surface
         // them too, since failed converts represent stuck pipeline state
         // the operator should see. Values above `pipeline_drift_threshold`
         // indicate either stamped failures or stems that errored without a
@@ -3643,7 +3647,7 @@ impl HomeStillMcp {
         };
         pipeline.record_queue(unconverted, depth);
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
-        pipeline.corrupted_pdfs = corrupted_pdfs;
+        pipeline.failed_conversions = failed_conversions;
         pipeline.inbox_pending = inbox_pending;
         pipeline.in_flight_conversions = Some(total_in_flight);
 

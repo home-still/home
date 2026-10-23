@@ -27,7 +27,7 @@ hs serve scribe    Run scribe service on this machine (auto-init)
 hs serve distill   Run distill service on this machine (auto-init)
 hs serve mcp       Run MCP server on this machine (auto-init)
 
-hs status          Live TUI dashboard (pipeline stats, service health)
+hs status          Live TUI dashboard (pipeline stats, service health). The Failed row counts documents whose conversion was given up on and a retry can bring back (a backend dropped them); bad sources, which never convert, are counted beside it and are the only failures left out of the conversion progress
 hs restart         Restart the services running this host's installed binaries (macOS: LaunchAgents are booted out and bootstrapped, so plist edits take effect)
 
 hs upgrade         Self-update binaries (checksum + version verified) + Docker images + restart
@@ -46,6 +46,7 @@ hs cloud status    Show cloud connection status
 hs cloud token     Print a fresh access token
 
 hs pipeline        Cross-service operations: rebuild, catch-up, purge-*, reap-phantoms, reconvert-failed, events-reset
+hs pipeline reconvert-failed --dry-run   Re-queue failed conversions: every retryable one by default, or exactly `--reason <reason>` (repeatable, any kind); lists what is selected and what is left
 hs migrate         One-shot data migrations: sharding, move-root-orphans, quarantine-bad-content, canonicalize-doi-stems, drop-local-html
 hs openalex        Local OpenAlex catalog (DuckDB), steps in order: load / load-works (newest copy of each id wins), build-indexes, install-fts (needs network once), build-fts; also status, query
 hs personal        Personal-document store

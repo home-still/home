@@ -233,6 +233,27 @@ pub fn classify(err: &anyhow::Error) -> FailureClass {
     failure_code(err).map_or(FailureClass::Transient, FailureCode::class)
 }
 
+/// The reason the chain dispatcher stamps when a handler called a failure
+/// non-retriable but typed it with no [`FailureCode`]: the document escaped
+/// every tier for a reason nobody named. It escalated, so it is retryable.
+pub const UNTYPED_ESCALATION: &str = "permanent_convert_failure";
+
+/// What retrying a document stamped `conversion_failed: <reason>` can do.
+/// `Escalate`-class codes (a backend failed on it) and
+/// [`UNTYPED_ESCALATION`] are retryable; `Permanent`-class codes are bad
+/// sources; any other token is unclassified — never guessed into a class.
+pub fn stamp_kind(reason: &str) -> hs_common::status::FailureKind {
+    use hs_common::status::FailureKind;
+    if reason == UNTYPED_ESCALATION {
+        return FailureKind::Retryable;
+    }
+    match FailureCode::from_wire(reason).map(FailureCode::class) {
+        Some(FailureClass::Escalate(_)) => FailureKind::Retryable,
+        Some(FailureClass::Permanent(_)) => FailureKind::BadSource,
+        Some(FailureClass::Transient) | None => FailureKind::Unclassified,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +378,30 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure_code(&err), Some(FailureCode::PdfParseError));
         assert_eq!(classify(&err), FailureClass::Permanent("pdf_parse_error"));
+    }
+
+    #[test]
+    fn a_stamps_kind_follows_its_codes_chain_verdict() {
+        use hs_common::status::FailureKind;
+        // Every code lands where its chain verdict puts it, so a new code
+        // cannot be counted as a bad source while the chain retries it.
+        for code in FailureCode::ALL {
+            let want = match code.class() {
+                FailureClass::Escalate(_) => FailureKind::Retryable,
+                FailureClass::Permanent(_) => FailureKind::BadSource,
+                FailureClass::Transient => FailureKind::Unclassified,
+            };
+            assert_eq!(stamp_kind(code.wire()), want, "{code:?}");
+        }
+        assert_eq!(stamp_kind("gapped_conversion"), FailureKind::Retryable);
+        assert_eq!(stamp_kind("paywall_html"), FailureKind::BadSource);
+        assert_eq!(stamp_kind(UNTYPED_ESCALATION), FailureKind::Retryable);
+        for unknown in ["", "corrupted", "gapped_conversion "] {
+            assert_eq!(
+                stamp_kind(unknown),
+                FailureKind::Unclassified,
+                "{unknown:?}"
+            );
+        }
     }
 }

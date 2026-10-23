@@ -1,0 +1,14 @@
+Pipeline:
+  Documents : 18030
+  Markdown  : 15884
+  Cataloged : 18007
+  Embedded  : 15940 docs, 445752 chunks
+  Failed    : 2053 retryable — recover with `hs pipeline reconvert-failed --dry-run`
+              gapped_conversion 1583, vlm_transport_error 432, vlm_repetition_loop 21, permanent_convert_failure 17
+  Bad source: 155 (empty_conversion 64, paywall_html 33, unsupported_content_type:binary 23, pdf_parse_error 20, source_missing 13, html_not_utf8 1, unsupported_content_type:html 1)
+  Queued    : 1257
+  Stalled   : 829
+
+Services:
+  ● scribe   http://<host>:7435            4 converting   0.0.1-rc.382
+  ● scribe   http://<glm-host>:7433                3 converting   0.0.1-rc.382

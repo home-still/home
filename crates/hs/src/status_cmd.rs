@@ -9,6 +9,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use hs_common::global_args::{GlobalArgs, OutputFormat};
+use hs_common::status::{FailedConversions, FailureKind};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
 
@@ -19,7 +20,8 @@ struct DashboardData {
     doc_counts: Option<(u64, u64)>,
     markdown_counts: Option<(u64, u64)>,
     catalog_count: Option<u64>,
-    corrupted_count: Option<u64>,
+    /// Catalog rows stamped `conversion_failed`, by what a retry can do.
+    failed: Option<FailedConversions>,
     embedded_docs: u64,
     embedded_chunks: u64,
     /// Catalog rows stamped `embedding_skip` (zero-chunk / junk-HTML).
@@ -82,7 +84,7 @@ impl DashboardData {
         self.doc_counts = new.doc_counts.or(self.doc_counts);
         self.markdown_counts = new.markdown_counts.or(self.markdown_counts);
         self.catalog_count = new.catalog_count.or(self.catalog_count);
-        self.corrupted_count = new.corrupted_count.or(self.corrupted_count);
+        self.failed = new.failed.or(self.failed.take());
         self.inbox_pending = new.inbox_pending.or(self.inbox_pending);
         self.in_flight_conversions = new.in_flight_conversions.or(self.in_flight_conversions);
         // Not carried over: a stale "queue empty" would hide a broker outage.
@@ -115,7 +117,7 @@ impl DashboardData {
             doc_counts: None,
             markdown_counts: None,
             catalog_count: None,
-            corrupted_count: None,
+            failed: None,
             embedded_docs: 0,
             embedded_chunks: 0,
             embedding_skipped: 0,
@@ -325,7 +327,7 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         markdown_counts: counts_ok.then_some((snap.pipeline.markdown, 0)),
         catalog_count: counts_ok.then_some(snap.pipeline.catalog_entries),
         counts_error: snap.pipeline.counts_error.clone(),
-        corrupted_count: snap.pipeline.corrupted_pdfs,
+        failed: snap.pipeline.failed_conversions.clone(),
         embedded_docs: snap.pipeline.embedded_documents.unwrap_or(0),
         embedded_chunks: snap.pipeline.embedded_chunks.unwrap_or(0),
         embedding_skipped: snap.pipeline.embedding_skipped.unwrap_or(0),
@@ -462,7 +464,7 @@ fn render(frame: &mut Frame, data: &DashboardData) {
 
     let outer = Layout::vertical([
         Constraint::Length(1),               // title
-        Constraint::Length(14), // pipeline: header + Documents/Markdown/Cataloged/Embedded/In-flight/Queued/Stalled/Inbox/Corrupted/Watcher/Indexer rows + 2 border rows
+        Constraint::Length(14), // pipeline: header + Documents/Markdown/Cataloged/Embedded/In-flight/Queued/Stalled/Inbox/Failed/Watcher/Indexer rows + 2 border rows
         Constraint::Length(1),  // spacer
         Constraint::Length(services_height), // services
         Constraint::Length(1),  // spacer
@@ -499,6 +501,80 @@ fn render(frame: &mut Frame, data: &DashboardData) {
     );
 }
 
+/// The command that recovers retryable failed conversions.
+const RECONVERT_HINT: &str = "hs pipeline reconvert-failed --dry-run";
+
+/// `reason n, reason n, …` for one kind, largest first.
+fn reason_list(f: &FailedConversions, kind: FailureKind) -> String {
+    f.reasons_of(kind)
+        .map(|r| format!("{} {}", r.reason, r.count))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The dashboard's Failed row: `(detail, trailing)` cells under the label
+/// "Failed, retry". The detail cell is the recovery command alone — at 110
+/// columns it has ~40, and a cut that kept `hs pipeline reconvert-failed`
+/// but dropped `--dry-run` would show the live command. The trailing cell
+/// says what it is about: the largest retryable reason, then the counts
+/// that need no action. Each cell is cut at its own width, so neither may
+/// depend on the other fitting.
+fn failed_note(f: &FailedConversions) -> (String, String) {
+    let mut counts = Vec::new();
+    if let Some(top) = f.reasons_of(FailureKind::Retryable).next() {
+        counts.push(format!("{} {}", top.reason, top.count));
+    }
+    if f.bad_source > 0 {
+        counts.push(format!("{} bad source", f.bad_source));
+    }
+    if f.unclassified > 0 {
+        counts.push(format!("{} unclassified", f.unclassified));
+    }
+    let action = if f.retryable > 0 {
+        RECONVERT_HINT.to_string()
+    } else {
+        "none".to_string()
+    };
+    (action, counts.join(" · "))
+}
+
+/// The text status's failed-conversion lines.
+fn failed_text_lines(f: &FailedConversions) -> Vec<String> {
+    if f.total() == 0 {
+        return vec!["Failed    : none".to_string()];
+    }
+    let mut lines = vec![format!(
+        "Failed    : {} retryable{}",
+        f.retryable,
+        if f.retryable > 0 {
+            format!(" — recover with `{RECONVERT_HINT}`")
+        } else {
+            String::new()
+        }
+    )];
+    if f.retryable > 0 {
+        lines.push(format!(
+            "            {}",
+            reason_list(f, FailureKind::Retryable)
+        ));
+    }
+    if f.bad_source > 0 {
+        lines.push(format!(
+            "Bad source: {} ({})",
+            f.bad_source,
+            reason_list(f, FailureKind::BadSource)
+        ));
+    }
+    if f.unclassified > 0 {
+        lines.push(format!(
+            "Unclassified failures: {} ({})",
+            f.unclassified,
+            reason_list(f, FailureKind::Unclassified)
+        ));
+    }
+    lines
+}
+
 fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let block = Block::new()
         .title(match &data.counts_error {
@@ -522,9 +598,12 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let markdown_count = data.markdown_counts.map(|(c, _)| c).unwrap_or(0);
     let markdown_bytes = data.markdown_counts.map(|(_, b)| b).unwrap_or(0);
     let catalog_count = data.catalog_count.unwrap_or(0);
-    let corrupted_count = data.corrupted_count.unwrap_or(0);
+    // Only sources that can never convert leave the denominator; a document
+    // a backend failed on is unfinished work.
+    let bad_source = data.failed.as_ref().map_or(0, |f| f.bad_source);
+    let failed_cells = data.failed.as_ref().map(failed_note).unwrap_or_default();
 
-    let convertible = doc_count.saturating_sub(corrupted_count);
+    let convertible = doc_count.saturating_sub(bad_source);
     let pdf_to_md = if convertible > 0 {
         (markdown_count as f64 / convertible as f64).min(1.0)
     } else {
@@ -706,15 +785,17 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
             Cell::from(""),
         ]),
         Row::new(vec![
-            Cell::from("Corrupted PDFs").style(Style::default().fg(Color::Red)),
-            Cell::from(if data.corrupted_count.is_some() {
-                format!("{:>6}", corrupted_count)
-            } else {
-                scanning.clone()
+            Cell::from("Failed, retry"),
+            Cell::from(match &data.failed {
+                Some(f) => format!("{:>6}", f.retryable),
+                None => scanning.clone(),
             })
-            .style(Style::default().fg(Color::Red)),
-            Cell::from(""),
-            Cell::from(""),
+            .style(match &data.failed {
+                Some(f) if f.retryable > 0 => Style::default().fg(Color::Red),
+                _ => Style::default().fg(Color::DarkGray),
+            }),
+            Cell::from(failed_cells.0),
+            Cell::from(failed_cells.1),
         ]),
         match &data.watcher {
             WatcherInfo::Stopped => Row::new(vec![
@@ -1199,8 +1280,10 @@ async fn run_oneshot_text() -> Result<()> {
         "  Embedded  : {} docs, {} chunks",
         data.embedded_docs, data.embedded_chunks
     );
-    if let Some(corrupted) = data.corrupted_count {
-        println!("  Corrupted : {corrupted}");
+    if let Some(f) = &data.failed {
+        for line in failed_text_lines(f) {
+            println!("  {line}");
+        }
     }
     if data.queue_server_too_old() {
         println!("  Queued    : n/a ({QUEUE_SERVER_TOO_OLD})");
@@ -1471,7 +1554,11 @@ mod tests {
     }
 
     fn draw(data: &DashboardData) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        draw_at(data, 160)
+    }
+
+    fn draw_at(data: &DashboardData, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
         terminal.draw(|frame| render(frame, data)).unwrap();
         terminal
             .backend()
@@ -1653,6 +1740,71 @@ mod tests {
             "{screen}"
         );
         assert!(!screen.contains("refused"), "{screen}");
+    }
+
+    /// Today's catalog, in miniature: the stamps the dashboard used to call
+    /// "Corrupted PDFs" are mostly documents a backend dropped.
+    fn failed_snapshot() -> hs_common::status::StatusSnapshot {
+        let mut snap = snapshot_with(Some(0), Some(0), None);
+        snap.pipeline.documents = 18_029;
+        snap.pipeline.markdown = 15_884;
+        let reasons = std::iter::repeat_n("gapped_conversion", 1_583)
+            .chain(std::iter::repeat_n("vlm_transport_error", 432))
+            .chain(std::iter::repeat_n("permanent_convert_failure", 17))
+            .chain(std::iter::repeat_n("paywall_html", 33))
+            .chain(std::iter::repeat_n("empty_conversion", 122));
+        snap.pipeline.failed_conversions = Some(FailedConversions::tally(
+            reasons,
+            hs_scribe::classify::stamp_kind,
+        ));
+        snap
+    }
+
+    #[test]
+    fn dropped_documents_are_shown_as_retryable_with_the_recovery_command() {
+        let screen = draw(&snapshot_to_dashboard(failed_snapshot()));
+        assert!(!screen.contains("Corrupted"), "{screen}");
+        for words in [
+            "Failed, retry",
+            "2032",
+            "hs pipeline reconvert-failed --dry-run",
+            "gapped_conversion 1583",
+            "155 bad source",
+        ] {
+            assert!(screen.contains(words), "missing {words:?}: {screen}");
+        }
+        // Progress excludes only the 155 bad sources: 15,884 / 17,874.
+        assert!(screen.contains("88.9%"), "{screen}");
+    }
+
+    /// A cut that kept `hs pipeline reconvert-failed` and dropped
+    /// `--dry-run` would show the live bulk command (measured at 110
+    /// columns before the cell held the command alone).
+    #[test]
+    fn a_narrow_terminal_still_shows_the_whole_dry_run_command() {
+        let screen = draw_at(&snapshot_to_dashboard(failed_snapshot()), 110);
+        assert!(
+            screen.contains("hs pipeline reconvert-failed --dry-run"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_text_status_lists_failures_by_kind_and_reason() {
+        let f = failed_snapshot().pipeline.failed_conversions.unwrap();
+        assert_eq!(
+            failed_text_lines(&f),
+            [
+                "Failed    : 2032 retryable — recover with \
+                 `hs pipeline reconvert-failed --dry-run`",
+                "            gapped_conversion 1583, vlm_transport_error 432, \
+                 permanent_convert_failure 17",
+                "Bad source: 155 (empty_conversion 122, paywall_html 33)",
+            ]
+        );
+        let none = FailedConversions::default();
+        assert_eq!(failed_text_lines(&none), ["Failed    : none"]);
+        assert_eq!(failed_note(&none), ("none".to_string(), String::new()));
     }
 
     /// The dashboard on screen is the loading frame with every collection

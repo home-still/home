@@ -37,16 +37,27 @@ loop does not run `hs upgrade`.
 
 ### B. Recover the documents already dropped
 
-They are in `papers/` with a `gapped_conversion` stamp and no markdown
-(BACKLOG P0-28). Options:
+They are in `papers/` with a failure stamp and no markdown (BACKLOG
+P0-28). Measured on the catalog 2026-10-23: **1,583** `gapped_conversion`
+and **432** `vlm_transport_error` (423 from one incident on 10-17), 2,053
+retryable stamps in all, beside 155 bad sources. Options:
 
-1. **Re-publish their convert events after A** (recommended): enumerate by
-   catalog stamp, dry-run first, then publish. A bulk re-conversion of a
-   few hundred documents through bmb at ~2–5 min each.
+1. **Re-queue the retryable ones after A** (recommended). Since rc.386:
+   `hs pipeline reconvert-failed --dry-run` lists exactly the 2,053 it
+   would re-queue and the 155 it leaves; drop `--dry-run` to run it (it
+   asks first). `--reason gapped_conversion --limit 25` is a staged
+   start. Through bmb alone (~15 documents an hour) that is days of work,
+   which is why C matters.
 2. Leave them; re-ingest by hand on demand.
 
 ### C. Make the olmocr tier start (P0-27)
 
+0. **Stop the idle scribe server on big that holds the room**
+   (recommended, now): `hs-serve-scribe` (`:7433`) is a disabled unit,
+   not in the scribe pool, with 0 conversions, running since an
+   accidental start on 2026-10-02 and holding **2,340 MiB**. Without it
+   16,417 MB would be free, above vLLM's ~15,718 MB. `sudo systemctl stop
+   hs-serve-scribe`; it stays disabled, so nothing restarts it.
 1. **Lower vLLM's `--gpu-memory-utilization` to fit beside the embedder**
    (≈0.55 ⇒ ~13.3 GB) and set the gate to the same requirement, so the
    gate and the backend agree. Needs a check that olmocr's KV cache still
@@ -56,5 +67,5 @@ They are in `papers/` with a `gapped_conversion` stamp and no markdown
 3. Code fix (the loop's next candidate): derive the gate from the
    backend's real requirement so they cannot drift.
 
-Recommendation: A now, B.1 after A is verified on bmb, C.3 as the next
-loop iteration with C.2 as the interim config.
+Recommendation: A and C.0 now; B.1 once A is verified on bmb; C.3 as the
+next loop iteration.

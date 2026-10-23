@@ -1,0 +1,2 @@
+old rc.382 (hs + hs-mcp :7445): median 8.77 s  min 8.24  max 9.73  (n=5, interleaved)
+new rc.386 (hs + hs-mcp :7495): median 8.27 s  min 8.17  max 8.63  (n=5, interleaved)

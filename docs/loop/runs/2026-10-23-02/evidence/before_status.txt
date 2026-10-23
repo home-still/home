@@ -1,0 +1,12 @@
+Pipeline:
+  Documents : 18029
+  Markdown  : 15884
+  Cataloged : 18006
+  Embedded  : 15940 docs, 445752 chunks
+  Corrupted : 2208
+  Queued    : 1256
+  Stalled   : 829
+
+Services:
+  ● scribe   http://<host>:7435            4 converting   0.0.1-rc.382
+  ● scribe   http://<glm-host>:7433                3 converting   0.0.1-rc.382

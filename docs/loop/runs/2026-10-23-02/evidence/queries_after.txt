@@ -1,0 +1,33 @@
+  q01 [concept] PASS rank=   1 ms= 1381.3  how does a transformer attention mechanism work
+  q02 [concept] PASS rank=   1 ms=  245.2  reinforcement learning policy optimization
+  q03 [concept] PASS rank=   1 ms=  324.5  risk factors for falls in elderly people
+  q04 [concept] PASS rank=   1 ms=  215.1  bipolar disorder quality of life outcomes
+  q05 [concept] PASS rank=   1 ms=  234.0  exercise and immune system function
+  q06 [concept] PASS rank=   1 ms=  232.7  effect of ultraviolet radiation on Earth's climate
+  q07 [concept] PASS rank=   1 ms=  203.5  lithium treatment for catatonia
+  q08 [concept] PASS rank=   1 ms=  206.7  autism spectrum disorder heritability
+  q09 [literal] PASS rank=   2 ms=  125.7  proximal humeral epiphyseal ossification
+  q10 [literal] PASS rank=   1 ms=  130.7  juvenile idiopathic arthritis uveitis
+  q11 [literal] PASS rank=   1 ms=  108.3  Korsakoff syndrome confabulation
+  q12 [literal] PASS rank=   1 ms=  186.6  cerebellar Bergmann glia potassium buffering
+  q13 [literal] PASS rank=   1 ms=  202.3  gut microbiota composition and diversity
+  q14 [literal] PASS rank=   3 ms=  228.3  hippocampal neurogenesis and adult memory
+  q15 [literal] PASS rank=   1 ms=  229.0  oxytocin social behaviour and vasopressin
+  q16 [literal] PASS rank=   1 ms=  280.3  cortisol stress response and the hypothalamic pituit
+  q17 [literal] PASS rank=   1 ms=  236.7  dopaminergic pathways in Parkinson disease
+  q18 [literal] PASS rank=   1 ms=  191.6  Turing test computation and machine intelligence
+  q19 [named] PASS rank=   1 ms=  216.6  Kandel principles of neural science
+  q20 [named] PASS rank=   1 ms=  334.4  Watson and Crick structure of DNA
+  q21 [named] PASS rank=   2 ms=  198.5  Waddington epigenetic landscape
+  q22 [named] PASS rank=   4 ms=  152.0  Gazzaniga split brain
+  q23 [named] PASS rank=   1 ms=  274.1  Einstein general relativity and the equivalence prin
+  q24 [named] PASS rank=   1 ms=  328.0  Darwin natural selection and the origin of species
+  q25 [named] PASS rank=   9 ms=  271.4  Rosalind Franklin and the diffraction data of DNA
+
+RECALL@10: 25/25 = 100.0%
+  concept  8/8 = 100.0%
+  literal  10/10 = 100.0%
+  named    7/7 = 100.0%
+  median latency 228 ms
+  the first hit is a reference list: 1/25 = 4.0%
+  the reference-list share of the page: 30/250 = 12.0%

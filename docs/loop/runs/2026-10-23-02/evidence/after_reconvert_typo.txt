@@ -1,0 +1,2 @@
+error: Error: no catalog row is stamped with reason `gapped`; reasons present: empty_conversion, gapped_conversion, html_not_utf8, paywall_html, pdf_parse_error, permanent_convert_failure, source_missing, unsupported_content_type:binary, unsupported_content_ty
+exit=1

@@ -1,0 +1,14 @@
+Scan: catalog for conversion_failed stamps
+Found: 2208 papers with conversion_failed stamp
+Reason:   64 × empty_conversion
+Reason: 1583 × gapped_conversion
+Reason:    1 × html_not_utf8
+Reason:   33 × paywall_html
+Reason:   20 × pdf_parse_error
+Reason:   17 × permanent_convert_failure
+Reason:   13 × source_missing
+Reason:   23 × unsupported_content_type:binary
+Reason:    1 × unsupported_content_type:html
+Reason:   21 × vlm_repetition_loop
+Reason:  432 × vlm_transport_error
+Dry-run complete.

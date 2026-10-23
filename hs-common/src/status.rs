@@ -127,13 +127,12 @@ pub struct PipelineCounts {
     /// the denominator.
     #[serde(default)]
     pub embedding_skipped: Option<u64>,
-    /// Catalog entries stamped `conversion_failed` — terminal content-type
-    /// or parse failures (paywall HTML renamed .pdf, truncated downloads,
-    /// corrupt PDFs). Rendered in the "Corrupted PDFs" row and subtracted
-    /// from the convert denominator so the progress bar reflects
-    /// convertible work only.
+    /// Catalog rows stamped `conversion_failed`, by what a retry can do.
+    /// Only [`FailedConversions::bad_source`] is excluded from the
+    /// conversion progress denominator: a document a backend failed on is
+    /// unfinished work, not an exclusion.
     #[serde(default)]
-    pub corrupted_pdfs: Option<u64>,
+    pub failed_conversions: Option<FailedConversions>,
     /// Files sitting in `papers/manually_downloaded/` waiting for the
     /// inbox sweeper's next tick. Counted with the same whitelist the
     /// sweeper itself uses (`hs_common::inbox::is_inbox_candidate_filename`)
@@ -187,6 +186,80 @@ pub struct PipelineCounts {
     /// outage looks exactly like an empty, fully converted corpus otherwise.
     #[serde(default)]
     pub counts_error: Option<String>,
+}
+
+/// What retrying a failed conversion can achieve, from the stamp's reason
+/// (`hs_scribe::classify::stamp_kind` maps reasons onto it). The server
+/// decides it once, so every reader of a snapshot agrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    /// A backend failed on the document; a fixed or a different backend
+    /// can convert it (`hs pipeline reconvert-failed`).
+    Retryable,
+    /// The source itself can never convert: not a PDF, a paywall stub, a
+    /// parse error, missing.
+    BadSource,
+    /// A reason this build does not know. Shown as such, never guessed.
+    Unclassified,
+}
+
+/// One stamp reason and how many catalog rows carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureReasonCount {
+    pub reason: String,
+    pub kind: FailureKind,
+    pub count: u64,
+}
+
+/// Catalog rows stamped `conversion_failed`, counted by [`FailureKind`] and
+/// by reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedConversions {
+    pub retryable: u64,
+    pub bad_source: u64,
+    pub unclassified: u64,
+    /// Every reason, largest count first (ties by name).
+    pub reasons: Vec<FailureReasonCount>,
+}
+
+impl FailedConversions {
+    /// Count `reasons` (one per stamped row) into kinds with `kind_of`.
+    pub fn tally<'a>(
+        reasons: impl IntoIterator<Item = &'a str>,
+        kind_of: impl Fn(&str) -> FailureKind,
+    ) -> Self {
+        let mut counts: std::collections::BTreeMap<&str, u64> = Default::default();
+        for reason in reasons {
+            *counts.entry(reason).or_default() += 1;
+        }
+        let mut out = Self::default();
+        for (reason, count) in counts {
+            let kind = kind_of(reason);
+            match kind {
+                FailureKind::Retryable => out.retryable += count,
+                FailureKind::BadSource => out.bad_source += count,
+                FailureKind::Unclassified => out.unclassified += count,
+            }
+            out.reasons.push(FailureReasonCount {
+                reason: reason.to_string(),
+                kind,
+                count,
+            });
+        }
+        // Stable sort over name order: ties stay alphabetical.
+        out.reasons.sort_by_key(|r| std::cmp::Reverse(r.count));
+        out
+    }
+
+    pub fn total(&self) -> u64 {
+        self.retryable + self.bad_source + self.unclassified
+    }
+
+    /// The reasons of one kind, largest first.
+    pub fn reasons_of(&self, kind: FailureKind) -> impl Iterator<Item = &FailureReasonCount> {
+        self.reasons.iter().filter(move |r| r.kind == kind)
+    }
 }
 
 impl PipelineCounts {
@@ -1248,7 +1321,7 @@ pub async fn collect_pipeline_counts(
         embedded_chunks,
         embedding_skipped,
         // Computed by caller (needs the full catalog in memory).
-        corrupted_pdfs: None,
+        failed_conversions: None,
         // Computed by caller (extra storage.list call for a sub-prefix).
         inbox_pending: None,
         // Computed by caller once it knows total in_flight.
@@ -1606,6 +1679,47 @@ mod unconverted_stem_tests {
         c.record_queue(None, Ok(7));
         assert_eq!(c.queued_conversions, Some(7));
         assert_eq!(c.stalled_conversions, None);
+    }
+
+    #[test]
+    fn failed_conversions_count_by_kind_and_list_reasons_largest_first() {
+        let kind = |r: &str| match r {
+            "gapped" | "transport" => FailureKind::Retryable,
+            "paywall" => FailureKind::BadSource,
+            _ => FailureKind::Unclassified,
+        };
+        let f = FailedConversions::tally(
+            [
+                "paywall",
+                "gapped",
+                "transport",
+                "gapped",
+                "mystery",
+                "gapped",
+            ],
+            kind,
+        );
+        assert_eq!((f.retryable, f.bad_source, f.unclassified), (4, 1, 1));
+        let order: Vec<(&str, u64)> = f
+            .reasons
+            .iter()
+            .map(|r| (r.reason.as_str(), r.count))
+            .collect();
+        // Largest first; equal counts in name order.
+        assert_eq!(
+            order,
+            [
+                ("gapped", 3),
+                ("mystery", 1),
+                ("paywall", 1),
+                ("transport", 1)
+            ]
+        );
+        let retryable: Vec<&str> = f
+            .reasons_of(FailureKind::Retryable)
+            .map(|r| r.reason.as_str())
+            .collect();
+        assert_eq!(retryable, ["gapped", "transport"]);
     }
 }
 

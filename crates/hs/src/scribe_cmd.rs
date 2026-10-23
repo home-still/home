@@ -347,7 +347,7 @@ pub(crate) fn classify_convert_failure(err: &anyhow::Error) -> ConvertClassifica
         // haven't catalogued yet, and the chain naturally terminates if
         // every backend rejects.
         hs_scribe::classify::FailureClass::Transient => {
-            ConvertClassification::Escalate("permanent_convert_failure".to_string())
+            ConvertClassification::Escalate(hs_scribe::classify::UNTYPED_ESCALATION.to_string())
         }
     }
 }
@@ -1331,7 +1331,9 @@ mod classify_convert_failure_tests {
         // rejects the chain stamps `permanent_convert_failure`.
         let err = anyhow::anyhow!("scribe convert failed: some novel failure mode");
         match classify_convert_failure(&err) {
-            ConvertClassification::Escalate(r) => assert_eq!(r, "permanent_convert_failure"),
+            ConvertClassification::Escalate(r) => {
+                assert_eq!(r, hs_scribe::classify::UNTYPED_ESCALATION)
+            }
             other => panic!("expected Escalate, got {:?}", other.reason()),
         }
     }
@@ -1360,7 +1362,7 @@ mod classify_convert_failure_tests {
         let err = anyhow::anyhow!("scribe convert failed for papers/pa/paywall-FormatError.pdf");
         assert!(matches!(
             classify_convert_failure(&err),
-            ConvertClassification::Escalate(r) if r == "permanent_convert_failure"
+            ConvertClassification::Escalate(r) if r == hs_scribe::classify::UNTYPED_ESCALATION
         ));
     }
 }

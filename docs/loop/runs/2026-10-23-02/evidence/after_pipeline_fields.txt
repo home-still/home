@@ -1,0 +1,13 @@
+{'documents': 18030, 'markdown': 15884, 'corrupted_pdfs': None}
+{'retryable': 2053, 'bad_source': 155, 'unclassified': 0}
+  {'count': 1583, 'kind': 'retryable', 'reason': 'gapped_conversion'}
+  {'count': 432, 'kind': 'retryable', 'reason': 'vlm_transport_error'}
+  {'count': 64, 'kind': 'bad_source', 'reason': 'empty_conversion'}
+  {'count': 33, 'kind': 'bad_source', 'reason': 'paywall_html'}
+  {'count': 23, 'kind': 'bad_source', 'reason': 'unsupported_content_type:binary'}
+  {'count': 21, 'kind': 'retryable', 'reason': 'vlm_repetition_loop'}
+  {'count': 20, 'kind': 'bad_source', 'reason': 'pdf_parse_error'}
+  {'count': 17, 'kind': 'retryable', 'reason': 'permanent_convert_failure'}
+  {'count': 13, 'kind': 'bad_source', 'reason': 'source_missing'}
+  {'count': 1, 'kind': 'bad_source', 'reason': 'html_not_utf8'}
+  {'count': 1, 'kind': 'bad_source', 'reason': 'unsupported_content_type:html'}
