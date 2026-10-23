@@ -1,0 +1,5 @@
+Scan: catalog for conversion_failed stamps
+Papers: 18291 total, 15884 have markdown, 144 pending republish
+Skipped: 2008 failed conversions (1888 retryable, 120 not) — re-queue them with `hs pipeline reconvert-failed --dry-run`
+Dry-run complete — no events published.
+exit=0 elapsed_ms=6800

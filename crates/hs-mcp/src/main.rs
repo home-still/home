@@ -3616,17 +3616,30 @@ impl HomeStillMcp {
         // the operator should see. Values above `pipeline_drift_threshold`
         // indicate either stamped failures or stems that errored without a
         // stamp; check scribe/event-watch logs for the latter.
+        //
+        // Stalled, unlike drift, leaves stamped stems out: it is what `hs
+        // pipeline catch-up` would queue, and catch-up skips them. Without
+        // the catalog the stamped stems are unknown, and so is Stalled.
         let total_in_flight: u64 = scribe_instances.iter().map(|s| s.in_flight).sum();
-        let unconverted = match hs_common::status::count_unconverted_stems(
+        let stamped: Option<std::collections::HashSet<&str>> =
+            catalog_triples.as_ref().map(|triples| {
+                triples
+                    .iter()
+                    .filter(|(_, _, entry)| entry.conversion_failed.is_some())
+                    .map(|(stem, _, _)| stem.as_str())
+                    .collect()
+            });
+        let unstamped_unconverted = match hs_common::status::count_unconverted_stems(
             &*self.storage,
             &self.papers_prefix,
             &self.markdown_prefix,
+            stamped.as_ref().unwrap_or(&Default::default()),
         )
         .await
         {
             Ok(unconverted) => {
-                pipeline.pipeline_drift = unconverted.saturating_sub(total_in_flight);
-                Some(unconverted)
+                pipeline.pipeline_drift = unconverted.all.saturating_sub(total_in_flight);
+                stamped.as_ref().map(|_| unconverted.unstamped)
             }
             Err(e) => {
                 pipeline.mark_unavailable(&e);
@@ -3645,7 +3658,7 @@ impl HomeStillMcp {
             Ok(Err(e)) => Err(format!("{e:#}")),
             Err(_) => Err("timed out asking the broker for queue depth".to_string()),
         };
-        pipeline.record_queue(unconverted, depth);
+        pipeline.record_queue(unstamped_unconverted, depth);
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
         pipeline.failed_conversions = failed_conversions;
         pipeline.inbox_pending = inbox_pending;

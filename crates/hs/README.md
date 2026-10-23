@@ -46,6 +46,7 @@ hs cloud status    Show cloud connection status
 hs cloud token     Print a fresh access token
 
 hs pipeline        Cross-service operations: rebuild, catch-up, purge-*, reap-phantoms, reconvert-failed, events-reset
+hs pipeline catch-up --dry-run           Queue every source with no markdown and no failure stamp (the Stalled count). Failed conversions are skipped and counted — `reconvert-failed` re-queues those
 hs pipeline reconvert-failed --dry-run   Re-queue failed conversions: every retryable one by default, or exactly `--reason <reason>` (repeatable, any kind); lists what is selected and what is left
 hs migrate         One-shot data migrations: sharding, move-root-orphans, quarantine-bad-content, canonicalize-doi-stems, drop-local-html
 hs openalex        Local OpenAlex catalog (DuckDB), steps in order: load / load-works (newest copy of each id wins), build-indexes, install-fts (needs network once), build-fts; also status, query

@@ -154,10 +154,14 @@ pub struct PipelineCounts {
     #[serde(default)]
     pub queued_conversions: Option<u64>,
     /// Papers that have a convertible source file (see
-    /// [`convertible_source_stem`]) but no markdown and are NOT outstanding
-    /// on the queue: nothing is queued to convert them, so `hs pipeline
-    /// catch-up` would queue every one. `None` when either the storage
-    /// listing or the queue depth is unavailable, or when the snapshot comes
+    /// [`convertible_source_stem`]), no markdown, no `conversion_failed`
+    /// stamp, and are NOT outstanding on the queue: nothing is queued to
+    /// convert them, so `hs pipeline catch-up` would queue every one. A
+    /// stamped failure is counted in `failed_conversions` instead. The queue
+    /// depth is subtracted as a whole, so events still queued for stamped
+    /// stems (published by catch-up before it skipped them) make this an
+    /// undercount until they drain. `None` when the storage listing, the
+    /// catalog or the queue depth is unavailable, or when the snapshot comes
     /// from a server that predates queue reporting (see `queue_error`).
     #[serde(default)]
     pub stalled_conversions: Option<u64>,
@@ -271,12 +275,12 @@ impl PipelineCounts {
     }
 
     /// Fold the queue reading into the snapshot. `unconverted` is the count
-    /// of papers with a convertible source and no markdown (`None` if it
-    /// could not be taken); `outstanding` is the scribe consumer's waiting +
-    /// unacked messages, or why the broker could not say. A failed reading
-    /// leaves `queued_conversions`/`stalled_conversions` unset and names the
-    /// cause. Exactly one of `queued_conversions` / `queue_error` is set
-    /// afterwards.
+    /// of papers with a convertible source, no markdown and no failure stamp
+    /// (`None` if it could not be taken); `outstanding` is the scribe
+    /// consumer's waiting + unacked messages, or why the broker could not
+    /// say. A failed reading leaves `queued_conversions`/`stalled_conversions`
+    /// unset and names the cause. Exactly one of `queued_conversions` /
+    /// `queue_error` is set afterwards.
     pub fn record_queue(&mut self, unconverted: Option<u64>, outstanding: Result<u64, String>) {
         match outstanding {
             Ok(queued) => {
@@ -561,7 +565,23 @@ pub fn convertible_source_stem(key: &str, size: u64) -> Option<&str> {
         .then_some(stem)
 }
 
-/// Count distinct source stems under `papers_prefix` that have no markdown.
+/// Source stems with no markdown: every one, and those with no
+/// `conversion_failed` stamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UnconvertedStems {
+    /// Every unconverted stem. The basis of `pipeline_drift`, which is
+    /// meant to show stamped failures too.
+    pub all: u64,
+    /// Unconverted stems nothing has given up on: the ones `hs pipeline
+    /// catch-up` queues, and so the basis of the Stalled count. A stamped
+    /// failure is reported as a failed conversion and re-queued only by
+    /// `hs pipeline reconvert-failed`.
+    pub unstamped: u64,
+}
+
+/// Count distinct source stems under `papers_prefix` that have no markdown,
+/// in total and excluding the stems in `stamped` (rows stamped
+/// `conversion_failed`).
 ///
 /// This is the honest basis for `pipeline_drift`. Comparing raw object
 /// counts (`pdfs + htmls + epubs` vs `markdown`) cannot answer "how many
@@ -581,15 +601,16 @@ pub fn convertible_source_stem(key: &str, size: u64) -> Option<&str> {
 /// zero exactly when every live source has markdown.
 ///
 /// "Source" is [`convertible_source_stem`] — the same predicate `hs
-/// pipeline catch-up` plans with, so every stem counted here is one
-/// catch-up would queue. Stamped failures still sitting in the live papers
-/// tree are deliberately *not* excluded — drift is meant to show those.
+/// pipeline catch-up` plans with, and catch-up skips `stamped` stems the
+/// same way, so every stem counted in `unstamped` is one catch-up would
+/// queue.
 #[cfg(feature = "storage")]
 pub async fn count_unconverted_stems(
     storage: &dyn Storage,
     papers_prefix: &str,
     markdown_prefix: &str,
-) -> anyhow::Result<u64> {
+    stamped: &std::collections::HashSet<&str>,
+) -> anyhow::Result<UnconvertedStems> {
     use anyhow::Context;
 
     // A failed listing is an error, never "0 unconverted": an S3 outage must
@@ -620,7 +641,10 @@ pub async fn count_unconverted_stems(
         .filter(|stem| !md_stems.contains(stem))
         .collect();
 
-    Ok(unconverted.len() as u64)
+    Ok(UnconvertedStems {
+        all: unconverted.len() as u64,
+        unstamped: unconverted.iter().filter(|s| !stamped.contains(*s)).count() as u64,
+    })
 }
 
 /// A single listing-and-deserialization pass over the three prefixes that
@@ -1467,10 +1491,10 @@ mod unconverted_stem_tests {
             .await
             .unwrap();
 
-        let n = count_unconverted_stems(&storage, "papers", "markdown")
+        let n = count_unconverted_stems(&storage, "papers", "markdown", &Default::default())
             .await
             .unwrap();
-        assert_eq!(n, 1, "only `dual` owes markdown");
+        assert_eq!(n.all, 1, "only `dual` owes markdown");
     }
 
     #[tokio::test]
@@ -1503,10 +1527,10 @@ mod unconverted_stem_tests {
             .unwrap();
 
         assert_eq!(
-            count_unconverted_stems(&storage, "papers", "markdown")
+            count_unconverted_stems(&storage, "papers", "markdown", &Default::default())
                 .await
                 .unwrap(),
-            0
+            UnconvertedStems::default()
         );
     }
 
@@ -1543,7 +1567,9 @@ mod unconverted_stem_tests {
 
     /// "Unconverted" is exactly what `hs pipeline catch-up` would queue:
     /// the inbox drop zone, zero-byte sources and unconvertible extensions
-    /// are not counted; `.htm` and `.epub` sources are.
+    /// are not counted; `.htm` and `.epub` sources are; a stem stamped
+    /// `conversion_failed` counts toward drift (`all`) but not toward what
+    /// catch-up queues (`unstamped`).
     #[tokio::test]
     async fn counts_only_what_catch_up_would_queue() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1570,12 +1596,17 @@ mod unconverted_stem_tests {
             .await
             .unwrap();
 
+        let stamped = std::collections::HashSet::from(["page"]);
         assert_eq!(
-            count_unconverted_stems(&storage, "papers", "markdown")
+            count_unconverted_stems(&storage, "papers", "markdown", &stamped)
                 .await
                 .unwrap(),
-            3,
-            "pdf + htm + epub; not the inbox file, the empty file or the .txt"
+            UnconvertedStems {
+                all: 3,
+                unstamped: 2
+            },
+            "pdf + htm + epub; not the inbox file, the empty file or the .txt; \
+             the stamped `page` is drift, not catch-up work"
         );
     }
 
@@ -1607,7 +1638,7 @@ mod unconverted_stem_tests {
         let s = Unreachable;
         let e = count_ext_via(&s, "papers", "pdf").await.unwrap_err();
         assert!(format!("{e:#}").contains("backend unreachable"), "{e:#}");
-        count_unconverted_stems(&s, "papers", "markdown")
+        count_unconverted_stems(&s, "papers", "markdown", &Default::default())
             .await
             .unwrap_err();
         collect_pipeline_counts(&s, "papers", "markdown", "catalog", None, None, None)

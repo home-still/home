@@ -1,0 +1,3 @@
+Papers: 18291 total, 15884 have markdown, 2152 pending republish
+Dry-run complete — no events published.
+exit=0 elapsed_ms=1670

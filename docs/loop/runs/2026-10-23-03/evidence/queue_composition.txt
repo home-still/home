@@ -1,0 +1,2 @@
+1197 pending messages read from PAPERS (seq 19580 - 20776 ) without consuming them
+[(('hs pipeline catch-up', '2026-10-21T14'), 1086), (('paper-download', '2026-10-23T14'), 28), (('paper-download', '2026-10-22T21'), 15), (('paper-download', '2026-10-21T17'), 14), (('paper-download', '2026-10-21T18'), 12), (('paper-download', '2026-10-21T14'), 8), (('paper-download', '2026-10-21T16'), 6), (('paper-download', '2026-10-23T02'), 5)]

@@ -1,0 +1,6 @@
+old {'documents': 18096, 'markdown': 15884, 'queued_conversions': 1264, 'stalled_conversions': 888, 'pipeline_drift': 2144}
+  old text:  Queued    : 1264
+  old text:  Stalled   : 888
+new {'documents': 18096, 'markdown': 15884, 'queued_conversions': 1264, 'stalled_conversions': 0, 'pipeline_drift': 2145}
+  new text:  Queued    : 1264
+  new text:  Stalled   : 0

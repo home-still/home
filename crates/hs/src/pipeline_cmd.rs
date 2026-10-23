@@ -236,12 +236,26 @@ struct CatchUpPlan {
     papers_total: usize,
     markdown_stems: usize,
     to_republish: Vec<String>,
+    /// Unconverted stems skipped because a conversion of them was already
+    /// given up on, as `(stem, reason)`, one per stem.
+    skipped_failed: Vec<(String, String)>,
 }
 
-/// Source keys under `papers/` that have no markdown yet. A listing error is
+/// Source keys under `papers/` that have no markdown yet and no
+/// `conversion_failed` stamp (`stamped`: stem → reason). A listing error is
 /// an error: planning from a partial listing would republish (or skip) the
 /// wrong papers.
-async fn plan_catch_up(storage: &dyn Storage) -> Result<CatchUpPlan> {
+///
+/// Stamped stems are skipped because re-queuing a failure is `hs pipeline
+/// reconvert-failed`'s job: it selects by what a retry can do and clears
+/// the stamp first. Catch-up used to republish them with everything else —
+/// on 2026-10-21 one run queued 1,070 known failures (60 of them sources
+/// that can never convert) for 3 unconverted documents, ahead of every
+/// later download in the FIFO queue.
+async fn plan_catch_up(
+    storage: &dyn Storage,
+    stamped: &std::collections::HashMap<String, String>,
+) -> Result<CatchUpPlan> {
     let papers = storage.list("papers").await.context("list papers prefix")?;
     let markdown = storage
         .list("markdown")
@@ -265,14 +279,20 @@ async fn plan_catch_up(storage: &dyn Storage) -> Result<CatchUpPlan> {
     // bytes `hs migrate quarantine-bad-content` stamped `conversion_failed`;
     // republishing them would re-queue them forever), resource forks,
     // zero-byte objects (scribe would fetch, fail, and the event would
-    // cycle) and unconvertible extensions. `hs status` counts "unconverted"
-    // with the same predicate, so everything it counts is queued here.
+    // cycle) and unconvertible extensions. `hs status` counts Stalled
+    // with the same predicate and the same stamp rule, so everything it
+    // counts is queued here.
     let mut to_republish: Vec<String> = Vec::new();
+    let mut skipped: std::collections::BTreeMap<&str, &str> = Default::default();
     for obj in &papers {
         let Some(stem) = hs_common::status::convertible_source_stem(&obj.key, obj.size) else {
             continue;
         };
         if md_stems.contains(stem) {
+            continue;
+        }
+        if let Some(reason) = stamped.get(stem) {
+            skipped.insert(stem, reason);
             continue;
         }
         to_republish.push(obj.key.clone());
@@ -282,6 +302,10 @@ async fn plan_catch_up(storage: &dyn Storage) -> Result<CatchUpPlan> {
         papers_total: papers.len(),
         markdown_stems: md_stems.len(),
         to_republish: one_source_per_stem(to_republish),
+        skipped_failed: skipped
+            .into_iter()
+            .map(|(s, r)| (s.to_string(), r.to_string()))
+            .collect(),
     })
 }
 
@@ -356,7 +380,23 @@ async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()>
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage().context("building storage backend")?;
 
-    let plan = plan_catch_up(&*storage).await?;
+    // The stamps decide what is new work and what is a known failure, so a
+    // catalog that cannot be read stops the run instead of guessing.
+    reporter.status("Scan", "catalog for conversion_failed stamps");
+    let stamped: std::collections::HashMap<String, String> =
+        hs_common::catalog::list_catalog_entries_parallel(
+            &*storage,
+            "catalog",
+            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
+            |_, _| {},
+        )
+        .await
+        .context("list catalog entries (needed to skip failed conversions)")?
+        .into_iter()
+        .filter_map(|(stem, _, entry)| entry.conversion_failed.map(|f| (stem, f.reason)))
+        .collect();
+
+    let plan = plan_catch_up(&*storage, &stamped).await?;
     reporter.status(
         "Papers",
         &format!(
@@ -366,13 +406,34 @@ async fn cmd_catch_up(dry_run: bool, reporter: &Arc<dyn Reporter>) -> Result<()>
             plan.to_republish.len()
         ),
     );
+    if !plan.skipped_failed.is_empty() {
+        use hs_common::status::FailureKind;
+        let retryable = plan
+            .skipped_failed
+            .iter()
+            .filter(|(_, r)| hs_scribe::classify::stamp_kind(r) == FailureKind::Retryable)
+            .count();
+        reporter.status(
+            "Skipped",
+            &format!(
+                "{} failed conversions ({retryable} retryable, {} not) — \
+                 re-queue them with `hs pipeline reconvert-failed --dry-run`",
+                plan.skipped_failed.len(),
+                plan.skipped_failed.len() - retryable
+            ),
+        );
+    }
 
     if dry_run {
         reporter.finish("Dry-run complete — no events published.");
         return Ok(());
     }
     if plan.to_republish.is_empty() {
-        reporter.finish("Nothing to do — every paper already has markdown.");
+        reporter.finish(if plan.skipped_failed.is_empty() {
+            "Nothing to do — every paper already has markdown."
+        } else {
+            "Nothing to do — every paper without markdown is a failed conversion."
+        });
         return Ok(());
     }
 
@@ -1779,8 +1840,20 @@ mod tests {
         s.put("papers/op/opqrst.txt", b"text".to_vec())
             .await
             .unwrap();
+        // given up on already: a gap-rejected PDF and a paywall stub. They
+        // are re-queued by `reconvert-failed`, never by catch-up.
+        s.put("papers/qr/qrstuv.pdf", b"%PDF".to_vec())
+            .await
+            .unwrap();
+        s.put("papers/st/stuvwx.html", b"<html/>".to_vec())
+            .await
+            .unwrap();
+        let stamped = std::collections::HashMap::from([
+            ("qrstuv".to_string(), "gapped_conversion".to_string()),
+            ("stuvwx".to_string(), "paywall_html".to_string()),
+        ]);
 
-        let plan = plan_catch_up(&s).await.unwrap();
+        let plan = plan_catch_up(&s, &stamped).await.unwrap();
 
         let mut pending = plan.to_republish.clone();
         pending.sort();
@@ -1793,15 +1866,24 @@ mod tests {
                 "papers/mn/mnopqr.htm",
             ]
         );
-
-        // `hs status` counts "unconverted" with the same definition, so
-        // everything it reports is something catch-up just planned.
         assert_eq!(
-            hs_common::status::count_unconverted_stems(&s, "papers", "markdown")
-                .await
-                .unwrap(),
-            pending.len() as u64
+            plan.skipped_failed,
+            vec![
+                ("qrstuv".to_string(), "gapped_conversion".to_string()),
+                ("stuvwx".to_string(), "paywall_html".to_string()),
+            ]
         );
+
+        // `hs status` counts Stalled from the same definition and the same
+        // stamps, so everything it reports is something catch-up just
+        // planned; drift still counts the two failures.
+        let stamped_stems = stamped.keys().map(String::as_str).collect();
+        let unconverted =
+            hs_common::status::count_unconverted_stems(&s, "papers", "markdown", &stamped_stems)
+                .await
+                .unwrap();
+        assert_eq!(unconverted.unstamped, pending.len() as u64);
+        assert_eq!(unconverted.all, pending.len() as u64 + 2);
     }
 
     #[tokio::test]
