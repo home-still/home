@@ -1,0 +1,11 @@
+before loaded: 3386 MiB in 3.9s
+before doc   1: 7482 MiB (peak 7482)
+before doc  26: 7482 MiB (peak 7482)
+before doc  51: 7482 MiB (peak 7482)
+before doc  76: 7482 MiB (peak 7482)
+before doc 101: 7482 MiB (peak 7482)
+before doc 126: 7482 MiB (peak 7482)
+before doc 151: 7482 MiB (peak 7482)
+before doc 176: 7482 MiB (peak 7482)
+before doc 200: 7482 MiB (peak 7482)
+before RESULT load=3386 MiB end=7482 MiB peak=7482 MiB docs=200 chunks=2465 words=2129649 embed_secs=149.3 chunks_per_s=16.5

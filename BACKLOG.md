@@ -266,6 +266,12 @@ this is a logging concern taking down the entire CLI, including the one command
 **Cause:** `HEALTH_WAIT_SECS = 90` (`crates/hs/src/upgrade_cmd.rs:14`) is used for the Qdrant `/healthz` wait. A corpus of 15,933 documents across three collections (`academic_papers`, `personal_docs`, `imessages`) cannot be recovered in 90 s, so the wait is guaranteed to expire on a large corpus.
 **Change:** the Qdrant wait must exceed a collection recovery — or, better, it must distinguish "not answering yet" from "still recovering": poll the container's state and say which. A host whose services are all up must not have its upgrade reported as failed. The upgrade already restarts the container (`down` then `up -d`), so the recovery is **caused by the upgrade**; the wait belongs to the same operation.
 **Acceptance:** `hs upgrade --pre --yes` on a host with a 15,933-document corpus exits 0, and a Qdrant that is genuinely down still fails the upgrade with a message that names Qdrant.
+**Partly fixed in rc.388 (2026-10-23):** the upgrade no longer recreates a compose service whose containers already run the images their tags name after the pull and that answers its health URL — the common case (Qdrant's image unchanged), which removes the outage (44.8–67.0 s measured on a copy of the corpus, ~7 min here) and the false timeout together. **Still open:** when the image really changed, the recreate and the 90 s wait are as before; the wait should still distinguish "recovering" from "down". See `docs/loop/runs/2026-10-23-04/`.
+
+### P0-29. The distill embedder's CUDA arena only grows, and now alone keeps the olmocr tier from starting (found 2026-10-23, rc.388 iteration; needs a decision)
+**Symptom:** the idle embedder held **8,510 MiB** (6,462 the day before, no restart); with the idle `:7433` scribe's 2,340 MiB, 13,137 MiB were free against vLLM's ~15,718. Stopping `:7433` alone is no longer enough (15,477).
+**Measured** (real `OnnxEmbedder`, defaults, 200 real documents): default arena 3,386 → **7,482** MiB after the first document (+4,096, a power-of-two step); `kSameAsRequested` **13,056** (worse — fragmentation); `gpu_mem_limit` 4/5 GiB fails batches (the limit error is not recognised as OOM, so the halving retry never runs). Per-run arena shrinkage needs an ORT run option fastembed does not expose.
+**Options and recommendation:** `docs/loop/needs-decision/gpu-budget-olmocr-vs-embedder.md` — restart distill + stop `:7433` now (→ 16,505 MiB free), then `embedding.idle_release_secs` (reload 2.5–4.2 s).
 
 ---
 

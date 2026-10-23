@@ -272,17 +272,59 @@ async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let compose = crate::restart_cmd::compose_runtime_for(&files).await?;
 
     for (name, cf) in &files {
-        upgrade_compose_service(&compose, cf, name, reporter).await?;
+        let health = compose_health_url(name, &scribe_cfg)?;
+        upgrade_compose_service(
+            &compose,
+            compose.engine(),
+            cf,
+            name,
+            health.as_deref(),
+            reporter,
+        )
+        .await?;
     }
     Ok(())
 }
 
-/// pull → down → up -d for one compose file; any failing step fails the
-/// upgrade. (`down` first avoids podman pod conflicts on recreate.)
+/// The URL that answers 200 when a managed compose service is up: the one
+/// the post-upgrade health check waits on. `None` for a file this host has
+/// no health probe for.
+fn compose_health_url(
+    name: &str,
+    scribe_cfg: &hs_scribe::config::ScribeConfig,
+) -> Result<Option<String>> {
+    Ok(match name {
+        "scribe" => Some(format!(
+            "{}/health",
+            local_service_url(scribe_cfg.servers.iter().map(|s| s.url.as_str()), "scribe")?
+        )),
+        // That compose file (written by `hs distill init`) runs Qdrant only.
+        "distill" => Some(format!(
+            "{}/healthz",
+            crate::distill_cmd::qdrant_rest_url()?
+        )),
+        _ => None,
+    })
+}
+
+/// Pull one compose file's images, then recreate its containers (`down` →
+/// `up -d`) only if something changed; any failing step fails the upgrade.
+/// (`down` first avoids podman pod conflicts on recreate.)
+///
+/// Recreating is not free: `down` stops the service. For Qdrant that is a
+/// search outage until it reloads its collections — 45–67 s measured on a
+/// copy of the corpus, ~7 minutes in production on 2026-10-22, longer than
+/// the post-upgrade health wait. So the containers are left running when
+/// each already runs the image its service names after the pull and the
+/// service answers its health URL. Anything that cannot be established —
+/// no engine, a probe failing, a service without an `image` — recreates,
+/// as every upgrade did before.
 async fn upgrade_compose_service(
     compose: &ComposeCmd,
+    engine: Option<&str>,
     compose_file: &Path,
     name: &str,
+    health_url: Option<&str>,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
     let cf = compose_file
@@ -292,6 +334,25 @@ async fn upgrade_compose_service(
     compose_step(compose, &["-f", cf, "pull"])
         .await
         .with_context(|| format!("upgrading {name} containers"))?;
+
+    let unchanged = match (engine, health_url) {
+        (Some(engine), Some(url)) => match probe_service_images(compose, engine, cf).await {
+            Ok(images) => images.unchanged() && answers_200(url).await,
+            Err(e) => {
+                tracing::info!(error = %format!("{e:#}"), "{name}: cannot compare running and pulled images; recreating");
+                false
+            }
+        },
+        _ => false,
+    };
+    if unchanged {
+        reporter.status(
+            "Unchanged",
+            &format!("{name}: images unchanged and healthy; containers left running"),
+        );
+        return Ok(());
+    }
+
     reporter.status("Stopping", &format!("{name} containers..."));
     compose_step(compose, &["-f", cf, "down"])
         .await
@@ -300,6 +361,112 @@ async fn upgrade_compose_service(
     compose_step(compose, &["-f", cf, "up", "-d"])
         .await
         .with_context(|| format!("upgrading {name} containers"))
+}
+
+/// A compose project's images after a pull, against what its containers run.
+#[derive(Debug, Default, PartialEq)]
+struct ServiceImages {
+    /// Services the compose file defines.
+    services: usize,
+    /// The image id each service's `image` names now.
+    named: Vec<String>,
+    /// The image id each running container of the project runs.
+    running: Vec<String>,
+}
+
+impl ServiceImages {
+    /// Every service has one running container, and the containers run
+    /// exactly the images the services name.
+    fn unchanged(&self) -> bool {
+        let norm = |id: &String| id.trim().trim_start_matches("sha256:").to_string();
+        let named: std::collections::BTreeSet<String> = self.named.iter().map(norm).collect();
+        let running: std::collections::BTreeSet<String> = self.running.iter().map(norm).collect();
+        self.services > 0
+            && self.named.len() == self.services
+            && self.running.len() == self.services
+            && named == running
+    }
+}
+
+/// Ask the compose runtime and its engine what the project's services name
+/// and what its containers run. Any command failing is an error (the
+/// caller recreates).
+async fn probe_service_images(
+    compose: &ComposeCmd,
+    engine: &str,
+    cf: &str,
+) -> Result<ServiceImages> {
+    let config = capture(
+        compose.run_capture(&["-f", cf, "config"]).await,
+        "compose config",
+    )?;
+    let images = service_images(&config)?;
+    let mut named = Vec::with_capacity(images.len());
+    for image in &images {
+        named
+            .push(engine_query(engine, &["image", "inspect", "--format", "{{.Id}}", image]).await?);
+    }
+    let ids = capture(
+        compose.run_capture(&["-f", cf, "ps", "-q"]).await,
+        "compose ps -q",
+    )?;
+    let mut running = Vec::new();
+    for id in ids.split_whitespace() {
+        running.push(engine_query(engine, &["inspect", "--format", "{{.Image}}", id]).await?);
+    }
+    Ok(ServiceImages {
+        services: images.len(),
+        named,
+        running,
+    })
+}
+
+/// The `image` of every service in resolved compose YAML. A service with
+/// no `image` (built locally) cannot be compared, so it is an error.
+fn service_images(config_yaml: &str) -> Result<Vec<String>> {
+    let doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(config_yaml).context("parsing `compose config` output")?;
+    let services = doc
+        .get("services")
+        .and_then(|s| s.as_mapping())
+        .context("`compose config` output has no services")?;
+    services
+        .iter()
+        .map(|(name, svc)| {
+            svc.get("image")
+                .and_then(|i| i.as_str())
+                .map(str::to_string)
+                .with_context(|| format!("service {name:?} names no image"))
+        })
+        .collect()
+}
+
+fn capture(out: Result<std::process::Output>, what: &str) -> Result<String> {
+    let out = out.with_context(|| format!("running {what}"))?;
+    anyhow::ensure!(out.status.success(), "{what} exited {}", out.status);
+    String::from_utf8(out.stdout).with_context(|| format!("{what} printed non-UTF-8"))
+}
+
+async fn engine_query(engine: &str, args: &[&str]) -> Result<String> {
+    let out = tokio::process::Command::new(engine)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(anyhow::Error::from);
+    let what = format!("{engine} {}", args.join(" "));
+    let text = capture(out, &what)?;
+    let text = text.trim();
+    anyhow::ensure!(!text.is_empty(), "{what} printed nothing");
+    Ok(text.to_string())
+}
+
+/// One GET, 5 s budget: does the service answer 200 right now?
+async fn answers_200(url: &str) -> bool {
+    let Ok(client) = hs_common::http::http_client(std::time::Duration::from_secs(5)) else {
+        return false;
+    };
+    matches!(client.get(url).send().await, Ok(r) if r.status().is_success())
 }
 
 // ── Post-upgrade health check ───────────────────────────────────
@@ -329,20 +496,17 @@ async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let scribe_cfg = hs_scribe::config::ScribeConfig::load()?;
     let hidden = hs_common::hidden_dir()?;
     let files = crate::restart_cmd::managed_compose_files(&hidden, scribe_cfg.local_server);
-    if files.iter().any(|(n, _)| *n == "scribe") {
-        let url = local_service_url(scribe_cfg.servers.iter().map(|s| s.url.as_str()), "scribe")?;
-        hs_common::compose::wait_for_url(&format!("{url}/health"), HEALTH_WAIT_SECS, "scribe")
-            .await?;
-        reporter.status("Health", "scribe: OK");
-    }
-
-    if files.iter().any(|(n, _)| *n == "distill") {
-        // That compose file (written by `hs distill init`) runs Qdrant only;
-        // the distill server is always a native unit, checked below.
-        let qdrant = crate::distill_cmd::qdrant_rest_url()?;
-        hs_common::compose::wait_for_url(&format!("{qdrant}/healthz"), HEALTH_WAIT_SECS, "Qdrant")
-            .await?;
-        reporter.status("Health", "Qdrant: OK");
+    // The same URLs the compose phase used to decide whether to recreate.
+    // The distill compose file runs Qdrant only; the distill server is
+    // always a native unit, checked below.
+    for (name, label) in [("scribe", "scribe"), ("distill", "Qdrant")] {
+        if !files.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        if let Some(url) = compose_health_url(name, &scribe_cfg)? {
+            hs_common::compose::wait_for_url(&url, HEALTH_WAIT_SECS, label).await?;
+            reporter.status("Health", &format!("{label}: OK"));
+        }
     }
     if find_companion_binary("hs-distill-server").is_some() {
         let cfg = hs_distill::config::DistillClientConfig::load()
@@ -430,7 +594,7 @@ mod tests {
         let compose = fake_compose(dir.path(), "down");
         let cf = dir.path().join("docker-compose.yml");
         std::fs::write(&cf, "services: {}\n").unwrap();
-        let err = upgrade_compose_service(&compose, &cf, "scribe", &reporter())
+        let err = upgrade_compose_service(&compose, None, &cf, "scribe", None, &reporter())
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("down"), "{err:#}");
@@ -447,7 +611,7 @@ mod tests {
             let cf = dir.path().join("c.yml");
             std::fs::write(&cf, "").unwrap();
             assert!(
-                upgrade_compose_service(&compose, &cf, "distill", &reporter())
+                upgrade_compose_service(&compose, None, &cf, "distill", None, &reporter())
                     .await
                     .is_err()
             );
@@ -456,12 +620,143 @@ mod tests {
         let compose = fake_compose(dir.path(), "none");
         let cf = dir.path().join("c.yml");
         std::fs::write(&cf, "").unwrap();
-        upgrade_compose_service(&compose, &cf, "distill", &reporter())
+        upgrade_compose_service(&compose, None, &cf, "distill", None, &reporter())
             .await
             .unwrap();
         let log = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
         let verbs: Vec<&str> = log.lines().map(|l| l.split(' ').nth(2).unwrap()).collect();
         assert_eq!(verbs, ["pull", "down", "up"]);
+    }
+
+    // ── leave unchanged containers running ─────────────────────────
+
+    fn images(services: usize, named: &[&str], running: &[&str]) -> ServiceImages {
+        ServiceImages {
+            services,
+            named: named.iter().map(|s| s.to_string()).collect(),
+            running: running.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn containers_are_unchanged_only_when_they_run_exactly_the_named_images() {
+        assert!(images(1, &["8a80"], &["8a80"]).unchanged());
+        // Docker prefixes ids with `sha256:`; podman does not.
+        assert!(images(1, &["sha256:8a80"], &["8a80\n"]).unchanged());
+        // The pull moved the tag: the container runs the old image.
+        assert!(!images(1, &["9b91"], &["8a80"]).unchanged());
+        // The container is not running.
+        assert!(!images(1, &["8a80"], &[]).unchanged());
+        // Two services, one container.
+        assert!(!images(2, &["8a80", "c0de"], &["8a80"]).unchanged());
+        // No services at all says nothing about the containers.
+        assert!(!images(0, &[], &[]).unchanged());
+    }
+
+    #[test]
+    fn service_images_come_from_the_resolved_config_and_require_an_image() {
+        // `podman-compose config` output for the distill stack.
+        let config = "services:\n  qdrant:\n    image: docker.io/qdrant/qdrant:latest\n    \
+                      ports:\n    - 6333:6333\n    restart: always\n";
+        assert_eq!(
+            service_images(config).unwrap(),
+            ["docker.io/qdrant/qdrant:latest"]
+        );
+        let built = "services:\n  app:\n    build: .\n";
+        assert!(format!("{:#}", service_images(built).unwrap_err()).contains("names no image"));
+    }
+
+    /// Stand-ins for a compose runtime and its engine that describe one
+    /// running Qdrant container; `tag_id` is what the tag names after the
+    /// pull, the container always runs `8a80`.
+    fn fake_runtime(dir: &Path, tag_id: &str) -> (ComposeCmd, String) {
+        let log = dir.join("calls.log");
+        let compose = dir.join("fake-compose");
+        std::fs::write(
+            &compose,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {log}\ncase \"$3\" in\n\
+                 config) printf 'services:\\n  qdrant:\\n    image: q:latest\\n' ;;\n\
+                 ps) echo cid1 ;;\nesac\nexit 0\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        let engine = dir.join("fake-engine");
+        std::fs::write(
+            &engine,
+            format!("#!/bin/sh\nif [ \"$1\" = image ]; then echo {tag_id}; else echo 8a80; fi\n"),
+        )
+        .unwrap();
+        for f in [&compose, &engine] {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (
+            ComposeCmd {
+                bin: compose.to_string_lossy().into_owned(),
+                args_prefix: vec![],
+            },
+            engine.to_string_lossy().into_owned(),
+        )
+    }
+
+    fn verbs(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls.log"))
+            .unwrap()
+            .lines()
+            .map(|l| l.split(' ').nth(2).unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_healthy_service_is_left_running() {
+        let healthy = serve(HashMap::from([("/healthz".to_string(), Route::ok("ok"))])).await;
+        let url = format!("{healthy}/healthz");
+        let dir = tempfile::tempdir().unwrap();
+        let (compose, engine) = fake_runtime(dir.path(), "8a80");
+        let cf = dir.path().join("c.yml");
+        upgrade_compose_service(
+            &compose,
+            Some(&engine),
+            &cf,
+            "distill",
+            Some(&url),
+            &reporter(),
+        )
+        .await
+        .unwrap();
+        // Pulled and inspected; never stopped.
+        assert_eq!(verbs(dir.path()), ["pull", "config", "ps"]);
+    }
+
+    #[tokio::test]
+    async fn a_moved_tag_or_an_unhealthy_service_is_recreated() {
+        let healthy = serve(HashMap::from([("/healthz".to_string(), Route::ok("ok"))])).await;
+        let healthy = format!("{healthy}/healthz");
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}/healthz", l.local_addr().unwrap())
+        };
+        for (tag_id, url) in [("9b91", healthy.as_str()), ("8a80", dead.as_str())] {
+            let dir = tempfile::tempdir().unwrap();
+            let (compose, engine) = fake_runtime(dir.path(), tag_id);
+            let cf = dir.path().join("c.yml");
+            upgrade_compose_service(
+                &compose,
+                Some(&engine),
+                &cf,
+                "distill",
+                Some(url),
+                &reporter(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                verbs(dir.path()),
+                ["pull", "config", "ps", "down", "up"],
+                "tag {tag_id}, health {url}"
+            );
+        }
     }
 
     fn health_route(device: &str) -> HashMap<String, Route> {

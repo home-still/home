@@ -1,0 +1,4 @@
+limit5120 loaded: 2870 MiB in 2.5s
+thread 'main' (2142545) panicked at crates/hs-distill/examples/vram_growth.rs:38:36:
+called `Result::unwrap()` on an `Err` value: Embedding("Embedding failed: Non-zero status code returned while running Add node. Name:'/0/auto_model/encoder/layer.0/attention/self/Add' Status Message: ~/work/ort-artifacts/ort-artifacts/onnxruntime/onnxruntime/core/framework/bfc_arena.cc:359 void *onnxruntime::BFCArena::AllocateRawInternal(size_t, bool, Stream *) Available memory of 536870912 is sma
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

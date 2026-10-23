@@ -42,6 +42,19 @@ impl ComposeCmd {
         None
     }
 
+    /// The container engine behind this compose command — the binary that
+    /// answers `inspect` / `image inspect` for its containers: `docker` for
+    /// `docker compose` / `docker-compose`, `podman` for `podman compose` /
+    /// `podman-compose`. `None` for any other binary.
+    pub fn engine(&self) -> Option<&'static str> {
+        let name = std::path::Path::new(&self.bin).file_name()?.to_str()?;
+        match name {
+            "docker" | "docker-compose" => Some("docker"),
+            "podman" | "podman-compose" => Some("podman"),
+            _ => None,
+        }
+    }
+
     /// Run a compose command with visible output.
     pub async fn run(&self, args: &[&str]) -> Result<std::process::ExitStatus> {
         let mut full_args: Vec<&str> = self.args_prefix.iter().map(|s| s.as_str()).collect();

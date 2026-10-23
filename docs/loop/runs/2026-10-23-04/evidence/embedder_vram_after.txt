@@ -1,0 +1,11 @@
+after loaded: 2474 MiB in 4.0s
+after doc   1: 5556 MiB (peak 5556)
+after doc  26: 13056 MiB (peak 13056)
+after doc  51: 13056 MiB (peak 13056)
+after doc  76: 13056 MiB (peak 13056)
+after doc 101: 13056 MiB (peak 13056)
+after doc 126: 13056 MiB (peak 13056)
+after doc 151: 13056 MiB (peak 13056)
+after doc 176: 13056 MiB (peak 13056)
+after doc 200: 13056 MiB (peak 13056)
+after RESULT load=2474 MiB end=13056 MiB peak=13056 MiB docs=200 chunks=2465 words=2129649 embed_secs=155.3 chunks_per_s=15.9

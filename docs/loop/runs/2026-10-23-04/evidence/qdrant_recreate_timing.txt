@@ -1,0 +1,10 @@
+Throwaway Qdrant: reflink copy of the live 7.3 GB storage, docker.io/qdrant/qdrant:latest
+(image id 8a80c550...), port 16333. rc.387 upgrade sequence, image unchanged:
+run 1: pull 1.0s  down 1.4s  up 1.5s  until healthy 41.9s  outage(down..healthy) 44.8s
+run 2: pull 4.0s  down 3.9s  up 3.6s  until healthy 59.5s  outage(down..healthy) 67.0s
+
+Live Qdrant on the GPU host, read-only probe (2026-10-23):
+compose ps -q             -> e5b33cbbe0c6
+inspect {{.Image}}        -> 8a80c5500151ab2b08eb5874698b81b6b8addbc53ef4fb0c47f516680cf413d2
+image inspect {{.Id}} tag -> 8a80c5500151ab2b08eb5874698b81b6b8addbc53ef4fb0c47f516680cf413d2
+/healthz                  -> 200   => rc.388 leaves it running

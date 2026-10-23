@@ -1,0 +1,4 @@
+limit4096 loaded: 3382 MiB in 4.2s
+thread 'main' (2142261) panicked at crates/hs-distill/examples/vram_growth.rs:38:36:
+called `Result::unwrap()` on an `Err` value: Embedding("Embedding failed: Non-zero status code returned while running FusedMatMul node. Name:'/0/auto_model/encoder/layer.0/attention/self/MatMul/MatMulScaleFusion/' Status Message: ~/work/ort-artifacts/ort-artifacts/onnxruntime/onnxruntime/core/framework/bfc_arena.cc:359 void *onnxruntime::BFCArena::AllocateRawInternal(size_t, bool, Stream *) Availa
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

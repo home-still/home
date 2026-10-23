@@ -1,0 +1,53 @@
+//! Throwaway: the embedder's own VRAM as it indexes real documents.
+//!
+//! Builds the production `OnnxEmbedder` (default `EmbeddingConfig`:
+//! max_length 1280, adaptive batch) and feeds every *.md in a directory as
+//! the server would: the document cut into ~900-word chunks, one
+//! `embed_batch` per document. After each document it records this
+//! process's VRAM (nvidia-smi, per process). Usage: vram_growth <dir> <label>
+use hs_distill::config::{ComputeDevice, EmbeddingConfig};
+use hs_distill::embed::onnx::OnnxEmbedder;
+use hs_distill::embed::Embedder;
+use std::time::Instant;
+
+#[tokio::main]
+async fn main() {
+    let dir = std::env::args().nth(1).expect("dir");
+    let label = std::env::args().nth(2).unwrap_or_default();
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    paths.sort();
+    let t0 = Instant::now();
+    let e = OnnxEmbedder::new(&EmbeddingConfig::default(), ComputeDevice::Cuda).unwrap();
+    let load = hs_common::gpu::self_vram_mb().unwrap_or(0);
+    println!("{label} loaded: {load} MiB in {:.1}s", t0.elapsed().as_secs_f64());
+    let (mut peak, mut chunks, mut words) = (load, 0usize, 0usize);
+    let t = Instant::now();
+    for (i, p) in paths.iter().enumerate() {
+        let text = std::fs::read_to_string(p).unwrap();
+        let w: Vec<&str> = text.split_whitespace().collect();
+        let batch: Vec<String> = w.chunks(900).map(|c| c.join(" ")).collect();
+        if batch.is_empty() {
+            continue;
+        }
+        chunks += batch.len();
+        words += w.len();
+        e.embed_batch(batch).await.unwrap();
+        let now = hs_common::gpu::self_vram_mb().unwrap_or(0);
+        peak = peak.max(now);
+        if i % 25 == 0 || i + 1 == paths.len() {
+            println!("{label} doc {:>3}: {now} MiB (peak {peak})", i + 1);
+        }
+    }
+    let secs = t.elapsed().as_secs_f64();
+    println!(
+        "{label} RESULT load={load} MiB end={} MiB peak={peak} MiB docs={} chunks={chunks} \
+         words={words} embed_secs={secs:.1} chunks_per_s={:.1}",
+        hs_common::gpu::self_vram_mb().unwrap_or(0),
+        paths.len(),
+        chunks as f64 / secs
+    );
+}
