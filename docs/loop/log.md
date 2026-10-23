@@ -2909,3 +2909,63 @@ hs-common (all features) 374 tests pass; rustdoc unchanged at 30 warnings.
 3. **P0-27: derive the olmocr VRAM gate from vLLM's real requirement.**
 4. **P0-26: the docs port firewall rule on big** (operator, sudo).
 5. **P1-27: olmocr cold starts fail whole documents.**
+
+## 2026-10-23-04 — `hs upgrade` leaves an unchanged, healthy Qdrant running
+
+**First pick, blocked: the embedder's VRAM.** The olmocr tier has not
+converted since 2026-10-22 22:01 UTC. The idle distill embedder held
+8,510 MiB (6,462 a day earlier), leaving 13,137 MiB free against vLLM's
+~15,718 — stopping the idle `:7433` scribe is no longer enough. Measured
+with the real embedder on 200 real documents: the CUDA arena grows
+3,386 → 7,482 MiB on the first document (+4,096, a power-of-two step) and
+never shrinks; `kSameAsRequested` is worse (13,056); a hard
+`gpu_mem_limit` fails batches. The fix that would work (per-run arena
+shrinkage) needs a fastembed change. Written up with measured options in
+`needs-decision/gpu-budget-olmocr-vs-embedder.md`; BACKLOG **P0-29**.
+
+**Change.** After pulling, `hs upgrade` recreates a compose service only
+if its containers do not already run the images their tags name, or the
+service does not answer its health URL; otherwise it leaves them
+running. Any probe failure recreates, as before.
+
+**Evidence.** Every upgrade on the GPU host stopped and restarted Qdrant
+with an unchanged image. Measured on a throwaway Qdrant (reflink copy of
+the live 7.3 GB storage), the exact old sequence: search outage **44.8 s**
+and **67.0 s**. In production on 2026-10-22: ~7 minutes, after which the
+90 s wait failed a healthy upgrade (P0-25). Literature (in the corpus):
+Bass et al. — rolling upgrade, and *escalating restart* "minimizing the
+level of service affected".
+
+**Before / after.**
+
+| | rc.387 | rc.388 |
+|---|---|---|
+| Qdrant outage per upgrade, image unchanged | 44.8–67.0 s (copy), ~7 min (production) | **0 s** (left running) |
+| false "Timed out waiting for Qdrant" in that case | yes (P0-25) | no — never stopped |
+| changed image / stale or missing container / unhealthy | recreate | recreate (unchanged) |
+
+The live host, probed read-only with the same commands: container on
+image `8a80c550…`, tag names `8a80c550…`, `/healthz` 200 → left running.
+Not done for time: an end-to-end run of the real function against the
+throwaway Qdrant; covered by stand-in tests of both paths.
+
+**Gates.** fmt; clippy ×3; workspace tests 1,585 passed / 0 failed;
+`hs` 237. Version bake `hs 0.0.1-rc.388` with marker.
+
+**Version.** `v0.0.1-rc.388`, commit `7346514`. Tagged and pushed; the release workflow (run `40016609189`) was still running when this was written, so the artifacts are **not yet verified** — check `gh run view 40016609189 -R home-still/home` and the downloaded `hs` before deploying.
+
+**Fleet gap.** big, bmb and two run **rc.382** — six releases behind.
+
+### Top 5 remaining items
+
+1. **Operator: upgrade bmb** (rc.385 stops the gapped drops), then big
+   and two.
+2. **Operator: free the card for olmocr** — restart distill and stop
+   `:7433` (→ ~16.5 GB free), then set `embedding.idle_release_secs`
+   (P0-29).
+3. **P0-28: recover the retryable documents** after 1 (`hs pipeline
+   reconvert-failed --dry-run`).
+4. **P0-25 remainder:** when Qdrant's image did change, the 90 s wait
+   should tell "recovering" from "down".
+5. **P0-27 / P1-27:** derive the olmocr VRAM gate from vLLM's
+   requirement; wait for a cold model before invoking olmocr.

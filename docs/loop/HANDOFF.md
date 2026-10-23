@@ -1,7 +1,8 @@
 # Handoff — home-still improvement loop, 2026-10-23
 
-Iteration `2026-10-23-03` (rc.387) is complete: released (2026-10-23
-19:05 UTC, workflow green, artifacts verified) and logged. Repo:
+Latest iteration `2026-10-23-04` (rc.388): committed (`7346514`), tagged,
+pushed and logged. **Release workflow run `40016609189` was still running at
+handoff — verify it** (§2). Repo:
 `home-still`, branch `main`. The loop prompt is the project command
 `/build-loop` (`.omp/commands/build-loop.md`).
 
@@ -9,53 +10,28 @@ Iteration `2026-10-23-03` (rc.387) is complete: released (2026-10-23
 
 | | state |
 |---|---|
-| Latest release | `v0.0.1-rc.387` (33 assets; `hs`/`hs-mcp` checksums, arch, marker and `--version` verified) |
-| Last commit on `main` | `c8332b5` (rc.387 change), pushed |
-| Fleet | big, bmb, two all on **rc.382** — rc.384–387 not deployed (rc.383 withdrawn) |
+| Latest tag | `v0.0.1-rc.388` — workflow run `40016609189` **unverified at handoff**; rc.387 is the last verified release |
+| Last commit on `main` | rc.388 log/handoff commit after `7346514`, pushed |
+| Fleet | big, bmb, two all on **rc.382** — rc.384–388 not deployed (rc.383 withdrawn) |
 | Uncommitted | nothing (this file and the rc.387 log entry are committed) |
 | Conversion | effectively stopped: 0 stored in ~24 h (see §4) |
 
-## 2. The last iteration: rc.387 — catch-up never re-queues a failed conversion
+## 2. Next actions for whoever picks this up
 
-**Problem.** `hs pipeline catch-up` republished every source with no
-markdown, including documents already stamped `conversion_failed`. One run
-on 2026-10-21 put 1,086 events on the FIFO `PAPERS` queue: 1,010 retryable
-failures, 60 bad sources, 13 already converted, **3** real work. 101 new
-downloads queued behind them for two days. `hs status`'s Stalled row (888)
-counted stamped failures and told the operator to run catch-up.
-
-**Change (commit `c8332b5`).**
-- `hs-common/src/status.rs`: `count_unconverted_stems(.., stamped)` returns
-  `UnconvertedStems { all, unstamped }`. `all` → `pipeline_drift`
-  (unchanged meaning); `unstamped` → Stalled. Docs on
-  `stalled_conversions` / `record_queue` updated (Stalled undercounts while
-  old failure events drain — stated, not hidden).
-- `crates/hs-mcp/src/main.rs` (`system_status`): builds the stamped set from
-  the catalog listing it already has; no catalog ⇒ Stalled unknown.
-- `crates/hs/src/pipeline_cmd.rs`: `plan_catch_up(storage, stamped)` skips
-  stamped stems and returns them as `skipped_failed`; `cmd_catch_up` reads
-  the catalog (fails loudly if it can't), reports
-  "Skipped: N failed conversions (R retryable, B not) — re-queue them with
-  `hs pipeline reconvert-failed --dry-run`".
-- `crates/hs/README.md`: catch-up line. `BACKLOG.md`: new **P1-31** (fixed
-  in rc.387) and a note under **P0-28** about the 1,070 queued failure
-  events.
-
-**Verified.**
-- Live dry runs, same store, back to back
-  (`runs/2026-10-23-03/evidence/`): catch-up 2,152 → **144** republished,
-  2,008 skipped (1,888 retryable, 120 not). Stalled 888 → **0**; drift
-  2,144 → 2,145. The queue was read message-by-message: exactly 144
-  unstamped unconverted stems are already queued, so 0 is true.
-- fmt clean; clippy clean ×3 (workspace minus hs-scribe; hs-scribe
-  default; hs-scribe `server,cuda,eval`, all `--all-targets`).
-- Tests (`unshare -rn`, loopback up): workspace 1,581 passed / 8 ignored;
-  hs-scribe `--features server` 378; hs-common `--all-features` 374;
-  0 failed. rustdoc 30 warnings (= baseline). RECALL@10 25/25.
-- Version bake on HEAD: `hs 0.0.1-rc.387`, marker present.
-
-**Released and logged.** Nothing left in this iteration; the next one
-starts from §5.
+1. **Verify rc.388's release**: `gh run view 40016609189 -R home-still/home`
+   must be all green (Gate ×3, 5 builds, Publish, Docker). Then download
+   `hs` (x86_64 linux + aarch64 darwin), check `sha256sum -c` against
+   `checksums-sha256.txt`, `file`, the marker
+   `hs-version-marker:0.0.1-rc.388:end`, and `--version`. Download to a
+   directory on disk, not `/tmp` (a shared 16 GB RAM disk that fills up).
+   If anything failed: delete the tag locally and remotely, fix, cut rc.389,
+   and correct the rc.388 log entry.
+2. rc.388 (`hs upgrade` leaves an unchanged, healthy Qdrant running) is
+   unit-tested only; its first real run is the operator's next `hs
+   upgrade` on big — expect "Unchanged: distill: images unchanged and
+   healthy; containers left running".
+3. The GPU item (P0-29) is blocked on the operator — see
+   `needs-decision/gpu-budget-olmocr-vs-embedder.md`.
 
 ## 3. This session's releases
 
@@ -65,6 +41,7 @@ starts from §5.
 | 385 | streaming repetition detector fires only on consecutive loops (false positives 96 % → 3.6 % olmocr, 72 % → 0 % glm_ocr; two production-dropped PDFs now convert) | `621afa6` | `runs/2026-10-23-01/` |
 | 386 | failed conversions reported by what a retry can do (Failed row, progress 100 % → 88.9 %); `reconvert-failed` re-queues only retryable stamps, `--reason` selects | `e1e52ea` | `runs/2026-10-23-02/` |
 | 387 | catch-up skips failed conversions (2,152 → 144 republished); Stalled counts only unstamped (888 → 0) | `c8332b5` | `runs/2026-10-23-03/` |
+| 388 | `hs upgrade` leaves an unchanged, healthy compose service running (Qdrant outage 45–67 s / ~7 min → 0) — **artifacts unverified** | `7346514` | `runs/2026-10-23-04/` |
 
 Also: `/build-loop` project command (`c9f8f99`).
 
@@ -75,7 +52,7 @@ Full write-up: `docs/loop/needs-decision/gapped-drops-and-dead-olmocr.md`.
 1. **Upgrade bmb** (`hs upgrade --pre --yes` there). Until it runs rc.385,
    every glm_ocr conversion with ordinary repeated phrasing is refused as
    gapped and terminated — 87/87 terminations in a 6 h window were this.
-2. **Stop big's idle scribe:** `sudo systemctl stop hs-serve-scribe`
+2. **Free the card for olmocr (P0-29):** stopping `:7433` alone is no longer enough — the embedder grew to 8.5 GB. Restart distill *and* stop big's idle scribe: `sudo systemctl stop hs-serve-scribe`
    (`:7433`, disabled, not in the pool, 0 conversions, running since an
    accidental start 2026-10-02, holds 2,340 MiB). Without it ~16.4 GB is
    free, above vLLM's ~15.7 GB, so the olmocr tier can start (P0-27).
