@@ -12,10 +12,15 @@
 //!   1. the model is already resident (llama-swap `/running` names it), or
 //!   2. the card has at least `headroom_mb` free for llama-swap to load it.
 //!
+//! Both are overridden by the host GPU broker's yield file: while the
+//! card is yielded to another tenant, nothing is admitted — not even with
+//! our model resident — so in-flight work drains and the broker can evict.
+//!
 //! Hosts without a working `nvidia-smi` (Apple Silicon pool members)
 //! have no VRAM signal, so the VRAM half of the gate is skipped there —
 //! never disable a pool member for a measurement we cannot take.
 
+use std::path::Path;
 use std::time::Duration;
 
 /// Verdict for one backend at one instant.
@@ -25,10 +30,11 @@ pub struct BackendState {
     pub reachable: bool,
     /// Our model id appears in the `/running` set.
     pub model_resident: bool,
-    /// `model_resident || free_vram_mb >= headroom_mb` (VRAM half
-    /// skipped when the host exposes no NVIDIA GPU).
+    /// [`admission`] of this probe's inputs.
     pub can_start: bool,
     pub free_vram_mb: Option<u64>,
+    /// The tenant the card is yielded to (gpu-tenant's yield file), if any.
+    pub yielding_to: Option<String>,
     /// RFC 3339, millisecond precision, UTC.
     pub checked_at: String,
 }
@@ -45,6 +51,7 @@ impl BackendState {
             model_resident: false,
             can_start: false,
             free_vram_mb,
+            yielding_to: None,
             checked_at: now_rfc3339(),
         }
     }
@@ -85,10 +92,29 @@ fn running_contains(body: &serde_json::Value, model: &str) -> bool {
         .any(|e| e.model == model)
 }
 
+/// Whether a conversion may start: never while the card is yielded to
+/// another tenant; otherwise if our model is resident or the card has
+/// `headroom_mb` free. No nvidia-smi (`free_vram_mb: None`) ⇒ no VRAM
+/// gate, so Apple Silicon pool members stay dispatchable.
+fn admission(
+    model_resident: bool,
+    free_vram_mb: Option<u64>,
+    headroom_mb: u64,
+    yielding_to: Option<&str>,
+) -> bool {
+    yielding_to.is_none() && (model_resident || free_vram_mb.is_none_or(|f| f >= headroom_mb))
+}
+
 /// Probe the backend once. Never returns an error: an unreachable
 /// backend is a verdict (`reachable: false`), not a failure of the
-/// health handler.
-pub async fn probe(endpoint: &str, model: &str, headroom_mb: u64) -> BackendState {
+/// health handler. `yield_file` is the GPU broker's yield file, when the
+/// host has one.
+pub async fn probe(
+    endpoint: &str,
+    model: &str,
+    headroom_mb: u64,
+    yield_file: Option<&Path>,
+) -> BackendState {
     let free_vram_mb = hs_common::gpu::free_vram_mb_async().await;
     let url = format!("{}/running", swap_base(endpoint));
 
@@ -113,15 +139,19 @@ pub async fn probe(endpoint: &str, model: &str, headroom_mb: u64) -> BackendStat
     };
 
     let model_resident = running_contains(&body, model);
-    // No nvidia-smi ⇒ no VRAM gate on this host (Apple Silicon pool
-    // members must stay dispatchable).
-    let vram_ok = free_vram_mb.is_none_or(|free| free >= headroom_mb);
+    let yielding_to = yield_file.and_then(|p| hs_common::gpu::yield_holder(p, chrono::Utc::now()));
 
     BackendState {
         reachable: true,
         model_resident,
-        can_start: model_resident || vram_ok,
+        can_start: admission(
+            model_resident,
+            free_vram_mb,
+            headroom_mb,
+            yielding_to.as_deref(),
+        ),
         free_vram_mb,
+        yielding_to,
         checked_at: now_rfc3339(),
     }
 }
@@ -207,6 +237,7 @@ mod tests {
             model_resident: false,
             can_start: true,
             free_vram_mb: Some(20000),
+            yielding_to: None,
             checked_at: now_rfc3339(),
         };
         assert!(base.admits());
@@ -220,5 +251,27 @@ mod tests {
             ..base
         }
         .admits());
+    }
+
+    #[test]
+    fn a_yield_blocks_even_a_resident_model() {
+        assert!(admission(true, Some(0), 15000, None));
+        assert!(!admission(
+            true,
+            Some(24000),
+            15000,
+            Some("qwen3.8-27b@big")
+        ));
+        assert!(!admission(false, None, 15000, Some("qwen3.8-27b@big")));
+    }
+
+    #[test]
+    fn headroom_admits_at_exactly_the_threshold() {
+        assert!(admission(false, Some(15000), 15000, None));
+        assert!(!admission(false, Some(14999), 15000, None));
+        assert!(
+            admission(false, None, 15000, None),
+            "no nvidia-smi ⇒ no VRAM gate"
+        );
     }
 }

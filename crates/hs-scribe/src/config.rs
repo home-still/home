@@ -220,6 +220,19 @@ pub struct AppConfig {
     /// Hosts without an NVIDIA GPU have no free-VRAM signal and skip the
     /// gate entirely. Override via `HS_SCRIBE_VRAM_HEADROOM_MB`.
     pub vram_headroom_mb: u64,
+    /// The host GPU broker's yield file (gpu-tenant writes
+    /// `{"for", "since", "expires"}`). While it names an unexpired
+    /// tenant, `/health` refuses dispatch even with the model resident, so
+    /// in-flight conversions drain and the broker can evict the backend.
+    /// `None` (default): no broker on this host.
+    #[serde(default)]
+    pub gpu_yield_file: Option<PathBuf>,
+    /// Command that asks the host GPU broker to make room when the
+    /// admission gate refuses (it is run with `--need-mib
+    /// <vram_headroom_mb>` appended, at most every 30 s, without blocking
+    /// the health check). `None` (default): the gate only waits.
+    #[serde(default)]
+    pub gpu_make_room_cmd: Option<Vec<String>>,
 }
 
 /// CUDA exists on every platform the server runs on except macOS (Metal via
@@ -272,6 +285,8 @@ impl Default for AppConfig {
             olmocr_model: "olmocr".into(),
             olmocr_bin: "olmocr".into(),
             vram_headroom_mb: 15000,
+            gpu_yield_file: None,
+            gpu_make_room_cmd: None,
         }
     }
 }

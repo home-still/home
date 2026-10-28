@@ -223,6 +223,10 @@ pub struct HealthResponse {
     /// which is the question an operator actually has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_vram_holders: Option<String>,
+    /// The tenant the host's GPU broker has yielded the card to. While
+    /// set, the gate refuses dispatch even with the model resident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_yielding_to: Option<String>,
     /// RFC 3339 timestamp of the last admission probe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_checked_at: Option<String>,

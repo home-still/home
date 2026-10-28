@@ -296,6 +296,98 @@ pub async fn compute_apps_summary_async() -> String {
     APPS_CACHE.get(GPU_SNAPSHOT_TTL, compute_apps_summary).await
 }
 
+/// Who the card is currently yielded to, read from gpu-tenant's yield file
+/// (`{"for": "...", "since": RFC3339, "expires": RFC3339}`). `Some(for)`
+/// only while the yield is unexpired; a missing file, an expired yield or
+/// a malformed file (warned) mean "not yielded".
+#[cfg(feature = "gpu-async")]
+pub fn yield_holder(path: &std::path::Path, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Yield {
+        #[serde(rename = "for")]
+        holder: String,
+        expires: String,
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
+    let parsed = serde_json::from_str::<Yield>(&raw)
+        .map_err(|e| e.to_string())
+        .and_then(|y| {
+            chrono::DateTime::parse_from_rfc3339(&y.expires)
+                .map(|exp| (y.holder, exp))
+                .map_err(|e| format!("expires: {e}"))
+        });
+    match parsed {
+        Ok((holder, expires)) if expires > now => Some(holder),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "malformed GPU yield file; ignoring it");
+            None
+        }
+    }
+}
+
+/// How long a make-room hook may run: it can drain a peer tenant
+/// before answering.
+const MAKE_ROOM_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// Ask the host's GPU broker to free `need_mb` of VRAM: runs
+/// `argv[0] argv[1..] --need-mib <need_mb>` (killed after
+/// [`MAKE_ROOM_TIMEOUT`]) and returns true iff it exits 0. BLOCKING;
+/// async callers use [`make_room_async`].
+pub fn make_room(argv: &[String], need_mb: u64) -> bool {
+    let Some((program, args)) = argv.split_first() else {
+        return false;
+    };
+    let mut child = match Command::new(program)
+        .args(args)
+        .arg("--need-mib")
+        .arg(need_mb.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(program = %program, error = %e, "GPU make-room hook failed to start");
+            return false;
+        }
+    };
+    let deadline = Instant::now() + MAKE_ROOM_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::warn!(program = %program, "GPU make-room hook timed out; killed");
+                return false;
+            }
+            Err(_) => return false,
+        }
+    };
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    tracing::info!(
+        program = %program,
+        code = ?status.code(),
+        answer = out.lines().next().unwrap_or(""),
+        "GPU make-room hook ran"
+    );
+    status.success()
+}
+
+/// [`make_room`] on a blocking thread.
+#[cfg(feature = "gpu-async")]
+pub async fn make_room_async(argv: Vec<String>, need_mb: u64) -> bool {
+    tokio::task::spawn_blocking(move || make_room(&argv, need_mb))
+        .await
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +597,76 @@ mod tests {
                 2,
                 "stale entry not refreshed"
             );
+        }
+    }
+
+    #[cfg(feature = "gpu-async")]
+    mod yield_file {
+        use super::super::yield_holder;
+        use chrono::{TimeZone, Utc};
+
+        fn write(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+            let p = dir.path().join("yield.json");
+            std::fs::write(&p, body).unwrap();
+            p
+        }
+
+        const BODY: &str = r#"{"for":"qwen3.8-27b@big","since":"2026-10-28T10:00:00+00:00","expires":"2026-10-28T10:01:30+00:00"}"#;
+
+        #[test]
+        fn missing_file_is_not_yielded() {
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(
+                yield_holder(&dir.path().join("yield.json"), Utc::now()),
+                None
+            );
+        }
+
+        #[test]
+        fn active_yield_names_its_holder_until_it_expires() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = write(&dir, BODY);
+            let before = Utc.with_ymd_and_hms(2026, 10, 28, 10, 1, 29).unwrap();
+            let at = Utc.with_ymd_and_hms(2026, 10, 28, 10, 1, 30).unwrap();
+            assert_eq!(yield_holder(&p, before).as_deref(), Some("qwen3.8-27b@big"));
+            assert_eq!(yield_holder(&p, at), None, "expired at its expiry instant");
+        }
+
+        #[test]
+        fn malformed_file_is_not_yielded() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = write(&dir, "{\"for\": 3");
+            assert_eq!(yield_holder(&p, Utc::now()), None);
+        }
+    }
+
+    // `sh` and `false` are POSIX tools; the broker hook exists only on Linux hosts.
+    #[cfg(unix)]
+    mod make_room_hook {
+        use super::super::make_room;
+
+        fn argv(a: &[&str]) -> Vec<String> {
+            a.iter().map(|s| s.to_string()).collect()
+        }
+
+        #[test]
+        fn passes_need_mib_and_reports_exit_status() {
+            // $1 = --need-mib, $2 = the amount.
+            assert!(make_room(
+                &argv(&["sh", "-c", "test \"$2\" = 5000", "x"]),
+                5000
+            ));
+            assert!(!make_room(
+                &argv(&["sh", "-c", "test \"$2\" = 5000", "x"]),
+                4999
+            ));
+        }
+
+        #[test]
+        fn failing_or_missing_hook_is_refusal() {
+            assert!(!make_room(&argv(&["false"]), 1));
+            assert!(!make_room(&argv(&["/nonexistent/gpu-tenant"]), 1));
+            assert!(!make_room(&[], 1));
         }
     }
 }

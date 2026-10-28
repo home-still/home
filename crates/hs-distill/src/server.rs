@@ -43,6 +43,7 @@ pub fn app(state: Arc<DistillServerState>, token: BackendToken) -> Router {
         .route("/collection/reset", post(handle_reset_collection))
         .route("/collection/hnsw", post(handle_enable_hnsw))
         .route("/scrub-interstitials", post(handle_scrub_interstitials))
+        .route("/embedder/release", post(handle_release_embedder))
         .route_layer(middleware::from_fn_with_state(token, require_token));
     Router::new()
         .route("/health", get(handle_health))
@@ -95,6 +96,10 @@ async fn handle_enable_hnsw(
     Query(q): Query<CollectionQuery>,
 ) -> Response {
     reply(state.enable_hnsw(q.collection.as_deref()).await)
+}
+
+async fn handle_release_embedder(State(state): State<Arc<DistillServerState>>) -> Response {
+    reply(state.release_embedder().await)
 }
 
 fn error_response(e: ApiError) -> Response {
