@@ -218,6 +218,13 @@ The markdown keeps the PDF's pages: the server reads olmocr's result document (`
 | `HS_SCRIBE_OLMOCR_MODEL` | `olmocr` | Model name the endpoint serves |
 | `HS_SCRIBE_VRAM_HEADROOM_MB` | `15000` | Free VRAM needed to cold-start the model; below it (and with the model not resident) `/health` and `/readiness` refuse work |
 
+On a host with a GPU broker (big's `gpu-tenant`), two `scribe_server:` keys in `config.yaml` connect the gate to it:
+
+| Key | Default | Description |
+|---|---|---|
+| `gpu_yield_file` | unset | The broker's yield file (`{"for","since","expires"}`). While it names an unexpired tenant, `/health` and `/readiness` refuse work even with the model resident, so in-flight conversions drain and the broker can evict the model. `/health` reports the tenant as `backend_yielding_to` |
+| `gpu_make_room_cmd` | unset | Argv run in the background (with `--need-mib <headroom>` appended, at most every 30 s) whenever the gate refuses; the broker decides whether to free the card |
+
 ## Models
 
 | Model | Size | Purpose |

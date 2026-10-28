@@ -590,6 +590,9 @@ fn backend_unavailable_reason(health: Option<&hs_scribe::client::HealthResponse>
         return "backend unavailable".to_string();
     };
     let mut parts: Vec<String> = Vec::new();
+    if let Some(holder) = h.backend_yielding_to.as_deref() {
+        parts.push(format!("GPU yielded to {holder}"));
+    }
     if h.backend_reachable == Some(false) {
         parts.push("the VLM backend is unreachable".to_string());
     }
@@ -4200,6 +4203,7 @@ mod backend_reason_tests {
             backend_vram_free_mb: free,
             backend_vram_headroom_mb: headroom,
             backend_vram_holders: holders.map(str::to_string),
+            backend_yielding_to: None,
             backend_checked_at: None,
         }
     }

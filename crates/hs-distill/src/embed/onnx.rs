@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,10 +36,10 @@ pub struct OnnxEmbedder {
     /// keeps the model warm for its own duration without the sweeper
     /// racing it to release.
     last_used_ms: Arc<AtomicI64>,
-    /// Free-VRAM floor enforced before every (re)load. Copied from
-    /// config so the lazy-reload path inside `spawn_blocking` can apply
-    /// the same gate as startup.
-    vram_floor_mb: u64,
+    /// The gate every lazy (re)load passes: free-VRAM floor, the host
+    /// GPU broker's yield, and its make-room hook. Shared with the
+    /// `spawn_blocking` reload path.
+    load_gate: Arc<LoadGate>,
 }
 
 impl OnnxEmbedder {
@@ -99,7 +100,11 @@ impl OnnxEmbedder {
             max_length: config.max_length,
             batch_ctrl: Arc::new(AdaptiveBatchController::new(adaptive_cfg)),
             last_used_ms,
-            vram_floor_mb: config.vram_floor_mb,
+            load_gate: Arc::new(LoadGate {
+                floor_mb: config.vram_floor_mb,
+                yield_file: config.gpu_yield_file.clone(),
+                make_room_cmd: config.gpu_make_room_cmd.clone(),
+            }),
         })
     }
 }
@@ -179,6 +184,45 @@ fn require_vram(floor_mb: u64) -> Result<(), DistillError> {
         )));
     }
     Ok(())
+}
+
+/// What a lazy (re)load of the pool must pass.
+struct LoadGate {
+    floor_mb: u64,
+    /// The host GPU broker's yield file; while it names a tenant the card
+    /// is theirs.
+    yield_file: Option<PathBuf>,
+    /// The broker's make-room hook, run once when the load is blocked.
+    make_room_cmd: Option<Vec<String>>,
+}
+
+impl LoadGate {
+    /// `Ok` when the pool may load now. A blocked load asks the broker
+    /// for room once and re-checks; still blocked is a `gpu busy`
+    /// embedding error, which `hs distill watch-events` NAKs for
+    /// redelivery. BLOCKING (the hook may drain another tenant).
+    fn check(&self) -> Result<(), DistillError> {
+        let Err(blocked) = self.blocked() else {
+            return Ok(());
+        };
+        match &self.make_room_cmd {
+            Some(cmd) if hs_common::gpu::make_room(cmd, self.floor_mb) => self.blocked(),
+            _ => Err(blocked),
+        }
+    }
+
+    fn blocked(&self) -> Result<(), DistillError> {
+        if let Some(holder) = self
+            .yield_file
+            .as_deref()
+            .and_then(|p| hs_common::gpu::yield_holder(p, chrono::Utc::now()))
+        {
+            return Err(DistillError::Embedding(format!(
+                "gpu busy: yielded to {holder}"
+            )));
+        }
+        require_vram(self.floor_mb)
+    }
 }
 
 /// The VRAM one row of a forward pass needs *beyond* the resident model:
@@ -331,8 +375,8 @@ impl Embedder for OnnxEmbedder {
         let texts_len = texts.len();
         let batch_size = self.batch_ctrl.current();
         let pool = Arc::clone(&self.pool);
-        let (vram_floor_mb, max_length, dimension) =
-            (self.vram_floor_mb, self.max_length, self.dimension);
+        let (load_gate, max_length, dimension) =
+            (Arc::clone(&self.load_gate), self.max_length, self.dimension);
 
         // fastembed's `embed` is synchronous and CPU/GPU-heavy. spawn_blocking
         // keeps it off the tokio worker threads. `texts` moves in; nothing is
@@ -344,11 +388,12 @@ impl Embedder for OnnxEmbedder {
                 // request after release pays the ~10 s load cost; subsequent
                 // requests are fast.
                 || {
-                    // Same free-VRAM gate as startup. Returning the error
-                    // here makes `hs distill watch-events` NAK so JetStream
-                    // redelivers once the card frees up — a CUDA OOM at this
-                    // point poisons the session for every later request.
-                    require_vram(vram_floor_mb)?;
+                    // Same free-VRAM gate as startup, plus the GPU
+                    // broker's yield. Returning the error here makes
+                    // `hs distill watch-events` NAK so JetStream redelivers
+                    // once the card frees up — a CUDA OOM at this point
+                    // poisons the session for every later request.
+                    load_gate.check()?;
                     tracing::info!("lazy-loading bge-m3 after idle release");
                     let mut m = build_text_embedding(max_length)?;
                     // Same CUDA-residency gate as startup: a driver hiccup or
@@ -434,5 +479,9 @@ impl Embedder for OnnxEmbedder {
 
     fn slots(&self) -> usize {
         self.pool.len()
+    }
+
+    fn release_idle(&self) -> usize {
+        self.pool.release_idle().released
     }
 }

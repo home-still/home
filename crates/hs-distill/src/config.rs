@@ -433,6 +433,18 @@ pub struct EmbeddingConfig {
     /// Hosts without an NVIDIA GPU have no signal and skip the gate.
     #[serde(default = "default_vram_floor_mb")]
     pub vram_floor_mb: u64,
+    /// The host GPU broker's yield file (gpu-tenant writes
+    /// `{"for", "since", "expires"}`). While it names an unexpired
+    /// tenant, a lazy (re)load of the pool is refused with `gpu busy`, so
+    /// the event is NAK'd and redelivered. `None` (default): no broker.
+    #[serde(default)]
+    pub gpu_yield_file: Option<PathBuf>,
+    /// Command that asks the host GPU broker to make room when a lazy
+    /// (re)load is blocked (run with `--need-mib <vram_floor_mb>`
+    /// appended; a zero exit means "try again now"). `None` (default):
+    /// a blocked load fails at once.
+    #[serde(default)]
+    pub gpu_make_room_cmd: Option<Vec<String>>,
 }
 
 /// bge-m3 needs ~4.4 GB resident; 5000 MB leaves a little slack for the
@@ -452,6 +464,8 @@ impl Default for EmbeddingConfig {
             compute_device: ComputeDevice::Cuda,
             idle_release_secs: None,
             vram_floor_mb: default_vram_floor_mb(),
+            gpu_yield_file: None,
+            gpu_make_room_cmd: None,
         }
     }
 }

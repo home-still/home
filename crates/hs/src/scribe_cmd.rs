@@ -15,12 +15,16 @@ use std::sync::Arc;
 /// headroom. A body without the numbers still says what it can and
 /// guesses nothing.
 fn describe_the_refusal(h: &hs_scribe::client::HealthResponse) -> String {
-    let mut why = format!(
+    let mut why = String::new();
+    if let Some(holder) = h.backend_yielding_to.as_deref() {
+        why.push_str(&format!("GPU yielded to {holder}; "));
+    }
+    why.push_str(&format!(
         "{} MB VRAM free",
         h.backend_vram_free_mb
             .map(|mb| mb.to_string())
             .unwrap_or_else(|| "unknown".into())
-    );
+    ));
     if let Some(headroom) = h.backend_vram_headroom_mb {
         why.push_str(&format!(", needs {headroom} MB"));
     }
@@ -1412,6 +1416,7 @@ mod refusal_tests {
             backend_vram_free_mb: free,
             backend_vram_headroom_mb: headroom,
             backend_vram_holders: holders.map(|h| h.to_string()),
+            backend_yielding_to: None,
             backend_checked_at: Some("2026-10-22T12:50:15.955Z".into()),
         }
     }

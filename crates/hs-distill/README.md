@@ -95,6 +95,8 @@ All fields have defaults and are optional. The server refuses to start on an inv
 | `embedding.adaptive_batch` | `true` | Tune the batch size in-process against observed throughput, starting from `batch_size`. A batch the accelerator **cannot allocate** also tunes it — down, not up: the card is busy, and a smaller batch is the answer |
 | `embedding.idle_release_secs` | unset | Drop the model from GPU memory after this many idle seconds (at least 1); the next request reloads it (~10 s). Unset keeps it resident |
 | `embedding.vram_floor_mb` | `5000` | Free VRAM required before (re)loading the model; below it the load fails naming the GPU holders |
+| `embedding.gpu_yield_file` | unset | The host GPU broker's yield file (`{"for","since","expires"}`). While it names an unexpired tenant a (re)load fails with `gpu busy: yielded to <tenant>`, so the event is NAK'd and redelivered |
+| `embedding.gpu_make_room_cmd` | unset | Argv run once (with `--need-mib <vram_floor_mb>` appended) when a (re)load is blocked; exit 0 means "try again now" |
 | `hnsw.m` / `hnsw.ef_construct` | `16` / `100` | HNSW graph of **new** collections (`m: 0` is rejected) |
 | `hnsw.search_ef` | `128` | Candidates considered per query |
 | `hnsw.max_indexing_threads` | `4` | Index-build threads used by `POST /collection/hnsw` (1..=64) |
@@ -271,6 +273,7 @@ Each markdown file goes through:
 | `/doc/{doc_id}/title` | POST | Write a title onto a document's points. A **payload** update: the vector is untouched, so it is not a re-embed and needs no embedding model. An empty title is a 400 |
 | `/doc/{doc_id}`, `/collection/reset`, `/scrub-interstitials` | DELETE / POST | Destructive maintenance |
 | `/collection/hnsw?collection=<name>` | POST | Enable HNSW on an existing collection with `hnsw.m`/`ef_construct`, capped at `hnsw.max_indexing_threads` (default 4). Returns immediately (Qdrant builds the graph in the background); a no-op that says so when already enabled. Never run at startup — use `hs distill hnsw enable --collection <name>` in a maintenance window |
+| `/embedder/release` | POST | Drop the model of every idle pool slot now (`{"released": n}`); the next embed reloads it. Used by the host GPU broker before it hands the card to another tenant |
 
 **Authentication.** `hs-distill-server` refuses to start unless `HS_BACKEND_TOKEN` (≥ 32 visible ASCII bytes, e.g. `openssl rand -hex 32`; the same value as the gateway and every client host) is set — put it in `~/.home-still/secrets.env`. Every route except `GET /health` and `GET /readiness` requires `Authorization: Bearer <token>` and answers 401 (JSON body) otherwise. `DistillClient` sends it automatically from the same variable.
 
