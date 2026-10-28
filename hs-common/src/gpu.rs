@@ -640,6 +640,8 @@ mod tests {
         }
     }
 
+    // `sh` and `false` are POSIX tools; the broker hook exists only on Linux hosts.
+    #[cfg(unix)]
     mod make_room_hook {
         use super::super::make_room;
 
