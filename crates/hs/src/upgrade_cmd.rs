@@ -569,19 +569,58 @@ mod tests {
         Arc::new(hs_common::reporter::SilentReporter)
     }
 
+    /// Stand-in scripts answer `--hs-ready` by exiting, which is how
+    /// [`make_exec_ready`] probes them.
+    const STAND_IN_PREAMBLE: &str = "#!/bin/sh\n[ \"$1\" = --hs-ready ] && exit 0\n";
+
+    /// Return only once `path` can be exec'd.
+    ///
+    /// A script written by one test thread can be inherited, still open for
+    /// writing, by a child another thread forks at that moment; until that
+    /// child execs, exec'ing the script fails with `ETXTBSY` ("Text file
+    /// busy"). Observed on the self-hosted runner 2026-11-05
+    /// (`failed to run compose -f …/docker-compose.yml pull: Text file busy
+    /// (os error 26)`) and reproduced on the host in 3 of 8 runs. One
+    /// successful exec proves no writer is left, and none can appear again
+    /// because the file is never reopened, so retry ONLY on `ETXTBSY`.
+    fn make_exec_ready(path: &Path) {
+        for _ in 0..1000 {
+            match std::process::Command::new(path).arg("--hs-ready").status() {
+                Ok(status) => {
+                    assert!(
+                        status.success(),
+                        "{}: readiness probe {status}",
+                        path.display()
+                    );
+                    return;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("{}: {e}", path.display()),
+            }
+        }
+        panic!("{}: still busy after 1000 exec attempts", path.display());
+    }
+
+    /// Write `body` as an exec-ready stand-in script at `path`.
+    fn write_stand_in(path: &Path, body: &str) {
+        std::fs::write(path, format!("{STAND_IN_PREAMBLE}{body}")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        make_exec_ready(path);
+    }
+
     /// Stand-in compose binary: logs argv, exits 1 for the subcommand in `$FAIL`.
     fn fake_compose(dir: &Path, fail_on: &str) -> ComposeCmd {
         let bin = dir.join("fake-compose");
         let log = dir.join("calls.log");
-        std::fs::write(
+        write_stand_in(
             &bin,
-            format!(
-                "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$3\" = \"{fail_on}\" ]; then echo boom >&2; exit 1; fi\nexit 0\n",
+            &format!(
+                "echo \"$@\" >> {}\nif [ \"$3\" = \"{fail_on}\" ]; then echo boom >&2; exit 1; fi\nexit 0\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         ComposeCmd {
             bin: bin.to_string_lossy().into_owned(),
             args_prefix: vec![],
@@ -672,25 +711,20 @@ mod tests {
     fn fake_runtime(dir: &Path, tag_id: &str) -> (ComposeCmd, String) {
         let log = dir.join("calls.log");
         let compose = dir.join("fake-compose");
-        std::fs::write(
+        write_stand_in(
             &compose,
-            format!(
-                "#!/bin/sh\necho \"$@\" >> {log}\ncase \"$3\" in\n\
+            &format!(
+                "echo \"$@\" >> {log}\ncase \"$3\" in\n\
                  config) printf 'services:\\n  qdrant:\\n    image: q:latest\\n' ;;\n\
                  ps) echo cid1 ;;\nesac\nexit 0\n",
                 log = log.display()
             ),
-        )
-        .unwrap();
+        );
         let engine = dir.join("fake-engine");
-        std::fs::write(
+        write_stand_in(
             &engine,
-            format!("#!/bin/sh\nif [ \"$1\" = image ]; then echo {tag_id}; else echo 8a80; fi\n"),
-        )
-        .unwrap();
-        for f in [&compose, &engine] {
-            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+            &format!("if [ \"$1\" = image ]; then echo {tag_id}; else echo 8a80; fi\n"),
+        );
         (
             ComposeCmd {
                 bin: compose.to_string_lossy().into_owned(),
