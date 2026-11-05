@@ -11,7 +11,7 @@ use crossterm::ExecutableCommand;
 use hs_common::global_args::{GlobalArgs, OutputFormat};
 use hs_common::status::{FailedConversions, FailureKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
 
 // ── Data model ──────────────────────────────────────────────────
 
@@ -451,16 +451,15 @@ fn render(frame: &mut Frame, data: &DashboardData) {
     // show all of it. The height is one line per service, plus the
     // extra lines the longest status needs, plus the block's two border
     // rows and the Qdrant row.
-    let status_width = services_status_width(
-        &data.scribe_servers,
-        &data.distill_servers,
-        frame.area().width.saturating_sub(4),
-    );
-    let status_lines =
-        services_status_lines(&data.scribe_servers, &data.distill_servers, status_width);
-    let services_height = (data.scribe_servers.len() + data.distill_servers.len()) as u16
-        + status_lines.saturating_sub(1)
-        + 3;
+    let width = frame.area().width.saturating_sub(4);
+    let diagnosis_lines =
+        services_diagnosis_lines(&data.scribe_servers, &data.distill_servers, width);
+    // service rows + the Qdrant row + the header row + the diagnosis block
+    // + the block's two border rows. Getting this one line short is exactly
+    // how the Indexer row vanished in rc.380 and how the diagnosis block
+    // went missing here: ratatui clips silently.
+    let services_height =
+        (data.scribe_servers.len() + data.distill_servers.len()) as u16 + 2 + diagnosis_lines + 2;
 
     let outer = Layout::vertical([
         Constraint::Length(1),               // title
@@ -919,22 +918,16 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
 
     let mut rows = Vec::new();
 
-    // The Status column's width comes from its **content**: a short label
-    // ("running", "idle", "3 converting") needs 24 characters, but the
-    // VRAM-gate diagnosis is 167 characters and must not be cut back to
-    // "backend unavailable: 12." — that truncation throws away exactly
-    // the part that tells the operator what to do. The width is the
-    // longest status line, clamped so the URL (which the operator also
-    // reads) always has room; a diagnosis longer than the terminal wraps
-    // onto more lines and the row gets taller, which is the honest
-    // rendering.
-    let status_width =
-        services_status_width(&data.scribe_servers, &data.distill_servers, inner.width);
-    let status_lines =
-        services_status_lines(&data.scribe_servers, &data.distill_servers, status_width);
-    // The URL is never truncated: the operator needs to know which tier
-    // the row is about, and `http://scribe.exa` does not say that.
-    let url_width = services_url_width(&data.scribe_servers, &data.distill_servers, inner.width);
+    // The Status column carries the **verdict**, never the diagnosis. A
+    // short label ("running", "idle", "3 converting") and a two-word
+    // verdict ("backend unavailable") are both short, so the column stays
+    // at its natural width and the table stays scannable. The diagnosis —
+    // which can run to 167 characters on a shared card — is drawn whole
+    // on its own line *beneath* the row, at the full table width, where
+    // it can be read as a sentence instead of wrapped into a paragraph
+    // four words wide. Squeezing it into this column is what produced the
+    // wall of `pid=… NNNMB` fragments.
+    let columns = services_columns(&data.scribe_servers, &data.distill_servers, inner.width);
 
     for svc in &data.scribe_servers {
         let (indicator, ind_style) = if svc.healthy {
@@ -943,17 +936,14 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
             ("○", Style::default().fg(Color::Red))
         };
         let status_text = format_status_activity(svc.healthy, "running", &svc.activity);
-        let row = Row::new(vec![
+        rows.push(Row::new(vec![
             Cell::from("Scribe"),
             Cell::from(indicator).style(ind_style),
-            status_cell(&status_text, status_width),
+            Cell::from(status_text),
             Cell::from(svc.url.clone()),
             Cell::from(svc.detail.clone()).style(Style::default().fg(Color::DarkGray)),
             Cell::from(svc.version.clone()).style(Style::default().fg(Color::DarkGray)),
-        ]);
-        // A ratatui row is ONE line tall unless told otherwise, so a
-        // wrapped diagnosis would be cut at the first line.
-        rows.push(row.height(status_lines));
+        ]));
     }
 
     for svc in &data.distill_servers {
@@ -963,15 +953,14 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
             ("○", Style::default().fg(Color::Red))
         };
         let status_text = format_status_activity(svc.healthy, "running", &svc.activity);
-        let row = Row::new(vec![
+        rows.push(Row::new(vec![
             Cell::from("Distill"),
             Cell::from(indicator).style(ind_style),
-            status_cell(&status_text, status_width),
+            Cell::from(status_text),
             Cell::from(svc.url.clone()),
             Cell::from(svc.detail.clone()).style(Style::default().fg(Color::DarkGray)),
             Cell::from(svc.version.clone()).style(Style::default().fg(Color::DarkGray)),
-        ]);
-        rows.push(row.height(status_lines));
+        ]));
     }
 
     let (q_indicator, q_style) = if data.qdrant_healthy {
@@ -1001,33 +990,60 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(8),            // Name
-            Constraint::Length(2),            // Indicator
-            Constraint::Length(status_width), // Status + Activity
-            Constraint::Length(url_width),    // URL — never truncated
-            Constraint::Length(12),           // Detail (the compute device)
-            Constraint::Length(16),           // Version
+            Constraint::Length(columns[0]), // Name
+            Constraint::Length(columns[1]), // Indicator
+            Constraint::Length(columns[2]), // Status verdict
+            Constraint::Length(columns[3]), // URL
+            Constraint::Length(columns[4]), // Detail (the compute device)
+            Constraint::Length(columns[5]), // Version
         ],
     );
 
-    frame.render_widget(table, inner);
-}
+    // The verdict rows take the top of the panel (one line each, plus the
+    // header); whatever is left holds the diagnoses.
+    let row_count = data.scribe_servers.len() as u16 + data.distill_servers.len() as u16 + 2;
+    let [table_area, diagnosis_area] =
+        Layout::vertical([Constraint::Length(row_count), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(table, table_area);
 
-/// The Status cell of the Services table.
-///
-/// A tier that is refusing work carries a **diagnosis** — the free VRAM,
-/// the headroom it needs and who is holding the card — which is far
-/// longer than the column's old fixed 24 characters. Truncating it back
-/// to `backend unavailable: 12.` would throw away exactly the part that
-/// tells the operator what to do.
-///
-/// A ratatui table cell **truncates** its text rather than wrapping it,
-/// so the text is wrapped here, at the column's width, into the lines
-/// the cell holds. A short label (`running`, `idle`, `3 converting`) is
-/// one line, as before.
-fn status_cell(text: &str, width: u16) -> Cell<'static> {
-    let lines: Vec<Line<'static>> = wrap_text(text, width).into_iter().map(Line::from).collect();
-    Cell::from(Text::from(lines))
+    let mut notes: Vec<Line<'static>> = Vec::new();
+    for (name, svc) in data
+        .scribe_servers
+        .iter()
+        .map(|s| ("Scribe", s))
+        .chain(data.distill_servers.iter().map(|s| ("Distill", s)))
+    {
+        let Some(detail) = diagnosis(&svc.activity) else {
+            continue;
+        };
+        // Wrapped at the panel's own width, on word boundaries, so the
+        // whole diagnosis is readable as prose. Prefixed with the tier it
+        // belongs to: the block is no longer aligned under its row.
+        //
+        // The gutter is part of the line's budget, not extra: `"  Scribe "`
+        // is 9 columns, and wrapping the text as though it were 6 is how a
+        // diagnosis ran one word past the border at 110 columns. Every
+        // line — first and continuation — gets the same width, so the
+        // block reads as a block.
+        let indent = format!("  {name} ");
+        let usable = diagnosis_area
+            .width
+            .saturating_sub(indent.chars().count() as u16);
+        for (i, line) in wrap_text(detail, usable).into_iter().enumerate() {
+            let gutter = if i == 0 {
+                indent.clone()
+            } else {
+                " ".repeat(indent.chars().count())
+            };
+            notes.push(Line::from(vec![
+                Span::styled(gutter, Style::default().fg(Color::DarkGray)),
+                Span::styled(line, Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+    if !notes.is_empty() {
+        frame.render_widget(Paragraph::new(notes), diagnosis_area);
+    }
 }
 
 /// Break `text` into lines of at most `width` characters, on word
@@ -1080,84 +1096,86 @@ fn wrap_text(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
-/// How wide the Services table's Status column should be.
+/// The Services table's column widths, sized from content.
 ///
-/// The floor is the old 24 characters, so a short label looks exactly as
-/// it always did. A longer status — the VRAM-gate diagnosis — takes the
-/// room it needs, up to what the terminal can give it while leaving the
-/// URL whole. Beyond that the diagnosis wraps onto more lines rather than
-/// being cut, and the row grows taller.
-fn services_status_width(
+/// Every column but the URL is sized to what it actually holds, so the
+/// table fits an 80-column terminal: at 80 the old independent floors
+/// (24 for Status, 21 for the URL, plus 38 of fixed columns) summed past
+/// the panel's width, and ratatui shrank *every* cell proportionally —
+/// which is how "Scribe" became "Sc" and `http://192.168.1.110:7435`
+/// became `http://192.168.1.11`. The URL now takes whatever remains,
+/// because it is the one value the operator must read whole.
+fn services_columns(
     scribe: &[ServiceStatus],
     distill: &[ServiceStatus],
-    terminal_width: u16,
-) -> u16 {
-    const FLOOR: u16 = 24;
-    /// Name(8) + Indicator(2) + URL + Detail(12) + Version(16) + the
-    /// block's borders and padding.
-    const OTHER_COLUMNS: u16 = 8 + 2 + 12 + 16 + 4;
+    inner_width: u16,
+) -> [u16; 6] {
+    /// "Distill" is the longest service name.
+    const NAME: u16 = 7;
+    const INDICATOR: u16 = 2;
+    /// "backend unavailable" is the longest verdict a row carries now that
+    /// the diagnosis moved to its own line.
+    const STATUS_FLOOR: u16 = 19;
 
-    let longest = scribe
+    let status = scribe
         .iter()
         .chain(distill.iter())
         .map(|svc| {
             format_status_activity(svc.healthy, "running", &svc.activity)
                 .chars()
-                .count()
+                .count() as u16
         })
         .max()
-        .unwrap_or(0) as u16;
-
-    // What the terminal can give the Status column, keeping the URL whole.
-    let room = terminal_width
-        .saturating_sub(OTHER_COLUMNS + services_url_width(scribe, distill, terminal_width));
-    longest.max(FLOOR).min(room.max(FLOOR))
-}
-
-/// How wide the Services table's URL column should be.
-///
-/// The URL is **never truncated**: the operator needs to know which tier
-/// a row is about, and `http://scribe.exa` does not say that. The width
-/// is the longest URL, and the Status column gives way if the terminal
-/// cannot hold both.
-fn services_url_width(
-    scribe: &[ServiceStatus],
-    distill: &[ServiceStatus],
-    terminal_width: u16,
-) -> u16 {
-    const FLOOR: u16 = 21;
-    /// Name(8) + Indicator(2) + Detail(12) + Version(16) + the block's
-    /// borders and padding.
-    const OTHER_COLUMNS: u16 = 8 + 2 + 12 + 16 + 4;
-
-    let longest = scribe
+        .unwrap_or(0)
+        .max(STATUS_FLOOR);
+    let detail = scribe
         .iter()
         .chain(distill.iter())
-        .map(|svc| svc.url.chars().count())
+        .map(|svc| svc.detail.chars().count() as u16)
         .max()
-        .unwrap_or(0) as u16;
+        .unwrap_or(0);
+    let version = scribe
+        .iter()
+        .chain(distill.iter())
+        .map(|svc| svc.version.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
+    let url = scribe
+        .iter()
+        .chain(distill.iter())
+        .map(|svc| svc.url.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
 
-    // The URL may take everything the other columns do not need, but
-    // never more than the terminal has.
-    let room = terminal_width.saturating_sub(OTHER_COLUMNS);
-    longest.max(FLOOR).min(room.max(FLOOR))
+    let fixed = NAME + INDICATOR + status + detail + version;
+    // The URL gets what is left, and is only cut when the terminal is too
+    // narrow to hold the fixed columns and the URL together.
+    let url = url.min(inner_width.saturating_sub(fixed).max(12));
+    [NAME, INDICATOR, status, url, detail, version]
 }
 
-/// How many lines the Services table's Status column needs.
+/// How many lines the diagnosis block beneath the Services rows needs.
 ///
-/// A wrapped diagnosis takes more than one line, and the table's row
-/// grows with it, so the block must be tall enough to show the whole
-/// thing.
-fn services_status_lines(scribe: &[ServiceStatus], distill: &[ServiceStatus], width: u16) -> u16 {
+/// Each service with a diagnosis contributes its wrapped line count; the
+/// row itself is always one line, so this is purely the extra block. The
+/// block is wrapped at the panel's width (minus the tier gutter), which
+/// is far wider than the Status column it used to be squeezed into.
+fn services_diagnosis_lines(
+    scribe: &[ServiceStatus],
+    distill: &[ServiceStatus],
+    width: u16,
+) -> u16 {
+    // The gutter is `"  Scribe "` / `"  Distill "` — 9 columns, the longest
+    // of the two. Budgeting for the shorter one wraps the text wider than
+    // the renderer does and leaves the panel a line short, which ratatui
+    // clips silently.
+    let usable = width.saturating_sub(9);
     scribe
         .iter()
         .chain(distill.iter())
-        .map(|svc| {
-            let text = format_status_activity(svc.healthy, "running", &svc.activity);
-            wrap_text(&text, width).len() as u16
-        })
-        .max()
-        .unwrap_or(1)
+        .filter_map(|svc| diagnosis(&svc.activity))
+        .map(|detail| wrap_text(detail, usable).len() as u16)
+        .sum()
 }
 
 /// An unhealthy server is not necessarily a stopped one: the server's own
@@ -1168,13 +1186,40 @@ fn format_status_activity(healthy: bool, running_label: &str, activity: &str) ->
         return if activity.is_empty() {
             "stopped".into()
         } else {
-            activity.into()
+            verdict(activity).to_string()
         };
     }
     match activity {
         "" | "idle" => running_label.into(),
-        other => format!("{running_label} · {other}"),
+        other => format!("{running_label} · {}", verdict(other)),
     }
+}
+
+/// The short verdict a Services row carries, cut from its diagnosis.
+///
+/// A diagnosis is a sentence — `backend unavailable: GPU yielded to
+/// qwen3.8-27b@big · 1.0 GiB free, needs 13.2 GiB · card held by
+/// llama-server 16.5 GiB` — and the verdict is the two words before the
+/// colon. The row states the verdict; the diagnosis is drawn whole on the
+/// line beneath it. Splitting them is what keeps a shared card from
+/// turning the table into a paragraph: the row stays scannable at any
+/// terminal width, and the detail is still all there.
+fn verdict(activity: &str) -> &str {
+    match activity.split_once(':') {
+        Some((head, _)) if !head.trim().is_empty() => head.trim(),
+        _ => activity.trim(),
+    }
+}
+
+/// The diagnosis a Services row carries beneath it, when it has one.
+///
+/// `None` for a short label ("running", "3 converting"), which needs no
+/// second line.
+fn diagnosis(activity: &str) -> Option<&str> {
+    activity
+        .split_once(':')
+        .map(|(_, rest)| rest.trim())
+        .filter(|rest| !rest.is_empty())
 }
 
 fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
@@ -1617,12 +1662,16 @@ mod tests {
             error: None,
         });
         let screen = draw(&data);
-        // The diagnosis is wrapped on word boundaries, so a line break can
-        // fall inside a phrase. What must survive is every **word** of it,
-        // and the two numbers that make it actionable.
+        // The row carries the verdict, not the paragraph: that is what
+        // keeps the table scannable on a shared card.
+        assert!(
+            screen.contains("backend unavailable"),
+            "the row lost its verdict"
+        );
+        // The diagnosis is wrapped on word boundaries beneath the row, so a
+        // line break can fall inside a phrase. What must survive is every
+        // **word** of it, and the two numbers that make it actionable.
         for part in [
-            "backend",
-            "unavailable:",
             "12.9",
             "GiB",
             "free,",
@@ -1648,6 +1697,30 @@ mod tests {
             screen.contains("http://scribe.example.local:7435"),
             "the URL was truncated"
         );
+    }
+
+    /// A diagnosis on the line beneath its row must be attributed to the
+    /// tier, and must not be wrapped into a column four words wide.
+    #[test]
+    fn a_diagnosis_reads_as_a_sentence_beneath_its_row() {
+        let mut data = DashboardData::blank(false, None);
+        data.scribe_servers.push(ServiceStatus {
+            url: "http://scribe.example.local:7435".into(),
+            healthy: false,
+            detail: String::new(),
+            activity: "backend unavailable: GPU yielded to qwen@big ·                        1.0 GiB free, needs 13.2 GiB · card held by llama-server 16.5 GiB"
+                .into(),
+            version: String::new(),
+            error: None,
+        });
+        let screen = draw_at(&data, 160);
+        // The verdict is the row's own cell, so the colon belongs to the
+        // diagnosis and "GPU yielded to" is not smeared across the table.
+        assert!(screen.contains("backend unavailable"), "{screen}");
+        assert!(screen.contains("llama-server 16.5 GiB"), "{screen}");
+        // The tier's name prefixes the block, since the block is no longer
+        // aligned under the row.
+        assert!(screen.contains("Scribe GPU yielded"), "{screen}");
     }
 
     /// Giving the Status column the room it needs must not take the room

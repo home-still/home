@@ -612,15 +612,70 @@ fn backend_unavailable_reason(health: Option<&hs_scribe::client::HealthResponse>
         }
     }
     if let Some(holders) = h.backend_vram_holders.as_deref() {
-        if !holders.trim().is_empty() {
-            parts.push(format!("held by {holders}"));
+        let card = holders_summary(holders);
+        if !card.is_empty() {
+            parts.push(format!("card held by {card}"));
         }
     }
     if parts.is_empty() {
         "backend unavailable".to_string()
     } else {
-        format!("backend unavailable: {}", parts.join("; "))
+        // "·" separates clauses: the diagnosis is read, not parsed.
+        format!("backend unavailable: {}", parts.join(" · "))
     }
+}
+
+/// Who is on the card, folded into something a person can read.
+///
+/// The health payload carries one `pid=… NNNMB name` entry per process,
+/// which is `nvidia-smi`'s shape, not a sentence. Three problems with
+/// printing it verbatim in a status row: the pid answers no question an
+/// operator of *this* tool has (the action is "wait for the tenant to
+/// idle", not "kill 220903"), MB is the only MB among GiB neighbours, and
+/// the length is what forces the row to wrap mid-token.
+///
+/// So: same process name folds into one entry, sizes report in GiB, pids
+/// drop. Two `llama-server`s are two processes but one tenant — summing
+/// them is the honest answer to "how much of my card is llama-server".
+fn holders_summary(holders: &str) -> String {
+    // Largest first, so the tenant that actually took the card leads.
+    let mut by_name: Vec<(String, u64)> = Vec::new();
+    for entry in holders.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // `pid=<n> <mb>MB <name>` — keep the name and the size, skip the pid.
+        // An entry with no size is not a holder report (a truncated or
+        // garbled string), so it is dropped rather than printed raw.
+        let mut mb: Option<u64> = None;
+        let mut name = String::new();
+        for token in entry.split_whitespace() {
+            if token.starts_with("pid=") {
+                continue;
+            }
+            if let Some(size) = token.strip_suffix("MB").and_then(|n| n.parse::<u64>().ok()) {
+                mb = Some(size);
+                continue;
+            }
+            if name.is_empty() {
+                name = token.to_string();
+            }
+        }
+        let (Some(mb), false) = (mb, name.is_empty()) else {
+            continue;
+        };
+        match by_name.iter_mut().find(|(existing, _)| *existing == name) {
+            Some((_, total)) => *total += mb,
+            None => by_name.push((name, mb)),
+        }
+    }
+    by_name.sort_by_key(|(_, mb)| std::cmp::Reverse(*mb));
+    by_name
+        .iter()
+        .map(|(name, mb)| format!("{name} {:.1} GiB", *mb as f64 / 1024.0))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A private read-only handle for one request. The shared connection is
@@ -4219,9 +4274,10 @@ mod backend_reason_tests {
     }
 
     /// The holders are the question an operator actually has: who is
-    /// holding the card.
+    /// holding the card. The answer names the tenants in GiB, not raw
+    /// pids and MB — a pid is not actionable from a status row.
     #[test]
-    fn the_holders_are_named() {
+    fn the_holders_are_named_in_gib_without_pids() {
         let h = health(
             Some(13251),
             Some(13500),
@@ -4229,8 +4285,53 @@ mod backend_reason_tests {
             Some(false),
         );
         let reason = backend_unavailable_reason(Some(&h));
-        assert!(reason.contains("hs-distill-server"), "{reason}");
-        assert!(reason.contains("7534MB"), "{reason}");
+        assert!(reason.contains("hs-distill-server 7.4 GiB"), "{reason}");
+        assert!(reason.contains("hs-scribe-server 2.5 GiB"), "{reason}");
+        assert!(!reason.contains("pid="), "a pid is noise here: {reason}");
+        assert!(!reason.contains("MB"), "sizes are GiB beside GiB: {reason}");
+    }
+
+    /// LARGEST FIRST, so the tenant that actually took the card leads.
+    #[test]
+    fn the_biggest_tenant_leads() {
+        let h = health(
+            Some(1051),
+            Some(13500),
+            Some("pid=1 500MB ollama; pid=2 15960MB llama-server"),
+            Some(false),
+        );
+        let reason = backend_unavailable_reason(Some(&h));
+        let llama = reason.find("llama-server").expect("llama-server named");
+        let ollama = reason.find("ollama").expect("ollama named");
+        assert!(llama < ollama, "the card's owner leads: {reason}");
+    }
+
+    /// Two processes, one tenant: summing them answers "how much of my
+    /// card is llama-server", which is the question worth answering.
+    #[test]
+    fn a_tenant_running_two_processes_is_folded_into_one_entry() {
+        let h = health(
+            Some(1051),
+            Some(13500),
+            Some("pid=1 15960MB llama-server; pid=2 920MB llama-server; pid=3 500MB ollama"),
+            Some(false),
+        );
+        let reason = backend_unavailable_reason(Some(&h));
+        assert_eq!(
+            reason.matches("llama-server").count(),
+            1,
+            "one entry per tenant: {reason}"
+        );
+        assert!(reason.contains("llama-server 16.5 GiB"), "{reason}");
+    }
+
+    /// A name that is not the last token on the line is still read whole,
+    /// and a malformed entry is dropped rather than printed raw.
+    #[test]
+    fn malformed_holder_entries_are_dropped_not_printed() {
+        assert_eq!(holders_summary(""), "");
+        assert_eq!(holders_summary("pid=1 500MB"), "");
+        assert_eq!(holders_summary("garbage; ; pid=2 100MB ok"), "ok 0.1 GiB");
     }
 
     /// A model that is already resident needs no room to start, so no
