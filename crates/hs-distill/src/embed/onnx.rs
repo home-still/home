@@ -174,13 +174,25 @@ fn verify_cuda_probe(model: &mut TextEmbedding) -> Result<usize, DistillError> {
 /// keeps this a no-op on non-CUDA hosts while still failing loudly on
 /// `big` when a foreign tenant owns the card.
 fn require_vram(floor_mb: u64) -> Result<(), DistillError> {
-    let Some(free) = hs_common::gpu::free_vram_mb() else {
+    vram_verdict(hs_common::gpu::free_vram_mb(), floor_mb, || {
+        hs_common::gpu::compute_apps_summary()
+    })
+}
+
+/// The VRAM half of the gate, as a pure verdict so the precedence between
+/// it and the broker's yield file can be tested without a GPU.
+fn vram_verdict(
+    free_mb: Option<u64>,
+    floor_mb: u64,
+    holders: impl FnOnce() -> String,
+) -> Result<(), DistillError> {
+    let Some(free) = free_mb else {
         return Ok(());
     };
     if free < floor_mb {
         return Err(DistillError::Embedding(format!(
             "gpu busy: {free} MB free < {floor_mb} MB required to load bge-m3; holders: {}",
-            hs_common::gpu::compute_apps_summary()
+            holders()
         )));
     }
     Ok(())
@@ -201,17 +213,46 @@ impl LoadGate {
     /// for room once and re-checks; still blocked is a `gpu busy`
     /// embedding error, which `hs distill watch-events` NAKs for
     /// redelivery. BLOCKING (the hook may drain another tenant).
+    ///
+    /// The re-check after a grant consults VRAM only. The yield file is
+    /// the broker's own state, and asking it for room is what clears
+    /// that state: a broker that answers "yes, there is room beside the
+    /// resident tenant" has already decided the yield no longer excludes
+    /// us, so re-reading the file it is about to rewrite would discard
+    /// the grant it just gave. Measured on `big` 2026-11-05: distill's
+    /// embedder was released on idle, and every reload for the rest of
+    /// the day answered `gpu busy: yielded to qwen3.8-27b@big` although
+    /// `gpu-tenant make-room --need-mib 5000` printed `ROOM free=6695`.
     fn check(&self) -> Result<(), DistillError> {
-        let Err(blocked) = self.blocked() else {
+        self.check_with(hs_common::gpu::free_vram_mb, hs_common::gpu::make_room)
+    }
+
+    /// [`Self::check`] with the two host probes injected, so the
+    /// post-grant precedence is tested through the real call path rather
+    /// than through a helper that the path might not use.
+    fn check_with(
+        &self,
+        free_mb: impl Fn() -> Option<u64>,
+        make_room: impl Fn(&[String], u64) -> bool,
+    ) -> Result<(), DistillError> {
+        let Err(blocked) = self.blocked_with(&free_mb) else {
             return Ok(());
         };
         match &self.make_room_cmd {
-            Some(cmd) if hs_common::gpu::make_room(cmd, self.floor_mb) => self.blocked(),
+            Some(cmd) if make_room(cmd, self.floor_mb) => self.after_grant(free_mb()),
             _ => Err(blocked),
         }
     }
 
-    fn blocked(&self) -> Result<(), DistillError> {
+    /// The verdict once the broker has granted room. VRAM only — see
+    /// [`LoadGate::check`] for why the yield file must not be re-read.
+    fn after_grant(&self, free_mb: Option<u64>) -> Result<(), DistillError> {
+        vram_verdict(free_mb, self.floor_mb, || {
+            hs_common::gpu::compute_apps_summary()
+        })
+    }
+
+    fn blocked_with(&self, free_mb: &dyn Fn() -> Option<u64>) -> Result<(), DistillError> {
         if let Some(holder) = self
             .yield_file
             .as_deref()
@@ -221,7 +262,9 @@ impl LoadGate {
                 "gpu busy: yielded to {holder}"
             )));
         }
-        require_vram(self.floor_mb)
+        vram_verdict(free_mb(), self.floor_mb, || {
+            hs_common::gpu::compute_apps_summary()
+        })
     }
 }
 
@@ -483,5 +526,108 @@ impl Embedder for OnnxEmbedder {
 
     fn release_idle(&self) -> usize {
         self.pool.release_idle().released
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── the yield-vs-grant precedence (measured on `big` 2026-11-05) ──
+    //
+    // Distill's embedder was released on idle release and every later
+    // load answered `gpu busy: yielded to qwen3.8-27b@big`, although the
+    // broker's own make-room hook printed `ROOM free=6695` for the same
+    // 5,000 MB need. The gate re-read the yield file after the grant and
+    // so discarded the grant: the file is the broker's state, and asking
+    // for room is what changes it. These tests pin the resolution.
+
+    /// A yield file naming another tenant, which is exactly the state
+    /// that broke every reload.
+    fn yielded_by_another_tenant() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("yield.json");
+        // An hour ahead, so the file is unambiguously active.
+        let expires = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        std::fs::write(
+            &path,
+            format!(r#"{{"for":"qwen3.8-27b@big","since":"2026-11-05T13:15:58Z","expires":"{expires}"}}"#),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn an_active_yield_alone_still_blocks_a_load() {
+        let (_dir, path) = yielded_by_another_tenant();
+        let gate = LoadGate {
+            floor_mb: 5000,
+            yield_file: Some(path),
+            // No hook: nothing can clear the yield, so the load waits.
+            make_room_cmd: None,
+        };
+        let err = gate.check().expect_err("an active yield must block");
+        assert!(format!("{err}").contains("qwen3.8-27b@big"), "{err}");
+    }
+
+    #[test]
+    fn a_granted_load_proceeds_even_though_the_yield_file_still_names_qwen() {
+        // The recorded failure, through the real call path. The gate is
+        // blocked (an active yield names qwen), the broker grants room
+        // (6,695 MB free against a 5,000 MB floor), and the load must
+        // proceed. Before the fix `check` re-read the yield file after
+        // the grant and refused, so distill could not reload its embedder
+        // at all while qwen stayed resident.
+        let (_dir, path) = yielded_by_another_tenant();
+        let gate = LoadGate {
+            floor_mb: 5000,
+            yield_file: Some(path),
+            make_room_cmd: Some(vec!["gpu-tenant".into(), "make-room".into()]),
+        };
+        let granted = |_: &[String], need_mb: u64| {
+            assert_eq!(need_mb, 5000, "the broker is asked for the floor");
+            true
+        };
+        assert!(
+            gate.check_with(|| Some(6695), granted).is_ok(),
+            "a granted load must not be discarded by the stale yield file"
+        );
+    }
+
+    #[test]
+    fn a_refused_grant_reports_the_yield_holder() {
+        let (_dir, path) = yielded_by_another_tenant();
+        let gate = LoadGate {
+            floor_mb: 5000,
+            yield_file: Some(path),
+            make_room_cmd: Some(vec!["gpu-tenant".into(), "make-room".into()]),
+        };
+        let err = gate
+            .check_with(|| Some(6695), |_, _| false)
+            .expect_err("a refused grant keeps the load blocked");
+        assert!(format!("{err}").contains("qwen3.8-27b@big"), "{err}");
+    }
+
+    #[test]
+    fn a_grant_does_not_override_a_card_that_still_cannot_hold_the_model() {
+        let (_dir, path) = yielded_by_another_tenant();
+        let gate = LoadGate {
+            floor_mb: 5000,
+            yield_file: Some(path),
+            make_room_cmd: Some(vec!["gpu-tenant".into(), "make-room".into()]),
+        };
+        // A broker may be wrong about its own arithmetic; the floor is not
+        // negotiable.
+        let err = gate
+            .check_with(|| Some(4999), |_, _| true)
+            .expect_err("4999 MB cannot hold a 5,000 MB model");
+        assert!(format!("{err}").contains("4999"), "{err}");
+    }
+
+    #[test]
+    fn no_nvidia_gpu_means_no_vram_gate() {
+        // Apple Silicon pool members expose no free-VRAM signal; the gate
+        // must stay out of their way rather than refuse every load.
+        assert!(vram_verdict(None, 5000, String::new).is_ok());
     }
 }
