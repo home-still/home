@@ -168,8 +168,17 @@ pub async fn run_download(
         let stage = reporter.begin_stage("Downloading", None);
         stage.set_message(&format!("DOI: {}", doi_str));
 
+        // The same per-chunk bar the batch path renders: one paper should not
+        // be the only download in the tool with no sign of progress.
+        let on_progress = |bytes_downloaded: u64, bytes_total: Option<u64>| {
+            if let Some(total) = bytes_total {
+                stage.set_length(total);
+            }
+            stage.set_position(bytes_downloaded);
+        };
+
         let result = downloader
-            .download_by_doi(&doi_str)
+            .download_by_doi(&doi_str, Some(&on_progress))
             .await
             .context("Download failed")?;
 

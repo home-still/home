@@ -189,7 +189,7 @@ async fn download_single(
     }
 
     if let Some(doi) = &paper.doi {
-        match service.download_by_doi(doi).await {
+        match service.download_by_doi(doi, progress_ref).await {
             Ok(mut dr) => {
                 dr.doi = paper.doi.clone();
                 return Ok(dr);

@@ -746,7 +746,7 @@ async fn a_storage_write_failure_aborts_the_chain_with_the_real_error() {
         &server.base,
     );
 
-    let err = dl.download_by_doi(arxiv_doi()).await.unwrap_err();
+    let err = dl.download_by_doi(arxiv_doi(), None).await.unwrap_err();
 
     assert!(matches!(err, PaperError::Storage(_)), "{err}");
     assert!(err.to_string().contains("disk full"), "{err}");
@@ -771,7 +771,7 @@ async fn a_storage_head_failure_aborts_before_any_request() {
         &server.base,
     );
 
-    let err = dl.download_by_doi("10.1234/abc").await.unwrap_err();
+    let err = dl.download_by_doi("10.1234/abc", None).await.unwrap_err();
 
     assert!(matches!(err, PaperError::Storage(_)), "{err}");
     assert!(err.to_string().contains("connection reset"), "{err}");
@@ -796,7 +796,7 @@ async fn a_local_failure_is_never_reported_as_no_open_access_pdf() {
         vec![provider_returning("s2", vec![server.url("/p.pdf")])],
         &server.base,
     );
-    let err = dl.download_by_doi("10.1234/abc").await.unwrap_err();
+    let err = dl.download_by_doi("10.1234/abc", None).await.unwrap_err();
     assert!(!matches!(err, PaperError::NoSourceYielded { .. }), "{err}");
     assert!(
         !err.to_string().contains("No PDF could be downloaded"),
@@ -848,7 +848,11 @@ async fn when_every_source_fails_the_error_lists_each_outcome() {
     ];
     let rig = Rig::new(&server, &config(1_000_000), resolvers);
 
-    let err = rig.dl.download_by_doi("10.1234/ABC").await.unwrap_err();
+    let err = rig
+        .dl
+        .download_by_doi("10.1234/ABC", None)
+        .await
+        .unwrap_err();
 
     let PaperError::NoSourceYielded { doi, sources } = &err else {
         panic!("expected NoSourceYielded, got {err}");
@@ -911,7 +915,11 @@ async fn when_no_source_failed_only_lacked_a_copy_the_error_is_permanent() {
     })
     .await;
     let rig = Rig::new(&server, &config(1_000_000), vec![]);
-    let err = rig.dl.download_by_doi("10.1234/abc").await.unwrap_err();
+    let err = rig
+        .dl
+        .download_by_doi("10.1234/abc", None)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err.category(), crate::error::ErrorCategory::Permanent),
         "{err}"
@@ -936,7 +944,7 @@ async fn a_later_source_succeeds_after_earlier_sources_fail() {
         )],
     );
 
-    let result = rig.dl.download_by_doi("10.1234/abc").await.unwrap();
+    let result = rig.dl.download_by_doi("10.1234/abc", None).await.unwrap();
 
     assert!(!result.skipped);
     assert_eq!(result.file_path, PathBuf::from("papers/10/10.1234_abc.pdf"));
@@ -970,7 +978,7 @@ async fn a_landing_page_url_is_skipped_for_the_direct_pdf_listed_after_it() {
 
     let result = rig
         .dl
-        .download_by_doi("10.1109/TVCG.2009.113")
+        .download_by_doi("10.1109/TVCG.2009.113", None)
         .await
         .unwrap();
 
@@ -991,7 +999,11 @@ async fn unpaywall_needs_a_contact_email_and_says_so_in_the_outcomes() {
     cfg.unpaywall_email = None;
     let rig = Rig::new(&server, &cfg, vec![]);
 
-    let err = rig.dl.download_by_doi("10.1234/abc").await.unwrap_err();
+    let err = rig
+        .dl
+        .download_by_doi("10.1234/abc", None)
+        .await
+        .unwrap_err();
 
     let PaperError::NoSourceYielded { sources, .. } = &err else {
         panic!("{err}");
@@ -1037,7 +1049,7 @@ async fn unpaywall_locations_are_tried_best_first_and_landing_pages_are_not_cand
     .await;
     let rig = Rig::new(&api, &config(1_000_000), vec![]);
 
-    let result = rig.dl.download_by_doi("10.1234/abc").await.unwrap();
+    let result = rig.dl.download_by_doi("10.1234/abc", None).await.unwrap();
 
     assert!(!result.skipped);
     // First location 404s, second is stored; the landing page was never fetched.
@@ -1065,7 +1077,7 @@ async fn doi_and_contact_email_are_percent_encoded_in_lookup_urls() {
     let server = FakeServer::start(|_| Route::Status(404)).await;
     let rig = Rig::new(&server, &config(1_000_000), vec![]);
 
-    let _ = rig.dl.download_by_doi(doi).await;
+    let _ = rig.dl.download_by_doi(doi, None).await;
 
     let hits = server.hits();
     let unpaywall = hits
@@ -1091,7 +1103,11 @@ async fn a_doi_unstorable_on_windows_fails_before_any_lookup() {
     let server = FakeServer::start(|_| Route::Status(404)).await;
     let rig = Rig::new(&server, &config(1_000_000), vec![]);
 
-    let err = rig.dl.download_by_doi("10.1234/a?b").await.unwrap_err();
+    let err = rig
+        .dl
+        .download_by_doi("10.1234/a?b", None)
+        .await
+        .unwrap_err();
 
     assert!(
         format!("{err}").contains("not storable on Windows"),
@@ -1107,7 +1123,7 @@ async fn pmc_sends_no_email_when_none_is_configured_and_never_an_invented_one() 
     cfg.unpaywall_email = None;
     let rig = Rig::new(&server, &cfg, vec![]);
 
-    let _ = rig.dl.download_by_doi("10.1234/abc").await;
+    let _ = rig.dl.download_by_doi("10.1234/abc", None).await;
 
     let hits = server.hits();
     let idconv = hits.iter().find(|h| h.starts_with("/idconv/")).unwrap();
@@ -1131,7 +1147,11 @@ async fn a_hostile_pmcid_in_the_response_is_not_followed() {
     .await;
     let rig = Rig::new(&server, &config(1_000_000), vec![]);
 
-    let err = rig.dl.download_by_doi("10.1234/abc").await.unwrap_err();
+    let err = rig
+        .dl
+        .download_by_doi("10.1234/abc", None)
+        .await
+        .unwrap_err();
 
     let PaperError::NoSourceYielded { sources, .. } = &err else {
         panic!("{err}");
@@ -1153,7 +1173,7 @@ async fn malformed_dois_are_rejected_before_any_source_is_asked() {
         "10.1234/a\\b",
         "doi:",
     ] {
-        let err = rig.dl.download_by_doi(doi).await.unwrap_err();
+        let err = rig.dl.download_by_doi(doi, None).await.unwrap_err();
         assert!(matches!(err, PaperError::InvalidInput(_)), "{doi:?}: {err}");
     }
     assert!(server.hits().is_empty());
@@ -1175,7 +1195,7 @@ async fn arxiv_doi_uses_the_arxiv_pdf_url_for_any_case_of_the_prefix() {
         })
         .await;
         let rig = Rig::new(&server, &config(1_000_000), vec![]);
-        let result = rig.dl.download_by_doi(doi).await.unwrap();
+        let result = rig.dl.download_by_doi(doi, None).await.unwrap();
         assert_eq!(
             result.file_path,
             PathBuf::from("papers/10/10.48550_arxiv.2005.11401.pdf"),
@@ -1247,7 +1267,7 @@ async fn a_search_download_and_a_doi_download_of_one_paper_share_one_object() {
         "https://doi.org/10.1017/S0033291718004038",
         "DOI:10.1017/S0033291718004038",
     ] {
-        let again = service.download_by_doi(doi).await.unwrap();
+        let again = service.download_by_doi(doi, None).await.unwrap();
         assert!(again.skipped, "{doi}");
         assert_eq!(again.file_path, batch.succeeded[0].file_path);
     }
@@ -1380,4 +1400,75 @@ async fn a_batch_failure_names_every_attempt() {
     );
     assert!(msg.contains("/missing.pdf"), "{msg}");
     assert!(msg.contains("DOI 10.1234/abc"), "{msg}");
+}
+
+/// The gap this closes: `paper_download` (the MCP tool agents used) called
+/// `download_by_doi`, which had no progress parameter at all, so a download
+/// reported nothing between start and finish and nothing could display it.
+/// `download_by_url` always had the callback; the DOI chain silently dropped
+/// it on the floor. This asserts the chain now forwards it.
+///
+/// A callback that is accepted but never called would pass a signature check
+/// and still leave the panel blank, so the assertion is on the events.
+#[tokio::test]
+async fn the_doi_chain_reports_progress_for_the_source_that_transfers() {
+    let body = pdf(50_000);
+    let b = body.clone();
+    let server = FakeServer::start(move |_| Route::Body {
+        content_type: "application/octet-stream",
+        body: b.clone(),
+    })
+    .await;
+    let dl = PaperDownloader::for_tests(
+        Arc::new(LocalFsStorage::new(tempfile::tempdir().unwrap().path())),
+        Arc::new(NoOpBus),
+        &config(1_000_000),
+        vec![provider_returning("s2", vec![server.url("/p.pdf")])],
+        &server.base,
+    );
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let cb = move |done: u64, total: Option<u64>| seen2.lock().push((done, total));
+
+    let result = dl.download_by_doi("10.1234/abc", Some(&cb)).await.unwrap();
+
+    assert_eq!(result.size_bytes, body.len() as u64);
+    let seen = seen.lock();
+    assert!(
+        !seen.is_empty(),
+        "the DOI chain must report progress, not just accept a callback"
+    );
+    assert_eq!(
+        seen.last().map(|p| p.0),
+        Some(body.len() as u64),
+        "the final event must account for every byte"
+    );
+    assert_eq!(
+        seen.last().and_then(|p| p.1),
+        Some(body.len() as u64),
+        "the declared total must reach the caller so the bar can set its length"
+    );
+}
+
+/// A caller with no interest in progress must still work: the batch and
+/// single-DOI CLI paths pass a callback, but library callers may not.
+#[tokio::test]
+async fn the_doi_chain_still_works_without_a_progress_callback() {
+    let body = pdf(4_000);
+    let b = body.clone();
+    let server = FakeServer::start(move |_| Route::Body {
+        content_type: "application/octet-stream",
+        body: b.clone(),
+    })
+    .await;
+    let dl = PaperDownloader::for_tests(
+        Arc::new(LocalFsStorage::new(tempfile::tempdir().unwrap().path())),
+        Arc::new(NoOpBus),
+        &config(1_000_000),
+        vec![provider_returning("s2", vec![server.url("/p.pdf")])],
+        &server.base,
+    );
+    let result = dl.download_by_doi("10.1234/abc", None).await.unwrap();
+    assert_eq!(result.size_bytes, body.len() as u64);
 }
