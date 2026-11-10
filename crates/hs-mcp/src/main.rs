@@ -1465,9 +1465,31 @@ impl HomeStillMcp {
         let stem = paper::stem::doi_stem(&doi).map_err(|e| format!("invalid DOI: {e}"))?;
         self.require_event_bus("paper_download").await?;
 
+        // Register the transfer before it starts: this tool's whole duration
+        // used to be invisible. `download_by_doi` drained the response into
+        // memory and did one `put`, so no storage counter could see it, and
+        // `downloaded_at` (which the History feed keys on) is stamped only
+        // after the transfer is over.
+        //
+        // The guard removes the entry however this function exits —
+        // success, provider error, storage error, or an early return — so a
+        // failed download cannot leave a permanent phantom row.
+        struct ActiveGuard<'a>(&'a str);
+        impl Drop for ActiveGuard<'_> {
+            fn drop(&mut self) {
+                hs_common::download_activity::finish(self.0);
+            }
+        }
+        hs_common::download_activity::start(&stem, &doi);
+        let _active = ActiveGuard(&stem);
+
+        let on_progress = |bytes_downloaded: u64, bytes_total: Option<u64>| {
+            hs_common::download_activity::progress(&stem, bytes_downloaded, bytes_total);
+        };
+
         let result = self
             .downloader
-            .download_by_doi(&doi)
+            .download_by_doi(&doi, Some(&on_progress))
             .await
             .map_err(|e| format!("Download failed: {e}"))?;
 
@@ -3721,6 +3743,9 @@ impl HomeStillMcp {
         pipeline.failed_conversions = failed_conversions;
         pipeline.inbox_pending = inbox_pending;
         pipeline.in_flight_conversions = Some(total_in_flight);
+        // Read after every other probe so the download count is as fresh as
+        // the conversions beside it.
+        pipeline.active_downloads = active_downloads_from_registry();
 
         // History from the catalog — same source and same default filter as
         // `catalog_recent` so the two activity feeds can never disagree.
@@ -4231,6 +4256,16 @@ async fn install_logging(is_sse: bool) -> hs_common::logging::LoggingHandle {
     handle
 }
 
+/// The live download set, as the snapshot reports it.
+///
+/// Named and tested separately because it is the *whole* connection between a
+/// running `paper_download` and the `Downloading` row: the registry is written
+/// by the tool and read only here. A silent break in this line leaves the
+/// panel blank exactly as it was before the feature existed.
+fn active_downloads_from_registry() -> Option<Vec<hs_common::download_activity::ActiveDownload>> {
+    Some(hs_common::download_activity::snapshot())
+}
+
 #[cfg(test)]
 mod backend_reason_tests {
     use super::*;
@@ -4626,4 +4661,32 @@ mod distill_search_mapping_tests {
         assert_eq!(full, "[]");
         assert_eq!(lite, "[]");
     }
+}
+
+/// The download the MCP `paper_download` tool registers must reach the status
+/// snapshot the panel reads. Every counter beside it is storage- or
+/// queue-backed; a download has neither until it finishes, so this field is
+/// the only thing that can show one while it runs. A break here is silent.
+#[test]
+fn a_registered_download_reaches_the_status_snapshot_field() {
+    let stem = "10.1234_snapshot_roundtrip";
+    hs_common::download_activity::start(stem, "Roundtrip Paper");
+    hs_common::download_activity::progress(stem, 2048, Some(4096));
+
+    let field = active_downloads_from_registry().expect("the field is always reported");
+    let entry = field
+        .iter()
+        .find(|d| d.stem == stem)
+        .expect("a started download must appear in the snapshot");
+
+    assert_eq!(entry.bytes_downloaded, 2048);
+    assert_eq!(entry.bytes_total, Some(4096));
+    assert_eq!(entry.progress_text(), "2 KB / 4 KB");
+
+    hs_common::download_activity::finish(stem);
+    let after = active_downloads_from_registry().unwrap();
+    assert!(
+        !after.iter().any(|d| d.stem == stem),
+        "a finished download must not linger in the panel"
+    );
 }

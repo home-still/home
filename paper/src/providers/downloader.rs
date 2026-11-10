@@ -402,10 +402,11 @@ impl PaperDownloader {
         urls: &[String],
         key: &str,
         outcomes: &mut Vec<SourceOutcome>,
+        on_progress: Option<&(dyn Fn(u64, Option<u64>) + Send + Sync)>,
     ) -> Result<Option<DownloadResult>, PaperError> {
         for raw in urls.iter().take(MAX_CANDIDATE_URLS) {
             let attempt = match self.policy.parse_and_check(raw) {
-                Ok(url) => match self.fetch_pdf(&url, None).await {
+                Ok(url) => match self.fetch_pdf(&url, on_progress).await {
                     Ok(fetched) => self.store(key, fetched).await,
                     Err(e) => Err(e),
                 },
@@ -544,7 +545,11 @@ impl DownloadService for PaperDownloader {
     /// another source, and reporting it as "no open-access PDF" would send
     /// the operator looking in the wrong place. When every source comes up
     /// empty the error lists each source's outcome.
-    async fn download_by_doi(&self, doi: &str) -> Result<DownloadResult, PaperError> {
+    async fn download_by_doi(
+        &self,
+        doi: &str,
+        on_progress: Option<&(dyn Fn(u64, Option<u64>) + Send + Sync)>,
+    ) -> Result<DownloadResult, PaperError> {
         // One identity for one paper: DOIs are case-insensitive, so the stem
         // is derived from the lowercased bare DOI (see `crate::stem`).
         let doi = stem::normalize_doi(doi)?;
@@ -563,7 +568,13 @@ impl DownloadService for PaperDownloader {
         if let Some(arxiv_id) = strip_arxiv_doi_prefix(&doi) {
             let url = arxiv_pdf_url(&self.endpoints.arxiv, arxiv_id)?;
             if let Some(hit) = self
-                .try_urls("arxiv", &[url.to_string()], &key, &mut outcomes)
+                .try_urls(
+                    "arxiv",
+                    &[url.to_string()],
+                    &key,
+                    &mut outcomes,
+                    on_progress,
+                )
                 .await?
             {
                 return Ok(hit);
@@ -581,7 +592,7 @@ impl DownloadService for PaperDownloader {
             )?;
             tracing::debug!(doi, url = %url, "MDPI direct PDF");
             if let Some(hit) = self
-                .try_urls("mdpi", &[url.to_string()], &key, &mut outcomes)
+                .try_urls("mdpi", &[url.to_string()], &key, &mut outcomes, on_progress)
                 .await?
             {
                 return Ok(hit);
@@ -592,7 +603,7 @@ impl DownloadService for PaperDownloader {
         match self.unpaywall_urls(&doi).await {
             Ok(urls) => {
                 if let Some(hit) = self
-                    .try_urls("unpaywall", &urls, &key, &mut outcomes)
+                    .try_urls("unpaywall", &urls, &key, &mut outcomes, on_progress)
                     .await?
                 {
                     return Ok(hit);
@@ -604,7 +615,10 @@ impl DownloadService for PaperDownloader {
         // 2b. PMC direct PDF (DOI → PMCID via NCBI ID Converter → PDF URL)
         match self.pmc_urls(&doi).await {
             Ok(urls) => {
-                if let Some(hit) = self.try_urls("pmc", &urls, &key, &mut outcomes).await? {
+                if let Some(hit) = self
+                    .try_urls("pmc", &urls, &key, &mut outcomes, on_progress)
+                    .await?
+                {
                     return Ok(hit);
                 }
             }
@@ -617,7 +631,7 @@ impl DownloadService for PaperDownloader {
             match resolver.get_by_doi(&doi).await {
                 Ok(Some(paper)) if !paper.download_urls.is_empty() => {
                     if let Some(hit) = self
-                        .try_urls(name, &paper.download_urls, &key, &mut outcomes)
+                        .try_urls(name, &paper.download_urls, &key, &mut outcomes, on_progress)
                         .await?
                     {
                         return Ok(hit);

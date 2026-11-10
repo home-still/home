@@ -36,6 +36,9 @@ struct DashboardData {
     /// row so a busy pool is visible in the Pipeline panel, not just in
     /// per-scribe Services rows.
     in_flight_conversions: Option<u64>,
+    /// Downloads the server is performing right now, with live byte counts.
+    /// `None` when the server predates this field.
+    active_downloads: Option<Vec<hs_common::download_activity::ActiveDownload>>,
     /// Outstanding work on the scribe consumer (waiting + unacked). `None`
     /// with `queue_error` set means the broker could not say.
     queued_conversions: Option<u64>,
@@ -123,6 +126,7 @@ impl DashboardData {
             embedding_skipped: 0,
             inbox_pending: None,
             in_flight_conversions: None,
+            active_downloads: None,
             queued_conversions: None,
             stalled_conversions: None,
             queue_error: None,
@@ -308,7 +312,10 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
             // Re-derive human detail from structured fields so the CLI can
             // format byte counts (fmt_bytes) and rich metadata consistently.
             let detail = match activity {
-                "Download" => ev.detail_bytes.map(fmt_bytes).unwrap_or(ev.detail),
+                "Download" => ev
+                    .detail_bytes
+                    .map(hs_common::fmt::fmt_bytes)
+                    .unwrap_or(ev.detail),
                 _ => ev.detail,
             };
             Some(HistoryEvent {
@@ -333,6 +340,7 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         embedding_skipped: snap.pipeline.embedding_skipped.unwrap_or(0),
         inbox_pending: snap.pipeline.inbox_pending,
         in_flight_conversions: snap.pipeline.in_flight_conversions,
+        active_downloads: snap.pipeline.active_downloads,
         queued_conversions: snap.pipeline.queued_conversions,
         stalled_conversions: snap.pipeline.stalled_conversions,
         queue_error: snap.pipeline.queue_error.clone(),
@@ -417,16 +425,58 @@ fn read_indexer_status() -> anyhow::Result<IndexerInfo> {
 
 // ── Formatting helpers ──────────────────────────────────────────
 
-fn fmt_bytes(bytes: u64) -> String {
-    if bytes >= 1_000_000_000 {
-        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
-    } else if bytes >= 1_000_000 {
-        format!("{:.0} MB", bytes as f64 / 1_000_000.0)
-    } else if bytes >= 1_000 {
-        format!("{:.0} KB", bytes as f64 / 1_000.0)
-    } else {
-        format!("{bytes} B")
+/// The `Downloading` row's detail: what is arriving and how far along.
+///
+/// A download has no storage-visible footprint until it finishes, so this row
+/// is the only place a transfer appears while it is happening. The stem is
+/// what an operator can act on (it names the catalog row); the title is a
+/// convenience, and the first download is the one shown — a burst is
+/// summarized by its count in the Count column.
+fn downloading_detail(data: &DashboardData) -> String {
+    let Some(downloads) = &data.active_downloads else {
+        return String::new();
+    };
+    match downloads.as_slice() {
+        [] => "none".to_string(),
+        [one] => {
+            let what = if one.title.is_empty() {
+                &one.stem
+            } else {
+                &one.title
+            };
+            format!("{} · {}", one.progress_text(), what)
+        }
+        [first, rest @ ..] => format!(
+            "{} · {} (+{} more)",
+            first.progress_text(),
+            if first.title.is_empty() {
+                &first.stem
+            } else {
+                &first.title
+            },
+            rest.len()
+        ),
     }
+}
+
+/// The `Downloading` lines for the text renderer.
+///
+/// A separate function from the table cell so both render paths can be tested
+/// against the same data — a value that fits one can be lost in the other.
+fn downloading_text_lines(data: &DashboardData) -> Vec<String> {
+    let Some(downloads) = &data.active_downloads else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!("  Downloading: {}", downloads.len())];
+    for d in downloads {
+        let title = if d.title.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", d.title)
+        };
+        lines.push(format!("      {} · {}{title}", d.progress_text(), d.stem));
+    }
+    lines
 }
 
 fn fmt_ago(dt: &chrono::DateTime<chrono::Utc>) -> String {
@@ -463,7 +513,7 @@ fn render(frame: &mut Frame, data: &DashboardData) {
 
     let outer = Layout::vertical([
         Constraint::Length(1),               // title
-        Constraint::Length(14), // pipeline: header + Documents/Markdown/Cataloged/Embedded/In-flight/Queued/Stalled/Inbox/Failed/Watcher/Indexer rows + 2 border rows
+        Constraint::Length(15), // pipeline: header + Documents/Markdown/Cataloged/Embedded/In-flight/Downloading/Queued/Stalled/Inbox/Failed/Watcher/Indexer rows + 2 border rows
         Constraint::Length(1),  // spacer
         Constraint::Length(services_height), // services
         Constraint::Length(1),  // spacer
@@ -636,7 +686,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                 scanning.clone()
             }),
             Cell::from(if data.doc_counts.is_some() {
-                format!("{:>8}", fmt_bytes(doc_bytes))
+                format!("{:>8}", hs_common::fmt::fmt_bytes(doc_bytes))
             } else {
                 String::new()
             }),
@@ -650,7 +700,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                 scanning.clone()
             }),
             Cell::from(if data.markdown_counts.is_some() {
-                format!("{:>8}", fmt_bytes(markdown_bytes))
+                format!("{:>8}", hs_common::fmt::fmt_bytes(markdown_bytes))
             } else {
                 String::new()
             }),
@@ -710,6 +760,19 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                 Some(_) => "idle".to_string(),
                 None => String::new(),
             }),
+            Cell::from(""),
+        ]),
+        Row::new(vec![
+            Cell::from("Downloading"),
+            Cell::from(match &data.active_downloads {
+                Some(d) => format!("{:>6}", d.len()),
+                None => scanning.clone(),
+            })
+            .style(match &data.active_downloads {
+                Some(d) if !d.is_empty() => Style::default().fg(Color::Cyan),
+                _ => Style::default().fg(Color::DarkGray),
+            }),
+            Cell::from(downloading_detail(data)),
             Cell::from(""),
         ]),
         Row::new(vec![
@@ -1330,6 +1393,11 @@ async fn run_oneshot_text() -> Result<()> {
             println!("  {line}");
         }
     }
+    // The TUI draws this from the same data; both paths must show a transfer
+    // that has no storage footprint yet.
+    for line in downloading_text_lines(&data) {
+        println!("{line}");
+    }
     if data.queue_server_too_old() {
         println!("  Queued    : n/a ({QUEUE_SERVER_TOO_OLD})");
         println!("  Stalled   : n/a ({QUEUE_SERVER_TOO_OLD})");
@@ -1930,5 +1998,94 @@ mod tests {
             snapshot
         );
         assert!(status_json_text(&snapshot, false).unwrap().lines().count() > 1);
+    }
+    /// Every counter in the Pipeline panel is storage- or queue-backed. A
+    /// download has neither until it finishes — the bytes are collected in
+    /// memory and written with one `put`, and `downloaded_at` is stamped after
+    /// the transfer — so `paper_download` was invisible for its whole
+    /// duration. The `Downloading` row is the only place it can appear.
+    #[test]
+    fn the_dashboard_shows_a_download_while_it_is_still_transferring() {
+        let mut data = DashboardData::blank(false, None);
+        data.active_downloads = Some(vec![hs_common::download_activity::ActiveDownload {
+            stem: "10.1001_jamapsychiatry.2015.3278".into(),
+            title: "Cannabis Use and Human Behavior".into(),
+            bytes_downloaded: 1_500_000,
+            bytes_total: Some(3_000_000),
+        }]);
+
+        let screen = draw(&data);
+        assert!(screen.contains("Downloading"), "no Downloading row");
+        assert!(
+            screen.contains("/ 3 MB"),
+            "the live byte counts are the point of the row: {screen}"
+        );
+        assert!(
+            screen.contains("Cannabis Use"),
+            "a transfer must name what is arriving"
+        );
+    }
+
+    /// A server that predates the field, or an idle one, must not look like a
+    /// stuck download or shift the rows below it.
+    /// The text renderer is a separate path from the table: a value that fits
+    /// one can be lost in the other. Both must show a live transfer.
+    #[test]
+    fn the_text_renderer_shows_a_download_too() {
+        let mut data = DashboardData::blank(false, None);
+        data.active_downloads = Some(vec![hs_common::download_activity::ActiveDownload {
+            stem: "10.1000_probe".into(),
+            title: "Probe".into(),
+            bytes_downloaded: 4_000_000,
+            bytes_total: Some(9_000_000),
+        }]);
+        let text = downloading_text_lines(&data).join("\n");
+        assert!(text.contains("Downloading: 1"), "no text-mode row: {text}");
+        assert!(text.contains("4 MB / 9 MB"), "no live byte counts: {text}");
+        assert!(
+            text.contains("10.1000_probe"),
+            "the stem is the actionable id"
+        );
+    }
+
+    #[test]
+    fn the_dashboard_says_no_download_when_nothing_is_transferring() {
+        let mut data = DashboardData::blank(false, None);
+        data.active_downloads = Some(Vec::new());
+        let screen = draw(&data);
+        assert!(screen.contains("Downloading"));
+        assert!(screen.contains("none"));
+
+        // Still renders when the server is too old to report the field.
+        data.active_downloads = None;
+        let screen = draw(&data);
+        assert!(screen.contains("Downloading"));
+        assert!(
+            screen.contains("Queued") && screen.contains("Stalled"),
+            "the rows below must still fit the panel"
+        );
+    }
+
+    /// A burst names the count and the transfer at its head rather than
+    /// truncating to a single entry with no sign of the others.
+    #[test]
+    fn a_download_burst_is_counted_not_hidden() {
+        let mut data = DashboardData::blank(false, None);
+        data.active_downloads = Some(vec![
+            hs_common::download_activity::ActiveDownload {
+                stem: "10.1_first".into(),
+                title: "First".into(),
+                bytes_downloaded: 500,
+                bytes_total: Some(1000),
+            },
+            hs_common::download_activity::ActiveDownload {
+                stem: "10.2_second".into(),
+                title: "Second".into(),
+                bytes_downloaded: 0,
+                bytes_total: None,
+            },
+        ]);
+        let screen = draw(&data);
+        assert!(screen.contains("+1 more"), "second download is invisible");
     }
 }

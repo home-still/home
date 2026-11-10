@@ -1,6 +1,8 @@
 pub mod config_file;
 pub mod cuda_libs;
+pub mod download_activity;
 pub mod exit_codes;
+pub mod fmt;
 pub mod gpu;
 pub mod hardware_profile;
 pub mod html;

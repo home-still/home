@@ -146,6 +146,18 @@ pub struct PipelineCounts {
     /// panel, not just in the per-scribe Services rows.
     #[serde(default)]
     pub in_flight_conversions: Option<u64>,
+    /// Downloads the server is performing right now, with their live byte
+    /// counts. A download has no other observable state: the bytes are
+    /// collected in memory and written with a single `put`, and
+    /// `downloaded_at` — which the History feed keys on — is stamped only
+    /// afterwards. So without this, `paper_download` was silent for its whole
+    /// duration. Rendered as the `Downloading` row in `hs status`.
+    ///
+    /// Process-local by construction: the server that builds this snapshot is
+    /// the process doing the download. `None` when the server is an older
+    /// build that does not report it.
+    #[serde(default)]
+    pub active_downloads: Option<Vec<crate::download_activity::ActiveDownload>>,
     /// Work outstanding on the scribe consumer of `papers.ingested`: waiting
     /// in the stream plus delivered and not yet acked (so it includes what is
     /// being converted right now). This is what a `hs pipeline catch-up`
@@ -1350,6 +1362,7 @@ pub async fn collect_pipeline_counts(
         inbox_pending: None,
         // Computed by caller once it knows total in_flight.
         in_flight_conversions: None,
+        active_downloads: None,
         queued_conversions: None,
         stalled_conversions: None,
         queue_error: None,
