@@ -126,16 +126,18 @@ async fn link(args: DocsLinkArgs, reporter: &Arc<dyn Reporter>) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("minting the link failed: {e}"))?;
 
     let lan = link_url(&base_url, &params);
-    reporter.finish(&lan);
+    // The URL is this command's result, so it goes to stdout: it is what
+    // a caller pipes or captures, and it must survive `--quiet`. The
+    // reporter writes progress to stderr and renders differently on a
+    // terminal; it keeps the one line a human reads, the expiry.
+    println!("{lan}");
     if let Some(remote_base) = remote_base {
-        let remote = link_url(&remote_base, &params);
-        reporter.finish(&remote);
+        println!("{}", link_url(&remote_base, &params));
     }
-    reporter.finish(&format!(
-        "expires at {} ({} seconds)",
-        expires_at_iso(params.expires_at),
-        ttl
-    ));
+    reporter.status(
+        "Expires",
+        &format!("{} ({} seconds)", expires_at_iso(params.expires_at), ttl),
+    );
     Ok(())
 }
 
