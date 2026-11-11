@@ -136,6 +136,17 @@ pub enum SourceFormat {
 }
 
 impl SourceFormat {
+    /// Every format the personal pipeline accepts, in probe order: the
+    /// richest source first. The docs service probes a personal
+    /// document's source in exactly this order.
+    pub const ALL: &'static [SourceFormat] = &[
+        SourceFormat::Pdf,
+        SourceFormat::Epub,
+        SourceFormat::Docx,
+        SourceFormat::Markdown,
+        SourceFormat::Txt,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             SourceFormat::Pdf => "pdf",

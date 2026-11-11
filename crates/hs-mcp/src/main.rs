@@ -152,7 +152,7 @@ struct DocLinkParams {
     #[schemars(description = "Paper stem name (filename without extension)")]
     stem: Stem,
     #[schemars(
-        description = "Which document to link: `source` (the original PDF, HTML or EPUB) or `markdown` (the converted text). Default: `source`"
+        description = "Which document to link: `source` (the original document: PDF, HTML, EPUB, DOCX, Markdown or text) or `markdown` (the converted text). Default: `source`"
     )]
     format: Option<String>,
     #[schemars(
@@ -1804,7 +1804,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Mint a fresh, signed, expiring link to a document in the corpus. The link opens the original document (PDF, HTML or EPUB) or its converted markdown, on the LAN and away from home. Use this when a link from a previous result has expired, or to get a link for a document you know the stem of but have not searched for.",
+        description = "Mint a fresh, signed, expiring link to a document in the corpus. The link opens the original document (PDF, HTML, EPUB, DOCX, Markdown or text) or its converted markdown, on the LAN and away from home. Use this when a link from a previous result has expired, or to get a link for a document you know the stem of but have not searched for.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

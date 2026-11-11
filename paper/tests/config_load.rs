@@ -11,7 +11,7 @@
 use hs_common::config_file::ConfigFile;
 use hs_common::CONFIG_REL_PATH;
 use paper::config::Config;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Run `f` with a hermetic env: no inherited vars, `$HOME` an empty dir.
 #[allow(clippy::result_large_err)] // figment's `Jail` closure type
@@ -101,7 +101,19 @@ fn load_yaml(yaml: Option<&str>) -> anyhow::Result<Config> {
             std::fs::write(path, yaml).unwrap();
         }
         let user = ConfigFile::load_in(&home).unwrap();
-        let system = ConfigFile::load_at(Path::new("/nonexistent/config.yaml"), &home).unwrap();
+        // The system-wide file must be absent, and absence has to be a
+        // `NotFound`. Do not spell it as `Path::new("/nonexistent/config.yaml")`:
+        // that is a POSIX absolute path, and on Windows `fs::read_to_string`
+        // resolved it somewhere that answered with the OS error
+        // `ERROR_NETNAME_DELETED` (code 64) rather than `NotFound` — the
+        // rc.392 gate's windows-2022 leg died on it with
+        // `Unreadable { path: "/nonexistent/config.yaml", source: Os { code: 64 … } }`.
+        // `load_at` reserves `NotFound` for the absent case and errors on every
+        // other kind, so the test panicked in its own setup before any
+        // assertion ran. A name inside the jail is a local path on every
+        // platform, and one that was never written.
+        let absent = home.join("no-such-system-config.yaml");
+        let system = ConfigFile::load_at(&absent, &home).unwrap();
         out = Some(Config::load_from(&system, &user));
         Ok(())
     });
