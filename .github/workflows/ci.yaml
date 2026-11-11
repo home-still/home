@@ -33,9 +33,16 @@ jobs:
         # build dies in cc-rs (`cl.exe` exit 2). Every crate but
         # hs-scribe pulls duckdb, so the whole leg failed. release.yaml
         # pinned the same runner for the same reason (rc.336/rc.337).
+        #
+        # macos-15, NOT macos-14: GitHub retired the macOS 14 images on
+        # 2026-11-02. A job asking for macos-14 is cancelled before it
+        # starts, with "The configuration 'macos-14-arm64-us-default' is
+        # not supported" — rc.391's gate died that way in 1 s on all three
+        # attempts. Both labels are arm64, so the swap changes nothing
+        # else about the job.
         # big is the self-hosted Ubuntu 24.04 runner (labels self-hosted, big) with a
         # persistent cargo cache; it stands in for ubuntu-24.04 on this matrix.
-        os: [big, macos-14, windows-2022]
+        os: [big, macos-15, windows-2022]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -111,4 +118,4 @@ jobs:
         if: matrix.os == 'big'
       # The macOS scribe server release artifact (aarch64-apple-darwin).
       - run: cargo check --locked -p hs-scribe --features server --bin hs-scribe-server
-        if: matrix.os == 'macos-14'
+        if: matrix.os == 'macos-15'
