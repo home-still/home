@@ -1,44 +1,21 @@
-# Python Model Conversion Tools
+# Legacy Python scripts
 
-This directory contains Python utilities for converting ML models to ONNX format for use in the pdf-mash Rust application.
+These scripts belong to an earlier version of the conversion pipeline. The
+current scribe server does not use them, and nothing in the build or the code
+runs them.
 
-## Setup
+| Script | What it does |
+|---|---|
+| `convert_to_onnx.py` | Exports a DocLayout-YOLO PyTorch model (`.pt`) to ONNX. |
+| `download_paddle_models.py` | Fills the PaddleOCR model cache in `~/.paddleocr/`. |
+| `download_dictionaries.py` | Downloads the SymSpell English frequency dictionaries. |
 
-```bash
-cd python
-uv sync
-```
+None of them produces the models the scribe server loads. It loads two ONNX
+files from `~/.home-still/models/`:
 
-## Usage
+| File | Model | Setting |
+|---|---|---|
+| `pp-doclayoutv3.onnx` | PP-DocLayout-V3 layout detection | `HS_SCRIBE_LAYOUT_MODEL_PATH` |
+| `slanet-plus.onnx` | SLANet-Plus table structure | `HS_SCRIBE_TABLE_MODEL_PATH` |
 
-### Convert DocLayout-YOLO Model
-
-```bash
-uv run python convert_to_onnx.py /path/to/model.pt
-```
-
-The script will:
-1. Load the PyTorch model
-2. Export to ONNX format
-3. Save as `model.onnx` in the same directory
-
-### Environment
-
-- Python 3.10+
-- Uses `uv` for dependency management
-- Dependencies defined in `pyproject.toml`
-
-## Models Directory Structure
-
-Model files should be placed in `../models/`:
-- Keep `.onnx` files for the Rust application
-- `.pt` and `.pth` files are gitignored
-- Downloaded model repos are gitignored
-
-## Dependencies
-
-Key packages:
-- `torch` - PyTorch for loading models
-- `onnx` - ONNX format handling
-- `onnxscript` - ONNX conversion utilities
-- `doclayout-yolo` - DocLayout-YOLO model architecture
+See the [scribe server settings](../../../docs/reference/configuration.md#scribe_server).

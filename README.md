@@ -1,10 +1,56 @@
 # home-still
 
-Free and open source tools to democratize knowledge acquisition, distillation, and comprehension.
+home-still is a personal research engine: it finds open academic papers,
+converts them to clean markdown, indexes them by meaning, and lets you and
+your AI assistant search and read them, on hardware you own.
 
-> **New here?** Start with the [plain-English guide](docs/guide.md) — what home-still is, why it exists, and how to use it without prior knowledge of vector databases or MCP.
->
-> **Setting up across multiple machines?** See the [home-cloud deployment guide](docs/deployment.md) — step-by-step recipes for tunnel host, storage server, GPU compute, DB host, and clients.
+## Why
+
+Most peer-reviewed knowledge is in papers that are free to read but hard to
+use: keyword search misses ideas phrased differently, PDFs are hard for
+software to read, and the good commercial tools charge per seat and keep
+your library in their account. home-still gives one person, at home, their
+own searchable library of the open literature, and answers grounded in
+papers they can check. [Read more](docs/explanation/overview.md).
+
+## What you can do
+
+- [Find and download papers](docs/how-to/find-and-download-papers.md) from
+  several academic providers at once, deduplicated and ranked.
+- [Convert PDFs, HTML and EPUB to markdown](docs/how-to/convert-documents.md)
+  with a layout model and a vision-language model, keeping pages, tables and
+  formulas.
+- [Search your library](docs/how-to/index-and-search.md) by meaning and by
+  keyword together.
+- [Open the source at the cited page and passage](docs/how-to/open-documents-with-links.md),
+  on your network or away from home.
+- [Keep personal documents](docs/how-to/manage-personal-documents.md), such
+  as medical and financial records, in a private searchable store.
+- [Use a local OpenAlex catalog](docs/how-to/use-the-openalex-catalog.md) for
+  offline metadata and the citation graph.
+- [Use the library from Claude and other MCP agents](docs/how-to/connect-claude-and-agents.md).
+- [Run across your home machines](docs/tutorials/home-cloud-cluster.md) and
+  [reach it remotely](docs/how-to/access-remotely.md) through one
+  authenticated gateway.
+- [Watch the whole pipeline](docs/reference/status-dashboard.md) on a live
+  dashboard.
+- [Upgrade every binary and service](docs/how-to/run-and-upgrade-services.md)
+  with one command.
+
+## Status
+
+home-still is under active development and ships as release candidates
+tagged `v0.0.1-rc.N` on
+[GitHub Releases](https://github.com/home-still/home/releases); the
+[changelog](CHANGELOG.md) lists what needs action when you upgrade.
+
+- **Platforms:** the `hs` command runs on macOS (Intel and Apple Silicon),
+  Linux (x86-64 and ARM64) and Windows.
+- **Search** needs an NVIDIA GPU with CUDA for the distill server (Linux,
+  x86-64), plus Docker or Podman for Qdrant.
+- **Conversion** needs a vision-language model backend: Ollama (Metal on
+  Apple Silicon, CUDA on NVIDIA) or an OpenAI-compatible server.
+- **Automation** needs a NATS server with JetStream.
 
 ## Install
 
@@ -12,650 +58,48 @@ Free and open source tools to democratize knowledge acquisition, distillation, a
 curl -fsSL https://raw.githubusercontent.com/home-still/home/main/docs/install.sh | sh
 ```
 
-Installs the `hs` binary to `~/.local/bin/`. Supports macOS (Intel + Apple Silicon), Linux (x86_64 + ARM64), and Windows.
+This installs `hs` and, where your platform has them, its companion servers
+into `~/.local/bin/`.
 
 ## Quick start
 
-```sh
-hs config init                                    # set up config + API keys
-hs paper search "transformer attention mechanisms" # search across all providers
-hs paper download "neural nets" -n 25              # download PDFs (publishes papers.ingested for the watchers)
-hs serve scribe                                    # run scribe service on this machine
-hs serve distill                                   # run distill service on this machine
-hs distill search "attention mechanism"            # semantic search
-hs status                                          # live pipeline dashboard
-```
-
-## What it does
-
-home-still is a four-phase academic research engine:
-
-| Phase | Tool | What it does | Status |
-|---|---|---|---|
-| **Acquire** | `hs paper` | Search and download papers from 5 providers (6 with a CORE key) | Working |
-| **Convert** | `hs scribe` | Convert PDFs to markdown using layout detection + VLM OCR | Working |
-| **Index** | `hs distill` | Chunk, embed, and index documents into Qdrant | Working |
-| **Search** | `hs distill search` | Semantic search across indexed documents | Working |
-| **Serve** | `hs serve` | Run a service on this machine (auto-init) | Working |
-| **Cloud** | `hs cloud` | Secure remote access via Cloudflare tunnel + OAuth2 | Working |
-
-## Paper search
-
-Search 5 academic providers simultaneously (6 with a CORE API key). Results are deduplicated, merged, and ranked using reciprocal rank fusion.
+These work right after installing, with nothing else running:
 
 ```sh
-# Keyword search (queries all providers by default)
-hs paper search "CRISPR gene editing"
-
-# By author, limit to 5 results
-hs paper search --type author "Hinton" -n 5
-
-# Recent papers with abstracts
-hs paper search "diffusion models" --date ">=2024" -a
-
-# Sort by citations, minimum 100
-hs paper search "attention is all you need" --sort citations --min-citations 100
-
-# Single provider
-hs paper search "neural ode" -p arxiv
-
-# JSON output for scripting
-hs paper search "LLM reasoning" --output json | jq '.papers[].title'
+hs config init
+hs paper search "transformer attention mechanisms" -n 5
+hs paper search --type author "Hinton" --sort citations -n 5
+hs paper get --doi 10.48550/arXiv.1706.03762
 ```
 
-### Download
-
-```sh
-# Search and download matching papers
-hs paper download "neural nets" -n 25
-
-# Download a single paper by DOI
-hs paper download --doi "10.48550/arXiv.2301.00001"
-
-# Higher concurrency
-hs paper download "transformers" -n 100 -c 8
-```
-
-Downloading papers auto-triggers the full pipeline: the scribe watcher detects new PDFs and converts them to markdown, then the distill indexer picks up new markdown files and indexes them into Qdrant. No manual `hs scribe convert` or `hs distill index` step is needed when the services are running.
-
-### Search options
-
-| Flag | Values | Default |
-|---|---|---|
-| `-t, --type` | keywords, title, author, doi, subject | keywords |
-| `-p, --provider` | all, arxiv, openalex, semantic_scholar, europe_pmc, crossref, core | all |
-| `-s, --sort` | relevance, date, citations | relevance |
-| `-n, --max-results` | any number | 10 |
-| `-d, --date` | `>=2024`, `>2023 <2025`, `>=2024-06` | none |
-| `-a, --abstract` | show abstracts | off |
-| `--min-citations` | minimum citation count | none |
-| `--offset` | pagination offset | 0 |
-
-### Providers
-
-| Provider | Coverage | Rate limit |
-|---|---|---|
-| [arXiv](https://arxiv.org) | Physics, math, CS, biology preprints | 1 req / 3s |
-| [OpenAlex](https://openalex.org) | 250M+ works across all disciplines | 10 req / s |
-| [Semantic Scholar](https://semanticscholar.org) | 200M+ papers with citation graphs | 1 req / s |
-| [Europe PMC](https://europepmc.org) | Biomedical and life sciences | 5 req / s |
-| [CrossRef](https://crossref.org) | 147M+ DOI records | 10 req / s |
-| [CORE](https://core.ac.uk) | 300M+ open access papers | 5 req / 10s |
-
-All providers are queried in parallel when using `--provider all` (default). Results are deduplicated by DOI and fuzzy title matching, then ranked with reciprocal rank fusion.
-
-## PDF-to-Markdown (Scribe)
-
-Convert academic PDFs into structured markdown. A scribe server runs one of two converters:
-
-**Layout pipeline** (the default):
-
-1. **Layout detection** -- PP-DocLayout-V3 via ONNX Runtime. Detects 25 region types (titles, paragraphs, figures, tables, formulas, headers, footers, captions, references, footnotes, and more).
-2. **VLM OCR** -- Sends each detected region (each table cell, for tables) to a vision-language model, GLM-OCR by default, for text extraction. The backend is chosen with `HS_SCRIBE_BACKEND`: `Ollama` (the default), `OpenAi` for any OpenAI-compatible server (llama-server, llama-swap, vLLM; URL in `HS_SCRIBE_OPENAI_URL`), or `Cloud`.
-3. **Markdown assembly** -- Regions are ordered and assembled into section-aware markdown with heading hierarchy and table structure.
-
-**olmocr** (`HS_SCRIBE_CONVERTER=olmocr`): runs the olmOCR CLI against a vLLM-served model; it renders and transcribes whole pages itself.
-
-A region whose VLM output falls into a loop (the same unit repeated back to back) is aborted mid-stream, and a conversion with aborted or unprocessable regions is refused rather than stored with holes. Stored output is also cleaned of long repeated runs.
-
-### Setup
-
-```sh
-hs serve scribe    # run the scribe server in the foreground (needs models, libpdfium and HS_BACKEND_TOKEN; see crates/hs-scribe/README.md)
-```
-
-With the Ollama backend on **macOS Apple Silicon**, Ollama runs natively with Metal GPU acceleration. Layout detection uses CUDA on **Linux with an NVIDIA GPU** when `HS_SCRIBE_USE_CUDA` is on (the default) and fails to start if CUDA cannot be used; set `HS_SCRIBE_USE_CUDA=false` to run it on the CPU, as Apple Silicon hosts must.
-
-### Convert
-
-```sh
-hs scribe convert paper.pdf              # output to stdout
-hs scribe convert paper.pdf --out paper.md  # output to file
-```
-
-### Watch directory
-
-Convert PDFs as `papers.ingested` events arrive on the configured event bus (`events.backend: nats`):
-
-```sh
-hs scribe watch-events              # foreground
-hs serve scribe-watch --install     # install as a user-level service
-hs status                           # show conversion progress
-```
-
-### Server management
-
-```sh
-hs serve scribe start    # run the scribe server in the background
-hs serve scribe stop     # stop it
-hs serve scribe --install  # install as a systemd / launchd service and start it
-hs status                # service health
-```
-
-With multiple servers configured, PDFs are load-balanced across them based on server readiness. See [crates/hs-scribe/README.md](crates/hs-scribe/README.md) for full documentation.
-
-## Semantic Search (Distill)
-
-Chunk, embed, and index converted markdown into a Qdrant vector database for semantic search.
-
-Search runs **two channels and fuses them**:
-
-- **Dense** — a bge-m3 vector per chunk, cosine similarity. Finds
-  passages that *mean* what the query means.
-- **Lexical** — a text index over the chunk text. Finds passages that
-  *say* the query's words.
-
-The two are combined with Reciprocal Rank Fusion, so a passage that only one
-channel likes is still ranked. This matters for specific queries: a dense
-embedder matches "thyroid" generically and loses "Hashimoto", and the
-lexical channel puts the passage about Hashimoto's disease at the top. See
-[docs/loop/runs/2026-10-20-01/research.md](docs/loop/runs/2026-10-20-01/research.md)
-for the measurement.
-
-**Reference lists are demoted.** A bibliography entry matches a query
-about a topic perfectly well in a dense embedding — semantically, a
-citation to work about hippocampal neurogenesis *is* about hippocampal
-neurogenesis — so a chunk of `doi:` lines can be the best-ranked hit for
-a question. Such chunks are pushed below the passages that discuss the
-topic; they are not dropped, so a user asking for a bibliography still
-gets it.
-
-The detector recognises the citation styles the corpus actually uses: a
-`doi:`, an `et al.`, a parenthesised **or bare** year after an author
-list, an ALL-CAPS APA list, a full given name, a reference number of
-any size, a page range, a volume, and a bulleted author list. Measured
-on the fixed query set: the share of queries whose **first** hit is a
-bibliography fell from 28 % to 4 %, the reference-like hits in the top 3
-from 24 % to 4 %, and recall rose from 96 % to 100 % — a bibliography
-that outranked the answer had pushed it out of the page. See
-[docs/loop/runs/2026-10-21-06/research.md](docs/loop/runs/2026-10-21-06/research.md).
-
-### Setup
-
-```sh
-hs distill init                          # set up Qdrant container
-hs serve distill start                   # start Qdrant + distill server
-```
-
-### Index and search
-
-```sh
-hs distill index                         # index all markdown files
-hs distill search "attention mechanism"  # semantic search
-hs distill search "neural nets" --year ">2020" --limit 5
-hs distill status                        # server liveness + collection stats
-```
-
-Search results include title, authors, year, relevance score, and text snippets. Low-quality chunks (repetition loops, garbled text) are automatically filtered during indexing.
-
-`hs distill status` reports the server's liveness by **asking the
-server** — its `/health` endpoint answers for itself, and the reply
-carries the server's own PID. It is not a PID-file check: a server
-started by systemd writes no PID file, and a PID file records the PID
-of a *previous* launch, so a file-based check reports a healthy server
-as dead.
-
-### Repairing missing titles
-
-A document indexed before its catalog row existed was indexed with no
-title, and — because the corpus is not re-indexed — it stays that way. The
-backfill writes the title onto the points that lack it, from the catalog
-where the catalog has one and from the document's own text where it does
-not. It is a **payload update**: no vector is recomputed, no GPU is
-used.
-
-```sh
-hs distill backfill-titles               # dry run: report what it would write
-hs distill backfill-titles --apply        # write it
-```
-
-Documents that neither source can title are reported by name, never given
-a placeholder that would look like a title.
-
-### Opening the documents (signed links)
-
-A search hit names a document; the docs service turns that name into a
-link a browser can follow. The link is signed and expiring: it opens one
-document, for a bounded time, and it stops working when the device it
-was minted for is revoked.
-
-```sh
-hs serve docs                             # the service (port 7446)
-hs serve docs --install                   # as a system service
-hs docs link 10.1371_journal.pone.0038469  # mint a link
-hs docs link 10.1371_journal.pone.0038469 --markdown --remote
-```
-
-Every tool that returns a document — `distill_search`,
-`abstract_search`, `personal_search`, `catalog_read`, and `doc_link` —
-carries a `links` object with a LAN URL and a remote URL for the source
-document and for its markdown. The remote URL goes through the cloud
-gateway; the LAN URL goes straight to the service, so a large PDF never
-hairpins through the tunnel.
-
-A link that names a passage points at it: the PDF link carries
-`#page=N`, and the markdown link carries a W3C text fragment that
-selects the passage. The page is part of the signed link, so a link
-minted for one page opens that page and nothing else.
-
-The page comes from the converter's page boundaries. Every converter
-keeps them, including olmocr since rc.384; a document olmocr converted
-before then is one flat page, so its hits carry no `page` and its PDF
-link opens at the first page.
-
-```sh
-hs docs link 10.1371_journal.pone.0038469 --page 11
-```
-
-**The collection is part of the link.** The corpus holds more than one
-store: the academic papers and the personal documents are separate, and
-a stem can name a document in either. A link names the store it is for,
-and the name is signed — so a link for a personal document cannot be
-edited into a link for an academic one, or the other way round.
-
-```sh
-hs docs link annual-checkup-notes-e564ee61 --collection personal
-```
-
-The personal store reaches the docs service through the corpus's own
-storage, under the `personal/` prefix. `hs migrate personal-to-storage
---dry-run` previews the move; the personal objects keep their names, and
-the local files are left in place.
-
-The personal store's **catalog** — its documents' metadata and their
-converted text — is read and written through the same `storage:` section
-as the rest of the corpus, so a personal document is found on every host
-that can reach the store, not only on the one whose disk holds a copy.
-The one exception is the **ingest inbox**, which is a local drop folder
-by design: it is where an external agent may introduce bytes, and it
-takes a filename, never a path.
-
-Configure the base URLs in `~/.home-still/config.yaml`:
-
-```yaml
-docs:
-  lan_base_url: http://<host>:7446
-  remote_base_url: https://<public-host>
-  link_ttl_secs: 3600
-```
-
-The **remote** links go through the cloud gateway, so the gateway needs
-a `docs` route and the docs host's firewall must allow the port:
-
-```yaml
-# on the gateway host, in ~/.home-still/config.yaml
-cloud:
-  gateway:
-    routes:
-      docs: http://<host>:7446
-```
-
-```bash
-# on the host that serves the docs service
-sudo ufw allow from 192.168.1.0/24 to any port 7446 proto tcp
-```
-
-The gateway refuses to start when a service it can route has no route,
-and reports a backend it cannot reach — so a missing route or a
-firewall that drops the port is visible at startup rather than as a
-dead link in a browser.
-
-The signing key lives in `~/.home-still/docs-link.key`, beside the other
-credentials. It is created with mode 0600 on first use and never
-overwritten.
-
-Output formats: `--output text` (default), `--output json`, `--output ndjson`.
-
-See [crates/hs-distill/README.md](crates/hs-distill/README.md) for full documentation.
-
-## Status Dashboard
-
-```sh
-hs status
-```
-
-Live TUI showing:
-- **Pipeline stats** -- PDF count, markdown count, catalog entries, embedded documents/chunks
-- **Service health** -- scribe servers (with version + in-flight conversions), distill servers, Qdrant
-- **Recent conversions** -- title, pages, duration, timestamp
-
-Refreshes every 3 seconds. Press `q` to quit.
-
-**A tier that is refusing work says why.** When a scribe tier's VRAM
-gate refuses to dispatch, the line names the shortfall and who is
-holding the card, instead of reporting only that the backend is
-unavailable:
-
-```
-○ scribe   http://big:7435   backend unavailable: 12.9 GiB free, needs 13.2 GiB;
-           held by pid=2227527 7534MB hs-distill-server; pid=1737565 2596MB
-           hs-scribe-server   0.0.1-rc.379
-```
-
-So the next step is visible from the dashboard: free the card, or lower
-the headroom. Before, the same condition read `backend unavailable`
-and the reason had to be found in the tier's journal on another host.
-
-## Service Deployment (Serve)
-
-Run a service on the current machine in the foreground (`start` / `stop` run it in the background; `--install` makes it a systemd / launchd service).
-
-```sh
-hs serve scribe                   # run scribe (PDF conversion) on this machine
-hs serve distill                  # run distill (embedding + search) on this machine
-hs serve mcp                      # run MCP server on this machine
-```
-
-`hs serve distill` initializes the Qdrant/distill prerequisites on first run (the `hs distill init` step). `hs serve scribe` does not provision anything: the scribe host needs its models, libpdfium and `HS_BACKEND_TOKEN` in place first. To make a node reachable through the gateway, add its URL to `cloud.gateway.routes` on the gateway host.
-
-## Load balancing
-
-The gateway is the single endpoint for off-network clients; it balances across the backends listed under `cloud.gateway.routes` (a single URL or a list per service; round-robin, with an instance that refuses connections skipped briefly). Add or remove a node by editing that list and restarting the gateway.
-
-## Self-Update
-
-```sh
-hs upgrade              # download latest, update containers, health check
-hs upgrade --check      # check for updates without installing
-hs upgrade --force      # reinstall even if already on latest
-```
-
-Downloads the correct binary for your platform from GitHub releases, replaces the running binary via atomic rename, pulls new Docker images, restarts containers, and runs health checks.
-
-## Cloud Access
-
-Access your home-still services from anywhere over the internet. Uses a Cloudflare tunnel for connectivity and OAuth2 for authentication.
-
-### Architecture
-
-```
-Remote machine              Cloudflare Edge              Gateway host          LAN services
-  hs CLI / Claude ──[HTTPS]──> cloud.example.com ──[QUIC]──> hs-gateway ──[HTTP]──> scribe, distill
-```
-
-### Prerequisites
-
-- A host on your LAN running [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) with an active tunnel
-- A domain name managed by Cloudflare (e.g., `cloud.example.com`)
-
-### Gateway setup
-
-On your tunnel host:
-
-```sh
-hs cloud init                # generate the signing secret and the admin key (both mode 0600)
-
-# Edit ~/.home-still/config.yaml:
-cloud:
-  gateway:
-    listen: 127.0.0.1:7440
-    routes:
-      scribe: http://gpu-server:7433
-      distill: http://gpu-server:7434
-      mcp: http://127.0.0.1:7445
-```
-
-The gateway's public URL is not read from this file: it is the required `--gateway-url` flag (an `https://` origin; startup fails otherwise).
-
-Add an ingress rule to your cloudflared config:
-
-```yaml
-- hostname: cloud.example.com
-  service: http://127.0.0.1:7440
-```
-
-Start the gateway as a systemd service or manually:
-
-```sh
-hs-gateway --gateway-url https://cloud.example.com
-```
-
-### Enrolling devices
-
-On the gateway host:
-
-```sh
-hs cloud invite              # generates a 5-minute, single-use code
-```
-
-On the remote machine:
-
-```sh
-hs cloud enroll --gateway https://cloud.example.com
-# enter the enrollment code when prompted
-```
-
-### Claude Desktop (OAuth2)
-
-The gateway implements OAuth 2.1 Authorization Code + PKCE, which Claude Desktop uses for remote MCP servers:
-
-1. Add `https://cloud.example.com/mcp` as a remote MCP server in Claude Desktop
-2. Claude opens your browser to the gateway's authorization page
-3. Generate a code with `hs cloud invite` on the gateway host
-4. Enter the code in the browser form
-5. Claude Desktop stores tokens and auto-refreshes them
-
-### CLI access
-
-For scripts and CLI tools:
-
-```sh
-hs cloud token               # prints a 4-hour access token
-hs cloud status               # check connection and token validity
-```
-
-See [crates/hs-gateway/README.md](crates/hs-gateway/README.md) for full documentation.
-
-## MCP Server
-
-home-still includes a [Model Context Protocol](https://modelcontextprotocol.io) server exposing the pipeline as 35 tools: paper search/download/citations (`paper_*`), catalog and markdown access (`catalog_*`, `markdown_*`), scribe (`scribe_health`, `scribe_convert`), distill (`distill_*`, `abstract_search`), personal documents (`personal_*`), `system_status`, and, once the local OpenAlex corpus is built, `openalex_*`. The full list with parameters is in [crates/hs-mcp/README.md](crates/hs-mcp/README.md).
-
-### Local (stdio)
-
-For Claude Desktop or Claude Code on the same machine:
-
-```json
-{
-  "mcpServers": {
-    "home-still": {
-      "command": "hs-mcp"
-    }
-  }
-}
-```
-
-### Remote (SSE via gateway)
-
-Run the MCP server on your LAN and expose through the gateway:
-
-```sh
-hs-mcp --serve 127.0.0.1:7445
-```
-
-Remote clients connect via `https://cloud.example.com/mcp` using OAuth2. See [crates/hs-mcp/README.md](crates/hs-mcp/README.md) for full documentation.
-
-## Configuration
-
-```sh
-hs config init          # creates ~/.home-still/config.yaml (interactive; --force overwrites)
-hs config show          # prints resolved config
-hs config path          # prints config file path
-```
-
-Config file: `~/.home-still/config.yaml`
-
-```yaml
-home:
-  project_dir: ~/home-still           # papers, markdown, catalog
-
-paper:
-  providers:
-    openalex:
-      # api_key: your-key-here
-  download:
-    # unpaywall_email: you@example.com
-
-scribe:
-  servers:
-    - http://localhost:7433
-    # - http://gpu-server:7433
-
-distill:
-  servers:
-    - http://localhost:7434
-```
-
-Override with environment variables: `HOME_STILL_PAPER_DOWNLOAD_PATH=/tmp/papers`
-
-## Global flags
-
-Available on all commands:
-
-| Flag | Values | Default |
-|---|---|---|
-| `--color` | auto, always, never | auto |
-| `--output` | text, json, ndjson | text |
-| `--quiet` | suppress non-result output | off |
-| `--verbose` | debug-level output | off |
-| `-y, --yes` | skip interactive prompts | off |
-
-## Network ports
-
-| Port | Service | Direction | Notes |
-|------|---------|-----------|-------|
-| **7433** | Scribe server | Client -> Server | PDF-to-markdown conversion |
-| **7434** | Distill server | Client -> Server | Embedding and semantic search |
-| **7440** | Gateway | Tunnel -> Gateway | Cloud access reverse proxy |
-| **7445** | MCP server | Gateway -> MCP | Model Context Protocol (SSE) |
-| **6333** | Qdrant REST | Server internal | Vector DB HTTP API |
-| **6334** | Qdrant gRPC | Server internal | Vector DB gRPC |
-| **11434** | Ollama | Server internal | VLM for OCR with the `Ollama` backend (an `OpenAi` backend uses its own server's port) |
-
-## Architecture
-
-```
-crates/hs/          Unified CLI binary (paper, scribe, distill, personal, serve, status, restart, upgrade, mcp, cloud, pipeline, migrate, openalex, config)
-crates/hs-scribe/   PDF-to-markdown (ONNX layout detection + VLM OCR, client/server)
-crates/hs-distill/  Vector embedding + semantic search (ONNX embeddings, Qdrant, client/server)
-crates/hs-gateway/  Cloud access reverse proxy (OAuth2, token auth, service routing)
-crates/hs-mcp/      MCP server (35 tools, stdio + streamable HTTP transport)
-paper/              Academic paper meta-search library (5 providers, 6 with a CORE key; aggregation)
-hs-common/          Shared infrastructure (reporter, service pool, catalog, auth, compose)
-```
-
-## Mac Known Issues and Fixes
-
-### NFS jukebox errors or slow directory listings
-
-When accessing the shared NFS mount from macOS, you may see:
-- `nfs server ...: resource temporarily unavailable (jukebox)` kernel messages
-- `hs status` stalling on filesystem counts ("Loading..." or "NFS stall")
-- Finder hanging indefinitely when opening `markdown/` (or similar dirs with thousands of sharded files)
-
-**Root causes and fixes:**
-
-1. **NFS export was `sync`** (every write blocks on disk — bad for USB-attached SSDs).
-   On the server, edit `/etc/exports`:
-   ```
-   <nfs-mount> <lan-subnet>(rw,async,no_subtree_check,all_squash,anonuid=1000,anongid=1000)
-   ```
-   Then `sudo exportfs -ra`.
-
-2. **macOS default NFS mount options are too small.** Remount with 1 MB blocks:
-   ```sh
-   sudo umount -f /Volumes/share
-   sudo mkdir -p /Volumes/share
-   sudo mount_nfs -o resvport,rw,rsize=1048576,wsize=1048576,nolocks \
-       <server-ip>:/<export-path> /Volumes/share
-   ```
-
-3. **Spotlight indexing the NFS share** causes Finder to read every file. Disable it:
-   ```sh
-   sudo mdutil -i off /Volumes/share
-   ```
-
-4. **Stale macOS NFS client cache** after a previous jukebox storm. A fresh remount (step 2) clears it.
-
-5. **Orphaned `.tmp*` files in `markdown/`** from crashed writes. Clean them on the server:
-   ```sh
-   ssh <nfs-server> "rm -f <nfs-mount>/home-still/markdown/.tmp* <nfs-mount>/home-still/markdown/._.tmp*"
-   ```
-
-### Finder still hangs on `markdown/` even after the fixes above
-
-Finder does extra work beyond `ls` (preview generation, folder size calculation, Quick Look). For a folder with 150+ sharded subdirectories containing thousands of `.md` files, this can be unresponsive even when the underlying NFS is healthy.
-
-**Workarounds:**
-- Use the CLI: `ls /Volumes/share/home-still/markdown/` is always fast
-- In Finder, View → Show View Options → uncheck **"Calculate all sizes"** and **"Show icon preview"**
-- Use List view (cmd+2) instead of Icon or Column view
-- Navigate directly to a shard subdirectory (cmd+shift+G, paste a path) rather than the top-level `markdown/`
-
-This is a macOS Finder limitation with large NFS-mounted directory trees, not a home-still bug. All `hs` tooling reads the directory fine.
-
-### `hs status` shows NFS stall on Air but big is healthy
-
-Air (macOS) and big (Linux) mount the same NFS export, but macOS NFSv3 client is much chattier than Linux NFSv4. If Air's mount is in a bad state:
-```sh
-sudo umount -f /Volumes/share
-sudo mkdir -p /Volumes/share
-sudo mount_nfs -o resvport,rw,rsize=1048576,wsize=1048576,nolocks <server>:/<export> /Volumes/share
-```
-
-### `hs upgrade` restarts watcher on a client node that shouldn't run it
-
-If a Mac (client node) gets its scribe watcher restarted during upgrade, set `scribe.local_server: false` in `~/.home-still/config.yaml`:
-```yaml
-scribe:
-  local_server: false
-  servers:
-    - http://<gpu-host>:7433
-```
-
-This prevents the watcher, scribe container init, and compose operations from running on this node. Only useful on nodes that should consume remote scribe services, not host them.
-
-## Build
-
-```sh
-# --release builds bake the version, so they name the tag they ship as (see build-support/version.rs)
-export HS_RELEASE_TAG=v0.0.1-rc.NNN
-cargo build --release -p hs                           # unified CLI
-cargo build --release -p hs-gateway                   # cloud gateway
-cargo build --release -p hs-mcp                       # MCP server
-cargo check -p hs-scribe --features server            # scribe server
-cargo check -p hs-distill --features server           # distill server
-cargo test --workspace                                # run tests
-```
-
-Development builds (no `--release`) take their version from `git describe`. A `--release` build of `hs`, `hs-gateway`, `hs-mcp`, `hs-scribe`, `hs-distill` (or of anything that depends on the last two, e.g. `personal`) without `HS_RELEASE_TAG` fails by design.
+Downloading needs the event bus, conversion needs a model and its layout
+files, and search needs the distill server.
+[Build your first research library](docs/tutorials/first-library.md) sets up
+each, step by step, on one machine, and ends with a library that converts
+and indexes every paper you download by itself.
+
+## Documentation
+
+The [documentation index](docs/README.md) has four parts:
+
+- [Tutorials](docs/README.md#tutorials): learn by building a working
+  library.
+- [How-to guides](docs/README.md#how-to-guides): get a specific task done.
+- [Reference](docs/README.md#reference): every command, tool, setting, port
+  and dashboard row.
+- [Explanation](docs/README.md#explanation): how and why it works the way it
+  does.
+
+## Contributing
+
+Building, testing, releasing and the documentation rules are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Related projects
 
-Other repos in the home-still family:
-
-- [**apple_health_source**](https://github.com/home-still/apple_health_source)
-  — sync Apple Health to your own Postgres/TimescaleDB and query it from
-  Claude Desktop via MCP. iOS app + Rust API + read-only SQL MCP server.
+- [apple_health_source](https://github.com/home-still/apple_health_source):
+  sync Apple Health to a database you own and query it from Claude Desktop
+  over MCP.
 
 ## License
 

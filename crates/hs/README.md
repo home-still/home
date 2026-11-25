@@ -1,120 +1,60 @@
 # hs
 
-Unified CLI for the home-still research pipeline.
+The `hs` command-line tool: every user-facing command of home-still, the
+service installers, the `hs status` dashboard, `hs upgrade`, and the docs
+service that serves signed document links.
 
-## Subcommands
+## User documentation
 
-```
-hs paper search    Search academic providers (5, plus CORE with an API key)
-hs paper download  Download papers by query or DOI
-hs paper get       Look up a single paper by DOI
+- [`hs` command reference](../../docs/reference/cli.md): every command, flag,
+  exit code and example.
+- [Run and upgrade services](../../docs/how-to/run-and-upgrade-services.md)
+- [`hs status` dashboard](../../docs/reference/status-dashboard.md)
+- [Documentation index](../../docs/README.md)
 
-hs scribe convert       Convert a single PDF to markdown
-hs scribe watch-events  Convert PDFs as `papers.ingested` events arrive (NATS)
-hs scribe reconvert     Clear a stem's conversion stamps and republish it for reconversion
-hs scribe catalog-backfill  Backfill catalog entries for markdown converted before the catalog existed
-hs scribe inbox    Sweep / run the manual-download inbox daemon
+## Code map
 
-hs distill init    Set up Qdrant and distill server
-hs distill index   Index markdown files into Qdrant
-hs distill search  Semantic search across indexed documents
-hs distill watch-events  Index markdown as `scribe.completed` events arrive (NATS)
-hs distill reconcile    Reconcile markdown, Qdrant and the catalog (dry-run by default)
-hs distill status  Show collection statistics
-hs distill hnsw enable --collection <name> --yes   Start the background HNSW index build (needs HS_BACKEND_TOKEN; without --yes it prints the plan and exits 1)
-
-hs serve scribe    Run scribe service on this machine (auto-init)
-hs serve distill   Run distill service on this machine (auto-init)
-hs serve mcp       Run MCP server on this machine (auto-init)
-
-hs status          Live TUI dashboard (pipeline stats, service health). The Failed row counts documents whose conversion was given up on and a retry can bring back (a backend dropped them); bad sources, which never convert, are counted beside it and are the only failures left out of the conversion progress
-hs restart         Restart the services running this host's installed binaries (macOS: LaunchAgents are booted out and bootstrapped, so plist edits take effect)
-
-hs upgrade         Self-update binaries (checksum + version verified) + Docker images + restart
-hs upgrade --check Check for updates without installing
-hs upgrade --force Reinstall even if on latest version
-hs upgrade --pre   Include pre-release tags
-
-hs mcp install     Write the home-still MCP server into Claude / OpenCode client configs
-hs mcp uninstall   Remove it again
-
-hs cloud init      Initialize this node as a cloud gateway (signing secret + admin key)
-hs cloud invite    Generate a one-time enrollment code (--name <device>, --scope <scribe|distill|mcp>, repeatable)
-hs cloud revoke    Revoke every token issued to a device (--name <device>, or oauth:<client_id>)
-hs cloud enroll    Enroll this device with a remote gateway
-hs cloud status    Show cloud connection status
-hs cloud token     Print a fresh access token
-
-hs pipeline        Cross-service operations: rebuild, catch-up, purge-*, reap-phantoms, reconvert-failed, events-reset
-hs pipeline catch-up --dry-run           Queue every source with no markdown and no failure stamp (the Stalled count). Failed conversions are skipped and counted — `reconvert-failed` re-queues those
-hs pipeline reconvert-failed --dry-run   Re-queue failed conversions: every retryable one by default, or exactly `--reason <reason>` (repeatable, any kind); lists what is selected and what is left
-hs migrate         One-shot data migrations: sharding, move-root-orphans, quarantine-bad-content, canonicalize-doi-stems, drop-local-html
-hs openalex        Local OpenAlex catalog (DuckDB), steps in order: load / load-works (newest copy of each id wins), build-indexes, install-fts (needs network once), build-fts; also status, query
-hs personal        Personal-document store
-
-hs config init     Generate default config file
-hs config show     Print resolved configuration
-hs config path     Print config file path
-```
-
-## Exit codes and interruption
-
-Every command exits non-zero when it did not finish its job: a destructive or
-batch command (`hs pipeline *`, `hs migrate *`, `hs distill abstracts build`,
-`hs scribe inbox sweep`) reports per-item errors and then fails the whole
-command if any item failed; `hs scribe watch-events` / `hs distill
-watch-events` exit 1 when the event stream ends, so the service manager
-restarts them.
-
-Ctrl+C is graceful for those long-running commands: the item in flight
-finishes, a summary of what was and was not done is printed, and the command
-exits non-zero. A second Ctrl+C exits immediately. `hs scribe inbox run`
-(and the `hs status` dashboard) also stop cleanly on SIGTERM.
-
-Bad inputs are not retried forever: an inbox file whose name cannot be a paper
-stem is moved to `corrupted/` once, with the reason logged.
-
-## Global flags
-
-| Flag | Description |
-|------|-------------|
-| `--color auto\|always\|never` | Color output mode |
-| `--output text\|json\|ndjson` | Output format |
-| `--quiet` | Suppress non-result output |
-| `--verbose` | Debug-level output |
-| `-y, --yes` | Skip interactive prompts |
-
-## Structure
-
-```
+```text
 src/
-  main.rs          Entry point, tokio runtime, dispatch
-  cli.rs           Clap derive: Cli, TopCmd, ConfigAction
-  shutdown.rs      Process-wide graceful-shutdown flag (SIGINT / SIGTERM)
-  scribe_cmd.rs    hs scribe subcommands
-  scribe_inbox.rs  Inbox sweeper / daemon
-  distill_cmd.rs   hs distill subcommands
-  cloud_cmd.rs     hs cloud subcommands
-  serve_cmd.rs     hs serve subcommands (auto-init, --install unit generation)
-  installer.rs     The one verified binary installer (hs upgrade, hs mcp install)
-  upgrade_cmd.rs   hs upgrade (self-update, compose refresh, health + CUDA check)
-  restart_cmd.rs   hs restart / post-upgrade service restart
-  mcp_cmd.rs       hs mcp install/uninstall
-  mcp_client.rs    MCP-over-HTTP client used by hs status
-  pipeline_cmd.rs  hs pipeline
-  migrate_cmd.rs   hs migrate
-  status_cmd.rs    hs status (ratatui TUI dashboard)
-  scribe_pool.rs   Load-balanced scribe client pool
-  daemon.rs        PID file management for background processes
-  config/
-    default.yaml   Embedded default configuration template
+  main.rs                 entry point, secrets loading, runtime, dispatch, hs config
+  cli.rs                  clap derive: Cli, TopCmd, MigrateAction, ConfigAction
+  shutdown.rs             process-wide graceful shutdown (SIGINT / SIGTERM)
+  scribe_cmd.rs           hs scribe; the tiered watcher dispatch
+  scribe_pool.rs          load-balanced scribe client pool
+  scribe_inbox.rs         the inbox sweeper and daemon
+  scribe_inbox_install.rs hs scribe inbox install | uninstall | status
+  distill_cmd.rs          hs distill
+  docs_cmd.rs             hs docs link | prune
+  docs_service.rs         the docs service behind hs serve docs
+  serve_cmd.rs            hs serve: foreground, start/stop, --install unit and plist generation
+  restart_cmd.rs          hs restart and the post-upgrade restart
+  upgrade_cmd.rs          hs upgrade: binaries, compose refresh, health and CUDA checks
+  installer.rs            the one verified binary installer (hs upgrade, hs mcp install)
+  mcp_cmd.rs              hs mcp install | uninstall
+  mcp_client.rs           MCP-over-HTTP client used by hs status
+  status_cmd.rs           hs status (ratatui dashboard and text output)
+  cloud_cmd.rs            hs cloud
+  pipeline_cmd.rs         hs pipeline
+  migrate_cmd.rs          hs migrate
+  migrate_personal.rs     hs migrate personal-to-storage
+  openalex_cmd.rs         hs openalex
+  daemon.rs               PID-file management for background processes
+  docs_tests.rs           drift tests: docs/reference/cli.md and every hs command the docs mention
+  test_http.rs            loopback HTTP fixture for unit tests
+config/
+  default.yaml            the template hs config init writes
 ```
 
-## Build
+`hs paper` and `hs personal` are implemented in the `paper` and `personal`
+crates; `hs distill`'s argument types live in `hs-distill`.
+
+## Build and test
 
 ```sh
-cargo build -p hs                                             # development: version from `git describe`
-HS_RELEASE_TAG=v0.0.1-rc.NNN cargo build --release -p hs      # release: version is the tag
+cargo build -p hs
+cargo test -p hs
 ```
 
-The `build.rs` bakes the version (including RC tags) into the binary via `env!("HS_VERSION")`; the rules live in `build-support/version.rs`. A `--release` build without a valid `HS_RELEASE_TAG` fails.
+The version is baked in by `build.rs` (rules in `build-support/version.rs`):
+a development build takes it from `git describe`, and a `--release` build
+requires `HS_RELEASE_TAG`. See [CONTRIBUTING](../../CONTRIBUTING.md).
