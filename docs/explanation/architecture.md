@@ -18,6 +18,9 @@ flowchart LR
     scribe -->|markdown| sw
     sw -->|markdown + catalog| st
     sw -->|scribe.completed| bus
+    sw -->|scribe.boxes| bus
+    bus -->|box-workers| sw
+    sw -->|word boxes| st
     bus -->|distill-workers| dw["hs distill watch-events"]
     dw -->|markdown| distill["distill server"]
     distill -->|vectors| qd[(Qdrant)]
@@ -28,10 +31,10 @@ flowchart LR
 
 **Storage** holds every document and its derivatives under one root:
 sources under `papers/`, markdown under `markdown/`, catalog entries under
-`catalog/`. The root is either a local directory (which can be a network
-mount) or an S3-compatible bucket such as Garage. Every program reads and
-writes through the same storage interface, so a document is the same object
-wherever it is seen from.
+`catalog/`, word boxes under `boxes/`. The root is either a local directory
+(which can be a network mount) or an S3-compatible bucket such as Garage.
+Every program reads and writes through the same storage interface, so a
+document is the same object wherever it is seen from.
 
 **The catalog** is one YAML entry per document, keyed by its stem. It records
 the document's metadata, which backend converted it and when, its page
@@ -39,10 +42,11 @@ offsets, whether it was embedded, and any failure stamp. Status counts,
 recovery commands and the MCP tools all read it.
 
 **The event bus** is NATS with JetStream. Storing a source publishes
-`papers.ingested`; storing its markdown publishes `scribe.completed`. Each
-kind of worker reads through one *durable pull consumer* (`scribe-workers`,
-`distill-workers`). Every watcher of a kind shares that consumer, so the
-broker splits the messages between them, and it remembers which are
+`papers.ingested`; storing its markdown publishes `scribe.completed` and, for
+a PDF, `scribe.boxes`. Each kind of work is read through one *durable pull
+consumer* (`scribe-workers`, `box-workers`, `distill-workers`). Every watcher
+of a kind shares that consumer, so the broker splits the messages between
+them, and it remembers which are
 unacknowledged. A watcher acknowledges a message only when the work is
 stored; a message whose watcher dies, or that takes longer than the
 acknowledgement wait, is delivered again. Delivery is therefore
@@ -58,6 +62,13 @@ they read the uploaded bytes and return markdown. The watcher that sent the
 request writes the result and the catalog entry. A scribe host therefore
 needs no storage access, and you add conversion capacity by starting another
 server and listing it.
+
+**Word boxes** are a second product of a PDF: where each word sits on its
+page, kept as one sidecar object per document. They are what lets a quotation
+be found and highlighted on the page it came from. The scribe watcher asks a
+scribe server for them once the markdown is stored, on a queue of its own, so
+a slow scan never holds up a conversion and a missing sidecar can be queued
+again without converting anything.
 
 **The distill server** chunks markdown, embeds the chunks on the GPU, and
 writes the points to Qdrant. It also answers searches.

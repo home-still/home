@@ -16,6 +16,17 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
   one is answered `500` naming the missing file. The keys
   `scribe_server.ocr_detection_model_path`, `ocr_recognition_model_path` and
   `ocr_dictionary_path` name other files.
+- `hs scribe watch-events` reads a second queue, `scribe.boxes`, and builds
+  the word boxes of each PDF it names through `/scribe/boxes`. The request is
+  published when a PDF's markdown is stored and by `hs personal add` for a
+  PDF. **Upgrade the scribe servers before the watcher**: a server without
+  `/scribe/boxes` answers 404, and a request no server can answer is retried
+  and then dropped after `events.nats.max_deliver` deliveries. **`hs personal
+  add` and `personal_add` now need the `events:` section and a reachable
+  broker for a PDF**, and refuse the PDF before converting it without them.
+  PDFs converted before this release have no word boxes: once the upgraded
+  watcher is running, run `hs scribe boxes catch-up` and watch
+  `hs scribe boxes status` until `missing`, `queued` and `building` are 0.
 - `hs docs link --collection` and `doc_link`'s `collection` are checked
   against the list of stores (`academic`, `personal`, `web`, `syntheses`).
   **A name that is not a store is now refused when the link is minted**; it

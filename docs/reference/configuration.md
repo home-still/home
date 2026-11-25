@@ -118,7 +118,7 @@ Where papers, markdown and the catalog live. An unknown key is an error. Read by
 
 ## `events`
 
-The event bus. An unknown key is an error. There is no default: the section is required by `hs paper download`, the scribe and distill watchers, `hs scribe inbox`, `hs scribe reconvert`, `hs pipeline`, `hs migrate` and `hs-mcp`. A command that needs a bus and finds no `events:` section stops and names the key to set.
+The event bus. An unknown key is an error. There is no default: the section is required by `hs paper download`, the scribe and distill watchers, `hs scribe inbox`, `hs scribe reconvert`, `hs scribe boxes`, `hs personal add` for a PDF, `hs pipeline`, `hs migrate` and `hs-mcp`. A command that needs a bus and finds no `events:` section stops and names the key to set.
 
 | Key | Default | Meaning |
 |---|---|---|

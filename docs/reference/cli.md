@@ -54,7 +54,7 @@ These commands stop gracefully on the first Ctrl+C: the item in progress finishe
 - `hs pipeline catch-up`, `hs pipeline rebuild`, `hs pipeline purge-skipped`, `hs pipeline purge-poisoned`, `hs pipeline reap-phantoms` and `hs pipeline reconvert-failed`
 - `hs migrate sharding`, `hs migrate move-root-orphans`, `hs migrate personal-to-storage`, `hs migrate quarantine-bad-content` and `hs migrate canonicalize-doi-stems`
 - `hs distill abstracts build` and `hs distill abstracts reconcile`
-- `hs scribe inbox run`, `hs scribe inbox sweep`, `hs serve mcp`, `hs serve docs` and `hs status`
+- `hs scribe inbox run`, `hs scribe inbox sweep`, `hs scribe boxes catch-up`, `hs serve mcp`, `hs serve docs` and `hs status`
 
 For these commands SIGTERM is also a graceful stop, so `systemctl stop` ends a service cleanly. A command that does not stop within 30 seconds of the first request is cancelled and exits with `interrupted`. Every other command is cancelled at once by the first Ctrl+C and exits with an error.
 
@@ -69,12 +69,13 @@ hs scribe [OPTIONS] <COMMAND>
 | Command | Description |
 |---|---|
 | `hs scribe convert` | Convert a PDF to markdown (sends to scribe server). |
-| `hs scribe watch-events` | Consume `papers.ingested` events from the event bus, convert each document through the scribe servers, and write the markdown back to storage. |
+| `hs scribe watch-events` | Consume `papers.ingested` and `scribe.boxes` events from the event bus: convert each ingested document through the scribe servers and write the markdown back to storage, and build and store the word boxes of each PDF that is asked for. |
 | `hs scribe inbox` | Sweep `papers/manually_downloaded/` in storage, move each file to its place under `papers/`, and publish `papers.ingested` so conversion starts. |
 | `hs scribe catalog-backfill` | Create catalog entries for markdown files in `scribe.output_dir` that have none. |
 | `hs scribe reconvert` | Clear a document's conversion stamps and derived artifacts, then republish `papers.ingested` so the watcher converts it again. |
+| `hs scribe boxes` | Word-box sidecars: where every word of a PDF sits on its page, which is what lets a quotation be highlighted in the document it is from. |
 
-The conversion commands read the `scribe:` section; the watchers also need `storage:` and `events:`. See [configuration](configuration.md).
+The conversion commands read the `scribe:` section; the watchers and `hs scribe boxes` also need `storage:` and `events:`. See [configuration](configuration.md).
 
 Example:
 
@@ -112,7 +113,7 @@ hs scribe convert paper.pdf --out paper.md --server http://<gpu-host>:7433
 
 ### `hs scribe watch-events`
 
-Consume `papers.ingested` events from the event bus, convert each document through the scribe servers, and write the markdown back to storage.
+Consume `papers.ingested` and `scribe.boxes` events from the event bus: convert each ingested document through the scribe servers and write the markdown back to storage, and build and store the word boxes of each PDF that is asked for.
 
 ```text
 hs scribe watch-events [OPTIONS]
@@ -122,7 +123,11 @@ hs scribe watch-events [OPTIONS]
 |---|---|---|
 | `--server <SERVER>` | none | Scribe server URL. Replaces `scribe.servers` for this run and forms a single tier. |
 
-Runs until stopped. It needs `storage:`, `events:` (a NATS backend) and `scribe.servers`, and it refuses to start on a host where libpdfium cannot be bound. Servers are grouped into tiers by `backend`, in `scribe.servers` order; a paper goes to the first tier and falls through to the next when a backend-class failure occurs. Within a tier the least-loaded server takes the paper. A tier converts at most the sum of its servers' `concurrency` at once.
+Runs until stopped. It needs `storage:`, `events:` (a NATS backend) and `scribe.servers`, and it refuses to start on a host where libpdfium cannot be bound. It reads two queues side by side.
+
+Conversions (`papers.ingested`): servers are grouped into tiers by `backend`, in `scribe.servers` order; a paper goes to the first tier and falls through to the next when a backend-class failure occurs. Within a tier the least-loaded server takes the paper. A tier converts at most the sum of its servers' `concurrency` at once. When a PDF's markdown is stored, the watcher publishes `scribe.boxes` for it.
+
+Word boxes (`scribe.boxes`): the watcher reads the PDF from storage, posts it to a scribe server's `/scribe/boxes`, checks that the sidecar it gets back was built from those bytes, and stores it under the store's `boxes/` prefix. The servers in `scribe.servers` take the requests in turn, whatever their tier, and as many requests run at once as there are servers; when a server cannot answer, the next is tried. A request for a key that is not where a store keeps a PDF, or for a PDF no server can read, is dropped with the reason logged. Any other failure is retried until `events.nats.max_deliver` deliveries are used up; `hs scribe boxes status` shows what is still missing and `hs scribe boxes catch-up` queues it again.
 
 The command exits non-zero when the event stream ends. Run it as a service with `hs serve scribe-watch --install`, and the service manager restarts it.
 
@@ -292,6 +297,74 @@ Example:
 
 ```bash
 hs scribe reconvert 10.48550_arxiv.2312.10997
+```
+
+### `hs scribe boxes`
+
+Word-box sidecars: where every word of a PDF sits on its page, which is what lets a quotation be highlighted in the document it is from.
+
+```text
+hs scribe boxes [OPTIONS] <COMMAND>
+```
+
+| Command | Description |
+|---|---|
+| `hs scribe boxes catch-up` | Queue a `scribe.boxes` build for every converted PDF that has no word-box sidecar. The running `hs scribe watch-events` builds them. |
+| `hs scribe boxes status` | Per store: PDFs, converted PDFs, sidecars built and sidecars missing; then the depth of the `scribe.boxes` queue. |
+
+A sidecar is one object per PDF, `<boxes prefix>/<shard>/<stem>.words.json.gz`: every word of every page with its box, read from the PDF's text layer, or by the word OCR for a page that has none. The stores that hold PDFs are `academic` (boxes under `boxes/`) and `personal` (under `<personal.storage_dir>/boxes/`).
+
+Neither command builds anything. A build is a `scribe.boxes` event, and `hs scribe watch-events` consumes it. The event is published when a PDF's markdown is stored, by `hs personal add` for a PDF, and by `hs scribe boxes catch-up`.
+
+Example:
+
+```bash
+hs scribe boxes status
+```
+
+### `hs scribe boxes catch-up`
+
+Queue a `scribe.boxes` build for every converted PDF that has no word-box sidecar. The running `hs scribe watch-events` builds them.
+
+```text
+hs scribe boxes catch-up [OPTIONS]
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `--store <STORE>` | none | Only this document store (default: every store that holds PDFs). |
+| `--dry-run` | off | Print the storage key of each PDF that would be queued, one per line, and publish nothing. |
+
+Lists each store's PDFs, markdown and sidecars, and publishes one `scribe.boxes` event for every PDF that has markdown and no sidecar. A PDF that is not converted yet is left out: its conversion asks for the word boxes when it finishes. `--store` must name a store that holds PDFs (`academic` or `personal`); any other store is refused. The command needs `storage:` and, without `--dry-run`, `events:`.
+
+The command does not read the queue. Run again while earlier requests are still waiting, it queues those PDFs a second time, and the second build replaces the sidecar with an identical one; check `hs scribe boxes status` first. `--dry-run` writes the keys to standard output.
+
+It ends with `boxes_requested=<n> errors=<n>` and exits non-zero when a request could not be published or the run was interrupted.
+
+Example:
+
+```bash
+hs scribe boxes catch-up --store academic --dry-run
+```
+
+### `hs scribe boxes status`
+
+Per store: PDFs, converted PDFs, sidecars built and sidecars missing; then the depth of the `scribe.boxes` queue.
+
+```text
+hs scribe boxes status [OPTIONS]
+```
+
+The command takes no arguments or flags of its own.
+
+Prints one line for each store that holds PDFs: its PDFs, how many of them are converted, how many have word boxes, and how many converted PDFs are missing them. The last line sums up: `missing` over all stores, `queued` (requests waiting on the `scribe.boxes` queue) and `building` (requests a watcher has taken and not finished).
+
+The command needs `storage:` and `events:`. It prints the store lines first and then fails if the queue cannot be read, which is the case until an `hs scribe watch-events` of this version has started once and created the queue's consumer.
+
+Example:
+
+```bash
+hs scribe boxes status
 ```
 
 ## `hs paper`
@@ -490,6 +563,8 @@ hs personal add [OPTIONS] <FILE>
 
 Accepted formats are PDF, EPUB, DOCX, Markdown (`.md`, `.markdown`) and plain text (`.txt`). A language model picks the category and title unless you pass them. A file whose content is already stored is refused unless you pass `--force`.
 
+Adding a PDF publishes `scribe.boxes` once the document is stored and indexed, and the scribe watcher builds its word boxes afterwards. A PDF therefore needs the `events:` section and a reachable broker; without them it is refused before it is converted.
+
 Example:
 
 ```bash
@@ -565,7 +640,7 @@ hs personal delete [OPTIONS] <STEM>
 |---|---|---|
 | `<STEM>` | required | Document stem. |
 
-Removes the document from Qdrant and from disk. The command has no confirmation prompt and no dry run.
+Removes the document from Qdrant and from disk, with its word boxes. The command has no confirmation prompt and no dry run.
 
 Example:
 

@@ -245,9 +245,11 @@ pub type EventStream = Pin<Box<dyn Stream<Item = anyhow::Result<Event>> + Send>>
 /// queue group).
 #[derive(Debug, Clone)]
 pub struct ConsumerSpec {
-    /// Stream the consumer binds to. Currently the canonical stream
-    /// names are `PAPERS` (subjects `papers.>`) and `SCRIBE`
-    /// (subjects `scribe.>`).
+    /// Stream the consumer binds to. The stream names are `PAPERS`
+    /// (subjects `papers.>`), `SCRIBE` (subjects `scribe.>`) and `DISTILL`
+    /// (subjects `distill.>`). The streams keep a message until one
+    /// consumer acks it (work-queue retention), so two consumers on one
+    /// stream must filter on different subjects.
     pub stream: &'static str,
     /// Subject to filter deliveries on, e.g. `papers.ingested`.
     pub subject: &'static str,
@@ -463,6 +465,15 @@ pub mod specs {
         stream: "SCRIBE",
         subject: "scribe.completed",
         durable_name: "distill-workers",
+    };
+
+    /// Requests to build a PDF's word-box sidecar (`crate::word_boxes`).
+    /// The payload names the PDF's storage key. On the `SCRIBE` stream
+    /// beside [`SCRIBE_COMPLETED`], under a subject of its own.
+    pub const SCRIBE_BOXES: ConsumerSpec = ConsumerSpec {
+        stream: "SCRIBE",
+        subject: "scribe.boxes",
+        durable_name: "box-workers",
     };
 }
 

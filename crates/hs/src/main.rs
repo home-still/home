@@ -21,6 +21,7 @@ mod migrate_personal;
 mod openalex_cmd;
 mod pipeline_cmd;
 mod restart_cmd;
+mod scribe_boxes;
 mod scribe_cmd;
 mod scribe_inbox;
 mod scribe_inbox_install;

@@ -1,4 +1,5 @@
 pub mod backend_probe;
+pub mod box_watch;
 #[cfg(test)]
 pub(crate) mod child_proc;
 pub mod classify;

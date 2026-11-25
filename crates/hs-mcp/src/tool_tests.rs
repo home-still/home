@@ -350,6 +350,24 @@ mod convert {
         assert_eq!(bus.published.lock().unwrap().len(), 1);
     }
 
+    /// A PDF that was converted before word boxes existed (or whose request
+    /// was lost) gets its sidecar asked for along with the announcement.
+    #[tokio::test]
+    async fn an_already_converted_pdf_without_word_boxes_has_them_requested() {
+        let storage = FaultyStorage::new();
+        let source_key = put_source(&storage, "scan", "pdf", b"%PDF-1.4").await;
+        seed_markdown(&*storage, "scan", "# Already here\n\nBody text.").await;
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage.clone(), bus.clone());
+
+        mcp.convert_source(&stem("scan")).await.unwrap();
+
+        let published = bus.published.lock().unwrap().clone();
+        let subjects: Vec<&str> = published.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(subjects, ["scribe.completed", "scribe.boxes"]);
+        assert_eq!(published[1].1, serde_json::json!({ "key": source_key }));
+    }
+
     /// The queue tool's whole point: the conversion is announced, not run.
     /// A caller that gets `queued: true` back must be able to see the event
     /// the watcher will consume, with the keys the watcher reads.

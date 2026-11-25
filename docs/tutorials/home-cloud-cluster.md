@@ -293,6 +293,17 @@ ls ~/.home-still/models
 `ls` lists `pp-doclayoutv3.onnx` and `slanet-plus.onnx`. The server refuses to
 start without them.
 
+Put the word OCR's three files beside them. The server uses them to find the
+words on a scanned page, so that a quotation can be highlighted in a PDF that
+has no text layer:
+
+```sh
+cd ~/.home-still/models
+for f in pp-ocrv5_mobile_det.onnx en_pp-ocrv5_mobile_rec.onnx ppocrv5_en_dict.txt; do
+  curl -fLO "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/$f"
+done
+```
+
 Install pdfium and the scribe server from their releases:
 
 ```sh
@@ -696,8 +707,8 @@ mkdir -p ~/.home-still/models
 ls ~/.home-still/models
 ```
 
-`ls` lists `pp-doclayoutv3.onnx` and `slanet-plus.onnx`; put them there as in
-step 8. Then:
+`ls` lists `pp-doclayoutv3.onnx`, `slanet-plus.onnx` and the word OCR's three
+files; put them there as in step 8. Then:
 
 ```sh
 cd "$(mktemp -d)"

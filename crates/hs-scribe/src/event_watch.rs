@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::StreamExt;
-use hs_common::event_bus::{specs, EventBus};
+use hs_common::event_bus::{ConsumerSpec, EventBus};
 use hs_common::storage::Storage;
+use hs_common::stores::Stores;
 use serde::{Deserialize, Serialize};
 
 use crate::classify::{classify, ConvertFailure, FailureClass, FailureCode};
@@ -67,6 +68,18 @@ pub struct IngestedEvent {
     pub source: Option<String>,
 }
 
+/// An event payload that names the storage object it is about.
+pub trait Keyed {
+    /// The object's storage key, as the publisher wrote it.
+    fn key(&self) -> &str;
+}
+
+impl Keyed for IngestedEvent {
+    fn key(&self) -> &str {
+        &self.key
+    }
+}
+
 /// Once-per-event source preparation: parse the key, check whether the
 /// markdown already exists (idempotent retry), fetch the source bytes,
 /// and — for PDFs — validate them and count pages for the page-scaled
@@ -76,9 +89,9 @@ pub struct IngestedEvent {
 /// storage per backend.
 pub enum SourcePrep {
     /// Markdown already present under this key — nothing to convert. The
-    /// caller still owes distill the `scribe.completed` announcement: the
-    /// attempt that wrote this markdown may have died before publishing it
-    /// (see [`announce_completed`]).
+    /// caller still owes what a finished conversion announces: the attempt
+    /// that wrote this markdown may have died before publishing it (see
+    /// [`announce_already_converted`]).
     AlreadyConverted(String),
     Fetched(SourceObject),
 }
@@ -97,14 +110,14 @@ pub struct SourceObject {
 }
 
 /// A failure of the event itself that no retry can fix.
-fn permanent(code: FailureCode, message: impl Into<String>) -> HandlerError {
+pub(crate) fn permanent(code: FailureCode, message: impl Into<String>) -> HandlerError {
     HandlerError::Permanent(ConvertFailure::err(code, message))
 }
 
 /// Classify a storage error: a key that cannot name an object is the
 /// event's fault and never worth redelivering; every other storage error
 /// (network, 5xx, auth) is cluster state that may clear up.
-fn storage_failure(err: anyhow::Error, context: String) -> HandlerError {
+pub(crate) fn storage_failure(err: anyhow::Error, context: String) -> HandlerError {
     if hs_common::storage::is_invalid_key(&err) {
         permanent(FailureCode::InvalidKey, format!("{context}: {err:#}"))
     } else {
@@ -116,7 +129,7 @@ fn storage_failure(err: anyhow::Error, context: String) -> HandlerError {
 /// the reason the key cannot be converted. The key is untrusted (it arrives
 /// on the bus): it must be a legal storage key and its stem a legal stem
 /// before either is used to build another key.
-fn parse_event_key(key: &str) -> Result<(String, String), HandlerError> {
+pub(crate) fn parse_event_key(key: &str) -> Result<(String, String), HandlerError> {
     hs_common::storage::validate_key(key)
         .map_err(|e| permanent(FailureCode::InvalidKey, format!("event key rejected: {e}")))?;
     let filename = key.rsplit_once('/').map(|(_, f)| f).unwrap_or(key);
@@ -272,11 +285,11 @@ async fn prepare_source_capped(
 /// Tell distill that the markdown at `md_key` is ready by publishing
 /// `scribe.completed`. A publish that fails is `Transient`: the event is
 /// NAKed, and its redelivery lands on [`SourcePrep::AlreadyConverted`] —
-/// whose caller announces again through here — so the announcement is
-/// retried until it gets through instead of being lost behind an ACK.
-/// Distill's handler is idempotent, so a repeat announcement only repeats
-/// the index.
-pub async fn announce_completed(
+/// whose caller announces again through [`announce_already_converted`] — so
+/// the announcement is retried until it gets through instead of being lost
+/// behind an ACK. Distill's handler is idempotent, so a repeat announcement
+/// only repeats the index.
+async fn announce_completed(
     bus: &dyn EventBus,
     md_key: &str,
     source_key: &str,
@@ -291,6 +304,21 @@ pub async fn announce_completed(
     bus.publish("scribe.completed", &bytes).await.map_err(|e| {
         HandlerError::Transient(e.context(format!("scribe.completed publish failed for {md_key}")))
     })
+}
+
+/// Publish what a source whose markdown already exists is still owed: the
+/// `scribe.completed` announcement and, for a PDF with no word-box sidecar,
+/// the request to build one (`scribe.boxes`). The attempt that wrote the
+/// markdown may have died before publishing either.
+pub async fn announce_already_converted(
+    bus: &dyn EventBus,
+    storage: &dyn Storage,
+    stores: &Stores,
+    md_key: &str,
+    source_key: &str,
+) -> Result<(), HandlerError> {
+    announce_completed(bus, md_key, source_key).await?;
+    crate::box_watch::request_missing_boxes(bus, storage, stores, source_key).await
 }
 
 /// Everything the QC gate decided about a VLM conversion. Computed on the
@@ -367,7 +395,7 @@ fn run_qc(conversion: ConversionResult, stem: &str) -> QcOutcome {
 /// Run a CPU-bound conversion step on the blocking pool. A panic inside it
 /// is a deterministic fault of this document (permanent); losing the task
 /// to runtime shutdown is not.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     what: &'static str,
     key: &str,
     f: impl FnOnce() -> T + Send + 'static,
@@ -413,7 +441,8 @@ async fn blocking_within<T: Send + 'static>(
 /// Given a prepared source, dispatch to the converter for its file type
 /// (PDF → scribe VLM, HTML → parser, EPUB → parser), and put the
 /// markdown back under `markdown/{shard}/{stem}.md`. Publishes
-/// `scribe.completed` with the markdown key on success.
+/// `scribe.completed` with the markdown key on success and, for a PDF,
+/// `scribe.boxes` with the source key, so its word-box sidecar is built.
 ///
 /// Error classification (`classify.rs`, from typed [`FailureCode`]s — never
 /// from message text):
@@ -426,8 +455,8 @@ async fn blocking_within<T: Send + 'static>(
 ///   as Permanent too.
 /// - `Transient` — cluster state that will recover: storage GET/PUT
 ///   failure, scribe 5xx / connection reset / dispatch timeout, no ready
-///   scribe servers, a failed `scribe.completed` publish. The caller NAKs
-///   with backoff.
+///   scribe servers, a failed `scribe.completed` or `scribe.boxes` publish.
+///   The caller NAKs with backoff.
 #[allow(clippy::too_many_arguments)]
 pub async fn convert_and_upload(
     storage: &dyn Storage,
@@ -720,46 +749,13 @@ pub async fn convert_and_upload(
     }
 
     announce_completed(bus, &md_key, &event.key).await?;
+    if source.ext == crate::box_watch::BOXED_SOURCE_EXTENSION {
+        crate::box_watch::request_boxes(bus, &event.key).await?;
+    }
 
     Ok(md_key)
 }
 
-/// Pull-consume `papers.ingested` from JetStream and dispatch each event
-/// to `handler`. Uses a durable JetStream consumer (see `specs::PAPERS_
-/// INGESTED`) so messages survive subscriber restarts — unlike the core
-/// NATS queue-subscribe that preceded it, which lost in-flight work on
-/// watcher restart (rc.278 post-mortem: ~2,156 papers silently dropped).
-///
-/// Ack policy:
-/// - `Ok(())` → `ack`. Message retired.
-/// - `Err(Permanent)` → `term`. Message never retried.
-/// - `Err(Transient)` → `nak` with `NAK_BACKOFF`. JetStream re-delivers.
-/// - The handler **panicked** → `term`, logged at ERROR with the event key.
-///   A panic is a bug in the code, triggered by this input: redelivery would
-///   run the same code on the same bytes (repeating the conversion work up
-///   to `max_deliver` times, each attempt `ack_wait` away) and panic again,
-///   so the event is retired at once and the document is picked up again by
-///   the catch-up sweep once the bug is fixed. Without the guard the panic
-///   killed the task that owned the event, which then sat un-acked until
-///   `ack_wait` (2 h by default) before the same panic repeated.
-///
-/// `max_deliver` on the consumer spec bounds total redeliveries, so a
-/// stuck-in-transient-loop message eventually surfaces as a permanent
-/// failure in operator logs.
-///
-/// While a handler runs, the event is kept alive with an in-progress
-/// heartbeat every `ack_wait / 3` (`ack_wait` = `events.nats.ack_wait_secs`),
-/// so the broker does not redeliver a conversion that is still running and
-/// `ack_wait` need not exceed the whole tier chain. A failed heartbeat is
-/// logged at WARN and does not fail the handler.
-///
-/// This function returns only with an error. The message stream ends (or
-/// yields a delivery error) when the broker drops the consumer or the
-/// connection (a competing watcher deleting the durable, a broker restart,
-/// missed heartbeats); consumption has then stopped, so returning `Ok` would
-/// let the process exit 0 and stay down. Handlers already running get
-/// `drain_timeout` to finish their ack/nak; the ones still running after it
-/// are abandoned, named in an ERROR log, and redelivered after `ack_wait`.
 /// Start-up check of the shared backend token: one authenticated request per
 /// scribe server *before* any event is pulled. A server that rejects the
 /// token stops the watcher here, naming `HS_BACKEND_TOKEN`; a server that
@@ -830,25 +826,76 @@ async fn nak_unstarted(
     );
 }
 
-pub async fn run_subscriber<F, Fut>(
+/// Resolves when `stop` carries `true`. With the sending side gone nobody
+/// can ask for a stop, so it then never resolves.
+async fn stop_requested(stop: &mut tokio::sync::watch::Receiver<bool>) {
+    let unreachable = stop.wait_for(|stop| *stop).await.is_err();
+    if unreachable {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Pull-consume `spec`'s subject from JetStream and dispatch each event to
+/// `handler`. The consumer is durable, so messages survive subscriber
+/// restarts — unlike the core NATS queue-subscribe that preceded it, which
+/// lost in-flight work on watcher restart (rc.278 post-mortem: ~2,156
+/// papers silently dropped).
+///
+/// Ack policy:
+/// - `Ok(())` → `ack`. Message retired.
+/// - `Err(Permanent)` → `term`. Message never retried.
+/// - `Err(Transient)` → `nak` with `NAK_BACKOFF`. JetStream re-delivers.
+/// - The handler **panicked** → `term`, logged at ERROR with the event key.
+///   A panic is a bug in the code, triggered by this input: redelivery would
+///   run the same code on the same bytes (repeating the work up to
+///   `max_deliver` times, each attempt `ack_wait` away) and panic again, so
+///   the event is retired at once and the document is picked up again by
+///   the catch-up sweep once the bug is fixed. Without the guard the panic
+///   killed the task that owned the event, which then sat un-acked until
+///   `ack_wait` (2 h by default) before the same panic repeated.
+///
+/// `max_deliver` on the consumer bounds total redeliveries, so a
+/// stuck-in-transient-loop message eventually surfaces as a permanent
+/// failure in operator logs.
+///
+/// While a handler runs, the event is kept alive with an in-progress
+/// heartbeat every `ack_wait / 3` (`ack_wait` = `events.nats.ack_wait_secs`),
+/// so the broker does not redeliver work that is still running and
+/// `ack_wait` need not exceed the longest handler. A failed heartbeat is
+/// logged at WARN and does not fail the handler.
+///
+/// This function returns `Ok` only when `stop` asked it to: it then pulls
+/// nothing more, hands back what it pulled and never started, and gives
+/// running handlers `drain_timeout` to finish. Every other return is an
+/// error. The message stream ends (or yields a delivery error) when the
+/// broker drops the consumer or the connection (a competing watcher
+/// deleting the durable, a broker restart, missed heartbeats); consumption
+/// has then stopped, so returning `Ok` would let the process exit 0 and
+/// stay down. Handlers already running get `drain_timeout` to finish their
+/// ack/nak; the ones still running after it are abandoned, named in an
+/// ERROR log, and redelivered after `ack_wait`.
+pub async fn run_subscriber<P, F, Fut>(
+    spec: &ConsumerSpec,
     bus: Arc<dyn EventBus>,
-    _storage: Arc<dyn Storage>,
     concurrency: usize,
     drain_timeout: Duration,
     ack_wait: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
     handler: F,
 ) -> Result<()>
 where
-    F: Fn(IngestedEvent) -> Fut + Send + Sync + 'static,
+    P: serde::de::DeserializeOwned + Keyed + Send + 'static,
+    F: Fn(P) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), HandlerError>> + Send + 'static,
 {
-    let mut stream = bus.consume(&specs::PAPERS_INGESTED).await?;
+    let subject = spec.subject;
+    let mut stream = bus.consume(spec).await?;
     let progress = hs_common::event_bus::progress_interval(ack_wait);
     let concurrency = concurrency.max(1);
     tracing::info!(
         concurrency,
-        "scribe consuming papers.ingested (durable: {})",
-        specs::PAPERS_INGESTED.durable_name
+        "scribe consuming {subject} (durable: {})",
+        spec.durable_name
     );
 
     // Cap in-flight dispatches so the watcher doesn't spawn thousands of
@@ -863,6 +910,7 @@ where
     // our token) reports it here; the loop stops consuming at once.
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<anyhow::Error>();
     let mut fatal: Option<anyhow::Error> = None;
+    let mut stopped = false;
     // Events pulled from the broker whose handler never started.
     let mut unstarted: Vec<hs_common::event_bus::Event> = Vec::new();
     loop {
@@ -870,6 +918,10 @@ where
             next = stream.next() => next,
             Some(e) = fatal_rx.recv() => {
                 fatal = Some(e);
+                break;
+            }
+            () = stop_requested(&mut stop) => {
+                stopped = true;
                 break;
             }
         };
@@ -881,13 +933,14 @@ where
                 break;
             }
         };
-        let parsed: IngestedEvent = match serde_json::from_slice(&event.payload) {
+        let parsed: P = match serde_json::from_slice(&event.payload) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(
+                    subject,
                     error = %e,
                     payload_len = event.payload.len(),
-                    "malformed papers.ingested payload — terminating (will not redeliver)"
+                    "malformed event payload — terminating (will not redeliver)"
                 );
                 if let Err(term_err) = event.term().await {
                     tracing::warn!(error = %term_err, "failed to term malformed event");
@@ -896,12 +949,18 @@ where
             }
         };
 
-        // Waiting for a slot is also a point where a fatal error must be
-        // seen: the event in hand has not started, and goes back unstarted.
+        // Waiting for a slot is also a point where a fatal error or a stop
+        // must be seen: the event in hand has not started, and goes back
+        // unstarted.
         let permit = tokio::select! {
             biased;
             Some(e) = fatal_rx.recv() => {
                 fatal = Some(e);
+                unstarted.push(event);
+                break;
+            }
+            () = stop_requested(&mut stop) => {
+                stopped = true;
                 unstarted.push(event);
                 break;
             }
@@ -911,12 +970,12 @@ where
         };
         let handler = Arc::clone(&handler);
         let fatal_tx = fatal_tx.clone();
-        let tracked = in_flight.track(parsed.key.clone());
+        let key = parsed.key().to_string();
+        let tracked = in_flight.track(key.clone());
         tokio::spawn(async move {
             let _permit = permit; // drop at scope end releases the slot
             let _tracked = tracked;
-            let key = parsed.key.clone();
-            tracing::info!(key = %key, "scribe received ingested event");
+            tracing::info!(key = %key, subject, "scribe received event");
             // The guard wraps the call too: a panic before the handler's
             // first await would otherwise escape it. The heartbeat keeps the
             // broker from redelivering the event while the handler runs
@@ -1018,35 +1077,64 @@ where
     if let Ok(e) = fatal_rx.try_recv() {
         return Err(e);
     }
+    if stopped {
+        tracing::info!("scribe stopped consuming {subject} on request{abandoned_note}");
+        return Ok(());
+    }
     Err(match delivery_error {
         Some(e) => e.context(format!(
-            "event delivery for {} failed: the consumer is no longer receiving{abandoned_note}",
-            specs::PAPERS_INGESTED.subject
+            "event delivery for {subject} failed: the consumer is no longer receiving{abandoned_note}"
         )),
         None => anyhow::anyhow!(
-            "event stream ended: the consumer or broker connection for {} is gone{abandoned_note}",
-            specs::PAPERS_INGESTED.subject
+            "event stream ended: the consumer or broker connection for {subject} is gone{abandoned_note}"
         ),
     })
 }
 
+/// Run two consumers side by side. A consumer ends only when it can no
+/// longer consume (see [`run_subscriber`]), so when either ends the other
+/// is told to stop through `stop` — the sender of the signal both were
+/// given — and waited for: its running handlers finish and its unstarted
+/// events go back to the broker. Returns the first consumer's error, and
+/// the second's when the first had none.
+pub async fn run_side_by_side(
+    stop: tokio::sync::watch::Sender<bool>,
+    first: impl Future<Output = Result<()>>,
+    second: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::pin!(first, second);
+    tokio::select! {
+        ended = &mut first => {
+            stop.send_replace(true);
+            ended.and(second.await)
+        }
+        ended = &mut second => {
+            stop.send_replace(true);
+            ended.and(first.await)
+        }
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::classify::{failure_code, FailureClass};
     use crate::pdf_meta::tests::{pdf_with_pages, skip_without_pdfium};
-    use hs_common::event_bus::{ConsumerSpec, Event, EventStream};
+    use hs_common::event_bus::{specs, ConsumerSpec, Event, EventStream};
     use hs_common::storage::LocalFsStorage;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     #[derive(Default)]
-    struct FakeBus {
-        published: Mutex<Vec<(String, serde_json::Value)>>,
-        fail_next_publishes: AtomicUsize,
-        to_consume: Mutex<Vec<Event>>,
+    pub(crate) struct FakeBus {
+        pub(crate) published: Mutex<Vec<(String, serde_json::Value)>>,
+        pub(crate) fail_next_publishes: AtomicUsize,
+        pub(crate) to_consume: Mutex<Vec<Event>>,
         /// When set, the stream yields this delivery error after the events.
-        then_fail: Mutex<Option<String>>,
+        pub(crate) then_fail: Mutex<Option<String>>,
+        /// When set, the stream stays open (and silent) after the events,
+        /// as a live consumer's does.
+        pub(crate) stay_open: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -1072,7 +1160,12 @@ mod tests {
                 .into_iter()
                 .map(Ok)
                 .chain(failure.map(|m| Err(anyhow::anyhow!(m))));
-            Ok(Box::pin(futures_util::stream::iter(items)))
+            let delivered = futures_util::stream::iter(items);
+            if self.stay_open.load(Ordering::SeqCst) {
+                Ok(Box::pin(delivered.chain(futures_util::stream::pending())))
+            } else {
+                Ok(Box::pin(delivered))
+            }
         }
     }
 
@@ -1092,10 +1185,19 @@ mod tests {
         }
     }
 
-    fn storage() -> (tempfile::TempDir, LocalFsStorage) {
+    pub(crate) fn storage() -> (tempfile::TempDir, LocalFsStorage) {
         let dir = tempfile::tempdir().unwrap();
         let s = LocalFsStorage::new(dir.path());
         (dir, s)
+    }
+
+    pub(crate) fn stores() -> Stores {
+        Stores::with_personal_prefix(hs_common::stores::PERSONAL_PREFIX_DEFAULT).unwrap()
+    }
+
+    /// A stop signal nobody can raise.
+    fn never_stopped() -> tokio::sync::watch::Receiver<bool> {
+        tokio::sync::watch::channel(false).1
     }
 
     #[tokio::test]
@@ -1213,25 +1315,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_markdown_is_already_converted_and_can_be_announced() {
+    async fn existing_markdown_is_already_converted_and_what_it_is_owed_is_announced() {
         let (_d, st) = storage();
+        let stores = stores();
         let md_key = hs_common::markdown::markdown_storage_key("done");
         st.put(&md_key, b"# text".to_vec()).await.unwrap();
-        let prep = prepare_source(&st, &event("papers/ab/done.pdf")).await;
+        let prep = prepare_source(&st, &event("papers/do/done.pdf")).await;
         let Ok(SourcePrep::AlreadyConverted(key)) = prep else {
             panic!("expected AlreadyConverted");
         };
         assert_eq!(key, md_key);
 
+        // No sidecar yet: the announcement, then the request to build one.
         let bus = FakeBus::default();
-        announce_completed(&bus, &key, "papers/ab/done.pdf")
+        announce_already_converted(&bus, &st, &stores, &key, "papers/do/done.pdf")
             .await
             .unwrap();
+        {
+            let published = bus.published.lock().unwrap();
+            assert_eq!(published.len(), 2, "{published:?}");
+            assert_eq!(published[0].0, "scribe.completed");
+            assert_eq!(published[0].1["key"], md_key);
+            assert_eq!(published[0].1["source_key"], "papers/do/done.pdf");
+            assert_eq!(published[1].0, "scribe.boxes");
+            assert_eq!(
+                published[1].1,
+                serde_json::json!({ "key": "papers/do/done.pdf" })
+            );
+        }
+
+        // With the sidecar stored, only the announcement is owed.
+        let (_, layout) = stores.documents(hs_common::stores::ACADEMIC).unwrap();
+        st.put(
+            &hs_common::word_boxes::boxes_key(layout, "done"),
+            b"sidecar".to_vec(),
+        )
+        .await
+        .unwrap();
+        announce_already_converted(&bus, &st, &stores, &key, "papers/do/done.pdf")
+            .await
+            .unwrap();
+        // A source that is not a PDF never has one.
+        announce_already_converted(
+            &bus,
+            &st,
+            &stores,
+            "markdown/pa/page.md",
+            "papers/pa/page.html",
+        )
+        .await
+        .unwrap();
         let published = bus.published.lock().unwrap();
-        assert_eq!(published.len(), 1);
-        assert_eq!(published[0].0, "scribe.completed");
-        assert_eq!(published[0].1["key"], md_key);
-        assert_eq!(published[0].1["source_key"], "papers/ab/done.pdf");
+        let subjects: Vec<&str> = published.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            subjects,
+            [
+                "scribe.completed",
+                "scribe.boxes",
+                "scribe.completed",
+                "scribe.completed"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1423,14 +1567,14 @@ mod tests {
         *bus.to_consume.lock().unwrap() = events;
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in = seen.clone();
-        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         let result = run_subscriber(
+            &specs::PAPERS_INGESTED,
             bus,
-            storage,
             concurrency,
             Duration::from_secs(30),
             ACK_WAIT,
-            move |e| {
+            never_stopped(),
+            move |e: IngestedEvent| {
                 let seen = seen_in.clone();
                 async move {
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1592,17 +1736,17 @@ mod tests {
             .unwrap();
         let bus = Arc::new(FakeBus::default());
         *bus.to_consume.lock().unwrap() = vec![ingested("papers/ab/one.pdf")];
-        let storage: Arc<dyn Storage> = Arc::new(st);
         let handled = Arc::new(AtomicUsize::new(0));
         let handled_in = handled.clone();
         let started = std::time::Instant::now();
         let result = run_subscriber(
+            &specs::PAPERS_INGESTED,
             bus,
-            storage,
             2,
             Duration::from_secs(30),
             ACK_WAIT,
-            move |_event| {
+            never_stopped(),
+            move |_event: IngestedEvent| {
                 let url = url.clone();
                 let handled = handled_in.clone();
                 async move {
@@ -1640,16 +1784,16 @@ mod tests {
         }
         let bus = Arc::new(FakeBus::default());
         *bus.to_consume.lock().unwrap() = events;
-        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         let handled = Arc::new(AtomicUsize::new(0));
         let handled_in = handled.clone();
         let result = run_subscriber(
+            &specs::PAPERS_INGESTED,
             bus,
-            storage,
             1,
             Duration::from_secs(5),
             ACK_WAIT,
-            move |_e| {
+            never_stopped(),
+            move |_e: IngestedEvent| {
                 let handled = handled_in.clone();
                 async move {
                     handled.fetch_add(1, Ordering::SeqCst);
@@ -1711,14 +1855,14 @@ mod tests {
         *bus.then_fail.lock().unwrap() = Some("consumer deleted".into());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in = seen.clone();
-        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         let err = run_subscriber(
+            &specs::PAPERS_INGESTED,
             bus,
-            storage,
             2,
             Duration::from_secs(30),
             ACK_WAIT,
-            move |e| {
+            never_stopped(),
+            move |e: IngestedEvent| {
                 let seen = seen_in.clone();
                 async move {
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1747,16 +1891,16 @@ mod tests {
         *bus.to_consume.lock().unwrap() = vec![good_a, poison, good_b];
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in = seen.clone();
-        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         // Concurrency 1: the permit the panicking task held must be released
         // or the event after it would never be dispatched.
         let result = run_subscriber(
+            &specs::PAPERS_INGESTED,
             bus,
-            storage,
             1,
             Duration::from_secs(30),
             ACK_WAIT,
-            move |e| {
+            never_stopped(),
+            move |e: IngestedEvent| {
                 let seen = seen_in.clone();
                 async move {
                     if e.key == "poison.pdf" {
@@ -1790,15 +1934,15 @@ mod tests {
             Event::recording("papers.ingested", br#"{"key":"quick.pdf"}"#.to_vec());
         *bus.to_consume.lock().unwrap() = vec![stuck, quick];
         *bus.then_fail.lock().unwrap() = Some("missed idle heartbeat".into());
-        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         let started = std::time::Instant::now();
         let err = run_subscriber(
+            &specs::PAPERS_INGESTED,
             bus,
-            storage,
             2,
             Duration::from_millis(300),
             ACK_WAIT,
-            move |e| async move {
+            never_stopped(),
+            move |e: IngestedEvent| async move {
                 if e.key == "stuck.pdf" {
                     std::future::pending::<()>().await;
                 }
@@ -1835,14 +1979,14 @@ mod tests {
             Event::recording("papers.ingested", br#"{"key":"fast.pdf"}"#.to_vec());
         *bus.to_consume.lock().unwrap() = vec![slow, fast];
         *bus.then_fail.lock().unwrap() = Some("stream closed".into());
-        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         let _ = run_subscriber(
+            &specs::PAPERS_INGESTED,
             bus,
-            storage,
             2,
             Duration::from_secs(30),
             Duration::from_millis(150),
-            move |e| async move {
+            never_stopped(),
+            move |e: IngestedEvent| async move {
                 if e.key == "slow.pdf" {
                     tokio::time::sleep(Duration::from_millis(400)).await;
                 }
@@ -1860,6 +2004,83 @@ mod tests {
             "a handler longer than the interval sends >= 1 heartbeat before its ack: {slow:?}"
         );
         assert_eq!(fast_log.decisions(), [Settlement::Ack]);
+    }
+
+    #[tokio::test]
+    async fn a_stop_request_ends_consumption_with_ok_and_hands_back_what_never_started() {
+        use hs_common::event_bus::Settlement;
+        let bus = Arc::new(FakeBus::default());
+        bus.stay_open.store(true, Ordering::SeqCst);
+        let (running, running_log) =
+            Event::recording("scribe.boxes", br#"{"key":"running.pdf"}"#.to_vec());
+        let (waiting, waiting_log) =
+            Event::recording("scribe.boxes", br#"{"key":"waiting.pdf"}"#.to_vec());
+        *bus.to_consume.lock().unwrap() = vec![running, waiting];
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_in = started.clone();
+        // Concurrency 1: the second event can only wait for the slot.
+        let run = tokio::spawn(run_subscriber(
+            &specs::SCRIBE_BOXES,
+            bus,
+            1,
+            Duration::from_secs(30),
+            ACK_WAIT,
+            stopped,
+            move |_e: IngestedEvent| {
+                let started = started_in.clone();
+                async move {
+                    started.notify_one();
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    Ok(())
+                }
+            },
+        ));
+        started.notified().await;
+        stop.send_replace(true);
+        run.await
+            .unwrap()
+            .expect("a requested stop is not an error");
+        // The running handler finished and settled its event; the other
+        // went back for immediate redelivery.
+        assert_eq!(running_log.decisions(), [Settlement::Ack]);
+        assert_eq!(waiting_log.decisions(), [Settlement::Nak(None)]);
+    }
+
+    #[tokio::test]
+    async fn when_one_consumer_ends_the_other_is_stopped_and_the_error_is_returned() {
+        let failing = Arc::new(FakeBus::default());
+        *failing.then_fail.lock().unwrap() = Some("consumer deleted".into());
+        let healthy = Arc::new(FakeBus::default());
+        healthy.stay_open.store(true, Ordering::SeqCst);
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let handle = |_e: IngestedEvent| async { Ok(()) };
+        let both = run_side_by_side(
+            stop,
+            run_subscriber(
+                &specs::SCRIBE_BOXES,
+                healthy,
+                1,
+                Duration::from_secs(5),
+                ACK_WAIT,
+                stopped.clone(),
+                handle,
+            ),
+            run_subscriber(
+                &specs::PAPERS_INGESTED,
+                failing,
+                1,
+                Duration::from_secs(5),
+                ACK_WAIT,
+                stopped,
+                handle,
+            ),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(10), both)
+            .await
+            .expect("the healthy consumer must be stopped, not waited on forever")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("consumer deleted"), "{err:#}");
     }
 
     // ── against the real scribe server (olmocr mode, stand-in CLI) ─────
@@ -1965,12 +2186,40 @@ mod tests {
             );
             assert!(bus.published.lock().unwrap().is_empty());
 
-            // Redelivery lands on AlreadyConverted, whose caller announces.
+            // Redelivery lands on AlreadyConverted, whose caller announces
+            // the markdown and asks for the PDF's word boxes.
             let Ok(SourcePrep::AlreadyConverted(key)) = prepare_source(&st, &ev).await else {
                 panic!("redelivery must find the stored markdown");
             };
-            announce_completed(&bus, &key, &ev.key).await.unwrap();
-            assert_eq!(bus.published.lock().unwrap().len(), 1);
+            announce_already_converted(&bus, &st, &stores(), &key, &ev.key)
+                .await
+                .unwrap();
+            let subjects = |bus: &FakeBus| -> Vec<String> {
+                let published = bus.published.lock().unwrap();
+                published.iter().map(|(s, _)| s.clone()).collect()
+            };
+            assert_eq!(subjects(&bus), ["scribe.completed", "scribe.boxes"]);
+
+            // A conversion whose announcements get through publishes both,
+            // the request naming the PDF.
+            convert_and_upload(
+                &st,
+                &client,
+                &bus,
+                &ev,
+                &policy,
+                &limits,
+                &src,
+                Some("olmocr".into()),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(subjects(&bus)[2..], ["scribe.completed", "scribe.boxes"]);
+            assert_eq!(
+                bus.published.lock().unwrap()[3].1,
+                serde_json::json!({ "key": "papers/ab/book.pdf" })
+            );
         }
 
         #[tokio::test]

@@ -255,6 +255,8 @@ Changes state: yes.
 
 Blocks until the conversion finishes; use `scribe_queue` instead unless the markdown is needed inside this call. A conversion is bounded by the scribe timeout ceiling of 3600 s. Converts a stored source document (PDF, HTML or EPUB; PDF is preferred when several exist) to markdown through the code path the scribe event watcher uses. PDFs go to the scribe server; HTML and EPUB are parsed locally. Writes the markdown to storage, stamps the catalog and announces `scribe.completed`. Markdown that already exists is not converted again; it is re-announced (`hs scribe reconvert` forces a fresh conversion). Fails, naming the cause, when storage is unreachable, the source is missing, the document is refused (not a PDF, a paywall page, empty or looping output) or the catalog stamp did not land. While a conversion runs, the tool sends a progress notification about every 20 seconds. Use `markdown_read` to fetch the content. Needs the event bus.
 
+When a PDF's markdown is stored, and when a PDF is found already converted without word boxes, the tool also publishes `scribe.boxes`; the scribe watcher builds the word boxes after the call returns.
+
 Changes state: yes.
 
 | Parameter | Type | Required or default | Meaning |
@@ -400,6 +402,8 @@ Changes state: no.
 
 Ingest a file already staged in the personal inbox. Takes a file name, not a path: absolute paths, path separators and a leading dot are rejected. The file must already be in the configured inbox directory. The tool runs the same ingest pipeline as `hs personal add`, blocks until indexing finishes (a long PDF can take many minutes) and reports the assigned stem, title and category. Sends progress notifications.
 
+For a PDF the tool also publishes `scribe.boxes` once the document is stored and indexed, and the scribe watcher builds its word boxes after the call returns. A PDF is refused before it is converted when the broker cannot be reached.
+
 Changes state: yes.
 
 | Parameter | Type | Required or default | Meaning |
@@ -512,7 +516,7 @@ The server reads `~/.home-still/config.yaml` once at startup and `~/.home-still/
 | Section | Required | Used for |
 |---|---|---|
 | `storage:` | yes | Catalog, papers and markdown objects. |
-| `events:` | yes | `papers.ingested` and `scribe.completed` announcements. |
+| `events:` | yes | `papers.ingested`, `scribe.completed` and `scribe.boxes` announcements. |
 | `scribe:` (`servers`, `convert_timeout_secs`, `timeout_policy`, `epub`) | no | `scribe_health`, `scribe_convert`. |
 | `distill:` (`servers`) | no | Distill and personal search and indexing tools. |
 | `paper:` | no | Provider settings for `paper_*` tools. |

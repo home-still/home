@@ -5,6 +5,7 @@ use figment::{
     Figment,
 };
 use hs_common::config_file::{env_key_path, unknown_env_names, ConfigError, ConfigFile};
+use hs_common::event_bus::{EventBus, EventBusConfig};
 use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -45,6 +46,12 @@ pub struct Config {
     /// they cannot drift apart.
     #[serde(skip)]
     pub storage: StorageConfig,
+    /// Event bus (top-level `events:` section); `None` when the config has
+    /// none. Ingesting a PDF asks the scribe watcher for its word boxes
+    /// over the bus, so without one a PDF ingest is refused
+    /// ([`Config::build_event_bus`]).
+    #[serde(skip)]
+    pub events: Option<EventBusConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +80,7 @@ impl Default for Config {
                 .collect(),
             project_dir: hs_common::default_project_dir(),
             storage: StorageConfig::default(),
+            events: None,
         }
     }
 }
@@ -206,6 +214,7 @@ impl Config {
         } else {
             user.default_storage().map_err(config_error)?
         };
+        cfg.events = EventBusConfig::from_file(user).map_err(config_error)?;
 
         if cfg.collection_name.trim().is_empty() {
             return Err(PersonalError::Config(
@@ -248,6 +257,12 @@ impl Config {
     /// code and drift apart.
     pub fn build_storage(&self) -> anyhow::Result<Arc<dyn Storage>> {
         self.storage.build()
+    }
+
+    /// Build the configured event bus. A config without an `events:` section
+    /// has none: this is an error, never a bus that drops everything.
+    pub async fn build_event_bus(&self) -> anyhow::Result<Arc<dyn EventBus>> {
+        EventBusConfig::build_required(self.events.as_ref()).await
     }
 
     pub fn markdown_dir(&self) -> PathBuf {

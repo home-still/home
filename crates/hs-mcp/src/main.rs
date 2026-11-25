@@ -1250,7 +1250,8 @@ impl HomeStillMcp {
     /// functions (`prepare_source` + `convert_and_upload`).
     async fn convert_source(&self, stem: &Stem) -> Result<String, String> {
         use hs_scribe::event_watch::{
-            announce_completed, convert_and_upload, prepare_source, IngestedEvent, SourcePrep,
+            announce_already_converted, convert_and_upload, prepare_source, IngestedEvent,
+            SourcePrep,
         };
 
         self.require_event_bus("scribe_convert").await?;
@@ -1268,9 +1269,15 @@ impl HomeStillMcp {
             .map_err(|e| format!("{source_key}: {e}"))?
         {
             SourcePrep::AlreadyConverted(md_key) => {
-                announce_completed(&*self.events, &md_key, &source_key)
-                    .await
-                    .map_err(|e| format!("{md_key} exists but announcing it failed: {e}"))?;
+                announce_already_converted(
+                    &*self.events,
+                    &*self.storage,
+                    &self.stores,
+                    &md_key,
+                    &source_key,
+                )
+                .await
+                .map_err(|e| format!("{md_key} exists but announcing it failed: {e}"))?;
                 return to_json(&serde_json::json!({
                     "stem": stem,
                     "markdown_key": md_key,

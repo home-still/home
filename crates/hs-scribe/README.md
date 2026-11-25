@@ -19,11 +19,15 @@ region.
 ```text
 client.rs               ScribeClient: upload, NDJSON progress stream, health and readiness
 event_watch.rs          the papers.ingested consumer: convert, store markdown and catalog, publish
+box_watch.rs            the scribe.boxes consumer: have a server build a PDF's word boxes, store them
 classify.rs             FailureCode wire tokens and their retryable / bad-source kind
 config.rs               scribe / scribe_server sections and HS_SCRIBE_* overrides
 pdfium.rs, pdf_meta.rs  binding libpdfium; page counts before dispatch
 html.rs, epub.rs        the bounded HTML and EPUB converters
 server.rs               the axum server, admission slots and the VRAM gate (feature server)
+word_boxes.rs           building a PDF's word-box sidecar: text layer, or word OCR for a scanned page
+word_ocr.rs             the word OCR (PP-OCRv5 mobile, on the CPU)
+reading_order.rs        putting a page's words in reading order
 backend_probe.rs        whether the VLM backend can start the model now
 pipeline/               PDF parsing, the per-page processor, markdown assembly
 models/                 PP-DocLayout-V3 layout and SLANet-Plus table models (ONNX)

@@ -56,6 +56,17 @@ fn markdown_prefix(prefix: &str) -> String {
     format!("{}/markdown", prefix.trim_end_matches('/'))
 }
 
+/// The key of a document's word boxes, which the scribe watcher writes for a
+/// PDF some time after the ingest that asked for them.
+fn word_boxes_key(prefix: &str, stem: &str) -> Result<String> {
+    let stores = hs_common::stores::Stores::with_personal_prefix(prefix)
+        .map_err(|e| PersonalError::Config(e.to_string()))?;
+    let (_, layout) = stores
+        .documents(hs_common::stores::PERSONAL)
+        .map_err(|e| PersonalError::Config(e.to_string()))?;
+    Ok(hs_common::word_boxes::boxes_key(layout, stem))
+}
+
 /// Documents in the store, most recently ingested first (the order the MCP
 /// `personal_list` tool promises), at most `limit` of them. `category` is
 /// checked against the store's taxonomy (see [`Config::resolve_category`]).
@@ -162,6 +173,7 @@ pub async fn delete(cfg: &Config, stem: &str) -> Result<u64> {
         format!("{prefix}/{}", hs_common::sharded_key(stem, "md")),
         format!("{prefix}/{}", hs_common::sharded_key(stem, "txt")),
         sidecar_key(prefix, stem),
+        word_boxes_key(prefix, stem)?,
         format!(
             "{}/{}",
             markdown_prefix(prefix),
@@ -357,6 +369,33 @@ mod tests {
         let err = delete(&cfg, "no-such-doc").await.unwrap_err();
 
         assert!(err.to_string().contains("no personal document"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_document_removes_the_word_boxes_built_for_it() {
+        let mut distill = mockito::Server::new_async().await;
+        distill
+            .mock("DELETE", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"deleted":2}"#)
+            .create_async()
+            .await;
+        let (_dir, cfg) = store_with_document(&distill.url()).await;
+        let storage = cfg.build_storage().unwrap();
+        let boxes = word_boxes_key(&cfg.storage_dir, "record").unwrap();
+        storage.put(&boxes, b"sidecar".to_vec()).await.unwrap();
+
+        delete(&cfg, "record").await.unwrap();
+
+        let left = storage
+            .list(&format!("{}/", cfg.storage_dir.trim_end_matches('/')))
+            .await
+            .unwrap();
+        assert!(
+            left.is_empty(),
+            "{:?}",
+            left.iter().map(|o| &o.key).collect::<Vec<_>>()
+        );
     }
 }
 
