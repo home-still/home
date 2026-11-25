@@ -102,10 +102,10 @@ impl LinkMinter {
     /// `None` when links are not configured, or when the document's
     /// stem is not a stem: a document with no valid stem has no link.
     ///
-    /// `page` is the page the passage is on, and `passage` is its
-    /// first line. The page is what a PDF viewer scrolls to; the first
-    /// line is what a text fragment quotes, so the browser selects the
-    /// passage itself.
+    /// `page` is the page the passage is on, and `passage` is the text
+    /// to select: a quote, or the passage's first line. The page is what
+    /// a PDF viewer scrolls to; the text is what a text fragment names,
+    /// so the browser selects the passage itself.
     ///
     /// `collection` is the store the document is in. It is part of the
     /// signature, so a link for a personal document is a capability for
@@ -138,6 +138,7 @@ impl LinkMinter {
                 &self.subject,
                 collection,
                 page,
+                None,
                 self.link_ttl_secs,
             ) else {
                 continue;
@@ -158,10 +159,10 @@ impl LinkMinter {
 
     /// The target a short link for one document and one format points at.
     ///
-    /// `passage` is the markdown's first line, as for [`LinkMinter::mint`]: the
-    /// fragment is stored with the code because a redirect cannot put one
-    /// back — the browser is already following a `Location` by the time it
-    /// would matter.
+    /// `passage` is the text to select in the markdown, as for
+    /// [`LinkMinter::mint`]: the fragment is stored with the code because a
+    /// redirect cannot put one back — the browser is already following a
+    /// `Location` by the time it would matter.
     pub fn short_target(
         &self,
         stem: &str,
@@ -178,6 +179,7 @@ impl LinkMinter {
             &self.subject,
             collection,
             page,
+            None,
             self.link_ttl_secs,
         )
         .ok()?;
@@ -248,9 +250,11 @@ pub struct ShortLinkTarget {
 /// about.
 ///
 /// The source is a PDF or an HTML page: the browser can only scroll it to a
-/// page. The markdown is text: the browser can select the passage in it. One
-/// function, because a long link and the short link that redirects to it must
-/// land the reader in the same place.
+/// page. The markdown is text: the browser can select the passage in it. The
+/// viewer, the page view and the page image show the passage themselves, from
+/// the page and the highlight in the query, where the signature covers them.
+/// One function, because a long link and the short link that redirects to it
+/// must land the reader in the same place.
 fn fragment_for(format: LinkFormat, page: Option<u32>, passage: Option<&str>) -> String {
     match format {
         LinkFormat::Source => page
@@ -259,6 +263,7 @@ fn fragment_for(format: LinkFormat, page: Option<u32>, passage: Option<&str>) ->
         LinkFormat::Markdown => passage
             .map(hs_common::docs::text_fragment)
             .unwrap_or_default(),
+        LinkFormat::Viewer | LinkFormat::Page | LinkFormat::PageImage => String::new(),
     }
 }
 

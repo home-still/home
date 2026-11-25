@@ -215,6 +215,7 @@ async fn serve(
             subject: params.subject.clone(),
             collection: params.collection.clone(),
             page: params.page,
+            highlight: params.highlight.clone(),
             issued_at: params.issued_at,
             expires_at: params.expires_at,
         },
@@ -284,6 +285,9 @@ async fn serve(
                 body,
             )
         }
+        // The rendered views of a PDF are not objects in storage: none
+        // of them is read from here.
+        LinkFormat::Viewer | LinkFormat::Page | LinkFormat::PageImage => return not_found(),
     };
 
     let Some(meta) = state.storage.head(&key).await.ok().flatten() else {
@@ -700,7 +704,8 @@ mod tests {
         collection: &str,
     ) -> String {
         let params =
-            hs_common::docs::mint(key, stem, format, subject, collection, None, 3600).unwrap();
+            hs_common::docs::mint(key, stem, format, subject, collection, None, None, 3600)
+                .unwrap();
         format!("/docs/v1/{stem}/{format}?{}", params.to_query())
     }
 
@@ -877,6 +882,7 @@ mod tests {
             LinkFormat::Source,
             "laptop",
             "academic",
+            None,
             None,
             0,
         )
@@ -1083,6 +1089,7 @@ mod tests {
             "laptop",
             "academic",
             Some(2),
+            None,
             3600,
         )
         .unwrap();
@@ -1111,6 +1118,7 @@ mod tests {
             "laptop",
             "academic",
             Some(99),
+            None,
             3600,
         )
         .unwrap();
@@ -1134,6 +1142,7 @@ mod tests {
             "laptop",
             "academic",
             Some(2),
+            None,
             3600,
         )
         .unwrap();

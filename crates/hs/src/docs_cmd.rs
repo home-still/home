@@ -159,7 +159,7 @@ async fn link(args: DocsLinkArgs, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let key = load_key(&key_path)?;
 
     let params = hs_common::docs::mint(
-        &key, &args.stem, format, &subject, store.name, args.page, ttl,
+        &key, &args.stem, format, &subject, store.name, args.page, None, ttl,
     )
     .map_err(|e| anyhow::anyhow!("minting the link failed: {e}"))?;
 
@@ -293,6 +293,7 @@ mod tests {
             "laptop",
             "academic",
             None,
+            None,
             60,
         )
         .unwrap();
@@ -312,6 +313,7 @@ mod tests {
             LinkFormat::Markdown,
             "laptop",
             "academic",
+            None,
             None,
             60,
         )

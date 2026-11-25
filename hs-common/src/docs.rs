@@ -8,16 +8,22 @@
 //!
 //! # The link
 //!
-//! A link names one document, one format, one subject and one expiry:
+//! A link names one document, one view of it, one store, one subject
+//! and one expiry, and may name a page and a highlight:
 //!
 //! ```text
-//! <base>/docs/v1/<stem>/<format>?exp=<unix>&sub=<subject>&fmt=<format>&sig=<hex>
+//! <base>/docs/v1/<stem>/<format>?iat=<unix>&exp=<unix>&sub=<subject>&col=<store>&fmt=<format>[&page=<n>][&hl=<highlight>]&sig=<hex>
 //! ```
 //!
-//! `sig` is `HMAC-SHA256(key, "v1|stem|fmt|sub|exp")`, hex-encoded.
-//! Every field the signature covers is in the query string, so a client
-//! that changes the stem, the format, the subject or the expiry
-//! invalidates the signature without touching the key.
+//! `sig` is `HMAC-SHA256(key, "v2|stem|fmt|sub|col|page|hl|iat|exp")`,
+//! hex-encoded, where `-` stands for a page or a highlight the link
+//! does not carry. Every field the signature covers is in the URL, so a
+//! client that changes any of them invalidates the signature without
+//! touching the key.
+//!
+//! The `v1` in the path is the version of the routes. The `v2` in the
+//! signed payload is the version of the signing rule
+//! ([`LINK_VERSION`]): the two change for different reasons.
 //!
 //! # Why a query string and not a header
 //!
@@ -51,8 +57,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// The version tag in the signed payload. A change to the signing rule
 /// changes the version, so an old link can never be verified by a new
-/// verifier and vice versa.
-pub const LINK_VERSION: &str = "v1";
+/// verifier and vice versa. `v2` added the highlight to the payload.
+pub const LINK_VERSION: &str = "v2";
 
 /// The shortest a link key may be. A short key is a weak key.
 pub const MIN_KEY_LEN: usize = 32;
@@ -147,31 +153,57 @@ pub fn new_short_link_code() -> String {
         .collect()
 }
 
-/// Which document a link opens.
+/// Which view of a document a link opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkFormat {
     /// The original object: the PDF, the HTML page or the EPUB.
     Source,
     /// The converted markdown.
     Markdown,
+    /// The source PDF in the page viewer, with the link's highlight laid
+    /// over the words it names.
+    Viewer,
+    /// One page of the source PDF as a web page: the page's image with
+    /// the highlight drawn on it, for a client that runs no script.
+    Page,
+    /// One page of the source PDF as a PNG image, with the highlight
+    /// drawn on it.
+    PageImage,
 }
 
 impl LinkFormat {
+    /// Every format, so the name of each is written once: [`Self::parse`]
+    /// reads what [`Self::as_str`] writes.
+    pub const ALL: [LinkFormat; 5] = [
+        LinkFormat::Source,
+        LinkFormat::Markdown,
+        LinkFormat::Viewer,
+        LinkFormat::Page,
+        LinkFormat::PageImage,
+    ];
+
     /// The name that appears in the URL path and in the signature.
     pub fn as_str(&self) -> &'static str {
         match self {
             LinkFormat::Source => "source",
             LinkFormat::Markdown => "markdown",
+            LinkFormat::Viewer => "viewer",
+            LinkFormat::Page => "page",
+            LinkFormat::PageImage => "page.png",
         }
     }
 
     /// Parse the format name from a URL or a query string.
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "source" => Some(LinkFormat::Source),
-            "markdown" => Some(LinkFormat::Markdown),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|format| format.as_str() == s)
+    }
+
+    /// Does a link in this format have to name a page?
+    ///
+    /// A page view and a page image are one page of the document, so a
+    /// link to either that names no page names nothing.
+    pub fn needs_page(&self) -> bool {
+        matches!(self, LinkFormat::Page | LinkFormat::PageImage)
     }
 }
 
@@ -204,6 +236,9 @@ pub enum LinkError {
     /// The page is not a page: the pages are 1-based, so page 0 names
     /// no page.
     BadPage,
+    /// The highlight is not one: no run of words, more than
+    /// [`MAX_HIGHLIGHT_SPANS`], a run on page 0 or a run of no words.
+    BadHighlight,
     /// A required query parameter is missing.
     MissingParameter(&'static str),
     /// The link key is unusable (too short, or missing).
@@ -219,6 +254,107 @@ impl fmt::Display for LinkError {
 }
 
 impl std::error::Error for LinkError {}
+
+/// The most runs of words one link highlights.
+///
+/// A quoted passage is one run for each page it is on, so this is also
+/// the most pages one quote may cross. It bounds the length of a link:
+/// the highlight is part of the URL.
+pub const MAX_HIGHLIGHT_SPANS: usize = 8;
+
+/// What separates a highlight's runs in a URL.
+///
+/// `~`, `.` and `-` are unreserved in a URL, so a highlight is written
+/// into a query string as it is, with no percent-encoding.
+const HIGHLIGHT_SPAN_SEPARATOR: char = '~';
+
+/// A run of consecutive words on one page of a source document.
+///
+/// The words are the page's words in the document's word-box sidecar
+/// (`hs_common::word_boxes`), counted from 0 in reading order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighlightSpan {
+    /// The page, 1-based.
+    pub page: u32,
+    /// The first word of the run.
+    pub start: u32,
+    /// One past the last word of the run.
+    pub end: u32,
+}
+
+/// The words a link highlights: where a quoted passage is on the page.
+///
+/// A highlight is part of the *request*, like the page, so it is signed:
+/// a link that boxes one passage cannot be edited into a link that boxes
+/// another. In a URL it is `<page>.<start>-<end>` for each run, joined
+/// by `~`: `3.120-164~4.0-12` is words 120 to 163 of page 3 and the
+/// first twelve words of page 4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Highlight {
+    spans: Vec<HighlightSpan>,
+}
+
+impl Highlight {
+    /// A highlight of these runs.
+    ///
+    /// Refused when there is no run, more than [`MAX_HIGHLIGHT_SPANS`],
+    /// a run on page 0 (the pages are 1-based) or a run of no words.
+    pub fn new(spans: Vec<HighlightSpan>) -> Result<Self, LinkError> {
+        let well_formed = !spans.is_empty()
+            && spans.len() <= MAX_HIGHLIGHT_SPANS
+            && spans
+                .iter()
+                .all(|span| span.page > 0 && span.start < span.end);
+        if !well_formed {
+            return Err(LinkError::BadHighlight);
+        }
+        Ok(Self { spans })
+    }
+
+    /// The runs, in the order the link names them.
+    pub fn spans(&self) -> &[HighlightSpan] {
+        &self.spans
+    }
+
+    /// Read a highlight from the form it has in a URL.
+    pub fn parse(wire: &str) -> Result<Self, LinkError> {
+        let spans = wire
+            .split(HIGHLIGHT_SPAN_SEPARATOR)
+            .map(parse_highlight_span)
+            .collect::<Option<Vec<_>>>()
+            .ok_or(LinkError::BadHighlight)?;
+        let highlight = Self::new(spans)?;
+        // One highlight has one spelling: `+3.1-2` and `03.1-2` are
+        // refused rather than read as `3.1-2`.
+        if highlight.to_string() != wire {
+            return Err(LinkError::BadHighlight);
+        }
+        Ok(highlight)
+    }
+}
+
+impl fmt::Display for Highlight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, span) in self.spans.iter().enumerate() {
+            if index > 0 {
+                write!(f, "{HIGHLIGHT_SPAN_SEPARATOR}")?;
+            }
+            write!(f, "{}.{}-{}", span.page, span.start, span.end)?;
+        }
+        Ok(())
+    }
+}
+
+/// Read one run of a highlight: `<page>.<start>-<end>`.
+fn parse_highlight_span(span: &str) -> Option<HighlightSpan> {
+    let (page, words) = span.split_once('.')?;
+    let (start, end) = words.split_once('-')?;
+    Some(HighlightSpan {
+        page: page.parse().ok()?,
+        start: start.parse().ok()?,
+        end: end.parse().ok()?,
+    })
+}
 
 /// The pieces of a link, as they travel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +375,8 @@ pub struct LinkParams {
     /// it is signed: a link minted for page 11 opens page 11 and
     /// nothing else. `None` means the whole document.
     pub page: Option<u32>,
+    /// The words the link highlights. `None` means none.
+    pub highlight: Option<Highlight>,
     /// When the link was minted, as a Unix timestamp in seconds.
     ///
     /// The link carries this so a revocation can be applied to it: a
@@ -256,14 +394,19 @@ impl LinkParams {
     /// The query string, without a leading `?`.
     pub fn to_query(&self) -> String {
         let page = self.page.map_or_else(String::new, |p| format!("&page={p}"));
+        let highlight = self
+            .highlight
+            .as_ref()
+            .map_or_else(String::new, |h| format!("&hl={h}"));
         format!(
-            "iat={}&exp={}&sub={}&col={}&fmt={}{}&sig={}",
+            "iat={}&exp={}&sub={}&col={}&fmt={}{}{}&sig={}",
             self.issued_at,
             self.expires_at,
             url_encode(&self.subject),
             url_encode(&self.collection),
             self.format.as_str(),
             page,
+            highlight,
             self.signature
         )
     }
@@ -385,9 +528,11 @@ pub fn now_secs() -> u64 {
 
 /// Mint a link.
 ///
-/// The expiry is `ttl_secs` from now. The link is bound to the stem,
-/// the format and the subject: changing any of them in the URL
-/// invalidates the signature.
+/// The expiry is `ttl_secs` from now. The link is bound to everything
+/// it names — the stem, the format, the subject, the store, the page
+/// and the highlight: changing any of them in the URL invalidates the
+/// signature.
+#[allow(clippy::too_many_arguments)]
 pub fn mint(
     key: &LinkKey,
     stem: &str,
@@ -395,34 +540,61 @@ pub fn mint(
     subject: &str,
     collection: &str,
     page: Option<u32>,
+    highlight: Option<&Highlight>,
     ttl_secs: u64,
 ) -> Result<LinkParams, LinkError> {
-    crate::validate_stem(stem).map_err(|_| LinkError::BadStem)?;
-    if subject.is_empty() {
+    let issued_at = now_secs();
+    signed(
+        key,
+        SignedFields {
+            stem: stem.to_string(),
+            format,
+            subject: subject.to_string(),
+            collection: collection.to_string(),
+            page,
+            highlight: highlight.cloned(),
+            issued_at,
+            expires_at: issued_at.saturating_add(ttl_secs),
+        },
+    )
+}
+
+/// Sign a sibling of a link that has already been verified.
+///
+/// The page viewer, the page view, the page image and the source link
+/// to each other: the same document for the same subject, in another
+/// format or on another page. `fields` is the verified link's fields
+/// with those differences applied. The issue time and the expiry are
+/// carried over, not renewed, so a sibling stops working when the link
+/// it was reached from does, and a revocation covers both.
+///
+/// A link to one view of a document is therefore a capability for the
+/// document's other views until it expires. It is not one for another
+/// document, store or subject: the caller keeps those as it verified
+/// them.
+pub fn resign(key: &LinkKey, fields: &SignedFields) -> Result<LinkParams, LinkError> {
+    signed(key, fields.clone())
+}
+
+/// Check a link's fields and sign them: the one place a signature is
+/// made.
+fn signed(key: &LinkKey, fields: SignedFields) -> Result<LinkParams, LinkError> {
+    crate::validate_stem(&fields.stem).map_err(|_| LinkError::BadStem)?;
+    if fields.subject.is_empty() {
         return Err(LinkError::MissingParameter("sub"));
     }
-    if collection.is_empty() {
+    if fields.collection.is_empty() {
         return Err(LinkError::MissingParameter("col"));
     }
     // The collection is part of the signature, so it has to be a name
     // the verifier can check — the same rule as the stem.
-    crate::validate_stem(collection).map_err(|_| LinkError::BadCollection)?;
+    crate::validate_stem(&fields.collection).map_err(|_| LinkError::BadCollection)?;
     // Page 0 is not a page: the pages are 1-based, and a link that
-    // named page 0 would be a link to a page that does not exist.
-    if page == Some(0) {
+    // named page 0 would be a link to a page that does not exist. A
+    // format that is one page of the document has to say which.
+    if fields.page == Some(0) || (fields.format.needs_page() && fields.page.is_none()) {
         return Err(LinkError::BadPage);
     }
-    let issued_at = now_secs();
-    let expires_at = issued_at.saturating_add(ttl_secs);
-    let fields = SignedFields {
-        stem: stem.to_string(),
-        format,
-        subject: subject.to_string(),
-        collection: collection.to_string(),
-        page,
-        issued_at,
-        expires_at,
-    };
     let signature = key.sign(&fields.signed_payload());
     Ok(LinkParams {
         stem: fields.stem,
@@ -430,6 +602,7 @@ pub fn mint(
         subject: fields.subject,
         collection: fields.collection,
         page: fields.page,
+        highlight: fields.highlight,
         issued_at: fields.issued_at,
         expires_at: fields.expires_at,
         signature,
@@ -459,6 +632,8 @@ pub struct SignedFields {
     pub collection: String,
     /// The page the link opens. `None` means the whole document.
     pub page: Option<u32>,
+    /// The words the link highlights. `None` means none.
+    pub highlight: Option<Highlight>,
     /// When the link was minted, as a Unix timestamp in seconds.
     pub issued_at: u64,
     /// When the link stops working, as a Unix timestamp in seconds.
@@ -471,13 +646,21 @@ impl SignedFields {
     /// The order and the separators are fixed: a verifier and a signer
     /// that disagree here would disagree silently.
     fn signed_payload(&self) -> String {
+        // `-` is what a link without a page or a highlight signs in
+        // their place. Neither can be spelled `-`: a page is a number
+        // and a highlight has at least one run.
+        const ABSENT: &str = "-";
         format!(
-            "{LINK_VERSION}|{}|{}|{}|{}|{}|{}|{}",
+            "{LINK_VERSION}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.stem,
             self.format.as_str(),
             self.subject,
             self.collection,
-            self.page.map_or_else(|| "-".to_string(), |p| p.to_string()),
+            self.page
+                .map_or_else(|| ABSENT.to_string(), |p| p.to_string()),
+            self.highlight
+                .as_ref()
+                .map_or_else(|| ABSENT.to_string(), |h| h.to_string()),
             self.issued_at,
             self.expires_at,
         )
@@ -533,7 +716,7 @@ pub fn pdf_page_fragment(page: u32) -> String {
     format!("#page={page}")
 }
 
-/// The longest text a fragment quotes, in characters.
+/// The longest text one term of a fragment quotes, in characters.
 ///
 /// The text-fragment spec asks for a *short* distinctive snippet, and
 /// a URL has a practical length limit. Measured over the corpus's own
@@ -542,48 +725,126 @@ pub fn pdf_page_fragment(page: u32) -> String {
 /// than the browser needs to find the passage.
 const MAX_FRAGMENT_CHARS: usize = 120;
 
-/// The URL fragment that points a browser at a span of text.
+/// The most words a fragment quotes in full.
+///
+/// A longer passage is named by its two ends instead: the browser
+/// selects everything from the first to the last, so the fragment stays
+/// short however long the passage is.
+pub const TEXT_FRAGMENT_MAX_WORDS: usize = 10;
+
+/// The words quoted from each end of a passage that is named by its
+/// ends.
+const TEXT_FRAGMENT_EDGE_WORDS: usize = TEXT_FRAGMENT_MAX_WORDS / 2;
+
+/// The URL fragment that points a browser at a passage of text.
 ///
 /// This is the W3C **Text Fragments** form, `#:~:text=`: the browser
 /// finds the quoted text in the document it loaded, scrolls to it and
 /// selects it. It needs nothing from the server — the fragment is
 /// resolved in the client, against the bytes the server sent.
 ///
-/// The quoted text is the beginning of the passage, cut at a word
-/// boundary: long enough to be distinctive, short enough for a URL.
-/// The first line of the passage is the right snippet for a second
-/// reason — it is the passage's `line_start`, so the service can find
-/// it by line number without searching the text.
-pub fn text_fragment(line: &str) -> String {
-    format!("#:~:text={}", url_encode_fragment(clip(line)))
+/// A passage of at most [`TEXT_FRAGMENT_MAX_WORDS`] words on one line is
+/// quoted whole: `text=<passage>`. A longer one, or one that runs over
+/// a line break, is named by its ends, `text=<textStart>,<textEnd>`:
+/// the first words of its first line and the last words of its last
+/// line. Neither end crosses a line break, because the markdown is
+/// served as text and a quoted space does not match a line break in it.
+///
+/// Every term is whole words: a term that ends mid-word is not text the
+/// browser matches. A passage with no words, or with a word too long to
+/// quote, has no fragment and the link opens the document unscrolled.
+pub fn text_fragment(passage: &str) -> String {
+    let mut lines = passage
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    let last = lines.next_back();
+    let first_words = word_ranges(first).len();
+
+    let quoted_whole = last.is_none()
+        && first_words <= TEXT_FRAGMENT_MAX_WORDS
+        && first.chars().count() <= MAX_FRAGMENT_CHARS;
+    if quoted_whole {
+        return format!("#:~:text={}", url_encode_fragment(first));
+    }
+
+    let edge_words = match last {
+        Some(_) => TEXT_FRAGMENT_EDGE_WORDS,
+        // Both ends are cut from one line, and the browser looks for
+        // the end after the start: they must not share a word.
+        None => TEXT_FRAGMENT_EDGE_WORDS.min(first_words / 2),
+    };
+    let start = leading_words(first, edge_words);
+    let end = trailing_words(last.unwrap_or(first), edge_words);
+    match start.zip(end) {
+        Some((start, end)) => format!(
+            "#:~:text={},{}",
+            url_encode_fragment(start),
+            url_encode_fragment(end)
+        ),
+        None => String::new(),
+    }
 }
 
-/// Cut a snippet to [`MAX_FRAGMENT_CHARS`], at a word boundary.
-///
-/// The cut is at a word boundary because a snippet that ends
-/// mid-word is not a substring of the document, and the browser
-/// matches on a substring: it would find nothing.
-fn clip(line: &str) -> &str {
-    let trimmed = line.trim();
-    if trimmed.chars().count() <= MAX_FRAGMENT_CHARS {
-        return trimmed;
+/// The byte range of each whitespace-separated word of a line.
+fn word_ranges(line: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut word_start = None;
+    for (index, ch) in line.char_indices() {
+        match (ch.is_whitespace(), word_start) {
+            (true, Some(start)) => {
+                ranges.push((start, index));
+                word_start = None;
+            }
+            (false, None) => word_start = Some(index),
+            _ => {}
+        }
     }
-    let cut = trimmed
-        .char_indices()
-        .nth(MAX_FRAGMENT_CHARS)
-        .map(|(i, _)| i)
-        .unwrap_or(trimmed.len());
-    // Back up to the last space, so the snippet ends on a word.
-    let end = trimmed[..cut].rfind(' ').unwrap_or(cut);
-    trimmed[..end].trim_end()
+    if let Some(start) = word_start {
+        ranges.push((start, line.len()));
+    }
+    ranges
+}
+
+/// The first words of a line, as the line has them: as many as fit in
+/// `max_words` and [`MAX_FRAGMENT_CHARS`]. `None` when not even one
+/// does.
+fn leading_words(line: &str, max_words: usize) -> Option<&str> {
+    let words = word_ranges(line);
+    let (start, _) = *words.first()?;
+    words
+        .iter()
+        .take(max_words)
+        .filter_map(|&(_, end)| line.get(start..end))
+        .take_while(|term| term.chars().count() <= MAX_FRAGMENT_CHARS)
+        .last()
+}
+
+/// The last words of a line, as the line has them: as many as fit in
+/// `max_words` and [`MAX_FRAGMENT_CHARS`]. `None` when not even one
+/// does.
+fn trailing_words(line: &str, max_words: usize) -> Option<&str> {
+    let words = word_ranges(line);
+    let (_, end) = *words.last()?;
+    words
+        .iter()
+        .rev()
+        .take(max_words)
+        .filter_map(|&(start, _)| line.get(start..end))
+        .take_while(|term| term.chars().count() <= MAX_FRAGMENT_CHARS)
+        .last()
 }
 
 /// Percent-encode a value for a URL fragment.
 ///
-/// The text-fragment syntax gives `&`, `#` and `=` meaning, so they
-/// are encoded; the rest of the punctuation a line contains is left
-/// readable, because a fragment a human can read is a fragment a human
-/// can check.
+/// The text-fragment syntax gives `&`, `#`, `=`, `,` and `-` meaning —
+/// `,` separates the two ends of a range and `-` marks the context
+/// around them — so they are encoded; the rest of the punctuation a
+/// line contains is left readable, because a fragment a human can read
+/// is a fragment a human can check.
 fn url_encode_fragment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
@@ -591,7 +852,6 @@ fn url_encode_fragment(value: &str) -> String {
             b'A'..=b'Z'
             | b'a'..=b'z'
             | b'0'..=b'9'
-            | b'-'
             | b'_'
             | b'.'
             | b'~'
@@ -623,6 +883,8 @@ pub struct LinkQuery {
     pub format: LinkFormat,
     /// The page the link opens. `None` means the whole document.
     pub page: Option<u32>,
+    /// The words the link highlights. `None` means none.
+    pub highlight: Option<Highlight>,
     /// The signature.
     pub signature: String,
 }
@@ -639,6 +901,7 @@ impl LinkQuery {
         let mut collection: Option<String> = None;
         let mut format: Option<LinkFormat> = None;
         let mut page: Option<u32> = None;
+        let mut highlight: Option<Highlight> = None;
         let mut signature: Option<String> = None;
 
         for pair in query.split('&') {
@@ -679,6 +942,10 @@ impl LinkQuery {
                     }
                     page = Some(parsed);
                 }
+                "hl" => {
+                    let wire = url_decode(value).ok_or(LinkError::BadHighlight)?;
+                    highlight = Some(Highlight::parse(&wire)?);
+                }
                 "sig" => {
                     signature = Some(url_decode(value).ok_or(LinkError::BadSignature)?);
                 }
@@ -692,6 +959,7 @@ impl LinkQuery {
             collection: collection.ok_or(LinkError::MissingParameter("col"))?,
             format: format.ok_or(LinkError::BadFormat)?,
             page,
+            highlight,
             signature: signature.ok_or(LinkError::MissingParameter("sig"))?,
         })
     }
@@ -976,6 +1244,7 @@ mod tests {
             "laptop",
             "academic",
             None,
+            None,
             3600,
         )
         .unwrap();
@@ -987,6 +1256,7 @@ mod tests {
                 subject: "laptop".to_string(),
                 collection: "academic".to_string(),
                 page: link.page,
+                highlight: None,
                 issued_at: link.issued_at,
                 expires_at: link.expires_at,
             },
@@ -1005,6 +1275,7 @@ mod tests {
             "laptop",
             "academic",
             None,
+            None,
             3600,
         )
         .unwrap();
@@ -1018,6 +1289,7 @@ mod tests {
                     subject: subject.to_string(),
                     collection: "academic".to_string(),
                     page: link.page,
+                    highlight: None,
                     issued_at: link.issued_at,
                     expires_at,
                 },
@@ -1068,6 +1340,7 @@ mod tests {
             "laptop",
             "academic",
             None,
+            None,
             3600,
         )
         .unwrap();
@@ -1080,6 +1353,7 @@ mod tests {
                     subject: "laptop".to_string(),
                     collection: "academic".to_string(),
                     page: link.page,
+                    highlight: None,
                     issued_at: link.issued_at,
                     expires_at: link.expires_at,
                 },
@@ -1101,6 +1375,7 @@ mod tests {
             "laptop",
             "academic",
             None,
+            None,
             0,
         )
         .unwrap();
@@ -1113,6 +1388,7 @@ mod tests {
                     subject: "laptop".to_string(),
                     collection: "academic".to_string(),
                     page: link.page,
+                    highlight: None,
                     issued_at: link.issued_at,
                     expires_at,
                 },
@@ -1132,6 +1408,7 @@ mod tests {
             LinkFormat::Source,
             "lap top",
             "academic",
+            None,
             None,
             3600,
         )
@@ -1185,6 +1462,7 @@ mod tests {
                     "laptop",
                     "academic",
                     None,
+                    None,
                     3600
                 )
                 .unwrap_err(),
@@ -1227,6 +1505,7 @@ mod tests {
             "laptop",
             "academic",
             Some(11),
+            None,
             3600,
         )
         .unwrap();
@@ -1238,6 +1517,7 @@ mod tests {
                 subject: "laptop".to_string(),
                 collection: "academic".to_string(),
                 page: Some(11),
+                highlight: None,
                 issued_at: link.issued_at,
                 expires_at: link.expires_at,
             },
@@ -1255,6 +1535,7 @@ mod tests {
                     subject: "laptop".to_string(),
                     collection: "academic".to_string(),
                     page: Some(12),
+                    highlight: None,
                     issued_at: link.issued_at,
                     expires_at: link.expires_at,
                 },
@@ -1272,6 +1553,7 @@ mod tests {
                     subject: "laptop".to_string(),
                     collection: "academic".to_string(),
                     page: None,
+                    highlight: None,
                     issued_at: link.issued_at,
                     expires_at: link.expires_at,
                 },
@@ -1297,6 +1579,7 @@ mod tests {
             "laptop",
             "personal",
             None,
+            None,
             3600,
         )
         .unwrap();
@@ -1308,6 +1591,7 @@ mod tests {
                 subject: "laptop".to_string(),
                 collection: "personal".to_string(),
                 page: link.page,
+                highlight: None,
                 issued_at: link.issued_at,
                 expires_at: link.expires_at,
             },
@@ -1325,6 +1609,7 @@ mod tests {
                     subject: "laptop".to_string(),
                     collection: "academic".to_string(),
                     page: link.page,
+                    highlight: None,
                     issued_at: link.issued_at,
                     expires_at: link.expires_at,
                 },
@@ -1355,6 +1640,7 @@ mod tests {
                 "laptop",
                 "../etc",
                 None,
+                None,
                 3600
             )
             .unwrap_err(),
@@ -1374,6 +1660,7 @@ mod tests {
                 "laptop",
                 "academic",
                 Some(0),
+                None,
                 3600
             )
             .unwrap_err(),
@@ -1396,6 +1683,7 @@ mod tests {
             "laptop",
             "academic",
             Some(11),
+            None,
             3600,
         )
         .unwrap();
@@ -1415,6 +1703,7 @@ mod tests {
             LinkFormat::Source,
             "laptop",
             "academic",
+            None,
             None,
             3600,
         )
@@ -1444,29 +1733,343 @@ mod tests {
         // Ordinary words stay readable.
         let fragment = crate::docs::text_fragment("plain words here");
         assert!(fragment.contains("plain%20words%20here"), "{fragment}");
+        // The characters the syntax itself uses are encoded: a `,` in
+        // the text would be read as the start of a second term, and a
+        // `-` at its edge as a mark for the context around it.
+        let fragment = crate::docs::text_fragment("state-of-the-art, mostly");
+        assert_eq!(fragment, "#:~:text=state%2Dof%2Dthe%2Dart%2C%20mostly");
     }
 
     #[test]
-    fn a_text_fragment_is_short_enough_for_a_url() {
-        // The corpus's passages run to hundreds of characters on their
-        // first line, and a URL has a practical length limit.
+    fn a_long_passage_is_named_by_its_two_ends() {
+        // The corpus's passages run to hundreds of characters, and a URL
+        // has a practical length limit: a long passage is named by where
+        // it starts and where it ends, and the browser selects all of it.
         let long = "During acute stress, the limbic system and thalamus are activated by the \
                      cerebral cortex through the reticular activating system, which subsequently \
                      activates the hypothalamus, triggering an autonomic nervous system and \
                      endocrine response, resulting in catecholamine and cortisol secretion.";
         let fragment = crate::docs::text_fragment(long);
-        let quoted = crate::docs::url_decode(fragment.trim_start_matches("#:~:text=")).unwrap();
-        assert!(
-            quoted.chars().count() <= 120,
-            "the snippet is {} chars: {quoted}",
-            quoted.chars().count()
+        let terms = fragment.trim_start_matches("#:~:text=");
+        // One unencoded comma: the one between the two ends.
+        assert_eq!(terms.matches(',').count(), 1, "{fragment}");
+        let (start, end) = terms.split_once(',').unwrap();
+        assert_eq!(
+            crate::docs::url_decode(start).unwrap(),
+            "During acute stress, the limbic"
         );
-        // And it ends on a word, so the browser's substring match finds
-        // it: a snippet cut mid-word is not in the document.
-        assert!(!quoted.ends_with(' '), "{quoted}");
+        assert_eq!(
+            crate::docs::url_decode(end).unwrap(),
+            "in catecholamine and cortisol secretion."
+        );
+
+        // Ten words are quoted whole. The eleventh turns the fragment
+        // into a range, and its two ends share no word: the browser
+        // looks for the end after the start.
+        assert_eq!(
+            crate::docs::text_fragment("one two three four five six seven eight nine ten"),
+            "#:~:text=one%20two%20three%20four%20five%20six%20seven%20eight%20nine%20ten"
+        );
+        assert_eq!(
+            crate::docs::text_fragment("one two three four five six seven eight nine ten eleven"),
+            "#:~:text=one%20two%20three%20four%20five,seven%20eight%20nine%20ten%20eleven"
+        );
+    }
+
+    #[test]
+    fn a_passage_over_several_lines_is_named_by_its_first_and_last_line() {
+        // Neither end crosses a line break: a quoted space does not
+        // match the document's newline.
+        let fragment = crate::docs::text_fragment(
+            "  Stress responses\n\nare mediated by the HPA axis\nand the sympathetic nervous system.\n",
+        );
+        assert_eq!(
+            fragment,
+            "#:~:text=Stress%20responses,and%20the%20sympathetic%20nervous%20system."
+        );
+    }
+
+    #[test]
+    fn a_passage_that_cannot_be_quoted_has_no_fragment() {
+        assert_eq!(crate::docs::text_fragment(""), "");
+        assert_eq!(crate::docs::text_fragment(" \n\t\n"), "");
+        // A word longer than a term may be is not cut: half a word is
+        // not text the browser matches.
+        let word = "x".repeat(MAX_FRAGMENT_CHARS + 1);
+        assert_eq!(crate::docs::text_fragment(&word), "");
+
+        // A short line of long words is named by its ends, each a whole
+        // word, and the ends do not overlap.
+        let first = "a".repeat(MAX_FRAGMENT_CHARS / 2 + 1);
+        let last = "b".repeat(MAX_FRAGMENT_CHARS / 2 + 1);
+        assert_eq!(
+            crate::docs::text_fragment(&format!("{first} middle {last}")),
+            format!("#:~:text={first},{last}")
+        );
+    }
+
+    fn highlight() -> Highlight {
+        Highlight::new(vec![
+            HighlightSpan {
+                page: 3,
+                start: 120,
+                end: 164,
+            },
+            HighlightSpan {
+                page: 4,
+                start: 0,
+                end: 12,
+            },
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn a_highlight_round_trips_through_a_url() {
+        let h = highlight();
+        assert_eq!(h.to_string(), "3.120-164~4.0-12");
+        assert_eq!(Highlight::parse("3.120-164~4.0-12").unwrap(), h);
+
+        let k = key();
+        let link = mint(
+            &k,
+            "10.1234_abcd",
+            LinkFormat::Viewer,
+            "laptop",
+            "academic",
+            Some(3),
+            Some(&h),
+            3600,
+        )
+        .unwrap();
+        let query = link.to_query();
+        assert!(query.contains("&hl=3.120-164~4.0-12&"), "{query}");
+        let parsed = LinkQuery::parse(&query).unwrap();
+        assert_eq!(parsed.format, LinkFormat::Viewer);
+        assert_eq!(parsed.highlight, Some(h));
+        // A client that percent-encodes the separator names the same
+        // highlight.
+        let encoded = query.replace('~', "%7E");
+        assert_eq!(
+            LinkQuery::parse(&encoded).unwrap().highlight,
+            parsed.highlight
+        );
+    }
+
+    #[test]
+    fn a_highlight_that_is_not_one_is_refused() {
+        // No run, a run of no words, a run that ends before it starts, a
+        // run on page 0, and more runs than a link carries.
+        assert_eq!(
+            Highlight::new(Vec::new()).unwrap_err(),
+            LinkError::BadHighlight
+        );
+        for (page, start, end) in [(1, 5, 5), (1, 6, 5), (0, 1, 2)] {
+            assert_eq!(
+                Highlight::new(vec![HighlightSpan { page, start, end }]).unwrap_err(),
+                LinkError::BadHighlight,
+                "page {page}, words {start} to {end}"
+            );
+        }
+        let one_too_many = vec![
+            HighlightSpan {
+                page: 1,
+                start: 0,
+                end: 1,
+            };
+            MAX_HIGHLIGHT_SPANS + 1
+        ];
+        assert_eq!(
+            Highlight::new(one_too_many).unwrap_err(),
+            LinkError::BadHighlight
+        );
+
+        // The same on the way in, with the spellings a minter never
+        // writes.
+        for wire in [
+            "",
+            "3",
+            "3.1",
+            "3.1-",
+            "3.-2",
+            "x.1-2",
+            "3.1-2~",
+            "~3.1-2",
+            "0.1-2",
+            "3.2-2",
+            "03.1-2",
+            "3.1-02",
+            "3.1-2,4.1-2",
+            "3.1-4294967296",
+        ] {
+            assert_eq!(
+                Highlight::parse(wire).unwrap_err(),
+                LinkError::BadHighlight,
+                "{wire:?}"
+            );
+            let query = format!("iat=1&exp=2&sub=laptop&col=academic&fmt=viewer&hl={wire}&sig=ab");
+            assert_eq!(
+                LinkQuery::parse(&query).unwrap_err(),
+                LinkError::BadHighlight,
+                "{wire:?}"
+            );
+        }
+        assert_eq!(
+            Highlight::parse("+3.1-2").unwrap_err(),
+            LinkError::BadHighlight
+        );
+    }
+
+    #[test]
+    fn a_highlight_is_signed() {
+        // A link that boxes one passage cannot be edited into a link
+        // that boxes another, or into one that boxes nothing.
+        let k = key();
+        let h = highlight();
+        let link = mint(
+            &k,
+            "10.1234_abcd",
+            LinkFormat::Viewer,
+            "laptop",
+            "academic",
+            Some(3),
+            Some(&h),
+            3600,
+        )
+        .unwrap();
+        let fields = |highlight: Option<Highlight>| SignedFields {
+            stem: "10.1234_abcd".to_string(),
+            format: LinkFormat::Viewer,
+            subject: "laptop".to_string(),
+            collection: "academic".to_string(),
+            page: Some(3),
+            highlight,
+            issued_at: link.issued_at,
+            expires_at: link.expires_at,
+        };
+        verify(&k, &fields(Some(h)), &link.signature).unwrap();
+
+        let one_word_more = Highlight::parse("3.120-165~4.0-12").unwrap();
+        assert_eq!(
+            verify(&k, &fields(Some(one_word_more)), &link.signature),
+            Err(LinkError::BadSignature)
+        );
+        assert_eq!(
+            verify(&k, &fields(None), &link.signature),
+            Err(LinkError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn a_resigned_sibling_verifies_and_expires_with_the_link_it_came_from() {
+        let k = key();
+        let h = highlight();
+        let link = mint(
+            &k,
+            "10.1234_abcd",
+            LinkFormat::Viewer,
+            "laptop",
+            "academic",
+            Some(3),
+            Some(&h),
+            3600,
+        )
+        .unwrap();
+        // The viewer's link to the image of the next page.
+        let sibling_fields = SignedFields {
+            stem: link.stem.clone(),
+            format: LinkFormat::PageImage,
+            subject: link.subject.clone(),
+            collection: link.collection.clone(),
+            page: Some(4),
+            highlight: link.highlight.clone(),
+            issued_at: link.issued_at,
+            expires_at: link.expires_at,
+        };
+        let sibling = resign(&k, &sibling_fields).unwrap();
+        assert_eq!(
+            (sibling.issued_at, sibling.expires_at),
+            (link.issued_at, link.expires_at)
+        );
+        assert_ne!(sibling.signature, link.signature);
+        verify(&k, &sibling_fields, &sibling.signature).unwrap();
+        let path = sibling.to_path();
         assert!(
-            long.contains(&quoted),
-            "the snippet is not a substring: {quoted}"
+            path.starts_with("/docs/v1/10.1234_abcd/page.png?"),
+            "{path}"
+        );
+        assert!(path.contains("&fmt=page.png&page=4&hl="), "{path}");
+
+        // What cannot be minted cannot be re-signed: the same checks.
+        let no_page = SignedFields {
+            page: None,
+            ..sibling_fields.clone()
+        };
+        assert_eq!(resign(&k, &no_page).unwrap_err(), LinkError::BadPage);
+        let not_a_stem = SignedFields {
+            stem: "../etc".to_string(),
+            ..sibling_fields
+        };
+        assert_eq!(resign(&k, &not_a_stem).unwrap_err(), LinkError::BadStem);
+    }
+
+    #[test]
+    fn a_view_of_one_page_has_to_name_the_page() {
+        let k = key();
+        let mint_view = |format: LinkFormat, page: Option<u32>| {
+            mint(
+                &k,
+                "10.1234_abcd",
+                format,
+                "laptop",
+                "academic",
+                page,
+                None,
+                3600,
+            )
+        };
+        for format in [LinkFormat::Page, LinkFormat::PageImage] {
+            assert_eq!(
+                mint_view(format, None).unwrap_err(),
+                LinkError::BadPage,
+                "{format}"
+            );
+            // With a page it is a link, and its format reads back from
+            // the query as the format it was minted in.
+            let link = mint_view(format, Some(2)).unwrap();
+            assert_eq!(LinkQuery::parse(&link.to_query()).unwrap().format, format);
+        }
+        // The viewer opens the whole document: it needs no page.
+        mint_view(LinkFormat::Viewer, None).unwrap();
+    }
+
+    #[test]
+    fn a_link_signed_under_the_old_rule_does_not_verify() {
+        // The signing rule changed with the highlight, and so did its
+        // version: a link minted before the change is refused, not read
+        // as a link with no highlight.
+        let k = key();
+        let issued_at = now_secs();
+        let expires_at = issued_at + 3600;
+        let old_signature = k.sign(&format!(
+            "v1|10.1234_abcd|source|laptop|academic|-|{issued_at}|{expires_at}"
+        ));
+        assert_eq!(
+            verify(
+                &k,
+                &SignedFields {
+                    stem: "10.1234_abcd".to_string(),
+                    format: LinkFormat::Source,
+                    subject: "laptop".to_string(),
+                    collection: "academic".to_string(),
+                    page: None,
+                    highlight: None,
+                    issued_at,
+                    expires_at,
+                },
+                &old_signature,
+            ),
+            Err(LinkError::BadSignature)
         );
     }
 
@@ -1481,6 +2084,7 @@ mod tests {
             LinkError::BadStem,
             LinkError::BadFormat,
             LinkError::BadPage,
+            LinkError::BadHighlight,
             LinkError::MissingParameter("exp"),
             LinkError::BadKey,
         ];
@@ -1529,6 +2133,7 @@ mod tests {
             "laptop",
             "academic",
             Some(3),
+            None,
             60,
         )
         .unwrap();

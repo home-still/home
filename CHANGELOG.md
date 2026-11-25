@@ -27,6 +27,13 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
   PDFs converted before this release have no word boxes: once the upgraded
   watcher is running, run `hs scribe boxes catch-up` and watch
   `hs scribe boxes status` until `missing`, `queued` and `building` are 0.
+- Document links are signed under a new rule that also covers the words a
+  link highlights. **A link or short link minted before the upgrade is
+  refused with `403` by an upgraded docs service, and a link minted by an
+  upgraded host is refused by a docs service that is not**: upgrade the docs
+  service and every host that mints links (`hs docs link`, the MCP server)
+  together. Links last an hour unless `docs.link_ttl_secs` says otherwise, so
+  nothing has to be minted again by hand.
 - `hs docs link --collection` and `doc_link`'s `collection` are checked
   against the list of stores (`academic`, `personal`, `web`, `syntheses`).
   **A name that is not a store is now refused when the link is minted**; it
