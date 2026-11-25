@@ -4,6 +4,16 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
 
 ## v0.0.1-rc.394
 
+- `hs docs link --collection` and `doc_link`'s `collection` are checked
+  against the list of stores (`academic`, `personal`, `web`, `syntheses`).
+  **A name that is not a store is now refused when the link is minted**; it
+  used to be signed and then answered with a 404.
+- `personal.storage_dir` is checked at startup by every command that reads
+  it, the docs service and the MCP server: it must be a relative path
+  without `.` or `..` parts and must not overlap another store's prefix
+  (`papers`, `markdown`, `catalog`, `boxes`, `web`, `syntheses`). The docs
+  service now serves personal documents from this prefix; it used to read
+  `personal/` whatever the setting said.
 - `doc_link` takes `short: true`, and `hs docs link --short` mints a
   12-character short link (`<base>/s/<code>`) that redirects to the signed
   URL. The code is a record in the storage backend and expires with the link

@@ -147,7 +147,7 @@ Notes:
 
 ## Link to a personal document
 
-The documents you add with `hs personal add` are a separate collection. A link names its collection, and the collection is signed, so a link for a personal document cannot be edited into a link for an academic one:
+The documents you add with `hs personal add` are a separate store. A link names its store, and the store is signed, so a link for a personal document cannot be edited into a link for an academic one:
 
 ```sh
 hs docs link annual-checkup-notes-e564ee61 --collection personal

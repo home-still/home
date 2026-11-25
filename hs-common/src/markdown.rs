@@ -10,7 +10,17 @@ use crate::storage::{ObjectMeta, Storage};
 /// Default storage prefix for markdown objects. Every writer and reader
 /// should agree on this so `markdown/{shard}/{stem}.md` is the one true
 /// convention across MCP tools, event-bus daemons, and direct Storage calls.
-pub const MARKDOWN_PREFIX: &str = "markdown";
+pub const MARKDOWN_PREFIX: &str = crate::stores::ACADEMIC_MARKDOWN_PREFIX;
+
+/// The byte sequence between two pages of a converted markdown.
+///
+/// It is **reserved** by the scribe pipeline
+/// (`hs_scribe::pipeline::markdown_generator::join_pages`): a `---` a
+/// model emits inside a page is rewritten to `***` first, so this exact
+/// sequence only ever appears between two pages, and the markdown's page
+/// N is the source document's page N. Every reader that needs page
+/// boundaries splits on this constant.
+pub const PAGE_SEPARATOR: &str = "\n\n---\n\n";
 
 /// Fully-qualified storage key for a markdown document under the default
 /// `markdown/` prefix. Shape: `markdown/{shard}/{stem}.md`.

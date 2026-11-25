@@ -28,12 +28,11 @@ pub struct DocsLinkArgs {
     #[arg(long)]
     pub markdown: bool,
 
-    /// The collection the document is in. The corpus holds more than
-    /// one: the academic papers and the personal documents are separate
-    /// stores, and a stem can name a document in either. The collection
-    /// is part of the link's signature, so a link for one cannot be
-    /// edited into a link for the other.
-    #[arg(long, default_value = "academic")]
+    /// The store the document is in: `academic`, `personal`, `web` or
+    /// `syntheses`. A stem can name a document in more than one store.
+    /// The store is part of the link's signature, so a link for one
+    /// cannot be edited into a link for another.
+    #[arg(long, default_value = hs_common::stores::ACADEMIC)]
     pub collection: String,
 
     /// The page to open, 1-based. The link opens that page and points
@@ -116,6 +115,11 @@ fn short_link_storage() -> Result<Arc<dyn hs_common::storage::Storage>> {
 async fn link(args: DocsLinkArgs, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let file = hs_common::config_file::ConfigFile::load()?;
     let config: Option<DocsConfig> = file.section::<DocsConfig>("docs")?;
+    // The store is checked here, where the name was typed: a link to a
+    // store that does not exist would be minted, signed and then answered
+    // with a 404. A derived store's documents are its parent's.
+    let stores = hs_common::stores::Stores::from_config(&file.load_system()?, &file)?;
+    let (store, _) = stores.documents(&args.collection)?;
 
     let format = if args.markdown {
         LinkFormat::Markdown
@@ -155,13 +159,7 @@ async fn link(args: DocsLinkArgs, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let key = load_key(&key_path)?;
 
     let params = hs_common::docs::mint(
-        &key,
-        &args.stem,
-        format,
-        &subject,
-        &args.collection,
-        args.page,
-        ttl,
+        &key, &args.stem, format, &subject, store.name, args.page, ttl,
     )
     .map_err(|e| anyhow::anyhow!("minting the link failed: {e}"))?;
 

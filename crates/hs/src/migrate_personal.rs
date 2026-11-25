@@ -26,9 +26,6 @@ use anyhow::Result;
 use hs_common::reporter::Reporter;
 use hs_common::storage::Storage;
 
-/// The prefix the personal store's objects live under.
-const PERSONAL_PREFIX: &str = "personal";
-
 /// Move the personal store into the corpus's storage.
 ///
 /// The objects keep their names: a personal document's markdown is
@@ -83,10 +80,16 @@ pub async fn run_personal_to_storage(
     let mut texts = Vec::new();
     collect_files(&markdown, &markdown, &mut texts, &["md"], &[])?;
 
+    // Where the objects go: the personal store's layout in the registry
+    // of stores, at the prefix this host is configured with.
+    let stores = hs_common::stores::Stores::with_personal_prefix(&personal_cfg.storage_dir)?;
+    let (_, layout) = stores.documents(hs_common::stores::PERSONAL)?;
+    let prefix = layout.source_prefix.as_str();
+
     let mut plan: Vec<(String, String)> = Vec::new();
     for (base, files) in [
-        (PERSONAL_PREFIX.to_string(), &sources),
-        (format!("{PERSONAL_PREFIX}/markdown"), &texts),
+        (prefix, &sources),
+        (layout.markdown_prefix.as_str(), &texts),
     ] {
         for file in files {
             let key = format!("{base}/{}", file.relative);
@@ -118,7 +121,7 @@ pub async fn run_personal_to_storage(
 
     if dry_run {
         reporter.finish(&format!(
-            "Dry-run: {planned} file(s) would be written under {PERSONAL_PREFIX}/"
+            "Dry-run: {planned} file(s) would be written under {prefix}/"
         ));
         return Ok(());
     }
@@ -158,7 +161,7 @@ pub async fn run_personal_to_storage(
     reporter.status("Skipped", &skipped.to_string());
     if failures.is_empty() {
         reporter.finish(&format!(
-            "The personal store is now under {PERSONAL_PREFIX}/ in the corpus's storage. \
+            "The personal store is now under {prefix}/ in the corpus's storage. \
              The local files were left in place."
         ));
         Ok(())

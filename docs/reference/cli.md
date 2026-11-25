@@ -1017,7 +1017,7 @@ hs docs link [OPTIONS] <STEM>
 |---|---|---|
 | `<STEM>` | required | The document's stem. |
 | `--markdown` | off | Link to the converted markdown instead of the original document. |
-| `--collection <COLLECTION>` | `academic` | Collection the document is in: `academic` or `personal`. The collection is part of the link's signature. |
+| `--collection <COLLECTION>` | `academic` | Store the document is in: `academic`, `personal`, `web` or `syntheses`. A name that is not a store is refused. The store is part of the link's signature. |
 | `--page <PAGE>` | none | The page to open, 1-based. The link opens that page and points at it. |
 | `--subject <SUBJECT>` | none | Subject the link is bound to. Default: `docs.default_subject`, else this machine's host name. |
 | `--ttl-secs <TTL_SECS>` | none | Seconds the link works. Default: `docs.link_ttl_secs`, else 3600. |

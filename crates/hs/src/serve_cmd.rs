@@ -359,13 +359,9 @@ async fn serve_docs(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
         storage,
         key,
         revocations,
-        // The collections this host serves. The academic corpus is
-        // always here; the personal store is served when its objects
-        // are in the store (the `personal:` prefix).
-        collections: vec![
-            crate::docs_service::CollectionLayout::academic("papers", "markdown"),
-            crate::docs_service::CollectionLayout::personal("personal"),
-        ],
+        // Every store of the corpus, from the one registry: a link's
+        // `col` names one of them.
+        stores: hs_common::stores::Stores::from_config(&file.load_system()?, &file)?,
     });
 
     let app = crate::docs_service::router(state);

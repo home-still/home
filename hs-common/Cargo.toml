@@ -34,7 +34,10 @@ service = [
     "dep:async-trait",
     "dep:futures",
 ]
+# The catalog is read and written through `storage`, and its page offsets
+# split on `markdown::PAGE_SEPARATOR`.
 catalog = [
+    "storage",
     "dep:chrono",
 ]
 compose = [

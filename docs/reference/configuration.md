@@ -410,7 +410,7 @@ The personal-documents store. See [Manage personal documents](../how-to/manage-p
 | Key | Default | Meaning |
 |---|---|---|
 | `collection_name` | `personal_docs` | Qdrant collection for the store. Must be non-empty. |
-| `storage_dir` | `personal` | Directory under the project directory that holds the store. |
+| `storage_dir` | `personal` | Prefix of the store's objects in the storage backend, and the store's directory under the project directory. Must be a relative path without `.` or `..` parts, and must not overlap another store's prefix (`papers`, `markdown`, `catalog`, `boxes`, `web`, `syntheses`). |
 | `ingest_inbox` | `inbox` | Directory that `personal_add` resolves file names against. A relative value is joined under `<project_dir>/<storage_dir>`; an absolute value is used as given. |
 | `distill_url` | `http://localhost:7434` | Distill server URL. |
 | `scribe_url` | `http://localhost:7433` | Scribe server URL. |

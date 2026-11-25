@@ -16,11 +16,12 @@
 //! # The client never names a file
 //!
 //! A request names a *stem*. The service decides where that stem's
-//! source object lives, by probing, for an academic stem, the same
-//! `pdf` → `html` → `epub` order the MCP server uses, and, for a
-//! personal stem, the formats the personal store accepts. A client that
-//! asks for `papers/10/whatever.pdf` is refused: it asked for a storage
-//! key, and storage keys are not a public interface.
+//! source object lives, by probing the extensions the link's store lists
+//! in the registry of stores (`hs_common::stores`): `pdf` → `html` →
+//! `epub` for an academic stem, the formats the personal store accepts
+//! for a personal one. A client that asks for `papers/10/whatever.pdf` is
+//! refused: it asked for a storage key, and storage keys are not a public
+//! interface.
 
 use std::sync::Arc;
 
@@ -34,30 +35,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use hs_common::docs::{LinkFormat, LinkKey, LinkQuery, Revocations};
 use hs_common::storage::{ByteRange, Storage};
-
-/// The extensions an academic source object may have, in probe order.
-///
-/// The same order the MCP server's `find_source_key` uses, so a link
-/// and a tool agree on which file a stem means.
-const ACADEMIC_SOURCE_EXTENSIONS: [&str; 3] = ["pdf", "html", "epub"];
-
-/// The extensions a personal source object may have, in probe order.
-///
-/// The personal store keeps a document under its own extension (see
-/// `personal::models::SourceFormat`): a scan stored as `.docx` or notes
-/// ingested as markdown have no PDF at all. Probing only the academic
-/// list gave 12 of 86 personal documents a source link that answered
-/// 404.
-const PERSONAL_SOURCE_EXTENSIONS: [&str; 5] = ["pdf", "epub", "docx", "md", "txt"];
-
-/// The separator between the pages of a converted markdown.
-///
-/// It is **reserved** by the scribe pipeline
-/// (`crates/hs-scribe/src/pipeline/markdown_generator.rs`): a `---` a
-/// model emits inside a page is rewritten to `***` first, so this exact
-/// byte sequence only ever appears between two pages. The markdown's
-/// page N is therefore the source document's page N.
-const PAGE_SEPARATOR: &str = "\n\n---\n\n";
+use hs_common::stores::{DocumentLayout, Stores};
 
 /// What the service needs to answer a request.
 pub struct DocsState {
@@ -67,65 +45,18 @@ pub struct DocsState {
     pub key: LinkKey,
     /// The subjects whose links are revoked.
     pub revocations: Revocations,
-    /// The collections this service serves, and where each one's objects
-    /// live.
+    /// The stores of the corpus, and where each one's objects live.
     ///
-    /// The corpus holds more than one store: the academic papers and the
-    /// personal documents are separate, and a stem can name a document in
-    /// either. The collection is part of the link's signature, so a link
-    /// names one document in one store and cannot be edited into a
-    /// document in another. A collection the service does not serve is a
-    /// 404 — there is one path, and it is the one this list names.
-    pub collections: Vec<CollectionLayout>,
+    /// The corpus holds more than one store, and a stem can name a
+    /// document in several. The store is part of the link's signature
+    /// (`col`), so a link names one document in one store and cannot be
+    /// edited into a document in another. A store the registry does not
+    /// hold, or one that holds no documents, is a 404.
+    pub stores: Stores,
     /// The short links this deployment has minted. Codes live in the corpus's
     /// storage beside the documents, so a code minted by the MCP server on one
     /// host resolves here.
     pub short_links: hs_common::docs::ShortLinks,
-}
-
-/// Where one collection's objects live.
-#[derive(Debug, Clone)]
-pub struct CollectionLayout {
-    /// The collection's name, as it appears in a link.
-    pub name: String,
-    /// The prefix the source objects live under.
-    pub papers_prefix: String,
-    /// The prefix the markdown lives under.
-    pub markdown_prefix: String,
-    /// The source extensions this collection's documents may have, in
-    /// probe order.
-    pub source_extensions: &'static [&'static str],
-}
-
-impl CollectionLayout {
-    /// The academic corpus: the sources under `papers/`, the converted
-    /// text under `markdown/`.
-    pub fn academic(papers_prefix: &str, markdown_prefix: &str) -> Self {
-        Self {
-            name: "academic".to_string(),
-            papers_prefix: papers_prefix.to_string(),
-            markdown_prefix: markdown_prefix.to_string(),
-            source_extensions: &ACADEMIC_SOURCE_EXTENSIONS,
-        }
-    }
-
-    /// The personal store.
-    ///
-    /// Its layout is the corpus's layout, one prefix deeper: the
-    /// sources are under `<prefix>/<shard>/<stem>.pdf` and the
-    /// converted text under `<prefix>/markdown/<shard>/<stem>.md`.
-    ///
-    /// A personal source is whatever the document was ingested as, so
-    /// this collection probes every format the personal store accepts,
-    /// not the academic list.
-    pub fn personal(prefix: &str) -> Self {
-        Self {
-            name: "personal".to_string(),
-            papers_prefix: prefix.to_string(),
-            markdown_prefix: format!("{}/markdown", prefix.trim_end_matches('/')),
-            source_extensions: &PERSONAL_SOURCE_EXTENSIONS,
-        }
-    }
 }
 
 /// Build the service's router.
@@ -293,14 +224,10 @@ async fn serve(
     {
         return refused();
     }
-    // The collection decides where the objects live. A collection this
-    // service does not serve is a 404: the link is genuine, but it
-    // names a store this host does not have.
-    let Some(layout) = state
-        .collections
-        .iter()
-        .find(|c| c.name == params.collection)
-    else {
+    // The store decides where the objects live. A store the registry
+    // does not hold is a 404: the link is genuine, but it names
+    // something this deployment does not have.
+    let Ok((_, layout)) = state.stores.documents(&params.collection) else {
         return not_found();
     };
     // A link minted before its subject was revoked is refused. The
@@ -322,11 +249,7 @@ async fn serve(
             None => return not_found(),
         },
         LinkFormat::Markdown => {
-            let key = format!(
-                "{}/{}",
-                layout.markdown_prefix.trim_end_matches('/'),
-                hs_common::sharded_key(&stem, "md")
-            );
+            let key = layout.markdown_key(&stem);
             if state.storage.head(&key).await.ok().flatten().is_none() {
                 return not_found();
             }
@@ -343,7 +266,8 @@ async fn serve(
                         Err(_) => return not_found(),
                     };
                     let text = String::from_utf8_lossy(&bytes);
-                    let pages: Vec<&str> = text.split(PAGE_SEPARATOR).collect();
+                    let pages: Vec<&str> =
+                        text.split(hs_common::markdown::PAGE_SEPARATOR).collect();
                     // The pages are 1-based. A page the document does
                     // not have is a 404, not an empty page: the link
                     // named something that is not there.
@@ -518,21 +442,17 @@ where
 
 use axum::extract::FromRequestParts;
 
-/// Find a stem's source object, probing the collection's extensions in
+/// Find a stem's source object, probing the store's extensions in
 /// order.
 ///
 /// Returns the key, the content type and the extension.
 async fn find_source_key(
     storage: &dyn Storage,
-    layout: &CollectionLayout,
+    layout: &DocumentLayout,
     stem: &str,
 ) -> Option<(String, String, String)> {
     for ext in layout.source_extensions {
-        let key = format!(
-            "{}/{}",
-            layout.papers_prefix.trim_end_matches('/'),
-            hs_common::sharded_key(stem, ext)
-        );
+        let key = layout.source_key(stem, ext);
         if storage.head(&key).await.ok().flatten().is_some() {
             let content_type = match *ext {
                 "pdf" => "application/pdf",
@@ -675,10 +595,8 @@ mod tests {
             storage,
             key: key.clone(),
             revocations: Revocations::default(),
-            collections: vec![
-                CollectionLayout::academic("papers", "markdown"),
-                CollectionLayout::personal("personal"),
-            ],
+            stores: Stores::with_personal_prefix(hs_common::stores::PERSONAL_PREFIX_DEFAULT)
+                .unwrap(),
         });
         (router(state.clone()), key, state)
     }
@@ -996,7 +914,7 @@ mod tests {
             storage: state.storage.clone(),
             key: state.key.clone(),
             revocations,
-            collections: state.collections.clone(),
+            stores: state.stores.clone(),
         });
         let app = router(state);
         assert_eq!(call(&app, &uri, None).await.status, 403);
@@ -1231,9 +1149,12 @@ mod tests {
     /// until the docs service can serve it.
     #[test]
     fn the_personal_probe_covers_every_format_the_personal_store_accepts() {
+        let stores =
+            Stores::with_personal_prefix(hs_common::stores::PERSONAL_PREFIX_DEFAULT).unwrap();
+        let (_, layout) = stores.documents(hs_common::stores::PERSONAL).unwrap();
         for format in personal::models::SourceFormat::ALL {
             assert!(
-                PERSONAL_SOURCE_EXTENSIONS.contains(&format.as_str()),
+                layout.source_extensions.contains(&format.as_str()),
                 "the personal store accepts {format:?}, but the docs service never probes \
                  {}.{ext} — a personal document ingested as one would answer 404",
                 "personal/<shard>/<stem>",
@@ -1241,7 +1162,7 @@ mod tests {
             );
         }
         assert_eq!(
-            PERSONAL_SOURCE_EXTENSIONS.len(),
+            layout.source_extensions.len(),
             personal::models::SourceFormat::ALL.len(),
             "the probe list and the personal store's formats have drifted apart"
         );
@@ -1334,9 +1255,9 @@ mod tests {
         );
     }
 
-    /// The academic collection's probe list is unchanged: a `papers/`
-    /// object stored only as a `.docx` is not a source. The two
-    /// collections do not share a list.
+    /// The academic store's probe list is its own: a `papers/` object
+    /// stored only as a `.docx` is not a source. The two stores do not
+    /// share a list.
     #[tokio::test]
     async fn an_academic_stem_with_only_a_docx_is_a_404() {
         let tmp = tempfile::tempdir().unwrap();

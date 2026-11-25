@@ -175,6 +175,10 @@ fn deps(
         openalex_db: None,
         // The tests do not configure links, so the tools carry none.
         link_minter: None,
+        stores: hs_common::stores::Stores::with_personal_prefix(
+            hs_common::stores::PERSONAL_PREFIX_DEFAULT,
+        )
+        .unwrap(),
     }
 }
 

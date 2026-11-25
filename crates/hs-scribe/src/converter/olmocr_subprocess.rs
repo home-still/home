@@ -187,7 +187,8 @@ fn read_result_document(workspace: &Path) -> Result<ResultDocument> {
 /// tiling the whole text. Anything else means olmocr's output does not
 /// describe the PDF it was given, and is refused like an incomplete run.
 fn paginate(doc: &ResultDocument, source_pages: u32) -> Result<String> {
-    use crate::pipeline::markdown_generator::{join_pages, PAGE_SEPARATOR};
+    use crate::pipeline::markdown_generator::join_pages;
+    use hs_common::markdown::PAGE_SEPARATOR;
 
     let spans = &doc.attributes.pdf_page_numbers;
     let incomplete = |detail: String| {
@@ -434,7 +435,7 @@ mod tests {
     use super::test_support::result_document;
     #[cfg(unix)]
     use super::test_support::{completed_in, install_stand_in, pages, write_result};
-    use crate::pipeline::markdown_generator::PAGE_SEPARATOR;
+    use hs_common::markdown::PAGE_SEPARATOR;
     #[cfg(unix)]
     use std::path::PathBuf;
 

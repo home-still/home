@@ -171,6 +171,7 @@ pub mod service;
 pub mod catalog;
 
 pub mod status;
+pub mod stores;
 
 #[cfg(feature = "storage")]
 pub mod storage;

@@ -352,7 +352,8 @@ impl<'a> WordWindow<'a> {
 /// returning the cleaned markdown plus a `Vec<TruncationCounts>` of
 /// per-page breakdowns (index-aligned with `compute_page_offsets`).
 ///
-/// Pages are split on the same `\n\n---\n\n` separator that
+/// Pages are split on the same separator
+/// ([`hs_common::markdown::PAGE_SEPARATOR`]) that
 /// [`hs_common::catalog::compute_page_offsets`] uses, so the returned
 /// per-page counts correspond 1:1 with the offset entries downstream.
 ///
@@ -362,7 +363,7 @@ impl<'a> WordWindow<'a> {
 /// run anywhere in the document and is NOT the sum of these: once one page
 /// loops it would also rewrite and count the benign runs on every other page.
 pub fn clean_repetitions_per_page(text: &str) -> (String, Vec<crate::diag::TruncationCounts>) {
-    const SEPARATOR: &str = "\n\n---\n\n";
+    const SEPARATOR: &str = hs_common::markdown::PAGE_SEPARATOR;
     let mut cleaned_pages: Vec<String> = Vec::new();
     let mut per_page_counts: Vec<crate::diag::TruncationCounts> = Vec::new();
     for page in text.split(SEPARATOR) {

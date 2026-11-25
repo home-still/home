@@ -4,6 +4,7 @@ use crate::error::DistillError;
 use crate::text::ceil_char_boundary;
 use crate::types::{Chunk, ChunkSpan, DocumentMeta};
 use hs_common::catalog::PageOffset;
+use hs_common::markdown::PAGE_SEPARATOR;
 
 pub struct ChunkerConfig {
     pub max_tokens: usize,
@@ -69,8 +70,6 @@ fn resolve_page(page_offsets: &[PageOffset], char_start: usize) -> Option<usize>
         .find(|po| char_start >= po.char_start && char_start < po.char_end)
         .map(|po| po.page)
 }
-
-const PAGE_SEPARATOR: &str = "\n\n---\n\n";
 
 /// Split markdown into chunks with line-number tracking. Every chunk's
 /// `span` is its exact byte range in `markdown` (`markdown[char_start..

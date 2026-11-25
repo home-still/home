@@ -160,7 +160,7 @@ struct DocLinkParams {
     )]
     page: Option<u32>,
     #[schemars(
-        description = "The collection the document is in: `academic` (the default) or `personal`. The collection is part of the link's signature, so a link for one store cannot be edited into a link for the other."
+        description = "The store the document is in: `academic` (the default), `personal`, `web` or `syntheses`. The store is part of the link's signature, so a link for one store cannot be edited into a link for another."
     )]
     collection: Option<String>,
     #[schemars(
@@ -255,7 +255,7 @@ fn map_distill_search_hits(
             let links = minter.and_then(|m| {
                 m.mint(
                     &h.doc_id,
-                    "academic",
+                    hs_common::stores::ACADEMIC,
                     h.page.map(|p| p as u32),
                     passage.as_deref(),
                 )
@@ -824,6 +824,9 @@ struct HomeStillMcp {
     /// The short links this deployment has minted, stored in the corpus
     /// beside the documents.
     short_links: hs_common::docs::ShortLinks,
+    /// The stores of the corpus: what a `store` argument and a link's
+    /// `col` are checked against.
+    stores: hs_common::stores::Stores,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -841,6 +844,7 @@ struct Deps {
     distill_servers: Vec<String>,
     openalex_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
     link_minter: Option<Arc<crate::links::LinkMinter>>,
+    stores: hs_common::stores::Stores,
 }
 
 /// See [`HomeStillMcp::probe_markdown`].
@@ -1007,6 +1011,7 @@ impl HomeStillMcp {
             openalex_db,
             paper_config,
             link_minter: Some(link_minter),
+            stores: hs_common::stores::Stores::from_config(&file.load_system()?, &file)?,
         })
     }
 
@@ -1022,7 +1027,18 @@ impl HomeStillMcp {
             distill_servers,
             openalex_db,
             link_minter,
+            stores,
         } = deps;
+
+        // The academic store's layout, from the registry.
+        let (_, academic) = stores
+            .documents(hs_common::stores::ACADEMIC)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (catalog_prefix, markdown_prefix, papers_prefix) = (
+            academic.catalog_prefix.clone(),
+            academic.markdown_prefix.clone(),
+            academic.source_prefix.clone(),
+        );
 
         // One provider set for the life of the process: every request goes
         // through the same rate limiters and circuit breakers, and a bad
@@ -1080,9 +1096,9 @@ impl HomeStillMcp {
             short_links: hs_common::docs::ShortLinks::new(storage.clone()),
             storage,
             events,
-            catalog_prefix: "catalog".to_string(),
-            markdown_prefix: hs_common::markdown::MARKDOWN_PREFIX.to_string(),
-            papers_prefix: "papers".to_string(),
+            catalog_prefix,
+            markdown_prefix,
+            papers_prefix,
             scribe_servers,
             scribe_convert_timeout,
             scribe_timeout_policy,
@@ -1092,6 +1108,7 @@ impl HomeStillMcp {
             distill_servers,
             openalex_db,
             link_minter,
+            stores,
             tool_router,
             prompt_router: Self::prompt_router(),
         })
@@ -1815,7 +1832,7 @@ impl HomeStillMcp {
                 let links = self
                     .link_minter
                     .as_ref()
-                    .and_then(|m| m.mint(&p.stem, "academic", None, None));
+                    .and_then(|m| m.mint(&p.stem, hs_common::stores::ACADEMIC, None, None));
                 to_json(&CatalogEntryWithLinks { entry, links })
             }
             None => Err(format!("No catalog entry found for '{}'", p.stem)),
@@ -1847,7 +1864,18 @@ impl HomeStillMcp {
             );
         }
         let wanted = p.format.as_deref().unwrap_or("source");
-        let collection = p.collection.as_deref().unwrap_or("academic");
+        // A store the registry does not hold is refused here: the link
+        // would be signed and then answered with a 404. A derived store's
+        // documents are its parent's.
+        let (store, _) = self
+            .stores
+            .documents(
+                p.collection
+                    .as_deref()
+                    .unwrap_or(hs_common::stores::ACADEMIC),
+            )
+            .map_err(|e| e.to_string())?;
+        let collection = store.name;
         let links = minter
             .mint(&p.stem, collection, p.page, None)
             .ok_or_else(|| format!("'{}' is not a document stem", p.stem))?;
@@ -2326,7 +2354,8 @@ impl HomeStillMcp {
         {
             Some(content) => {
                 if let Some(page) = p.page {
-                    let pages: Vec<&str> = content.split("\n\n---\n\n").collect();
+                    let pages: Vec<&str> =
+                        content.split(hs_common::markdown::PAGE_SEPARATOR).collect();
                     if page == 0 || page > pages.len() {
                         Err(format!(
                             "Page {} not found. Document has {} pages.",
@@ -3103,15 +3132,15 @@ impl HomeStillMcp {
             .into_iter()
             .map(|h| {
                 // The personal documents are served by the same docs
-                // service as the academic ones, under their own
-                // collection: the collection is part of the link's
-                // signature, so the link is a capability for this
-                // document and not for another store's.
+                // service as the academic ones, under their own store:
+                // the store is part of the link's signature, so the
+                // link is a capability for this document and not for
+                // another store's.
                 let passage = h.snippet.lines().next().map(str::trim);
                 let links = self
                     .link_minter
                     .as_ref()
-                    .and_then(|m| m.mint(&h.stem, "personal", None, passage));
+                    .and_then(|m| m.mint(&h.stem, hs_common::stores::PERSONAL, None, passage));
                 serde_json::json!({
                     "stem": h.stem,
                     "title": h.title,
@@ -4199,7 +4228,7 @@ impl ServerHandler for HomeStillMcp {
             .ok_or_else(|| ErrorData::resource_not_found("markdown not found", None))?;
 
             let text = if let Some(page) = page {
-                let pages: Vec<&str> = content.split("\n\n---\n\n").collect();
+                let pages: Vec<&str> = content.split(hs_common::markdown::PAGE_SEPARATOR).collect();
                 if page == 0 || page > pages.len() {
                     return Err(ErrorData::invalid_params(
                         format!("page {page} not found, document has {} pages", pages.len()),

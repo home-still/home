@@ -5,16 +5,15 @@ use figment::{
     providers::{Env, Serialized},
     Figment,
 };
-use hs_common::config_file::{env_key_path, unknown_env_names, ConfigError, ConfigFile};
+use hs_common::config_file::{
+    env_key_path, unknown_env_names, ConfigError, ConfigFile, SYSTEM_CONFIG_PATH,
+};
 use hs_common::event_bus::{EventBus, EventBusConfig};
 use hs_common::storage::{Storage, StorageConfig};
 use hs_common::CONFIG_REL_PATH;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// The system-wide config file, merged under the user's.
-const SYSTEM_CONFIG_PATH: &str = "/etc/home-still/config.yaml";
 
 /// Prefix of the environment variables that override config keys.
 const ENV_PREFIX: &str = "HOME_STILL_";
