@@ -4,6 +4,18 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
 
 ## v0.0.1-rc.394
 
+- The scribe server answers `POST /scribe/boxes`: the body is a PDF, the
+  response its word-box sidecar (every word of every page with its box),
+  read from the text layer, or by a word OCR on the CPU for a page that has
+  none. **Each host that runs a scribe server needs three more model files
+  in `~/.home-still/models/` before it can read a scanned page**:
+  `pp-ocrv5_mobile_det.onnx`, `en_pp-ocrv5_mobile_rec.onnx` and
+  `ppocrv5_en_dict.txt`, from
+  `https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/<file>`.
+  Without them a PDF with a text layer still gets its sidecar and a scanned
+  one is answered `500` naming the missing file. The keys
+  `scribe_server.ocr_detection_model_path`, `ocr_recognition_model_path` and
+  `ocr_dictionary_path` name other files.
 - `hs docs link --collection` and `doc_link`'s `collection` are checked
   against the list of stores (`academic`, `personal`, `web`, `syntheses`).
   **A name that is not a store is now refused when the link is minted**; it

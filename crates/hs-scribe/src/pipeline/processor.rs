@@ -7,9 +7,9 @@ use crate::models::table_structure::{
 };
 use crate::ocr::region::RegionType;
 use crate::ocr::OcrEngine;
+use crate::pdfium::PdfParser;
 use crate::pipeline::markdown_generator::{assemble_page_markdown, join_pages};
-use crate::pipeline::pdf_parser::PageData;
-use crate::pipeline::PdfParser;
+use crate::render::PageData;
 use crate::utils::deduplication::{deduplicate_boxes, filter_contained_regions};
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt, TryStreamExt};

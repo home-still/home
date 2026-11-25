@@ -67,6 +67,7 @@ docs = [
 # page (`word_boxes`).
 boxes = [
     "dep:flate2",
+    "dep:sha2",
 ]
 storage = [
     "dep:anyhow",

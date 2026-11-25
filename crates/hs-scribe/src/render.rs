@@ -1,3 +1,9 @@
+//! Rasterising a PDF page: the picture the layout model, the VLM, the word
+//! OCR and the docs service's page view are all given.
+//!
+//! Needs the `render` feature (pdfium's bitmap as an `image`); the parser
+//! itself, page counting and the text layer are in [`crate::pdfium`].
+
 use crate::classify::{ConvertFailure, FailureCode};
 use anyhow::Result;
 use pdfium_render::prelude::*;
@@ -57,7 +63,7 @@ pub fn plan_render(
     })
 }
 
-pub use crate::pdfium::PdfParser;
+use crate::pdfium::PdfParser;
 
 impl PdfParser {
     /// Render a single page to a raster image at `dpi`, never larger than

@@ -165,6 +165,18 @@ pub struct AppConfig {
     pub pipeline_mode: PipelineMode,
     pub layout_model_path: String,
     pub table_model_path: String,
+    /// The model that finds lines of text on a page with no text layer,
+    /// for the word-box sidecar (`POST /scribe/boxes`): a file name in
+    /// `~/.home-still/models/` or an absolute path. Loaded the first time a
+    /// scanned page is read. Override via `HS_SCRIBE_OCR_DETECTION_MODEL_PATH`.
+    pub ocr_detection_model_path: String,
+    /// The model that reads one line of text. Override via
+    /// `HS_SCRIBE_OCR_RECOGNITION_MODEL_PATH`.
+    pub ocr_recognition_model_path: String,
+    /// The character list of the recognition model: the two are a pair, and
+    /// a list from another model fails every scanned page. Override via
+    /// `HS_SCRIBE_OCR_DICTIONARY_PATH`.
+    pub ocr_dictionary_path: String,
     pub region_parallel: usize,
     /// Cap on concurrent pages-in-flight per single PDF conversion.
     /// Inserted between stage-1 (CPU layout) and stage-2 (GPU VLM) so a
@@ -273,6 +285,9 @@ impl Default for AppConfig {
             pipeline_mode: PipelineMode::PerRegion,
             layout_model_path: "pp-doclayoutv3.onnx".into(),
             table_model_path: "slanet-plus.onnx".into(),
+            ocr_detection_model_path: "pp-ocrv5_mobile_det.onnx".into(),
+            ocr_recognition_model_path: "en_pp-ocrv5_mobile_rec.onnx".into(),
+            ocr_dictionary_path: "ppocrv5_en_dict.txt".into(),
             region_parallel: class.region_parallel(),
             page_parallel: 2,
             use_cuda: DEFAULT_USE_CUDA,
@@ -435,6 +450,18 @@ impl AppConfig {
 
     pub fn resolved_table_model_path(&self) -> PathBuf {
         Self::resolve_model_path(&self.table_model_path)
+    }
+
+    pub fn resolved_ocr_detection_model_path(&self) -> PathBuf {
+        Self::resolve_model_path(&self.ocr_detection_model_path)
+    }
+
+    pub fn resolved_ocr_recognition_model_path(&self) -> PathBuf {
+        Self::resolve_model_path(&self.ocr_recognition_model_path)
+    }
+
+    pub fn resolved_ocr_dictionary_path(&self) -> PathBuf {
+        Self::resolve_model_path(&self.ocr_dictionary_path)
     }
 }
 

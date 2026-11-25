@@ -60,6 +60,7 @@ the gateway) sets the same value in `~/.home-still/secrets.env`.
 | `/readiness` | GET | no | `ready`, `vlm_slots_total`, `vlm_slots_available` (0 while the backend gate is closed) and `in_flight_conversions`. Clients dispatch by these numbers. |
 | `/info` | GET | yes | Version and capabilities (`layout`, `tables`). |
 | `/scribe/stream` | POST | yes | Multipart upload of one document; streams progress and then the markdown as NDJSON. |
+| `/scribe/boxes` | POST | yes | The request body is one PDF; the response is its word-box sidecar (gzip-compressed JSON: every word of every page with its box), read from the text layer, or by the word OCR for a page that has none. Runs one document at a time on the CPU and does not wait for the VLM backend. `415` for a body that is not a PDF, `413` past 256 MiB, `422` with `{"error","code"}` for a PDF that cannot be read, `500` with `{"error"}` when the host cannot do it (a missing OCR model file is named). |
 
 ## Distill server endpoints
 

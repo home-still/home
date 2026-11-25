@@ -35,6 +35,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::stores::DocumentLayout;
 
@@ -343,6 +344,19 @@ pub fn boxes_key(layout: &DocumentLayout, stem: &str) -> String {
     )
 }
 
+/// The SHA-256 of a source document's bytes, as the lower-case hexadecimal
+/// a sidecar names its source by ([`WordBoxes::source_sha256`]).
+pub fn source_sha256(source: &[u8]) -> String {
+    use fmt::Write as _;
+    let digest = Sha256::digest(source);
+    let mut hex = String::with_capacity(SHA256_HEX_CHARS);
+    for byte in digest {
+        // Writing to a `String` cannot fail.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// A rectangle given as fractions of the page (`0.0` at the left and top
 /// edges, `1.0` at the right and bottom edges), as a box in sidecar units.
 ///
@@ -544,6 +558,18 @@ mod tests {
                 "{bad:?} was accepted"
             );
         }
+    }
+
+    /// The digest of "abc" is the first test vector of FIPS 180-4.
+    #[test]
+    fn a_source_is_named_by_its_sha256_in_the_form_a_sidecar_accepts() {
+        assert_eq!(
+            source_sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let mut boxes = sidecar();
+        boxes.source_sha256 = source_sha256(b"%PDF-1.7");
+        assert!(boxes.validate().is_ok());
     }
 
     #[test]

@@ -9,7 +9,7 @@ Every home-still binary reads one file, `~/.home-still/config.yaml`, and one opt
 | `~/.home-still/config.yaml` | The configuration file. |
 | `~/.home-still/secrets.env` | `KEY=VALUE` secrets exported into each process's environment. See [secrets.env](#secretsenv). |
 | `/etc/home-still/config.yaml` | System-wide file. Only the paper and personal loaders read it; the user file is merged over it. |
-| `~/.home-still/models/` | Where bare model file names (`pp-doclayoutv3.onnx`, `slanet-plus.onnx`) are looked up. |
+| `~/.home-still/models/` | Where bare model file names (`pp-doclayoutv3.onnx`, `slanet-plus.onnx`, the word OCR's three files) are looked up. |
 | `~/.home-still/cloud-secret.key` | Default gateway signing secret (`cloud.gateway.secret_path`). |
 | `~/.home-still/docs-link.key` | Signing key for document links. Created on first use with mode `0600`. |
 
@@ -256,6 +256,9 @@ The scribe server (`hs serve scribe`, `hs-scribe-server`). Every key is also an 
 | `use_cuda` | `HS_SCRIBE_USE_CUDA` | `true`; `false` on macOS | Run ONNX layout detection on CUDA. `true` on macOS is a start-up error. |
 | `layout_model_path` | `HS_SCRIBE_LAYOUT_MODEL_PATH` | `pp-doclayoutv3.onnx` | Layout model. A bare file name is looked up in `~/.home-still/models/`; an existing path is used as given. |
 | `table_model_path` | `HS_SCRIBE_TABLE_MODEL_PATH` | `slanet-plus.onnx` | Table-structure model, resolved the same way. |
+| `ocr_detection_model_path` | `HS_SCRIBE_OCR_DETECTION_MODEL_PATH` | `pp-ocrv5_mobile_det.onnx` | Text-line detector of the word OCR, which `/scribe/boxes` runs on pages without a text layer. Resolved the same way. The three OCR files are read when the first such page arrives, not at start-up; a missing one fails that document's request and names the file. |
+| `ocr_recognition_model_path` | `HS_SCRIBE_OCR_RECOGNITION_MODEL_PATH` | `en_pp-ocrv5_mobile_rec.onnx` | Text recogniser of the word OCR (PP-OCRv5 mobile, Latin letters and digits). |
+| `ocr_dictionary_path` | `HS_SCRIBE_OCR_DICTIONARY_PATH` | `ppocrv5_en_dict.txt` | Character list of the recogniser. It must be the one published with that recognition model. |
 
 `vlm_concurrency`, `page_parallel` and `parallel` must not exceed the number of permits a Tokio semaphore can hold.
 
