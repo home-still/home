@@ -32,6 +32,7 @@ feature flags so each crate compiles only what it needs.
 | `compose` | `compose`: Docker / Podman Compose detection |
 | `auth` | `auth::token` (typed HMAC tokens), `auth::client` (refreshing client), `auth::backend` (`HS_BACKEND_TOKEN`) |
 | `docs` | `docs`: the signer, verifier, revocation list and short-link alias table of document links (implies `storage`) |
+| `boxes` | `word_boxes`: the word-box sidecar (each word of a source page and its rectangle), its storage key and its gzip-JSON codec |
 
 Always available, without a feature:
 
@@ -41,6 +42,7 @@ Always available, without a feature:
 | `config_file` | The `~/.home-still/config.yaml` loader and unknown-key reporting. |
 | `secrets` | The `~/.home-still/secrets.env` loader. |
 | `status` | Pipeline counters, failure kinds and repair listings. |
+| `stores` | The registry of the corpus's stores: each one's name, ledger tenant and, for a store of documents, its layout in storage. |
 | `cuda_libs` | Locating the CUDA libraries ONNX Runtime needs. |
 | `gpu` | GPU name, memory and per-process VRAM via `nvidia-smi`. |
 | `hardware_profile` | Host classes and their default concurrency. |

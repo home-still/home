@@ -173,6 +173,9 @@ pub mod catalog;
 pub mod status;
 pub mod stores;
 
+#[cfg(feature = "boxes")]
+pub mod word_boxes;
+
 #[cfg(feature = "storage")]
 pub mod storage;
 
