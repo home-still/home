@@ -33,6 +33,7 @@ feature flags so each crate compiles only what it needs.
 | `auth` | `auth::token` (typed HMAC tokens), `auth::client` (refreshing client), `auth::backend` (`HS_BACKEND_TOKEN`) |
 | `docs` | `docs`: the signer, verifier, revocation list and short-link alias table of document links (implies `storage`) |
 | `boxes` | `word_boxes`: the word-box sidecar (each word of a source page and its rectangle), its storage key and its gzip-JSON codec |
+| `quote` | `quote`: checking that a converted markdown contains a quoted passage (`locate`) and placing the passage on the source's page from the word boxes (`place`, `align`, `line_rects`) (implies `boxes` and `storage`) |
 
 Always available, without a feature:
 

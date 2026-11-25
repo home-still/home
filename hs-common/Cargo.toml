@@ -69,6 +69,14 @@ boxes = [
     "dep:flate2",
     "dep:sha2",
 ]
+# Finding a quoted passage in a converted markdown and placing it on the
+# source's page through the word-box sidecar (`quote`). Pages are split on
+# `markdown::PAGE_SEPARATOR`, which lives behind `storage`.
+quote = [
+    "boxes",
+    "storage",
+    "dep:unicode-normalization",
+]
 storage = [
     "dep:anyhow",
     "dep:async-trait",
@@ -176,6 +184,9 @@ uuid = { workspace = true, optional = true }
 
 # boxes feature deps
 flate2 = { workspace = true, optional = true }
+
+# quote feature deps
+unicode-normalization = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
