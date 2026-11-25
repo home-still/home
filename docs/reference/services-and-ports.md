@@ -80,6 +80,7 @@ the gateway) sets the same value in `~/.home-still/secrets.env`.
 | `/collection/reset` | POST | yes | Drop and recreate a collection. |
 | `/collection/hnsw?collection=<name>` | POST | yes | Start the background HNSW index build on a collection. |
 | `/scrub-interstitials` | POST | yes | Delete chunks matching publisher interstitial pages. |
+| `/embedder/release` | POST | yes | Drop the model of every idle pool slot now (`{"released": n}`); the next embed reloads it. A host GPU broker calls it before handing the card to another tenant. |
 
 Bad input is a 400, a missing dependency a 503, anything else a 500.
 

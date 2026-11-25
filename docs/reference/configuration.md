@@ -239,6 +239,8 @@ The scribe server (`hs serve scribe`, `hs-scribe-server`). Every key is also an 
 | `max_convert_deadline_secs` | `HS_SCRIBE_MAX_CONVERT_DEADLINE_SECS` | `7200` | Ceiling on the per-request `X-Convert-Deadline-Secs` a caller may ask for. A larger request is clamped. Must be at least `convert_deadline_secs`. |
 | `max_render_pixels` | `HS_SCRIBE_MAX_RENDER_PIXELS` | `36000000` | Ceiling on the pixels of one rendered page. A page whose media box times the dpi exceeds it is rendered at a lower dpi; an implausible page box is refused. At least 1. |
 | `vram_headroom_mb` | `HS_SCRIBE_VRAM_HEADROOM_MB` | `15000` | Free VRAM required to cold-start the model. Below it, and with the model not resident, `/health` and `/readiness` refuse work. Hosts without an NVIDIA GPU skip the check. |
+| `gpu_yield_file` | none | unset | A host GPU broker's yield file (`{"for","since","expires"}`). While it names an unexpired tenant, `/health` and `/readiness` refuse work even with the model resident, so in-flight conversions drain and the broker can evict the model. `/health` reports the tenant as `backend_yielding_to`. |
+| `gpu_make_room_cmd` | none | unset | Argv run in the background, with `--need-mib <vram_headroom_mb>` appended and at most every 30 s, whenever the gate refuses work. The broker decides whether to free the card. |
 
 ### Pipeline and performance
 
@@ -321,6 +323,8 @@ The distill server (`hs serve distill`, `hs-distill-server`). The server refuses
 | `embedding.compute_device` | `cuda` | Only `cuda` is accepted; any other value fails to load. |
 | `embedding.idle_release_secs` | unset | Drop the model from GPU memory after this many idle seconds; at least 1. The next request reloads it. Unset keeps it resident. |
 | `embedding.vram_floor_mb` | `5000` | Free VRAM required before (re)loading the model. Below it the load fails and names the GPU holders. Hosts without an NVIDIA GPU skip the check. |
+| `embedding.gpu_yield_file` | unset | A host GPU broker's yield file (`{"for","since","expires"}`). While it names an unexpired tenant a (re)load fails with `gpu busy: yielded to <tenant>`, so the event is NAK'd and redelivered. |
+| `embedding.gpu_make_room_cmd` | unset | Argv run once, with `--need-mib <vram_floor_mb>` appended, when a (re)load is blocked; exit 0 means "try again now". |
 | `hnsw.m` | `16` | Edges per node for new collections; 4 to 128. |
 | `hnsw.ef_construct` | `100` | Candidates considered while building the graph; from `m` to 1024. |
 | `hnsw.search_ef` | `128` | Candidates considered per query; 1 to 4096. |

@@ -107,6 +107,13 @@ impl From<DistillError> for ApiError {
     }
 }
 
+/// Body of `POST /embedder/release`.
+#[derive(Debug, serde::Serialize)]
+pub struct EmbedderRelease {
+    /// Model slots dropped from the GPU.
+    pub released: usize,
+}
+
 /// Body of `POST /distill` and `POST /distill/stream`.
 #[derive(Deserialize)]
 pub struct IndexRequest {
@@ -552,6 +559,18 @@ impl DistillServerState {
             .store
             .enable_hnsw(&collection, &self.config.hnsw)
             .await?)
+    }
+
+    /// Drop the embedder's idle model slots now (the GPU broker hands the
+    /// card to another tenant). Busy slots finish their embed and are left
+    /// alone; the next embed reloads through the load gate.
+    pub async fn release_embedder(&self) -> Result<EmbedderRelease, ApiError> {
+        let embedder = Arc::clone(&self.embedder);
+        let released = tokio::task::spawn_blocking(move || embedder.release_idle())
+            .await
+            .map_err(|e| ApiError::from(DistillError::Embedding(format!("release task: {e}"))))?;
+        tracing::info!(released, "embedder released on request");
+        Ok(EmbedderRelease { released })
     }
 
     pub async fn scrub_interstitials(

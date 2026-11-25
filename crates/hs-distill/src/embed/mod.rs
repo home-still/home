@@ -39,6 +39,12 @@ pub trait Embedder: Send + Sync {
     fn health(&self) -> EmbedderHealth;
     /// How many `embed_batch` calls can run at once (model pool size).
     fn slots(&self) -> usize;
+    /// Drop the model of every idle slot now, freeing its VRAM; the next
+    /// embed reloads it. Returns how many slots were released. Backends
+    /// with nothing to release keep the default.
+    fn release_idle(&self) -> usize {
+        0
+    }
 }
 
 /// Compare the configured embedding width with the one the model actually

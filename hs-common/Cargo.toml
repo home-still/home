@@ -19,9 +19,11 @@ http = [
     "dep:reqwest",
     "dep:anyhow",
 ]
-# Async, TTL-cached `gpu::*_async` accessors for request handlers.
+# Async, TTL-cached `gpu::*_async` accessors for request handlers, and the
+# GPU-broker coordination helpers (`gpu::yield_holder`, `gpu::make_room_async`).
 gpu-async = [
     "dep:tokio",
+    "dep:chrono",
     "tokio/rt",
     "tokio/sync",
     "tokio/time",

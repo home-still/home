@@ -119,6 +119,9 @@ pub struct ServerState {
     /// that caps concurrent `olmocr` subprocesses and that `/readiness`
     /// reports.
     pub admission: Arc<tokio::sync::Semaphore>,
+    /// When the admission gate last ran `gpu_make_room_cmd`; rate-limits
+    /// the hook to one attempt per [`MAKE_ROOM_INTERVAL`].
+    pub make_room_at: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl ServerState {
@@ -141,6 +144,7 @@ impl ServerState {
             total_conversions: Arc::new(AtomicU64::new(0)),
             backend_state: Arc::new(tokio::sync::Mutex::new(None)),
             admission,
+            make_room_at: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -202,6 +206,7 @@ async fn cached_backend_state(state: &ServerState) -> Option<BackendState> {
         &state.config.olmocr_endpoint,
         &state.config.olmocr_model,
         state.config.vram_headroom_mb,
+        state.config.gpu_yield_file.as_deref(),
     )
     .await;
     let previous = slot.as_ref().map(|(_, s)| s.admits());
@@ -218,13 +223,39 @@ async fn cached_backend_state(state: &ServerState) -> Option<BackendState> {
                 free_vram_mb = ?fresh.free_vram_mb,
                 reachable = fresh.reachable,
                 headroom_mb = state.config.vram_headroom_mb,
+                yielding_to = ?fresh.yielding_to,
                 holders = %holders,
                 "vlm backend unavailable — refusing dispatch"
             );
         }
     }
     *slot = Some((std::time::Instant::now(), fresh.clone()));
+    drop(slot);
+    if fresh.reachable && !fresh.admits() {
+        request_room(state).await;
+    }
     Some(fresh)
+}
+
+/// Least time between two `gpu_make_room_cmd` runs.
+const MAKE_ROOM_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Ask the host GPU broker for room in the background (never awaited
+/// here: the hook may drain another tenant for minutes), at most once per
+/// [`MAKE_ROOM_INTERVAL`]. The next probe sees the outcome.
+async fn request_room(state: &ServerState) {
+    let Some(cmd) = state.config.gpu_make_room_cmd.as_ref() else {
+        return;
+    };
+    let mut last = state.make_room_at.lock().await;
+    if last.is_some_and(|at| at.elapsed() < MAKE_ROOM_INTERVAL) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    tokio::spawn(hs_common::gpu::make_room_async(
+        cmd.clone(),
+        state.config.vram_headroom_mb,
+    ));
 }
 
 fn record_success(last_slot: &AtomicU64, total: &AtomicU64, md: &str) {
@@ -381,6 +412,7 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoRespon
         backend_vram_free_mb: backend.as_ref().and_then(|b| b.free_vram_mb),
         backend_vram_headroom_mb: gate_applies.then_some(state.config.vram_headroom_mb),
         backend_vram_holders: holders,
+        backend_yielding_to: backend.as_ref().and_then(|b| b.yielding_to.clone()),
         backend_checked_at: backend.as_ref().map(|b| b.checked_at.clone()),
     };
     if admits {
