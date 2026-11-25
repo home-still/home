@@ -10,6 +10,12 @@ const DEFAULT_DISTILL_PORT: u16 = 7434;
 const DEFAULT_MCP_PORT: u16 = 7445;
 const DEFAULT_DOCS_PORT: u16 = 7446;
 
+/// How long the docs service keeps answering after pdfium is found wedged
+/// or poisoned, before it exits for its supervisor to restart it: long
+/// enough for a health check to see the fault and for requests in flight
+/// to finish.
+const DOCS_PDFIUM_FAULT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Subcommand, Debug)]
 pub enum ServeCmd {
     /// Run a scribe server (auto-init, foreground)
@@ -326,6 +332,14 @@ async fn serve_mcp(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
 /// build, ship and keep in step for no gain.
 async fn serve_docs(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     reporter.status("Serve", &format!("docs on port {port}"));
+
+    // The page views of a PDF are rendered by pdfium. A host without
+    // libpdfium must not answer some links and fail others: it refuses to
+    // start instead.
+    hs_scribe::pdfium::require().context(
+        "the docs service renders the pages of a PDF with libpdfium, which cannot be bound",
+    )?;
+    hs_scribe::pdfium::install_fault_exit(DOCS_PDFIUM_FAULT_GRACE);
 
     let file = hs_common::config_file::ConfigFile::load()?;
     let storage_cfg = file

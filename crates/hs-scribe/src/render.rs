@@ -34,28 +34,74 @@ pub fn plan_render(
     dpi: u16,
     max_pixels: u64,
 ) -> Result<RenderSize, ConvertFailure> {
-    let bad = |why: String| ConvertFailure::new(FailureCode::PdfParseError, why);
+    check_page_box(width_pts, height_pts)?;
+    let scale = f64::from(dpi) / POINTS_PER_INCH;
+    fit_to_pixel_cap(
+        f64::from(width_pts) * scale,
+        f64::from(height_pts) * scale,
+        max_pixels,
+    )
+    .map_err(|(width, height)| {
+        not_renderable(format!(
+            "a {width_pts}x{height_pts} pt page renders to {width}x{height} px at {dpi} dpi under \
+             the {max_pixels}-pixel limit"
+        ))
+    })
+}
+
+/// Where a page is rasterized to be shown at one width whatever its size:
+/// `width_px` wide, its height in proportion, scaled down uniformly until
+/// it fits `max_pixels`. The same refusals as [`plan_render`].
+pub fn plan_render_to_width(
+    width_pts: f32,
+    height_pts: f32,
+    width_px: u32,
+    max_pixels: u64,
+) -> Result<RenderSize, ConvertFailure> {
+    check_page_box(width_pts, height_pts)?;
+    let width = f64::from(width_px);
+    let height = width * f64::from(height_pts) / f64::from(width_pts);
+    fit_to_pixel_cap(width, height, max_pixels).map_err(|(width, height)| {
+        not_renderable(format!(
+            "a {width_pts}x{height_pts} pt page renders to {width}x{height} px at {width_px} px \
+             wide under the {max_pixels}-pixel limit"
+        ))
+    })
+}
+
+/// Points in an inch: the unit a PDF measures a page in.
+const POINTS_PER_INCH: f64 = 72.0;
+
+fn not_renderable(why: String) -> ConvertFailure {
+    ConvertFailure::new(FailureCode::PdfParseError, why)
+}
+
+/// Refuse a page box no backend can render: a side that is not a finite
+/// positive number, or one longer than [`MAX_PAGE_POINTS`].
+fn check_page_box(width_pts: f32, height_pts: f32) -> Result<(), ConvertFailure> {
     for (side, name) in [(width_pts, "width"), (height_pts, "height")] {
         if !side.is_finite() || side <= 0.0 || side > MAX_PAGE_POINTS {
-            return Err(bad(format!(
+            return Err(not_renderable(format!(
                 "page {name} of {side} pt is not a renderable size (0 < side <= {MAX_PAGE_POINTS} pt)"
             )));
         }
     }
-    let scale = f64::from(dpi) / 72.0;
-    let (w, h) = (f64::from(width_pts) * scale, f64::from(height_pts) * scale);
-    let pixels = w * h;
+    Ok(())
+}
+
+/// `width` x `height` pixels as whole pixels, scaled down uniformly until
+/// they fit `max_pixels`. `Err` with the size arrived at when the cap
+/// leaves a side under one pixel.
+fn fit_to_pixel_cap(width: f64, height: f64, max_pixels: u64) -> Result<RenderSize, (f64, f64)> {
+    let pixels = width * height;
     let fit = if pixels > max_pixels as f64 {
         (max_pixels as f64 / pixels).sqrt()
     } else {
         1.0
     };
-    let (width, height) = ((w * fit).floor(), (h * fit).floor());
+    let (width, height) = ((width * fit).floor(), (height * fit).floor());
     if width < 1.0 || height < 1.0 {
-        return Err(bad(format!(
-            "a {width_pts}x{height_pts} pt page renders to {width}x{height} px at {dpi} dpi under \
-             the {max_pixels}-pixel limit"
-        )));
+        return Err((width, height));
     }
     Ok(RenderSize {
         width: width as u32,
@@ -78,13 +124,38 @@ impl PdfParser {
         dpi: u16,
         max_pixels: u64,
     ) -> Result<PageData> {
+        Self::rasterize(document, idx, |width_pts, height_pts| {
+            plan_render(width_pts, height_pts, dpi, max_pixels)
+        })
+    }
+
+    /// Render a single page `width_px` wide, never larger than `max_pixels`
+    /// (see [`plan_render_to_width`]): the picture of a page a reader is
+    /// shown, which has one width whatever the page's size.
+    pub fn render_page_to_width(
+        document: &PdfDocument,
+        idx: u16,
+        width_px: u32,
+        max_pixels: u64,
+    ) -> Result<PageData> {
+        Self::rasterize(document, idx, |width_pts, height_pts| {
+            plan_render_to_width(width_pts, height_pts, width_px, max_pixels)
+        })
+    }
+
+    /// Render page `idx` at the size `plan` gives for the page's box.
+    fn rasterize(
+        document: &PdfDocument,
+        idx: u16,
+        plan: impl FnOnce(f32, f32) -> Result<RenderSize, ConvertFailure>,
+    ) -> Result<PageData> {
         let page = document
             .pages()
             .get(idx)
             .map_err(|e| crate::pdfium::page_error(e, idx))?;
 
         let (width_pts, height_pts) = (page.width().value, page.height().value);
-        let size = plan_render(width_pts, height_pts, dpi, max_pixels)
+        let size = plan(width_pts, height_pts)
             .map_err(|e| anyhow::Error::new(e).context(format!("page {idx}")))?;
 
         let config = PdfRenderConfig::new()
@@ -197,6 +268,29 @@ mod tests {
     #[test]
     fn a_cap_too_small_for_one_pixel_per_side_is_refused() {
         assert!(plan_render(612.0, 792.0, 200, 0).is_err());
+    }
+
+    #[test]
+    fn a_page_shown_at_one_width_keeps_its_shape() {
+        let s = plan_render_to_width(LETTER.0, LETTER.1, 1_400, DEFAULT_MAX_RENDER_PIXELS).unwrap();
+        assert_eq!((s.width, s.height), (1_400, 1_811));
+
+        // A landscape slide is as wide as a portrait page, and shorter.
+        let slide = plan_render_to_width(960.0, 540.0, 1_400, DEFAULT_MAX_RENDER_PIXELS).unwrap();
+        assert_eq!((slide.width, slide.height), (1_400, 787));
+    }
+
+    #[test]
+    fn a_page_shown_at_one_width_obeys_the_pixel_cap_and_the_box_rules() {
+        // A 30 pt strip 14 400 pt long would be 672 000 px tall at 1 400 wide.
+        let strip = plan_render_to_width(30.0, 14_400.0, 1_400, 1_000_000).unwrap();
+        assert!(u64::from(strip.width) * u64::from(strip.height) <= 1_000_000);
+        assert!(strip.width >= 1 && strip.height > strip.width);
+
+        for (w, h) in [(0.0, 792.0), (612.0, f32::NAN), (14_400.5, 792.0)] {
+            let e = plan_render_to_width(w, h, 1_400, DEFAULT_MAX_RENDER_PIXELS).unwrap_err();
+            assert_eq!(e.code(), FailureCode::PdfParseError, "{w}x{h}");
+        }
     }
 
     // ── pdfium-backed: skipped (loudly) when libpdfium cannot be bound ──

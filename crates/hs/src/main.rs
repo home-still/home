@@ -13,6 +13,7 @@ mod docs_cmd;
 mod docs_service;
 #[cfg(test)]
 mod docs_tests;
+mod docs_views;
 mod installer;
 mod mcp_client;
 mod mcp_cmd;

@@ -89,17 +89,36 @@ Bad input is a 400, a missing dependency a 503, anything else a 500.
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/health` | GET | Liveness. |
+| `/health` | GET | Liveness: storage is readable and pdfium is working. |
 | `/docs/v1/{stem}/source` | GET | The original document: PDF, HTML or EPUB for `academic`; PDF, EPUB, DOCX, Markdown or text for `personal`. Honours `Range`. |
 | `/docs/v1/{stem}/markdown` | GET | The converted markdown, or one page of it with `page=N`. |
+| `/docs/v1/{stem}/page.png` | GET | Page `page=N` of a PDF as a PNG 1,400 pixels wide, with the words `hl` names boxed. |
+| `/docs/v1/{stem}/page` | GET | That picture in a page of HTML, with links to the pages before and after, the viewer, the PDF and the converted text. |
+| `/docs/v1/{stem}/viewer` | GET | The whole PDF in a viewer that draws it in the browser (pdf.js), scrolled to the words `hl` names or to `page=N`. |
+| `/docs/assets/{version}/{file}` | GET | The viewer's scripts and the stylesheet. No signature; `{version}` is a hash of the files, and any other is `404`. |
 | `/s/{code}` | GET | A short link: `302` to the signed link the code stands for, with its fragment. An unknown or expired code is `404`. |
 
-A request is served only with a valid signature in the query string:
-`iat` (issued), `exp` (expiry), `sub` (subject), `col` (collection:
-`academic` or `personal`), `fmt` (`source` or `markdown`), optional `page`, and
-`sig`, an HMAC-SHA256 over the stem and those fields with the key in
+A request for a document is served only with a valid signature in the query
+string: `iat` (issued), `exp` (expiry), `sub` (subject), `col` (collection:
+`academic` or `personal`), `fmt` (`source`, `markdown`, `page.png`, `page` or
+`viewer`: the route the link opens, and no other), optional `page`, optional
+`hl` and `sig`, an HMAC-SHA256 over the stem and those fields with the key in
 `~/.home-still/docs-link.key`. A host that mints links (`hs docs link`, the
 MCP `doc_link` tool and the tools that attach links) must hold the same key.
+
+`hl` is the highlight: up to eight runs of words, each written
+`<page>.<first word>-<word after the last>` and joined with `~` (`3.41-58`
+is words 41 to 57 of page 3), counted from 0 in the page's word boxes
+(`boxes/`, built by `hs scribe watch-events`).
+The three page routes exist for a PDF only and answer `404` for any other
+source, for a page the PDF does not have, and for an `hl` the word boxes
+cannot answer. `page.png` and `page` need `page`. Every link a page view or
+the viewer carries is signed by the service for the same subject and expiry
+as the link it was opened with.
+
+The service renders pages with libpdfium, which it binds from `~/.local/lib`,
+`~/.home-still/dyld-libs` or the system library path, and it refuses to start
+without it.
 
 A short link needs no signature of its own: `/s/{code}` redirects to one of the
 signed links above, and that link is checked in full. The code is a record

@@ -34,6 +34,15 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
   service and every host that mints links (`hs docs link`, the MCP server)
   together. Links last an hour unless `docs.link_ttl_secs` says otherwise, so
   nothing has to be minted again by hand.
+- The docs service answers three more routes for a PDF:
+  `/docs/v1/{stem}/page.png` (one page as a picture, the cited words boxed),
+  `/docs/v1/{stem}/page` (that picture in a page of HTML) and
+  `/docs/v1/{stem}/viewer` (the whole PDF in a pdf.js viewer), and serves the
+  viewer's scripts under `/docs/assets/`. **The host that runs `hs serve docs`
+  now needs libpdfium** (in `~/.local/lib`, `~/.home-still/dyld-libs` or the
+  system library path, as a scribe host has it) **and the service refuses to
+  start without it.** The gateway already forwards `/docs/*`, so nothing
+  changes there.
 - `hs docs link --collection` and `doc_link`'s `collection` are checked
   against the list of stores (`academic`, `personal`, `web`, `syntheses`).
   **A name that is not a store is now refused when the link is minted**; it

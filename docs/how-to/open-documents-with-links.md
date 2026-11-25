@@ -5,6 +5,7 @@ Run the docs service, mint signed links to your documents, and open them from yo
 ## Before you start
 
 - The host that runs the docs service reads the same `storage:` section as the rest of your library, and can reach the storage backend. See [`storage`](../reference/configuration.md#storage).
+- That host has libpdfium in `~/.local/lib`, `~/.home-still/dyld-libs` or the system library path. The service renders the pages of a PDF with it and does not start without it.
 - Your documents are downloaded and converted. A link to a document that is not in storage returns 404.
 - For links that work away from home, a gateway is running with a `docs` route and a public URL such as `https://cloud.example.com`. Set it up with [Build a home cloud cluster](../tutorials/home-cloud-cluster.md); [Access your library remotely](access-remotely.md) covers enrolling devices.
 

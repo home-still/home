@@ -324,12 +324,13 @@ pub fn align(page: &PageWords, tokens: &[String]) -> Option<WordSpan> {
     })
 }
 
-/// One rectangle per text line of a run of words, each
+/// One rectangle per text line of the run `words` of a page's words, each
 /// `[x0, y0, x1, y1]` in box units and [`BOX_PADDING_UNITS`] larger than
-/// its words on every side, within the page.
-pub fn line_rects(page: &PageWords, span: &WordSpan) -> Vec<[u16; 4]> {
-    let start = usize::try_from(span.start).unwrap_or(usize::MAX);
-    let end = usize::try_from(span.end)
+/// its words on every side, within the page. The run is cut at the page's
+/// last word; one that starts past it has no rectangle.
+pub fn line_rects(page: &PageWords, words: std::ops::Range<u32>) -> Vec<[u16; 4]> {
+    let start = usize::try_from(words.start).unwrap_or(usize::MAX);
+    let end = usize::try_from(words.end)
         .unwrap_or(usize::MAX)
         .min(page.boxes.len());
     let mut lines: Vec<[u16; 4]> = Vec::new();
@@ -1322,13 +1323,8 @@ mod tests {
     #[test]
     fn line_rects_is_one_padded_rectangle_per_text_line() {
         let words = page(1, &["alpha beta gamma", "delta epsilon"]);
-        let span = WordSpan {
-            start: 1,
-            end: 5,
-            matched_ratio: 1.0,
-        };
         assert_eq!(
-            line_rects(&words, &span),
+            line_rects(&words, 1..5),
             [[1_780, 980, 3_320, 1_220], [980, 1_280, 2_520, 1_520]]
         );
     }
@@ -1337,21 +1333,11 @@ mod tests {
     fn line_rects_stays_within_the_page_and_the_words_there_are() {
         let mut edge = PageWords::new(1, WordOrigin::Ocr, PAGE_WIDTH_PT, PAGE_HEIGHT_PT);
         edge.push("edge".to_string(), [0, 5, BOX_UNITS_PER_PAGE_SIDE, 9_995]);
-        let beyond = WordSpan {
-            start: 0,
-            end: 7,
-            matched_ratio: 1.0,
-        };
         assert_eq!(
-            line_rects(&edge, &beyond),
+            line_rects(&edge, 0..7),
             [[0, 0, BOX_UNITS_PER_PAGE_SIDE, BOX_UNITS_PER_PAGE_SIDE]]
         );
-        let outside = WordSpan {
-            start: 3,
-            end: 2,
-            matched_ratio: 1.0,
-        };
-        assert!(line_rects(&edge, &outside).is_empty());
+        assert!(line_rects(&edge, 3..5).is_empty());
     }
 
     #[test]
@@ -1368,8 +1354,9 @@ mod tests {
         assert_eq!(placed.len(), 1);
         assert_eq!(placed[0].page, 2);
         assert_eq!((placed[0].span.start, placed[0].span.end), (1, 8));
+        let span = placed[0].span;
         assert_eq!(
-            line_rects(&boxes.pages[1], &placed[0].span).len(),
+            line_rects(&boxes.pages[1], span.start..span.end).len(),
             2,
             "the passage is on two text lines"
         );

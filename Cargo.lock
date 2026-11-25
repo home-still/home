@@ -2296,6 +2296,7 @@ dependencies = [
  "hs-common",
  "hs-distill",
  "hs-scribe",
+ "image",
  "libc",
  "openalex-ingest",
  "owo-colors",
