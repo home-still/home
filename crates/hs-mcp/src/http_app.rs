@@ -385,6 +385,23 @@ mod tests {
         })
     }
 
+    /// Every tool whose schema has a `stem` or `doc_id` property, with the name
+    /// it uses. Derived from the router, not listed, so a tool that invents
+    /// another name for a stem is caught here.
+    fn stem_fields() -> Vec<(String, String)> {
+        HomeStillMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .filter_map(|tool| {
+                let props = tool.input_schema.get("properties")?.as_object()?;
+                props
+                    .keys()
+                    .find(|k| matches!(k.as_str(), "stem" | "doc_id"))
+                    .map(|k| (tool.name.to_string(), k.clone()))
+            })
+            .collect()
+    }
+
     /// RA-4 / RA-27: a stem is untrusted client text that ends up inside
     /// storage keys. Every stem-taking tool refuses a stem that could leave
     /// its prefix, with JSON-RPC invalid-params, before any handler runs.
@@ -392,18 +409,27 @@ mod tests {
     async fn every_tool_that_takes_a_stem_rejects_a_path_like_stem() {
         let run = start(Duration::from_secs(60)).await;
         let session = open_session(&run).await;
-        let cases = [
-            ("catalog_read", "stem"),
-            ("markdown_read", "stem"),
-            ("scribe_convert", "stem"),
-            ("distill_index", "stem"),
-            ("distill_reindex", "stem"),
-            ("distill_exists", "doc_id"),
-            ("personal_read", "stem"),
-            ("personal_reindex", "stem"),
-        ];
+        let fields = stem_fields();
+        // Ten: catalog_read, doc_link, markdown_read, scribe_queue,
+        // scribe_convert, distill_exists, distill_index, distill_reindex,
+        // personal_read, personal_reindex. The number is asserted so that a tool
+        // that starts taking a stem — or stops — is a deliberate change here, and
+        // the failure prints the list.
+        assert_eq!(
+            fields.len(),
+            10,
+            "expected every tool that takes a stem; found {fields:?}"
+        );
+        for (tool, field) in &fields {
+            assert_eq!(
+                field, "stem",
+                "{tool} names its stem `{field}`; every tool that takes a stem must call it \
+                 `stem` — an agent passing `stem` to one that does not is refused with `missing \
+                 field`"
+            );
+        }
         let mut id = 10;
-        for (tool, field) in cases {
+        for (tool, field) in &fields {
             for bad in ["..", "../../etc/passwd", "a/b", "a\\b", "", "."] {
                 id += 1;
                 let reply = rpc(

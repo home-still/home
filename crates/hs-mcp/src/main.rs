@@ -152,7 +152,7 @@ struct DocLinkParams {
     #[schemars(description = "Paper stem name (filename without extension)")]
     stem: Stem,
     #[schemars(
-        description = "Which document to link: `source` (the original PDF, HTML or EPUB) or `markdown` (the converted text). Default: `source`"
+        description = "Which document to link: `source` (the original document: PDF, HTML, EPUB, DOCX, Markdown or text) or `markdown` (the converted text). Default: `source`"
     )]
     format: Option<String>,
     #[schemars(
@@ -163,6 +163,11 @@ struct DocLinkParams {
         description = "The collection the document is in: `academic` (the default) or `personal`. The collection is part of the link's signature, so a link for one store cannot be edited into a link for the other."
     )]
     collection: Option<String>,
+    #[schemars(
+        description = "When true, also mint a short link — `<base>/s/<code>` — that redirects to the signed link. Use it when the URL has to be short enough to paste, read out loud or keep on one line; the long `lan`/`remote` pair is returned either way. Minting a short link writes one small record to the corpus, which `hs docs prune` cleans up once it expires."
+    )]
+    #[serde(default)]
+    short: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -275,14 +280,24 @@ fn map_distill_search_hits(
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DistillExistsParams {
-    #[schemars(description = "Document ID to check")]
-    doc_id: Stem,
+    #[schemars(
+        description = "Paper stem name (filename without extension) of the indexed document to check"
+    )]
+    stem: Stem,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PaperDownloadParams {
     #[schemars(description = "DOI of the paper to download")]
     doi: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ScribeQueueParams {
+    #[schemars(
+        description = "Paper stem name (filename without extension) of a PDF, HTML or EPUB source already stored in the papers directory"
+    )]
+    stem: Stem,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -748,6 +763,9 @@ struct HomeStillMcp {
     /// Mints the signed, expiring links that let a user open what an
     /// agent found.
     link_minter: Option<Arc<crate::links::LinkMinter>>,
+    /// The short links this deployment has minted, stored in the corpus
+    /// beside the documents.
+    short_links: hs_common::docs::ShortLinks,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -1001,6 +1019,7 @@ impl HomeStillMcp {
         }
 
         Ok(Self {
+            short_links: hs_common::docs::ShortLinks::new(storage.clone()),
             storage,
             events,
             catalog_prefix: "catalog".to_string(),
@@ -1746,9 +1765,12 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Mint a fresh, signed, expiring link to a document in the corpus. The link opens the original document (PDF, HTML or EPUB) or its converted markdown, on the LAN and away from home. Use this when a link from a previous result has expired, or to get a link for a document you know the stem of but have not searched for.",
+        description = "Mint a fresh, signed, expiring link to a document in the corpus. The link opens the original document (PDF, HTML, EPUB, DOCX, Markdown or text) or its converted markdown, on the LAN and away from home. Use this when a link from a previous result has expired, or to get a link for a document you know the stem of but have not searched for. With `short: true` it also stores a 12-character code — `<base>/s/<code>` — that redirects to that link, which is the form to hand a person when the URL has to be short enough to paste or read out loud.",
         annotations(
-            read_only_hint = true,
+            // Not read-only in the `short` case: it stores the code. A client
+            // that plans a call by its annotations must not be told a write is
+            // free.
+            read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = false,
             open_world_hint = false
@@ -1782,11 +1804,73 @@ impl HomeStillMcp {
         };
         let pair =
             pair.ok_or_else(|| format!("no {wanted} link could be minted for '{}'", p.stem))?;
+
+        if !p.short {
+            return to_json(&serde_json::json!({
+                "stem": p.stem,
+                "format": wanted,
+                "lan": pair.lan,
+                "remote": pair.remote,
+                "expires_at": links.expires_at,
+            }));
+        }
+
+        // A short link is an alias for a signed one: the code is stored in the
+        // corpus and answered with a redirect, so minting one is a write. It
+        // fails loudly, because a code the caller is shown but the service
+        // cannot resolve is a 404 the user would find instead of the document.
+        let format = match wanted {
+            "source" => hs_common::docs::LinkFormat::Source,
+            "markdown" => hs_common::docs::LinkFormat::Markdown,
+            other => {
+                return Err(format!(
+                    "unknown format {other:?}: use `source` or `markdown`"
+                ))
+            }
+        };
+        let target = minter
+            .short_target(&p.stem, collection, p.page, None, format)
+            .ok_or_else(|| format!("no {wanted} short link could be minted for '{}'", p.stem))?;
+        let code = loop {
+            let candidate = hs_common::docs::new_short_link_code();
+            // A collision is 1e-18 unlikely, but overwriting someone else's
+            // code would silently repoint their link: retry instead.
+            if self
+                .short_links
+                .get(&candidate)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_none()
+            {
+                break candidate;
+            }
+        };
+        self.short_links
+            .put(
+                &code,
+                &hs_common::docs::ShortLink {
+                    target: target.target,
+                    fragment: target.fragment,
+                    expires_at: target.expires_at,
+                },
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "the {wanted} link could not be stored as a short link, so no code was \
+                     issued (the long link below still works): {e:#}"
+                )
+            })?;
+        let short = minter
+            .short_urls(&code)
+            .ok_or("short links need `docs.lan_base_url` and `docs.remote_base_url`")?;
+
         to_json(&serde_json::json!({
             "stem": p.stem,
             "format": wanted,
             "lan": pair.lan,
             "remote": pair.remote,
+            "short": short,
             "expires_at": links.expires_at,
         }))
     }
@@ -2394,7 +2478,56 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Convert a stored source document (PDF, HTML or EPUB; PDF preferred when several exist) to markdown through the same code path the scribe event watcher uses: PDFs go to the scribe VLM server, HTML and EPUB are parsed by the shared parsers. Takes a stem name (filename without extension). Writes markdown to storage, stamps the catalog and announces `scribe.completed`. Markdown that already exists is not converted again (it is re-announced; `hs scribe reconvert` forces a fresh conversion). Fails, naming the cause, when storage is unreachable, the source is missing, the document is refused (not a PDF, paywall page, empty or looping output) or the catalog stamp did not land. While a conversion runs, the tool sends a progress notification about every 20 seconds. Use `markdown_read` to fetch content.",
+        description = "Queue a stored source document (PDF, HTML or EPUB) for conversion and return immediately — do NOT use this to wait. Publishes `papers.ingested`, which the `hs scribe watch-events` daemon picks up: typical documents finish in seconds to a few minutes, and the timeout ceiling for one document is 1 hour, so the conversion far outlives a tool call. Poll `catalog_list` (it reports `converted` and `conversion_failed` per stem) or `distill_index` until the markdown exists, then read it with `markdown_read`. Use `scribe_convert` ONLY when you want to block this call until the document is ready. An `already_converted` reply means the source no longer needs queueing.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn scribe_queue(
+        &self,
+        Parameters(p): Parameters<ScribeQueueParams>,
+    ) -> Result<String, String> {
+        self.require_event_bus("scribe_queue").await?;
+
+        // Queueing is only honest if the source exists: `find_source_key`
+        // probes the collection's extensions and errors when there is none,
+        // so a caller cannot queue a stem that will fail in the watcher with
+        // no one listening.
+        let source_key = self.find_source_key(&p.stem).await?;
+
+        // `IngestedEvent` declares every field but `key` as `#[serde(default)]`
+        // — a minimal publisher may only know the object key, so the optional
+        // fields are omitted rather than filled with guesses.
+        let payload = serde_json::json!({
+            "key": source_key,
+            "source": "mcp:scribe_queue",
+        });
+        let bytes = serde_json::to_vec(&payload)
+            .map_err(|e| format!("serializing papers.ingested for {source_key}: {e}"))?;
+        self.events
+            .publish(hs_common::event_bus::specs::PAPERS_INGESTED.subject, &bytes)
+            .await
+            .map_err(|e| {
+                format!(
+                    "queueing {source_key} failed (nothing was queued; the source is stored and \
+                     the conversion did not start): {e:#}"
+                )
+            })?;
+
+        to_json(&serde_json::json!({
+            "stem": p.stem,
+            "source_key": source_key,
+            "queued": true,
+            "next": "poll catalog_list for this stem until `converted` is true, or \
+                     distill_index to embed it once it is",
+        }))
+    }
+
+    #[tool(
+        description = "BLOCKS until the conversion finishes — use `scribe_queue` instead unless you need the markdown in this call; conversion is bounded by the scribe timeout ceiling of 3600 s. Converts a stored source document (PDF, HTML or EPUB; PDF preferred when several exist) to markdown through the same code path the scribe event watcher uses: PDFs go to the scribe VLM server, HTML and EPUB are parsed by the shared parsers. Takes a stem name (filename without extension). Writes markdown to storage, stamps the catalog and announces `scribe.completed`. Markdown that already exists is not converted again (it is re-announced; `hs scribe reconvert` forces a fresh conversion). Fails, naming the cause, when storage is unreachable, the source is missing, the document is refused (not a PDF, paywall page, empty or looping output) or the catalog stamp did not land. While a conversion runs, the tool sends a progress notification about every 20 seconds. Use `markdown_read` to fetch content.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2539,9 +2672,9 @@ impl HomeStillMcp {
             .map_err(|e| format!("{e:#}"))?
             .ok_or("No distill server configured")?;
 
-        match client.doc_exists(&p.doc_id).await {
+        match client.doc_exists(&p.stem).await {
             Ok(exists) => to_json(&serde_json::json!({
-                "doc_id": p.doc_id,
+                "stem": p.stem,
                 "indexed": exists,
             })),
             Err(e) => Err(format!("Check failed: {e:#}")),
@@ -2606,10 +2739,11 @@ impl HomeStillMcp {
     }
 
     async fn reconcile_orphans(&self, p: DistillReconcileParams) -> Result<String, String> {
-        // rc.306 P0-6: MCP is read-only. The caller's dry_run argument
-        // is ignored; the delete path lives in `hs distill reconcile`
-        // (existing CLI) and `hs distill purge <doc_id>`.
-        let _ = p.dry_run;
+        // rc.306 P0-6: MCP is read-only. The caller's dry_run argument is
+        // ignored; the delete path lives in `hs distill reconcile` (existing
+        // CLI) and `hs distill purge <doc_id>`. The response says so, because
+        // a caller that asked to apply must not read a report as a success.
+        let client_wanted_apply = !p.dry_run;
         let client = self
             .distill_client()
             .map_err(|e| format!("{e:#}"))?
@@ -2638,6 +2772,7 @@ impl HomeStillMcp {
         to_json(&serde_json::json!({
             "dry_run": true,
             "mcp_forced_dry_run": true,
+            "requested_apply_ignored": client_wanted_apply,
             "apply_hint": "use `hs distill reconcile --reembed` or `hs distill purge <doc_id>` (CLI-only) for the delete path",
             "total_doc_ids": doc_ids.len(),
             "scanned_doc_ids": scanned,
@@ -3837,12 +3972,12 @@ impl ServerHandler for HomeStillMcp {
              Full pipeline workflow:\n\
              1. DISCOVER: paper_search (by query) or paper_get (by DOI) — metadata lookup\n\
              2. DOWNLOAD: paper_download (by DOI) — downloads the actual PDF/HTML into the papers directory. This is REQUIRED before conversion.\n\
-             3. CONVERT: scribe_convert (PDF/HTML stem → markdown)\n\
+             3. CONVERT: scribe_queue (PDF/HTML/EPUB stem → queued) then poll; scribe_convert BLOCKS for the whole conversion (timeout ceiling 3600 s), so use it only when you need the markdown in this call\n\
              4. READ: catalog_read, markdown_read, or use resources (catalog:///{stem}, markdown:///{stem})\n\
              5. INDEX: distill_index (markdown → vector DB)\n\
              6. SEARCH: distill_search (semantic search across all indexed papers)\n\
              7. MONITOR: system_status, scribe_health, distill_status\n\n\
-             To add a new paper to the pipeline: paper_search → paper_download → scribe_convert → distill_index\n\n\
+             To add a new paper to the pipeline: paper_search → paper_download → scribe_queue → (poll catalog_list) → distill_index\n\n\
              Personal documents: personal_search, personal_list, personal_read are read-only \
              over the user's private medical/financial/school records. Writes are scoped: \
              personal_add takes a FILENAME (not a path) and resolves it under the configured \
@@ -4520,5 +4655,48 @@ mod distill_search_mapping_tests {
         let lite = serde_json::to_string(&map_distill_search_hits(vec![], false, None)).unwrap();
         assert_eq!(full, "[]");
         assert_eq!(lite, "[]");
+    }
+}
+
+/// The MCP tool reference lists every tool the server defines, and only those.
+#[cfg(test)]
+mod docs_tests {
+    use std::collections::BTreeSet;
+
+    use super::HomeStillMcp;
+
+    const REFERENCE: &str = include_str!("../../../docs/reference/mcp-tools.md");
+
+    /// Names in headings of the form ``### `tool_name` ``.
+    fn documented_tools(markdown: &str) -> BTreeSet<String> {
+        markdown
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim_end().strip_prefix("### `")?.strip_suffix('`')?;
+                (!name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+                    .then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_tool_has_a_reference_entry_and_every_entry_is_a_tool() {
+        // The unfiltered router: the `openalex_*` tools are removed from a
+        // running server's router only when the corpus is not ready.
+        let defined: BTreeSet<String> = HomeStillMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let documented = documented_tools(REFERENCE);
+
+        let missing: Vec<&String> = defined.difference(&documented).collect();
+        let extra: Vec<&String> = documented.difference(&defined).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "docs/reference/mcp-tools.md disagrees with the tools the server defines.\n\
+             missing from docs: {missing:?}\n\
+             documents no tool: {extra:?}"
+        );
     }
 }

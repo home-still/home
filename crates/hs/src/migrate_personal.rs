@@ -64,6 +64,12 @@ pub async fn run_personal_to_storage(
 
     // The files that have to move: the sources and the sidecars under
     // the store's root, and the converted text under its `markdown/`.
+    //
+    // A personal document may have been ingested *as* markdown, so `md`
+    // is a source extension here — but the converted text lives under
+    // `markdown/`, inside this same walk, and is uploaded separately
+    // below. Skipping that directory is what keeps 86 converted
+    // documents from becoming 86 more source objects.
     let root = personal_cfg.root_dir();
     let markdown = personal_cfg.markdown_dir();
     let mut sources = Vec::new();
@@ -71,10 +77,11 @@ pub async fn run_personal_to_storage(
         &root,
         &root,
         &mut sources,
-        &["pdf", "html", "epub", "docx", "txt", "catalog.yaml"],
+        &["pdf", "html", "epub", "docx", "txt", "catalog.yaml", "md"],
+        &["markdown"],
     )?;
     let mut texts = Vec::new();
-    collect_files(&markdown, &markdown, &mut texts, &["md"])?;
+    collect_files(&markdown, &markdown, &mut texts, &["md"], &[])?;
 
     let mut plan: Vec<(String, String)> = Vec::new();
     for (base, files) in [
@@ -178,11 +185,17 @@ struct FileToMove {
 ///
 /// The `catalog.yaml` sidecar is named with a dot, so the extensions
 /// are matched as a suffix rather than as an extension.
+///
+/// `skip_dirs` names directories, by their path relative to `base`, that
+/// are not walked at all. The store's root is walked for sources, and
+/// `markdown/` lives inside it: walking it as a source tree would upload
+/// every converted document a second time, as a fake source.
 fn collect_files(
     dir: &std::path::Path,
     base: &std::path::Path,
     out: &mut Vec<FileToMove>,
     extensions: &[&str],
+    skip_dirs: &[&str],
 ) -> Result<()> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(());
@@ -190,7 +203,15 @@ fn collect_files(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_files(&path, base, out, extensions)?;
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if skip_dirs.iter().any(|s| *s == rel) {
+                continue;
+            }
+            collect_files(&path, base, out, extensions, skip_dirs)?;
             continue;
         }
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -224,9 +245,73 @@ mod tests {
         std::fs::write(shard.join("ignored.bin"), b"bin").unwrap();
 
         let mut out = Vec::new();
-        collect_files(dir.path(), dir.path(), &mut out, &["pdf", "catalog.yaml"]).unwrap();
+        collect_files(
+            dir.path(),
+            dir.path(),
+            &mut out,
+            &["pdf", "catalog.yaml"],
+            &[],
+        )
+        .unwrap();
         let mut names: Vec<String> = out.iter().map(|f| f.relative.clone()).collect();
         names.sort();
         assert_eq!(names, ["ab/paper.catalog.yaml", "ab/paper.pdf"]);
+    }
+
+    /// The converted text lives under `markdown/`, inside the same root
+    /// the sources are walked from. Walking it as a source tree would
+    /// upload every converted document again at
+    /// `personal/<shard>/<stem>.md` — a fake source that shadows the
+    /// real one.
+    #[test]
+    fn the_converted_markdown_is_not_walked_as_a_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("ab");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("paper.pdf"), b"pdf").unwrap();
+        std::fs::write(shard.join("paper.md"), b"the original").unwrap();
+        let converted = dir.path().join("markdown").join("ab");
+        std::fs::create_dir_all(&converted).unwrap();
+        std::fs::write(converted.join("paper.md"), b"the converted text").unwrap();
+
+        let mut out = Vec::new();
+        collect_files(
+            dir.path(),
+            dir.path(),
+            &mut out,
+            &["pdf", "md"],
+            &["markdown"],
+        )
+        .unwrap();
+        let mut names: Vec<String> = out.iter().map(|f| f.relative.clone()).collect();
+        names.sort();
+        assert_eq!(names, ["ab/paper.md", "ab/paper.pdf"]);
+    }
+
+    /// A document ingested *as* markdown is a source at the store's
+    /// root, and the root walk collects it.
+    ///
+    /// Measured on the live store 2026-11-11: 11 of 86 personal
+    /// documents were ingested this way, and this walk omitted `md`, so
+    /// their source was never uploaded and their source link answered
+    /// 404.
+    #[test]
+    fn a_markdown_source_is_collected_from_the_store_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("an");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("notes.md"), b"# a note").unwrap();
+
+        let mut out = Vec::new();
+        collect_files(
+            dir.path(),
+            dir.path(),
+            &mut out,
+            &["pdf", "html", "epub", "docx", "txt", "catalog.yaml", "md"],
+            &["markdown"],
+        )
+        .unwrap();
+        let names: Vec<String> = out.iter().map(|f| f.relative.clone()).collect();
+        assert_eq!(names, ["an/notes.md"]);
     }
 }

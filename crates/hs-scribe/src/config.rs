@@ -1055,10 +1055,11 @@ mod tests {
         }
     }
 
-    /// Every `HS_SCRIBE_*` variable that README, the compose files or the
-    /// Dockerfile tell an operator to set must set a real key (or be one of
-    /// the variables read directly). `HS_SCRIBE_TIMEOUT_SECS` was documented
-    /// and set in the e2e compose for a long time while mapping to no field.
+    /// Every `HS_SCRIBE_*` variable that the README, the user docs, the
+    /// compose files or the Dockerfile tell an operator to set must set a
+    /// real key (or be one of the variables read directly).
+    /// `HS_SCRIBE_TIMEOUT_SECS` was documented and set in the e2e compose
+    /// for a long time while mapping to no field.
     #[test]
     fn every_documented_variable_maps_to_a_field_or_a_direct_read() {
         let documents = [
@@ -1073,8 +1074,16 @@ mod tests {
             ),
             ("Dockerfile", include_str!("../docker/Dockerfile")),
             (
-                "docs/deployment.md",
-                include_str!("../../../docs/deployment.md"),
+                "docs/reference/configuration.md",
+                include_str!("../../../docs/reference/configuration.md"),
+            ),
+            (
+                "docs/tutorials/home-cloud-cluster.md",
+                include_str!("../../../docs/tutorials/home-cloud-cluster.md"),
+            ),
+            (
+                "docs/how-to/convert-documents.md",
+                include_str!("../../../docs/how-to/convert-documents.md"),
             ),
         ];
         let (client, server) = key_trees().unwrap();

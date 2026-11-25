@@ -47,6 +47,12 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         // before the fallback so it is not caught by the authenticated
         // proxy.
         .route("/docs/{*rest}", get(proxy::docs_handler))
+        // A short link is a redirect to a signed one, and it is followed by a
+        // browser that has no bearer token either — so it is unauthenticated
+        // for the same reason `/docs` is. It is the same handler: both paths
+        // are forwarded to the docs backend unchanged, and the redirect's
+        // `Location` is a path, so following it lands on `/docs/...` here.
+        .route("/s/{code}", get(proxy::docs_handler))
         // Authenticated proxy — catch all remaining paths
         .fallback(any(proxy::proxy_handler))
         .layer(middleware::from_fn_with_state(
@@ -76,6 +82,25 @@ mod tests {
         let state = test_state(&[]).await;
         let resp = call(&state, Request::get("/health").body(Body::empty()).unwrap()).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A short link is followed by a browser with no bearer token, exactly as a
+    /// document link is. The code must reach the docs backend rather than the
+    /// authenticated proxy, which would answer 401 before the redirect ever
+    /// happened.
+    #[tokio::test]
+    async fn a_short_link_is_unauthenticated_and_reaches_the_docs_backend() {
+        let state = test_state(&[("docs", "http://127.0.0.1:9")]).await;
+        let resp = call(
+            &state,
+            Request::get("/s/abcdefghjkmn").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a short link must not require a bearer token"
+        );
     }
 
     #[tokio::test]

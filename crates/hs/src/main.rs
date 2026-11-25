@@ -11,6 +11,8 @@ pub mod daemon;
 mod distill_cmd;
 mod docs_cmd;
 mod docs_service;
+#[cfg(test)]
+mod docs_tests;
 mod installer;
 mod mcp_client;
 mod mcp_cmd;

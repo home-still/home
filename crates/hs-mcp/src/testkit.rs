@@ -227,6 +227,26 @@ pub fn server_with_bus(storage: Arc<dyn Storage>, bus: Arc<RecordingBus>) -> Hom
     .unwrap()
 }
 
+/// [`server_with_bus`] with a link minter, so the `links`-bearing tools can be
+/// exercised end to end.
+///
+/// The base URLs are fixed, the key is fixed, and the corpus is whatever
+/// `storage` holds — which is what a short link's record is written into.
+pub fn server_with_links(storage: Arc<dyn Storage>, bus: Arc<RecordingBus>) -> HomeStillMcp {
+    let mut d = deps(
+        storage,
+        bus,
+        vec!["http://127.0.0.1:9".to_string()],
+        Vec::new(),
+    );
+    d.link_minter = Some(crate::links::LinkMinter::for_test(
+        hs_common::docs::LinkKey::from_bytes(vec![9u8; 32]).unwrap(),
+        "http://host:7446",
+        "https://public.example",
+    ));
+    HomeStillMcp::from_deps(d).unwrap()
+}
+
 /// [`server`] over an arbitrary event bus (for example a lazily connected
 /// one whose broker is down).
 pub fn server_with_event_bus(

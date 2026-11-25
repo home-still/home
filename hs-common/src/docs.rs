@@ -57,6 +57,96 @@ pub const LINK_VERSION: &str = "v1";
 /// The shortest a link key may be. A short key is a weak key.
 pub const MIN_KEY_LEN: usize = 32;
 
+/// The storage prefix short links live under.
+pub const SHORT_LINK_PREFIX: &str = "short-links";
+
+/// The path short links are served from. A short link is
+/// `<base>/s/<code>`; the service answers it with a redirect to the
+/// signed link it stands for.
+pub const SHORT_LINK_PATH: &str = "/s";
+
+/// Characters in a short-link code.
+///
+/// Twelve characters from a 31-symbol alphabet is 59 bits. The code is not
+/// what protects a document — opening it lands on a signed, expiring link
+/// that is checked in full — so the length only has to make a code
+/// impossible to guess and short enough to read out loud.
+pub const SHORT_LINK_CODE_LEN: usize = 12;
+
+/// The alphabet a code is drawn from: lower-case letters and digits with
+/// the look-alikes (`0`, `1`, `i`, `l`, `o`) removed, so a code copied off a
+/// screen by hand does not turn into a different code.
+const SHORT_LINK_ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+
+/// One short link: what a code stands for.
+///
+/// The target is a **path**, not a URL. A short link and the signed link it
+/// points at live on the same origin — the LAN base URL and the remote base
+/// URL serve the same paths — so one code works both at home and away, which
+/// a stored absolute URL could not.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ShortLink {
+    /// The path and query the redirect goes to, from the site root.
+    pub target: String,
+    /// The fragment the redirect appends.
+    ///
+    /// A fragment is never sent to a server, so a redirect has to carry it
+    /// itself: a PDF page (`#page=11`) or a quoted passage (`#:~:text=…`)
+    /// would otherwise be lost between the short link and the document.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fragment: String,
+    /// When the code stops working, as a Unix timestamp in seconds.
+    ///
+    /// The signed link it points at has its own expiry, and this one is not
+    /// the same clock: this is what `hs docs prune` deletes on, so an expired
+    /// code is garbage rather than a redirect into a 403.
+    pub expires_at: u64,
+}
+
+impl ShortLink {
+    /// The `Location` a request for this code is answered with: the target,
+    /// the query string and the fragment, relative to whichever origin
+    /// served the request.
+    pub fn location(&self) -> String {
+        format!("{}{}", self.target, self.fragment)
+    }
+}
+
+/// The storage key a code lives at.
+///
+/// Codes are unsharded: they are already random, and a listing under one
+/// prefix is what `hs docs prune` walks.
+pub fn short_link_key(code: &str) -> String {
+    format!("{SHORT_LINK_PREFIX}/{code}.json")
+}
+
+/// Is this a well-formed short-link code?
+///
+/// The check is what keeps a code from being a path: it accepts exactly the
+/// alphabet [`new_short_link_code`] emits, at exactly
+/// [`SHORT_LINK_CODE_LEN`], so `/s/../docs-link.key` is a 404 and never a
+/// storage read.
+pub fn is_valid_short_code(code: &str) -> bool {
+    code.len() == SHORT_LINK_CODE_LEN && code.bytes().all(|b| SHORT_LINK_ALPHABET.contains(&b))
+}
+
+/// Mint a fresh short-link code.
+///
+/// Uniformly drawn from [`SHORT_LINK_ALPHABET`]; the alphabet's length is
+/// not a power of two, so a byte is taken modulo the alphabet length — a
+/// bias of at most 8/256 that changes no security property, because the code
+/// is a pointer and not a capability.
+pub fn new_short_link_code() -> String {
+    use rand::RngCore;
+
+    let mut bytes = [0u8; SHORT_LINK_CODE_LEN];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|b| SHORT_LINK_ALPHABET[*b as usize % SHORT_LINK_ALPHABET.len()] as char)
+        .collect()
+}
+
 /// Which document a link opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkFormat {
@@ -175,6 +265,21 @@ impl LinkParams {
             self.format.as_str(),
             page,
             self.signature
+        )
+    }
+
+    /// The link as a path from the site root: what a redirect points at.
+    ///
+    /// A short link stores this rather than a full URL, because the same path
+    /// is served on the LAN base URL and on the remote one. The stem is
+    /// percent-encoded so a stem with a `/`-adjacent character cannot grow a
+    /// path segment.
+    pub fn to_path(&self) -> String {
+        format!(
+            "/docs/v1/{}/{}?{}",
+            url_encode(&self.stem),
+            self.format.as_str(),
+            self.to_query()
         )
     }
 }
@@ -667,6 +772,131 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     f.write_all(bytes)?;
     f.sync_all()?;
     Ok(())
+}
+
+/// The short links this deployment has minted.
+///
+/// A short link is a code and the signed link behind it, kept in the
+/// corpus's storage beside the documents. It is an alias table and not a
+/// second signing scheme: opening a code lands on the same signed, expiring
+/// URL an agent would otherwise have pasted, which is checked in full. The
+/// code itself is a pointer, so a stale one is a redirect into a 403, which
+/// is why [`ShortLink::expires_at`] is stored and pruned.
+///
+/// # One path
+///
+/// There is one store: this one. Minting a code writes a record, and serving
+/// one reads the same record; no in-memory map survives a restart, so a
+/// short link handed out yesterday works after a redeploy or it is reported
+/// missing, but never answered from a cache that disagrees with storage.
+#[cfg(feature = "storage")]
+#[derive(Clone)]
+pub struct ShortLinks {
+    storage: std::sync::Arc<dyn crate::storage::Storage>,
+}
+
+#[cfg(feature = "storage")]
+impl ShortLinks {
+    /// A store over `storage`.
+    pub fn new(storage: std::sync::Arc<dyn crate::storage::Storage>) -> Self {
+        Self { storage }
+    }
+
+    /// Store a code's target and fragment.
+    ///
+    /// The write is what makes the code work, so its failure is returned: a
+    /// caller that prints a code it could not store has printed a 404.
+    pub async fn put(&self, code: &str, link: &ShortLink) -> anyhow::Result<()> {
+        if !is_valid_short_code(code) {
+            anyhow::bail!("{code:?} is not a short-link code");
+        }
+        let key = short_link_key(code);
+        let bytes = serde_json::to_vec(link)
+            .map_err(|e| anyhow::anyhow!("serializing the short link for {code} failed: {e}"))?;
+        self.storage.put(&key, bytes).await.map_err(|e| {
+            anyhow::anyhow!(
+                "storing the short link {code} at {this_key} failed: {e:#}",
+                this_key = key
+            )
+        })
+    }
+
+    /// The link a code stands for, or `None` when there is no such code.
+    ///
+    /// An expired code is not returned: a code outlives its usefulness the
+    /// moment the link behind it stops working, and a redirect into a 403 is
+    /// worse than a 404 that says the code is unknown.
+    pub async fn get(&self, code: &str) -> anyhow::Result<Option<ShortLink>> {
+        if !is_valid_short_code(code) {
+            return Ok(None);
+        }
+        let key = short_link_key(code);
+        let bytes = match self.storage.get(&key).await {
+            Ok(bytes) => bytes,
+            Err(e) if crate::storage::is_not_found(&e) => return Ok(None),
+            Err(e) => anyhow::bail!("reading the short link {code} failed: {e:#}"),
+        };
+        let link: ShortLink = serde_json::from_slice(&bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "the short link {code} at {key} is malformed: {e}. Refusing to guess what it \
+                 pointed at."
+            )
+        })?;
+        if now_secs() >= link.expires_at {
+            return Ok(None);
+        }
+        Ok(Some(link))
+    }
+
+    /// Every stored code, expired or not.
+    pub async fn list(&self) -> anyhow::Result<Vec<(String, ShortLink)>> {
+        let objects = self
+            .storage
+            .list(SHORT_LINK_PREFIX)
+            .await
+            .map_err(|e| anyhow::anyhow!("listing {SHORT_LINK_PREFIX} failed: {e:#}"))?;
+        let mut out = Vec::new();
+        for object in objects {
+            let Some(code) = object
+                .key
+                .strip_prefix(SHORT_LINK_PREFIX)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .and_then(|rest| rest.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let bytes = self.storage.get(&object.key).await.map_err(|e| {
+                anyhow::anyhow!("reading the short link {} failed: {e:#}", object.key)
+            })?;
+            let link: ShortLink = serde_json::from_slice(&bytes).map_err(|e| {
+                anyhow::anyhow!(
+                    "the short link at {} is malformed: {e}. Refusing to guess what it pointed \
+                     at.",
+                    object.key
+                )
+            })?;
+            out.push((code.to_string(), link));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// Delete every code whose link has expired. Returns the codes deleted.
+    pub async fn prune(&self) -> anyhow::Result<Vec<String>> {
+        let now = now_secs();
+        let mut deleted = Vec::new();
+        for (code, link) in self.list().await? {
+            if now < link.expires_at {
+                continue;
+            }
+            self.storage
+                .delete(&short_link_key(&code))
+                .await
+                .map_err(|e| anyhow::anyhow!("deleting the short link {code} failed: {e:#}"))?;
+            deleted.push(code);
+        }
+        Ok(deleted)
+    }
 }
 
 /// The subjects whose links have been revoked, and when.
@@ -1256,5 +1486,161 @@ mod tests {
         ];
         let rendered: Vec<String> = reasons.iter().map(|r| r.to_string()).collect();
         assert!(rendered.iter().all(|r| r == &rendered[0]), "{rendered:?}");
+    }
+
+    #[test]
+    fn a_short_code_is_the_alphabet_at_a_fixed_length() {
+        // The alphabet has no look-alikes, so a code read off a screen by hand
+        // does not turn into a different code.
+        for _ in 0..200 {
+            let code = new_short_link_code();
+            assert!(is_valid_short_code(&code), "{code}");
+            assert!(
+                !code.contains('0')
+                    && !code.contains('1')
+                    && !code.contains('i')
+                    && !code.contains('l')
+                    && !code.contains('o'),
+                "{code}"
+            );
+        }
+        // And the check is what keeps a code from being a path.
+        for bad in [
+            "",
+            "short",
+            "/etc/passwd",
+            "../docs-link.key",
+            "abcdefghjkm!",
+            "ABCDEFGHJKMN",
+            "abcdefghjkmnp",
+        ] {
+            assert!(!is_valid_short_code(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_link_path_is_what_a_redirect_points_at() {
+        // A short link stores a path, not a URL: the same path is served on the
+        // LAN base URL and on the remote one.
+        let params = mint(
+            &key(),
+            "10.1234_abcd",
+            LinkFormat::Markdown,
+            "laptop",
+            "academic",
+            Some(3),
+            60,
+        )
+        .unwrap();
+        let path = params.to_path();
+        assert!(
+            path.starts_with("/docs/v1/10.1234_abcd/markdown?"),
+            "{path}"
+        );
+        assert!(path.contains("page=3"), "{path}");
+        assert!(
+            !path.contains("://"),
+            "a redirect target must be a path: {path}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "storage"))]
+mod short_link_tests {
+    use super::*;
+    use crate::storage::{LocalFsStorage, Storage};
+
+    fn store(dir: &std::path::Path) -> ShortLinks {
+        ShortLinks::new(std::sync::Arc::new(LocalFsStorage::new(dir)))
+    }
+
+    /// A code outlives nothing: it is a pointer to a signed link, so what it
+    /// stores is the path, the fragment and the expiry — and reading it back
+    /// before the expiry gives exactly that.
+    #[tokio::test]
+    async fn a_stored_code_resolves_until_it_expires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let link = ShortLink {
+            target: "/docs/v1/10.1234_abcd/source?iat=1&exp=2&sig=x".to_string(),
+            fragment: "#page=11".to_string(),
+            expires_at: now_secs() + 60,
+        };
+        store.put("abcdefghjkmn", &link).await.unwrap();
+
+        let found = store.get("abcdefghjkmn").await.unwrap().unwrap();
+        assert_eq!(found, link);
+        assert_eq!(
+            found.location(),
+            format!("{}{}", link.target, link.fragment)
+        );
+    }
+
+    /// A browser follows a `Location` and cannot be made to re-add a fragment,
+    /// so the fragment travels with the record.
+    #[tokio::test]
+    async fn an_expired_code_is_not_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        store
+            .put(
+                "abcdefghjkmn",
+                &ShortLink {
+                    target: "/docs/v1/10.1234_abcd/source?iat=1&exp=2&sig=x".to_string(),
+                    fragment: String::new(),
+                    expires_at: now_secs(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The signed link behind it has expired, so the code is a redirect into
+        // a 403: answered as unknown instead.
+        assert!(store.get("abcdefghjkmn").await.unwrap().is_none());
+    }
+
+    /// Pruning is what stops the table growing forever, and it must not delete a
+    /// code that still works.
+    #[tokio::test]
+    async fn pruning_deletes_only_the_expired_codes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let live = ShortLink {
+            target: "/docs/v1/live/source?iat=1&exp=2&sig=x".to_string(),
+            fragment: String::new(),
+            expires_at: now_secs() + 3600,
+        };
+        let dead = ShortLink {
+            expires_at: now_secs() - 1,
+            ..live.clone()
+        };
+        store.put("aaaaaaaaaaaa", &live).await.unwrap();
+        store.put("bbbbbbbbbbbb", &dead).await.unwrap();
+
+        let deleted = store.prune().await.unwrap();
+
+        assert_eq!(deleted, ["bbbbbbbbbbbb"]);
+        assert!(store.get("aaaaaaaaaaaa").await.unwrap().is_some());
+        assert!(store.get("bbbbbbbbbbbb").await.unwrap().is_none());
+    }
+
+    /// A code that is not a code is never read from storage: the check is what
+    /// keeps `/s/../docs-link.key` a 404 rather than a key lookup.
+    #[tokio::test]
+    async fn a_malformed_code_is_never_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(LocalFsStorage::new(tmp.path()));
+        storage
+            .put(
+                "secrets.txt",
+                b"a secret that must never be served".to_vec(),
+            )
+            .await
+            .unwrap();
+        let store = ShortLinks::new(storage);
+
+        for bad in ["../secrets", "secrets.txt", "", "abcdefghjkm"] {
+            assert!(store.get(bad).await.unwrap().is_none(), "{bad:?}");
+        }
     }
 }

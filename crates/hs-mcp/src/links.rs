@@ -8,6 +8,11 @@
 //! The links are signed by the same code the docs service verifies
 //! with, so a link the MCP hands out opens exactly what the service
 //! serves.
+//!
+//! A **short** link is an alias for one of those: a 12-character code stored
+//! in the corpus, answered by the docs service with a redirect to the signed
+//! URL. It is minted only when a caller asks, because minting one is a
+//! storage write and a search hit is not the right place to make one.
 
 use hs_common::docs::{LinkFormat, LinkKey};
 
@@ -29,6 +34,22 @@ pub struct LinkPair {
     pub lan: String,
     /// The URL that works from away from home.
     pub remote: String,
+}
+
+/// A short link: one code, both origins.
+///
+/// The code is stored once in the corpus (see
+/// [`hs_common::docs::ShortLinks`]) and answered with a redirect that is
+/// relative, so the LAN and remote forms differ only in the origin and both
+/// keep working when the link is re-minted under the same code.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ShortLinkPair {
+    /// The URL that works from the LAN.
+    pub lan: String,
+    /// The URL that works from away from home.
+    pub remote: String,
+    /// The code itself, which is what both URLs end with.
+    pub code: String,
 }
 
 /// The mints links for the tools.
@@ -122,18 +143,7 @@ impl LinkMinter {
                 continue;
             };
             expires_at = expires_at.max(params.expires_at);
-            // The source is a PDF or an HTML page: the browser can only
-            // scroll it to a page. The markdown is text: the browser can
-            // select the passage in it.
-            let fragment = match format {
-                LinkFormat::Source => params
-                    .page
-                    .map(hs_common::docs::pdf_page_fragment)
-                    .unwrap_or_default(),
-                LinkFormat::Markdown => passage
-                    .map(hs_common::docs::text_fragment)
-                    .unwrap_or_default(),
-            };
+            let fragment = fragment_for(format, params.page, passage);
             *slot = Some(LinkPair {
                 lan: url(lan_base, &params, &fragment),
                 remote: url(remote_base, &params, &fragment),
@@ -144,6 +154,47 @@ impl LinkMinter {
         }
         out.expires_at = expires_at_iso(expires_at);
         Some(out)
+    }
+
+    /// The target a short link for one document and one format points at.
+    ///
+    /// `passage` is the markdown's first line, as for [`LinkMinter::mint`]: the
+    /// fragment is stored with the code because a redirect cannot put one
+    /// back — the browser is already following a `Location` by the time it
+    /// would matter.
+    pub fn short_target(
+        &self,
+        stem: &str,
+        collection: &str,
+        page: Option<u32>,
+        passage: Option<&str>,
+        format: LinkFormat,
+    ) -> Option<ShortLinkTarget> {
+        let key = self.key.as_ref()?;
+        let params = hs_common::docs::mint(
+            key,
+            stem,
+            format,
+            &self.subject,
+            collection,
+            page,
+            self.link_ttl_secs,
+        )
+        .ok()?;
+        Some(ShortLinkTarget {
+            target: params.to_path(),
+            fragment: fragment_for(format, params.page, passage),
+            expires_at: params.expires_at,
+        })
+    }
+
+    /// The two URLs a code answers on.
+    pub fn short_urls(&self, code: &str) -> Option<ShortLinkPair> {
+        Some(short_link_urls(
+            self.lan_base_url.as_ref()?,
+            self.remote_base_url.as_ref()?,
+            code,
+        ))
     }
 }
 
@@ -174,17 +225,61 @@ pub const DEFAULT_TTL_SECS: u64 = 3600;
 /// string, where the signature covers it.
 fn url(base: &str, params: &hs_common::docs::LinkParams, fragment: &str) -> String {
     let base = base.trim_end_matches('/');
-    format!(
-        "{base}/docs/v1/{}/{}?{}{fragment}",
-        params.stem,
-        params.format.as_str(),
-        params.to_query()
-    )
+    format!("{base}{}{fragment}", params.to_path())
+}
+
+/// A short link's target: the redirect's path, its fragment and its expiry.
+///
+/// Built by [`LinkMinter::short_target`], which returns nothing when links are
+/// not configured, the stem is not a stem, or the format is one this
+/// deployment does not serve — the same conditions that make
+/// [`LinkMinter::mint`] return nothing for that format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShortLinkTarget {
+    /// The path from the site root the redirect points at.
+    pub target: String,
+    /// The fragment the redirect appends.
+    pub fragment: String,
+    /// When the signed link behind the code stops working.
+    pub expires_at: u64,
+}
+
+/// The fragment that points a browser at the part of the document a link is
+/// about.
+///
+/// The source is a PDF or an HTML page: the browser can only scroll it to a
+/// page. The markdown is text: the browser can select the passage in it. One
+/// function, because a long link and the short link that redirects to it must
+/// land the reader in the same place.
+fn fragment_for(format: LinkFormat, page: Option<u32>, passage: Option<&str>) -> String {
+    match format {
+        LinkFormat::Source => page
+            .map(hs_common::docs::pdf_page_fragment)
+            .unwrap_or_default(),
+        LinkFormat::Markdown => passage
+            .map(hs_common::docs::text_fragment)
+            .unwrap_or_default(),
+    }
 }
 
 /// The subject a link is bound to when none is configured.
 fn default_subject() -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
+}
+
+/// The two URLs a short-link code answers on.
+///
+/// The code is the whole path segment, so the URL carries nothing that names
+/// the document: what it opens lives in the stored record and is checked when
+/// the redirect is followed.
+fn short_link_urls(lan_base: &str, remote_base: &str, code: &str) -> ShortLinkPair {
+    let lan = lan_base.trim_end_matches('/');
+    let remote = remote_base.trim_end_matches('/');
+    ShortLinkPair {
+        lan: format!("{lan}{}/{code}", hs_common::docs::SHORT_LINK_PATH),
+        remote: format!("{remote}{}/{code}", hs_common::docs::SHORT_LINK_PATH),
+        code: code.to_string(),
+    }
 }
 
 /// The expiry, as an ISO timestamp.
@@ -280,6 +375,53 @@ mod tests {
             .mint("../etc/passwd", "academic", None, None)
             .is_none());
         assert!(minter().mint("", "academic", None, None).is_none());
+    }
+
+    #[test]
+    fn a_short_link_is_a_code_on_both_origins() {
+        let pair = minter().short_urls("abcdefghjkmn").unwrap();
+        assert_eq!(pair.lan, "http://host:7446/s/abcdefghjkmn");
+        assert_eq!(pair.remote, "https://public.example/s/abcdefghjkmn");
+        assert_eq!(pair.code, "abcdefghjkmn");
+    }
+
+    #[test]
+    fn a_short_target_carries_the_page_and_the_fragment() {
+        // The redirect points at a path, so the same code works on whichever
+        // origin served it; the page travels in the query *and* in the fragment
+        // because a browser cannot be made to re-add a fragment after a
+        // redirect.
+        let target = minter()
+            .short_target(
+                "10.1234_abcd",
+                "academic",
+                Some(11),
+                None,
+                LinkFormat::Source,
+            )
+            .unwrap();
+        assert!(
+            target.target.starts_with("/docs/v1/10.1234_abcd/source?"),
+            "{target:?}"
+        );
+        assert!(target.target.contains("page=11"));
+        assert_eq!(target.fragment, "#page=11");
+        assert!(target.expires_at > hs_common::docs::now_secs());
+    }
+
+    #[test]
+    fn a_markdown_short_target_quotes_the_passage() {
+        let target = minter()
+            .short_target(
+                "10.1234_abcd",
+                "academic",
+                Some(11),
+                Some("The passage's first line"),
+                LinkFormat::Markdown,
+            )
+            .unwrap();
+        assert!(target.target.contains("/markdown?"), "{target:?}");
+        assert!(target.fragment.starts_with("#:~:text="), "{target:?}");
     }
 
     #[test]

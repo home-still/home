@@ -147,6 +147,41 @@ mod reconcile {
         assert_eq!(out["scanned_doc_ids"], 2);
     }
 
+    /// The description promises a notice when `dry_run=false` is ignored, and
+    /// the tool used to discard the argument silently: an agent that asked to
+    /// apply read a report as a success. The response now says so, and says
+    /// `false` when nobody asked.
+    #[tokio::test]
+    async fn an_apply_request_is_reported_as_ignored() {
+        let storage = FaultyStorage::new();
+        let distill = FakeDistill::start(vec![]).await;
+        let mcp = server(storage, Some(&distill));
+
+        let asked = mcp
+            .reconcile_orphans(DistillReconcileParams {
+                dry_run: false,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let asked: serde_json::Value = serde_json::from_str(&asked).unwrap();
+        assert_eq!(
+            asked["requested_apply_ignored"], true,
+            "a caller that asked to apply must not read a dry-run report as a success: {asked}"
+        );
+        assert_eq!(
+            asked["dry_run"], true,
+            "the report is still a dry run: {asked}"
+        );
+
+        let not_asked = mcp.reconcile_orphans(reconcile()).await.unwrap();
+        let not_asked: serde_json::Value = serde_json::from_str(&not_asked).unwrap();
+        assert_eq!(
+            not_asked["requested_apply_ignored"], false,
+            "the field reports what the caller asked for, not a constant: {not_asked}"
+        );
+    }
+
     /// The tool asks the server for the whole list; the old 100 000 default
     /// made a larger collection fail outright.
     #[tokio::test]
@@ -313,6 +348,142 @@ mod convert {
             "the stored markdown must be untouched"
         );
         assert_eq!(bus.published.lock().unwrap().len(), 1);
+    }
+
+    /// The queue tool's whole point: the conversion is announced, not run.
+    /// A caller that gets `queued: true` back must be able to see the event
+    /// the watcher will consume, with the keys the watcher reads.
+    #[tokio::test]
+    async fn queueing_publishes_the_ingest_event_and_converts_nothing() {
+        let storage = FaultyStorage::new();
+        let source_key = put_source(&storage, "paper", "html", ARTICLE.as_bytes()).await;
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage.clone(), bus.clone());
+
+        let out = mcp
+            .scribe_queue(Parameters(crate::ScribeQueueParams {
+                stem: stem("paper"),
+            }))
+            .await
+            .unwrap();
+
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["queued"], true);
+        assert_eq!(out["stem"], "paper");
+        assert_eq!(out["source_key"], source_key);
+
+        let published = bus.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            published[0].0,
+            hs_common::event_bus::specs::PAPERS_INGESTED.subject
+        );
+        assert_eq!(published[0].1["key"], source_key);
+        assert_eq!(published[0].1["source"], "mcp:scribe_queue");
+
+        // Queueing is an announcement, not a conversion.
+        assert!(
+            !storage
+                .exists(&hs_common::markdown::markdown_storage_key("paper"))
+                .await
+                .unwrap(),
+            "the tool must not convert anything itself"
+        );
+    }
+
+    /// A queued stem with no stored source would fail in the watcher with no
+    /// one listening, so the tool refuses it at the door.
+    #[tokio::test]
+    async fn queueing_a_stem_with_no_source_publishes_nothing() {
+        let storage = FaultyStorage::new();
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage, bus.clone());
+
+        let err = mcp
+            .scribe_queue(Parameters(crate::ScribeQueueParams {
+                stem: stem("ghost"),
+            }))
+            .await
+            .unwrap_err();
+
+        for ext in ["pdf", "html", "epub"] {
+            assert!(err.contains(&format!("ghost.{ext}")), "{err}");
+        }
+        assert!(bus.published.lock().unwrap().is_empty());
+    }
+}
+
+mod doc_link {
+    use super::*;
+    use crate::stem::Stem;
+    use crate::testkit::{server_with_links, RecordingBus};
+    use hs_common::storage::Storage;
+
+    fn link(stem: &str, short: bool) -> Parameters<crate::DocLinkParams> {
+        Parameters(crate::DocLinkParams {
+            stem: Stem::parse(stem).unwrap(),
+            format: None,
+            page: None,
+            collection: None,
+            short,
+        })
+    }
+
+    /// A short link is an alias, and minting one is a write: the code has to
+    /// exist in the corpus before the caller is told it works, because a code
+    /// the service cannot resolve is a 404 the user would find instead of the
+    /// document.
+    #[tokio::test]
+    async fn a_short_link_is_stored_and_its_code_resolves_to_the_signed_path() {
+        let storage = crate::testkit::FaultyStorage::new();
+        let mcp = server_with_links(storage.clone(), Arc::new(RecordingBus::default()));
+
+        let out = mcp.doc_link(link("10.1234_abcd", true)).await.unwrap();
+
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let code = out["short"]["code"].as_str().unwrap();
+        assert_eq!(out["short"]["lan"], format!("http://host:7446/s/{code}"));
+        assert_eq!(
+            out["short"]["remote"],
+            format!("https://public.example/s/{code}")
+        );
+        // The long links are still there: the code is an addition, not a
+        // replacement.
+        assert!(out["lan"].as_str().unwrap().contains("/docs/v1/"));
+
+        let stored = hs_common::docs::ShortLinks::new(storage.clone())
+            .get(code)
+            .await
+            .unwrap()
+            .expect("the code the caller was given must resolve");
+        assert!(
+            stored.target.starts_with("/docs/v1/10.1234_abcd/source?"),
+            "{}",
+            stored.target
+        );
+        assert_eq!(stored.target, {
+            // What the redirect must land on is exactly the signed link the
+            // caller was also given, so the two cannot drift.
+            let lan = out["lan"].as_str().unwrap();
+            lan.trim_start_matches("http://host:7446").to_string()
+        });
+    }
+
+    /// Without `short` nothing is written: a search hit must not fill the corpus
+    /// with aliases.
+    #[tokio::test]
+    async fn a_link_without_short_stores_nothing() {
+        let storage = crate::testkit::FaultyStorage::new();
+        let mcp = server_with_links(storage.clone(), Arc::new(RecordingBus::default()));
+
+        let out = mcp.doc_link(link("10.1234_abcd", false)).await.unwrap();
+
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(out.get("short").is_none(), "{out}");
+        assert!(
+            storage.list("short-links").await.unwrap().is_empty(),
+            "a link without `short` must not write a code"
+        );
     }
 }
 

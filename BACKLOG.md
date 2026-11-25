@@ -268,6 +268,19 @@ this is a logging concern taking down the entire CLI, including the one command
 **Acceptance:** `hs upgrade --pre --yes` on a host with a 15,933-document corpus exits 0, and a Qdrant that is genuinely down still fails the upgrade with a message that names Qdrant.
 **Partly fixed in rc.388 (2026-10-23):** the upgrade no longer recreates a compose service whose containers already run the images their tags name after the pull and that answers its health URL — the common case (Qdrant's image unchanged), which removes the outage (44.8–67.0 s measured on a copy of the corpus, ~7 min here) and the false timeout together. **Still open:** when the image really changed, the recreate and the 90 s wait are as before; the wait should still distinguish "recovering" from "down". See `docs/loop/runs/2026-10-23-04/`.
 
+### P0-30. A wedged `llama-swap` answers every model-start request with an empty `200` after 240 s and never spawns a backend (found 2026-11-02, rc.389)
+**Symptom:** `big`'s scribe tier converted **nothing** for at least 40 minutes. `GET :8081/running` answered `{"running":[]}` in ~40 µs, but every `POST :8081/v1/chat/completions` — for `olmocr` *and* `glm-ocr` *and* gpu-tenant's own warm-up probe — hung for exactly **240.1 s** and then returned `200` with a **zero-length body**. `gpu-tenant`'s reaper repeated `warm-up of olmocr failed: no answer timed out` every 4 minutes for 40+ minutes. Scribe saw it as `backend_reachable: true, backend_model_resident: false` (the `/health` probe is answered by llama-swap, not by a backend), so it kept dispatching and each conversion died on its own 1800 s deadline.
+**Cause:** llama-swap's supervisor thread was wedged — it had **no child processes at all** except its `nvidia-smi` poller, so `cmd: bash run-olmocr.sh ${PORT}` was never executed; the 240 s is llama-swap's own per-model start wait expiring. `run-olmocr.sh` and vLLM were both healthy: run by hand, vLLM served on :8099 and answered with no error (the same command the swap would have run). `systemctl --user restart llama-swap` fixed it immediately — the next `/running` showed `olmocr state=starting`, then `state=ready` at 19,578 MiB, and conversions completed. The trigger is not identified; the process had been up 2 d 08 h.
+**The trap:** an empty `200` with a live `/running` and a healthy `/health` makes the tier look *up*. The tier's probe (`backend_probe.rs`) asks llama-swap, so it can never distinguish "arbiter alive, backend never started" from "model not resident yet". Scribe then refused nothing (VRAM was 19,615 MB free, above its 13,500 headroom) and burned a slot per event.
+**Change:** (a) treat a completion response with an empty body as a backend start failure, not a success, so the caller sees one clear error instead of an empty answer; (b) the tier's admission probe must confirm the model is actually resident *and* a backend process exists for it (`/running` names a `ready` state), not merely that the arbiter answered; (c) `gpu-tenant reap` must escalate after N consecutive warm-up timeouts — the reaper logged 10 identical failures and did nothing, so a wedged arbiter is invisible to the one component whose job is to notice; (d) the watchdog (`hs-scribe-watchdog.timer`, which exists today) should cover the arbiter, not only `hs-serve-scribe`.
+**Acceptance:** killing llama-swap's supervisor while leaving the HTTP listener answering makes `hs status` name the scribe tier as unavailable within one tick, and `gpu-tenant reap` restarts the arbiter (or posts an actionable board line) instead of repeating `warm-up failed` forever. Reproduced by `SIGSTOP`-ing the supervisor; the fix must clear it without an operator.
+
+### P0-31. A success stamp never clears `embedding_skip`, so catalog rows carry both "embedded" and "not embedded" (found 2026-11-02, rc.389)
+**Symptom:** `catalog/li/lightbown_designing_ux_of_game_dev_tools_2015.yaml` held **both** `embedding: {chunks_indexed: 164, compute_device: Cuda, embedded_at: ...}` **and** `embedding_skip: {reason: "embed_failed: ... gpu busy: 4978 MB free < 5000 MB required ...", at: <15 minutes earlier>}`. The document is in Qdrant and `distill_search` returns it; the row still reads as skipped. `catalog_list(embedded=false)` and any operator count derived from "has an `embedding_skip`" disagree with qdrant's `points_count`.
+**Cause:** `update_embedding_catalog_via` (`hs-common/src/catalog.rs:642-665`) stamps `entry.embedding = Some(...)` and writes the row, but **never sets `entry.embedding_skip = None`**. `update_embedding_skip_via` sets the skip. Nothing in the success path clears it, and the only two `embedding_skip = None` sites are unrelated (`scribe_cmd.rs:260` for reconvert, `hs-mcp/src/main.rs:1485` when synthesising an entry). The reconciler's `classify` reads `has_embedding_stamp` first so it is not misled, but every reader that looks at `embedding_skip` alone is.
+**Change:** one path — the success stamp clears the skip in the same write, so a row can never assert both. Fix it in `update_embedding_catalog_via` (the single writer of `embedding`), not at the call sites.
+**Acceptance:** after any successful index of a stem that previously carried an `embed_failed` skip, its row has `embedding` and no `embedding_skip`. A regression test drives `update_embedding_skip_via` then `update_embedding_catalog_via` on one entry and asserts the second removes the first. Sweep existing rows for the contradictory pair.
+
 ### P0-29. The distill embedder's CUDA arena only grows, and now alone keeps the olmocr tier from starting (found 2026-10-23, rc.388 iteration; needs a decision)
 **Symptom:** the idle embedder held **8,510 MiB** (6,462 the day before, no restart); with the idle `:7433` scribe's 2,340 MiB, 13,137 MiB were free against vLLM's ~15,718. Stopping `:7433` alone is no longer enough (15,477).
 **Measured** (real `OnnxEmbedder`, defaults, 200 real documents): default arena 3,386 → **7,482** MiB after the first document (+4,096, a power-of-two step); `kSameAsRequested` **13,056** (worse — fragmentation); `gpu_mem_limit` 4/5 GiB fails batches (the limit error is not recognised as OOM, so the halving retry never runs). Per-run arena shrinkage needs an ORT run option fastembed does not expose.
@@ -320,6 +333,25 @@ this is a logging concern taking down the entire CLI, including the one command
 ---
 
 ## P1 — Reliability (panics and silent failures in hot paths)
+
+### P1-32. No supported way to obtain the scribe layout and table models
+
+The scribe server loads `pp-doclayoutv3.onnx` and `slanet-plus.onnx` from
+`~/.home-still/models/` (`crates/hs-scribe/src/config.rs:261-262,397-415`),
+but neither code nor docs say where to get them; `crates/hs-scribe/python/`
+holds unrelated legacy scripts. Add a fetch (e.g. to `hs serve scribe`
+auto-init) or document a verified source.
+
+### P1-33. Release binaries cannot use CUDA on a host that never built home-still
+
+`hs-distill-server` and the Linux `hs-scribe-server` link ONNX Runtime
+statically and load its CUDA provider (`libonnxruntime_providers_cuda.so`)
+from `~/.cache/ort.pyke.io/dfbin/` (`hs-common/src/cuda_libs.rs:40-61`). Only
+a `cargo build` with the `cuda` feature populates that cache; the release
+archives contain the binary alone (`.github/workflows/release.yaml:196`). A
+host installed from releases (`install.sh`, `hs upgrade`) therefore has no
+provider and the servers refuse to start. Ship the provider with the release
+(and have `hs upgrade` install it), or document a verified source.
 
 ### P1-27. An olmocr cold start fails whole documents: llama-swap proxies to a vLLM port that is not listening yet (found 2026-10-22, rc.384 iteration)
 **Symptom:** after the model's 60 s `ttl` unload, the next document's six page requests got `500` from llama-swap (`proxy error: dial tcp 127.0.0.1:5801: connect: connection refused`) while vLLM was still loading; olmocr exhausted its per-page retries in ~20 s and reported `Completed pages: 0, Failed pages: 6`. The same PDF converted cleanly (6/6 pages, 109 s) when the model was warm.
@@ -1275,3 +1307,127 @@ Found by the workstreams and reviewers while fixing the above; each re-verified 
 **Evidence:** a fresh `hs status` lost its file ≈25 s after creation (`/proc/<pid>/fd/3` → `.nfs…`); after restarting `home-still-scribe-inbox.service` another probe kept its file for the whole 65 s and ended with `current-*` still in the directory. Flock conflicts on this NFS mount were checked separately (cross-process, same-process, 6 workers plus churn): no live file was adopted.
 **Fixed in rc.364:** the P1-26 fix (P0-24) lets `hs upgrade` restart every discovered unit, including user units, so no pre-rc.362 `hs` process outlives the upgrade. The two stale units were restarted by hand on big; the system units on big keep their dead spool files until the rc.364 upgrade restarts them.
 **Open (not done, owner decision):** (1) the spool has no recovery once its current file vanishes — `rotate_now` retries forever and the data in the unlinked inode is never shipped, though the open handle could still read it; (2) `hs status` leaves the stderr tracing layer on while the TUI owns the terminal, so any WARN corrupts the screen; (3) rollout rule: a host's `hs` processes must all move to rc.362+ together, because pre-rc.362 shippers delete rc.362 spool files.
+
+### P1-29. Distill could never reload its embedder after the idle release — the yield gate discarded the broker's own grant (found 2026-11-05)
+**Symptom:** `hs distill watch-events` logged `distill index failed … 500 Embedding error: gpu busy: yielded to qwen3.8-27b@big` every 30 s for hours, and `hs distill search` answered the same. The distill server was healthy and `/health` said `ok`; three markdown objects redelivered forever and none of the 18 181 converted documents could gain a vector.
+**Evidence, measured on big:**
+- `gpu-tenant make-room --who home-still-distill@big --need-mib 5000` printed `ROOM free=6695` — the card had the room.
+- The server logged `GPU make-room hook ran … code=Some(1) answer="REFUSED: qwen active (idle 0s < 600s)"` at the same instants, because the *broker* had a second defect: a resident coding model went straight to the eviction branch without first asking whether the caller's need already fit in the free VRAM. Fixed in `gpu-tenant/gpu-tenant` `cmd_make_room` (a co-tenant that fits is admitted before eviction is considered; tests `test_admits_a_co_tenant_that_already_fits_beside_a_resident_qwen`, `test_a_co_tenant_that_does_not_fit_still_needs_an_idle_qwen`).
+- With the broker fixed the hook answered `ROOM`, and the load *still* failed: `LoadGate::check` re-read the yield file after the grant. The yield file is the broker's own state, and a grant is precisely the statement that it no longer excludes us, so the file the grant was about discarded every grant. Proven by releasing the embedder (`POST /embedder/release`) and calling `hs distill search`: `gpu busy: yielded to qwen3.8-27b@big` while `make-room` printed `ROOM free=6695`.
+**Impact:** a manual `systemctl --user restart hs-serve-distill-user` was the only way to load the embedder, and it was needed again every time the 120 s idle release fired. Indexing throughput was effectively zero.
+**Fixed (branch `fix/distill-reload-after-broker-grant`, commit 474bb37):** the post-grant verdict consults VRAM only, matching the startup path. A card that genuinely lacks the floor still refuses; a refused grant still names the yield holder. Both host probes are injected into `LoadGate::check_with`, so the precedence is tested through the real call path — reverting the fix makes `a_granted_load_proceeds_even_though_the_yield_file_still_names_qwen` and `a_grant_does_not_override_a_card_that_still_cannot_hold_the_model` fail. Gate: `cargo fmt --all --check`, `cargo clippy -p hs-distill --features cuda --all-targets -- -D warnings`, `unshare -rn sh -c 'ip link set lo up && cargo test -p hs-distill --features cuda --lib'` → 323 passed.
+**Residue:** not yet in a tagged release; `big` runs the hand-built binary until an rc ships it.
+
+### P1-30. bmb ran rc.382, whose repetition detector permanently rejected most documents it converted (found 2026-11-05)
+**Symptom:** of the conversions the scribe pool routed to bmb, the great majority ended in `scribe handler permanent failure — terminating (will not redeliver) … converted with N region(s) the server could not process; refusing to record a conversion with holes`. In the 24 h to 08:00 on 2026-11-05: **124 permanent failures against 11 "markdown already present"**. `hs pipeline reconvert-failed --dry-run` reports 309 of the 330 retryable failures as `gapped_conversion`.
+**Cause:** bmb was on **hs 0.0.1-rc.382 (2026-10-22)**. The detector rewrite that made the gate fire only on *consecutive* periodicity landed in `621afa6`, first released in **rc.385**; rc.382 has the older rule, which aborts a region on ordinary human repetition (affiliation lists, citation runs) and — because any skipped region makes `qc_verdict` return `RejectGapped` — rejects the whole document.
+**Evidence from the corpus's own diagnostics:** over the 40 newest `/mnt/home-still/diag/*.diag.jsonl`, **20 487 aborted regions in 32 331 pages** (63 %), decomposed as `repetition_aborted 20487, crop_skipped 0` — every skip is the detector, none is a geometry fault. Individual aborts land at a median of ~250–1000 bytes of output, far short of a runaway loop.
+**Fixed:** `hs upgrade --pre` on bmb → **rc.389**, verified live (`/health` reports `0.0.1-rc.389`). No `aborted region` lines and no `gapped_conversion` rejections since.
+**Residue:** the 309 documents already stamped `gapped_conversion` need `hs pipeline reconvert-failed` to be retried against the fixed binary; they are queued, not lost.
+**2026-11-05 — shipped.** Merged as `3282eae` (main), with the runner-only test flake it surfaced fixed alongside it in `38e3329`. All three CI legs green (`big` 2m41s, `macos-14` 4m23s, `windows-2022` 9m46s). Two independent defects were involved, both real:
+1. **The broker never admitted a co-tenant that already fit.** `gpu-tenant`'s `cmd_make_room` jumped straight to eviction whenever a coding model was resident, without first asking whether the caller's need fitted in the VRAM already free. Fixed in `~/home-cloud/gpu-tenant/gpu-tenant` (26 tests green): a co-tenant that fits is admitted before eviction is considered.
+2. **The gate then discarded the grant.** `LoadGate::check` re-read the yield file after the broker said yes. Fixed on `main` as above.
+
+**Until an rc ships the fix, `big`'s embedder does not idle-release** (`distill_server.embedding.idle_release_secs` removed from `big`'s config on 2026-11-05; backup at `/tmp/config.yaml.bak-*`). That keeps the reload path out of play entirely. Re-setting it is safe once the deployed `hs` is rc.390 or later.
+
+**2026-11-05 — interim config on `big` while the fix waits for an rc.** Two settings were changed by hand on `big` (`~/.home-still/config.yaml`, backups at `/tmp/config.yaml.bak-*`); no code. Both should be revisited when the deployed `hs` is at least rc.390, which carries the merged gate fix:
+1. `distill_server.embedding.idle_release_secs: 120` — **removed**, so the embedder never releases. With rc.389's gate, a release was permanent (every reload refused) and only a server restart recovered it.
+2. `distill_server.embedding.adaptive_batch: false` with `batch_size: 8` — the EWMA controller hill-climbed the batch against throughput and grew the embedder from **3,382 MB to 6,932 MB**, leaving the card at **55 MiB free** with qwen resident (that measurement is the one worth keeping: an unbounded adaptive batch on a shared 24 GB card eats whatever is left). Pinned at 8 the footprint is **3,382 MB steady** and free VRAM is **3,605 MiB**, with indexing still clean (0 failures in 5 min). Once the reload path is fixed, re-enabling `idle_release_secs` is safe; whether to restore `adaptive_batch` should be decided on measured ingest throughput at both settings, not assumed.
+
+**Not investigated, noticed in passing (2026-11-05):** `hs status` reported the inbox `Watcher` running on **mac_air** with `swept 0 / 161` and a 6 s-old tick, while mac_air has not been a scribe pool member since 2026-04-24. The heartbeat is read from S3 (`INBOX_HEARTBEAT_KEY`) and liveness is the object's `last_modified`, so a process there is genuinely ticking; whether mac_air sweeping the inbox is *intended* is a separate question from the pipeline health above. Also: the `Indexer` row said `done · 2836 indexed · 0 chunks` from a status file last written at 09:08, ~90 min stale — accurate for the one-shot `hs distill index` daemon it describes, but easy to misread as the live indexer while `hs distill watch-events` is the thing actually indexing.
+
+### P1-31. Conversions are capped at 60 minutes, so the corpus's largest books can never convert — and after 5 attempts are dropped permanently (found 2026-11-05)
+**Symptom:** the 694-page *Rules of Play* was dispatched at 08:17 with `timeout_secs=3600`; at 09:17 it failed `scribe convert failed`, was redelivered, and started again from page 1. Five such documents occupied every scribe slot at once (522, 385, 360, 253, 253 pages), with `total_conversions` flat for over 20 minutes. 18 deadline aborts today across the watchers.
+**Evidence:** measured page rate on bmb's own log timestamps is **6.3 s/page**. That implies **72 min for 694 pages** and **54 min for 522** — both at or past the cap. The book is not failing to convert; it is being killed at 60 min every time, and `events.nats.max_deliver: 5` (NATS `max_deliver` 5, confirmed on the live consumer) then **drops the message permanently**, so these documents are lost rather than retried. `ceiling_secs` is a flat cap that ignores page count even though `per_page_secs` exists to scale it — the same length-blind shape as the QC absolute ceiling that was already fixed.
+**Interim fix on `big` (2026-11-05, config only, backup `/tmp/config.yaml.bak-timeout`):** `scribe.timeout_policy.ceiling_secs` 3600 → **7200**. Verified live: both watchers now log `ceiling_secs=7200`. `ack_wait` was **not** changed: the doc comment on `NatsYaml::ack_wait_secs` ("must be ≥ the timeout policy's ceiling") is misleading — the watchers send a progress heartbeat every `ack_wait / 3` while a handler runs, so `ack_wait` bounds only how long an event stays invisible after a watcher *crash*, not the length of a conversion. Raising it for this reason would have been cargo-culting the comment over the implementation. The comment should be corrected.
+**Not fixed:** 7200 s still caps a 12,000-page book at the same length-blind wall. The real fix is to derive the ceiling from page count (or raise it well past the largest document in the corpus) **and** to make `max_deliver` exhaustion visible — a document dropped after 5 attempts should end up stamped `conversion_failed` with a reason, not silently vanish from the queue.
+**Also stale in `big`'s config:** `scribe.timeout_policy.fallback_secs` is warned as an unknown key on every watcher start and does nothing; `scribe.autotune` and `scribe.use_cuda` were warned the same way on bmb. Worth a pass over `~/.home-still/config.yaml` against the documented key set.
+
+### P1-32. Restarting a scribe watcher strands in-flight messages until `ack_wait` expires, and can wedge delivery entirely (found 2026-11-05)
+**Symptom:** after `systemctl --user restart hs-scribe-watch-events{,-bmb}` to pick up a timeout-policy change, bmb went **completely idle** — 6/6 slots free, `in_flight_conversions: 0`, 661 documents queued — and stayed that way. `scribe-workers` showed `ack_pending: 32` with `num_pending: 629` and two consumers waiting.
+**Cause:** the restart kills handlers mid-conversion, and their deliveries stay **acked-pending** in JetStream until `ack_wait` (default 7200 s) expires. `max_ack_pending` is 32 (`hs-common/src/event_bus/config.rs:99`), so the 32 orphaned deliveries **filled the entire in-flight window** and JetStream delivered nothing new for the next two hours.
+**Workaround used:** raised `events.nats.max_ack_pending` to 64 on `big`, which let delivery resume immediately (the orphans expire on their own and are then redelivered). Queue went from frozen to flowing within 30 s — `num_pending` 629 → 594, four conversions in flight, and `hs status` `Queued` 661 → 658.
+**Why this matters beyond the workaround:** any restart of a watcher with a full in-flight window silently stops ingestion for up to `ack_wait`. The default pairing (32 pending slots, 2 h ack_wait) makes a routine `systemctl restart` a two-hour outage. Options worth weighing: a lower `ack_wait` (heartbeats make it safe), draining before restart (`SIGTERM` already waits for handlers, so a plain `restart` should stop the watcher *before* the new one starts pulling — verify systemd is not overlapping them), or a `max_ack_pending` comfortably above `concurrency`.
+**Not fixed in code.** Logged rather than changed, because lowering `ack_wait` alters crash-recovery behaviour and wants its own measurement.
+
+### P1-33. A corrupt source refused *before dispatch* is never stamped, so it re-queues forever (found 2026-11-10)
+**Observed on `big`:** `hs status` showed `Queued 0` with `Stalled 24`; the 24 are papers with a source file, no markdown and **no failure stamp**. `hs pipeline catch-up --dry-run` reported them as `24 pending republish` on every run.
+**Evidence.** Running `hs pipeline catch-up --yes` republished all 24 (`papers_republished=24 errors=0`). Both watchers consumed them immediately and each ended in
+`PDF refused before dispatch … code="pdf_parse_error" error=PDF cannot be opened (pdfium error 3)` → `scribe handler permanent failure — terminating (will not redeliver)`.
+Then `catch-up --dry-run` **still** listed the same 24, because nothing was recorded. The catalog rows are the reason they cannot be recorded: `catalog/Ph/Physically_Based_Rendering_3rd.yaml` is **3 bytes — literally `{}`** — and so are the other sampled stems (`newman_building_microservices_2nd`, `book_artists_guide_human_anatomy_bammes`). A phantom row has no `conversion_failed` field to write.
+**The sources really are corrupt, so refusing is correct.** Downloaded `papers/ne/newman_building_microservices_2nd.pdf`: **7,340,032 bytes = exactly 7 MiB**, the last 40 bytes are mid-stream binary, and there is **no `%%EOF`** anywhere in the final 1 KiB. `Physically_Based_Rendering_3rd.pdf` is 22,343,680 bytes and does open (`%PDF-1.7`), while `book_artists_guide_human_anatomy_bammes.pdf` is **30,408,704 = 29 MiB** exactly. Exact-MiB sizes with no EOF marker are truncated uploads.
+**The defect is the missing stamp, not the refusal.** `event_watch.rs` (~line 240) returns `HandlerError::Permanent` for a pre-dispatch `pdf_parse_error` *without* calling `update_conversion_failed_via`, unlike the QC `RejectGapped`/`RejectLoop` paths which do stamp. Two halves to fix: (a) stamp the failure so the source-scan stops re-queueing it; (b) `hs pipeline catch-up` should treat a phantom `{}` catalog row as its own repair case, or say why it cannot be stamped, instead of reporting "pending republish" for ever. Today `Stalled` never reaches 0 and the same 24 events are republished on every catch-up.
+
+### P1-34. `run-olmocr.sh` had drifted to `--gpu-memory-utilization 0.65`, so olmocr could never start and both scribe servers looked idle (found 2026-11-10)
+**Observed on `big`:** `llama-swap.service` was `inactive (dead)`, `Result=success`, exit status 0, last stopped 2026-11-09 11:05 — i.e. an explicit stop, not a crash (`Restart=always` would otherwise have brought it back). The user journal retains nothing from that window, so the cause of the stop is unrecoverable. Consequence: big's scribe reported
+`backend unavailable: the VLM backend is unreachable · 15.5 GiB free`, and `total_conversions: 0` with `last_conversion_at: null`.
+**Starting llama-swap was not enough.** olmocr then stuck in `state: starting`; `/tmp/vllm-child.log` said exactly why:
+`ValueError: Free memory on device (15.24/23.61 GiB) on startup is less than desired GPU memory utilization (0.65, 15.35 GiB)` — short by **113 MiB**. `~/.home-still/llama-swap.yaml`'s own comment documents **0.60** as the value chosen on 2026-06-30 precisely so vLLM coexists with the pinned distill embedder ("0.75 no longer fit and vLLM crash-looped"), but `run-olmocr.sh` had drifted to 0.65. 0.60 needs 14.17 GiB against 15.24 free.
+**Fixed on `big` (script only, backup `/tmp/run-olmocr.sh.bak-*`):** `--gpu-memory-utilization` 0.65 → **0.60**, then `llama-swap` restarted. olmocr reached `state: ready`; scribe went to `ok`, `backend_model_resident: true`; and a real end-to-end convert succeeded (`hs scribe convert` → **EXIT=0, 40,522 bytes of coherent markdown**, and the server logged `CLI exited cleanly completed=6 failed=0`).
+**Still unexplained:** why llama-swap was stopped. `enabled` + `Restart=always` means nothing scheduled should stop it, and the unit being `inactive` rather than `failed` implies `systemctl stop`. Worth a watchdog — a dead `:8081` silently disables every scribe on that host while `hs status` only reports it as one unhealthy row among several.
+
+### P1-35. `system_status` costs 13.7 s, so a single fast download is over before any surface can sample it (found 2026-11-10)
+**Context.** Pipeline downloads had no observable state at all until they finished (see the `feat/download-inflight` PR): the bytes are collected in memory and written with one `put`, and `downloaded_at` is stamped afterwards, so neither storage nor History could see a transfer in progress. That PR adds an in-flight registry and a `Downloading` row.
+**The remaining limit, measured on `big`:** `system_status` — the single source the panel reads — takes **13.7 s** on the deployed release build and **27 s** on a debug build. A 91 KB PDF finished in about 2 s, and a 557 KB one in about 3 s, so both were over before a sample landed. Concretely: one download shows `Downloading: 0`; a **sequential batch** of eight is caught (`Downloading: 1 · 557 KB / 557 KB · 10.1371_journal.pone.0000315`). The ingest work that prompted this (200 papers, run one DOI at a time) is visible; a single manual download usually is not.
+**Why it is slow:** `build_status_snapshot` walks the whole catalog to compute counts, drift and History on every call. Nothing is cached between calls.
+**Not attempted here, deliberately:** the row is correct and the registry is cheap, so this is a latency problem in a different component. Options, in increasing cost: (a) a cheap status read that reports only process-local liveness fields (in-flight conversions, active downloads, heartbeat) and skips the catalog walk — this is what the panel needs for a 3 s refresh; (b) cache the catalog-derived counts with a short TTL and invalidate on catalog writes; (c) sample only on transfer start rather than continuous progress.
+**Verification that the wiring works regardless:** both render paths are covered by tests, and the live batch capture above proves the registry reaches the panel.
+
+### P1-36. `big_mac` cannot run `hs upgrade`: outbound TCP 443 is blocked at the OS level (found rc.393 rollout, 2026-11-11)
+**Symptom.** `hs upgrade --pre --yes` on `big_mac` stops at the first step:
+`Failed to reach GitHub API: … tcp connect error: Can't assign requested address (os error 49)`.
+`hs --version` there stays at **rc.382** while every other host moved to rc.393.
+**Measured 2026-11-11 on the host.** `dscacheutil -q host -a name api.github.com` resolves
+(`140.82.114.5`), so it is not DNS. `nc -z -G 5 api.github.com 443` reports **BLOCKED**, and
+`route -n get 1.1.1.1` names a live default route (`<gateway-ip>`, `en10`). `curl` to
+`api.github.com` exits **7** (could not connect). So the block is outbound TCP 443 itself.
+**Not new and not caused by rc.393.** This is the same condition recorded against rc.355
+(`scribe.servers` on `big` has `http://big_mac:7433` commented out since 2026-05-13 for exactly
+this). It is logged here because the rollout report must not read "fleet deployed" while one
+host is 11 release candidates behind.
+**Why it matters little for this rc:** `big_mac` runs no docs service, so neither defect rc.393
+fixes is reachable there. It does run an `hs` CLI and, per rc.355, a scribe LaunchAgent.
+**Options, none taken here:** (a) fix the host's outbound policy — the real fix, outside this
+repo; (b) let `hs upgrade` accept a local artifact path so a blocked host can be updated from a
+file carried over SSH, which is a feature, not a workaround, and would need its own rc;
+(c) delete the stale LaunchAgents if `big_mac` is not meant to be a scribe member at all
+(the rc.355 finding suggests it is not).
+
+### P1-37. The macOS 14 runner label was retired under the release gate (found rc.391/rc.392, 2026-11-11)
+**Symptom.** Every tag began failing the gate in **about one second** with
+`The configuration 'macos-14-arm64-us-default' is not supported`. No step ran; `big` and
+`windows-2022` passed. A `--failed` rerun failed identically, so it was not flake.
+**Cause.** GitHub retired the macOS 14 images on **2026-11-02**. rc.390's gate had run the same
+label successfully on 2026-11-05, so the rollout reached this repository after that.
+**Fixed in rc.393**: `ci.yaml` and `release.yaml` move to `macos-15`, which is also arm64, so the
+aarch64 leg is still native and `x86_64-apple-darwin` is still cross-compiled and verified by
+file type plus version marker (`run_native: false`). A comment in each file records the reason.
+**Worth knowing:** this blocked *every* tag for nine days' worth of rc candidates and had nothing
+to do with the change being released. A gate whose failures are all "runner not supported" should
+be distinguishable from a gate that failed on code — check for a sub-5-second gate job first.
+
+### P1-38. `paper/tests/config_load.rs` used a POSIX-absolute path as "a file that is absent" (found rc.392, 2026-11-11)
+**Symptom.** The `windows-2022` gate leg failed inside the *setup* of
+`a_malformed_storage_or_events_section_is_an_error_not_the_defaults`:
+`Unreadable { path: "/nonexistent/config.yaml", source: Os { code: 64, kind: Uncategorized,
+message: "The specified network name is no longer available." } }`.
+**Cause.** `ConfigFile::load_at` treats only `NotFound` as "absent" and reports every other read
+error as `Unreadable` — which is the correct rule. `/nonexistent/config.yaml` is a POSIX absolute
+path; on Windows it did not resolve to a local missing file. The test then `unwrap()`ed in its own
+setup, so it never reached an assertion.
+**Fixed in rc.393:** the absent path is now a name inside the jail (local and unwritten on every
+platform), and the contract is pinned where it belongs —
+`a_system_file_that_is_not_there_is_an_absent_config_not_an_error` in `hs-common/src/config_file.rs`
+asserts `load_at` over a missing path is `Ok` with `exists() == false`.
+**Why it surfaced now:** rc.390 passed that leg on 2026-11-05 only because the Windows job ran
+lucky; the macOS retirement (P1-37) moved which legs ran and exposed it. `big` never exercises this
+path, so a Linux-only local gate could not see it.
+
+### P1-39. Nothing prunes the short-link table, so it grows without bound (found rc.394, 2026-11-11)
+**Symptom.** `short-links/<code>.json` records accumulate in the storage backend forever unless
+someone remembers to run `hs docs prune`.
+**Cause.** The command exists and is documented, but no service, timer or unit runs it — the same
+shape P0-25 had: a maintenance path that exists only in a README. An expired code is harmless (the
+service answers it `404`), so this is clutter rather than a fault, but it is unbounded.
+**Fix.** Schedule it: a weekly timer on the host that owns the corpus storage. Until then the
+how-to says a cron entry is enough, which puts the burden on the operator.

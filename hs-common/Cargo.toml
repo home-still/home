@@ -49,10 +49,13 @@ auth = [
     "dep:http",
     "dep:subtle",
 ]
-# Signed, expiring document links: the signer, the verifier and the
-# revocation list. Builds on `auth` for the HMAC and the key handling.
+# Signed, expiring document links: the signer, the verifier, the
+# revocation list and the short-link alias table. Builds on `auth` for the
+# HMAC and the key handling, and on `storage` because a short link is a
+# record beside the documents rather than an in-memory map.
 docs = [
     "auth",
+    "storage",
     "dep:anyhow",
 ]
 storage = [

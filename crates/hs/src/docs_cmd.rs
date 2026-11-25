@@ -15,6 +15,8 @@ use hs_common::reporter::Reporter;
 pub enum DocsCmd {
     /// Mint a link to a document.
     Link(DocsLinkArgs),
+    /// Delete the short links whose signed link has expired.
+    Prune,
 }
 
 #[derive(Args, Debug)]
@@ -56,6 +58,14 @@ pub struct DocsLinkArgs {
     /// Print the remote URL as well as the LAN one.
     #[arg(long)]
     pub remote: bool,
+
+    /// Mint a short link — `<base>/s/<code>` — instead of the full signed URL.
+    ///
+    /// The code is stored in the corpus and answered with a redirect, so it
+    /// needs the storage section of the config. It outlives nothing the full
+    /// link does not: it expires with it, and `hs docs prune` deletes it.
+    #[arg(long)]
+    pub short: bool,
 }
 
 /// The default link lifetime, in seconds.
@@ -69,7 +79,37 @@ pub const DEFAULT_TTL_SECS: u64 = 3600;
 pub async fn dispatch(cmd: DocsCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
     match cmd {
         DocsCmd::Link(args) => link(args, reporter).await,
+        DocsCmd::Prune => prune(reporter).await,
     }
+}
+
+/// Delete the short links whose signed link has expired.
+async fn prune(reporter: &Arc<dyn Reporter>) -> Result<()> {
+    let storage = short_link_storage()?;
+    let store = hs_common::docs::ShortLinks::new(storage);
+    let deleted = store.prune().await?;
+    reporter.status(
+        "Pruned",
+        &format!("{} expired short link(s)", deleted.len()),
+    );
+    Ok(())
+}
+
+/// The corpus's storage, for the short-link table.
+fn short_link_storage() -> Result<Arc<dyn hs_common::storage::Storage>> {
+    let file = hs_common::config_file::ConfigFile::load()?;
+    let storage_cfg = file
+        .section::<hs_common::storage::StorageConfig>("storage")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "short links live in the corpus's storage, which needs a `storage:` section in \
+                 ~/.home-still/config.yaml (backend: local|s3)"
+            )
+        })?;
+    let storage = storage_cfg
+        .build()
+        .map_err(|e| anyhow::anyhow!("storage config invalid: {e:#}"))?;
+    Ok(storage)
 }
 
 /// Mint a link.
@@ -126,16 +166,65 @@ async fn link(args: DocsLinkArgs, reporter: &Arc<dyn Reporter>) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("minting the link failed: {e}"))?;
 
     let lan = link_url(&base_url, &params);
-    reporter.finish(&lan);
-    if let Some(remote_base) = remote_base {
-        let remote = link_url(&remote_base, &params);
-        reporter.finish(&remote);
+    if !args.short {
+        // The URL is this command's result, so it goes to stdout: it is what
+        // a caller pipes or captures, and it must survive `--quiet`. The
+        // reporter writes progress to stderr and renders differently on a
+        // terminal; it keeps the one line a human reads, the expiry.
+        println!("{lan}");
+        if let Some(remote_base) = remote_base {
+            println!("{}", link_url(&remote_base, &params));
+        }
+        reporter.status(
+            "Expires",
+            &format!("{} ({} seconds)", expires_at_iso(params.expires_at), ttl),
+        );
+        return Ok(());
     }
-    reporter.finish(&format!(
-        "expires at {} ({} seconds)",
-        expires_at_iso(params.expires_at),
-        ttl
-    ));
+
+    // A short link is an alias for the signed one above: the code goes in the
+    // corpus and the service answers it with a redirect. Nothing else changes,
+    // so the signed link is still what a browser ends up on.
+    let store = hs_common::docs::ShortLinks::new(short_link_storage()?);
+    let code = loop {
+        let candidate = hs_common::docs::new_short_link_code();
+        // A collision is vanishingly unlikely, but overwriting someone else's
+        // code would silently repoint their link.
+        if store.get(&candidate).await?.is_none() {
+            break candidate;
+        }
+    };
+    let fragment = params
+        .page
+        .map(hs_common::docs::pdf_page_fragment)
+        .unwrap_or_default();
+    store
+        .put(
+            &code,
+            &hs_common::docs::ShortLink {
+                target: params.to_path(),
+                fragment,
+                expires_at: params.expires_at,
+            },
+        )
+        .await?;
+
+    println!(
+        "{}{}/{code}",
+        base_url.trim_end_matches('/'),
+        hs_common::docs::SHORT_LINK_PATH
+    );
+    if let Some(remote_base) = remote_base {
+        println!(
+            "{}{}/{code}",
+            remote_base.trim_end_matches('/'),
+            hs_common::docs::SHORT_LINK_PATH
+        );
+    }
+    reporter.status(
+        "Expires",
+        &format!("{} ({} seconds)", expires_at_iso(params.expires_at), ttl),
+    );
     Ok(())
 }
 
@@ -169,12 +258,7 @@ fn link_url(base: &str, params: &hs_common::docs::LinkParams) -> String {
         .page
         .map(hs_common::docs::pdf_page_fragment)
         .unwrap_or_default();
-    format!(
-        "{base}/docs/v1/{}/{}?{}{fragment}",
-        params.stem,
-        params.format.as_str(),
-        params.to_query()
-    )
+    format!("{base}{}{fragment}", params.to_path())
 }
 
 /// The subject a link is bound to when none is configured: the name of

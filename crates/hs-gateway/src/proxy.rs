@@ -96,6 +96,9 @@ pub enum RouteError {
 ///
 /// The request's `Range` header is forwarded, so a PDF viewer seeking
 /// to a page works through the gateway exactly as it does on the LAN.
+///
+/// `/s/<code>` shares this handler: a short link is a redirect to a signed
+/// one, and the browser that follows it has no bearer token either.
 pub async fn docs_handler(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
     // The path is checked here, exactly as in the authenticated proxy.
     if check_path(req.uri().path()).is_err() {

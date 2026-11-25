@@ -16,10 +16,11 @@
 //! # The client never names a file
 //!
 //! A request names a *stem*. The service decides where that stem's
-//! source object lives, by probing the same `pdf` → `html` → `epub`
-//! order the MCP server uses. A client that asks for
-//! `papers/10/whatever.pdf` is refused: it asked for a storage key, and
-//! storage keys are not a public interface.
+//! source object lives, by probing, for an academic stem, the same
+//! `pdf` → `html` → `epub` order the MCP server uses, and, for a
+//! personal stem, the formats the personal store accepts. A client that
+//! asks for `papers/10/whatever.pdf` is refused: it asked for a storage
+//! key, and storage keys are not a public interface.
 
 use std::sync::Arc;
 
@@ -34,11 +35,20 @@ use futures::StreamExt;
 use hs_common::docs::{LinkFormat, LinkKey, LinkQuery, Revocations};
 use hs_common::storage::{ByteRange, Storage};
 
-/// The extensions a source object may have, in probe order.
+/// The extensions an academic source object may have, in probe order.
 ///
 /// The same order the MCP server's `find_source_key` uses, so a link
 /// and a tool agree on which file a stem means.
-const SOURCE_EXTENSIONS: [&str; 3] = ["pdf", "html", "epub"];
+const ACADEMIC_SOURCE_EXTENSIONS: [&str; 3] = ["pdf", "html", "epub"];
+
+/// The extensions a personal source object may have, in probe order.
+///
+/// The personal store keeps a document under its own extension (see
+/// `personal::models::SourceFormat`): a scan stored as `.docx` or notes
+/// ingested as markdown have no PDF at all. Probing only the academic
+/// list gave 12 of 86 personal documents a source link that answered
+/// 404.
+const PERSONAL_SOURCE_EXTENSIONS: [&str; 5] = ["pdf", "epub", "docx", "md", "txt"];
 
 /// The separator between the pages of a converted markdown.
 ///
@@ -67,6 +77,10 @@ pub struct DocsState {
     /// document in another. A collection the service does not serve is a
     /// 404 — there is one path, and it is the one this list names.
     pub collections: Vec<CollectionLayout>,
+    /// The short links this deployment has minted. Codes live in the corpus's
+    /// storage beside the documents, so a code minted by the MCP server on one
+    /// host resolves here.
+    pub short_links: hs_common::docs::ShortLinks,
 }
 
 /// Where one collection's objects live.
@@ -78,6 +92,9 @@ pub struct CollectionLayout {
     pub papers_prefix: String,
     /// The prefix the markdown lives under.
     pub markdown_prefix: String,
+    /// The source extensions this collection's documents may have, in
+    /// probe order.
+    pub source_extensions: &'static [&'static str],
 }
 
 impl CollectionLayout {
@@ -88,6 +105,7 @@ impl CollectionLayout {
             name: "academic".to_string(),
             papers_prefix: papers_prefix.to_string(),
             markdown_prefix: markdown_prefix.to_string(),
+            source_extensions: &ACADEMIC_SOURCE_EXTENSIONS,
         }
     }
 
@@ -96,11 +114,16 @@ impl CollectionLayout {
     /// Its layout is the corpus's layout, one prefix deeper: the
     /// sources are under `<prefix>/<shard>/<stem>.pdf` and the
     /// converted text under `<prefix>/markdown/<shard>/<stem>.md`.
+    ///
+    /// A personal source is whatever the document was ingested as, so
+    /// this collection probes every format the personal store accepts,
+    /// not the academic list.
     pub fn personal(prefix: &str) -> Self {
         Self {
             name: "personal".to_string(),
             papers_prefix: prefix.to_string(),
             markdown_prefix: format!("{}/markdown", prefix.trim_end_matches('/')),
+            source_extensions: &PERSONAL_SOURCE_EXTENSIONS,
         }
     }
 }
@@ -111,6 +134,11 @@ pub fn router(state: Arc<DocsState>) -> Router {
         .route("/health", get(health))
         .route("/docs/v1/{stem}/source", get(serve_source))
         .route("/docs/v1/{stem}/markdown", get(serve_markdown))
+        // A short link: `<base>/s/<code>` is answered with a redirect to the
+        // signed link it stands for. The redirect is relative, so one code
+        // works on whichever origin served it — the LAN base URL and the
+        // remote base URL serve the same paths.
+        .route("/s/{code}", get(serve_short_link))
         .layer(axum::middleware::from_fn(catch_panic))
         .with_state(state)
 }
@@ -156,6 +184,54 @@ fn bad_request() -> Response {
         "bad request",
     )
         .into_response()
+}
+
+/// A short link, answered with a redirect to the signed link it stands for.
+///
+/// The code is a pointer, not a capability: what it points at is signed,
+/// expiring and checked by the same verifier every other link goes through, so
+/// this handler adds no way to reach a document that a signed link would not
+/// already reach. What it does add is a URL short enough to paste, read out
+/// loud, and keep on one line.
+///
+/// The `Location` is a **path** — `/docs/v1/<stem>/source?…` plus the fragment
+/// — so the same code works at home and away: the LAN base URL and the remote
+/// base URL serve the same paths, and a stored absolute URL would pin one
+/// origin.
+async fn serve_short_link(
+    State(state): State<Arc<DocsState>>,
+    Path(code): Path<String>,
+) -> Response {
+    // An unknown code, a malformed code and an expired code are one answer:
+    // 404. Distinguishing them would tell a prober which codes exist.
+    let link = match state.short_links.get(&code).await {
+        Ok(Some(link)) => link,
+        Ok(None) => return not_found(),
+        Err(e) => {
+            // A storage failure is not "no such code": say so, because the
+            // operator must be able to tell a bad link from a broken store.
+            tracing::error!("short link {code} could not be read: {e:#}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "short links are unavailable",
+            )
+                .into_response();
+        }
+    };
+    let location = link.location();
+    let Ok(location) = HeaderValue::from_str(&location) else {
+        // The stored target is written by `hs docs link --short` and the MCP
+        // tool, both of which build it from validated parts; a value that is
+        // not header-safe means the record was written by something else.
+        tracing::error!("short link {code} has a target that is not a valid Location");
+        return not_found();
+    };
+    // `302`, not `301`: a short link's target can be re-minted under the same
+    // code, and a permanent redirect would be cached by the browser forever.
+    let mut response = StatusCode::FOUND.into_response();
+    response.headers_mut().insert(header::LOCATION, location);
+    response
 }
 
 /// The document's source object.
@@ -241,12 +317,10 @@ async fn serve(
     // `body` is `Some` when the link names a page of the markdown: that
     // page is served in place of the whole document.
     let (key, content_type, extension, body) = match format {
-        LinkFormat::Source => {
-            match find_source_key(&*state.storage, &layout.papers_prefix, &stem).await {
-                Some((key, content_type, extension)) => (key, content_type, extension, None),
-                None => return not_found(),
-            }
-        }
+        LinkFormat::Source => match find_source_key(&*state.storage, layout, &stem).await {
+            Some((key, content_type, extension)) => (key, content_type, extension, None),
+            None => return not_found(),
+        },
         LinkFormat::Markdown => {
             let key = format!(
                 "{}/{}",
@@ -444,25 +518,29 @@ where
 
 use axum::extract::FromRequestParts;
 
-/// Find a stem's source object, probing the extensions in order.
+/// Find a stem's source object, probing the collection's extensions in
+/// order.
 ///
 /// Returns the key, the content type and the extension.
 async fn find_source_key(
     storage: &dyn Storage,
-    papers_prefix: &str,
+    layout: &CollectionLayout,
     stem: &str,
 ) -> Option<(String, String, String)> {
-    for ext in SOURCE_EXTENSIONS {
+    for ext in layout.source_extensions {
         let key = format!(
             "{}/{}",
-            papers_prefix.trim_end_matches('/'),
+            layout.papers_prefix.trim_end_matches('/'),
             hs_common::sharded_key(stem, ext)
         );
         if storage.head(&key).await.ok().flatten().is_some() {
-            let content_type = match ext {
+            let content_type = match *ext {
                 "pdf" => "application/pdf",
                 "html" => "text/html; charset=utf-8",
                 "epub" => "application/epub+zip",
+                "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "md" => "text/markdown; charset=utf-8",
+                "txt" => "text/plain; charset=utf-8",
                 _ => "application/octet-stream",
             };
             return Some((key, content_type.to_string(), ext.to_string()));
@@ -590,9 +668,10 @@ mod tests {
     async fn service(
         dir: &std::path::Path,
     ) -> (Router, hs_common::docs::LinkKey, std::sync::Arc<DocsState>) {
-        let storage = Arc::new(LocalFsStorage::new(dir));
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(dir));
         let key = hs_common::docs::LinkKey::from_bytes(vec![11u8; 32]).unwrap();
         let state = Arc::new(DocsState {
+            short_links: hs_common::docs::ShortLinks::new(storage.clone()),
             storage,
             key: key.clone(),
             revocations: Revocations::default(),
@@ -617,7 +696,13 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let client = reqwest::Client::new();
+        // Redirects are not followed: a short link *is* a `302`, and a client
+        // that follows it reports the document's `200` instead, which would
+        // hide the redirect this helper exists to observe.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
         let mut builder = client.get(format!("http://{addr}{uri}"));
         if let Some(range) = range {
             builder = builder.header("Range", range);
@@ -643,6 +728,7 @@ mod tests {
     }
 
     /// What a request came back with.
+    #[derive(Debug)]
     struct TestResponse {
         status: u16,
         headers: Vec<(String, String)>,
@@ -700,13 +786,94 @@ mod tests {
         format!("/docs/v1/{stem}/{format}?{}", params.to_query())
     }
 
+    /// A short link, stored in the corpus the way `hs docs link --short` stores
+    /// one.
+    async fn put_short_link(dir: &std::path::Path, code: &str, target: String, exp: u64) {
+        let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(dir));
+        hs_common::docs::ShortLinks::new(storage)
+            .put(
+                code,
+                &hs_common::docs::ShortLink {
+                    target,
+                    fragment: "#page=2".to_string(),
+                    expires_at: exp,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A short link is a redirect, not a document: the browser is sent to the
+    /// signed link, and the fragment the code stored survives the hop because a
+    /// browser cannot be made to re-add one.
+    #[tokio::test]
+    async fn a_short_link_redirects_to_the_signed_link_and_its_fragment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, key, _state) = service(tmp.path()).await;
+        put_document(tmp.path(), "10.1234_test", b"%PDF-1.5 pretend").await;
+        let signed = link(&key, "10.1234_test", LinkFormat::Source, "laptop");
+        put_short_link(
+            tmp.path(),
+            "abcdefghjkmn",
+            signed.clone(),
+            hs_common::docs::now_secs() + 3600,
+        )
+        .await;
+
+        let resp = call(&app, "/s/abcdefghjkmn", None).await;
+
+        assert_eq!(resp.status, 302, "{resp:?}");
+        let location = resp.header("location").expect("a redirect has a Location");
+        assert_eq!(location, format!("{signed}#page=2"));
+        // The redirect's target is a path, so the same code works on whichever
+        // origin served it.
+        assert!(location.starts_with("/docs/v1/"), "{location}");
+    }
+
+    /// An unknown code, an expired one and a malformed one are one answer, so a
+    /// prober learns only that the code is not usable.
+    #[tokio::test]
+    async fn an_unknown_expired_or_malformed_code_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, key, _state) = service(tmp.path()).await;
+        put_document(tmp.path(), "10.1234_test", b"%PDF-1.5 pretend").await;
+        let signed = link(&key, "10.1234_test", LinkFormat::Source, "laptop");
+        put_short_link(
+            tmp.path(),
+            "bbbbbbbbbbbb",
+            signed,
+            hs_common::docs::now_secs() - 1,
+        )
+        .await;
+
+        for uri in [
+            "/s/abcdefghjkmn",
+            "/s/bbbbbbbbbbbb",
+            "/s/notacode",
+            "/s/..%2F..%2Fetc%2Fpasswd",
+        ] {
+            assert_eq!(call(&app, uri, None).await.status, 404, "{uri}");
+        }
+    }
+
     /// A personal document: a source under `personal/` and its markdown
     /// under `personal/markdown/`.
-    async fn put_personal_document(dir: &std::path::Path, stem: &str, body: &[u8]) {
+    ///
+    /// `source_extension` is the extension the source is stored under —
+    /// a personal document keeps whatever it was ingested as.
+    async fn put_personal_document(
+        dir: &std::path::Path,
+        stem: &str,
+        source_extension: &str,
+        body: &[u8],
+    ) {
         let storage = LocalFsStorage::new(dir);
         storage
             .put(
-                &format!("personal/{}", hs_common::sharded_key(stem, "pdf")),
+                &format!(
+                    "personal/{}",
+                    hs_common::sharded_key(stem, source_extension)
+                ),
                 body.to_vec(),
             )
             .await
@@ -825,6 +992,7 @@ mod tests {
         let mut revocations = state.revocations.clone();
         revocations.revoke("laptop", hs_common::docs::now_secs() + 1);
         let state = Arc::new(DocsState {
+            short_links: hs_common::docs::ShortLinks::new(state.storage.clone()),
             storage: state.storage.clone(),
             key: state.key.clone(),
             revocations,
@@ -876,7 +1044,13 @@ mod tests {
     async fn a_personal_document_is_served_by_its_own_link() {
         let tmp = tempfile::tempdir().unwrap();
         let (app, key, _state) = service(tmp.path()).await;
-        put_personal_document(tmp.path(), "annual-checkup-abc123", b"%PDF-1.5 pretend").await;
+        put_personal_document(
+            tmp.path(),
+            "annual-checkup-abc123",
+            "pdf",
+            b"%PDF-1.5 pretend",
+        )
+        .await;
 
         let uri = link_in(
             &key,
@@ -907,7 +1081,7 @@ mod tests {
         let (app, key, _state) = service(tmp.path()).await;
         // The same stem, in both stores.
         put_document(tmp.path(), "shared-abc123", b"%PDF-1.5 academic").await;
-        put_personal_document(tmp.path(), "shared-abc123", b"%PDF-1.5 personal").await;
+        put_personal_document(tmp.path(), "shared-abc123", "pdf", b"%PDF-1.5 personal").await;
 
         let personal = link_in(
             &key,
@@ -1050,6 +1224,134 @@ mod tests {
         // The same signature, a different page.
         let tampered = uri.replace("page=2", "page=3");
         assert_eq!(call(&app, &tampered, None).await.status, 403);
+    }
+
+    /// The personal probe list must cover every format the personal
+    /// store accepts. If `SourceFormat` gains a variant, this fails
+    /// until the docs service can serve it.
+    #[test]
+    fn the_personal_probe_covers_every_format_the_personal_store_accepts() {
+        for format in personal::models::SourceFormat::ALL {
+            assert!(
+                PERSONAL_SOURCE_EXTENSIONS.contains(&format.as_str()),
+                "the personal store accepts {format:?}, but the docs service never probes \
+                 {}.{ext} — a personal document ingested as one would answer 404",
+                "personal/<shard>/<stem>",
+                ext = format.as_str()
+            );
+        }
+        assert_eq!(
+            PERSONAL_SOURCE_EXTENSIONS.len(),
+            personal::models::SourceFormat::ALL.len(),
+            "the probe list and the personal store's formats have drifted apart"
+        );
+    }
+
+    /// A scan stored as a `.docx` is served as its source.
+    ///
+    /// Measured on the live store 2026-11-11: `2024-w2-summary-a658ac50`
+    /// is a `.docx`, was present in storage, and answered 404 because
+    /// the probe only looked for `pdf`, `html`, `epub`.
+    #[tokio::test]
+    async fn a_personal_document_stored_as_a_docx_is_served_as_its_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, key, _state) = service(tmp.path()).await;
+        put_personal_document(
+            tmp.path(),
+            "2024-w2-summary-a658ac50",
+            "docx",
+            b"PK\x03\x04 pretend docx",
+        )
+        .await;
+
+        let uri = link_in(
+            &key,
+            "2024-w2-summary-a658ac50",
+            LinkFormat::Source,
+            "laptop",
+            "personal",
+        );
+        let resp = call(&app, &uri, None).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.header("content-type"),
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
+        assert_eq!(
+            resp.header("content-disposition"),
+            Some("inline; filename=\"2024-w2-summary-a658ac50.docx\"")
+        );
+        assert_eq!(&resp.body[..4], b"PK\x03\x04");
+    }
+
+    /// A document ingested *as* markdown is served as its source from
+    /// the store root, not from `personal/markdown/`.
+    #[tokio::test]
+    async fn a_personal_document_that_was_markdown_is_served_as_its_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, key, _state) = service(tmp.path()).await;
+        // The root source, which is the document itself — distinct from
+        // the converted text under `personal/markdown/`.
+        let storage = LocalFsStorage::new(tmp.path());
+        storage
+            .put(
+                &format!(
+                    "personal/{}",
+                    hs_common::sharded_key("annual-checkup-notes-e564ee61", "md")
+                ),
+                b"# the original note\n".to_vec(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                &format!(
+                    "personal/markdown/{}",
+                    hs_common::sharded_key("annual-checkup-notes-e564ee61", "md")
+                ),
+                b"# the converted text\n".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let uri = link_in(
+            &key,
+            "annual-checkup-notes-e564ee61",
+            LinkFormat::Source,
+            "laptop",
+            "personal",
+        );
+        let resp = call(&app, &uri, None).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.header("content-type"),
+            Some("text/markdown; charset=utf-8")
+        );
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(
+            body.contains("the original note"),
+            "the source link served the converted text: {body}"
+        );
+    }
+
+    /// The academic collection's probe list is unchanged: a `papers/`
+    /// object stored only as a `.docx` is not a source. The two
+    /// collections do not share a list.
+    #[tokio::test]
+    async fn an_academic_stem_with_only_a_docx_is_a_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, key, _state) = service(tmp.path()).await;
+        let storage = LocalFsStorage::new(tmp.path());
+        storage
+            .put(
+                &format!("papers/{}", hs_common::sharded_key("10.1234_docx", "docx")),
+                b"PK\x03\x04 pretend docx".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let uri = link(&key, "10.1234_docx", LinkFormat::Source, "laptop");
+        assert_eq!(call(&app, &uri, None).await.status, 404);
     }
 
     #[tokio::test]

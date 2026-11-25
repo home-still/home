@@ -355,6 +355,7 @@ async fn serve_docs(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     let revocations = hs_common::docs::Revocations::load(&revocation_path())?;
 
     let state = Arc::new(crate::docs_service::DocsState {
+        short_links: hs_common::docs::ShortLinks::new(storage.clone()),
         storage,
         key,
         revocations,

@@ -961,15 +961,19 @@ mod tests {
             .any(|n| n.contains("distill_server.embedding.batchsize") && n.contains("batch_size")));
     }
 
-    /// Every `HS_DISTILL_*` variable the README or the deployment guide
-    /// tells an operator about must set a real key (or be allow-listed).
+    /// Every `HS_DISTILL_*` variable the README or the user docs tell an
+    /// operator about must set a real key (or be allow-listed).
     #[test]
     fn every_documented_variable_maps_to_a_field() {
         let documents = [
             ("README.md", include_str!("../README.md")),
             (
-                "docs/deployment.md",
-                include_str!("../../../docs/deployment.md"),
+                "docs/reference/configuration.md",
+                include_str!("../../../docs/reference/configuration.md"),
+            ),
+            (
+                "docs/tutorials/home-cloud-cluster.md",
+                include_str!("../../../docs/tutorials/home-cloud-cluster.md"),
             ),
         ];
         let project = hs_common::default_project_dir();
