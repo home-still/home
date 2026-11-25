@@ -81,9 +81,19 @@ pub const GAP_PENALTY: i32 = 1;
 /// for the boxes to be on the same text line.
 pub const LINE_MERGE_MIN_VERTICAL_OVERLAP: f32 = 0.5;
 
-/// How far a line's rectangle reaches past its words on every side, in
-/// box units.
-pub const BOX_PADDING_UNITS: u16 = 20;
+/// How far a line's rectangle reaches past its words to the left and to
+/// the right, in box units. Up and down it is not padded: a word's box
+/// is as tall as its font, which already holds the room above and below
+/// the letters, and in text set tight it reaches the lines beside it as
+/// it is.
+pub const LINE_SIDE_PADDING_UNITS: u16 = 20;
+
+/// How far below a line the next one may start, in heights of the shorter
+/// of the two, for the first one's rectangle to reach down to it. The
+/// leading between the lines of a paragraph and the space between two
+/// paragraphs are closed, so a passage is one region; the gap a figure
+/// leaves is not.
+pub const LINE_JOIN_MAX_GAP_HEIGHTS: f32 = 1.0;
 
 /// The characters that hyphenate a word at the end of a line.
 const LINE_BREAK_HYPHENS: [char; 3] = ['-', '\u{2010}', '\u{00AD}'];
@@ -325,9 +335,12 @@ pub fn align(page: &PageWords, tokens: &[String]) -> Option<WordSpan> {
 }
 
 /// One rectangle per text line of the run `words` of a page's words, each
-/// `[x0, y0, x1, y1]` in box units and [`BOX_PADDING_UNITS`] larger than
-/// its words on every side, within the page. The run is cut at the page's
-/// last word; one that starts past it has no rectangle.
+/// `[x0, y0, x1, y1]` in box units: as tall as its words and
+/// [`LINE_SIDE_PADDING_UNITS`] wider than them on each side, within the
+/// page. A line with the next one just below it ([`is_next_line_below`])
+/// reaches down to it, so the lines of a paragraph leave no gaps between
+/// their rectangles. The run is cut at the page's last word; one that
+/// starts past it has no rectangle.
 pub fn line_rects(page: &PageWords, words: std::ops::Range<u32>) -> Vec<[u16; 4]> {
     let start = usize::try_from(words.start).unwrap_or(usize::MAX);
     let end = usize::try_from(words.end)
@@ -340,7 +353,13 @@ pub fn line_rects(page: &PageWords, words: std::ops::Range<u32>) -> Vec<[u16; 4]
             _ => lines.push(*word),
         }
     }
-    lines.into_iter().map(padded).collect()
+    let following: Vec<[u16; 4]> = lines.iter().skip(1).copied().collect();
+    for (line, next) in lines.iter_mut().zip(following) {
+        if is_next_line_below(*line, next) {
+            line[3] = next[1];
+        }
+    }
+    lines.into_iter().map(widened).collect()
 }
 
 /// Place a located passage on the pages of its source.
@@ -736,6 +755,24 @@ fn same_line(a: [u16; 4], b: [u16; 4]) -> bool {
     f32::from(bottom.saturating_sub(top)) / f32::from(shorter) >= LINE_MERGE_MIN_VERTICAL_OVERLAP
 }
 
+/// Whether `lower` is the text line just below `upper`: it starts under
+/// it, no further down than [`LINE_JOIN_MAX_GAP_HEIGHTS`] allows, and the
+/// two share a stretch across the page. The first line of the next column
+/// is not: it starts above, and to one side.
+fn is_next_line_below(upper: [u16; 4], lower: [u16; 4]) -> bool {
+    let [upper_left, upper_top, upper_right, upper_bottom] = upper;
+    let [lower_left, lower_top, lower_right, lower_bottom] = lower;
+    let Some(gap) = lower_top.checked_sub(upper_bottom) else {
+        // The two overlap already, or `lower` is not below at all.
+        return false;
+    };
+    let shorter = upper_bottom
+        .saturating_sub(upper_top)
+        .min(lower_bottom.saturating_sub(lower_top));
+    let share_a_stretch = upper_left.max(lower_left) < upper_right.min(lower_right);
+    share_a_stretch && f32::from(gap) <= f32::from(shorter) * LINE_JOIN_MAX_GAP_HEIGHTS
+}
+
 /// The smallest box holding both.
 fn union(a: [u16; 4], b: [u16; 4]) -> [u16; 4] {
     [
@@ -746,16 +783,16 @@ fn union(a: [u16; 4], b: [u16; 4]) -> [u16; 4] {
     ]
 }
 
-/// A box grown by [`BOX_PADDING_UNITS`] on every side, within the page.
-fn padded(bounds: [u16; 4]) -> [u16; 4] {
+/// A box grown by [`LINE_SIDE_PADDING_UNITS`] to the left and to the
+/// right, within the page.
+fn widened(bounds: [u16; 4]) -> [u16; 4] {
     let [x0, y0, x1, y1] = bounds;
     [
-        x0.saturating_sub(BOX_PADDING_UNITS),
-        y0.saturating_sub(BOX_PADDING_UNITS),
-        x1.saturating_add(BOX_PADDING_UNITS)
+        x0.saturating_sub(LINE_SIDE_PADDING_UNITS),
+        y0,
+        x1.saturating_add(LINE_SIDE_PADDING_UNITS)
             .min(BOX_UNITS_PER_PAGE_SIDE),
-        y1.saturating_add(BOX_PADDING_UNITS)
-            .min(BOX_UNITS_PER_PAGE_SIDE),
+        y1,
     ]
 }
 
@@ -1321,21 +1358,47 @@ mod tests {
     }
 
     #[test]
-    fn line_rects_is_one_padded_rectangle_per_text_line() {
+    fn line_rects_is_one_rectangle_per_text_line_wider_than_its_words() {
         let words = page(1, &["alpha beta gamma", "delta epsilon"]);
+        // The first line reaches down to the second.
         assert_eq!(
             line_rects(&words, 1..5),
-            [[1_780, 980, 3_320, 1_220], [980, 1_280, 2_520, 1_520]]
+            [[1_780, 1_000, 3_320, 1_300], [980, 1_300, 2_520, 1_500]]
         );
+    }
+
+    #[test]
+    fn a_line_reaches_down_only_to_the_line_just_below_it() {
+        let first = [1_000, 1_000, 3_000, 1_200];
+        let bottom_before = |second: [u16; 4]| {
+            let mut words = PageWords::new(1, WordOrigin::Ocr, PAGE_WIDTH_PT, PAGE_HEIGHT_PT);
+            words.push("first".to_string(), first);
+            words.push("second".to_string(), second);
+            let rects = line_rects(&words, 0..2);
+            assert_eq!(rects.len(), 2, "{second:?}");
+            rects[0][3]
+        };
+        // The next line of the paragraph, and the first of the one after
+        // it, a line's height down.
+        assert_eq!(bottom_before([1_000, 1_250, 3_000, 1_450]), 1_250);
+        assert_eq!(bottom_before([1_000, 1_400, 3_000, 1_600]), 1_400);
+        // Past a figure: further down than a line is tall.
+        assert_eq!(bottom_before([1_000, 1_401, 3_000, 1_601]), 1_200);
+        // The top of the next column: above, and to one side.
+        assert_eq!(bottom_before([5_000, 300, 7_000, 500]), 1_200);
+        // Below, and wholly to one side.
+        assert_eq!(bottom_before([3_100, 1_250, 5_000, 1_450]), 1_200);
+        // Set tight: the two overlap as they are.
+        assert_eq!(bottom_before([1_000, 1_150, 3_000, 1_350]), 1_200);
     }
 
     #[test]
     fn line_rects_stays_within_the_page_and_the_words_there_are() {
         let mut edge = PageWords::new(1, WordOrigin::Ocr, PAGE_WIDTH_PT, PAGE_HEIGHT_PT);
-        edge.push("edge".to_string(), [0, 5, BOX_UNITS_PER_PAGE_SIDE, 9_995]);
+        edge.push("edge".to_string(), [5, 5, 9_995, 9_995]);
         assert_eq!(
             line_rects(&edge, 0..7),
-            [[0, 0, BOX_UNITS_PER_PAGE_SIDE, BOX_UNITS_PER_PAGE_SIDE]]
+            [[0, 5, BOX_UNITS_PER_PAGE_SIDE, 9_995]]
         );
         assert!(line_rects(&edge, 3..5).is_empty());
     }

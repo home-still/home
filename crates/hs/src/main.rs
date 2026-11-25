@@ -11,6 +11,7 @@ pub mod daemon;
 mod distill_cmd;
 mod docs_cmd;
 mod docs_service;
+mod docs_shape;
 #[cfg(test)]
 mod docs_tests;
 mod docs_views;

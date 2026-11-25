@@ -34,7 +34,7 @@ const DRAWN = "drawn";
 const FAILED = "failed";
 
 // The link's own data, written into the page by the service: the signed
-// URL of the PDF, the page the link names, the rectangles to box on each
+// URL of the PDF, the page the link names, the shape to highlight on each
 // page and how many units a page side is divided into.
 const config = JSON.parse(document.getElementById("hs-cite").textContent);
 const status = document.getElementById("status");
@@ -49,25 +49,50 @@ function shape(box, size) {
   box.style.aspectRatio = `${size.width} / ${size.height}`;
 }
 
-// A page's place in the document: a box of the page's shape, a canvas to
-// draw it on, and the highlight laid over both. The highlight is placed in
-// fractions of the page, so it is right before the page is drawn and at
+// Put a mark where a rectangle `[x0, y0, x1, y1]` lies on its page, in
+// fractions of the page: it is right before the page is drawn and at
 // whatever width the window gives it.
-function pageBox(number, size, rects) {
+function place(mark, [x0, y0, x1, y1]) {
+  mark.style.left = `${(x0 / config.units) * PERCENT}%`;
+  mark.style.top = `${(y0 / config.units) * PERCENT}%`;
+  mark.style.width = `${((x1 - x0) / config.units) * PERCENT}%`;
+  mark.style.height = `${((y1 - y0) / config.units) * PERCENT}%`;
+}
+
+// A page's highlight: the pieces of its `fill` tinted together, so where
+// two meet is tinted once, and a line along each piece of its `outline`,
+// which is the edge of the whole passage. The lines are laid on together
+// too, so a corner, where two of them meet, is no darker than the rest.
+function highlightLayer(region) {
+  const layer = document.createElement("div");
+  layer.className = "highlight";
+  layer.append(marks("tint", region.fill), marks("line", region.outline));
+  return layer;
+}
+
+// One of a highlight's two layers: a mark placed for each rectangle.
+function marks(name, rects) {
+  const group = document.createElement("div");
+  group.className = name;
+  for (const rect of rects) {
+    const mark = document.createElement("div");
+    place(mark, rect);
+    group.append(mark);
+  }
+  return group;
+}
+
+// A page's place in the document: a box of the page's shape, a canvas to
+// draw it on, and the highlight, when the page has one, laid over both.
+function pageBox(number, size, highlight) {
   const box = document.createElement("section");
   box.className = "page";
   box.dataset.page = String(number);
   box.setAttribute("aria-label", `Page ${number}`);
   shape(box, size);
   box.append(document.createElement("canvas"));
-  for (const [x0, y0, x1, y1] of rects) {
-    const mark = document.createElement("div");
-    mark.className = "highlight";
-    mark.style.left = `${(x0 / config.units) * PERCENT}%`;
-    mark.style.top = `${(y0 / config.units) * PERCENT}%`;
-    mark.style.width = `${((x1 - x0) / config.units) * PERCENT}%`;
-    mark.style.height = `${((y1 - y0) / config.units) * PERCENT}%`;
-    box.append(mark);
+  if (highlight) {
+    box.append(highlightLayer(highlight));
   }
   return box;
 }
@@ -146,8 +171,8 @@ async function show() {
     return;
   }
 
-  const rects = new Map(
-    config.highlights.map((highlight) => [highlight.page, highlight.rects]),
+  const highlights = new Map(
+    config.highlights.map((highlight) => [highlight.page, highlight]),
   );
   // Every page is given the first page's shape until it is drawn: reading
   // each page's own would mean reading the whole document before showing
@@ -155,7 +180,7 @@ async function show() {
   const first = (await pdf.getPage(1)).getViewport({ scale: 1 });
   const entries = [];
   for (let number = 1; number <= pdf.numPages; number += 1) {
-    const box = pageBox(number, first, rects.get(number) ?? []);
+    const box = pageBox(number, first, highlights.get(number));
     container.append(box);
     entries.push({
       number,
@@ -171,9 +196,9 @@ async function show() {
   // Where the reader is taken: the first highlighted passage, or the page
   // the link names. That page gets its own shape first, so the passage is
   // where the scroll expects it.
-  const mark = container.querySelector(".highlight");
+  const mark = container.querySelector(".highlight .tint div");
   const landing = mark
-    ? entries[Number(mark.parentElement.dataset.page) - 1]
+    ? entries[Number(mark.closest(".page").dataset.page) - 1]
     : entries[(config.page ?? 0) - 1];
   if (landing) {
     const page = await pdf.getPage(landing.number);

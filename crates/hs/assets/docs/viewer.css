@@ -15,9 +15,13 @@
   --sheet: #ffffff;
   --shadow: rgba(0, 0, 0, 0.5);
   /* The same yellow and amber the service paints on a page image:
-     HIGHLIGHT_FILL_RGBA and HIGHLIGHT_OUTLINE_RGB in docs_views.rs. */
-  --highlight: rgba(255, 221, 0, 0.35);
+     HIGHLIGHT_FILL_RGB and HIGHLIGHT_OUTLINE_RGB in docs_views.rs. */
+  --highlight-fill: rgb(255, 243, 165);
   --highlight-edge: rgb(230, 138, 0);
+  /* Half the thickness of the line around a highlight: it is drawn this
+     far to each side of the passage's edge, as HIGHLIGHT_OUTLINE_PX is
+     there. */
+  --highlight-edge-half: 1px;
   /* The widest a page is shown: wider than this and a line of a
      two-column paper is longer than a reader's eye follows. */
   --sheet-width: 1000px;
@@ -117,9 +121,40 @@ body {
   height: 100%;
 }
 
-.highlight {
+/* A highlight covers its page and draws nothing itself: its two layers
+   do, with the marks the viewer's script places inside them.
+
+   Both layers are laid on the page as ink is on paper: blank paper takes
+   their colour and print stays as dark as it was. The words under a
+   highlight read as they did, and so does a letter the line around it
+   crosses: in text set tight, the passage's edge lies on the line of
+   text beside it. Each layer is blended whole, so where two of its marks
+   meet or overlap the page is no darker. */
+.highlight,
+.highlight .tint,
+.highlight .line {
   position: absolute;
-  background: var(--highlight);
-  outline: 2px solid var(--highlight-edge);
+  inset: 0;
   pointer-events: none;
+}
+
+.highlight .tint,
+.highlight .line {
+  mix-blend-mode: multiply;
+}
+
+.highlight .tint div {
+  position: absolute;
+  background: var(--highlight-fill);
+}
+
+/* A piece of the passage's edge has a length and no thickness. Its
+   padding is the line: to each side of it and past both ends, so the
+   pieces join at the corners. */
+.highlight .line div {
+  position: absolute;
+  box-sizing: content-box;
+  margin: calc(-1 * var(--highlight-edge-half));
+  padding: var(--highlight-edge-half);
+  background: var(--highlight-edge);
 }

@@ -12,12 +12,13 @@
 //!
 //! A link's highlight names runs of words in the document's word-box
 //! sidecar. Each run becomes one rectangle per text line
-//! ([`hs_common::quote::line_rects`]), and those are what is drawn: on the
-//! picture itself for `page.png`, and by the viewer over its own rendering
-//! of the page. A highlight the sidecar cannot answer (there is no
-//! sidecar, or it lacks a page or a word the highlight names) is a 404: a
-//! page shown without the passage it was linked for would claim to show a
-//! quote and not show it.
+//! ([`hs_common::quote::line_rects`]), and a page's rectangles are drawn
+//! as the one region they cover ([`crate::docs_shape::Shape`]): on the
+//! picture itself for `page.png`, and by the viewer over its own
+//! rendering of the page. A highlight the sidecar cannot answer (there is
+//! no sidecar, or it lacks a page or a word the highlight names) is a
+//! 404: a page shown without the passage it was linked for would claim to
+//! show a quote and not show it.
 //!
 //! # The links between the views
 //!
@@ -34,7 +35,7 @@
 //! browser may keep them for good ([`ASSET_CACHE_CONTROL`]) and still gets
 //! the new ones from a newer service, whose pages name another version.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock};
 
@@ -57,24 +58,28 @@ use crate::docs_service::{
     filename_for, find_source_key, private_cache_control, verify_request, DocsState, Refusal,
     Verified,
 };
+use crate::docs_shape::Shape;
 
 /// How wide the picture of a page is, whatever the page's size: enough
 /// that the body text of a two-column paper is sharp on a dense screen.
 const PAGE_IMAGE_WIDTH_PX: u32 = 1_400;
 
-/// The yellow a highlighted passage is tinted with, and how opaque it is
-/// (out of 255): the text under it stays readable.
-const HIGHLIGHT_FILL_RGBA: [u8; 4] = [255, 221, 0, 90];
+/// The yellow a highlighted passage is tinted with: what blank paper
+/// becomes under it.
+const HIGHLIGHT_FILL_RGB: [u8; 3] = [255, 243, 165];
 
 /// The amber of the line drawn around a highlighted passage, which is
 /// what finds it on a page seen whole.
 const HIGHLIGHT_OUTLINE_RGB: [u8; 3] = [230, 138, 0];
 
-/// How thick that line is, in pixels of the picture.
-const HIGHLIGHT_OUTLINE_PX: u32 = 3;
+/// How thick that line is, in pixels of the picture. It is centred on the
+/// passage's edge. In text set tight that edge lies on the line of text
+/// above or below the passage, which is one reason a highlight is laid
+/// on as ink ([`inked`]) and hides nothing.
+const HIGHLIGHT_OUTLINE_PX: u32 = 4;
 
-/// A fully opaque alpha.
-const OPAQUE: u16 = u8::MAX as u16;
+/// A colour channel at its fullest.
+const CHANNEL_MAX: u16 = u8::MAX as u16;
 
 /// The only source a page view is made from.
 const PDF_EXTENSION: &str = "pdf";
@@ -372,16 +377,16 @@ fn to_pixels(units: u16, side_px: u32) -> u32 {
     u32::try_from(offset).unwrap_or(side_px)
 }
 
-/// A pixel under the highlight's tint.
-fn tinted(pixel: Rgb<u8>) -> Rgb<u8> {
-    let [red, green, blue, alpha] = HIGHLIGHT_FILL_RGBA;
-    let alpha = u16::from(alpha);
+/// A pixel with a colour laid on it as ink is on paper: blank paper takes
+/// the colour and print stays as dark as it was. The words under a
+/// highlight, and a letter the line around it crosses, read as they did.
+fn inked(pixel: Rgb<u8>, ink: [u8; 3]) -> Rgb<u8> {
     let mix = |under: u8, over: u8| {
-        let mixed =
-            (u16::from(under) * (OPAQUE - alpha) + u16::from(over) * alpha + OPAQUE / 2) / OPAQUE;
-        // A weighted mean of two bytes is a byte.
+        let mixed = (u16::from(under) * u16::from(over) + CHANNEL_MAX / 2) / CHANNEL_MAX;
+        // The product of two fractions of a byte is a byte.
         u8::try_from(mixed).unwrap_or(u8::MAX)
     };
+    let [red, green, blue] = ink;
     Rgb([
         mix(pixel[0], red),
         mix(pixel[1], green),
@@ -389,33 +394,44 @@ fn tinted(pixel: Rgb<u8>) -> Rgb<u8> {
     ])
 }
 
-/// Draw a highlight on the picture of a page: each rectangle tinted
-/// [`HIGHLIGHT_FILL_RGBA`], with a line [`HIGHLIGHT_OUTLINE_PX`] thick
-/// just inside its edge.
+/// Draw a highlight on the picture of a page: the region its rectangles
+/// cover tinted [`HIGHLIGHT_FILL_RGB`], once however they overlap, with
+/// a line [`HIGHLIGHT_OUTLINE_PX`] thick around the outside of the whole.
 fn draw_highlights(image: &mut RgbImage, rects: &[[u16; 4]]) {
     let (width, height) = image.dimensions();
-    for &[x0, y0, x1, y1] in rects {
-        let (left, right) = (to_pixels(x0, width), to_pixels(x1, width));
-        let (top, bottom) = (to_pixels(y0, height), to_pixels(y1, height));
-        for y in top..bottom {
-            for x in left..right {
-                let from_edge = (x - left)
-                    .min(right - 1 - x)
-                    .min(y - top)
-                    .min(bottom - 1 - y);
-                let Some(pixel) = image.get_pixel_mut_checked(x, y) else {
-                    continue;
-                };
-                *pixel = if from_edge < HIGHLIGHT_OUTLINE_PX {
-                    Rgb(HIGHLIGHT_OUTLINE_RGB)
-                } else {
-                    tinted(*pixel)
-                };
+    let shape = Shape::of(rects);
+    for [x0, y0, x1, y1] in shape.fill {
+        for y in to_pixels(y0, height)..to_pixels(y1, height) {
+            for x in to_pixels(x0, width)..to_pixels(x1, width) {
+                if let Some(pixel) = image.get_pixel_mut_checked(x, y) {
+                    *pixel = inked(*pixel, HIGHLIGHT_FILL_RGB);
+                }
             }
+        }
+    }
+    // The line runs past both ends of each piece by half its thickness,
+    // so the pieces join at the corners. A pixel there is on two pieces
+    // and is inked once: twice would leave the corners darker.
+    let before = HIGHLIGHT_OUTLINE_PX / 2;
+    let after = HIGHLIGHT_OUTLINE_PX - before;
+    let mut line = HashSet::new();
+    for [x0, y0, x1, y1] in shape.outline {
+        let across = to_pixels(x0, width).saturating_sub(before)
+            ..to_pixels(x1, width).saturating_add(after).min(width);
+        let down = to_pixels(y0, height).saturating_sub(before)
+            ..to_pixels(y1, height).saturating_add(after).min(height);
+        for y in down {
+            line.extend(across.clone().map(|x| (x, y)));
+        }
+    }
+    for (x, y) in line {
+        if let Some(pixel) = image.get_pixel_mut_checked(x, y) {
+            *pixel = inked(*pixel, HIGHLIGHT_OUTLINE_RGB);
         }
     }
 }
 
+/// The picture as the bytes of a PNG.
 fn encode_png(image: &RgbImage) -> anyhow::Result<Vec<u8>> {
     let mut png = Vec::new();
     PngEncoder::new(&mut png).write_image(
@@ -719,17 +735,19 @@ struct ViewerData {
     source: String,
     /// The page the link names, 1-based.
     page: Option<u32>,
-    /// How many units a page side is divided into: what `rects` are in.
+    /// How many units a page side is divided into: what a highlight's
+    /// shape is in.
     units: u16,
-    /// The rectangles to box, by page.
+    /// What to draw, by page.
     highlights: Vec<PageHighlight>,
 }
 
 #[derive(Serialize)]
 struct PageHighlight {
     page: u32,
-    /// `[x0, y0, x1, y1]`, the origin at the page's top left.
-    rects: Vec<[u16; 4]>,
+    /// `fill` and `outline`, the origin at the page's top left.
+    #[serde(flatten)]
+    shape: Shape,
 }
 
 /// JSON as it may stand in a `<script>` data block: nothing in it can
@@ -775,7 +793,10 @@ async fn viewer(
         units: BOX_UNITS_PER_PAGE_SIDE,
         highlights: rects
             .into_iter()
-            .map(|(page, rects)| PageHighlight { page, rects })
+            .map(|(page, rects)| PageHighlight {
+                page,
+                shape: Shape::of(&rects),
+            })
             .collect(),
     };
     let data = serde_json::to_string(&data).map_err(|e| {
@@ -817,6 +838,9 @@ mod tests {
     /// The picture of a Letter page at [`PAGE_IMAGE_WIDTH_PX`].
     const PAGE_IMAGE_HEIGHT_PX: u32 = 1_811;
     const WHITE: Rgb<u8> = Rgb([255, 255, 255]);
+    const BLACK: Rgb<u8> = Rgb([0, 0, 0]);
+    /// Blank paper under a highlight's tint.
+    const TINT: Rgb<u8> = Rgb(HIGHLIGHT_FILL_RGB);
     /// The words of page 2 of the fixture's sidecar: two on one line, one
     /// on the next.
     const PAGE_TWO_WORDS: [(&str, [u16; 4]); 3] = [
@@ -991,19 +1015,110 @@ mod tests {
     }
 
     #[test]
-    fn a_highlight_is_tinted_inside_a_line_around_it_and_touches_nothing_else() {
+    fn a_highlight_is_tinted_with_a_line_around_it_and_touches_nothing_else() {
         let mut image = RgbImage::from_pixel(1_000, 500, WHITE);
         // 200..600 px across, 100..200 px down.
         draw_highlights(&mut image, &[[2_000, 2_000, 6_000, 4_000]]);
 
-        let outline = Rgb(HIGHLIGHT_OUTLINE_RGB);
-        assert_eq!(*image.get_pixel(400, 150), tinted(WHITE), "the middle");
-        assert_ne!(tinted(WHITE), WHITE, "a tint that cannot be seen");
-        for (x, y) in [(200, 150), (599, 150), (400, 100), (400, 199), (202, 102)] {
-            assert_eq!(*image.get_pixel(x, y), outline, "the edge at {x},{y}");
+        assert_eq!(*image.get_pixel(400, 150), TINT, "the middle");
+        // The line is centred on the edge: two pixels outside it, which
+        // were blank and are the line's own colour, the corners included
+        // (inked twice they would be darker), and two inside it, which
+        // were tinted first.
+        let outside_half = [
+            (198, 150),
+            (601, 150),
+            (400, 98),
+            (400, 201),
+            (198, 98),
+            (601, 201),
+        ];
+        for (x, y) in outside_half {
+            assert_eq!(
+                *image.get_pixel(x, y),
+                Rgb(HIGHLIGHT_OUTLINE_RGB),
+                "the edge at {x},{y}"
+            );
         }
-        assert_eq!(*image.get_pixel(203, 103), tinted(WHITE), "inside the line");
-        for (x, y) in [(199, 150), (600, 150), (400, 99), (400, 200), (0, 0)] {
+        for (x, y) in [(201, 150), (598, 150), (400, 101), (400, 198)] {
+            assert_eq!(
+                *image.get_pixel(x, y),
+                inked(TINT, HIGHLIGHT_OUTLINE_RGB),
+                "the edge at {x},{y}"
+            );
+        }
+        for (x, y) in [(202, 150), (597, 150), (400, 102), (400, 197)] {
+            assert_eq!(*image.get_pixel(x, y), TINT, "inside at {x},{y}");
+        }
+        for (x, y) in [(197, 150), (602, 150), (400, 97), (400, 202), (0, 0)] {
+            assert_eq!(*image.get_pixel(x, y), WHITE, "outside at {x},{y}");
+        }
+    }
+
+    /// A highlight tinted over its words left them paler than print, and
+    /// in text set tight the edge of a passage lies on the letters of the
+    /// line above it, where a solid line cut through them (both seen on a
+    /// real two-column paper).
+    #[test]
+    fn a_highlight_leaves_print_as_dark_as_it_was() {
+        let mut image = RgbImage::from_pixel(1_000, 500, WHITE);
+        // The stem of a letter: from above the passage, down through the
+        // line along its top edge and into it.
+        let stem = 90..110;
+        for y in stem.clone() {
+            image.put_pixel(400, y, BLACK);
+        }
+        // 200..600 px across, 100..200 px down.
+        draw_highlights(&mut image, &[[2_000, 2_000, 6_000, 4_000]]);
+
+        for y in stem {
+            assert_eq!(*image.get_pixel(400, y), BLACK, "the stem at 400,{y}");
+        }
+        // Beside the stem the highlight is as it is anywhere.
+        assert_eq!(*image.get_pixel(399, 99), Rgb(HIGHLIGHT_OUTLINE_RGB));
+        assert_eq!(*image.get_pixel(401, 105), TINT);
+    }
+
+    /// Lines set tight give rectangles that overlap, because a word's box
+    /// is taller than the step between lines. Drawn one by one, each
+    /// rectangle's edge struck through the line beside it and the overlap
+    /// was tinted twice (seen on a real two-column paper).
+    #[test]
+    fn overlapping_lines_are_drawn_as_one_region() {
+        let mut image = RgbImage::from_pixel(1_000, 1_000, WHITE);
+        // Three lines 40 px tall, 30 px apart: the first indented, the
+        // last short.
+        let lines = [
+            [2_000, 3_000, 9_000, 3_400], // 200..900 across, 300..340 down
+            [1_000, 3_300, 9_000, 3_700], // 100..900 across, 330..370 down
+            [1_000, 3_600, 4_000, 4_000], // 100..400 across, 360..400 down
+        ];
+        draw_highlights(&mut image, &lines);
+
+        // Down the passage, through both overlaps: tinted once, and no
+        // line anywhere inside.
+        for y in 302..398 {
+            assert_eq!(*image.get_pixel(300, y), TINT, "300,{y}");
+        }
+        // Right of the short last line the passage ends a line sooner.
+        for y in 302..368 {
+            assert_eq!(*image.get_pixel(600, y), TINT, "600,{y}");
+        }
+        let around = [
+            (300, 299), // above the first line
+            (300, 400), // below the last
+            (600, 370), // below the second, past the end of the last
+            (150, 329), // above the second, left of the indent
+            (199, 315), // left of the first
+        ];
+        for (x, y) in around {
+            assert_eq!(
+                *image.get_pixel(x, y),
+                Rgb(HIGHLIGHT_OUTLINE_RGB),
+                "the edge at {x},{y}"
+            );
+        }
+        for (x, y) in [(300, 297), (300, 402), (600, 372), (150, 327), (197, 315)] {
             assert_eq!(*image.get_pixel(x, y), WHITE, "outside at {x},{y}");
         }
     }
@@ -1015,10 +1130,11 @@ mod tests {
         // The second box has no area, and a coordinate past the page.
         draw_highlights(&mut image, &[whole, [9_000, 5_000, u16::MAX, 5_000]]);
 
-        let outline = Rgb(HIGHLIGHT_OUTLINE_RGB);
-        assert_eq!(*image.get_pixel(0, 0), outline);
-        assert_eq!(*image.get_pixel(332, 76), outline);
-        assert_eq!(*image.get_pixel(160, 40), tinted(WHITE));
+        // The page's own edge has no outside: the line is all on the tint.
+        let tinted_line = inked(TINT, HIGHLIGHT_OUTLINE_RGB);
+        assert_eq!(*image.get_pixel(0, 0), tinted_line);
+        assert_eq!(*image.get_pixel(332, 76), tinted_line);
+        assert_eq!(*image.get_pixel(160, 40), TINT);
     }
 
     #[test]
@@ -1076,7 +1192,7 @@ mod tests {
             PAGE_IMAGE_WIDTH_PX * 38 / 100,
             PAGE_IMAGE_HEIGHT_PX * 31 / 100,
         );
-        assert_eq!(*image.get_pixel(x, y), tinted(WHITE));
+        assert_eq!(*image.get_pixel(x, y), TINT);
         assert_eq!(*image.get_pixel(10, 10), WHITE);
 
         // The same page without a highlight is the blank page there, and
@@ -1308,11 +1424,21 @@ mod tests {
         let data: serde_json::Value = serde_json::from_str(block).unwrap();
         assert_eq!(data["units"], 10_000);
         assert_eq!(data["page"], serde_json::Value::Null);
+        // Two lines, the first reaching down to the second, which is the
+        // shorter: one region, with a step where the second ends.
         assert_eq!(
             data["highlights"],
             serde_json::json!([{
                 "page": 2,
-                "rects": [[1_980, 2_980, 4_520, 3_220], [1_980, 3_280, 3_220, 3_520]],
+                "fill": [[1_980, 3_000, 4_520, 3_300], [1_980, 3_300, 3_220, 3_500]],
+                "outline": [
+                    [1_980, 3_000, 4_520, 3_000],
+                    [3_220, 3_300, 4_520, 3_300],
+                    [1_980, 3_500, 3_220, 3_500],
+                    [1_980, 3_000, 1_980, 3_500],
+                    [3_220, 3_300, 3_220, 3_500],
+                    [4_520, 3_000, 4_520, 3_300],
+                ],
             }])
         );
         // The source is a link this service answers with the PDF.
@@ -1387,14 +1513,14 @@ mod tests {
             assert!(ASSETS.iter().any(|asset| imported.ends_with(asset.name)));
         }
         let css = asset(STYLESHEET);
-        let [red, green, blue, _] = HIGHLIGHT_FILL_RGBA;
+        let [red, green, blue] = HIGHLIGHT_FILL_RGB;
         assert!(
-            css.contains(&format!("rgba({red}, {green}, {blue}, ")),
+            css.contains(&format!("--highlight-fill: rgb({red}, {green}, {blue});")),
             "{css}"
         );
         let [red, green, blue] = HIGHLIGHT_OUTLINE_RGB;
         assert!(
-            css.contains(&format!("rgb({red}, {green}, {blue})")),
+            css.contains(&format!("--highlight-edge: rgb({red}, {green}, {blue});")),
             "{css}"
         );
     }
