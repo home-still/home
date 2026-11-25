@@ -49,15 +49,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-14 is arm64: this x86_64 binary is cross-compiled and cannot
+          # macos-15 is arm64: this x86_64 binary is cross-compiled and cannot
           # be executed here (run_native: false), so it is verified by file
           # type + version marker only.
+          #
+          # macOS 15, not 14: GitHub retired the macOS 14 images on
+          # 2026-11-02 and cancels such a job before it starts ("The
+          # configuration 'macos-14-arm64-us-default' is not supported"),
+          # which killed rc.391's gate. Both labels are arm64.
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             archive: tar.gz
             run_native: false
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             archive: tar.gz
             build_scribe: true
             # macOS has no CUDA: the scribe server runs on Metal via

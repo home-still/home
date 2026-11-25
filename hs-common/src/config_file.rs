@@ -662,6 +662,23 @@ mod tests {
     }
 
     #[test]
+    fn a_system_file_that_is_not_there_is_an_absent_config_not_an_error() {
+        // `load_at` reserves `ConfigError::Unreadable` for a file it could
+        // not read and treats only `NotFound` as "absent". The path has to
+        // be one that really is local and really is absent on every
+        // platform: rc.392's gate died on `Path::new("/nonexistent/config.yaml")`,
+        // which on Windows answered with `ERROR_NETNAME_DELETED` (64)
+        // instead of `NotFound`, so the caller's `unwrap()` panicked in
+        // its own setup. Keeping this assertion here is what stops the
+        // portable spelling from being reintroduced.
+        let home = home_with(None);
+        let absent = home.path().join("no-such-system-config.yaml");
+        let file = ConfigFile::load_at(&absent, home.path()).unwrap();
+        assert!(!file.exists());
+        assert_eq!(file.path(), absent);
+    }
+
+    #[test]
     fn an_absent_file_gives_the_documented_defaults() {
         let home = home_with(None);
         let file = ConfigFile::load_in(home.path()).unwrap();
