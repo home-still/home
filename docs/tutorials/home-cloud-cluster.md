@@ -356,8 +356,8 @@ The pieces are:
 4. **A chat model.** myelin uses any OpenAI-compatible chat model when an
    agent calls `remember` or `investigate`. Note its address and model name.
 
-5. **myelin itself.** myelin is built from its own repository. Its README
-   documents every `MYELIN_*` environment variable:
+5. **myelin itself.** myelin is built from its own repository. Its
+   `docs/FEATURES.md` lists every `MYELIN_*` environment variable:
 
    ```sh
    git clone https://github.com/home-still/myelin
@@ -367,8 +367,9 @@ The pieces are:
    ```
 
 Put myelin's settings in `~/.config/myelin-mcp.env`, readable by you only.
-`<llm-url>`, `<llm-model>` and `<rerank-url>` are the addresses and model name
-from items 3 and 4:
+`<rerank-url>` is the reranker's server root from item 3, with no path (for
+example `http://127.0.0.1:5813`). `<llm-url>` and `<llm-model>` are the chat
+model's address, ending in `/v1`, and its model name from item 4:
 
 ```sh
 umask 077
