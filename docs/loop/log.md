@@ -3058,8 +3058,9 @@ written.
 1. **Owner: decide whether a depth fitted to the gate queries counts as
    the gate passing.** Rows 2 and 11 are both true.
 2. **Give the embedder a batch as large as its context** (8,192), then
-   index again the documents that hold a chunk over 2,048 tokens. Untested:
-   whether Ollama's `num_batch` does it, or it takes a separate embedder.
+   index again the documents that hold a chunk over 2,048 tokens. Tested
+   after this entry: Ollama's `num_batch` does it (BACKLOG P1-40); the
+   store is not yet pointed at it.
 3. **myelin: a refused `observe` must leave no ledger records**, and
    reconcile must not count a document with records but no index points
    as indexed.

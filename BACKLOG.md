@@ -1448,9 +1448,14 @@ than 2,048 tokens. The model's own limit is 8,192, but Ollama starts it with a 2
 must fit one batch. An earlier version of this entry blamed 4 parallel slots; that was a guess
 and it was wrong.
 **Fix.** Run the embedder with a batch equal to its context, then index again every document
-holding a chunk over 2,048 tokens. Untested: whether Ollama's `num_batch` (request option or
-Modelfile parameter) raises it, or the store needs an embedder of its own. Not a chunk-size cut:
-that changes retrieval for the whole corpus.
+holding a chunk over 2,048 tokens. Tested 2026-11-26 on the GPU host, nothing kept: Ollama's
+`num_batch` 8,192 does it, as a request option and as a parameter of a derived model reached
+through the OpenAI-compatible endpoint the store uses (identical vectors). Both refused documents
+then embed in full (39 of 39 and 42 of 42 windows of 4,000 characters, longest 2,614 tokens), and
+a formerly truncated window's tail reaches its vector. Cost measured: 268 MiB more VRAM and about
+0.5 GB more resident memory in the runner. Not done: pointing the store at such a model and
+indexing the two documents end to end. Not a chunk-size cut: that changes retrieval for the whole
+corpus.
 
 ### P1-41. A refused myelin `observe` leaves ledger records with no index points, and the document then counts as indexed (found 2026-11-26)
 **Symptom.** The two documents of P1-40 were listed by `/docs`, `/exists` and the status counts
