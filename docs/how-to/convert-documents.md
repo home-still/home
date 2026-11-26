@@ -83,8 +83,10 @@ hs scribe convert paper.pdf --server http://<scribe-host>:7433 --out paper.md
 
 The scribe watcher takes each `papers.ingested` event, sends the document to
 the scribe tiers in `scribe.servers`, and stores the markdown and catalog
-entry. For a PDF it then has a scribe server build the word boxes, which
-record where each word sits on its page, and stores those too.
+entry in the store the document's key belongs to. For a PDF it then has a
+scribe server build the word boxes, which record where each word sits on its
+page, and stores those too. A Markdown or plain-text source needs no
+server: the watcher stores its text as the markdown.
 
 1. Install it as a user service:
 

@@ -1242,7 +1242,7 @@ impl HomeStillMcp {
             source: Some("mcp:scribe_convert".to_string()),
         };
 
-        let source = match prepare_source(&*self.storage, &event)
+        let source = match prepare_source(&*self.storage, &self.stores, &event)
             .await
             .map_err(|e| format!("{source_key}: {e}"))?
         {

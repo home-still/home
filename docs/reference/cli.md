@@ -125,7 +125,7 @@ hs scribe watch-events [OPTIONS]
 
 Runs until stopped. It needs `storage:`, `events:` (a NATS backend) and `scribe.servers`, and it refuses to start on a host where libpdfium cannot be bound. It reads two queues side by side.
 
-Conversions (`papers.ingested`): servers are grouped into tiers by `backend`, in `scribe.servers` order; a paper goes to the first tier and falls through to the next when a backend-class failure occurs. Within a tier the least-loaded server takes the paper. A tier converts at most the sum of its servers' `concurrency` at once. When a PDF's markdown is stored, the watcher publishes `scribe.boxes` for it.
+Conversions (`papers.ingested`): the source's key says which store it belongs to (`papers/` is the `academic` store's prefix, and each other store has its own), and the markdown and the catalog entry are stored in that store. A key under no store's prefix, and a file type the store does not take, are refused for good. A `.md` or `.txt` source is not sent to a server: its text is stored as the markdown, with its line endings made `\n`; it must be UTF-8 and at most 16 MiB. For the other types, servers are grouped into tiers by `backend`, in `scribe.servers` order; a paper goes to the first tier and falls through to the next when a backend-class failure occurs. Within a tier the least-loaded server takes the paper. A tier converts at most the sum of its servers' `concurrency` at once. When a PDF's markdown is stored, the watcher publishes `scribe.boxes` for it.
 
 Word boxes (`scribe.boxes`): the watcher reads the PDF from storage, posts it to a scribe server's `/scribe/boxes`, checks that the sidecar it gets back was built from those bytes, and stores it under the store's `boxes/` prefix. The servers in `scribe.servers` take the requests in turn, whatever their tier, and as many requests run at once as there are servers; when a server cannot answer, the next is tried. A request for a key that is not where a store keeps a PDF, or for a PDF no server can read, is dropped with the reason logged. Any other failure is retried until `events.nats.max_deliver` deliveries are used up; `hs scribe boxes status` shows what is still missing and `hs scribe boxes catch-up` queues it again.
 
@@ -825,6 +825,8 @@ hs distill watch-events [OPTIONS]
 | `--server <SERVER>` | none | Override server URL. |
 
 Runs until stopped. It needs `storage:`, `events:` and `distill.servers`; the first server in `distill.servers` is used unless you pass `--server`. Before it pulls an event, it checks that the server accepts its `HS_BACKEND_TOKEN`. Run it as a service with `hs serve distill-watch --install`.
+
+Each event names its store: the document is indexed into that store and its catalog entry there is stamped. An event that names no store, a store that keeps no documents of its own, or a key that is not that store's markdown key for the document is dropped and is not delivered again.
 
 Example:
 

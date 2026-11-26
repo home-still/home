@@ -87,11 +87,13 @@ the catalog. The reason's kind decides what can recover it:
 | `epub_parse_error` | bad source | The EPUB cannot be opened, exceeds the size caps, or has a missing, escaping or non-UTF-8 spine item. |
 | `html_not_utf8` | bad source | The HTML is not UTF-8. |
 | `html_parse_error` | bad source | The HTML nests too deeply, or its conversion did not finish in time. |
-| `unsupported_extension` | bad source | No converter handles the file's extension. |
+| `text_not_utf8` | bad source | The Markdown or plain-text source is not UTF-8. |
+| `text_too_large` | bad source | The Markdown or plain-text source is over 16 MiB. |
+| `unsupported_extension` | bad source | No converter handles the file's extension, or the store that holds the source does not take it. |
 | `source_missing` | bad source | The source object does not exist in storage. |
 | `missing_extension` | bad source | The event's key has no extension. |
-| `invalid_key` | bad source | The event's key cannot name a document (escapes the storage root, or an empty or dot-segment stem). |
-| `empty_conversion` | bad source | The HTML or EPUB parser produced less text than can be indexed. |
+| `invalid_key` | bad source | The event's key cannot name a document (escapes the storage root, an empty or dot-segment stem, or under no store's source prefix). |
+| `empty_conversion` | bad source | The HTML or EPUB parser produced less text than can be indexed, or a Markdown or plain-text source holds less. |
 | `conversion_panicked` | bad source | The server panicked converting this document; the same bytes panic again. |
 | `vlm_request_rejected` | bad source | The VLM backend refused the page's request itself (bad request, payload too large, unsupported media). |
 | `empty_vlm_conversion` | retryable | The VLM produced less text than can be indexed. |

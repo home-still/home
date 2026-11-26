@@ -204,8 +204,8 @@ messages and an unacknowledged message is delivered again (at-least-once).
 
 | Subject | Stream | Published when | Durable consumer | Consumed by |
 |---|---|---|---|---|
-| `papers.ingested` | `PAPERS` | a source document is stored (download, inbox, `hs pipeline catch-up`, `hs scribe reconvert`) | `scribe-workers` | `hs scribe watch-events` |
-| `scribe.completed` | `SCRIBE` | a conversion's markdown is stored | `distill-workers` | `hs distill watch-events` |
+| `papers.ingested` | `PAPERS` | a source document is stored in any store (download, inbox, `hs pipeline catch-up`, `hs scribe reconvert`) | `scribe-workers` | `hs scribe watch-events` |
+| `scribe.completed` | `SCRIBE` | a conversion's markdown is stored; the payload names the document's store | `distill-workers` | `hs distill watch-events` |
 | `scribe.boxes` | `SCRIBE` | a PDF's markdown is stored, a PDF is added to the personal store, or `hs scribe boxes catch-up` finds a converted PDF without word boxes | `box-workers` | `hs scribe watch-events` |
 
 The `DISTILL` stream holds `distill.>` subjects. `hs pipeline events-reset`

@@ -59,13 +59,20 @@ pub enum FailureCode {
     /// HTML the converter refuses to parse: elements nested deeper than
     /// `html::MAX_HTML_NESTING`, or a conversion that did not finish in time.
     HtmlParseError,
+    /// A Markdown or plain-text source that is not UTF-8.
+    TextNotUtf8,
+    /// A Markdown or plain-text source over
+    /// `event_watch::MAX_TEXT_SOURCE_BYTES`.
+    TextTooLarge,
+    /// No converter handles the extension, or the store that holds the
+    /// source does not declare it.
     UnsupportedExtension,
     /// The source object does not exist in storage.
     SourceMissing,
     /// The event key carries no extension; no parser can be picked.
     MissingExtension,
     /// The event key cannot name a document (escapes the storage root,
-    /// empty or dot-segment stem).
+    /// empty or dot-segment stem, or under no store's source prefix).
     InvalidKey,
     /// A parser (HTML / EPUB) produced output below the indexable floor.
     /// Every tier runs the same parser, so this is content-intrinsic.
@@ -109,6 +116,8 @@ impl FailureCode {
             Self::EpubParseError => "epub_parse_error",
             Self::HtmlNotUtf8 => "html_not_utf8",
             Self::HtmlParseError => "html_parse_error",
+            Self::TextNotUtf8 => "text_not_utf8",
+            Self::TextTooLarge => "text_too_large",
             Self::UnsupportedExtension => "unsupported_extension",
             Self::SourceMissing => "source_missing",
             Self::MissingExtension => "missing_extension",
@@ -126,12 +135,14 @@ impl FailureCode {
         }
     }
 
-    const ALL: [FailureCode; 21] = [
+    const ALL: [FailureCode; 23] = [
         Self::UnsupportedContentTypeHtml,
         Self::UnsupportedContentTypeBinary,
         Self::PaywallHtml,
         Self::PdfParseError,
         Self::EpubParseError,
+        Self::TextNotUtf8,
+        Self::TextTooLarge,
         Self::HtmlNotUtf8,
         Self::HtmlParseError,
         Self::UnsupportedExtension,
@@ -167,6 +178,8 @@ impl FailureCode {
             | Self::EpubParseError
             | Self::HtmlNotUtf8
             | Self::HtmlParseError
+            | Self::TextNotUtf8
+            | Self::TextTooLarge
             | Self::UnsupportedExtension
             | Self::SourceMissing
             | Self::MissingExtension

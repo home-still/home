@@ -37,6 +37,17 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
   `academic` and its reference lists; `hs pipeline purge-poisoned` and
   `hs migrate` also delete its record from `abstracts`, because they delete
   its catalog entry. `hs pipeline rebuild` empties both stores.
+- A `scribe.completed` event names the store its document belongs to, and
+  `hs distill watch-events` indexes the document into that store. **Upgrade
+  the scribe and distill watchers together, then run `hs distill
+  reconcile`**: the new distill watcher drops an event published by an older
+  scribe watcher, because it names no store, and does not take it again.
+- `hs scribe watch-events` works out a source's store from its key. It
+  refuses a file type the store does not take (`unsupported_extension`) and
+  a key under no store's prefix (`invalid_key`). It takes `.md` and `.txt`
+  sources in the stores that hold them and stores their text as the
+  markdown; one that is not UTF-8 fails as `text_not_utf8`, and one over
+  16 MiB as `text_too_large`.
 
 ## v0.0.1-rc.394
 

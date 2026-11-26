@@ -560,7 +560,9 @@ pub(crate) async fn cmd_watch_events(
                 // its own failure stamping (source_missing) and
                 // classification: Permanent → TERM, Transient → NAK.
                 let source =
-                    match hs_scribe::event_watch::prepare_source(storage.as_ref(), &event).await {
+                    match hs_scribe::event_watch::prepare_source(storage.as_ref(), &stores, &event)
+                        .await
+                    {
                         Ok(hs_scribe::event_watch::SourcePrep::AlreadyConverted(md_key)) => {
                             // An earlier attempt wrote the markdown; it may have
                             // died before telling distill, or before asking for
@@ -672,7 +674,7 @@ pub(crate) async fn cmd_watch_events(
                                         if let Err(stamp_err) =
                                             hs_common::catalog::update_conversion_failed_via(
                                                 storage.as_ref(),
-                                                "catalog",
+                                                &source.catalog_prefix,
                                                 &stem,
                                                 &reason,
                                                 attempts_log.clone(),
@@ -738,7 +740,7 @@ pub(crate) async fn cmd_watch_events(
                             if let Err(stamp_err) =
                                 hs_common::catalog::update_conversion_failed_via(
                                     storage.as_ref(),
-                                    "catalog",
+                                    &source.catalog_prefix,
                                     &stem,
                                     &reason,
                                     attempts_log,

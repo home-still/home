@@ -515,6 +515,7 @@ pub(crate) async fn cmd_watch_events(
     // A rejected HS_BACKEND_TOKEN stops the watcher here, before it pulls an event.
     hs_distill::event_watch::preflight(&distill).await?;
 
+    let stores = Arc::new(hs_common::stores::Stores::load().context("reading the store registry")?);
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
     run_subscriber(
@@ -527,8 +528,16 @@ pub(crate) async fn cmd_watch_events(
             let storage = storage_for_handler.clone();
             let bus = bus_for_handler.clone();
             let distill = distill.clone();
+            let stores = stores.clone();
             async move {
-                index_and_publish(storage.as_ref(), distill.as_ref(), bus.as_ref(), &event).await
+                index_and_publish(
+                    storage.as_ref(),
+                    &stores,
+                    distill.as_ref(),
+                    bus.as_ref(),
+                    &event,
+                )
+                .await
             }
         },
     )
