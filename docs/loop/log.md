@@ -3034,7 +3034,13 @@ Found while indexing, both open:
   exactly 2,048 prompt tokens, and replacing such a chunk's last 300
   characters leaves its vector unchanged (cosine 1.0). Two documents are
   refused outright with HTTP 413 (`10.48550_arxiv.2604.26509`,
-  `W3212386989`), on every attempt since 2026-10-30.
+  `W3212386989`), on every attempt since 2026-10-30. Against production
+  this is not a loss for the truncated chunks: its ONNX embedder cuts at
+  `embedding.max_length`, 1,280 tokens on this host (the default, read in
+  `config.rs` on main), and 240 of the same 1,500 chunks (16.0%) are over
+  that. That figure is derived from the candidate's chunk texts, not
+  measured on production's inputs. The loss is the two refused documents,
+  which production embeds from a prefix.
 - A refused `observe` leaves ledger records with no index points. The two
   documents above were listed as indexed (90 and 111 chunks) with nothing
   searchable. Those 201 records were purged; the store then holds 475,786

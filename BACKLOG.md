@@ -1438,7 +1438,10 @@ how-to says a cron entry is enough, which puts the burden on the operator.
 with no error (30 of 1,500 randomly sampled academic chunks, 2.0%, report exactly 2,048 prompt
 tokens; replacing the last 300 characters of one leaves its vector unchanged), and some inputs are
 refused with HTTP 413. Two documents (`10.48550_arxiv.2604.26509`, `W3212386989`) fail every
-indexing attempt for that reason; the Qdrant-era index holds both.
+indexing attempt for that reason; the Qdrant-era index holds both. The Qdrant-era ONNX embedder
+cuts sooner, at `embedding.max_length` = 1,280 tokens (240 of the same 1,500 chunks, 16.0%, are
+over that; derived from these chunk texts, not measured on its inputs), so for truncated chunks
+the myelin path is the better of the two and only the two refused documents are a loss.
 **Cause.** A chunk is at most 4,000 characters, which table and formula markup turns into more
 than 2,048 tokens. The model's own limit is 8,192, but Ollama starts it with a 2,048-token batch
 (measured from the process arguments: `-c 8192 -np 1 -b 2048 -ub 2048`), and an embedding input
