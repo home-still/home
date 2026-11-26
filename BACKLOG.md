@@ -1456,6 +1456,23 @@ a formerly truncated window's tail reaches its vector. Cost measured: 268 MiB mo
 0.5 GB more resident memory in the runner. Not done: pointing the store at such a model and
 indexing the two documents end to end. Not a chunk-size cut: that changes retrieval for the whole
 corpus.
+**Done 2026-11-26.** The store's embedder is `bge-m3-8k`: `bge-m3` with `num_batch 8192`, made
+with `ollama create`. The distill server names that model and stops at start-up when Ollama reads
+fewer tokens than a 2,100-word probe holds (`verify_embed_capacity`). Both refused documents
+then indexed (58 and 53 chunks; ledger rows equal index points). A chunk of 2,374 tokens is
+stored with the vector of its whole text (cosine 1.0).
+**Corrections to the text above, all measured the same day.**
+- "about 0.5 GB more resident memory" held only for inputs up to 2,614 tokens. The runner keeps
+  host memory for the longest input it has read: 1.4 GiB after 18 tokens, 3.4 after 2,102, 4.6
+  after 3,302, 5.4 after 4,502, 9.0 after 8,002. VRAM moved by under 100 MiB across them. The
+  9.0 GiB reading took the host to 0.7 GiB available. So the start-up probe is just over the stock
+  batch, and myelin's split cap (P1-43) is 4,500 characters, not the model's whole context.
+- Length does not say whether a stock model cuts an input or refuses it: inputs of 2,364, 4,502
+  and 8,002 tokens were cut to 2,048 with HTTP 200, and one of 2,078 was refused with HTTP 413.
+- The count given to the owner, 3,120 documents holding a record over 2,048 tokens (7,981
+  records), was taken on whole records. The store embedded a record over 4,000 characters in
+  two pieces (P1-43), so only a piece over 2,048 tokens was cut and the count is too high. It
+  was not taken again: P1-43 needs every document indexed again anyway.
 
 ### P1-41. A refused myelin `observe` leaves ledger records with no index points, and the document then counts as indexed (found 2026-11-26)
 **Symptom.** The two documents of P1-40 were listed by `/docs`, `/exists` and the status counts
@@ -1473,6 +1490,13 @@ a list of ids to keep, nothing lists a document's ids past 200, and an unchanged
 same ids again, so "delete what this attempt wrote" would delete the live records. The same gap
 leaves a duplicate generation when the first store's write succeeds and the second's fails; that
 needs a way to list a document's record ids.
+**Fixed 2026-11-26 in myelin** (`home-still/myelin#217`, closes #216). A call's episodes are
+embedded before any ledger row is written; a failure after that removes the rows and points the
+call added and nothing older. The caller gets the failing step and its cause instead of the word
+`store`. Shown with the two documents of P1-40: after the embedder fix both index, and their
+ledger rows equal their index points. Still open: the write of derived records is not undone
+when it fails (the error says what it left), and the duplicate generation when the first store's
+write succeeds and the second's fails.
 
 ### P1-42. The cutover gate picks and scores retrieval settings on the same 25 queries (found 2026-11-26)
 **Symptom.** At myelin's default rerank depth the gate fails (23/25). Seven depths were then tried
@@ -1483,3 +1507,35 @@ repeats, but one query sits at rank 8 and recall is not monotone in depth. All a
 judged by it.
 **Fix.** A second, held-out query set that no setting is tuned on; a retrieval setting is accepted
 on that set. Until then the 2026-11-26 result is "passes at a fitted depth", not "passes".
+
+### P1-43. myelin gave the two pieces of a record over 4,000 characters equal weight, so a fifth of the records had a vector that was half their last lines (found 2026-11-26)
+**Symptom.** Measured on the candidate store. A record is a header line and a chunk of up to
+4,000 characters, so 70,444 of the 378,829 records of `academic` are over 4,000 characters
+(18.6 %, in 15,230 of 19,263 documents), as are 26,162 of 96,957 in `references` (27.0 %), 87 of
+3,834 in `personal` and 36 of 3,462 in `abstracts`. The longest is 4,406. Each of them was
+stored as the plain average of the vectors of two pieces; in a sample of 285 the smaller piece
+had a median of 260 characters. For one document a 4,045-character record's stored vector
+equalled the average of its 3,954- and 91-character pieces (cosine 1.0) and was 0.90 from the
+vector of the whole text. Such vectors score higher against unrelated queries: the top 12 dense
+hits of gate queries q11 and q09 average 0.551 and 0.558 as stored, and 0.481 and 0.506 when the
+same texts are embedded whole; split records are 23 and 17 of their top 25 dense hits, and none
+of those holds the expected term.
+**Cause.** myelin's `RemoteEmbedder` split an input over 4,000 characters on line boundaries and
+returned the unweighted mean of the pieces' vectors.
+**Fix.** Done in myelin (`home-still/myelin#218`): the mean is weighted by piece length, and the
+cap is a setting, `MYELIN_EMBED__MAX_CHARS`. The store runs with 4,500, so every home-still
+record is embedded whole (needs the embedder of P1-40). After indexing one document again its
+records' vectors equal their whole-text vectors (cosine 1.0). Every document is being indexed
+again (started 2026-11-26 16:04 UTC). Not shown: that this is why the gate missed q09 and q11 at
+depth 25. The chunks that answer them are not split, and q09's best chunk has 8,361 records
+above it in dense score.
+
+### P1-44. The store's approximate dense search misses records an exact search returns (found 2026-11-26)
+**Symptom.** Measured on the candidate store's Qdrant (483,082 points, HNSW `m` 16,
+`ef_construct` 100, no quantization): the approximate top 25 dense hits share 17 of 25 with the
+exact top 25 for gate query q11, and 22 of 25 for q09. For q11 the approximate search misses the
+exact search's first hit, a chunk about the query's subject.
+**Cause.** Not established. Two queries, both taken while a fifth of the vectors were the
+averages of P1-43, which sit close to many queries.
+**Fix.** Measure again on the re-indexed store, over the whole query set. Only when recall is
+still low: raise the search `ef` in myelin, and judge it on the held-out queries, not the gate's.
