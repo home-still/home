@@ -88,6 +88,28 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Index documents of the `academic` store again from their stored
+    /// markdown and catalog entry, replacing their records in place. A
+    /// document's new records are written before its earlier ones are
+    /// deleted, so it stays searchable throughout.
+    Reindex {
+        /// Stems of the documents to index again
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        stems: Vec<String>,
+        /// Index every document that has markdown
+        #[arg(long)]
+        all: bool,
+        /// With `--all`, leave out the documents indexed at or after this
+        /// time (RFC 3339); name the time a stopped run began to continue it
+        #[arg(long, value_name = "TIME", requires = "all")]
+        older_than: Option<String>,
+        /// How many documents are indexed at once
+        #[arg(long, default_value = "1")]
+        concurrency: std::num::NonZeroUsize,
+        /// Override server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
     /// Delete every stored chunk for a doc_id. CLI-only (no MCP) because
     /// this is a destructive write — use to clear orphaned chunks after
     /// markdown has been removed, or to force a clean re-index.

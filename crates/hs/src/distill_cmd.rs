@@ -155,6 +155,23 @@ pub async fn dispatch(
             reembed,
             server,
         } => cmd_reconcile(fix_stamps, reembed, server.as_deref(), reporter).await,
+        DistillCmd::Reindex {
+            stems,
+            all,
+            older_than,
+            concurrency,
+            server,
+        } => {
+            crate::maintain::reindex::cmd(
+                stems,
+                all,
+                older_than,
+                concurrency,
+                server.as_deref(),
+                reporter,
+            )
+            .await
+        }
         DistillCmd::Purge { doc_id, server } => {
             cmd_purge(&doc_id, server.as_deref(), reporter).await
         }

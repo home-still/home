@@ -92,7 +92,9 @@ fn classify(in_store: bool, state: &CatalogState) -> Classification {
     }
 }
 
-fn is_embed_failure(reason: Option<&str>) -> bool {
+/// Whether an `embedding_skip` reason records an index attempt that failed,
+/// as opposed to a document found to hold nothing to index.
+pub fn is_embed_failure(reason: Option<&str>) -> bool {
     reason.is_some_and(|r| r.starts_with("embed_failed"))
 }
 

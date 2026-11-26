@@ -48,6 +48,15 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
   sources in the stores that hold them and stores their text as the
   markdown; one that is not UTF-8 fails as `text_not_utf8`, and one over
   16 MiB as `text_too_large`.
+- `hs distill reindex <STEM>...` indexes documents again from their stored
+  markdown and catalog entry; `--all` covers every document, and
+  `--older-than <TIME>` continues a run that stopped. Each document keeps
+  its earlier records until the new ones are written. **A store that an
+  earlier myelin-backed distill server filled needs `hs distill reindex
+  --all` once after the upgrade**: until a paper is indexed again, its
+  reference lists stay in `academic` and its records lack `store`. A store
+  that is empty needs `hs distill reconcile --reembed` instead, which
+  indexes every document it does not hold.
 
 ## v0.0.1-rc.394
 

@@ -16,6 +16,7 @@ mod docs_shape;
 mod docs_tests;
 mod docs_views;
 mod installer;
+mod maintain;
 mod mcp_cmd;
 mod migrate_cmd;
 mod migrate_personal;

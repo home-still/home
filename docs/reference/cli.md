@@ -733,6 +733,7 @@ hs distill [OPTIONS] <COMMAND>
 | `hs distill watch-events` | Consume `scribe.completed` events from the event bus and index each markdown object through the distill server. |
 | `hs distill diagnose` | Explain why a stem produces or does not produce chunks: fetch its markdown, run the chunker and quality filter, and print the accept or reject reason for each chunk. |
 | `hs distill reconcile` | Compare the markdown objects, the `academic` store and the catalog, and optionally repair the differences. |
+| `hs distill reindex` | Index documents of the `academic` store again from their stored markdown and catalog entry, replacing their records in place. |
 | `hs distill purge` | Delete every stored chunk for a `doc_id`. |
 | `hs distill abstracts` | Manage the `abstracts` store, which holds one record per paper built from its title and abstract. |
 
@@ -875,6 +876,32 @@ Example:
 
 ```bash
 hs distill reconcile --fix-stamps
+```
+
+### `hs distill reindex`
+
+Index documents of the `academic` store again from their stored markdown and catalog entry, replacing their records in place.
+
+```text
+hs distill reindex [OPTIONS] [STEMS]...
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `[STEMS]...` | none | Stems of the documents to index again. Required unless `--all` is given. |
+| `--all` | off | Index every document that has markdown. |
+| `--older-than <TIME>` | none | With `--all`, leave out the documents indexed at or after this time (RFC 3339). |
+| `--concurrency <CONCURRENCY>` | `1` | How many documents are indexed at once. |
+| `--server <SERVER>` | none | Override server URL. |
+
+A document's new records are written before its earlier ones are deleted, so it stays searchable throughout. Each document's catalog entry is read again, which picks up corrected metadata, and its `embedding` stamp is written again. A document that fails is reported and counted and keeps the records and the stamp it had; the others still run, and the command exits non-zero.
+
+Use `--all` after an upgrade that changes what a record carries. A run over a large store takes hours: to continue one that stopped, pass the time it began as `--older-than`, and the documents it already indexed are left out. A document the catalog marks with a failed index attempt is never left out.
+
+Example:
+
+```bash
+hs distill reindex --all --older-than 2026-01-31T00:00:00Z
 ```
 
 ### `hs distill purge`
