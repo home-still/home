@@ -101,7 +101,7 @@ journalctl --user -u hs-scribe-watch-events -f
 
 On macOS the services are LaunchAgents named `com.home-still.<service>`, and their logs are under `~/Library/Logs/home-still/`. Every unit name is in [service units](../reference/services-and-ports.md#service-units).
 
-See the whole pipeline at once with the dashboard, which reads the MCP server's `system_status`:
+See the whole pipeline at once with the dashboard, which reads the MCP server's `GET /mcp/status` route:
 
 ```sh
 HS_MCP_URL=http://localhost:7445/mcp hs status

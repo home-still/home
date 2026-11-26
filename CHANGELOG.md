@@ -57,6 +57,32 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
   reference lists stay in `academic` and its records lack `store`. A store
   that is empty needs `hs distill reconcile --reembed` instead, which
   indexes every document it does not hold.
+- **`hs-mcp` has ten tools: `cite`, `read`, `documents`, `discover`,
+  `graph`, `acquire`, `capture`, `personal_add`, `synthesis_save` and
+  `status`.** Every other tool is gone, and so are the `catalog:///` and
+  `markdown:///` resources; a client that calls a removed tool is answered
+  "tool not found". Searching is `recall` on the myelin server, which a
+  client connects beside `hs-mcp`. `docs/reference/mcp-tools.md` says where
+  each removed tool went.
+- New tools: `capture` keeps a web page the agent has read in the `web`
+  store (capturing the same address again replaces the page);
+  `synthesis_save` saves an answer in `syntheses` and refuses it unless
+  every citation is in its document; `status` reports the queues, the index
+  and the converters, or one document stage by stage; `discover` and
+  `graph` take `source` to choose between the online providers and the
+  local OpenAlex corpus, and no longer disappear from the tool list when
+  the corpus is not built (they refuse and say how to build it).
+- The prompts are `guidance`, `verify` and `brief`; `research_paper`,
+  `summarize_document` and `compare_papers` are gone.
+- `hs status` reads `GET /mcp/status` on the MCP server instead of calling
+  the `system_status` tool. **Upgrade `hs` and `hs-mcp` together**: a new
+  `hs status` against an older `hs-mcp` is answered `404`, and an older
+  `hs status` finds no `system_status` tool on a new one.
+- The maintenance tools became commands: `hs pipeline repair-catalog`,
+  `hs pipeline backfill-titles`, `hs migrate dedupe-url-encoded`,
+  `hs scribe queue <STEM>`, `hs distill scan-repetitions` and
+  `hs distill backfill`. A command that writes does so by default and takes
+  `--dry-run`.
 
 ## v0.0.1-rc.394
 

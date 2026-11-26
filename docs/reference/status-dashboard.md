@@ -5,9 +5,10 @@ recent activity. In an interactive terminal it is a live dashboard (`q`, Esc or
 Ctrl+C quits); when stdout or stdin is not a terminal it prints the same data
 once as text. `--output json` and `--output ndjson` print it once as JSON.
 
-The data comes from the MCP server's [`system_status`](mcp-tools.md#system_status)
-tool, so the CLI and an agent see the same numbers. `hs status` reaches the MCP
-server in one of two ways:
+The data comes from the MCP server's `GET /mcp/status` route (see
+[HTTP routes](mcp-tools.md#http-routes)). An agent reads the pipeline with the
+[`status`](mcp-tools.md#status) tool. `hs status` reaches the MCP server in one
+of two ways:
 
 | Setting | Route |
 |---|---|

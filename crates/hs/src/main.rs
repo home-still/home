@@ -212,6 +212,9 @@ fn main() -> ExitCode {
                         )
                         .await
                     }
+                    cli::MigrateAction::DedupeUrlEncoded => {
+                        maintain::dedupe_url_encoded::cmd().await
+                    }
                 },
                 TopCmd::Pipeline { command } => pipeline_cmd::dispatch(command, &reporter).await,
                 TopCmd::Openalex { command } => openalex_cmd::dispatch(command).await,

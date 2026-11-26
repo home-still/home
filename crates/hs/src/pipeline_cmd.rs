@@ -129,6 +129,27 @@ pub enum PipelineCmd {
         #[arg(long = "reason", value_name = "REASON")]
         reasons: Vec<String>,
     },
+    /// Report where the academic catalog and the storage disagree: sources
+    /// with no catalog entry, entries with no markdown or no source, missing
+    /// stage flags, stale markdown paths and documents never converted.
+    /// Reads only; it changes nothing and prints a JSON report.
+    RepairCatalog {
+        /// Cap what each `would_*` count reports at this many entries.
+        /// Default: no cap.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Look up the title and other metadata of catalog entries that have a
+    /// DOI and no title. Without `--dry-run` it looks them up and writes them.
+    BackfillTitles {
+        /// Report what would be looked up without contacting a provider or
+        /// writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Look up at most this many entries. Default: all.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -155,6 +176,12 @@ pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<
             limit,
             reasons,
         } => cmd_reconvert_failed(dry_run, yes, limit, &reasons, reporter).await,
+        PipelineCmd::RepairCatalog { limit } => {
+            crate::maintain::repair_catalog::cmd(limit, reporter.as_ref()).await
+        }
+        PipelineCmd::BackfillTitles { dry_run, limit } => {
+            crate::maintain::backfill_titles::cmd(dry_run, limit, reporter.as_ref()).await
+        }
     }
 }
 

@@ -74,6 +74,7 @@ hs scribe [OPTIONS] <COMMAND>
 | `hs scribe catalog-backfill` | Create catalog entries for markdown files in `scribe.output_dir` that have none. |
 | `hs scribe reconvert` | Clear a document's conversion stamps and derived artifacts, then republish `papers.ingested` so the watcher converts it again. |
 | `hs scribe boxes` | Word-box sidecars: where every word of a PDF sits on its page, which is what lets a quotation be highlighted in the document it is from. |
+| `hs scribe queue` | Announce that one stored source needs converting: publish `papers.ingested` so the scribe watcher converts it. |
 
 The conversion commands read the `scribe:` section; the watchers and `hs scribe boxes` also need `storage:` and `events:`. See [configuration](configuration.md).
 
@@ -297,6 +298,26 @@ Example:
 
 ```bash
 hs scribe reconvert 10.48550_arxiv.2312.10997
+```
+
+### `hs scribe queue`
+
+Announce that one stored source needs converting.
+
+```text
+hs scribe queue [OPTIONS] <STEM>
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `<STEM>` | required | Catalog stem (no extension), e.g. `10.48550_arxiv.2312.10997`. |
+
+Looks for the stem's source (`.pdf`, `.html` or `.epub`) in the `academic` store and publishes `papers.ingested` for it, so the scribe watcher converts it. It converts nothing itself, and a stem with no stored source is an error that names every key tried and publishes nothing. It needs `storage:` and an `events:` section, and fails when the event bus is not reachable. On success it prints a JSON report with `stem`, `source_key`, `queued` and a hint for what to run next. Unlike `hs scribe reconvert`, it clears nothing: it is for a source that was stored and never announced.
+
+Example:
+
+```bash
+hs scribe queue 10.48550_arxiv.2312.10997
 ```
 
 ### `hs scribe boxes`
@@ -734,6 +755,8 @@ hs distill [OPTIONS] <COMMAND>
 | `hs distill diagnose` | Explain why a stem produces or does not produce chunks: fetch its markdown, run the chunker and quality filter, and print the accept or reject reason for each chunk. |
 | `hs distill reconcile` | Compare the markdown objects, the `academic` store and the catalog, and optionally repair the differences. |
 | `hs distill reindex` | Index documents of the `academic` store again from their stored markdown and catalog entry, replacing their records in place. |
+| `hs distill backfill` | Index the converted documents that were never embedded. |
+| `hs distill scan-repetitions` | Report stored markdown that the repetition cleaner would cut heavily. |
 | `hs distill purge` | Delete every stored chunk for a `doc_id`. |
 | `hs distill abstracts` | Manage the `abstracts` store, which holds one record per paper built from its title and abstract. |
 
@@ -902,6 +925,50 @@ Example:
 
 ```bash
 hs distill reindex --all --older-than 2026-01-31T00:00:00Z
+```
+
+### `hs distill backfill`
+
+Index the converted documents that were never embedded.
+
+```text
+hs distill backfill [OPTIONS]
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `--dry-run` | off | Report what would be indexed without sending anything to the server or writing anything. |
+| `--limit <LIMIT>` | none | Index at most this many documents. Without it, all of them. |
+| `--retry-skipped` | off | Also index documents whose last indexing found nothing to index. |
+| `--server <SERVER>` | none | Override server URL. |
+
+A document is a candidate when its catalog entry has a conversion stamp, no embedding stamp with chunks, and no record that indexing found nothing to index (unless `--retry-skipped` is given). The command indexes the candidates one at a time into the `academic` store and stamps each catalog entry; the JSON report has `candidates`, `indexed`, `still_skipped` (indexed with no chunks), `errors` (one line for each document that could not be indexed or stamped), up to ten `samples` and `dry_run: false`. With `--dry-run` it sends nothing and writes nothing, and the report has `candidates`, `would_index`, `samples` and `dry_run: true`. The command exits with an error when `errors` is not empty, after printing the report. `hs distill reconcile --reembed` also indexes unembedded documents, and it compares the store as well; `hs distill reindex` indexes documents again whether or not they were embedded.
+
+Example:
+
+```bash
+hs distill backfill --dry-run --limit 100
+```
+
+### `hs distill scan-repetitions`
+
+Report stored markdown that the repetition cleaner would cut heavily.
+
+```text
+hs distill scan-repetitions [OPTIONS]
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `--limit <LIMIT>` | `100000` | Scan at most this many documents. |
+| `--threshold <THRESHOLD>` | `20` | Report documents cut more than this many times. |
+
+A converter that loops writes the same words again and again. The command runs the repetition cleaner over each stored markdown document of the `academic` store in memory and reports the documents it would cut more than `--threshold` times. The JSON report has `scanned`, `threshold`, `flagged_count` and `flagged`; each flagged document has its `stem`, its storage `key`, `truncations`, the count for each cleaning pass in `truncations_by_pass` and an `offending_snippet` where the cleaned text first differs. The command changes nothing. It stops with an error naming the document when one cannot be read or is not UTF-8.
+
+Example:
+
+```bash
+hs distill scan-repetitions --threshold 50
 ```
 
 ### `hs distill purge`
@@ -1593,8 +1660,9 @@ hs migrate [OPTIONS] <COMMAND>
 | `hs migrate quarantine-bad-content` | Find `papers/**/*.pdf` objects whose bytes are not a PDF, rename HTML to `.html`, and move other content to `papers/.quarantine/`. |
 | `hs migrate drop-local-html` | Delete catalog rows whose `conversion.server` is `local-html`, together with their markdown and source HTML. |
 | `hs migrate canonicalize-doi-stems` | Lowercase DOI-derived stems and merge case-collision duplicates onto one storage key. |
+| `hs migrate dedupe-url-encoded` | Report documents stored under a URL-encoded stem and again under the decoded one. |
 
-Migrations act immediately: none of them asks for confirmation. Every migration except `hs migrate sharding` has `--dry-run`, which prints the plan and changes nothing.
+Migrations act immediately: none of them asks for confirmation. Every migration except `hs migrate sharding` and `hs migrate dedupe-url-encoded` has `--dry-run`, which prints the plan and changes nothing. `hs migrate dedupe-url-encoded` only reports.
 
 Example:
 
@@ -1725,6 +1793,24 @@ Example:
 hs migrate canonicalize-doi-stems --dry-run
 ```
 
+### `hs migrate dedupe-url-encoded`
+
+Report documents stored under a URL-encoded stem and again under the decoded one.
+
+```text
+hs migrate dedupe-url-encoded
+```
+
+This command has no options.
+
+Lists the markdown of the `academic` store and finds each stem that contains a percent-encoded byte, such as `10.1%2Fabc`, whose decoded form is also a stem. It prints a JSON report with `pairs_found`, `would_delete_encoded_rows` and up to ten `samples`, each with the `encoded` and the `decoded` stem. The command changes nothing, so it has no `--dry-run`, and it exits with status 0 whenever it could read the storage.
+
+Example:
+
+```bash
+hs migrate dedupe-url-encoded
+```
+
 ## `hs pipeline`
 
 Cross-service pipeline operations (rebuild from papers, etc.).
@@ -1742,6 +1828,8 @@ hs pipeline [OPTIONS] <COMMAND>
 | `hs pipeline purge-poisoned` | Delete documents that reached the store but whose text is an anti-bot or cookie-wall page. |
 | `hs pipeline reap-phantoms` | Delete catalog entries that have no downloaded paper, no markdown and no embedding record. |
 | `hs pipeline reconvert-failed` | Re-queue documents whose conversion was given up on. |
+| `hs pipeline repair-catalog` | Report where the academic catalog and the storage disagree. |
+| `hs pipeline backfill-titles` | Look up the title and other metadata of catalog entries that have a DOI and no title. |
 
 Pipeline operations read `storage:`, `events:` and `distill.servers`. The destructive ones (`rebuild`, `purge-*`, `reap-phantoms`) have `--dry-run` and ask for confirmation unless `--yes` is given. `--yes` on these commands is a local, long-form flag: `-y` is not accepted.
 
@@ -1895,6 +1983,47 @@ Example:
 
 ```bash
 hs pipeline reconvert-failed --dry-run --limit 25
+```
+
+### `hs pipeline repair-catalog`
+
+Report where the academic catalog and the storage disagree.
+
+```text
+hs pipeline repair-catalog [OPTIONS]
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `--limit <LIMIT>` | none | Cap each `would_*` count at this many entries. Without it, no cap. |
+
+Reads every source, every markdown object and every catalog entry of the `academic` store once, then looks for seven kinds of disagreement in that snapshot and prints one JSON report with a count and up to ten example stems for each: `disk_no_catalog` (a source with no catalog entry), `catalog_no_markdown` (an entry that says the document was converted, with no markdown), `catalog_no_source` (an entry with neither a source nor markdown), `flag_drift` (a stage flag is missing but storage shows the stage done), `flag_drift_resync` (timestamps that still carry the stamp of one earlier batch), `md_path_drift` (a recorded markdown path that is not where the markdown is) and `stuck_convert` (a source that was never converted and has no failure stamp). The command changes nothing. It exits with status 0 whenever it could read the storage, whatever it found. `hs pipeline reap-phantoms` deletes the entries that `catalog_no_source` lists.
+
+Example:
+
+```bash
+hs pipeline repair-catalog --limit 100
+```
+
+### `hs pipeline backfill-titles`
+
+Look up the title and other metadata of catalog entries that have a DOI and no title.
+
+```text
+hs pipeline backfill-titles [OPTIONS]
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `--dry-run` | off | Report what would be looked up without contacting a provider or writing anything. |
+| `--limit <LIMIT>` | none | Look up at most this many entries. Without it, all of them. |
+
+An entry is a candidate when it has a DOI and its title is missing or blank. The command asks the paper providers for each candidate by DOI. An entry whose lookup returns a title gets the title, plus the authors, publication date, abstract and citation count it lacks; a field it already has is kept. The entry is read again just before it is written, so a stamp written meanwhile is not lost, and it is marked as repaired. The JSON report has `candidates`, `backfilled`, `no_metadata` (the providers know nothing under that DOI), `errors` (one line for each entry whose lookup or write failed), up to ten `samples` and `dry_run: false`. With `--dry-run` it contacts no provider and writes nothing, and the report has `candidates`, `would_backfill`, `samples` and `dry_run: true`. The command exits with an error when `errors` is not empty, after printing the report. Provider settings are read from the paper configuration.
+
+Example:
+
+```bash
+hs pipeline backfill-titles --dry-run --limit 50
 ```
 
 ## `hs openalex`

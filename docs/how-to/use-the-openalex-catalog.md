@@ -86,7 +86,7 @@ Then run the steps in this order. Each prints what it did and exits non-zero on 
    sudo systemctl start hs-serve-mcp
    ```
 
-The MCP server checks for the finished catalog once, at start-up, and offers the `openalex_*` tools only when it is complete. Restart it after every build. See [tool visibility](../reference/mcp-tools.md#tool-visibility).
+The MCP server checks for the finished catalog once, at start-up. Until the catalog is complete, `discover` and `graph` refuse `source: "openalex"` and say why. Restart the server after every build. See [startup requirements](../reference/mcp-tools.md#startup-requirements).
 
 ## Look at the catalog
 
@@ -107,7 +107,7 @@ hs openalex query "SELECT openalex_id, title, cited_by_count FROM works ORDER BY
 
 ## Use it from an agent
 
-Five tools read the catalog: `openalex_search`, `openalex_get`, `openalex_references`, `openalex_citations` and `openalex_authors_by_topic`. Ask your agent to search for a topic, then to list what a work cites or what cites it. The parameters are in [OpenAlex tools](../reference/mcp-tools.md#openalex-tools).
+Two tools read the catalog when they are given `source: "openalex"`: [`discover`](../reference/mcp-tools.md#discover) searches works, looks one up by DOI and lists a topic's most cited authors; [`graph`](../reference/mcp-tools.md#graph) lists what a work cites and what cites it. Ask your agent to search for a topic, then to follow a work's citations.
 
 ## Load a newer snapshot
 
@@ -122,4 +122,4 @@ The loader refuses a partition that is newer than one it already loaded for the 
    hs openalex query "SELECT openalex_id, title FROM works LIMIT 1"
    ```
 
-3. After you restart the MCP server, `openalex_search` appears in your client's tool list, and a search returns works. If it does not appear, the catalog is not complete: rerun `hs openalex build-fts`, then restart the server.
+3. After you restart the MCP server, ask your agent to call `discover` with `source: "openalex"` and a query: it returns works. If it answers that the corpus is not built, the catalog is not complete: rerun `hs openalex build-fts`, then restart the server.

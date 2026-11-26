@@ -172,6 +172,24 @@ pub async fn dispatch(
             )
             .await
         }
+        DistillCmd::Backfill {
+            dry_run,
+            limit,
+            retry_skipped,
+            server,
+        } => {
+            crate::maintain::distill_backfill::cmd(
+                dry_run,
+                limit,
+                retry_skipped,
+                server.as_deref(),
+                reporter.as_ref(),
+            )
+            .await
+        }
+        DistillCmd::ScanRepetitions { limit, threshold } => {
+            crate::maintain::scan_repetitions::cmd(limit, threshold, reporter.as_ref()).await
+        }
         DistillCmd::Purge { doc_id, server } => {
             cmd_purge(&doc_id, server.as_deref(), reporter).await
         }
@@ -213,7 +231,7 @@ pub(crate) async fn delete_paper_everywhere(client: &DistillClient, stem: &str) 
 }
 
 /// Open the local OpenAlex DuckDB read-only using the path from
-/// `~/.home-still/config.yaml`. Mirrors `open_openalex_readonly` in hs-mcp;
+/// `~/.home-still/config.yaml`. Mirrors `OpenAlexCorpus::open` in hs-mcp;
 /// keeps the same memory cap so a stray query can't OOM the CLI process
 /// the way it used to OOM hs-mcp.
 fn open_openalex_readonly_for_cli() -> Result<duckdb::Connection> {

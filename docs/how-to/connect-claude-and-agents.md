@@ -101,7 +101,7 @@ The entry holds no credentials; the client authorizes through the gateway as abo
 
 1. Restart the client. It lists a `home-still` server and its tools.
 
-2. Ask it to call `system_status`, or ask: "How many papers are in my home-still library?" It answers from the live counts.
+2. Ask it to call `status`, or ask: "How many papers are indexed in my home-still library?" It answers from the live counts.
 
 3. For a service, confirm that the HTTP server answers, with the same data the client sees:
 

@@ -11,11 +11,12 @@ use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
+use axum::routing::get;
+use axum::{Json, Router};
 use hs_common::auth::backend::{BackendAuthError, BackendToken};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -27,13 +28,43 @@ use crate::HomeStillMcp;
 ///
 /// Sessions are released by the client's `DELETE`; this is the backstop for
 /// clients that vanish. It must outlast the longest tool call that sends no
-/// progress notification (a batch `distill_backfill`, a large
-/// `personal_add`), because the clock is reset only by session traffic and a
-/// call still running when it fires is cancelled with its session.
+/// progress notification, because the clock is reset only by session traffic
+/// and a call still running when it fires is cancelled with its session.
+/// (`personal_add`, the one tool that runs for minutes, sends progress.)
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+/// The MCP endpoint's path. The MCP service answers on every path no other
+/// route claims; this is the one clients are given.
+const MCP_PATH: &str = "/mcp";
+
+/// How many of the latest pipeline events the dashboard snapshot carries.
+const STATUS_HISTORY_LIMIT: usize = 20;
+
+/// The query of the dashboard snapshot.
+#[derive(Debug, Default, serde::Deserialize)]
+struct StatusQuery {
+    /// Keep the `catalog_repair` backfill rows in the history (they are
+    /// left out by default), each flagged `"repair": true`.
+    #[serde(default)]
+    include_repaired: bool,
+}
+
+/// The snapshot `hs status` draws. It lists the storage to count the
+/// pipeline's stages, which no agent's tool call should pay for: that is why
+/// it is a route beside the MCP endpoint and not a tool.
+async fn status_snapshot(
+    State(server): State<HomeStillMcp>,
+    Query(query): Query<StatusQuery>,
+) -> Json<hs_common::status::StatusSnapshot> {
+    Json(
+        server
+            .build_status_snapshot(STATUS_HISTORY_LIMIT, query.include_repaired)
+            .await,
+    )
+}
+
 /// Build the HTTP app for `server`. Every request, whatever its path or
-/// method, is checked against `token` before the MCP service sees it.
+/// method, is checked against `token` before a handler sees it.
 pub fn build(server: HomeStillMcp, token: BackendToken, session_idle_timeout: Duration) -> Router {
     build_with_sessions(server, token, session_idle_timeout).0
 }
@@ -44,18 +75,22 @@ fn build_with_sessions(
     token: BackendToken,
     session_idle_timeout: Duration,
 ) -> (Router, Arc<LocalSessionManager>) {
-    // Stateful sessions stay: tools stream `notifications/progress` to the
-    // caller (scribe_convert), which needs a session to carry them.
+    // Stateful sessions stay: a tool streams `notifications/progress` to its
+    // caller (`personal_add`), which needs a session to carry them.
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.keep_alive = Some(session_idle_timeout);
     let sessions = Arc::new(session_manager);
 
+    let status_path = format!("{MCP_PATH}{}", hs_common::mcp_client::STATUS_PATH_SUFFIX);
+    let status = Router::new()
+        .route(&status_path, get(status_snapshot))
+        .with_state(server.clone());
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         sessions.clone(),
         StreamableHttpServerConfig::default(),
     );
-    let router = Router::new()
+    let router = status
         .fallback_service(service)
         .layer(middleware::from_fn_with_state(token, require_token))
         // Outermost: a handler panic is a 500 and the server keeps serving.
@@ -215,7 +250,7 @@ mod tests {
     }
 
     /// RA-24: the listener is reachable from the network, so the token is the
-    /// only thing between a stranger and `paper_download`/`scribe_convert`.
+    /// only thing between a stranger and `acquire`/`capture`.
     #[tokio::test]
     async fn requests_without_a_valid_token_are_401_and_create_no_session() {
         let run = start(Duration::from_secs(60)).await;
@@ -253,6 +288,7 @@ mod tests {
         for (method, path) in [
             (reqwest::Method::GET, "/"),
             (reqwest::Method::GET, "/mcp"),
+            (reqwest::Method::GET, "/mcp/status"),
             (reqwest::Method::DELETE, "/mcp"),
             (reqwest::Method::OPTIONS, "/mcp"),
             (reqwest::Method::POST, "/anything/else"),
@@ -396,40 +432,25 @@ mod tests {
                 let props = tool.input_schema.get("properties")?.as_object()?;
                 props
                     .keys()
-                    .find(|k| matches!(k.as_str(), "stem" | "doc_id"))
+                    .find(|k| k.as_str() == "doc_id")
                     .map(|k| (tool.name.to_string(), k.clone()))
             })
             .collect()
     }
 
-    /// RA-4 / RA-27: a stem is untrusted client text that ends up inside
-    /// storage keys. Every stem-taking tool refuses a stem that could leave
-    /// its prefix, with JSON-RPC invalid-params, before any handler runs.
+    /// RA-4 / RA-27: a document id is untrusted client text that ends up
+    /// inside storage keys. Every tool that takes one refuses an id that
+    /// could leave its prefix, with JSON-RPC invalid-params, before any
+    /// handler runs.
     #[tokio::test]
-    async fn every_tool_that_takes_a_stem_rejects_a_path_like_stem() {
+    async fn every_tool_that_takes_a_doc_id_rejects_a_path_like_one() {
         let run = start(Duration::from_secs(60)).await;
         let session = open_session(&run).await;
         let fields = stem_fields();
-        // Ten: catalog_read, cite, markdown_read, scribe_queue,
-        // scribe_convert, distill_exists, distill_index, distill_reindex,
-        // personal_read, personal_reindex. The number is asserted so that a tool
-        // that starts taking a stem — or stops — is a deliberate change here, and
-        // the failure prints the list.
-        assert_eq!(
-            fields.len(),
-            10,
-            "expected every tool that takes a stem; found {fields:?}"
-        );
-        for (tool, field) in &fields {
-            // `cite` takes the id as a hit names it (`meta.doc_id`); every
-            // other tool still calls it `stem`.
-            let expected = if tool == "cite" { "doc_id" } else { "stem" };
-            assert_eq!(
-                field, expected,
-                "{tool} names its stem `{field}`, not `{expected}`: an agent passing \
-                 `{expected}` is refused with `missing field`"
-            );
-        }
+        // The tools are named so that one that starts taking a document id —
+        // or stops — is a deliberate change here.
+        let tools: Vec<&str> = fields.iter().map(|(tool, _)| tool.as_str()).collect();
+        assert_eq!(tools, ["cite", "read", "status"]);
         let mut id = 10;
         for (tool, field) in &fields {
             for bad in ["..", "../../etc/passwd", "a/b", "a\\b", "", "."] {
@@ -437,7 +458,7 @@ mod tests {
                 let reply = rpc(
                     &run,
                     &session,
-                    // The quote is there so that the stem is the only thing
+                    // The quote is there so that the id is the only thing
                     // `cite` can refuse; the other tools ignore it.
                     call(
                         id,
@@ -452,6 +473,21 @@ mod tests {
                 );
             }
         }
+
+        // A synthesis's citations carry document ids too, one level down.
+        for bad in ["..", "a/b", ""] {
+            id += 1;
+            let arguments = serde_json::json!({
+                "title": "t",
+                "body": "b",
+                "citations": [{ "store": "academic", "doc_id": bad, "quote": "four words at least" }],
+            });
+            let reply = rpc(&run, &session, call(id, "synthesis_save", arguments)).await;
+            assert_eq!(
+                reply["error"]["code"], -32602,
+                "synthesis_save(citations[0].doc_id={bad:?}) must be invalid params, got {reply}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -461,40 +497,34 @@ mod tests {
         let reply = rpc(
             &run,
             &session,
-            call(2, "catalog_read", serde_json::json!({"stem": "Año"})),
+            call(2, "read", serde_json::json!({"doc_id": "Año"})),
         )
         .await;
         assert!(reply.get("error").is_none(), "{reply}");
         assert_eq!(
             reply["result"]["isError"], true,
-            "no such entry is a tool error"
+            "no such document is a tool error"
         );
     }
 
     #[tokio::test]
-    async fn resource_uris_with_path_like_stems_are_invalid_params() {
+    async fn the_dashboard_snapshot_is_served_beside_the_mcp_endpoint() {
         let run = start(Duration::from_secs(60)).await;
-        let session = open_session(&run).await;
-        let mut id = 20;
-        for uri in [
-            "catalog:///..",
-            "catalog:///a/b",
-            "markdown:///..",
-            "markdown:///../x",
-            "markdown:///a/b/page/1",
-            "markdown:///",
-        ] {
-            id += 1;
-            let reply = rpc(
-                &run,
-                &session,
-                serde_json::json!({
-                    "jsonrpc": "2.0", "id": id, "method": "resources/read",
-                    "params": {"uri": uri}
-                }),
-            )
-            .await;
-            assert_eq!(reply["error"]["code"], -32602, "{uri}: {reply}");
-        }
+        let resp = run
+            .http
+            .get(format!("{}/mcp/status", run.base))
+            .header("Authorization", format!("Bearer {SECRET}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let snapshot: hs_common::status::StatusSnapshot = resp.json().await.unwrap();
+        // An empty corpus with no servers configured: the snapshot is still
+        // whole, and it says when it was made.
+        assert!(snapshot.generated_at.is_some());
+        assert!(snapshot.scribe_instances.is_empty());
+        assert!(snapshot.history.is_empty());
+        // Asking for the snapshot opens no MCP session.
+        assert_eq!(run.sessions.sessions.read().await.len(), 0);
     }
 }

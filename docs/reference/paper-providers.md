@@ -1,6 +1,6 @@
 # Paper providers
 
-`hs paper search`, `hs paper download` and the MCP `paper_search` tool query
+`hs paper search`, `hs paper download` and the MCP `discover` tool query
 these providers. The keys are under `paper.providers.<name>` in
 [configuration](configuration.md#paper).
 
@@ -97,11 +97,10 @@ DOI or download URL are skipped before they count toward `-n`.
 
 ## Citation graph
 
-The MCP tools [`paper_references`](mcp-tools.md#paper_references) and
-[`paper_citations`](mcp-tools.md#paper_citations) use the Semantic Scholar
-Graph API under the same rate limiter as search.
+The MCP tool [`graph`](mcp-tools.md#graph), with `source: "semantic_scholar"`,
+uses the Semantic Scholar Graph API under the same rate limiter as search.
 
-| `paper_citations` parameter | Meaning |
+| `graph` parameter, for `direction: "citations"` | Meaning |
 |---|---|
 | `limit` | 1–1000, default 100. Counts papers that pass `year_from`. |
 | `year_from` | Only citing papers from this year on; applied while pages are fetched. |

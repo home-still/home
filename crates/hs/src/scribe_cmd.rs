@@ -122,6 +122,14 @@ pub enum ScribeCmd {
         #[command(subcommand)]
         action: crate::scribe_boxes::BoxesAction,
     },
+    /// Announce that one stored source needs converting: publish
+    /// `papers.ingested` for the stem's PDF, HTML or EPUB so the scribe
+    /// watcher converts it. Fails, and publishes nothing, when the stem has
+    /// no stored source. Converts nothing itself.
+    Queue {
+        /// Catalog stem (no extension), e.g. `10.48550_arxiv.2312.10997`.
+        stem: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -164,6 +172,7 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
         ScribeCmd::Reconvert { stem } => cmd_reconvert(&stem, reporter).await,
         ScribeCmd::Boxes { action } => crate::scribe_boxes::dispatch(action, reporter).await,
+        ScribeCmd::Queue { stem } => crate::maintain::scribe_queue::cmd(&stem).await,
     }
 }
 

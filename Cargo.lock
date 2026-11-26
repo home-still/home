@@ -2205,6 +2205,7 @@ dependencies = [
  "owo-colors",
  "paper",
  "parking_lot",
+ "percent-encoding",
  "personal",
  "ratatui",
  "reqwest",

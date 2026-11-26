@@ -67,9 +67,9 @@ fn word_boxes_key(prefix: &str, stem: &str) -> Result<String> {
     Ok(hs_common::word_boxes::boxes_key(layout, stem))
 }
 
-/// Documents in the store, most recently ingested first (the order the MCP
-/// `personal_list` tool promises), at most `limit` of them. `category` is
-/// checked against the store's taxonomy (see [`Config::resolve_category`]).
+/// Documents in the store, most recently ingested first, at most `limit` of
+/// them. `category` is checked against the store's taxonomy (see
+/// [`Config::resolve_category`]).
 pub async fn list_entries(
     cfg: &Config,
     category: Option<&str>,
@@ -78,9 +78,7 @@ pub async fn list_entries(
     let category = category.map(|c| cfg.resolve_category(c)).transpose()?;
     let storage = cfg.build_storage().map_err(storage_error)?;
     let mut found: Vec<(Option<String>, ListEntry)> = Vec::new();
-    for key in sidecar_keys(&*storage, &cfg.storage_dir).await? {
-        let stem = sidecar_stem(&key);
-        let entry = read_sidecar(&*storage, &key).await?;
+    for (stem, entry) in list_cards(&*storage, &cfg.storage_dir).await? {
         if let Some(cat) = category {
             let matches = entry
                 .category

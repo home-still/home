@@ -197,6 +197,10 @@ pub enum MigrateAction {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Report documents stored under a URL-encoded stem (`10.1%2Fabc`) and
+    /// again under the decoded one. Reads only; it changes nothing and
+    /// prints a JSON report of the pairs.
+    DedupeUrlEncoded,
 }
 
 #[derive(Subcommand, Debug)]

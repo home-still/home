@@ -70,7 +70,7 @@ hs personal read lab-results-2024-q1-abcdef01
 
 `list` shows the most recently ingested documents first, with title, category and stem. `search` is semantic, over the personal collection only. `read` prints the converted markdown of one stem. `--category` accepts any letter case.
 
-Agents use the same store through `personal_search`, `personal_list` and `personal_read`. See [Personal tools](../reference/mcp-tools.md#personal-tools).
+Agents search the same store with `recall` on the `myelin` server (`stores: ["personal"]`), list it with [`documents`](../reference/mcp-tools.md#documents) and read from it with [`read`](../reference/mcp-tools.md#read), both with `store: "personal"`.
 
 ## Re-index a document
 
@@ -99,7 +99,7 @@ hs personal config path
 
 ## Open a personal document from a search hit
 
-Hits from `personal_search` carry signed links when document links are configured. A link names the personal collection, so you can also mint one by hand:
+`read` and `cite` return signed links for a personal document when document links are configured. A link names the personal collection, so you can also mint one by hand:
 
 ```sh
 hs docs link lab-results-2024-q1-abcdef01 --collection personal

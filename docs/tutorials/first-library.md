@@ -207,8 +207,8 @@ hs mcp install --client desktop
 
 This adds home-still to Claude Desktop's configuration. Restart Claude
 Desktop; in a new chat, ask "Search my home-still library for how the
-Transformer's attention is computed, and cite the page." Claude calls
-`distill_search`, reads the passages, and answers with citations.
+Transformer's attention is computed, and cite the page." Claude searches with
+`recall`, checks each quote with `cite`, and answers with citations.
 
 ## 9. Make it automatic
 

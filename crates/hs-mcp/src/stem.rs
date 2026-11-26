@@ -1,6 +1,6 @@
 //! A document stem as it arrives from an MCP client.
 //!
-//! Every tool, prompt and resource that takes a stem (or a doc id, which is a
+//! Every tool and prompt that takes a stem (or a doc id, which is a
 //! stem) builds storage keys from it. A stem like `..` or `a/b` would walk
 //! out of the prefix the key is supposed to live under, so the check happens
 //! once, at the boundary, in this type: a `Stem` that exists has passed
@@ -8,14 +8,11 @@
 //!
 //! Tool parameters declare `Stem` instead of `String`. rmcp deserializes the
 //! arguments before the handler runs, so a bad stem is answered with a
-//! JSON-RPC *invalid params* error and the handler never executes. Resource
-//! URIs are not deserialized; they go through [`Stem::parse`] and
-//! [`Stem::invalid_params`].
+//! JSON-RPC *invalid params* error and the handler never executes.
 
 use std::fmt;
 use std::ops::Deref;
 
-use rmcp::model::ErrorData;
 use rmcp::schemars;
 
 /// A stem that passed [`hs_common::validate_stem`].
@@ -47,11 +44,6 @@ impl Stem {
                 reason,
             }),
         }
-    }
-
-    /// The JSON-RPC error for a stem taken from a resource URI.
-    pub fn invalid_params(e: InvalidStemArg) -> ErrorData {
-        ErrorData::invalid_params(e.to_string(), None)
     }
 }
 

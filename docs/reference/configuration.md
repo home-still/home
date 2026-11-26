@@ -397,7 +397,7 @@ The local OpenAlex database. See [Use the OpenAlex catalog](../how-to/use-the-op
 | `db_path` | required | Path of the DuckDB file. `~/` expands. Must be non-empty. |
 | `snapshot_dir` | required by `hs openalex` | Directory that holds the OpenAlex snapshot. `hs-mcp` does not read it. |
 
-`hs openalex` stops when the section, `db_path` or `snapshot_dir` is missing. `hs-mcp` offers the `openalex_*` tools only when the database file exists and its build is complete; see [MCP tools](mcp-tools.md#tool-visibility).
+`hs openalex` stops when the section, `db_path` or `snapshot_dir` is missing. In `hs-mcp`, `discover` and `graph` read the database only when the file exists and its build is complete; see [MCP tools](mcp-tools.md#startup-requirements).
 
 ## `personal`
 

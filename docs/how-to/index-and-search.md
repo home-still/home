@@ -90,8 +90,8 @@ hs distill abstracts reconcile
 hs distill abstracts status
 ```
 
-`build --force` re-embeds papers that are already in it. The MCP tool
-[`abstract_search`](../reference/mcp-tools.md#abstract_search) searches it.
+`build --force` re-embeds papers that are already in it. An agent searches it
+with `recall` on the `myelin` server, naming the store: `stores: ["abstracts"]`.
 
 ## Keep the index consistent
 

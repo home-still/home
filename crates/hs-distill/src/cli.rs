@@ -110,6 +110,35 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Index the converted documents that were never embedded: those whose
+    /// catalog entry has a conversion stamp and no embedding stamp with
+    /// chunks. Without `--dry-run` it indexes them.
+    Backfill {
+        /// Report what would be indexed without sending anything to the
+        /// server or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Index at most this many documents. Default: all.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Also index documents whose last indexing found nothing to index
+        #[arg(long)]
+        retry_skipped: bool,
+        /// Override server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Report stored markdown that the repetition cleaner would cut heavily,
+    /// which is how a looping conversion shows. Reads only; it changes
+    /// nothing and prints a JSON report.
+    ScanRepetitions {
+        /// Scan at most this many documents. Default: 100000.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Report documents cut more than this many times. Default: 20.
+        #[arg(long)]
+        threshold: Option<usize>,
+    },
     /// Delete every stored chunk for a doc_id. CLI-only (no MCP) because
     /// this is a destructive write — use to clear orphaned chunks after
     /// markdown has been removed, or to force a clean re-index.

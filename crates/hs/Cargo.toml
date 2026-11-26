@@ -30,6 +30,7 @@ dialoguer = { workspace = true }
 reqwest = { workspace = true }
 futures = "0.3"
 tempfile = "3"
+percent-encoding = "2"
 sha2 = "0.10"
 # The picture of a page the docs service answers `page.png` with: drawing
 # the highlight on pdfium's bitmap and encoding the result.

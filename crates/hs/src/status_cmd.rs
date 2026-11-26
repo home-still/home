@@ -210,12 +210,12 @@ struct HistoryEvent {
 // ── Data collection ─────────────────────────────────────────────
 
 async fn collect_data() -> DashboardData {
-    // Single source of truth: the MCP gateway's `system_status` tool, whose
+    // Single source of truth: the MCP server's dashboard snapshot, whose
     // counts come from the Storage trait and therefore work for both LocalFs
-    // and S3/Garage backends. On MCP failure the TUI shows a blank dashboard
-    // that SAYS why (the counts-unavailable banner) — zeros are accurate
-    // ("we don't know yet") rather than confidently wrong, and the cause is
-    // never discarded.
+    // and S3/Garage backends. When it cannot be read the TUI shows a blank
+    // dashboard that SAYS why (the counts-unavailable banner) — zeros are
+    // accurate ("we don't know yet") rather than confidently wrong, and the
+    // cause is never discarded.
     match collect_data_via_mcp().await {
         Ok(data) => data,
         Err(e) => {
@@ -234,20 +234,13 @@ async fn collect_data() -> DashboardData {
     }
 }
 
-/// Populate the dashboard from the MCP `system_status` tool — the single
+/// Populate the dashboard from the MCP server's status snapshot — the single
 /// source of truth for pipeline counts and service health. Byte counts stay
-/// at 0 (system_status reports object counts, not sizes). The `indexer` row
+/// at 0 (the snapshot reports object counts, not sizes). The `indexer` row
 /// reflects the distill-index daemon on the CLI host, not the remote gateway.
 async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
-    use serde_json::Value;
-
-    let client = hs_common::mcp_client::McpClient::from_default_creds().await?;
-    let called = client
-        .call_tool("system_status", Value::Object(Default::default()))
-        .await;
-    // End the session whether or not the call worked.
-    client.close_logged().await;
-    let snap: hs_common::status::StatusSnapshot = serde_json::from_value(called?)?;
+    let snapshot = hs_common::mcp_client::status_snapshot().await?;
+    let snap: hs_common::status::StatusSnapshot = serde_json::from_value(snapshot)?;
 
     let mut data = snapshot_to_dashboard(snap);
     data.indexer = read_indexer_status()?;
@@ -1282,13 +1275,8 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
 // `hs status > status.txt` work everywhere.
 
 async fn run_oneshot_json(ndjson: bool) -> Result<()> {
-    use serde_json::Value;
-    let client = hs_common::mcp_client::McpClient::from_default_creds().await?;
-    let called = client
-        .call_tool("system_status", Value::Object(Default::default()))
-        .await;
-    client.close_logged().await;
-    println!("{}", status_json_text(&called?, ndjson)?);
+    let snapshot = hs_common::mcp_client::status_snapshot().await?;
+    println!("{}", status_json_text(&snapshot, ndjson)?);
     Ok(())
 }
 

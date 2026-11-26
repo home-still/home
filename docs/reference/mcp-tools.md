@@ -1,6 +1,8 @@
 # MCP tools reference
 
-`hs-mcp` is the Model Context Protocol server for home-still. This page lists every tool, resource and setting it exposes. To connect a client, see [Connect Claude and agents](../how-to/connect-claude-and-agents.md).
+`hs-mcp` is the Model Context Protocol server for home-still. It has ten tools and three prompts: this page lists them, with the settings the server reads. To connect a client, see [Connect Claude and agents](../how-to/connect-claude-and-agents.md).
+
+`hs-mcp` does not search. Searching the corpus is the `recall` tool of the `myelin` memory server, which a client connects beside this one. A hit from `recall` carries `store` and `meta.doc_id`; those two values are what `read`, `cite` and `status` take.
 
 ## Server
 
@@ -20,147 +22,63 @@
 
 The HTTP transport requires `HS_BACKEND_TOKEN`: at least 32 bytes of visible ASCII, set in the environment or in `~/.home-still/secrets.env`. The server refuses to start without it. Every request, on every path, must carry `Authorization: Bearer <token>`; a missing or wrong token gets `401`. There is no unauthenticated health route. The stdio transport needs no token.
 
+### HTTP routes
+
+| Route | Purpose |
+|---|---|
+| `/mcp` | The MCP endpoint. |
+| `GET /mcp/status` | The dashboard snapshot that [`hs status`](status-dashboard.md) draws, as JSON. `?include_repaired=true` also lists failures that were repaired since. It is not a tool: an agent asks [`status`](#status). |
+
 ### Startup requirements
 
 | Requirement | Behaviour when absent |
 |---|---|
 | `storage:` section in `~/.home-still/config.yaml` | The server does not start. |
-| `events:` section in `~/.home-still/config.yaml` | The server does not start. The broker connection is made on the first publish, so a broker outage affects only `paper_download`, `scribe_queue` and `scribe_convert`. |
+| `events:` section in `~/.home-still/config.yaml` | The server does not start. The broker connection is made on the first publish, so a broker outage affects only `acquire`, `capture`, `synthesis_save` and `personal_add`; each refuses before it stores anything. |
 | A malformed config section | The server does not start; the error names the section. |
-| `scribe.servers`, `distill.servers` | The server starts. A tool that needs the missing service returns an error saying so. |
-
-### Tool visibility
-
-The five `openalex_*` tools appear in `tools/list` only when the OpenAlex database exists and holds the `openalex_works` row in its `_corpus_state` table, which `hs openalex build-fts` writes last. The check runs once at startup, so restart the server after building the corpus. See [Use the OpenAlex catalog](../how-to/use-the-openalex-catalog.md).
+| `scribe.servers`, `distill.servers` | The server starts. `status` reports the part it could not ask as an `error`. |
+| The local OpenAlex corpus | The server starts. `discover` and `graph` with `source: "openalex"` fail with the reason and the command that builds the corpus. The check runs once at startup, so restart the server after building it. See [Use the OpenAlex catalog](../how-to/use-the-openalex-catalog.md). |
 
 ### What the tools cannot do
 
-Destructive operations are CLI-only: deleting a personal document (`hs personal delete`), purging vectors (`hs distill purge`) and the `hs pipeline purge-*` commands. `catalog_repair`, `dedupe_url_encoded`, `distill_reconcile` and `distill_scan_repetitions` only report; a `dry_run` argument of `false` on them is ignored. See [CLI reference](cli.md).
+Maintenance and destructive operations are CLI-only. Deleting a personal document is `hs personal delete`; purging records is `hs distill purge` and the `hs pipeline purge-*` commands; repairs and re-indexing are listed under [Tools removed in favour of the CLI](#tools-removed-in-favour-of-the-cli). See [CLI reference](cli.md).
+
+The server exposes no MCP resources. `read` returns a document's card and text, and `documents` lists what a store holds.
 
 ### Prompts
 
 | Prompt | Arguments | Purpose |
 |---|---|---|
-| `research_paper` | `topic` | Search papers, read documents and synthesise findings. |
-| `summarize_document` | `stem` | Summarise one document from the library. |
-| `compare_papers` | `stem_a`, `stem_b` | Compare two papers from the library. |
+| `guidance` | `question` | Answer a question from the corpus: profile, recall, cite each claim, answer with links. |
+| `verify` | `claim` | Check a claim against the corpus: find support and contradiction, cite both, give a verdict. |
+| `brief` | `topic` | Write a cited brief on a topic, widen the corpus if it is thin, and save the brief. |
 
-## Parameter conventions
+## Conventions
 
-| Type | Meaning |
+| Term | Meaning |
 |---|---|
-| stem | A document stem: the file name without extension. A stem that is empty, absolute or contains a path separator or `..` is rejected with an invalid-parameters error before the tool runs. |
-| string, integer, boolean | JSON string, number and boolean. |
+| store | One of `academic` (papers), `references` and `abstracts` (derived from the papers), `personal` (the user's own records), `web` (captured pages), `syntheses` (saved answers) and `memory`. `memory` holds no documents. A tool given `references` or `abstracts` works on the paper the hit belongs to. |
+| doc_id | A document's id within its store: `meta.doc_id` of a search hit, or `doc_id` of a `documents` row. An id that is empty, absolute or contains a path separator or `..` is rejected with an invalid-parameters error before the tool runs. |
 | optional | The parameter may be omitted; the table gives the value used then. |
 
-"Sends progress notifications" means the tool emits MCP `notifications/progress` messages while it runs, when the caller supplied a progress token: about every 20 seconds for most tools, and per batch of catalog reads for `catalog_repair`.
+A tool that fails returns an MCP tool error whose text says what failed and, where there is one, what to do instead. A storage outage is an error; it is never reported as "no such document" or as an empty list.
 
-"Changes state: yes" means the tool's `read_only_hint` is `false`: it writes to storage, the catalog, the vector index or the event bus.
+"Changes state: yes" means the tool's `read_only_hint` is `false`: it writes to storage and announces on the event bus.
 
-## Paper tools
+## Tools
 
-### `paper_search`
-
-Search academic papers across the configured providers. Returns a JSON object `{"papers": [...], "provider_failures": [...]}`. `provider_failures` names each provider that failed; if every provider fails the call is an error. Providers and their limits are listed in [Paper providers](paper-providers.md).
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `query` | string | required | Search query. |
-| `max_results` | integer | `10` | Maximum results. |
-| `search_type` | string | `keywords` | One of `keywords`, `title`, `author`, `doi`, `subject`. Anything else is an error. |
-| `date` | string | none | Date filter, for example `>=2023` or `2020-2024`. A filter that does not parse is an error. |
-| `offset` | integer | `0` | Result offset for paging. OpenAlex needs a multiple of `max_results`; Europe PMC cannot page by offset (an error when requested alone, left out of `all` when `offset` is above 0). |
-| `provider` | string | `all` | One of `all`, `arxiv`, `openalex`, `semantic_scholar` (alias `s2`), `europmc` (alias `pmc`), `crossref`, `core`. Unknown values are an error. |
-| `min_citations` | integer | none | Exclude papers with fewer citations. OpenAlex, Semantic Scholar and CORE honour it; arXiv does not. |
-| `sort` | string | `relevance` | One of `relevance`, `citations`, `date`. Anything else is an error. |
-
-### `paper_get`
-
-Look up one paper by DOI. Returns JSON with the full metadata.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `doi` | string | required | DOI to look up. |
-
-### `paper_references`
-
-Return the structured reference list of a paper: each reference's DOI, title, year, authors, venue and citation count. Source: the Semantic Scholar Graph API.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `doi` | string | required | DOI of the paper whose reference list to return. |
-
-### `paper_citations`
-
-Return the papers that cite a paper (forward citation chaining), each with DOI, title, year, authors, venue and citation count. Source: the Semantic Scholar Graph API.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `doi` | string | required | DOI of the paper to find citing works for. |
-| `limit` | integer | `100` | Maximum citations to return; maximum `1000`. |
-| `year_from` | integer | none | Minimum publication year. Applied while paging, so `limit` counts only citing papers from this year on. |
-| `sort` | string | `year` | `year` or `citations`. |
-
-### `paper_download`
-
-Download a paper's PDF by DOI into the papers directory. Tries arXiv, MDPI and the shared provider resolvers (Semantic Scholar, Europe PMC, CORE with a key, OpenAlex, CrossRef). Creates a catalog entry with metadata and announces the download on the event bus. Fails if the provider lookup or the catalog write fails; the PDF stays stored and a retry repairs the row. Returns JSON with the file path, size and SHA-256. Needs the event bus.
-
-Changes state: yes.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `doi` | string | required | DOI of the paper to download. |
-
-## Catalog tools
-
-### `catalog_list`
-
-List papers in the catalog with title, conversion status and embedded status. Returns a JSON array.
-
-Flag semantics:
-
-| Field | Meaning |
-|---|---|
-| `converted` | `true` if and only if markdown exists. |
-| `conversion_failed` | `null`, or `{reason, kind}` when the conversion was given up on. `kind` is `retryable` (a backend failed on the document; `hs pipeline reconvert-failed` re-queues it), `bad_source` (the source can never convert) or `unclassified`. Reasons are listed in [Status dashboard](status-dashboard.md#conversion-failure-reasons). |
-| `embedded` | `true` only when Qdrant actually received chunks (`chunks_indexed > 0`). |
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `limit` | integer | all | Maximum items to return. |
-| `offset` | integer | `0` | Items to skip. |
-| `embedded` | boolean | all | `true` returns only embedded papers, `false` only papers not yet embedded. |
-
-### `catalog_recent`
-
-Most recent catalog activity: download, convert, embed and embed-skip events, one row per event, newest first. Ties break by stem. Rows whose timestamp comes from a `catalog_repair` backfill are left out unless `include_repaired` is `true`; those rows carry `"repair": true`. The status dashboard's history pane uses the same data.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `limit` | integer | `30` | Maximum items to return. |
-| `include_repaired` | boolean | `false` | Include rows stamped by a `catalog_repair` backfill. |
-
-### `catalog_read`
-
-Read the full catalog entry for a paper: metadata, conversion info, page offsets and download URLs. Returns JSON.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `stem` | stem | required | Paper stem. |
+| Tool | Purpose | Changes state |
+|---|---|---|
+| [`cite`](#cite) | Check a quote against its document and return a verifiable citation. | only with `short` |
+| [`read`](#read) | A document's card and a slice of its text. | no |
+| [`documents`](#documents) | List the documents of one store. | no |
+| [`discover`](#discover) | Look outside the corpus for works worth adding. | no |
+| [`graph`](#graph) | Step along the citation graph from a DOI. | no |
+| [`acquire`](#acquire) | Download a paper by DOI into `academic`. | yes |
+| [`capture`](#capture) | Keep a web page in `web`. | yes |
+| [`personal_add`](#personal_add) | Ingest a file staged in the personal inbox. | yes |
+| [`synthesis_save`](#synthesis_save) | Save an answer, with its verified citations, in `syntheses`. | yes |
+| [`status`](#status) | How the pipeline is, or how one document is. | no |
 
 ### `cite`
 
@@ -173,356 +91,246 @@ For a quote the document contains, the result is JSON:
 | `store`, `doc_id` | What was asked. |
 | `title`, `authors`, `year`, `doi`, `source_url` | From the document's catalog entry: `null`, or `[]` for `authors`, where the entry has none. |
 | `quote` | `text` (the passage as the document has it), `exact` (`false` when the quote was found as the same words in the same order rather than as typed), `found_in` (`document` or `abstract`), `page`, `line_start` and `line_end`. `page` is the page the passage starts on: read from the word boxes when `boxes.status` is `located`, otherwise from the page offsets the conversion recorded for a PDF, otherwise `null`. The lines are lines of the converted text, and `null` for an abstract. |
-| `boxes` | `status` is `located`, `not_located` (the word boxes are built and the passage could not be placed in them), `pending` (a PDF whose word boxes are not built yet) or `not_applicable` (the source is not a PDF, or the quote is from an abstract). `not_located` says the converted text and the words read from the PDF's pages disagree at the passage, so the quote is not confirmed on the page: in 100 sentences sampled from 20 converted papers (2026-11-25), all 5 that came back `not_located` were text the conversion had made up. `located` also carries `origin` (`text_layer`, or `ocr` when a page the passage is on was read by character recognition), `matched_ratio` (the share of the passage's words found on the page, in order) and `pages`: for each page the passage is on, `page` and `rects`, one `[x0, y0, x1, y1]` per line of the passage, in ten-thousandths of the page's width and height from its top left corner. |
+| `boxes` | `status` is `located`, `not_located` (the word boxes are built and the passage could not be placed in them), `pending` (a PDF whose word boxes are not built yet) or `not_applicable` (the source is not a PDF, or the quote is from an abstract). `not_located` says the converted text and the words read from the PDF's pages disagree at the passage, so the quote is not confirmed on the page: in 100 sentences sampled from 20 converted papers (2026-11-25), all 5 that came back `not_located` were text the conversion had made up. `located` also carries `origin` (`text_layer`, or `ocr` when a page the passage is on was read by character recognition), `matched_ratio` (the share of the passage's words found on the page, in order) and `pages`: for each page the passage is on, the page number, its size in points and the rectangles around the passage's words. |
 | `links` | `source` (the original document, at the passage's page when it is known) and `markdown` (the converted text, the passage selected), each a `lan` and a `remote` URL. When `boxes.status` is `located`, also `viewer` (the whole PDF, opened on the boxed passage) and `page` (that page as a picture, the passage boxed). `original_url` is `source_url` with a text fragment that selects the passage, or `null`. `short` is `lan`, `remote` and `code` when `short` was asked for, otherwise `null`. `expires_at` is when the links stop working. |
 
 With `image` the result has a second content item: the page the passage starts on as a PNG, the passage boxed. The MCP server fetches it from the docs service at `docs.lan_base_url`.
 
-For `references` the quote is checked against the document the reference list belongs to, and for `abstracts` against the abstract in the document's catalog entry. Links are signed for the store that holds the document. The call fails when `docs.lan_base_url` or `docs.remote_base_url` is not set, when the signing key is unavailable, when the store or the document is unknown, when the document has no converted text yet, and for `memory`, which holds no documents. See [Open documents with links](../how-to/open-documents-with-links.md).
+For `references` the quote is checked against the document the reference list belongs to, and for `abstracts` against the abstract in the document's catalog entry. Links are signed for the store that holds the document. The call fails when `docs.lan_base_url` or `docs.remote_base_url` is not set, when the signing key is unavailable, when the store or the document is unknown, when the document has no converted text yet, and for `memory`. See [Open documents with links](../how-to/open-documents-with-links.md).
 
 Changes state: only with `short`, which stores the code in the corpus.
 
 | Parameter | Type | Required or default | Meaning |
 |---|---|---|---|
 | `store` | string | `academic` | The store the passage was found in: the `store` of the hit. |
-| `doc_id` | stem | required | The document's id: `meta.doc_id` of the hit. |
+| `doc_id` | doc_id | required | The document's id: `meta.doc_id` of the hit. |
 | `quote` | string | required | The passage, word for word: at least 4 words, at most 2000 characters. |
 | `near_line` | integer | none | A line of the document near the passage. When the document says the quote more than once, the occurrence nearest this line is the one cited. Refused for `abstracts`. |
 | `image` | boolean | `false` | Also return the page as an image with the passage boxed. The call fails unless `boxes.status` is `located`. |
 | `short` | string | none | `viewer`, `page`, `source` or `markdown`: also store a 12-character code that redirects to that link, returned as `<base>/s/<code>` under `links.short`. The docs service answers the code with a redirect to the signed link, carrying its fragment, so the code expires with the link and is pruned by `hs docs prune`. `viewer` and `page` are refused unless `boxes.status` is `located`. Storing the code writes one small record to the corpus. |
 
-### `catalog_repair`
+### `read`
 
-Report catalog and storage disagreements in seven directions: forward disk orphans, `catalog_no_markdown`, `catalog_no_source` phantoms, flag drift, flag-drift resync, `md-path-drift` and stuck conversions. Report only: a `dry_run` of `false` is ignored and the response says so. `hs distill reconcile --fix-stamps --reembed` backfills embedding stamps; `hs pipeline catch-up` re-queues unconverted papers. Sends progress notifications as it reads the catalog.
+Read a document: its catalog card and a slice of its text. The result has two content items. The first is JSON:
 
-Changes state: no.
+| Field | Meaning |
+|---|---|
+| `store`, `doc_id` | What was asked. |
+| `card` | `title`, `authors`, `year`, `doi`, `source_url`, `abstract`, `category`, `added` and `pages`, from the document's catalog entry. For `personal` the card is the one stored beside the document. |
+| `converted` | Whether the document has text yet. When `false` there is no `slice` and no second item; ask [`status`](#status). |
+| `slice` | What was returned: `line_start`, `line_end`, `page` (the page `line_start` is on), `total_lines`, `total_pages`, `cut_mid_line` and `next_line`. `next_line` is the line to go on from when the selection did not fit in `max_chars`, otherwise `null`. |
+| `links` | Signed links that open the source and the converted text, when links are configured; otherwise `null`. |
 
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `dry_run` | boolean | `true` | Ignored; the tool only reports. |
-| `limit` | integer | none | Maximum number of orphans to examine in this call. |
+The second item is the text, every line behind its number: `12: The delta grows`. The numbers are the ones `lines`, a hit's `meta.line_start` and a citation's `quote.line_start` count in.
 
-### `dedupe_url_encoded`
-
-Report URL-encoded duplicate stems: pairs of an encoded and a decoded form where the decoded twin is the one indexed. Report only.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `dry_run` | boolean | `true` | Ignored; the tool only reports. |
-
-### `catalog_backfill_title`
-
-Fill empty or missing `title` fields on catalog rows that have a DOI. Rows created by `catalog_repair`, the inbox watcher or server-event conversions have no title until a metadata lookup happens. For each eligible row the tool asks the aggregate paper provider and stamps `title`, plus `authors`, `publication_date`, `abstract_text` and `cited_by_count` when they come back. Each row costs one provider lookup. Sends progress notifications.
-
-Changes state: yes (unless `dry_run` is `true`).
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `dry_run` | boolean | `true` | Report what would be backfilled without writing. |
-| `limit` | integer | none | Maximum number of catalog rows to process in this call. |
-
-## Markdown tools
-
-### `markdown_list`
-
-List converted markdown documents with file sizes and page counts. Sends progress notifications.
+The call fails when the store holds no document with that id (the error points at `documents`), when `page` and `lines` are both given, and when the selection is outside the document; the last error names the document's line or page count.
 
 Changes state: no.
 
 | Parameter | Type | Required or default | Meaning |
 |---|---|---|---|
-| `limit` | integer | all | Maximum items to return. |
-| `offset` | integer | `0` | Items to skip. |
-| `embedded` | boolean | ignored | Applies to `catalog_list` only. |
+| `store` | string | `academic` | The store the document is in. |
+| `doc_id` | doc_id | required | The document's id. |
+| `page` | integer | none | Read this page of the source, 1-based. Not together with `lines`. |
+| `lines` | `[first, last]` | none | Read these lines of the converted text, 1-based and inclusive. Not together with `page`. With neither, reading starts at line 1. |
+| `max_chars` | integer | `12000` | The most characters of text to return. The slice ends on a whole line. |
 
-### `markdown_read`
+### `documents`
 
-Read a converted markdown document, or one page of it.
+List the documents of one store, newest first. This lists what the corpus holds; to find documents by what they say, use `recall` on the `myelin` server.
+
+The result is JSON: `store`, `matching` (how many documents pass the filters), `documents` and `next_cursor`. Each row has `doc_id`, `title`, `authors`, `year`, `doi`, `source_url`, `category` (when the entry has one), `added`, `converted` and `indexed`. `next_cursor` is `null` on the last page.
+
+The call fails for a store that holds no documents of its own (`references`, `abstracts`, `memory`), for an unknown store, for an `added_after` that is not a timestamp or a date, and for a cursor that does not belong to the listing.
 
 Changes state: no.
 
 | Parameter | Type | Required or default | Meaning |
 |---|---|---|---|
-| `stem` | stem | required | Paper stem. |
-| `page` | integer | whole document | Page number, 1-based. |
+| `store` | string | `academic` | `academic`, `personal`, `web` or `syntheses`. |
+| `title_contains` | string | none | Only documents whose title contains this text, whatever its case. |
+| `added_after` | string | none | Only documents added after this moment: an RFC 3339 timestamp, or a date read as the start of that day, UTC. |
+| `limit` | integer | `20` | Documents per page, at most 200. |
+| `cursor` | string | none | `next_cursor` of the previous page, with the same filters. |
 
-## Scribe tools
+### `discover`
 
-### `scribe_health`
+Look outside the corpus for works worth adding to it. `source` chooses where: `providers` asks the online paper providers (arXiv, OpenAlex, Semantic Scholar, Europe PMC, CrossRef and, with an API key, CORE; see [Paper providers](paper-providers.md)); `openalex` reads the local OpenAlex corpus without the network.
 
-Check the scribe server: model status, version, in-flight conversions and available VLM slots. Uses the first server in `scribe.servers`.
+Give exactly one of `query` and `doi`.
 
-Changes state: no. Takes no parameters.
+| Request | Result |
+|---|---|
+| `source: "providers"`, `query` | `{source, works, provider_failures}`. `provider_failures` names each provider that did not answer; the call fails only when none did. |
+| `source: "providers"`, `doi` | `{source, work}`: one work's metadata. |
+| `source: "openalex"`, `query` | `{source, works}`: works that contain every term of the query, best match first. |
+| `source: "openalex"`, `doi` | `{source, work}`: the work with its `authors` and `topics`. |
+| `source: "openalex"`, `query`, `kind: "authors"` | `{source, topic, authors}`: the most cited authors of the topic `query` names, by its id (`T10001`) or its exact name. |
 
-### `scribe_queue`
+The call fails when both or neither of `query` and `doi` are given, when `limit` is out of range, when `kind: "authors"` is asked of `providers` or with a `doi`, when a year filter is given to anything but a search for works, when the DOI is not in the source, and when the local corpus is not built.
 
-Queue a stored source document (PDF, HTML or EPUB) for conversion and return at once. Publishes `papers.ingested`, which the `hs scribe watch-events` daemon consumes; the conversion happens after the call returns. One document's conversion is bounded by the scribe timeout ceiling of 3600 s, so it far outlives a tool call. Poll `catalog_list`, which reports `converted` and `conversion_failed` per stem, or call `distill_index` once the markdown exists. Use `scribe_convert` only when the markdown is needed inside the call. Refuses a stem with no stored source, so a queue entry cannot point at nothing. Needs the event bus and a running watcher.
+Changes state: no.
+
+| Parameter | Type | Required or default | Meaning |
+|---|---|---|---|
+| `source` | string | required | `providers` or `openalex`. |
+| `query` | string | one of `query`, `doi` | What to search for. |
+| `doi` | string | one of `query`, `doi` | The DOI of one work to look up. |
+| `kind` | string | `works` | `works`, or `authors` (with `source: "openalex"` and a `query` naming a topic). |
+| `year_from` | integer | none | Only works published in this year or later. |
+| `year_to` | integer | none | Only works published in this year or earlier. |
+| `limit` | integer | `10` | How many results a search returns, 1 to 200. |
+
+### `graph`
+
+Step along the citation graph from a paper's DOI. `direction` is `references` (the works the paper cites) or `citations` (the works that cite it). `source` is `semantic_scholar` (the Graph API, online; see [Paper providers](paper-providers.md)) or `openalex` (the local OpenAlex corpus).
+
+The result is JSON: `doi`, `direction`, `source`, `works`, `returned` and `truncated`. `truncated` says more works matched than were returned. The works carry their source's fields: Semantic Scholar gives DOI, title, year, authors, venue and citation count; OpenAlex gives its id, DOI, title, year and citation count. A work without a year sorts last under `sort: "year"` and is dropped by `year_from`.
+
+The call fails when the DOI is malformed, when `limit` is out of range, when the source has no work with that DOI, and, for `openalex`, when the local corpus is not built.
+
+Changes state: no.
+
+| Parameter | Type | Required or default | Meaning |
+|---|---|---|---|
+| `doi` | string | required | The DOI of the paper to step from. |
+| `direction` | string | required | `references` or `citations`. |
+| `source` | string | required | `semantic_scholar` or `openalex`. |
+| `limit` | integer | `100` | How many works to return, 1 to 1000. |
+| `year_from` | integer | none | Only works published in this year or later. |
+| `sort` | string | `year` | `year` (newest first) or `citations` (most cited first). |
+
+### `acquire`
+
+Download a paper by DOI into the `academic` store. The tool tries arXiv, MDPI and the providers' open-access locations, stores the file, writes its catalog entry and announces it. Conversion to text, indexing and word boxes then run in the background.
+
+The result is JSON: `store`, `doc_id`, `doi`, `state` and `converted`. `state` is `queued` (stored by this call; the answer also carries the file's size and SHA-256) or `present` (the store already held it; nothing was downloaded). When `converted` is `false`, ask [`status`](#status) with the `doc_id` until it is, then `read` and `cite`.
+
+The call fails when no open copy can be downloaded, when the metadata lookup fails, when the catalog entry cannot be written, and when the event bus is unreachable, in which case nothing is downloaded. Calling again repairs a half-finished acquisition.
 
 Changes state: yes.
 
 | Parameter | Type | Required or default | Meaning |
 |---|---|---|---|
-| `stem` | stem | required | Stem of a PDF, HTML or EPUB source stored in the papers directory. |
+| `doi` | string | required | The paper's DOI, for example `10.1038/s41586-021-03819-2`. |
 
-### `scribe_convert`
+### `capture`
 
-Blocks until the conversion finishes; use `scribe_queue` instead unless the markdown is needed inside this call. A conversion is bounded by the scribe timeout ceiling of 3600 s. Converts a stored source document (PDF, HTML or EPUB; PDF is preferred when several exist) to markdown through the code path the scribe event watcher uses. PDFs go to the scribe server; HTML and EPUB are parsed locally. Writes the markdown to storage, stamps the catalog and announces `scribe.completed`. Markdown that already exists is not converted again; it is re-announced (`hs scribe reconvert` forces a fresh conversion). Fails, naming the cause, when storage is unreachable, the source is missing, the document is refused (not a PDF, a paywall page, empty or looping output) or the catalog stamp did not land. While a conversion runs, the tool sends a progress notification about every 20 seconds. Use `markdown_read` to fetch the content. Needs the event bus.
+Keep a web page in the `web` store, so it can be searched, read and cited like a paper. The caller fetches the page and passes its content; the server does not fetch.
 
-When a PDF's markdown is stored, and when a PDF is found already converted without word boxes, the tool also publishes `scribe.boxes`; the scribe watcher builds the word boxes after the call returns.
+The page's `doc_id` is made from its address without the fragment, so **capturing the same address again replaces the page captured before**, together with the text converted from it. The tool is annotated as destructive for that reason.
 
-Changes state: yes.
+The result is JSON: `store`, `doc_id`, `source_url` (the address without its fragment), `size_bytes`, `replaced` and `next`. Conversion and indexing run in the background; [`status`](#status) with the `doc_id` says when the page can be read and cited.
 
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `stem` | stem | required | Stem of a PDF, HTML or EPUB source stored in the papers directory. |
-
-## Distill tools
-
-### `distill_search`
-
-Semantic search across indexed documents. Returns ranked hits with text snippet, metadata, score, page, line range and `links` (when links are configured). See [Search](../explanation/search.md) for how hits are ranked.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `query` | string | required | Search query. |
-| `limit` | integer | `10` | Maximum results. |
-| `year` | string | none | Year filter, for example `>2020`, `2023`, `>=2021`. |
-| `include_text` | boolean | `true` | When `false`, omit `chunk_text` from each hit: a metadata-only response for ranking or de-duplicating large result sets. Score and ranking are unaffected. |
-
-### `abstract_search`
-
-Semantic search over paper abstracts: the `abstracts` store, one record per paper. Each record is the paper's title and abstract; the abstract comes from the local OpenAlex catalog, else the paper's catalog abstract, else the converted markdown's `## Abstract` section. Papers with no usable abstract are not indexed. Body sections are excluded, so it is more precise than `distill_search` for finding the paper that argues a claim. Returns ranked hits with score, title, DOI, year and abstract text.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `query` | string | required | Search query. |
-| `limit` | integer | `10` | Maximum results. |
-| `year` | string | none | Year filter, as for `distill_search`. |
-| `include_text` | boolean | `true` | When `false`, omit the abstract text from each hit. |
-
-### `distill_status`
-
-Distill system status: the `academic` store's document and chunk counts, compute device and server version.
-
-Changes state: no. Takes no parameters.
-
-### `distill_exists`
-
-Check whether a document has been indexed in the vector database.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `stem` | stem | required | Stem of the indexed document to check. |
-
-### `distill_index`
-
-Index a converted markdown document into the vector database.
+The call fails for content over 2 MiB, for empty content, for an address that is not `http` or `https`, for HTML that is a paywall or login page rather than the article, and when the event bus is unreachable. A refused call stores nothing.
 
 Changes state: yes.
 
 | Parameter | Type | Required or default | Meaning |
 |---|---|---|---|
-| `stem` | stem | required | Stem of a markdown document to index. |
-
-### `distill_reconcile`
-
-Report Qdrant `doc_id`s whose markdown object is missing. Report only: a `dry_run` of `false` is ignored and the response says so with `requested_apply_ignored: true` (the field is `false` when the caller did not ask to apply). The write path is `hs distill reconcile --reembed` or `hs distill purge <doc_id>`. Sends progress notifications.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `dry_run` | boolean | `true` | Ignored; the tool only reports. |
-| `limit` | integer | every `doc_id` | Maximum number of `doc_id`s to check for missing markdown. |
-
-### `distill_scan_repetitions`
-
-Scan markdown objects for VLM repetition artifacts and report the `doc_id`s whose cleanup truncation count exceeds `threshold`. Report only; remediate with `hs distill purge <doc_id>` or a re-index. An unreadable or non-UTF-8 object is an error, never skipped. Sends progress notifications.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `limit` | integer | `100000` | Maximum number of markdown objects to scan. |
-| `threshold` | integer | `20` | Flag documents whose repetition truncation count exceeds this value. Lower is more aggressive. |
-
-### `distill_reindex`
-
-Re-index a document from storage with fresh catalog metadata, replacing its vectors in place. The new chunks are upserted and stale tail chunks are removed only after indexing succeeds, so a failure leaves the previous vectors untouched.
-
-Changes state: yes.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `stem` | stem | required | Stem of the document to re-index. |
-
-### `distill_backfill`
-
-Find catalog entries that are converted but not embedded and retry indexing for each. Documents previously stamped with an `embedding_skip` reason are left out unless `retry_skipped` is `true`. Sends progress notifications.
-
-Changes state: yes (unless `dry_run` is `true`).
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `dry_run` | boolean | `true` | Report what would be re-indexed without writing. |
-| `limit` | integer | none | Maximum number of documents to attempt in this call. |
-| `retry_skipped` | boolean | `false` | Also retry documents stamped with an `embedding_skip` reason. |
-
-## Personal tools
-
-These tools work on the personal-documents store. See [Manage personal documents](../how-to/manage-personal-documents.md).
-
-### `personal_search`
-
-Semantic search over the personal documents: the `personal` store.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `query` | string | required | Search query. |
-| `limit` | integer | `10` | Maximum results. |
-| `category` | string | all categories | Restrict to one category: `medical`, `financial`, `education`, `legal`, `employment`, `tax`, `insurance`, `correspondence` or `other`. |
-
-### `personal_list`
-
-List ingested personal documents, most recent first.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `limit` | integer | `50` | Maximum entries to return. |
-| `category` | string | all categories | Restrict to one category. |
-
-### `personal_read`
-
-Read the converted markdown of one personal document.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `stem` | stem | required | Document stem. |
+| `url` | string | required | The page's address. |
+| `content` | string | required | The whole page, at most 2 MiB. Citations are checked against this text, so not a summary. |
+| `content_type` | string | required | What `content` is written in: `html`, `markdown` or `text`. |
+| `title` | string | none | The page's title, as `documents` and citations show it. |
 
 ### `personal_add`
 
-Ingest a file already staged in the personal inbox. Takes a file name, not a path: absolute paths, path separators and a leading dot are rejected. The file must already be in the configured inbox directory. The tool runs the same ingest pipeline as `hs personal add`, blocks until indexing finishes (a long PDF can take many minutes) and reports the assigned stem, title and category. Sends progress notifications.
+Ingest a file already staged in the personal inbox. The user puts the file in the inbox directory; the tool takes its file name, runs the same pipeline as `hs personal add` and blocks until the document is indexed. Converting a long PDF can take many minutes.
 
-For a PDF the tool also publishes `scribe.boxes` once the document is stored and indexed, and the scribe watcher builds its word boxes after the call returns. A PDF is refused before it is converted when the broker cannot be reached.
+The result is JSON: `store`, `doc_id`, `title`, `category`, `chunks_indexed` and `source_file`.
 
-Changes state: yes.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `filename` | string | required | File name inside the personal inbox. |
-| `category` | string | model-chosen | Override the category. Must be one of the configured categories. |
-| `title` | string | model-chosen | Override the title. |
-| `force` | boolean | `false` | Replace an existing document with the same stem or the same file content. |
-
-### `personal_reindex`
-
-Re-chunk and re-embed an already-ingested personal document from its stored markdown. Vectors are replaced in place; nothing is deleted first, so a failed re-embed leaves the previous vectors untouched.
+The call fails for a name that has a path separator or a leading dot, for a file that is not in the inbox, for a category that is not configured, and for a document the store already holds unless `force` is set. See [Manage personal documents](../how-to/manage-personal-documents.md).
 
 Changes state: yes.
 
 | Parameter | Type | Required or default | Meaning |
 |---|---|---|---|
-| `stem` | stem | required | Document stem to re-chunk and re-embed. |
+| `filename` | string | required | The file's name inside the personal inbox. Never a path. |
+| `category` | string | chosen by the model | One of the configured categories. |
+| `title` | string | chosen by the model | The document's title. |
+| `force` | boolean | `false` | Replace an existing document with the same id or the same content. |
 
-## Status tools
+### `synthesis_save`
 
-### `system_status`
+Save an answer as a document in the `syntheses` store, so it can be found, read and cited later. Every citation is checked exactly as `cite` checks it. **When one document does not contain its quote, nothing is saved** and the error names the citation by its position.
 
-Full pipeline status: PDF count, markdown count, catalog count, embedded-document count and the health of every service. The `history` pane matches `catalog_recent`'s defaults. The `hs status` command renders this data; see [Status dashboard](status-dashboard.md).
+The saved document is markdown that starts with front matter: the title, the creation time, the tags and each verified citation (`store`, `doc_id`, `page` and `lines` where they are known, and `quote` as the document has it). Each call saves a new document.
+
+The result is JSON: `store`, `doc_id`, `citations_verified` and `next`. Indexing runs in the background.
+
+The call fails for an empty title or body, for a body over 1 MiB, for an empty `citations` list, for a citation that fails the check, and when the event bus is unreachable.
+
+Changes state: yes.
+
+| Parameter | Type | Required or default | Meaning |
+|---|---|---|---|
+| `title` | string | required | The question the synthesis answers, or its subject. |
+| `body` | string | required | The synthesis, as markdown, at most 1 MiB. |
+| `citations` | list | required, at least one | Each item is `{store, doc_id, quote}`: the store and document of the hit, and the passage word for word. |
+| `tags` | list of strings | none | Words to file the synthesis under. |
+
+### `status`
+
+How the pipeline is, or how one document is. One part that cannot answer does not fail the call: that part carries `{"error": "<reason>"}` in place of its value and the rest of the answer stands.
+
+Without `doc_id` the result is JSON:
+
+| Field | Meaning |
+|---|---|
+| `queues` | One row per queue: sources waiting to be converted, converted documents waiting to be indexed, and PDFs waiting for their word boxes. Each has `queue`, `holds` and `depth` (`waiting` and `in_progress`). |
+| `index` | What the index holds for `store`: `store`, `documents`, `documents_is_a_floor`, `records` and `embed_model`. |
+| `converters` | One row per conversion server: `server`, `ready`, `slots_total`, `slots_available`, `converting` and `backend_status`. |
+
+This form reads only sources that answer at once and never lists the storage.
+
+With `doc_id` the result is JSON:
+
+| Field | Meaning |
+|---|---|
+| `store`, `doc_id` | What was asked. |
+| `source` | `stored`, and `extension`: the format the source is stored in. |
+| `catalog_entry` | Whether the document has a catalog entry. |
+| `converted` | Whether the document has text. |
+| `records` | For the document's own store and each store derived from it, how many records the index holds for the document. |
+| `boxes` | `built`, `pending` or `not_applicable` (the source is not a PDF). |
+| `failure` | `null`, or the failure recorded for the document: `stage` (`conversion` or `indexing`), `reason` and `at`. |
+
+A document nothing is known about is an answer, not an error: its source is not stored and it is not converted.
 
 Changes state: no.
 
 | Parameter | Type | Required or default | Meaning |
 |---|---|---|---|
-| `include_repaired` | boolean | `false` | Include rows stamped by a `catalog_repair` backfill in `history`, annotated `"repair": true`. |
+| `store` | string | `academic` | The store to report on. With `doc_id`, the store the document is in. |
+| `doc_id` | doc_id | none | Report on this one document instead of the pipeline. |
 
-## OpenAlex tools
+## Tools removed in favour of the CLI
 
-These tools query the local OpenAlex database and make no external calls. They are listed only when the OpenAlex corpus is ready; see [Tool visibility](#tool-visibility).
+Earlier releases exposed about forty tools. The ones below are gone; this table says where each one went.
 
-### `openalex_search`
+| Removed tool | Use instead |
+|---|---|
+| `distill_search`, `abstract_search`, `personal_search` | `recall` on the `myelin` server, with `stores` naming the store. |
+| `paper_search`, `paper_get`, `openalex_search`, `openalex_get`, `openalex_authors_by_topic` | [`discover`](#discover) |
+| `paper_references`, `paper_citations`, `openalex_references`, `openalex_citations` | [`graph`](#graph) |
+| `paper_download` | [`acquire`](#acquire) |
+| `catalog_list`, `catalog_recent`, `markdown_list`, `personal_list` | [`documents`](#documents) |
+| `catalog_read`, `markdown_read`, `personal_read`, and the `catalog:///` and `markdown:///` resources | [`read`](#read) |
+| `scribe_health`, `distill_status`, `distill_exists` | [`status`](#status) |
+| `system_status` | `hs status`, which reads `GET /mcp/status`; an agent asks [`status`](#status). |
+| `scribe_convert` | `hs scribe convert` |
+| `scribe_queue` | `hs scribe queue <STEM>` |
+| `distill_index` | `hs distill index` |
+| `distill_reconcile` | `hs distill reconcile` |
+| `distill_reindex` | `hs distill reindex` |
+| `distill_backfill` | `hs distill backfill` |
+| `distill_scan_repetitions` | `hs distill scan-repetitions` |
+| `personal_reindex` | `hs personal reindex` |
+| `catalog_repair` | `hs pipeline repair-catalog` |
+| `catalog_backfill_title` | `hs pipeline backfill-titles` |
+| `dedupe_url_encoded` | `hs migrate dedupe-url-encoded` |
 
-Search the local OpenAlex catalog by free text (BM25 over title and abstract). Returns a JSON array of works with `openalex_id`, DOI, title, year, citations and BM25 score. Needs the full-text index from `hs openalex build-fts`.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `query` | string | required | Free-text query. |
-| `max_results` | integer | `10` | Maximum results; maximum `200`. |
-| `year_from` | integer | none | Minimum publication year. |
-| `year_to` | integer | none | Maximum publication year. |
-| `min_citations` | integer | none | Minimum `cited_by_count`. |
-| `sort` | string | `relevance` | `relevance`, `citations` or `year`. |
-
-### `openalex_get`
-
-Look up one work by OpenAlex ID or DOI. Returns JSON with the work and its denormalised authors and topics.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `id_or_doi` | string | required | OpenAlex work ID (for example `W2741809807`) or DOI (for example `10.1234/x`). |
-
-### `openalex_references`
-
-List the works a given work cites (outbound references): `openalex_id`, DOI, title, year and `cited_by_count`.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `openalex_id` | string | required | OpenAlex work ID whose references to list. |
-| `limit` | integer | `100` | Maximum results; maximum `1000`. |
-
-### `openalex_citations`
-
-List the works that cite a given work (forward citation chaining).
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `openalex_id` | string | required | OpenAlex work ID to find citing works for. |
-| `limit` | integer | `100` | Maximum results; maximum `1000`. |
-| `year_from` | integer | none | Minimum publication year. |
-| `sort` | string | `citations` | `citations` or `year`. |
-
-### `openalex_authors_by_topic`
-
-Top authors for an OpenAlex topic, ranked by total `cited_by_count`. Returns a JSON array of `openalex_id`, `display_name`, `cited_by_count` and `papers_in_topic`.
-
-Changes state: no.
-
-| Parameter | Type | Required or default | Meaning |
-|---|---|---|---|
-| `topic_id` | string | required | OpenAlex topic ID, for example `T13975`; take it from `openalex_search` or the `topics` table. |
-| `limit` | integer | `25` | Maximum authors; maximum `200`. |
-
-## Resources
-
-| URI template | MIME type | Content |
-|---|---|---|
-| `catalog:///{stem}` | `application/yaml` | The paper's catalog entry: metadata, conversion info and page offsets. |
-| `markdown:///{stem}` | `text/markdown` | The full converted markdown. |
-| `markdown:///{stem}/page/{page}` | `text/markdown` | One page of the converted markdown; `page` is 1-based. |
-
-`resources/list` enumerates one `catalog:///` and one `markdown:///` resource for every catalog entry and converted document. An invalid stem is an invalid-parameters error; a missing entry is resource-not-found; a page outside the document is an invalid-parameters error naming the page count.
+See [CLI reference](cli.md) for each command.
 
 ## Configuration it reads
 
@@ -530,14 +338,13 @@ The server reads `~/.home-still/config.yaml` once at startup and `~/.home-still/
 
 | Section | Required | Used for |
 |---|---|---|
-| `storage:` | yes | Catalog, papers and markdown objects. |
-| `events:` | yes | `papers.ingested`, `scribe.completed` and `scribe.boxes` announcements. |
-| `scribe:` (`servers`, `convert_timeout_secs`, `timeout_policy`, `epub`) | no | `scribe_health`, `scribe_convert`. |
-| `distill:` (`servers`) | no | Distill and personal search and indexing tools. |
-| `paper:` | no | Provider settings for `paper_*` tools. |
-| `docs:` (`lan_base_url`, `remote_base_url`, `link_ttl_secs`, `default_subject`) | no | Signed links in search hits and `cite`. Links are off, and `cite` fails, until both base URLs are set. |
-| `storage:` | yes | Short-link codes (`cite` with `short`) are records beside the documents. |
-| `openalex:` (`db_path`) | no | The local OpenAlex database for the `openalex_*` tools. |
+| `storage:` | yes | Sources, converted text, catalog entries, word boxes and short-link codes. |
+| `events:` | yes | Announcing what `acquire`, `capture`, `synthesis_save` and `personal_add` stored; the queue depths in `status`. |
+| `scribe:` (`servers`) | no | Converter readiness in `status`. |
+| `distill:` (`servers`) | no | Record counts in `status`; indexing in `personal_add`. |
+| `paper:` | no | Provider settings for `discover`, `graph` and `acquire`. |
+| `docs:` (`lan_base_url`, `remote_base_url`, `link_ttl_secs`, `default_subject`) | no | Signed links in `read` and `cite`. Links are off, and `cite` fails, until both base URLs are set. |
+| `openalex:` (`db_path`) | no | The local OpenAlex corpus for `discover` and `graph`. |
 
 | Variable | Used for |
 |---|---|

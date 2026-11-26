@@ -92,9 +92,9 @@ At start-up the gateway probes each backend from its own host and warns about on
 
 ## Get links from an agent
 
-Every tool that returns a document carries a `links` object with a LAN URL and a remote URL for the source and for the markdown: `distill_search`, `abstract_search`, `personal_search` and `catalog_read`. The `cite` tool checks a quote against a document and returns fresh links that open the document on that passage. Both need `docs.lan_base_url` and `docs.remote_base_url`. See [`cite`](../reference/mcp-tools.md#cite) and [Connect Claude and agents](connect-claude-and-agents.md).
+The [`read`](../reference/mcp-tools.md#read) tool returns a `links` object with a LAN URL and a remote URL for the source and for the markdown. The [`cite`](../reference/mcp-tools.md#cite) tool checks a quote against a document and returns fresh links that open the document on that passage. Both need `docs.lan_base_url` and `docs.remote_base_url`. See [Connect Claude and agents](connect-claude-and-agents.md).
 
-A PDF link carries `#page=N`. A markdown link from a search hit or from `cite` carries a text fragment (`#:~:text=…`) that selects the passage. The page is part of the signature: a link minted for page 11 opens page 11 and nothing else. For a quote whose words were found on a PDF page, `cite` also returns a `viewer` link and a `page` link, which show the page with the passage boxed.
+A PDF link carries `#page=N`. A markdown link from `cite` carries a text fragment (`#:~:text=…`) that selects the passage. The page is part of the signature: a link minted for page 11 opens page 11 and nothing else. For a quote whose words were found on a PDF page, `cite` also returns a `viewer` link and a `page` link, which show the page with the passage boxed.
 
 ## Mint a link by hand
 

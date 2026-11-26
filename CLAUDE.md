@@ -52,15 +52,17 @@ cargo check -p pdf-mash            # Check pdf-mash
 
 ## MCP tools — citation graph
 
-- `paper_references(doi)` — return the structured reference list of a paper by DOI.
-- `paper_citations(doi, limit?, year_from?, sort?)` — return the list of papers
-  that cite a given DOI. Default limit 100, max 1000. Sort by `year` (default)
-  or `citations`.
+- `graph(doi, direction, source, limit?, year_from?, sort?)` — step along the
+  citation graph from a DOI. `direction` is `references` or `citations`;
+  `source` is `semantic_scholar` or `openalex` (the local corpus). Default
+  limit 100, max 1000. Sort by `year` (default) or `citations`.
 
-Both tools call the Semantic Scholar Graph API and reuse the same HTTP client,
-auth, and 429-retry path as `paper_search` / `paper_get` (see
-`paper/src/providers/semantic_scholar.rs`). They are forward-chaining
-primitives for the `home-still-bridge` snowballing skill. The live integration
+With `source: "semantic_scholar"` the tool calls the Semantic Scholar Graph API
+and reuses the same HTTP client, auth, and 429-retry path as `discover` (see
+`paper/src/providers/semantic_scholar.rs`). It is the forward-chaining
+primitive for the `home-still-bridge` snowballing skill. The live integration
 test (`citation_graph_live_attention_is_all_you_need`) is `#[ignore]` — run
 with `cargo test -p paper -- --ignored citation_graph_live`.
+
+The whole tool surface (ten tools) is in `docs/reference/mcp-tools.md`.
 

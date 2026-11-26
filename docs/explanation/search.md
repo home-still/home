@@ -73,8 +73,8 @@ this", a second store, `abstracts`, holds one record per paper: its title
 and abstract. The abstract comes from the local
 OpenAlex catalog when it has the paper, else from the provider's record in
 the catalog, else from the markdown's `## Abstract` section; a paper with
-none is skipped. `hs distill abstracts build` fills it, and the MCP
-`abstract_search` tool searches it.
+none is skipped. `hs distill abstracts build` fills it, and an agent searches
+it with `recall` on the `myelin` server.
 
 ## From a hit to the page
 

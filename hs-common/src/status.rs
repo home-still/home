@@ -1,7 +1,7 @@
 //! Unified pipeline-status snapshot.
 //!
-//! Both `hs status` (CLI TUI) and the MCP `system_status` tool render from the
-//! same `StatusSnapshot` so CLI users and LLM consumers see identical truth.
+//! Both `hs status` (CLI TUI) and the MCP server's `/mcp/status` route render
+//! from the same `StatusSnapshot` so every reader sees identical truth.
 //! The CLI layers on its own TUI-only chrome (byte counts, watcher/indexer
 //! daemon state); everything structural lives here.
 
@@ -40,13 +40,14 @@ pub struct StatusSnapshot {
 }
 
 /// Storage key the inbox daemon writes its heartbeat to each sweep tick.
-/// Read by every `hs status` client via MCP `system_status`, so the TUI
-/// can render the `Watcher` row honestly regardless of which host the CLI
-/// is running on. Leading `.` keeps it out of top-level listings.
+/// Read by every `hs status` client through the MCP server's status
+/// snapshot, so the TUI can render the `Watcher` row honestly regardless of
+/// which host the CLI is running on. Leading `.` keeps it out of top-level
+/// listings.
 pub const INBOX_HEARTBEAT_KEY: &str = ".heartbeats/scribe-inbox.yaml";
 
 /// Daemon heartbeat contents. Written by `hs scribe inbox` (cmd_run) at
-/// the top of each sweep tick; consumed by `system_status` / `hs status`.
+/// the top of each sweep tick; consumed by the status snapshot / `hs status`.
 ///
 /// `last_sweep_*` fields are populated by the POST-tick stamp with the
 /// `SweepReport` from `sweep_inbox_once`. They're `Option<u64>` so the
@@ -381,10 +382,10 @@ pub struct HistoryEvent {
 
 /// Build the history event list from catalog entries, newest first.
 ///
-/// When `include_repaired` is `false` (the default for both `system_status`
-/// and `catalog_recent`), rows whose timestamp is a `catalog_repair`
-/// backfill fingerprint are suppressed so the feed shows organic activity.
-/// When `true`, those rows reappear annotated with `repair: true`.
+/// When `include_repaired` is `false` (the default of the status snapshot),
+/// rows whose timestamp is a `catalog_repair` backfill fingerprint are
+/// suppressed so the feed shows organic activity. When `true`, those rows
+/// reappear annotated with `repair: true`.
 #[cfg(feature = "catalog")]
 pub fn build_history(
     entries: &[(String, CatalogEntry)],

@@ -1,23 +1,23 @@
 //! Tiny HTTP client for MCP servers over streamable HTTP.
 //!
-//! Used by `hs status` (and other read-only CLI commands) on client-role nodes
-//! where the authoritative data lives on a remote server and this node has no
-//! usable local filesystem view, and by `hs-distill-server` to talk to the
-//! myelin store. Mirrors what `npx mcp-remote` does for
-//! Claude Desktop, but in-process — no Node, no long-polling, just POST and
-//! parse the SSE-wrapped JSON result.
+//! Used by `hs-distill-server` to talk to the myelin store. Mirrors what
+//! `npx mcp-remote` does for Claude Desktop, but in-process — no Node, no
+//! long-polling, just POST and parse the SSE-wrapped JSON result.
 //!
 //! Wiring:
-//!   1. Load cached cloud creds via `AuthenticatedClient::from_default_path()`.
-//!   2. Open the MCP session: POST initialize (capture `mcp-session-id`), then
+//!   1. Open the MCP session: POST initialize (capture `mcp-session-id`), then
 //!      POST `notifications/initialized`. Both must succeed.
-//!   3. `call_tool(name, args)` POSTs a `tools/call` request and returns the
+//!   2. `call_tool(name, args)` POSTs a `tools/call` request and returns the
 //!      tool's text content parsed as JSON (tools always return JSON strings
 //!      inside a text content frame, at least in this project's server). A
 //!      non-2xx answer, a JSON-RPC error, or a result flagged `isError` is an
 //!      `Err`, never data.
-//!   4. `close()` ends the session with `DELETE` so the server does not keep
-//!      one session per `hs status` invocation.
+//!   3. `close()` ends the session with `DELETE` so the server does not keep
+//!      it until it expires.
+//!
+//! [`status_snapshot`] is the one request here that is not MCP: `hs status`
+//! reads the home-still MCP server's dashboard snapshot over plain HTTP,
+//! from the route beside the MCP endpoint.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -39,31 +39,67 @@ fn excerpt(body: &str) -> String {
     body.chars().take(BODY_EXCERPT_CHARS).collect()
 }
 
-impl McpClient {
-    /// Build a client and complete the MCP handshake. Two endpoint paths:
-    ///
-    /// - `HS_MCP_URL` env var set: use it verbatim, no auth. For same-host
-    ///   and LAN-direct operation where round-tripping through the cloud
-    ///   gateway (and depending on a 7-day refresh token) is unnecessary.
-    ///   Example: `HS_MCP_URL=http://localhost:7445/mcp`.
-    /// - Otherwise: load cached cloud creds and route through the gateway.
-    pub async fn from_default_creds() -> Result<Self> {
-        if let Ok(direct) = std::env::var("HS_MCP_URL") {
-            let http = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .context("build direct-mode http client for MCP")?;
-            return Self::connect(AuthedHttp::plain(http), direct).await;
-        }
+/// What follows the MCP endpoint in the address of the home-still MCP
+/// server's dashboard snapshot: `<endpoint>/status`.
+pub const STATUS_PATH_SUFFIX: &str = "/status";
 
-        let auth = AuthenticatedClient::from_default_path()
-            .context("load cloud credentials (hs cloud enroll --gateway <url>)")?;
-        let endpoint = format!("{}/mcp", auth.gateway_url().trim_end_matches('/'));
-        let http = AuthedHttp::with_auth(auth, std::time::Duration::from_secs(30))
-            .context("build authenticated http client for MCP")?;
-        Self::connect(http, endpoint).await
+/// How long a request to the home-still MCP server may take.
+const HOME_STILL_MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The home-still MCP endpoint this host is configured to use, and a client
+/// for it:
+///
+/// - `HS_MCP_URL` set: that address, verbatim, sending `HS_BACKEND_TOKEN`
+///   when it is set. For same-host and LAN-direct operation, where a round
+///   trip through the cloud gateway (and its 7-day refresh token) is
+///   unnecessary. Example: `HS_MCP_URL=http://localhost:7445/mcp`.
+/// - Otherwise: the gateway's `/mcp`, with the cached cloud credentials.
+fn home_still_endpoint() -> Result<(AuthedHttp, String)> {
+    if let Ok(direct) = std::env::var("HS_MCP_URL") {
+        let http = reqwest::Client::builder()
+            .timeout(HOME_STILL_MCP_TIMEOUT)
+            .build()
+            .context("build direct-mode http client for MCP")?;
+        return Ok((AuthedHttp::plain(http), direct));
     }
 
+    let auth = AuthenticatedClient::from_default_path()
+        .context("load cloud credentials (hs cloud enroll --gateway <url>)")?;
+    let endpoint = format!("{}/mcp", auth.gateway_url().trim_end_matches('/'));
+    let http = AuthedHttp::with_auth(auth, HOME_STILL_MCP_TIMEOUT)
+        .context("build authenticated http client for MCP")?;
+    Ok((http, endpoint))
+}
+
+/// The dashboard snapshot of the home-still MCP server this host is
+/// configured to use (see `hs_common::status::StatusSnapshot`).
+pub async fn status_snapshot() -> Result<Value> {
+    let (http, endpoint) = home_still_endpoint()?;
+    fetch_status(&http, &endpoint).await
+}
+
+/// `GET <endpoint>/status`. Anything but a 2xx answer with a JSON body is an
+/// error that carries the status and the start of the body.
+async fn fetch_status(http: &AuthedHttp, endpoint: &str) -> Result<Value> {
+    let url = format!("{}{STATUS_PATH_SUFFIX}", endpoint.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("read the answer of GET {url}"))?;
+    if !status.is_success() {
+        anyhow::bail!("GET {url} failed ({status}): {}", excerpt(&body));
+    }
+    serde_json::from_str(&body)
+        .with_context(|| format!("GET {url} did not answer JSON: {}", excerpt(&body)))
+}
+
+impl McpClient {
     /// Open a session against `endpoint` with an already-built client.
     pub async fn connect(http: AuthedHttp, endpoint: String) -> Result<Self> {
         let mut client = Self {
@@ -308,7 +344,7 @@ mod tests {
     #[test]
     fn parses_sse_result_json_text() {
         let body = "data: \n\nid: 0\nretry: 3000\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"catalog_entries\\\":2855}\"}],\"isError\":false}}\n";
-        let parsed = parse_tool_result("system_status", body).unwrap();
+        let parsed = parse_tool_result("recall", body).unwrap();
         assert_eq!(parsed["catalog_entries"], 2855);
     }
 
@@ -335,10 +371,10 @@ mod tests {
                 "content": [{"type": "text", "text": "storage backend unreachable"}],
                 "isError": true}})
         );
-        let err = parse_tool_result("system_status", &body).unwrap_err();
+        let err = parse_tool_result("recall", &body).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("storage backend unreachable"), "{msg}");
-        assert!(msg.contains("system_status"), "{msg}");
+        assert!(msg.contains("recall"), "{msg}");
     }
 
     #[test]
@@ -395,7 +431,7 @@ mod tests {
         let client = client(&server).await.unwrap();
 
         let err = client
-            .call_tool("system_status", json!({}))
+            .call_tool("recall", json!({}))
             .await
             .expect_err("a 503 is a failure");
 
@@ -407,7 +443,7 @@ mod tests {
         let server = mcp_server(sse(tool_ok("{\"catalog_entries\":2855}")), 200).await;
         let client = client(&server).await.unwrap();
 
-        let value = client.call_tool("system_status", json!({})).await.unwrap();
+        let value = client.call_tool("recall", json!({})).await.unwrap();
 
         assert_eq!(value["catalog_entries"], 2855);
         // Every request after initialize carries the session id.
