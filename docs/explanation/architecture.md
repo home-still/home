@@ -23,10 +23,13 @@ flowchart LR
     sw -->|word boxes| st
     bus -->|distill-workers| dw["hs distill watch-events"]
     dw -->|markdown| distill["distill server"]
-    distill -->|vectors| qd[(Qdrant)]
-    mcp["hs-mcp"] --> st
+    distill -->|records| my["myelin server"]
+    my -->|embed| ol["Ollama bge-m3"]
+    my --> qd[(myelin's Qdrant)]
+    agent["AI assistant"] -->|recall| my
+    agent --> mcp["hs-mcp"]
+    mcp --> st
     mcp --> distill
-    mcp --> qd
 ```
 
 **Storage** holds every document and its derivatives under one root:
@@ -70,11 +73,23 @@ scribe server for them once the markdown is stored, on a queue of its own, so
 a slow scan never holds up a conversion and a missing sidecar can be queued
 again without converting anything.
 
-**The distill server** chunks markdown, embeds the chunks on the GPU, and
-writes the points to Qdrant. It also answers searches.
+**The distill server** chunks markdown and writes the chunks as records into
+a named *store* of a myelin server, over MCP. It does not embed anything
+itself. It also answers searches by asking myelin. At start-up it defines
+every store in myelin and refuses to start when myelin does not answer or
+when Ollama does not hold the embedding model on the GPU.
 
-**The MCP server** (`hs-mcp`) reads storage, the catalog, Qdrant and the
-distill server, and offers them as tools to an AI assistant. `hs status` asks
+**myelin** is a separate project (`github.com/home-still/myelin`). It embeds
+each chunk with Ollama's `bge-m3` on the GPU, keeps the vectors in a Qdrant
+of its own, fuses keyword and vector candidates and reranks them with a
+cross-encoder. home-still no longer runs or manages a Qdrant. myelin serves
+two MCP surfaces: the full one, used by the distill server, and an agent
+surface, where an assistant searches. See
+[set up myelin](../tutorials/home-cloud-cluster.md#8-set-up-myelin-on-the-gpu-host).
+
+**The MCP server** (`hs-mcp`) reads storage, the catalog and the distill
+server, and offers them as tools to an AI assistant: it reads, cites and
+acquires, while search is the `myelin` server's. `hs status` asks
 it for the pipeline's numbers, so the dashboard and an assistant always agree.
 
 ## The scribe tier chain
@@ -124,7 +139,7 @@ the gateway, not the caller.
 
 - **Devices** enroll with a one-time code created on the gateway host. The
   code fixes the device's name and its **scopes**: `scribe`, `distill`,
-  `mcp`. A device gets a refresh token and trades it for short-lived access
+  `mcp`, `memory`. A device gets a refresh token and trades it for short-lived access
   tokens; each proxied request needs an access token whose scopes cover the
   service.
 - **Claude Desktop** uses OAuth 2.1 with PKCE against the same gateway; the
@@ -153,7 +168,7 @@ starts, refuses every link whose subject is on it.
 |---|---|---|
 | `crates/hs` | `hs` | The command line: every command, the service installers, `hs status`, `hs upgrade`, and the docs service. |
 | `crates/hs-scribe` | `hs-scribe-server`, and a client library | Conversion: the scribe server and the client the watcher uses. |
-| `crates/hs-distill` | `hs-distill-server`, and a client library | Chunking, embedding, Qdrant and search. |
+| `crates/hs-distill` | `hs-distill-server`, and a client library | Chunking, and writing and searching records in myelin. |
 | `crates/hs-mcp` | `hs-mcp` | The MCP server. |
 | `crates/hs-gateway` | `hs-gateway` | The authenticating reverse proxy. |
 | `crates/openalex-ingest` | library | Loads an OpenAlex snapshot into a local DuckDB catalog. |
@@ -196,20 +211,9 @@ backend unavailable: 12.9 GiB free, needs 13.2 GiB; held by pid=4242 7534MB hs-d
 It names the free memory, the headroom, and every process holding the card,
 so you can see which tenant to stop or move.
 
-**The distill embedder is CUDA-only.** A distill server built without CUDA
-does not compile, and one whose model does not land on the GPU refuses to
-start. Before it loads the model it requires `embedding.vram_floor_mb` of free
-memory, and it names the holders when that is missing.
-
-**The embedder's memory stays allocated.** ONNX Runtime keeps the memory its
-allocator has taken for as long as the model is loaded, so the server's share
-of the card can grow past the model's own size during heavy indexing. Set
-`embedding.idle_release_secs` on a shared card: after that many seconds
-without a request the server drops the model and its GPU allocations, and the
-next request loads it again (a few seconds of warm-up).
-
-**The embedder sizes its batches to the card.** The scratch memory one pass
-needs grows with the square of the passage length, so before each pass the
-server sizes the batch to what the card can hold now, and a batch the card
-cannot allocate is retried at half the size, down to one passage. A busy card
-slows indexing instead of failing it.
+**The embedding model must be on the GPU.** Embedding is done by Ollama's
+`bge-m3` behind myelin. The distill server asks Ollama where that model is
+resident, and refuses to start, and reports itself not ready, unless it is
+fully on the GPU. It never accepts a CPU or partly offloaded model. When
+Ollama does not hold the model on the GPU, fix Ollama's CUDA or free VRAM;
+see [troubleshoot](../how-to/troubleshoot.md).

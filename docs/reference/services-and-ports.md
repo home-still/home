@@ -6,11 +6,12 @@
 |---|---|---|---|
 | 7433 | Scribe server (conversion) | `hs serve scribe` | `--port` |
 | 7435 | A second scribe server on the same host (a convention, e.g. an olmocr converter beside the default one) | `hs serve scribe --port 7435` | `--port` |
-| 7434 | Distill server (embedding and search) | `hs serve distill` | `--port`, or `distill_server.port` / `HS_DISTILL_PORT` |
+| 7434 | Distill server (chunking and search) | `hs serve distill` | `--port`, or `distill_server.port` / `HS_DISTILL_PORT` |
 | 7440 | Cloud gateway | `hs-gateway` | `cloud.gateway.listen` (required, e.g. `0.0.0.0:7440`) |
 | 7445 | MCP server, HTTP transport | `hs serve mcp` | `--port` |
 | 7446 | Docs service (signed document links) | `hs serve docs` | `--port` |
-| 6333, 6334 | Qdrant REST and gRPC | Docker / Podman | the compose file |
+| 7462 | Memory server (myelin), full surface: the distill server writes and searches through it | `myelin-mcp --serve` | `--serve <addr:port>` |
+| 7463 | Memory server (myelin), agent surface: what an agent connects to | `myelin-mcp --serve-agents` | `--serve-agents <addr:port>` |
 | 4222 | NATS with JetStream (event bus) | Docker / Podman | `events.nats.url` |
 | 3900 | Garage S3 API (object storage) | Docker / Podman | `storage.s3.endpoint` |
 | 11434 | Ollama (the default VLM backend for conversion) | Ollama | `HS_SCRIBE_OLLAMA_URL` |
@@ -70,7 +71,7 @@ Every route except `/health`, `/readiness` and `/search` names one store: in the
 |---|---|---|---|
 | `/health` | GET | no | Status, the server's own `pid`, device, embedding model and versions; 503 if the embedding model is not on the GPU or myelin is unreachable. |
 | `/readiness` | GET | no | `ready`, `capacity` (1: writes are serialized), `in_flight`, `reason`; 503 when not ready. |
-| `/status?store=<name>` | GET | yes | The store's statistics (chunks, documents, device). |
+| `/status?store=<name>` | GET | yes | The store's statistics (`records_count`, documents, device). |
 | `/distill` | POST | yes | Index one document into the store its body names. |
 | `/distill/stream` | POST | yes | The same, streaming NDJSON progress. |
 | `/search` | POST | yes | Search the stores listed in `stores`; an empty or absent list searches the default stores. `limit` defaults to 10, at most 200; `query` is at most 65,536 bytes. Each hit names its store. |
@@ -95,8 +96,8 @@ Bad input is a 400, a missing dependency a 503, anything else a 500.
 | `/s/{code}` | GET | A short link: `302` to the signed link the code stands for, with its fragment. An unknown or expired code is `404`. |
 
 A request for a document is served only with a valid signature in the query
-string: `iat` (issued), `exp` (expiry), `sub` (subject), `col` (collection:
-`academic` or `personal`), `fmt` (`source`, `markdown`, `page.png`, `page` or
+string: `iat` (issued), `exp` (expiry), `sub` (subject), `col` (the store the
+document is in, such as `academic` or `personal`), `fmt` (`source`, `markdown`, `page.png`, `page` or
 `viewer`: the route the link opens, and no other), optional `page`, optional
 `hl` and `sig`, an HMAC-SHA256 over the stem and those fields with the key in
 `~/.home-still/docs-link.key`. A host that mints links (`hs docs link`, the
@@ -147,10 +148,13 @@ hs-gateway --gateway-url https://cloud.example.com [--listen <addr:port>]
 At startup the gateway requires `HS_BACKEND_TOKEN`, the signing secret
 (`~/.home-still/cloud-secret.key`) and the admin key
 (`~/.home-still/cloud-admin.key`; both are created by `hs cloud init`, or on
-first start), and a route for each of `scribe`, `distill`, `mcp` and `docs`.
-It then probes each backend's `/health` from its own host and logs a warning
-for any it cannot reach; an unreachable backend does not stop it. On SIGTERM
-or SIGINT, requests in flight get 30 seconds to finish.
+first start), and a route for each of `scribe`, `distill`, `mcp`, `memory`
+and `docs`. It then probes each backend's `/health` from its own host and
+logs a warning for any that does not answer or that answers with a server
+error; any other answer, including the `401` of a server that wants the
+backend token on every path, shows the backend is reachable. A backend that
+is away does not stop the gateway. On SIGTERM or SIGINT, requests in flight
+get 30 seconds to finish.
 
 ## Gateway endpoints
 
@@ -164,7 +168,7 @@ or SIGINT, requests in flight get 30 seconds to finish.
 | `/health` | GET | none | Returns `ok`. |
 | `/cloud/enroll` | POST | enrollment code | Exchange an enrollment code for a refresh token. |
 | `/cloud/refresh` | POST | refresh token | Exchange a refresh token for an access token. |
-| `/cloud/admin/invite` | POST | admin key | Create an enrollment code: `{"device_name": "…", "scopes": ["scribe", "distill", "mcp"]}`. |
+| `/cloud/admin/invite` | POST | admin key | Create an enrollment code: `{"device_name": "…", "scopes": ["scribe", "distill", "mcp", "memory"]}`. |
 | `/cloud/admin/revoke` | POST | admin key | Revoke every token issued to `{"subject": "<device name or oauth:client_id>"}`. |
 | `/docs/{*rest}` | GET | the link's signature | Proxied to the `docs` route. No bearer token: the signed link is the authorisation. |
 | any other path | any | access token | Proxied by its first path segment; see below. |
@@ -182,7 +186,13 @@ itself.
 | `/scribe`, `/scribe/*` | `scribe` | `scribe` |
 | `/distill`, `/distill/*`, `/search`, `/exists/<id>` | `distill` | `distill` |
 | `/mcp`, `/mcp/*` | `mcp` | `mcp` |
+| `/memory`, `/memory/*` | `memory` | `memory` |
 | `/docs/*` | `docs` | none (signed link) |
+
+A path reaches its backend unchanged, except under `/memory`: the memory
+server serves `/mcp`, which on the gateway belongs to the `mcp` service, so
+the gateway takes the leading `/memory` off. `/memory/mcp` reaches the
+memory server as `/mcp`.
 
 Any other path is a 404. A path with `.` or `..` segments, empty segments or
 encoded separators is a 400 and is not forwarded. The gateway replaces the
@@ -191,6 +201,10 @@ describe the caller, does not follow backend redirects, and streams both
 bodies. Errors: 502 backend unreachable, 504 timeout, 413 body too large, 503
 over the concurrency limit. An unauthenticated request gets a 401 whose
 `WWW-Authenticate` header points at the OAuth metadata.
+
+The memory server's agent listener must accept `HS_BACKEND_TOKEN` as its
+bearer token when it listens on an address other hosts can reach: start it
+with `MYELIN_MCP_TOKEN` set to the same value.
 
 Each route in `cloud.gateway.routes` takes one URL or a list. The gateway
 round-robins requests across a list and skips an instance that refused a

@@ -10,15 +10,21 @@ It takes about an hour, most of it downloads.
 ## What you need
 
 - Linux on x86-64 with an NVIDIA GPU (8 GB of memory or more) and a working
-  NVIDIA driver with CUDA. The search server only runs on the GPU.
+  NVIDIA driver with CUDA. The search server only runs while its embedding
+  model is on the GPU.
 - ONNX Runtime's CUDA provider, `libonnxruntime_providers_cuda.so`, under
-  `~/.cache/ort.pyke.io/dfbin/`. The search and scribe servers load it from
-  there. The release archives do not include it; a build of home-still with
-  `--features cuda` puts it there (see [contributing](../../CONTRIBUTING.md)).
-- [Docker](https://docs.docker.com/get-docker/) or Podman, for Qdrant and
-  NATS.
+  `~/.cache/ort.pyke.io/dfbin/`. The scribe server loads it from there for
+  its layout and table models. The release archives do not include it; a
+  build of home-still with `--features cuda` puts it there (see
+  [contributing](../../CONTRIBUTING.md)).
+- [Docker](https://docs.docker.com/get-docker/) or Podman, for NATS (and for
+  myelin's Qdrant).
 - [Ollama](https://ollama.com/download), which runs the model that reads
-  your PDFs.
+  your PDFs and the embedding model `bge-m3`.
+- A myelin server, which holds the search index. It is a separate project
+  with its own Qdrant; set it up as in
+  [step 8 of the cluster tutorial](home-cloud-cluster.md#8-set-up-myelin-on-the-gpu-host),
+  with every address on this one machine.
 - `curl`, `tar`, `openssl` and `sha256sum`.
 
 ## 1. Install home-still
@@ -187,8 +193,10 @@ hs distill index
 ```
 
 `hs serve distill start` starts the search server, which keeps passages in a
-myelin server and needs that server and Ollama running first (see
-[`distill_server`](../reference/configuration.md#distill_server));
+myelin server and needs that server and Ollama, with `bge-m3` pulled
+(`ollama pull bge-m3`), running first (see
+[`distill_server`](../reference/configuration.md#distill_server)). It exits
+when myelin does not answer or Ollama does not hold the model on the GPU.
 `hs distill index` cuts your markdown into passages, embeds them and stores
 them, showing a progress bar. Now ask a question:
 
@@ -202,13 +210,20 @@ relevance score, found by meaning even where they share none of your words.
 ## 8. Ask Claude about your library
 
 ```sh
-hs mcp install --client desktop
+hs mcp install --client code
 ```
 
-This adds home-still to Claude Desktop's configuration. Restart Claude
-Desktop; in a new chat, ask "Search my home-still library for how the
-Transformer's attention is computed, and cite the page." Claude searches with
-`recall`, checks each quote with `cite`, and answers with citations.
+An assistant uses two MCP servers: `home-still`, which reads and cites, and
+`myelin`, where it searches. The command writes both into Claude Code's
+configuration. Start a new Claude Code session and ask "Search my home-still
+library for how the Transformer's attention is computed, and cite the page."
+The assistant searches with `recall` on `myelin`, checks each quote with
+`cite`, and answers with citations.
+
+Claude Desktop's configuration file takes only commands, so
+`hs mcp install --client desktop` gives it `home-still` alone and says so. It
+reaches the memory server through a gateway, as a server you add in the app:
+see [connect Claude and agents](../how-to/connect-claude-and-agents.md).
 
 ## 9. Make it automatic
 

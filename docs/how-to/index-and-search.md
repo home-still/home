@@ -121,6 +121,20 @@ with `recall` on the `myelin` server, naming the store: `stores: ["abstracts"]`.
    hs distill purge 10.48550_arxiv.1706.03762
    ```
 
+5. Fill an empty index, after you first set up myelin or after a rebuild,
+   then re-index what is already indexed when you need to:
+
+   ```sh
+   hs distill reconcile --reembed
+   hs distill abstracts build --force
+   hs personal reindex <stem>
+   ```
+
+   Run `hs personal reindex` once for each personal document. To index the
+   documents of the `academic` store again, replacing their records in place,
+   run `hs distill reindex --all`; pass `--older-than <time>` to resume a run
+   that stopped.
+
 ## Check it worked
 
 ```sh

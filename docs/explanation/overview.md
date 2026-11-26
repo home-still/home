@@ -51,8 +51,8 @@ institutions that can buy a commercial service.
    └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
         │                  │                  │                  │
         ▼                  ▼                  ▼                  ▼
-   sources in         markdown in        points in          passages with
-   papers/            markdown/          Qdrant             links to the
+   sources in         markdown in        records in         passages with
+   papers/            markdown/          myelin             links to the
                                                             page they are on
 ```
 
@@ -65,11 +65,12 @@ institutions that can buy a commercial service.
    The result is markdown with the source's pages kept apart. See
    [how conversion works](conversion.md).
 3. **Index.** The distill server cuts the markdown into passages, turns each
-   into a vector that captures its meaning, and stores it in Qdrant together
-   with its text and metadata.
-4. **Search.** A query runs two ways at once, by meaning and by keyword, and
-   the two rankings are fused. Each hit names its paper and page, and can
-   carry a link that opens the source at that page. See
+   into a vector that captures its meaning, and stores it in a named store
+   of a myelin server together with its text and metadata.
+4. **Search.** A query runs two ways at once, by meaning and by keyword, the
+   two rankings are fused, and a cross-encoder reranks the best candidates.
+   Each hit names its paper and page, and can carry a link that opens the
+   source at that page. See
    [how search works](search.md).
 
 Each stored document publishes an event, and watchers pick the events up: a
@@ -80,15 +81,16 @@ shows the whole pipeline.
 ## Using it through an AI assistant
 
 Search returns passages. To get a synthesis across several papers, you
-connect an MCP client such as Claude to home-still's
-[MCP server](../reference/mcp-tools.md). The assistant can then search your
+connect an MCP client such as Claude to two MCP servers: `myelin`, where the
+assistant searches, and home-still's [MCP server](../reference/mcp-tools.md),
+which reads and cites. The assistant can then search your
 library, read whole papers, follow citations and hand you links to the exact
 page, and answer with citations you can verify.
 
 ## What runs where
 
 On one machine, everything runs side by side: the `hs` command, a scribe
-server, a distill server, Qdrant, NATS and Ollama.
+server, a distill server, myelin (with its own Qdrant), NATS and Ollama.
 [Build your first research library](../tutorials/first-library.md) sets that
 up.
 
@@ -99,8 +101,8 @@ job its hardware suits:
   and catalog, as a shared filesystem or an S3-compatible Garage store.
 - **GPU compute** (a desktop with an NVIDIA card) runs conversion and
   embedding. It is the only machine that needs real horsepower, and the
-  distill server requires CUDA.
-- **Qdrant** runs on a host with fast disk.
+  distill server requires the embedding model to be on the GPU. The distill
+  server and myelin, which holds the search index, run on this host.
 - **The gateway host** runs Cloudflare's tunnel agent and `hs-gateway`, the
   one program reachable from the internet.
 - **Your laptops** run the `hs` command and Claude.

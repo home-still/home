@@ -46,7 +46,7 @@ An environment variable overrides a key of the section it names. The prefix sele
 | Prefix | Sections | Rule |
 |---|---|---|
 | `HS_SCRIBE_` | `scribe`, `scribe_server` | `HS_SCRIBE_<KEY>` sets the top-level key `<key>` (lower case) of the section being loaded. `HS_SCRIBE_CONVERT_TIMEOUT_SECS` sets `scribe.convert_timeout_secs`; `HS_SCRIBE_VLM_CONCURRENCY` sets `scribe_server.vlm_concurrency`. The two sections have disjoint keys, so one prefix serves both. Nested keys (`timeout_policy.*`, `epub.*`) have no variable. |
-| `HS_DISTILL_` | `distill`, `distill_server` | `HS_DISTILL_<KEY>` sets the top-level key `<key>` (lower case) of the section being loaded. `HS_DISTILL_PORT` sets `distill_server.port`. Nested keys (`embedding.*`, `hnsw.*`) have no variable. |
+| `HS_DISTILL_` | `distill`, `distill_server` | `HS_DISTILL_<KEY>` sets the top-level key `<key>` (lower case) of the section being loaded. `HS_DISTILL_PORT` sets `distill_server.port`. Nested keys have no variable. |
 | `HOME_STILL_PAPER_` | `paper` | The words after the prefix name the key path, joined by `_` whether they separate levels or words inside a key: `HOME_STILL_PAPER_DOWNLOAD_PATH` is `paper.download_path`; `HOME_STILL_PAPER_DOWNLOAD_TIMEOUT_SECS` is `paper.download.timeout_secs`. |
 | `HOME_STILL_STORAGE_`, `HOME_STILL_EVENTS_` | `storage`, `events` | Same rule, read by the paper loader. |
 | `HOME_STILL_PERSONAL_` | `personal` | Same rule. `HOME_STILL_PERSONAL_NAMING_MAX_INPUT_TOKENS` is `personal.naming.max_input_tokens`. |
@@ -61,7 +61,7 @@ An unknown key is an error.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `project_dir` | `~/home-still` | The project directory: papers, markdown, catalog, logs and the local Qdrant data directory live under it. Must be a non-empty string; `~/` expands. |
+| `project_dir` | `~/home-still` | The project directory: papers, markdown, catalog and logs live under it. Must be a non-empty string; `~/` expands. |
 | `log_dir` | `<project_dir>/logs` | Where each binary spools its log files. |
 
 Without a `storage:` section the local-filesystem default (`~/home-still`) applies. If `home.project_dir` names a different directory and `storage:` is absent, loading fails until `storage.local.root` is set.
@@ -375,7 +375,7 @@ The gateway (`hs-gateway`). There is no default gateway: a missing `cloud.gatewa
 | `backend_failure_cooldown_secs` | `10` | How long an instance that refused a connection is skipped. |
 | `auth_rate_limit_per_minute` | `30` | POSTs per minute allowed on each of `/cloud/enroll`, `/authorize`, `/token` and `/register`; at least 1. |
 
-`routes` must contain a backend for each of `scribe`, `distill`, `mcp` and `docs`; a missing service stops the gateway and names the key to add. A route is `http://host[:port]` or `https://host[:port]` with no credentials, path, query or fragment, and an instance may be listed once per service.
+`routes` must contain a backend for each of `scribe`, `distill`, `mcp`, `memory` and `docs`; a missing service stops the gateway and names the line to add. A route is `http://host[:port]` or `https://host[:port]` with no credentials, path, query or fragment, and an instance may be listed once per service. `memory` is the agent listener of the memory server (myelin), port 7463.
 
 ```yaml
 cloud:
@@ -385,6 +385,7 @@ cloud:
       scribe: [http://<gpu-host>:7433, http://<scribe-host>:7433]
       distill: http://<gpu-host>:7434
       mcp: http://127.0.0.1:7445
+      memory: http://<memory-host>:7463
       docs: http://<docs-host>:7446
 ```
 

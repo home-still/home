@@ -68,13 +68,13 @@ hs personal search "cholesterol results" --category medical -n 5
 hs personal read lab-results-2024-q1-abcdef01
 ```
 
-`list` shows the most recently ingested documents first, with title, category and stem. `search` is semantic, over the personal collection only. `read` prints the converted markdown of one stem. `--category` accepts any letter case.
+`list` shows the most recently ingested documents first, with title, category and stem. `search` is semantic, over the `personal` store only. `read` prints the converted markdown of one stem. `--category` accepts any letter case.
 
 Agents search the same store with `recall` on the `myelin` server (`stores: ["personal"]`), list it with [`documents`](../reference/mcp-tools.md#documents) and read from it with [`read`](../reference/mcp-tools.md#read), both with `store: "personal"`.
 
 ## Re-index a document
 
-After the chunker or the embedder changes, rebuild one document's vectors from its stored markdown. The new vectors replace the old ones in place; nothing is deleted first.
+After the chunker changes, or to fill an empty index, rebuild one document's records from its stored markdown. The new records replace the old ones in place; nothing is deleted first. The command takes one stem, so run it once for each document.
 
 ```sh
 hs personal reindex lab-results-2024-q1-abcdef01
@@ -86,7 +86,7 @@ hs personal reindex lab-results-2024-q1-abcdef01
 hs personal delete lab-results-2024-q1-abcdef01
 ```
 
-This removes the document's vectors from Qdrant and its source, markdown and sidecar from storage. It asks for no confirmation and cannot be undone. A stem that names nothing is an error. Agents cannot delete personal documents.
+This removes the document's records from the `personal` store and its source, markdown and sidecar from storage. It asks for no confirmation and cannot be undone. A stem that names nothing is an error. Agents cannot delete personal documents.
 
 ## See where the store is configured
 
@@ -99,7 +99,7 @@ hs personal config path
 
 ## Open a personal document from a search hit
 
-`read` and `cite` return signed links for a personal document when document links are configured. A link names the personal collection, so you can also mint one by hand:
+`read` and `cite` return signed links for a personal document when document links are configured. A link names the `personal` store, so you can also mint one by hand (the flag keeps the name `--collection`):
 
 ```sh
 hs docs link lab-results-2024-q1-abcdef01 --collection personal

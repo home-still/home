@@ -4,7 +4,7 @@ A search question is rarely phrased the way the paper that answers it is
 written. home-still's search is built so that a question finds the passage
 whether it shares the passage's *meaning*, its *rare words*, or both.
 
-## From markdown to points
+## From markdown to records
 
 The distill server prepares each converted document once, when it is
 indexed.
@@ -14,15 +14,16 @@ indexed.
    one of them. Cuts fall on sentence boundaries and never cross a page
    separator, so every passage belongs to one page of the source.
 2. **Embedding.** Each passage is turned into a 1024-dimensional vector by
-   BGE-M3, a multilingual embedding model, running on the GPU. The model reads
-   up to 1280 tokens, enough for the whole passage plus a short header, so no
-   passage loses its tail.
-3. **Storing.** Each passage becomes one *point* in Qdrant: its vector, its
-   text, and the document's metadata (title, authors, year, DOI, page, line
-   numbers). Point ids are derived from the document and the passage's
-   position, so indexing a document again replaces its points instead of
+   BGE-M3, a multilingual embedding model that Ollama runs on the GPU for
+   myelin.
+3. **Storing.** Each passage becomes one *record* in a myelin store: its
+   text, its vector, and the document's metadata (title, authors, year, DOI,
+   page, line numbers). Documents live in named stores (`academic`,
+   `references`, `abstracts`, `personal`, `web`, `syntheses`, `memory`).
+   Indexing a document again writes a new generation of its records and then
+   forgets the earlier ones, so a re-index replaces a document instead of
    adding copies, and passages past a shortened document's new end are
-   deleted.
+   gone.
 
    The metadata comes from the document's catalog entry, never from guessing
    at the text: the first DOI or year in a paper is usually a citation. A
@@ -31,30 +32,23 @@ indexed.
 
 ## Two channels, one ranking
 
-Each search runs two retrievals over the same collection.
+Each search runs two retrievals over the same store, inside myelin.
 
 - **Dense.** The query is embedded with the same model and compared with
   every passage by cosine similarity. This finds passages that *mean* what
   the query means, even when they use none of its words.
-- **Lexical.** A text index over the passages finds those that *contain* the
-  query's words.
+- **Lexical.** A BM25 text index over the passages finds those that
+  *contain* the query's words.
 
 Neither is enough alone. A dense model represents "Hashimoto thyroiditis"
 much like any thyroid passage and can lose the specific disease; a keyword
 match cannot answer "how does attention scale with sequence length". The two
 result lists are merged with **reciprocal rank fusion**: each passage scores
 by its *rank* in each list, not by its raw score, because a cosine and a term
-count are not on the same scale. The fused score orders hits within one
-search; it means nothing when compared across searches.
-
-**Which words the lexical channel requires** depends on how rare they are in
-your library. The text match is an AND, and a real question is not: no
-single passage contains every word of "Hashimoto thyroiditis euthyroid
-patients", though the passage you want contains the rare ones. So the
-lexical channel runs several small matches and pools their hits, most
-specific first: the two rarest terms of the query; the query's first term
-(usually what the question is about) with the rarest other term; the rarest
-term alone; and the first term alone.
+count are not on the same scale. A cross-encoder
+(`bge-reranker-v2-m3`) then reads the query next to each of the best
+candidates and orders them. The score orders hits within one search; it
+means nothing when compared across searches.
 
 **Reference lists are kept apart.** To a dense model, a bibliography entry
 about hippocampal neurogenesis *is* about hippocampal neurogenesis, so a

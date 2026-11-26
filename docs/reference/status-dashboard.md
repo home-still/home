@@ -22,7 +22,7 @@ of two ways:
 | Documents | Source documents (PDF, HTML, EPUB) under `papers/`. | Total size. | | |
 | Markdown | Markdown documents under `markdown/`. | Total size. | Markdown ÷ (Documents − bad sources), capped at 100 %. A document that failed for a retryable reason stays in the denominator. | `hs pipeline catch-up` |
 | Cataloged | Catalog entries. | | | `hs scribe catalog-backfill` |
-| Embedded | Documents with points in Qdrant. | Chunk count, and how many documents are stamped `embedding_skip` (markdown that yields no chunk). | Embedded ÷ (Markdown − skipped). | `hs distill reconcile --reembed` |
+| Embedded | Documents with records in the store. | Chunk count, and how many documents are stamped `embedding_skip` (markdown that yields no chunk). | Embedded ÷ (Markdown − skipped). | `hs distill reconcile --reembed` |
 | In-flight | Conversions running now, summed over every scribe server's `/readiness`. | `converting across N scribes`, or `idle`. | | |
 | Queued | Messages outstanding on the `scribe-workers` consumer: waiting in the stream plus delivered and not yet acknowledged. | `waiting for or held by a scribe`, `queue empty`, or `unavailable: <reason>` when the broker cannot say. `?` means unknown, never zero. | | |
 | Stalled | Sources with no markdown and no failure stamp, minus Queued. These were never queued, or their message was lost. | `no markdown and not queued — run hs pipeline catch-up`, or `none`. | | `hs pipeline catch-up --dry-run` |
@@ -45,14 +45,14 @@ names the cause), and `...` while the first count is in progress.
 ## Services rows
 
 One row per scribe server in `scribe.servers`, one per distill server in
-`distill.servers`, and one for Qdrant.
+`distill.servers`, and a last one, `Store`, for the myelin server the distill server uses.
 
 | Column | Meaning |
 |---|---|
 | Indicator | `●` healthy, `○` not. |
-| Status | `running`, `idle`, `N converting` (scribe), `N embedding` (distill), `healthy`/`stopped` (Qdrant), or the reason the service is unhealthy. |
-| URL | The configured address. Never truncated. |
-| Detail | Model, slots and device as the service reports them. |
+| Status | `running`, `idle`, `N converting` (scribe), `N embedding` (distill), `healthy`/`stopped` (the store), or the reason the service is unhealthy. |
+| URL | The configured address; for the store row, the myelin server's URL. Never truncated. |
+| Detail | Model, slots and device as the service reports them. For the store row: the store's name. |
 | Version | The service's version. |
 
 When a scribe server's VLM backend lacks GPU memory, the status is a

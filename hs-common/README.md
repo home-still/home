@@ -44,7 +44,7 @@ Always available, without a feature:
 | `secrets` | The `~/.home-still/secrets.env` loader. |
 | `status` | Pipeline counters, failure kinds and repair listings. |
 | `stores` | The registry of the corpus's stores: each one's name, ledger tenant and, for a store of documents, its layout in storage. |
-| `cuda_libs` | Locating the CUDA libraries ONNX Runtime needs. |
+| `cuda_libs` | Locating the CUDA libraries the scribe server's ONNX Runtime needs (used by `hs serve scribe`). |
 | `gpu` | GPU name, memory and per-process VRAM via `nvidia-smi`. |
 | `hardware_profile` | Host classes and their default concurrency. |
 | `html` | HTML shape detection and paywall-stub heuristics, shared by the downloader and the scribe watcher. |

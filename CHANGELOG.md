@@ -83,6 +83,49 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
   `hs scribe queue <STEM>`, `hs distill scan-repetitions` and
   `hs distill backfill`. A command that writes does so by default and takes
   `--dry-run`.
+- The gateway has a fifth route, `memory`, mounted at `/memory`: it forwards
+  `/memory/mcp` to the myelin server's agent listener as `/mcp` and admits
+  only a token with the new `memory` scope. **Add
+  `memory: http://<memory-host>:7463` to `cloud.gateway.routes` immediately
+  before upgrading the gateway binary**: the new gateway does not start
+  without it and names the line to add, and the old one does not start with
+  it. The memory host must listen for agents on an address the gateway
+  reaches (`myelin-mcp --serve-agents <address>:7463`), with
+  `MYELIN_MCP_TOKEN` set to the value of `HS_BACKEND_TOKEN`, and its
+  firewall must admit that port from the gateway host.
+- `hs cloud invite --scope` takes `memory`, and a code without `--scope`
+  grants all four scopes. **A device or OAuth client enrolled before this
+  release holds tokens without `memory`, and `/memory/mcp` answers it
+  `403`: enroll it again.** Claude Desktop adds `<gateway>/mcp` and
+  `<gateway>/memory/mcp` as two servers, each with its own code.
+- `hs mcp install` writes two servers, `home-still` (the `hs-mcp` command)
+  and `myelin` (`http://127.0.0.1:7463/mcp`); with `--remote` both are the
+  gateway's `/mcp` and `/memory/mcp`. `hs mcp uninstall` removes both.
+  Claude Code's URL entries are written as `"type": "http"`; the earlier
+  `"type": "url"` entry was one Claude Code refuses, so **run
+  `hs mcp install --remote` again on a machine that used it**. Claude
+  Desktop's file takes commands only, so it gets `home-still` alone, and
+  `hs mcp install --client desktop --remote` now writes nothing and says to
+  add the two addresses in the app.
+- The gateway's start-up check counts a backend that answers `401` or `404`
+  on `/health` as reachable. Only no answer, or a `5xx`, is reported.
+- `hs` no longer runs a Qdrant. `hs upgrade`, `hs restart` and
+  `hs distill server start` do not read
+  `~/.home-still/docker-compose-distill.yml`, and an upgrade no longer waits
+  for Qdrant, so it cannot fail while Qdrant loads its collections. **The
+  container that file started keeps running until you stop it**
+  (`docker compose -f ~/.home-still/docker-compose-distill.yml down`);
+  nothing in home-still reads it. myelin's own Qdrant is another container
+  and must stay up.
+- **The index of an earlier release is not carried over.** Fill the stores
+  from what is already stored: `hs distill reconcile --reembed` for
+  `academic` and `references`, `hs distill abstracts build --force` for
+  `abstracts`, and `hs personal reindex <STEM>` for each personal document
+  (`hs personal list` names them).
+- The status snapshot (`GET /mcp/status`) describes the index in `store`
+  (`store`, `compute_device`, `embed_model`, `version`, `url`) where it had
+  `qdrant`, and the distill server's `/status` reports `records_count` where
+  it had `points_count`. `hs status` labels the row `Store`.
 
 ## v0.0.1-rc.394
 

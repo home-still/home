@@ -21,12 +21,12 @@ understand why the work is split this way, read the
    ┌──────────────────────▼───────────────────────────────────┐
    │                         home LAN                         │
    │                                                          │
-   │  <gateway-host>     <storage-host>      <qdrant-host>    │
-   │  cloudflared        NFS export          Qdrant           │
+   │  <gateway-host>     <storage-host>      <laptop>         │
+   │  cloudflared        NFS export          hs, Claude       │
    │  hs-gateway         NATS JetStream                       │
    │                                                          │
-   │  <gpu-host>                             <laptop>         │
-   │  scribe, distill                        hs, Claude       │
+   │  <gpu-host>                                              │
+   │  scribe, distill, myelin                                 │
    │  MCP, docs, watchers                                     │
    │                                                          │
    │  <scribe-host> (optional second conversion worker)       │
@@ -42,8 +42,7 @@ resolves on your LAN wherever you see it.
 |---|---|---|
 | `<gateway-host>` | Raspberry Pi 4 or 5, 4 GB or more of RAM | `cloudflared`, `hs-gateway` |
 | `<storage-host>` | Raspberry Pi 5, 8 GB, a 1 TB or larger USB SSD | The NFS export, NATS |
-| `<qdrant-host>` | Raspberry Pi 5, 16 GB, a 512 GB NVMe drive | Qdrant |
-| `<gpu-host>` | x86-64 Linux, 32 GB of RAM, an NVIDIA GPU with 8 GB of memory or more | The scribe, distill, MCP and docs servers, the event watchers |
+| `<gpu-host>` | x86-64 Linux, 32 GB of RAM, an NVIDIA GPU with 8 GB of memory or more | The scribe, distill, MCP and docs servers, myelin and its Qdrant, the event watchers |
 | `<laptop>` | Any computer; the steps use a Mac | `hs`, the inbox watcher, Claude Desktop |
 | `<scribe-host>` | An Apple Silicon Mac (optional, step 17) | A second scribe server |
 
@@ -52,13 +51,13 @@ You also need:
 - A domain on Cloudflare, for the tunnel. The steps use `cloud.example.com`;
   replace it with your own hostname.
 - [Docker](https://docs.docker.com/get-docker/) on `<storage-host>` and
-  `<qdrant-host>`.
+  `<gpu-host>`.
 - [Ollama](https://ollama.com/download) on `<gpu-host>`, for the model that
-  reads your PDFs.
+  reads your PDFs and the embedding model `bge-m3`.
 - A working NVIDIA driver with CUDA on `<gpu-host>`.
 - ONNX Runtime's CUDA provider, `libonnxruntime_providers_cuda.so`, under
-  `~/.cache/ort.pyke.io/dfbin/` on `<gpu-host>`. The scribe and distill
-  servers load it from there. The release archives do not include it; a build
+  `~/.cache/ort.pyke.io/dfbin/` on `<gpu-host>`. The scribe server loads it
+  from there, for its layout and table models. The release archives do not include it; a build
   of home-still with `--features cuda` puts it there (see
   [contributing](../../CONTRIBUTING.md)).
 - `curl`, `tar`, `openssl` and `sha256sum` on every host.
@@ -85,7 +84,7 @@ program name, for example `0.0.1-rc.388`. If the shell cannot find `hs`, add
 
 Every host gets `hs`, `hs-gateway` and `hs-mcp`. Only `<gpu-host>` gets
 `hs-distill-server`, because the release publishes it for x86-64 Linux only.
-The scribe server is a separate download, which you fetch in step 8.
+The scribe server is a separate download, which you fetch in step 7.
 
 ## 2. Create the shared secret
 
@@ -166,32 +165,7 @@ The log ends with the server ready and JetStream started. The workers create
 their streams and durable consumers the first time they connect; you do
 nothing more on the broker.
 
-## 5. Start Qdrant on the database host
-
-On `<qdrant-host>`:
-
-```sh
-mkdir -p /mnt/nvme/qdrant
-docker run -d \
-  --name qdrant \
-  --restart unless-stopped \
-  -p 6333:6333 -p 6334:6334 \
-  -v /mnt/nvme/qdrant:/qdrant/storage \
-  qdrant/qdrant:latest
-
-curl -fsS http://localhost:6333/healthz
-curl -fsS http://localhost:6333/collections
-```
-
-`healthz` answers with Qdrant's health text and `collections` lists none yet.
-
-Qdrant stores one vector per chunk of text. Each vector has 1024 numbers, so
-it takes 4 KiB as 32-bit floats before Qdrant adds its search graph and the
-chunk's text. The distill server creates its collections with the vectors and
-payloads on disk, so plan disk space at more than 4 KiB per chunk and leave
-RAM for the operating system to cache the files it reads most.
-
-## 6. Prepare the GPU host: driver and storage
+## 5. Prepare the GPU host: driver and storage
 
 On `<gpu-host>`, install the NVIDIA driver, CUDA and the NFS client. The
 commands below are for Arch Linux and its derivatives; on Ubuntu or Debian,
@@ -217,7 +191,7 @@ ls /mnt/share/home-still
 
 `ls` lists `catalog`, `logs`, `markdown` and `papers`.
 
-## 7. Configure home-still on the GPU host
+## 6. Configure home-still on the GPU host
 
 Write `~/.home-still/config.yaml` on `<gpu-host>`:
 
@@ -265,7 +239,7 @@ hs config show
 You see the effective paper configuration as YAML, with your Unpaywall email.
 Every key is described in the [configuration reference](../reference/configuration.md).
 
-## 8. Set up conversion on the GPU host
+## 7. Set up conversion on the GPU host
 
 The scribe server needs the model that reads text, two small layout models,
 the PDF library pdfium, and the server binary.
@@ -332,6 +306,134 @@ enables it and starts it; it asks for your `sudo` password. `/health` answers
 with JSON whose `status` is `ok`. If it does not, read the unit's log with
 `journalctl -u hs-serve-scribe -f` and see
 [Troubleshoot](../how-to/troubleshoot.md#a-scribe-or-distill-server-does-not-start).
+
+## 8. Set up myelin on the GPU host
+
+The distill server does not embed or index anything itself. It writes the
+chunks of your documents into [myelin](https://github.com/home-still/myelin),
+a separate memory server, and searches them there. myelin embeds each chunk
+with Ollama's `bge-m3` on the GPU, keeps the vectors in a Qdrant of its own,
+combines keyword and vector matches, and reranks the best candidates with a
+cross-encoder. home-still does not install, start, upgrade or check this
+Qdrant; you run it with the tools below. On `<gpu-host>`, install
+[Docker](https://docs.docker.com/get-docker/) if it is not there yet.
+
+The pieces are:
+
+1. **Ollama with the embedding model.** Pull the model:
+
+   ```sh
+   ollama pull bge-m3:latest
+   ```
+
+   The distill server loads the model with its first embedding request and
+   refuses to start while Ollama holds it on the CPU or split between the CPU
+   and the GPU. Once it is loaded, `ollama ps` lists `bge-m3:latest` with its
+   processor as `100% GPU`.
+
+2. **myelin's Qdrant.** Run it on the same host, with its data on a fast disk,
+   and publish its ports to the host's loopback only. myelin is developed
+   against Qdrant 1.19.1:
+
+   ```sh
+   mkdir -p ~/.local/share/myelin/qdrant
+   docker run -d \
+     --name myelin-qdrant \
+     --restart unless-stopped \
+     -p 127.0.0.1:6333:6333 -p 127.0.0.1:6334:6334 \
+     -v ~/.local/share/myelin/qdrant:/qdrant/storage \
+     qdrant/qdrant:v1.19.1
+   curl -fsS http://localhost:6333/healthz
+   ```
+
+   `healthz` answers with Qdrant's health text. Each chunk takes one vector of
+   1024 numbers, which is 4 KiB as 32-bit floats before Qdrant adds its search
+   graph and the chunk's text, so plan more than 4 KiB of disk per chunk.
+
+3. **A reranker.** Serve the `bge-reranker-v2-m3` model with llama.cpp's
+   `llama-server --rerank`, and note its address.
+
+4. **A chat model.** myelin uses any OpenAI-compatible chat model when an
+   agent calls `remember` or `investigate`. Note its address and model name.
+
+5. **myelin itself.** myelin is built from its own repository. Its README
+   documents every `MYELIN_*` environment variable:
+
+   ```sh
+   git clone https://github.com/home-still/myelin
+   cd myelin
+   cargo build --release -p myelin-mcp
+   install -m 0755 target/release/myelin-mcp ~/.local/bin/
+   ```
+
+Put myelin's settings in `~/.config/myelin-mcp.env`, readable by you only.
+`<llm-url>`, `<llm-model>` and `<rerank-url>` are the addresses and model name
+from items 3 and 4:
+
+```sh
+umask 077
+cat > ~/.config/myelin-mcp.env <<'ENV'
+MYELIN_QDRANT__URL=http://127.0.0.1:6334
+MYELIN_EMBED__URL=http://127.0.0.1:11434/v1
+MYELIN_EMBED__MODEL=bge-m3:latest
+MYELIN_EMBED__DIM=1024
+MYELIN_RERANK__URL=<rerank-url>
+MYELIN_RERANK__MODEL=bge-reranker-v2-m3
+MYELIN_LLM__URL=<llm-url>
+MYELIN_LLM__MODEL=<llm-model>
+MYELIN_MCP_TOKEN=<token>
+ENV
+```
+
+`MYELIN_MCP_TOKEN` is the secret that a listener on a network address
+requires. Give it the same value as `HS_BACKEND_TOKEN` (step 2): the gateway
+sends that secret to every backend, including the memory server. Listeners on
+the loopback need no token.
+
+Write the user service `~/.config/systemd/user/myelin-mcp.service`. It has two
+listeners for agents: one on the loopback, for the agents on this host, and one
+on `<gpu-host>`'s LAN address, which the gateway reaches (step 13). The distill
+server uses the full surface, which listens on the loopback only:
+
+```ini
+[Unit]
+Description=myelin memory server
+
+[Service]
+EnvironmentFile=%h/.config/myelin-mcp.env
+ExecStart=%h/.local/bin/myelin-mcp \
+  --serve 127.0.0.1:7462 \
+  --serve-agents 127.0.0.1:7463 \
+  --serve-agents <gpu-host-lan-address>:7463 \
+  --collection home_still \
+  --ledger %h/.local/share/myelin/home_still.ledger \
+  --meta-index year:integer \
+  --meta-index topics:keyword \
+  --meta-index category:keyword
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+Replace `<gpu-host-lan-address>` with the address the gateway uses to reach
+`<gpu-host>`. `--collection` names myelin's Qdrant collection and `--ledger`
+is the path of myelin's own database, in the directory made in item 2; keep
+both between restarts. Start the service and open port 7463 to the gateway
+host only:
+
+```sh
+sudo loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now myelin-mcp
+systemctl --user status myelin-mcp
+sudo ufw allow from <gateway-host> to any port 7463 proto tcp
+```
+
+The service shows `active (running)`. `myelin-mcp` has no `/health` route, so
+the first real check is the next step: the distill server connects to myelin
+before it listens and names the address when it cannot.
 
 ## 9. Start the distill server
 
@@ -510,13 +612,16 @@ cloud:
       scribe: http://<gpu-host>:7433
       distill: http://<gpu-host>:7434
       mcp: http://<gpu-host>:7445
+      memory: http://<gpu-host>:7463
       docs: http://<gpu-host>:7446
 ```
 
 The gateway refuses to start unless `routes` names a backend for each of
-`scribe`, `distill`, `mcp` and `docs`. The `docs` route is what makes signed
-document links work from outside your LAN. The other keys, and the gateway's
-endpoints, are in the [configuration reference](../reference/configuration.md#cloudgateway)
+`scribe`, `distill`, `mcp`, `memory` and `docs`. The `memory` route is the
+memory server's agent listener, where an assistant searches the library; the
+`docs` route is what makes signed document links work from outside your LAN.
+The other keys, and the gateway's endpoints, are in the
+[configuration reference](../reference/configuration.md#cloudgateway)
 and the [services reference](../reference/services-and-ports.md#gateway-endpoints).
 
 The gateway's public address is not in the configuration; you pass it with
@@ -637,22 +742,27 @@ event bus on your LAN.
 
 ## 15. Connect Claude Desktop
 
-Claude Desktop reaches the MCP server through the gateway, using OAuth. On
-`<gateway-host>`, create a code that grants only the MCP scope:
+Claude Desktop reaches two servers through the gateway, using OAuth: the tools
+server at `/mcp` and the memory server at `/memory/mcp`. Each is added on its
+own and signs in on its own, so on `<gateway-host>` create one code for each
+when you are ready to paste it (a code lasts five minutes):
 
 ```sh
 hs cloud invite --name claude-desktop --scope mcp
+hs cloud invite --name claude-desktop-memory --scope memory
 ```
 
-Then in Claude Desktop:
+Then in Claude Desktop, once for each address:
 
-1. Add `https://cloud.example.com/mcp` as a remote MCP server.
+1. Add `https://cloud.example.com/mcp`, then `https://cloud.example.com/memory/mcp`,
+   as a remote MCP server.
 2. Claude opens your browser on the gateway's authorization page.
-3. Paste the code and select Authorize.
+3. Paste the code for that server and select Authorize.
 
 Claude Desktop stores its tokens and refreshes them with its refresh token. In
-a new chat, ask Claude to list the home-still tools: you see the paper, scribe,
-distill and status tools. They are listed in the [MCP tools reference](../reference/mcp-tools.md).
+a new chat, ask Claude to search your library and show its source: it finds the
+passage with `recall` on the memory server and returns the page with `cite` on
+the tools server. The tools are listed in the [MCP tools reference](../reference/mcp-tools.md).
 
 ## 16. Watch the inbox from the laptop
 
@@ -702,7 +812,7 @@ ls ~/.home-still/models
 ```
 
 `ls` lists `pp-doclayoutv3.onnx`, `slanet-plus.onnx` and the word OCR's three
-files; put them there as in step 8. Then:
+files; put them there as in step 7. Then:
 
 ```sh
 cd "$(mktemp -d)"
@@ -753,7 +863,7 @@ reach, and the pipeline has one distill host.
 ## Where to go next
 
 - [Operate a cluster](../how-to/operate-a-cluster.md): verify, upgrade, add a
-  GPU node, take a node out and recover Qdrant.
+  GPU node, take a node out and rebuild a damaged search index.
 - [Troubleshoot](../how-to/troubleshoot.md): a symptom, its cause and its fix.
 - [Access remotely](../how-to/access-remotely.md): enroll more devices and
   revoke them.

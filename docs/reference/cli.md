@@ -287,7 +287,7 @@ hs scribe reconvert [OPTIONS] <STEM>
 Resets one document so the watcher converts it again. The steps, in order:
 
 1. Validate the stem, read its catalog entry, and find its source (`.pdf`, `.html`, `.htm` or `.epub`) under `papers/`.
-2. When the document has an embedding or an embedding-skip stamp, delete its Qdrant chunks through the distill server. A failure here stops the command before anything else changes.
+2. When the document has an embedding or an embedding-skip stamp, delete its records from its store through the distill server. A failure here stops the command before anything else changes.
 3. Delete the markdown object.
 4. Clear the `conversion`, `conversion_failed`, `embedding` and `embedding_skip` stamps.
 5. Publish `papers.ingested` for the source.
@@ -553,13 +553,13 @@ hs personal [OPTIONS] <COMMAND>
 |---|---|
 | `hs personal add` | Ingest a single file into the personal store. |
 | `hs personal list` | List ingested documents, most recently ingested first. |
-| `hs personal search` | Semantic search across the personal collection. |
+| `hs personal search` | Semantic search across the `personal` store. |
 | `hs personal read` | Read a document's converted markdown by stem. |
-| `hs personal delete` | Remove a document from Qdrant and disk. |
-| `hs personal reindex` | Re-chunk and re-embed a document. Useful after chunker/embedder changes. |
+| `hs personal delete` | Remove a document from the `personal` store and disk. |
+| `hs personal reindex` | Re-chunk and re-embed a document. Useful after the chunker changes. |
 | `hs personal config` | View configuration. |
 
-The personal store is a separate collection from the academic corpus; see [configuration](configuration.md) for the `personal:` section.
+The personal documents are a store of their own, `personal`, apart from the `academic` store; see [configuration](configuration.md) for the `personal:` section.
 
 Example:
 
@@ -613,7 +613,7 @@ hs personal list --category medical -n 20
 
 ### `hs personal search`
 
-Semantic search across the personal collection.
+Semantic search across the `personal` store.
 
 ```text
 hs personal search [OPTIONS] <QUERY>
@@ -651,7 +651,7 @@ hs personal read lab-results
 
 ### `hs personal delete`
 
-Remove a document from Qdrant and disk.
+Remove a document from the `personal` store and disk.
 
 ```text
 hs personal delete [OPTIONS] <STEM>
@@ -661,7 +661,7 @@ hs personal delete [OPTIONS] <STEM>
 |---|---|---|
 | `<STEM>` | required | Document stem. |
 
-Removes the document from Qdrant and from disk, with its word boxes. The command has no confirmation prompt and no dry run.
+Removes the document's records from the `personal` store and the document from disk, with its word boxes. The command has no confirmation prompt and no dry run.
 
 Example:
 
@@ -671,7 +671,7 @@ hs personal delete lab-results
 
 ### `hs personal reindex`
 
-Re-chunk and re-embed a document. Useful after chunker/embedder changes.
+Re-chunk and re-embed a document. Useful after the chunker changes, or to fill an empty index.
 
 ```text
 hs personal reindex [OPTIONS] <STEM>
@@ -1104,7 +1104,7 @@ hs docs link [OPTIONS] <STEM>
 |---|---|---|
 | `<STEM>` | required | The document's stem. |
 | `--markdown` | off | Link to the converted markdown instead of the original document. |
-| `--collection <COLLECTION>` | `academic` | Store the document is in: `academic`, `personal`, `web` or `syntheses`. A name that is not a store is refused. The store is part of the link's signature. |
+| `--collection <COLLECTION>` | `academic` | The store the document is in (the flag keeps its name): `academic`, `personal`, `web` or `syntheses`. A name that is not a store is refused. The store is part of the link's signature. |
 | `--page <PAGE>` | none | The page to open, 1-based. The link opens that page and points at it. |
 | `--subject <SUBJECT>` | none | Subject the link is bound to. Default: `docs.default_subject`, else this machine's host name. |
 | `--ttl-secs <TTL_SECS>` | none | Seconds the link works. Default: `docs.link_ttl_secs`, else 3600. |
@@ -1161,7 +1161,7 @@ hs restart [OPTIONS]
 
 The command takes no arguments or flags of its own.
 
-Discovers the units that run this host's home-still binaries (systemd system units, systemd user units and launchd agents), matches them by the executable they run, and restarts them. It also restarts the distill index daemon and the managed compose containers, and exits non-zero when any restart failed. One-shot timer jobs are left alone.
+Discovers the units that run this host's home-still binaries (systemd system units, systemd user units and launchd agents), matches them by the executable they run, and restarts them. It also restarts the distill index daemon and the scribe compose containers (`~/.home-still/docker-compose.yml`, when `scribe.local_server` is on), and exits non-zero when any restart failed. One-shot timer jobs are left alone.
 
 Example:
 
@@ -1183,9 +1183,9 @@ hs upgrade [OPTIONS]
 | `--force` | off | Force reinstall even if already on the latest version. |
 | `--pre` | off | Include pre-release versions (e.g. rc candidates). |
 
-The command fetches the latest release from GitHub, asks for confirmation (skipped by `--yes`), and resolves every download and checksum before it changes anything. It then updates the managed Docker services, replaces the installed binaries with `hs` last, restarts the services that run the replaced binaries, and waits for them to answer their health endpoints.
+The command fetches the latest release from GitHub, asks for confirmation (skipped by `--yes`), and resolves every download and checksum before it changes anything. It then updates the scribe compose stack, replaces the installed binaries with `hs` last, restarts the services that run the replaced binaries, and waits for them to answer their health endpoints.
 
-The companion binaries `hs-distill-server`, `hs-gateway`, `hs-mcp` and `hs-scribe-server` are upgraded only when already installed on the host. For each managed compose file the command pulls the images and recreates the containers only when an image changed or the service does not answer its health URL; an unchanged, healthy service keeps running. Without `--pre`, only stable releases are considered.
+The companion binaries `hs-distill-server`, `hs-gateway`, `hs-mcp` and `hs-scribe-server` are upgraded only when already installed on the host. For the scribe compose stack (`~/.home-still/docker-compose.yml`, when `scribe.local_server` is on) the command pulls the images and recreates the containers only when an image changed or the service does not answer its health URL; an unchanged, healthy service keeps running. It does not manage myelin or its Qdrant, and it waits for no database after the restart. Without `--pre`, only stable releases are considered.
 
 Example:
 
@@ -1207,7 +1207,7 @@ hs serve [OPTIONS] <COMMAND>
 | `hs serve distill` | Run a distill server (auto-init, foreground). |
 | `hs serve mcp` | Run an MCP server (foreground). |
 | `hs serve scribe-watch` | NATS event-watch daemon that converts `papers.ingested` events into markdown via the scribe pool. Runs as a user-level service. |
-| `hs serve distill-watch` | NATS event-watch daemon that indexes `scribe.completed` events into Qdrant via the distill server. Runs as a user-level service. |
+| `hs serve distill-watch` | NATS event-watch daemon that indexes `scribe.completed` events into the myelin store via the distill server. Runs as a user-level service. |
 | `hs serve docs` | Run the docs service: serves the corpus's documents over signed, expiring links. |
 
 `hs serve` runs a service in the foreground, installs it as a service, or starts and stops it in the background. The ports are listed in [services and ports](services-and-ports.md).
@@ -1255,7 +1255,7 @@ hs serve distill [OPTIONS] [ACTION]
 
 | Name | Default | Meaning |
 |---|---|---|
-| `<ACTION>` | none | `start` runs Qdrant and the distill server in the background, `stop` stops them. Without it the server runs in the foreground. |
+| `<ACTION>` | none | `start` runs the distill server in the background, `stop` stops it. Without it the server runs in the foreground. |
 | `--port <PORT>` | `7434` | Port the foreground server and the installed service listen on. `start` and `stop` use `distill_server.port` from the configuration instead. |
 | `--install` | off | Install as a system service and start it. |
 | `--uninstall` | off | Stop and remove the system service. |
@@ -1264,7 +1264,7 @@ In the foreground the command runs the `hs-distill-server` binary on the given p
 
 `--install` writes the system unit `hs-serve-distill.service` (Linux, using `sudo`) or the LaunchAgent `com.home-still.distill` (macOS), enables it and starts it. `--uninstall` removes it.
 
-`start` starts Qdrant through `~/.home-still/docker-compose-distill.yml` when that file exists (otherwise Qdrant must already be reachable), stops any distill server recorded in the PID file, starts `hs-distill-server` in the background with its output in `distill-server.log` under the log directory, waits up to 300 seconds for `/health`, and starts the indexing daemon. `stop` stops the server process and, when the compose file exists, `down`s the Qdrant container.
+`start` stops any distill server recorded in the PID file, starts `hs-distill-server` in the background with its output in `distill-server.log` under the log directory, waits up to 300 seconds for `/health`, and starts the indexing daemon. It starts no database: myelin and Ollama must already be running. `stop` stops the server process.
 
 Example:
 
@@ -1317,7 +1317,7 @@ hs serve scribe-watch --install
 
 ### `hs serve distill-watch`
 
-NATS event-watch daemon that indexes `scribe.completed` events into Qdrant via the distill server. Runs as a user-level service.
+NATS event-watch daemon that indexes `scribe.completed` events into the myelin store via the distill server. Runs as a user-level service.
 
 ```text
 hs serve distill-watch [OPTIONS]
@@ -1351,7 +1351,7 @@ hs serve docs [OPTIONS]
 | `--install-user` | off | Install as a user service and start it. |
 | `--uninstall` | off | Stop and remove the service. |
 
-In the foreground the command serves the corpus's documents on `0.0.0.0:<port>` over signed, expiring links. It requires a `storage:` section, creates the link signing key on first use (mode 0600, never overwritten), and reads the revocation list the gateway also reads, so revoking a device revokes its links. It serves the academic collection and the personal store when its objects are in storage.
+In the foreground the command serves the corpus's documents on `0.0.0.0:<port>` over signed, expiring links. It requires a `storage:` section, creates the link signing key on first use (mode 0600, never overwritten), and reads the revocation list the gateway also reads, so revoking a device revokes its links. It serves the documents of every store (`academic`, `personal`, `web`, `syntheses`) whose objects are in storage.
 
 `--install` writes the system unit `hs-serve-docs.service` (Linux, using `sudo`) or the LaunchAgent `com.home-still.docs` (macOS). `--install-user` writes the user unit `hs-serve-docs.service` (Linux) or the LaunchAgent `com.home-still.serve-docs` (macOS). `--uninstall` removes both kinds. The three flags cannot be combined.
 
@@ -1415,7 +1415,7 @@ hs cloud invite [OPTIONS]
 | Name | Default | Meaning |
 |---|---|---|
 | `--name <NAME>` | `device` | Device name for the enrollment. |
-| `--scope <SCOPE>` | none | Scope to grant: `scribe`, `distill` or `mcp`. Repeat the flag for several. Without it the code grants all three. |
+| `--scope <SCOPE>` | none | Scope to grant: `scribe`, `distill`, `mcp` or `memory`. Repeat the flag for several. Without it the code grants all four. |
 
 Asks the local gateway for a one-time enrollment code and prints the code, its scopes and its lifetime. It reads `cloud.gateway.listen` and the admin key on this host, so it works only on the gateway host, and it fails when `hs-gateway` is not running.
 
@@ -1511,10 +1511,10 @@ hs mcp [OPTIONS] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `hs mcp install` | Install MCP server config into Claude Desktop and/or Claude Code. |
-| `hs mcp uninstall` | Remove MCP server config from Claude Desktop and/or Claude Code. |
+| `hs mcp install` | Write the `home-still` and `myelin` servers into your clients' configuration. |
+| `hs mcp uninstall` | Remove the `home-still` and `myelin` servers from your clients' configuration. |
 
-These commands edit the MCP server entry named `home-still` in each client's configuration file. The tools the server exposes are listed in [MCP tools](mcp-tools.md).
+These commands edit two MCP server entries in each client's configuration file: `home-still`, the tools server (`hs-mcp`), whose tools are listed in [MCP tools](mcp-tools.md), and `myelin`, the memory server, where an agent searches the library and keeps what it is asked to remember.
 
 Example:
 
@@ -1524,7 +1524,7 @@ hs mcp --help
 
 ### `hs mcp install`
 
-Install MCP server config into Claude Desktop and/or Claude Code.
+Write the `home-still` and `myelin` servers into your clients' configuration.
 
 ```text
 hs mcp install [OPTIONS]
@@ -1533,12 +1533,14 @@ hs mcp install [OPTIONS]
 | Name | Default | Meaning |
 |---|---|---|
 | `--client <CLIENT>` | `all` | Target client: `desktop` (Claude Desktop), `code` (Claude Code), `opencode` (OpenCode) or `all`. |
-| `--remote` | off | Configure remote access via cloud gateway instead of local stdio. |
+| `--remote` | off | Reach both servers through the cloud gateway instead of on this machine. |
 | `--gateway-url <GATEWAY_URL>` | none | Gateway URL for remote mode (reads from cloud config if omitted). |
 
-Local mode writes a stdio entry that runs the `hs-mcp` binary and copies the variables from `~/.home-still/secrets.env` into the entry, so the client's file holds those values. When `hs-mcp` is not installed the command downloads it from GitHub. `--remote` writes a URL entry that points at the gateway's `/mcp` path instead; it takes the gateway from `--gateway-url` or from the enrolled credentials.
+Local mode writes two entries. `home-still` runs the `hs-mcp` binary as the client's child process and copies the variables from `~/.home-still/secrets.env` into the entry, so the client's file holds those values; when `hs-mcp` is not installed the command downloads it from GitHub. `myelin` is a URL entry for the memory server on this machine, `http://127.0.0.1:7463/mcp`. `--remote` writes two URL entries that point at the gateway instead, `<gateway>/mcp` and `<gateway>/memory/mcp`; it takes the gateway from `--gateway-url` or from the enrolled credentials.
 
-The entry is written to `claude_desktop_config.json` (Claude Desktop), `~/.claude.json` (Claude Code) and `~/.config/opencode/opencode.json` (OpenCode). Existing content is preserved, and the file is replaced atomically.
+Claude Desktop reads only commands from its file, so a URL entry is never written there: the command prints the URL to add as a connector in the app, and `--client desktop --remote` writes nothing and fails.
+
+The entries are written to `claude_desktop_config.json` (Claude Desktop), `~/.claude.json` (Claude Code) and `~/.config/opencode/opencode.json` (OpenCode). Existing content is preserved, an entry of the same name is replaced, and the file is replaced atomically.
 
 Example:
 
@@ -1548,7 +1550,7 @@ hs mcp install --client desktop
 
 ### `hs mcp uninstall`
 
-Remove MCP server config from Claude Desktop and/or Claude Code.
+Remove the `home-still` and `myelin` servers from your clients' configuration.
 
 ```text
 hs mcp uninstall [OPTIONS]
