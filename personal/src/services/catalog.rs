@@ -209,6 +209,25 @@ pub async fn reindex(cfg: &Config, stem: &str) -> Result<u32> {
     Ok(result.chunks_indexed)
 }
 
+/// The catalog sidecar of the document `stem` of the store kept under
+/// `prefix`, or `None` when the store has no such document.
+///
+/// The personal store keeps each document's card beside the document, not
+/// under a catalog prefix as the other stores do, so a caller that holds a
+/// stem and the corpus's storage reads the card here.
+pub async fn read_card(
+    storage: &dyn Storage,
+    prefix: &str,
+    stem: &str,
+) -> Result<Option<CatalogEntry>> {
+    check_stem(stem)?;
+    let key = sidecar_key(prefix, stem);
+    if storage.head(&key).await.map_err(storage_error)?.is_none() {
+        return Ok(None);
+    }
+    read_sidecar(storage, &key).await.map(Some)
+}
+
 /// A document's catalog sidecar, read from the store.
 async fn read_sidecar(storage: &dyn Storage, key: &str) -> Result<CatalogEntry> {
     let raw = storage.get(key).await.map_err(storage_error)?;

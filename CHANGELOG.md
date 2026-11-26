@@ -43,21 +43,33 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
   system library path, as a scribe host has it) **and the service refuses to
   start without it.** The gateway already forwards `/docs/*`, so nothing
   changes there.
-- `hs docs link --collection` and `doc_link`'s `collection` are checked
-  against the list of stores (`academic`, `personal`, `web`, `syntheses`).
-  **A name that is not a store is now refused when the link is minted**; it
-  used to be signed and then answered with a 404.
+- **The MCP tool `doc_link` is removed; `cite` replaces it.** `cite` takes
+  `store`, `doc_id` and `quote`, checks the quote against the document's
+  text and refuses a quote the document does not contain, naming the
+  closest passage. For a quote it finds it returns the passage as the
+  document has it, the document's title, authors, year and DOI, the
+  passage's lines, page and word rectangles (`boxes.status` is `located`,
+  `not_located`, `pending` or `not_applicable`) and signed links: `source`,
+  `markdown` and, for a located passage, `viewer` and `page`. `short`
+  (`viewer`, `page`, `source` or `markdown`) stores a short link, as
+  `doc_link`'s `short: true` did. A client that called `doc_link` for a link
+  to a stem it knew calls `cite` with a quote, or reads `links` from
+  `catalog_read`. **With `image: true` the MCP server fetches the page
+  image from the docs service at `docs.lan_base_url`, so that address has
+  to be reachable from the host the MCP server runs on.**
+- `hs docs link --collection` and `cite`'s `store` are checked against the
+  list of stores. **A name that is not a store is now refused when the link
+  is minted**; it used to be signed and then answered with a 404.
 - `personal.storage_dir` is checked at startup by every command that reads
   it, the docs service and the MCP server: it must be a relative path
   without `.` or `..` parts and must not overlap another store's prefix
   (`papers`, `markdown`, `catalog`, `boxes`, `web`, `syntheses`). The docs
   service now serves personal documents from this prefix; it used to read
   `personal/` whatever the setting said.
-- `doc_link` takes `short: true`, and `hs docs link --short` mints a
-  12-character short link (`<base>/s/<code>`) that redirects to the signed
-  URL. The code is a record in the storage backend and expires with the link
-  behind it; `hs docs prune` deletes the expired ones. Search hits never mint
-  one.
+- `hs docs link --short` mints a 12-character short link (`<base>/s/<code>`)
+  that redirects to the signed URL. The code is a record in the storage
+  backend and expires with the link behind it; `hs docs prune` deletes the
+  expired ones. Search hits never mint one.
 - The docs service answers `/s/{code}` with a `302` to the signed link, and
   the gateway forwards `/s/*` unauthenticated for the same reason it forwards
   `/docs/*`: a browser following the redirect has no bearer token.

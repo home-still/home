@@ -92,9 +92,9 @@ At start-up the gateway probes each backend from its own host and warns about on
 
 ## Get links from an agent
 
-Every tool that returns a document carries a `links` object with a LAN URL and a remote URL for the source and for the markdown: `distill_search`, `abstract_search`, `personal_search` and `catalog_read`. The `doc_link` tool mints a fresh link for a stem you already know. Both need `docs.lan_base_url` and `docs.remote_base_url`. See [`doc_link`](../reference/mcp-tools.md#doc_link) and [Connect Claude and agents](connect-claude-and-agents.md).
+Every tool that returns a document carries a `links` object with a LAN URL and a remote URL for the source and for the markdown: `distill_search`, `abstract_search`, `personal_search` and `catalog_read`. The `cite` tool checks a quote against a document and returns fresh links that open the document on that passage. Both need `docs.lan_base_url` and `docs.remote_base_url`. See [`cite`](../reference/mcp-tools.md#cite) and [Connect Claude and agents](connect-claude-and-agents.md).
 
-A PDF link carries `#page=N`. A markdown link from a search hit carries a text fragment (`#:~:text=…`) that selects the passage. The page is part of the signature: a link minted for page 11 opens page 11 and nothing else.
+A PDF link carries `#page=N`. A markdown link from a search hit or from `cite` carries a text fragment (`#:~:text=…`) that selects the passage. The page is part of the signature: a link minted for page 11 opens page 11 and nothing else. For a quote whose words were found on a PDF page, `cite` also returns a `viewer` link and a `page` link, which show the page with the passage boxed.
 
 ## Mint a link by hand
 
@@ -134,11 +134,11 @@ https://cloud.example.com/s/k7f3m2q9xd4t
 
 Nothing about the authorization changes: the code is an alias stored in your storage backend, and the docs service answers it with a redirect to the signed link, which is still checked in full. The code's `Location` is a path, so one code works both on the LAN and through the gateway; whatever fragment the full link would have carried — `#page=11`, or a `#:~:text=…` passage — travels with the redirect and survives the hop.
 
-An agent gets the same thing from `doc_link` with `"short": true`, which returns the long pair *and* a `short` object with `lan`, `remote` and `code`.
+An agent gets the same thing from `cite` with `"short"` set to the link the code should stand for (`"source"`, `"markdown"`, `"viewer"` or `"page"`), which returns the long links *and* a `short` object with `lan`, `remote` and `code`.
 
 Notes:
 
-- **Minting one is a write.** The code is a record under `short-links/` in your storage backend, so the host needs the `storage:` section. Search hits never mint one; only `--short` or `short: true` does.
+- **Minting one is a write.** The code is a record under `short-links/` in your storage backend, so the host needs the `storage:` section. Search hits never mint one; only `--short` or `cite`'s `short` does.
 - **It expires with the link behind it.** A code is answered while its signed link works and is a 404 afterwards, so a link that reached a chat log does not stay clickable past its TTL.
 - **Prune the expired ones.** `hs docs prune` deletes every expired record and prints how many it removed. Nothing runs it for you; a weekly cron entry is enough:
 

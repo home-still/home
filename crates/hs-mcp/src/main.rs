@@ -9,7 +9,7 @@ use rmcp::{
         wrapper::Parameters,
     },
     model::{
-        ErrorData, GetPromptRequestParams, GetPromptResult, ListPromptsResult,
+        CallToolResult, ErrorData, GetPromptRequestParams, GetPromptResult, ListPromptsResult,
         ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
         ProgressNotificationParam, PromptMessage, PromptMessageRole, RawResource,
         RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
@@ -28,6 +28,7 @@ mod stem;
 mod testkit;
 #[cfg(test)]
 mod tool_tests;
+mod tools;
 
 // ── Tool parameter types ────────────────────────────────────────
 
@@ -145,29 +146,6 @@ struct OpenAlexAuthorsByTopicParams {
 struct CatalogReadParams {
     #[schemars(description = "Paper stem name (filename without extension)")]
     stem: Stem,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DocLinkParams {
-    #[schemars(description = "Paper stem name (filename without extension)")]
-    stem: Stem,
-    #[schemars(
-        description = "Which document to link: `source` (the original document: PDF, HTML, EPUB, DOCX, Markdown or text) or `markdown` (the converted text). Default: `source`"
-    )]
-    format: Option<String>,
-    #[schemars(
-        description = "The page to open, 1-based. The link opens that page and points at it. The markdown's pages are the source document's pages."
-    )]
-    page: Option<u32>,
-    #[schemars(
-        description = "The store the document is in: `academic` (the default), `personal`, `web` or `syntheses`. The store is part of the link's signature, so a link for one store cannot be edited into a link for another."
-    )]
-    collection: Option<String>,
-    #[schemars(
-        description = "When true, also mint a short link — `<base>/s/<code>` — that redirects to the signed link. Use it when the URL has to be short enough to paste, read out loud or keep on one line; the long `lan`/`remote` pair is returned either way. Minting a short link writes one small record to the corpus, which `hs docs prune` cleans up once it expires."
-    )]
-    #[serde(default)]
-    short: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1575,6 +1553,7 @@ impl HomeStillMcp {
                 .as_ref()
                 .map(|p| p.download_urls.clone())
                 .unwrap_or_default(),
+            source_url: None,
             pdf_path: Some(result.file_path.display().to_string()),
             markdown_path: None,
             downloaded_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -1847,7 +1826,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Mint a fresh, signed, expiring link to a document in the corpus. The link opens the original document (PDF, HTML, EPUB, DOCX, Markdown or text) or its converted markdown, on the LAN and away from home. Use this when a link from a previous result has expired, or to get a link for a document you know the stem of but have not searched for. With `short: true` it also stores a 12-character code — `<base>/s/<code>` — that redirects to that link, which is the form to hand a person when the URL has to be short enough to paste or read out loud.",
+        description = "Check a quote against the document it is from, and return a citation a reader can verify. Call it for every passage you present as a quotation from the corpus, before you present it. The quote is matched against the document's own text: markup, line breaks, spacing, hyphenation, case and typography may differ, the words may not. When the document does not contain the quote the call FAILS and names the closest passage: quote that passage, or do not quote. On success it returns the passage as the document has it; the document's title, authors, year and DOI; where the passage is (its lines, and for a PDF whose word boxes are built its page and the rectangles around its words: `boxes.status` is `located`, `not_located`, `pending` or `not_applicable`); and signed, expiring links, each for the LAN and for away from home: `links.source` (the original document), `links.markdown` (the converted text, the passage selected) and, for a located passage, `links.viewer` (the PDF opened on the boxed passage) and `links.page` (that page as a picture, the passage boxed). `image: true` also returns that picture in the result. `short` also stores a 12-character code that redirects to one of the links. Call it again for fresh links when earlier ones have expired.",
         annotations(
             // Not read-only in the `short` case: it stores the code. A client
             // that plans a call by its annotations must not be told a write is
@@ -1858,114 +1837,13 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    async fn doc_link(&self, Parameters(p): Parameters<DocLinkParams>) -> Result<String, String> {
-        let minter = self
-            .link_minter
-            .as_ref()
-            .ok_or("Document links are not configured on this host")?;
-        if !minter.is_enabled() {
-            return Err(
-                "Document links are not configured on this host. Set `docs.lan_base_url` and \
-                 `docs.remote_base_url` in ~/.home-still/config.yaml."
-                    .to_string(),
-            );
-        }
-        let wanted = p.format.as_deref().unwrap_or("source");
-        // A store the registry does not hold is refused here: the link
-        // would be signed and then answered with a 404. A derived store's
-        // documents are its parent's.
-        let (store, _) = self
-            .stores
-            .documents(
-                p.collection
-                    .as_deref()
-                    .unwrap_or(hs_common::stores::ACADEMIC),
-            )
-            .map_err(|e| e.to_string())?;
-        let collection = store.name;
-        let links = minter
-            .mint(&p.stem, collection, p.page, None)
-            .ok_or_else(|| format!("'{}' is not a document stem", p.stem))?;
-        let pair = match wanted {
-            "source" => links.source.clone(),
-            "markdown" => links.markdown.clone(),
-            other => {
-                return Err(format!(
-                    "unknown format {other:?}: use `source` or `markdown`"
-                ))
-            }
-        };
-        let pair =
-            pair.ok_or_else(|| format!("no {wanted} link could be minted for '{}'", p.stem))?;
-
-        if !p.short {
-            return to_json(&serde_json::json!({
-                "stem": p.stem,
-                "format": wanted,
-                "lan": pair.lan,
-                "remote": pair.remote,
-                "expires_at": links.expires_at,
-            }));
-        }
-
-        // A short link is an alias for a signed one: the code is stored in the
-        // corpus and answered with a redirect, so minting one is a write. It
-        // fails loudly, because a code the caller is shown but the service
-        // cannot resolve is a 404 the user would find instead of the document.
-        let format = match wanted {
-            "source" => hs_common::docs::LinkFormat::Source,
-            "markdown" => hs_common::docs::LinkFormat::Markdown,
-            other => {
-                return Err(format!(
-                    "unknown format {other:?}: use `source` or `markdown`"
-                ))
-            }
-        };
-        let target = minter
-            .short_target(&p.stem, collection, p.page, None, format)
-            .ok_or_else(|| format!("no {wanted} short link could be minted for '{}'", p.stem))?;
-        let code = loop {
-            let candidate = hs_common::docs::new_short_link_code();
-            // A collision is 1e-18 unlikely, but overwriting someone else's
-            // code would silently repoint their link: retry instead.
-            if self
-                .short_links
-                .get(&candidate)
-                .await
-                .map_err(|e| e.to_string())?
-                .is_none()
-            {
-                break candidate;
-            }
-        };
-        self.short_links
-            .put(
-                &code,
-                &hs_common::docs::ShortLink {
-                    target: target.target,
-                    fragment: target.fragment,
-                    expires_at: target.expires_at,
-                },
-            )
-            .await
-            .map_err(|e| {
-                format!(
-                    "the {wanted} link could not be stored as a short link, so no code was \
-                     issued (the long link below still works): {e:#}"
-                )
-            })?;
-        let short = minter
-            .short_urls(&code)
-            .ok_or("short links need `docs.lan_base_url` and `docs.remote_base_url`")?;
-
-        to_json(&serde_json::json!({
-            "stem": p.stem,
-            "format": wanted,
-            "lan": pair.lan,
-            "remote": pair.remote,
-            "short": short,
-            "expires_at": links.expires_at,
-        }))
+    async fn cite(
+        &self,
+        Parameters(p): Parameters<tools::cite::CiteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // A refusal is the tool's answer, not a protocol failure: it goes
+        // back as a result flagged `isError`, as every other tool's does.
+        Ok(tools::cite::tool_result(self.cite_quote(p).await))
     }
 
     #[tool(

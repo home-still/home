@@ -104,7 +104,7 @@ string: `iat` (issued), `exp` (expiry), `sub` (subject), `col` (collection:
 `viewer`: the route the link opens, and no other), optional `page`, optional
 `hl` and `sig`, an HMAC-SHA256 over the stem and those fields with the key in
 `~/.home-still/docs-link.key`. A host that mints links (`hs docs link`, the
-MCP `doc_link` tool and the tools that attach links) must hold the same key.
+MCP `cite` tool and the tools that attach links) must hold the same key.
 
 `hl` is the highlight: up to eight runs of words, each written
 `<page>.<first word>-<word after the last>` and joined with `~` (`3.41-58`
@@ -123,7 +123,7 @@ without it.
 A short link needs no signature of its own: `/s/{code}` redirects to one of the
 signed links above, and that link is checked in full. The code is a record
 under `short-links/` in the storage backend, written by `hs docs link --short`
-or `doc_link` with `short: true` and deleted by `hs docs prune` once the link
+or `cite` with `short` and deleted by `hs docs prune` once the link
 behind it expires.
 
 The service reads the revocation list `~/.home-still/cloud-revoked.json`,

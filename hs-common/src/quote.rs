@@ -156,7 +156,7 @@ pub enum LocateError {
         /// How many characters it has.
         chars: usize,
     },
-    /// The document does not contain the quote.
+    /// The text does not contain the quote.
     NotFound(QuoteNotFound),
 }
 
@@ -166,7 +166,7 @@ impl fmt::Display for LocateError {
             Self::TooShort { tokens } => write!(
                 f,
                 "the quote has {tokens} word(s); it needs at least {MIN_QUOTE_TOKENS} to be told \
-                 apart from the rest of the document"
+                 apart from the rest of the text"
             ),
             Self::TooLong { chars } => write!(
                 f,
@@ -174,13 +174,13 @@ impl fmt::Display for LocateError {
                  {MAX_QUOTE_CHARS}"
             ),
             Self::NotFound(QuoteNotFound { closest: None }) => f.write_str(
-                "the document does not contain the quote, and no passage of it resembles the quote",
+                "the text does not contain the quote, and no passage of it resembles the quote",
             ),
             Self::NotFound(QuoteNotFound {
                 closest: Some(closest),
             }) => write!(
                 f,
-                "the document does not contain the quote; the closest passage (lines {}-{}, \
+                "the text does not contain the quote; the closest passage (lines {}-{}, \
                  ratio {:.2} of the quote's words in order) is: {}",
                 closest.line_start, closest.line_end, closest.ratio, closest.text
             ),
