@@ -2969,3 +2969,93 @@ throwaway Qdrant; covered by stand-in tests of both paths.
    should tell "recovering" from "down".
 5. **P0-27 / P1-27:** derive the olmocr VRAM gate from vLLM's
    requirement; wait for a cold model before invoking olmocr.
+
+## 2026-11-26-01 — cutover gate: fails at the default rerank depth, passes at a depth chosen on the gate's own queries
+
+**Evidence.** The academic corpus was indexed again into the myelin store
+from stored markdown: 19,331 stems, 19,327 indexed (475,739 chunks), 2 left
+out as already indexed since the run began, 2 refused. The gate is
+`docs/loop/eval_queries.py --limit 10` against each server; neither the
+harness nor `queries.yaml` was edited. Rule: candidate `RECALL@10` at or
+above the baseline, `first_is_reference` and `reference_share` at or below.
+
+**Before / after.** Every measurement taken, in the order taken.
+
+| # | What | Candidate rerank depth | RECALL@10 | misses | first hit a reference list | reference share | median ms |
+|---|---|---|---|---|---|---|---|
+| 1 | harness, baseline (Qdrant, rc.394) | n/a | 25/25 | none | 2/25 | 28/250 | 1690 |
+| 2 | harness, candidate, **defaults** | 25 | **23/25** | q09, q11 | 2/25 | 22/250 | 1453 |
+| 3 | scan | 25 | 23/25 | q09, q11 | 2/25 | 0.088 | 1161 |
+| 4 | scan | 30 | 24/25 | q11 | 2/25 | 0.076 | 1310 |
+| 5 | scan | 35 | 24/25 | q09 | 2/25 | 0.080 | 1537 |
+| 6 | scan | 40 | 24/25 | q09 | 2/25 | 0.080 | 1725 |
+| 7 | scan | 50 | 25/25 | none | 2/25 | 0.080 | 1933 |
+| 8 | scan | 75 | 25/25 | none | 2/25 | 0.076 | 2795 |
+| 9 | scan | 100 | 24/25 | q10 | 2/25 | 0.076 | 3122 |
+| 10 | harness, baseline, repeated | n/a | 25/25 | none | 2/25 | 28/250 | 205 |
+| 11 | harness, candidate, `--rerank-depth 50` | 50 | **25/25** | none | 2/25 | 20/250 | 2117 |
+| 12 | harness, candidate, same setting again | 50 | 25/25 | none | 2/25 | 20/250 | 1974 |
+
+Row 2 is the gate as the plan states it, and it **fails** on recall. Rows
+3 to 9 are not harness runs: they ask the candidate for L hits and keep the
+top ten, which sets the rerank head depth to L. They were run after row 2
+failed, to pick a depth. Rows 11 and 12 are the harness at the depth picked.
+
+How to read the pass. Depth 50 was selected on the same 25 queries the gate
+scores, from 7 depths of which 2 reach 25/25. Recall is not monotone in
+depth (q09 is lost at 35 and 40, q10 at 100), so each deciding query sits
+near rank 10 and moves with the depth: q10 is at rank 8 at depth 50. Row 12
+shows the measurement repeats; it does not show that depth 50 is better
+than 40 on queries outside this set. No held-out queries were run.
+
+Latency is not a pass rule. Row 1 against row 2 reads as the candidate
+being faster; row 10 against row 11 is the like-for-like pair, baseline
+warm, and there the candidate's median is about ten times the baseline's.
+
+Same corpus: **the plan's condition that the document counts match is not
+met.** Production reports 19,387 documents, the candidate 19,266; 19,247
+are shared. Production only, 140: 137 with no markdown in storage, 1 whose
+chunks the current quality filter all rejects, 2 the candidate refuses
+(below). Candidate only, 19: an old `zero_chunks_or_empty` skip that now
+chunks. 63 of the 19,331 stems are absent from the candidate, all stamped
+`zero_chunks_or_empty` during this run. Of the 500 top-ten hits in a
+baseline and a candidate run, 3 come from a document the other side lacks
+(q05 and q09 baseline, q15 candidate); none is the hit that decides a pass.
+An earlier note in this work gave production's surplus as 56 documents
+without markdown. That was inferred, not measured, and is wrong: it is 137.
+
+Found while indexing, both open:
+
+- The embedder accepts 2,048 tokens per input here, not the model's 8,192
+  (Ollama splits the context across 4 slots). Longer inputs are cut without
+  an error: 30 of 1,500 randomly sampled academic chunks (2.0%) report
+  exactly 2,048 prompt tokens, and replacing such a chunk's last 300
+  characters leaves its vector unchanged (cosine 1.0). Two documents are
+  refused outright with HTTP 413 (`10.48550_arxiv.2604.26509`,
+  `W3212386989`), on every attempt since 2026-10-30.
+- A refused `observe` leaves ledger records with no index points. The two
+  documents above were listed as indexed (90 and 111 chunks) with nothing
+  searchable. Those 201 records were purged; the store then holds 475,786
+  records, equal to the index's point count (378,829 + 96,957).
+
+**Gates.** No code changed for this entry. `myelin-mcp` on the GPU host now
+runs with `--rerank-depth 50`; the unit file carries a comment naming this
+entry.
+
+**Version.** Branch `myelin-cutover` at `bfa1c6f`, untagged when this was
+written.
+
+### Top 5 remaining items
+
+1. **Owner: decide whether a depth fitted to the gate queries counts as
+   the gate passing.** Rows 2 and 11 are both true.
+2. **Give the embedder its full context** (one slot, or a dedicated
+   embedder), then index again the documents that hold a chunk over 2,048
+   tokens. Needs root on the GPU host for the Ollama setting.
+3. **myelin: a refused `observe` must leave no ledger records**, and
+   reconcile must not count a document with records but no index points
+   as indexed.
+4. **Held-out queries for the gate**, so a retrieval setting is not
+   chosen and scored on the same 25.
+5. **Production's 137 indexed documents without markdown**: purge or
+   explain.
