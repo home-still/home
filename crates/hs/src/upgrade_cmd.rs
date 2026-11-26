@@ -286,6 +286,10 @@ async fn upgrade_docker_services(reporter: &Arc<dyn Reporter>) -> Result<()> {
     Ok(())
 }
 
+/// Qdrant's health URL on the host that runs the `distill` compose file,
+/// which publishes Qdrant's REST port 6333.
+const QDRANT_HEALTH_URL: &str = "http://localhost:6333/healthz";
+
 /// The URL that answers 200 when a managed compose service is up: the one
 /// the post-upgrade health check waits on. `None` for a file this host has
 /// no health probe for.
@@ -298,11 +302,9 @@ fn compose_health_url(
             "{}/health",
             local_service_url(scribe_cfg.servers.iter().map(|s| s.url.as_str()), "scribe")?
         )),
-        // That compose file (written by `hs distill init`) runs Qdrant only.
-        "distill" => Some(format!(
-            "{}/healthz",
-            crate::distill_cmd::qdrant_rest_url()?
-        )),
+        // That compose file runs Qdrant only (the distill server itself uses
+        // the myelin store). It publishes Qdrant's REST port on this host.
+        "distill" => Some(QDRANT_HEALTH_URL.to_string()),
         _ => None,
     })
 }

@@ -151,7 +151,7 @@ jobs:
         run: >
           cargo build --locked --release
           --target ${{ matrix.target }}
-          -p hs-distill --features cuda --bin hs-distill-server
+          -p hs-distill --features server --bin hs-distill-server
 
       # Gateway and MCP server are published for the tar.gz targets only; the
       # Windows leg ships just `hs` (zip), so it does not build them.

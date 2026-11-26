@@ -36,14 +36,8 @@ pub fn app(state: Arc<DistillServerState>, token: BackendToken) -> Router {
         .route("/status", get(handle_status))
         .route("/exists/{doc_id}", get(handle_exists))
         .route("/doc/{doc_id}", axum::routing::delete(handle_delete_doc))
-        .route("/doc/{doc_id}/title", post(handle_set_title))
         .route("/docs", get(handle_list_docs))
-        .route("/docs/titles", get(handle_payload_titles))
-        .route("/docs/markdown-paths", get(handle_payload_markdown_paths))
         .route("/collection/reset", post(handle_reset_collection))
-        .route("/collection/hnsw", post(handle_enable_hnsw))
-        .route("/scrub-interstitials", post(handle_scrub_interstitials))
-        .route("/embedder/release", post(handle_release_embedder))
         .route_layer(middleware::from_fn_with_state(token, require_token));
     Router::new()
         .route("/health", get(handle_health))
@@ -91,17 +85,6 @@ async fn require_token(
     }
 }
 
-async fn handle_enable_hnsw(
-    State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<CollectionQuery>,
-) -> Response {
-    reply(state.enable_hnsw(q.collection.as_deref()).await)
-}
-
-async fn handle_release_embedder(State(state): State<Arc<DistillServerState>>) -> Response {
-    reply(state.release_embedder().await)
-}
-
 fn error_response(e: ApiError) -> Response {
     let status = match e.kind {
         ErrorKind::BadRequest => StatusCode::BAD_REQUEST,
@@ -131,14 +114,6 @@ fn reply<T: serde::Serialize>(result: Result<T, ApiError>) -> Response {
 
 #[derive(Deserialize)]
 struct CollectionQuery {
-    collection: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ScrubQuery {
-    /// When true, scan and report only — do not delete. Default false.
-    #[serde(default)]
-    dry_run: bool,
     collection: Option<String>,
 }
 
@@ -195,53 +170,6 @@ async fn handle_list_docs(
     )
 }
 
-async fn handle_payload_titles(
-    State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<CollectionQuery>,
-) -> Response {
-    reply(
-        state
-            .payload_titles(q.collection.as_deref())
-            .await
-            .map(|titles| serde_json::json!({"titles": titles})),
-    )
-}
-
-async fn handle_payload_markdown_paths(
-    State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<CollectionQuery>,
-) -> Response {
-    reply(
-        state
-            .payload_markdown_paths(q.collection.as_deref())
-            .await
-            .map(|paths| serde_json::json!({"paths": paths})),
-    )
-}
-
-/// The body of `POST /doc/{doc_id}/title`.
-#[derive(Deserialize)]
-struct SetTitleBody {
-    /// The title to write onto the document's points.
-    title: String,
-    /// Target a non-default collection.
-    #[serde(default)]
-    collection: Option<String>,
-}
-
-async fn handle_set_title(
-    State(state): State<Arc<DistillServerState>>,
-    Path(doc_id): Path<String>,
-    Json(body): Json<SetTitleBody>,
-) -> Response {
-    reply(
-        state
-            .set_title(&doc_id, &body.title, body.collection.as_deref())
-            .await
-            .map(|points| serde_json::json!({"doc_id": doc_id, "points_updated": points})),
-    )
-}
-
 async fn handle_reset_collection(
     State(state): State<Arc<DistillServerState>>,
     Query(q): Query<CollectionQuery>,
@@ -253,17 +181,6 @@ async fn handle_reset_collection(
             .map(|(collection, deleted)| {
                 serde_json::json!({"collection": collection, "deleted_points": deleted})
             }),
-    )
-}
-
-async fn handle_scrub_interstitials(
-    State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<ScrubQuery>,
-) -> Response {
-    reply(
-        state
-            .scrub_interstitials(q.dry_run, q.collection.as_deref())
-            .await,
     )
 }
 
@@ -342,8 +259,7 @@ async fn handle_search(
 mod tests {
     use super::*;
     use crate::client::{DistillStreamLine, ReadinessResponse};
-    use crate::embed::EmbedderHealth;
-    use crate::testutil::{prose, small_chunk_config, FakeEmbedder, FakeStore};
+    use crate::testutil::{fake_state, prose, FakeOllama, FakeStore, OllamaMode};
     use hs_common::service::protocol::StreamLine;
 
     /// A real axum server on an ephemeral loopback port, over fakes.
@@ -374,18 +290,13 @@ mod tests {
     struct Harness {
         base: String,
         http: reqwest::Client,
-        embedder: Arc<FakeEmbedder>,
         store: Arc<FakeStore>,
+        ollama: FakeOllama,
     }
 
     async fn start() -> Harness {
-        let embedder = Arc::new(FakeEmbedder::new());
-        let store = Arc::new(FakeStore::default());
-        let state = Arc::new(DistillServerState::new(
-            embedder.clone(),
-            store.clone(),
-            small_chunk_config(),
-        ));
+        let (state, store, ollama) = fake_state().await;
+        let state = Arc::new(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -394,8 +305,8 @@ mod tests {
         Harness {
             base: format!("http://{addr}"),
             http: http_client(Some(TOKEN)),
-            embedder,
             store,
+            ollama,
         }
     }
 
@@ -435,9 +346,9 @@ mod tests {
                 assert!(!text.contains("UNIQUE-SECRET"), "{route}: {text}");
             }
         }
-        assert_eq!(h.embedder.calls(), 0);
+        assert!(h.ollama.http.recorded().is_empty());
         assert_eq!(h.store.ops(), []);
-        assert!(h.store.state.lock().upserted.is_empty());
+        assert!(h.store.state.lock().written.is_empty());
     }
 
     #[tokio::test]
@@ -483,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn a_failure_after_streaming_started_is_an_error_line() {
         let h = start().await;
-        h.store.state.lock().fail_upsert_from_call = Some(0);
+        h.store.state.lock().fail_write_from_call = Some(0);
         let text = h
             .post(
                 "/distill/stream",
@@ -542,18 +453,13 @@ mod tests {
                 .send()
                 .await
                 .unwrap(),
-            h.http
-                .post(h.url(&format!("/scrub-interstitials?{q}")))
-                .send()
-                .await
-                .unwrap(),
         ];
         for resp in responses {
             let url = resp.url().path().to_string();
             assert_eq!(resp.status(), 400, "{url}");
         }
         assert_eq!(h.store.ops(), []);
-        assert_eq!(h.embedder.calls(), 0);
+        assert!(h.ollama.http.recorded().is_empty());
     }
 
     #[tokio::test]
@@ -604,8 +510,8 @@ mod tests {
                 .status(),
             400
         );
-        // 500: the store fails while indexing
-        h.store.state.lock().fail_upsert_from_call = Some(0);
+        // 503: the store fails while indexing
+        h.store.state.lock().fail_write_from_call = Some(0);
         assert_eq!(
             h.post(
                 "/distill",
@@ -613,7 +519,7 @@ mod tests {
             )
             .await
             .status(),
-            500
+            503
         );
     }
 
@@ -648,35 +554,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_and_health_follow_the_embedder_and_qdrant() {
+    async fn readiness_and_health_follow_the_embedder_and_myelin() {
         let h = start().await;
         let ready = h.http.get(h.url("/readiness")).send().await.unwrap();
         assert_eq!(ready.status(), 200);
         let body: ReadinessResponse = ready.json().await.unwrap();
         assert!(body.ready);
-        assert_eq!(body.capacity, 2);
+        assert_eq!(body.capacity, 1);
         assert_eq!(
             h.http.get(h.url("/health")).send().await.unwrap().status(),
             200
         );
 
-        *h.embedder.health.lock() = EmbedderHealth::Failed("slot 0 poisoned".into());
+        *h.ollama.mode.lock() = OllamaMode::Cpu;
         let resp = h.http.get(h.url("/readiness")).send().await.unwrap();
         assert_eq!(resp.status(), 503);
         let body: ReadinessResponse = resp.json().await.unwrap();
         assert!(!body.ready);
         let reason = body.reason.unwrap();
-        assert!(reason.contains("embedder unusable"));
-        assert!(
-            !reason.contains("poisoned"),
-            "internal detail leaked: {reason}"
-        );
+        assert_eq!(reason, "embedder not on GPU");
         assert_eq!(
             h.http.get(h.url("/health")).send().await.unwrap().status(),
             503
         );
 
-        *h.embedder.health.lock() = EmbedderHealth::Healthy;
+        *h.ollama.mode.lock() = OllamaMode::Cuda;
         h.store.state.lock().down = true;
         assert_eq!(
             h.http
@@ -766,8 +668,11 @@ mod tests {
 
         let ready = client.readiness().await.unwrap();
         assert!(ready.is_ready());
-        assert_eq!(ready.available_slots(), 2);
-        assert_eq!(client.health().await.unwrap().embed_model, "bge-m3");
+        assert_eq!(ready.available_slots(), 1);
+        let health = client.health().await.unwrap();
+        assert_eq!(health.embed_model, "bge-m3:latest");
+        assert_eq!(health.compute_device, "cuda");
+        assert_eq!(health.backend_version, "fake-myelin 1.0.0");
 
         client
             .search(
@@ -807,8 +712,6 @@ mod tests {
             u64::from(indexed.chunks_indexed)
         );
         assert_eq!(client.reset_collection().await.unwrap(), 0);
-        let report = client.scrub_interstitials(true).await.unwrap();
-        assert_eq!(report.matched, 0);
     }
 
     // ── RA-26: backend bearer token ────────────────────────────────────
@@ -824,8 +727,6 @@ mod tests {
             ("DELETE", "/doc/d"),
             ("GET", "/docs"),
             ("POST", "/collection/reset"),
-            ("POST", "/collection/hnsw"),
-            ("POST", "/scrub-interstitials"),
         ]
     }
 
@@ -854,7 +755,7 @@ mod tests {
             }
         }
         assert_eq!(h.store.ops(), [], "nothing may run unauthenticated");
-        assert_eq!(h.embedder.calls(), 0);
+        assert!(h.ollama.http.recorded().is_empty());
 
         let open = http_client(None);
         for path in ["/health", "/readiness"] {
@@ -866,69 +767,6 @@ mod tests {
             let r = send(&h.http, method, h.url(path)).await;
             assert_ne!(r.status(), 401, "{method} {path}");
         }
-    }
-
-    #[tokio::test]
-    async fn enable_hnsw_submits_once_then_reports_a_no_op() {
-        let h = start().await;
-        let first: serde_json::Value = h
-            .http
-            .post(h.url("/collection/hnsw?collection=paper_abstracts"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(first["submitted"], true);
-        assert_eq!(first["collection"], "paper_abstracts");
-        assert_eq!(first["max_indexing_threads"], 4);
-        let again: serde_json::Value = h
-            .http
-            .post(h.url("/collection/hnsw?collection=paper_abstracts"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(again["submitted"], false);
-        assert_eq!(
-            h.store.ops(),
-            [crate::testutil::Op::EnableHnsw {
-                collection: "paper_abstracts".into(),
-                threads: 4
-            }]
-        );
-        let unknown = h
-            .http
-            .post(h.url("/collection/hnsw?collection=made_up"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(unknown.status(), 400);
-    }
-
-    #[tokio::test]
-    async fn the_client_enables_hnsw_with_the_token() {
-        let h = start().await;
-        let client = crate::client::DistillClient::new_with_client(
-            &h.base,
-            hs_common::auth::client::AuthedHttp::plain_with_backend_token(
-                http_client(None),
-                Some(token()),
-            ),
-        );
-        let r = client.enable_hnsw(None).await.unwrap();
-        assert!(r.submitted);
-        assert_eq!(r.collection, "academic_papers");
-
-        let anon = crate::client::DistillClient::new_with_client(
-            &h.base,
-            hs_common::auth::client::AuthedHttp::plain_with_backend_token(http_client(None), None),
-        );
-        let err = anon.enable_hnsw(None).await.unwrap_err();
-        assert!(format!("{err:#}").contains("401"), "{err:#}");
     }
 
     #[test]
@@ -950,7 +788,7 @@ mod tests {
     #[tokio::test]
     async fn an_indexing_panic_is_a_typed_500_on_both_routes_and_the_server_survives() {
         let h = start().await;
-        *h.embedder.panic.lock() = true;
+        h.store.state.lock().panic_on_write = true;
 
         let resp = h
             .post(
@@ -994,7 +832,7 @@ mod tests {
         assert!(typed.is_permanent_rejection());
 
         // Still serving.
-        *h.embedder.panic.lock() = false;
+        h.store.state.lock().panic_on_write = false;
         assert_eq!(
             h.post(
                 "/distill",
@@ -1007,44 +845,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_markdown_paths_route_reports_each_documents_own_key() {
-        // The doc_id is NOT the markdown key: a book ingested from a
-        // download provider has a title-based doc_id while its markdown
-        // is keyed by a shard of the title. The backfill reads the key
-        // from the payload, so the route has to report it verbatim.
+    async fn the_title_hnsw_and_scrub_routes_are_gone() {
+        // Titles are derived at index time, there is no HNSW to enable and no
+        // per-chunk scrub: these routes have no handler, token or not.
         let h = start().await;
-        h.post(
-            "/distill",
-            serde_json::json!({"path":"a.md","content": prose(4)}),
-        )
-        .await;
-
-        let resp = h
-            .http
-            .get(h.url("/docs/markdown-paths"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let paths = body["paths"].as_object().expect("paths object");
-        assert!(!paths.is_empty(), "no markdown path was reported");
-        for (doc_id, path) in paths {
-            assert!(
-                path.as_str().unwrap().starts_with("markdown/"),
-                "the key for {doc_id} is not a storage key: {path}"
-            );
+        for (method, path) in [
+            ("POST", "/doc/d/title"),
+            ("GET", "/docs/titles"),
+            ("GET", "/docs/markdown-paths"),
+            ("POST", "/collection/hnsw"),
+            ("POST", "/scrub-interstitials"),
+        ] {
+            let resp = send(&h.http, method, h.url(path)).await;
+            assert_eq!(resp.status(), 404, "{method} {path}");
         }
-    }
-
-    #[tokio::test]
-    async fn the_markdown_paths_route_needs_the_backend_token() {
-        let h = start().await;
-        let resp = http_client(None)
-            .get(h.url("/docs/markdown-paths"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
+        assert_eq!(h.store.ops(), []);
     }
 }

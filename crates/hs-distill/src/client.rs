@@ -75,8 +75,9 @@ pub struct HealthResponse {
     pub collection: String,
     #[serde(default)]
     pub version: String,
+    /// The myelin server behind this distill server, as `<name> <version>`.
     #[serde(default)]
-    pub qdrant_version: String,
+    pub backend_version: String,
     #[serde(default)]
     pub embed_model: String,
     /// The server's own process id.
@@ -93,10 +94,11 @@ pub struct HealthResponse {
 /// Readiness response from the distill server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadinessResponse {
-    /// The embedder is healthy and Qdrant answers.
+    /// The embedding model is on the GPU and myelin answers.
     pub ready: bool,
     pub in_flight: usize,
-    /// Concurrent `embed` calls the server can run (its model pool size).
+    /// Concurrent index requests the server can run (writes are serialized,
+    /// so 1).
     #[serde(default = "default_capacity")]
     pub capacity: usize,
     /// Why `ready` is false.
@@ -134,11 +136,11 @@ pub struct StatusResponse {
     pub compute_device: String,
     #[serde(default)]
     pub embed_model: String,
-    /// Qdrant endpoint this distill server is talking to. An internal
+    /// myelin endpoint this distill server is talking to. An internal
     /// address, so it is served only on the token-protected `/status`, never
     /// on the open `/health`.
     #[serde(default)]
-    pub qdrant_url: String,
+    pub myelin_url: String,
 }
 
 pub type DistillStreamLine = hs_common::service::protocol::StreamLine<DistillProgress, IndexResult>;
@@ -207,7 +209,7 @@ impl std::error::Error for ServerError {}
 /// Upper bound on one indexing request (`/distill`, `/distill/stream`) unless
 /// the caller sets another with [`DistillClient::with_index_timeout`].
 ///
-/// Indexing a book-length markdown is chunk -> GPU embed -> upsert on a card
+/// Indexing a book-length markdown is chunk -> GPU embed -> store on a card
 /// shared with the scribe VLM: minutes under contention, never close to
 /// half an hour. The bound exists for the stalled-server case, where a
 /// request with no deadline would hold its watcher handler slot forever
@@ -215,16 +217,10 @@ impl std::error::Error for ServerError {}
 /// so nothing else would ever free it).
 pub const DEFAULT_INDEX_TIMEOUT: Duration = Duration::from_secs(1800);
 
-/// Bound for every request that is not an index, a scrub or a reset and does
+/// Bound for every request that is not an index or a reset and does
 /// not set its own: the client-wide default, so no request site can be left
 /// without one.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// How many times a title write is attempted before it is a failure.
-///
-/// A payload write can time out while the live indexer is writing to the
-/// same collection. The write is idempotent, so a retry is safe.
-const TITLE_WRITE_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
 pub struct DistillClient {
@@ -320,8 +316,8 @@ impl DistillClient {
     /// Index markdown already held in memory. `path_hint` names the document
     /// (its file stem becomes the doc id) but the server never reads it from
     /// disk. Pass `catalog` when the caller already has the catalog entry:
-    /// the server has no catalog of its own, so without one the Qdrant
-    /// payload carries no title, authors, DOI or year.
+    /// the server has no catalog of its own, so without one the stored
+    /// chunks carry no title, authors, DOI or year.
     pub async fn index_content(
         &self,
         path_hint: &str,
@@ -332,7 +328,7 @@ impl DistillClient {
             .await
     }
 
-    /// Same as `index_content` but routes the upsert to a non-default Qdrant
+    /// Same as `index_content` but routes the write to a non-default
     /// collection. The collection must be one the server is configured to
     /// serve (`distill_server.collections`); an unknown name is a 400. The
     /// request is bounded by the client's index timeout.
@@ -490,8 +486,8 @@ impl DistillClient {
         Ok((data.exists, data.chunks))
     }
 
-    /// Delete every point whose `doc_id` matches. Returns the number of
-    /// points that were deleted.
+    /// Delete every chunk whose `doc_id` matches. Returns the number of
+    /// chunks that were deleted.
     pub async fn delete_doc(&self, doc_id: &str) -> Result<u64> {
         self.delete_doc_in(doc_id, None).await
     }
@@ -514,95 +510,8 @@ impl DistillClient {
         Ok(data.deleted)
     }
 
-    /// Write a title onto every point of a document.
-    ///
-    /// A **payload** update: the vector is untouched, so this is not a
-    /// re-embed and needs no embedding model. Returns the number of
-    /// points updated.
-    pub async fn set_title(&self, doc_id: &str, title: &str) -> Result<u64> {
-        #[derive(Deserialize)]
-        struct Set {
-            points_updated: u64,
-        }
-        let url = self.endpoint(&["doc", doc_id, "title"], &[])?;
-        // A write to Qdrant can time out while the live indexer is
-        // writing to the same collection. The write is a payload update
-        // and is idempotent — writing the same title twice is the same
-        // write — so a timed-out write is retried rather than reported
-        // as a failure.
-        let mut last: Option<String> = None;
-        for attempt in 1..=TITLE_WRITE_ATTEMPTS {
-            let resp = self
-                .http
-                .post(url.clone())
-                .json(&serde_json::json!({ "title": title }))
-                .timeout(Duration::from_secs(30))
-                .send()
-                .await;
-            match resp {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        let data: Set = json_or_server_error(resp, "set_title").await?;
-                        return Ok(data.points_updated);
-                    }
-                    let body = resp.text().await.unwrap_or_default();
-                    last = Some(format!("{status}: {body}"));
-                }
-                Err(e) => last = Some(format!("{e:#}")),
-            }
-            if attempt < TITLE_WRITE_ATTEMPTS {
-                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
-            }
-        }
-        anyhow::bail!(
-            "set_title({doc_id}) failed after {TITLE_WRITE_ATTEMPTS} attempts: {}",
-            last.unwrap_or_else(|| "unknown error".to_string())
-        )
-    }
-
-    /// The title currently stored on each document's points.
-    pub async fn payload_titles(
-        &self,
-    ) -> Result<std::collections::BTreeMap<String, Option<String>>> {
-        #[derive(Deserialize)]
-        struct Titles {
-            titles: std::collections::BTreeMap<String, Option<String>>,
-        }
-        let url = format!("{}/docs/titles", self.server_url);
-        let resp = self
-            .http
-            .get(url)
-            .timeout(Duration::from_secs(300))
-            .send()
-            .await
-            .context("Failed to reach distill server")?;
-        let data: Titles = json_or_server_error(resp, "payload_titles").await?;
-        Ok(data.titles)
-    }
-
-    /// The storage key of each document's markdown, as stored on its points.
-    pub async fn payload_markdown_paths(
-        &self,
-    ) -> Result<std::collections::BTreeMap<String, String>> {
-        #[derive(Deserialize)]
-        struct Paths {
-            paths: std::collections::BTreeMap<String, String>,
-        }
-        let url = format!("{}/docs/markdown-paths", self.server_url);
-        let resp = self
-            .http
-            .get(url)
-            .timeout(Duration::from_secs(300))
-            .send()
-            .await
-            .context("Failed to reach distill server")?;
-        let data: Paths = json_or_server_error(resp, "payload_markdown_paths").await?;
-        Ok(data.paths)
-    }
-
-    /// Drop + recreate the Qdrant collection, wiping every vector.
-    /// Returns the pre-drop point count for reporting.
+    /// Delete every document of the collection. Returns the number of
+    /// chunks that were deleted.
     pub async fn reset_collection(&self) -> Result<u64> {
         #[derive(Deserialize)]
         struct Reset {
@@ -612,50 +521,13 @@ impl DistillClient {
         let resp = self
             .http
             .post(&url)
-            .timeout(Duration::from_secs(120))
+            // One delete per document: minutes on a large corpus.
+            .timeout(DEFAULT_INDEX_TIMEOUT)
             .send()
             .await
             .context("Failed to reach distill server")?;
         let data: Reset = json_or_server_error(resp, "reset_collection").await?;
         Ok(data.deleted_points)
-    }
-
-    /// Ask the server to enable HNSW on a collection (default collection when
-    /// `None`) with its configured parameters. Returns at once; Qdrant builds
-    /// the graph in the background. Idempotent.
-    pub async fn enable_hnsw(&self, collection: Option<&str>) -> Result<crate::store::HnswEnable> {
-        let url = self.endpoint(&["collection", "hnsw"], &collection_query(collection))?;
-        let resp = self
-            .http
-            .post(url)
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await
-            .context("Failed to reach distill server")?;
-        json_or_server_error(resp, "enable_hnsw").await
-    }
-
-    /// Scan every point in the collection for chunks whose `chunk_text`
-    /// matches a known anti-bot / cookie-banner interstitial signature.
-    /// When `dry_run` is true, returns counts and samples without
-    /// deleting. Used by the `hs pipeline purge-poisoned-chunks` CLI to
-    /// scrub contamination from real papers (cookie banner appended to
-    /// the article body) without dropping the whole document.
-    pub async fn scrub_interstitials(&self, dry_run: bool) -> Result<crate::types::ScrubReport> {
-        let url = format!(
-            "{}/scrub-interstitials?dry_run={}",
-            self.server_url, dry_run
-        );
-        let resp = self
-            .http
-            .post(&url)
-            // Scroll over an entire collection can take minutes on a large
-            // corpus; let the server set the pace rather than timing it out.
-            .timeout(Duration::from_secs(900))
-            .send()
-            .await
-            .context("Failed to reach distill server")?;
-        json_or_server_error(resp, "scrub_interstitials").await
     }
 
     /// List every distinct `doc_id` present in the collection. `limit` is a
@@ -1059,7 +931,7 @@ mod tests {
         let s = typed.downcast_ref::<ServerError>().expect("typed");
         assert!(s.is_permanent_rejection());
         assert_eq!(s.code.as_deref(), Some(crate::api::PANIC_CODE));
-        let other = type_stream_error(anyhow::anyhow!("Server error: qdrant down"));
+        let other = type_stream_error(anyhow::anyhow!("Server error: myelin down"));
         assert!(other.downcast_ref::<ServerError>().is_none());
     }
 }

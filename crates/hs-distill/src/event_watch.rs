@@ -68,7 +68,7 @@ const STAMP_BACKOFFS: [Duration; 3] = [
 
 /// Retry a storage write up to 3 times with exponential backoff. Stamp
 /// writes are the bookkeeping side of the embedding pipeline — a single S3
-/// blip must not make the catalog and Qdrant diverge.
+/// blip must not make the catalog and the store diverge.
 async fn write_with_retry<F, Fut>(op_name: &str, stem: &str, op: F) -> Result<()>
 where
     F: FnMut() -> Fut,
@@ -140,7 +140,7 @@ fn stem_of(key: &str) -> &str {
 
 /// Pull the markdown at `event.key` from `storage` and ask the distill
 /// server to index it. Loads the catalog entry for the stem so metadata
-/// (title, authors, DOI, year) lands on Qdrant payloads. Publishes
+/// (title, authors, DOI, year) lands on the stored chunks. Publishes
 /// `distill.completed` on success.
 ///
 /// Every step that must happen for the event to be complete is an error
@@ -197,7 +197,7 @@ pub async fn index_and_publish(
             {
                 tracing::error!(stem = %stem, error = %stamp_err, "failed to stamp embed_failed");
             }
-            // Index failures are transient by default — a flaky Qdrant
+            // Index failures are transient by default — a flaky store
             // or a slow VRAM recovery shouldn't throw away the event.
             // JetStream's max_deliver bounds the retry count; a truly
             // broken markdown will eventually TERM on its own.
@@ -928,7 +928,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_server_error_is_transient_and_leaves_a_retryable_marker() {
-        let rig = rig(|| Reply::Json(500, "qdrant down".into())).await;
+        let rig = rig(|| Reply::Json(500, "myelin down".into())).await;
         assert_eq!(kind_of(run(&rig, "markdown/do/doc.md").await), "transient");
         let row = hs_common::catalog::read_catalog_entry_via(&rig.storage, "catalog", "doc")
             .await

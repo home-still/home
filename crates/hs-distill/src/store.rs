@@ -1,12 +1,13 @@
-//! The vector-store seam. The server talks to Qdrant only through
-//! [`VectorStore`]; tests drive the same code with an in-memory fake.
+//! The document-store seam: a parsed search filter and the [`DocumentStore`]
+//! trait the server writes and searches through.
+
+use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 
 use crate::client::{SearchFilters, SearchHit};
-use crate::collection::CollectionSpec;
 use crate::error::DistillError;
-use crate::types::{EmbeddedChunk, ScrubReport};
+use crate::types::Chunk;
 
 /// A parsed `year` search filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,146 +68,56 @@ impl SearchFilter {
     }
 }
 
-/// What `enable_hnsw` did for one collection.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct HnswEnable {
-    pub collection: String,
-    /// An update was sent to Qdrant. False: the collection already had these
-    /// parameters and nothing was changed.
-    pub submitted: bool,
-    pub m: u64,
-    pub ef_construct: u64,
-    /// Cap on index-building threads included in the update (0 when
-    /// nothing was submitted).
-    pub max_indexing_threads: u64,
-    /// The graph builds in the background after this returns.
-    pub message: String,
-}
-
-/// Does a collection with (`m`, `ef_construct`) already match the wanted
-/// HNSW parameters? Unknown (`None`) never matches.
-pub fn hnsw_matches(
-    m: Option<u64>,
-    ef_construct: Option<u64>,
-    want: &crate::config::HnswConfig,
-) -> bool {
-    m == Some(want.m) && ef_construct == Some(want.ef_construct)
-}
-
-/// Distinct document ids of a collection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocIds {
-    pub ids: Vec<String>,
-    /// More documents exist than `ids` holds (the requested limit was hit).
-    pub truncated: bool,
-}
-
+/// The document-store seam. The server talks to myelin only through
+/// [`DocumentStore`]; tests drive the same code with an in-memory fake.
+///
+/// A document is one generation of records: [`write_document`] stores every
+/// chunk of the document's current text and returns the record ids, and
+/// [`forget_document`] with those ids as `keep` then removes every earlier
+/// generation. The two calls are separate so a failed write never removes the
+/// previous version.
+///
+/// [`write_document`]: DocumentStore::write_document
+/// [`forget_document`]: DocumentStore::forget_document
 #[async_trait]
-pub trait VectorStore: Send + Sync {
-    /// Qdrant reachable; returns its version.
+pub trait DocumentStore: Send + Sync {
+    /// Backend reachable; returns "<server name> <version>" from the MCP
+    /// initialize result.
     async fn health(&self) -> Result<String, DistillError>;
 
-    /// Insert or overwrite points (ids derive from `doc_id` + chunk index).
-    async fn upsert(&self, collection: &str, chunks: &[EmbeddedChunk]) -> Result<(), DistillError>;
-
-    /// Delete every point of `doc_id` whose `chunk_index >= from_chunk`.
-    /// `from_chunk == 0` removes the whole document.
-    async fn delete_chunks_from(
+    /// Write one generation of a document; returns one record id per chunk,
+    /// in chunk order.
+    async fn write_document(
         &self,
         collection: &str,
         doc_id: &str,
-        from_chunk: u32,
-    ) -> Result<(), DistillError>;
+        chunks: &[Chunk],
+    ) -> Result<Vec<String>, DistillError>;
 
-    /// Number of points stored for `doc_id`.
-    async fn doc_chunks(&self, collection: &str, doc_id: &str) -> Result<u64, DistillError>;
-
-    /// The dense channel: nearest neighbours by vector similarity.
-    ///
-    /// Returns the hits with the store's point id, so the caller can fuse
-    /// this ranking with another channel's (see [`crate::fusion`]).
-    async fn search(
+    /// Hard-delete every record of `doc_id` not in `keep`; returns how many
+    /// were deleted.
+    async fn forget_document(
         &self,
         collection: &str,
-        vector: Vec<f32>,
-        limit: u64,
-        filter: &SearchFilter,
-    ) -> Result<Vec<(String, SearchHit)>, DistillError>;
+        doc_id: &str,
+        keep: &[String],
+    ) -> Result<u64, DistillError>;
 
-    /// The lexical channel: chunks whose text contains the query's terms.
-    ///
-    /// Returns the matching points, best first, as `(point_id, hit)`. The
-    /// ordering is the store's own relevance order for the text match; the
-    /// caller fuses it with the dense ranking (see [`crate::fusion`]).
-    ///
-    /// An empty `query` yields an empty list without touching the store: a
-    /// query with no usable terms has no lexical candidates, and inventing
-    /// "all points" would be a silent, wrong answer.
-    async fn lexical_search(
+    /// Ranked hits, best first, at most `limit`.
+    async fn search(
         &self,
         collection: &str,
         query: &str,
         limit: u64,
         filter: &SearchFilter,
-    ) -> Result<Vec<(String, SearchHit)>, DistillError>;
+    ) -> Result<Vec<SearchHit>, DistillError>;
 
-    /// Total points in the collection.
-    async fn points_count(&self, collection: &str) -> Result<u64, DistillError>;
-
-    /// The title currently stored on each document's points.
-    ///
-    /// A document with no title on any point maps to `None`. This is the
-    /// input to the title backfill (see [`crate::backfill`]).
-    async fn payload_titles(
+    /// doc_id -> live record count (one doc when `doc_id` is `Some`).
+    async fn inventory(
         &self,
         collection: &str,
-    ) -> Result<std::collections::BTreeMap<String, Option<String>>, DistillError>;
-
-    /// Write a title onto every point of a document.
-    ///
-    /// A **payload** update: the vector is not touched, so this is not a
-    /// re-embed and needs no embedding model. Returns the number of
-    /// points updated.
-    async fn set_payload_title(
-        &self,
-        collection: &str,
-        doc_id: &str,
-        title: &str,
-    ) -> Result<u64, DistillError>;
-
-    /// The storage key of each document's markdown, as stored on its points.
-    ///
-    /// The doc_id is *not* the markdown key: a book ingested from Anna's
-    /// Archive has a title-based doc_id, while its markdown is keyed by a
-    /// shard of the title. The payload carries the key itself, so the
-    /// backfill reads it from there rather than deriving it (see
-    /// [`crate::backfill`]).
-    async fn payload_markdown_paths(
-        &self,
-        collection: &str,
-    ) -> Result<std::collections::BTreeMap<String, String>, DistillError>;
-
-    /// Up to `limit` distinct document ids, flagging whether more exist.
-    async fn doc_ids(&self, collection: &str, limit: u64) -> Result<DocIds, DistillError>;
-
-    /// Submit `hnsw` (m, ef_construct, bounded indexing threads) to an
-    /// existing collection and return immediately; Qdrant builds the graph
-    /// in the background. A no-op when the collection already matches.
-    async fn enable_hnsw(
-        &self,
-        collection: &str,
-        hnsw: &crate::config::HnswConfig,
-    ) -> Result<HnswEnable, DistillError>;
-
-    /// Drop and recreate the collection; returns the prior point count.
-    async fn reset(&self, collection: &str, spec: &CollectionSpec) -> Result<u64, DistillError>;
-
-    /// Find (and unless `dry_run`, delete) chunks that are anti-bot pages.
-    async fn scrub_interstitials(
-        &self,
-        collection: &str,
-        dry_run: bool,
-    ) -> Result<ScrubReport, DistillError>;
+        doc_id: Option<&str>,
+    ) -> Result<BTreeMap<String, u64>, DistillError>;
 }
 
 #[cfg(test)]

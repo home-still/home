@@ -1,8 +1,9 @@
-//! Tiny HTTP client for the home-still MCP server behind the cloud gateway.
+//! Tiny HTTP client for MCP servers over streamable HTTP.
 //!
 //! Used by `hs status` (and other read-only CLI commands) on client-role nodes
 //! where the authoritative data lives on a remote server and this node has no
-//! usable local filesystem view. Mirrors what `npx mcp-remote` does for
+//! usable local filesystem view, and by `hs-distill-server` to talk to the
+//! myelin store. Mirrors what `npx mcp-remote` does for
 //! Claude Desktop, but in-process — no Node, no long-polling, just POST and
 //! parse the SSE-wrapped JSON result.
 //!
@@ -21,12 +22,14 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
-use hs_common::auth::client::{AuthedHttp, AuthenticatedClient};
+use crate::auth::client::{AuthedHttp, AuthenticatedClient};
 
 pub struct McpClient {
     http: AuthedHttp,
     endpoint: String,
     session_id: Option<String>,
+    /// The `serverInfo` object (`name`, `version`) of the initialize result.
+    server_info: Option<Value>,
 }
 
 /// How much of a response body is quoted in an error message.
@@ -62,11 +65,12 @@ impl McpClient {
     }
 
     /// Open a session against `endpoint` with an already-built client.
-    async fn connect(http: AuthedHttp, endpoint: String) -> Result<Self> {
+    pub async fn connect(http: AuthedHttp, endpoint: String) -> Result<Self> {
         let mut client = Self {
             http,
             endpoint,
             session_id: None,
+            server_info: None,
         };
         client.handshake().await?;
         Ok(client)
@@ -101,10 +105,11 @@ impl McpClient {
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        // Drain body, session is ready once we've read the headers.
-        resp.text()
+        let body = resp
+            .text()
             .await
             .context("read MCP initialize response body")?;
+        self.server_info = initialize_server_info(&body);
 
         let notif = json!({
             "jsonrpc": "2.0",
@@ -136,6 +141,12 @@ impl McpClient {
             anyhow::bail!("MCP request failed ({status}): {}", excerpt(&text));
         }
         Ok(text)
+    }
+
+    /// The `serverInfo` (`name`, `version`) the server reported when the
+    /// session was opened; `None` when its initialize result carried none.
+    pub fn server_info(&self) -> Option<&Value> {
+        self.server_info.as_ref()
     }
 
     /// Invoke a tool and return its text content parsed as JSON.
@@ -184,6 +195,24 @@ impl McpClient {
             tracing::warn!(error = %e, "could not end the MCP session; the server keeps it until it expires");
         }
     }
+}
+
+/// `result.serverInfo` of an initialize response, which is either an SSE
+/// stream with a `data:` frame or one plain JSON-RPC body.
+fn initialize_server_info(body: &str) -> Option<Value> {
+    let frames = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .chain(std::iter::once(body));
+    for payload in frames {
+        let Ok(v) = serde_json::from_str::<Value>(payload.trim()) else {
+            continue;
+        };
+        if let Some(info) = v.pointer("/result/serverInfo") {
+            return Some(info.clone());
+        }
+    }
+    None
 }
 
 /// Pull the tool result out of the first SSE `data:` frame that carries a
@@ -256,10 +285,9 @@ mod tests {
         FakeServer::start(move |req| {
             let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
             match (req.method.as_str(), rpc["method"].as_str()) {
-                ("POST", Some("initialize")) => {
-                    sse(json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
-                        .with_header("mcp-session-id", "sess-1")
-                }
+                ("POST", Some("initialize")) => sse(json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "serverInfo": {"name": "stand-in", "version": "1.2.3"}}}))
+                .with_header("mcp-session-id", "sess-1"),
                 ("POST", Some("notifications/initialized")) => Response::raw(202, "text/plain", ""),
                 ("POST", Some("tools/call")) => tool_reply.clone(),
                 ("DELETE", _) => Response::raw(delete_status, "text/plain", ""),
@@ -321,6 +349,38 @@ mod tests {
         );
         let err = parse_tool_result("nope", &body).unwrap_err();
         assert!(format!("{err:#}").contains("unknown tool"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn the_initialize_result_names_the_server() {
+        let server = mcp_server(sse(tool_ok("{}")), 200).await;
+        let opened = client(&server).await.unwrap();
+        let info = opened.server_info().expect("serverInfo");
+        assert_eq!(
+            (info["name"].as_str(), info["version"].as_str()),
+            (Some("stand-in"), Some("1.2.3"))
+        );
+
+        // A server whose initialize result has no serverInfo reports none.
+        let bare = FakeServer::start(|req| {
+            let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            match rpc["method"].as_str() {
+                Some("initialize") => sse(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+                _ => Response::raw(202, "text/plain", ""),
+            }
+        })
+        .await;
+        assert!(client(&bare).await.unwrap().server_info().is_none());
+    }
+
+    #[test]
+    fn server_info_is_read_from_a_plain_json_body_too() {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "result": {"serverInfo": {"name": "n"}}});
+        assert_eq!(
+            initialize_server_info(&body.to_string()).unwrap()["name"],
+            "n"
+        );
+        assert!(initialize_server_info("not json").is_none());
     }
 
     #[tokio::test]

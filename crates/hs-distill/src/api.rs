@@ -3,7 +3,7 @@
 //! `server` is a thin axum adapter over [`DistillServerState`]; everything
 //! that decides what a request means — validation, collection routing,
 //! limits, error classification — lives here so it runs (and is tested)
-//! without a socket, a GPU, or a Qdrant.
+//! without a socket, a GPU, or a myelin.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -16,36 +16,24 @@ use crate::client::{
     DistillProgress, HealthResponse, IndexResult, ReadinessResponse, SearchFilters, SearchHit,
     StatusResponse, MAX_DOC_LIST_LIMIT, MAX_SEARCH_LIMIT,
 };
-use crate::collection::CollectionSpec;
 use crate::config::DistillServerConfig;
-use crate::embed::{Embedder, EmbedderHealth, MODEL_NAME};
+use crate::embed_device::{ollama_embed_device, DEVICE_CUDA, OLLAMA_EMBED_MODEL};
 use crate::error::DistillError;
-use crate::fusion;
 use crate::pipeline::{self, ContentProfile, IndexJob};
 use crate::reference_list;
-use crate::store::{SearchFilter, VectorStore};
-use crate::types::ScrubReport;
+use crate::store::{DocumentStore, SearchFilter};
 
-/// How long `/readiness` waits for Qdrant before reporting not-ready.
-const READINESS_QDRANT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long `/readiness` waits for each backend (myelin, ollama) before
+/// reporting not-ready.
+const READINESS_BACKEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Hits returned when a search request names no `limit`.
 const DEFAULT_SEARCH_LIMIT: u64 = 10;
 
-/// How many candidates the lexical channel contributes to a fusion.
-///
-/// Fusion ranks, so the pool has to be deeper than the answer: a chunk
-/// that only the lexical channel likes must still be in the pool to be
-/// ranked at all. Ten times the default page is the same order of
-/// magnitude our sibling crate uses (myelin's `recall` asks the lexical
-/// channel for 50 and returns 6).
-const LEXICAL_CANDIDATES: u64 = 100;
-
-/// Longest search query accepted, in bytes. The model reads at most
-/// `embedding.max_length` tokens (8192 at most, well under this even for
-/// 3-byte-per-token scripts); without a bound a single request could hand
-/// the tokenizer megabytes while holding an embedder slot, stalling every
-/// document being indexed behind it.
+/// Longest search query accepted, in bytes. The query is embedded and then
+/// read by the reranker next to every candidate; without a bound a single
+/// request could hand them megabytes and stall every document being indexed
+/// behind it.
 pub const MAX_SEARCH_QUERY_BYTES: usize = 64 * 1024;
 
 /// Machine-readable code sent with a 500 caused by a panic in the index
@@ -98,6 +86,7 @@ impl From<DistillError> for ApiError {
     fn from(e: DistillError) -> Self {
         let kind = match e {
             DistillError::InvalidInput(_) => ErrorKind::BadRequest,
+            DistillError::Backend(_) => ErrorKind::Unavailable,
             _ => ErrorKind::Internal,
         };
         Self {
@@ -118,7 +107,7 @@ pub struct EmbedderRelease {
 #[derive(Deserialize)]
 pub struct IndexRequest {
     /// Document name. Only its file stem is used (it becomes the `doc_id`
-    /// and, with the catalog, the payload's `markdown_path`); the file it
+    /// and, with the catalog, the stored `markdown_path`); the file it
     /// names is never opened.
     pub path: Option<String>,
     /// The markdown to index. Required: the server indexes the text it is
@@ -162,30 +151,31 @@ pub struct DocList {
 }
 
 pub struct DistillServerState {
-    pub embedder: Arc<dyn Embedder>,
-    pub store: Arc<dyn VectorStore>,
+    pub store: Arc<dyn DocumentStore>,
+    /// HTTP client for ollama, which runs the embedding model behind the
+    /// store (`config.ollama_url`).
+    pub ollama: reqwest::Client,
     pub config: DistillServerConfig,
     pub in_flight: Arc<AtomicUsize>,
 }
 
 impl DistillServerState {
     pub fn new(
-        embedder: Arc<dyn Embedder>,
-        store: Arc<dyn VectorStore>,
+        store: Arc<dyn DocumentStore>,
+        ollama: reqwest::Client,
         config: DistillServerConfig,
     ) -> Self {
         Self {
-            embedder,
             store,
+            ollama,
             config,
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// The collection a request targets. Missing means the configured
-    /// default; any other name must be one of the collections configured
-    /// (and verified at startup) — a request can never create or reach an
-    /// arbitrary Qdrant collection by naming it.
+    /// default; any other name must be one of the collections configured —
+    /// a request can never reach an arbitrary myelin tenant by naming it.
     pub fn resolve_collection(&self, requested: Option<&str>) -> Result<String, ApiError> {
         let Some(name) = requested else {
             return Ok(self.config.collection_name.clone());
@@ -203,8 +193,26 @@ impl DistillServerState {
         )))
     }
 
-    fn spec(&self) -> CollectionSpec {
-        CollectionSpec::new(self.embedder.dimension(), &self.config.hnsw)
+    /// Where ollama has the embedding model: `"cuda"`, `"cpu"` or
+    /// `"partial"`.
+    async fn embedder_device(&self) -> Result<String, DistillError> {
+        ollama_embed_device(&self.ollama, &self.config.ollama_url).await
+    }
+
+    /// The embedder's device, provided it is fully on the GPU. Embedding
+    /// runs on the GPU or not at all: any other placement, and any failure
+    /// to find out, is [`ErrorKind::Unavailable`]. The cause is logged, not
+    /// returned (the open probes must not reveal it).
+    async fn require_gpu_embedder(&self) -> Result<String, ApiError> {
+        let device = self.embedder_device().await.map_err(|e| {
+            tracing::warn!("embedder unavailable: {e}");
+            ApiError::unavailable("embedder unavailable")
+        })?;
+        if device != DEVICE_CUDA {
+            tracing::warn!(%device, "the embedding model is not fully on the GPU");
+            return Err(ApiError::unavailable("embedder not on GPU"));
+        }
+        Ok(device)
     }
 
     // ── index ──────────────────────────────────────────────────────
@@ -233,7 +241,7 @@ impl DistillServerState {
         })
     }
 
-    /// Chunk, embed and store a prepared document.
+    /// Chunk and store a prepared document.
     pub async fn run_index(
         &self,
         job: PreparedIndex,
@@ -247,6 +255,9 @@ impl DistillServerState {
             catalog,
             collection,
         } = job;
+        // Embedding happens inside the store's write; refuse to start one
+        // while the model is not on the GPU.
+        let device = self.require_gpu_embedder().await?;
         let work = pipeline::index_document(
             IndexJob {
                 doc_id: &doc_id,
@@ -257,7 +268,6 @@ impl DistillServerState {
                 profile: ContentProfile::for_collection(&collection),
             },
             &self.config,
-            self.embedder.as_ref(),
             self.store.as_ref(),
             on_progress,
         );
@@ -281,7 +291,7 @@ impl DistillServerState {
         Ok(IndexResult {
             doc_id,
             chunks_indexed: chunks,
-            embedding_device: self.embedder.device().to_string(),
+            embedding_device: device,
         })
     }
 
@@ -305,59 +315,14 @@ impl DistillServerState {
             Some(n) => n.min(MAX_SEARCH_LIMIT),
         };
 
-        let embeddings = self.embedder.embed_batch(vec![req.query.clone()]).await?;
-        let query_vector = embeddings
-            .into_iter()
-            .next()
-            .map(|e| e.dense)
-            .ok_or_else(|| DistillError::Embedding("embedder returned no vector".into()))?;
-
-        // Two channels, one ranking. The dense channel finds passages that
-        // *mean* what the query means; the lexical channel finds passages
-        // that *say* the query's words. Neither subsumes the other: a dense
-        // embedder matches "thyroid" generically and loses "Hashimoto",
-        // while a keyword match cannot answer "how does attention work".
-        // Their ranks are fused, not their scores (see `crate::fusion`).
-        // The candidate pool is the page. Measured: a wider pool
-        // (50 candidates for a 10-result page) changes the ranking
-        // enough to lose an expected passage — for "Dawson and Krebs"
-        // the extra candidates are 137 chunks about a botanist named
-        // Dawson, and the one that mentions Dawson and Krebs falls out
-        // of the page.
-        let pool = limit;
-        let dense = self
+        // The store ranks: dense and BM25 candidates fused by rank, then
+        // reordered by a cross-encoder.
+        let mut hits = self
             .store
-            .search(&collection, query_vector, pool, &filter)
+            .search(&collection, &req.query, limit, &filter)
             .await?;
-
-        // The lexical channel is asked for more candidates than the caller
-        // wants: fusion works on ranks, so a candidate that only the
-        // lexical channel likes still has to be in the pool to be fused.
-        // The lexical channel keeps a deep pool (as in rc.365). Its
-        // candidate sets are conjunctions of the query's terms, and the
-        // deepest pool is what makes the right set win: for "Dawson and
-        // Krebs" the set "dawson AND krebs" holds two chunks and the set
-        // "dawson AND tricarboxylic" holds one, and the two rarest terms
-        // decide which is asked for. A shallower pool changes that
-        // choice, and with it the ranking.
-        let lexical = self
-            .store
-            .lexical_search(&collection, &req.query, LEXICAL_CANDIDATES, &filter)
-            .await?;
-
-        if lexical.is_empty() {
-            // No lexical candidate: the query has no term the text index
-            // can match (or the index is not there). The dense ranking is
-            // the whole answer — a query with no words to match has one
-            // channel, not two. This is not a degraded fallback: it is the
-            // complete result for a query the lexical channel cannot
-            // speak to.
-            let mut hits: Vec<SearchHit> = dense.into_iter().map(|(_, hit)| hit).collect();
-            demote_reference_lists(&mut hits, limit);
-            return Ok(hits);
-        }
-
-        Ok(fuse_channels(&dense, &lexical, limit))
+        demote_reference_lists(&mut hits, limit);
+        Ok(hits)
     }
 
     // ── health / readiness / status ────────────────────────────────
@@ -365,65 +330,66 @@ impl DistillServerState {
     pub async fn health(&self) -> Result<HealthResponse, ApiError> {
         // /health is unauthenticated: it says *that* a dependency is down,
         // never why (the cause is logged). Detail lives behind the token.
-        if let EmbedderHealth::Failed(why) = self.embedder.health() {
-            tracing::warn!("health: embedder unusable: {why}");
-            return Err(ApiError::unavailable("embedder unusable"));
-        }
-        let qdrant_version = self.store.health().await.map_err(|e| {
-            tracing::warn!("health: qdrant unavailable: {e}");
-            ApiError::unavailable("qdrant unavailable")
+        let compute_device = self.require_gpu_embedder().await?;
+        let backend_version = self.store.health().await.map_err(|e| {
+            tracing::warn!("health: myelin unavailable: {e}");
+            ApiError::unavailable("myelin unavailable")
         })?;
         Ok(HealthResponse {
             status: "ok".into(),
-            compute_device: self.embedder.device().to_string(),
+            compute_device,
             collection: self.config.collection_name.clone(),
             version: env!("HS_VERSION").to_string(),
-            qdrant_version,
-            embed_model: MODEL_NAME.into(),
+            backend_version,
+            embed_model: OLLAMA_EMBED_MODEL.into(),
             pid: std::process::id(),
         })
     }
 
-    /// Ready means this server can index and search right now: the embedder
-    /// is healthy and Qdrant answers. `capacity` is the embedder's slot
-    /// count; `in_flight` the requests being served.
+    /// Ready means this server can index and search right now: the
+    /// embedding model is on the GPU and myelin answers. Writes are
+    /// serialized, so `capacity` is 1; `in_flight` is the requests being
+    /// served.
     pub async fn readiness(&self) -> ReadinessResponse {
-        let reason = match self.embedder.health() {
-            EmbedderHealth::Failed(why) => {
-                tracing::warn!("readiness: embedder unusable: {why}");
-                Some("embedder unusable".to_string())
-            }
-            EmbedderHealth::Healthy => {
-                match tokio::time::timeout(READINESS_QDRANT_TIMEOUT, self.store.health()).await {
-                    Ok(Ok(_)) => None,
-                    Ok(Err(e)) => {
-                        tracing::warn!("readiness: qdrant unavailable: {e}");
-                        Some("qdrant unavailable".to_string())
-                    }
-                    Err(_) => Some("qdrant health check timed out".to_string()),
-                }
-            }
-        };
+        let reason = self.not_ready_reason().await;
         ReadinessResponse {
             ready: reason.is_none(),
             in_flight: self.in_flight.load(Ordering::Relaxed),
-            capacity: self.embedder.slots(),
+            capacity: 1,
             reason,
+        }
+    }
+
+    async fn not_ready_reason(&self) -> Option<String> {
+        match tokio::time::timeout(READINESS_BACKEND_TIMEOUT, self.require_gpu_embedder()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("readiness: {e}");
+                return Some(e.message);
+            }
+            Err(_) => return Some("embedder check timed out".to_string()),
+        }
+        match tokio::time::timeout(READINESS_BACKEND_TIMEOUT, self.store.health()).await {
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => {
+                tracing::warn!("readiness: myelin unavailable: {e}");
+                Some("myelin unavailable".to_string())
+            }
+            Err(_) => Some("myelin health check timed out".to_string()),
         }
     }
 
     pub async fn status(&self, collection: Option<&str>) -> Result<StatusResponse, ApiError> {
         let collection = self.resolve_collection(collection)?;
-        let points_count = self.store.points_count(&collection).await?;
-        let docs = self.store.doc_ids(&collection, MAX_DOC_LIST_LIMIT).await?;
+        let inventory = self.store.inventory(&collection, None).await?;
         Ok(StatusResponse {
             collection,
-            points_count,
-            documents_count: docs.ids.len() as u64,
-            documents_count_truncated: docs.truncated,
-            compute_device: self.embedder.device().to_string(),
-            embed_model: MODEL_NAME.into(),
-            qdrant_url: self.config.qdrant_url.clone(),
+            points_count: inventory.values().sum(),
+            documents_count: inventory.len() as u64,
+            documents_count_truncated: false,
+            compute_device: self.embedder_device().await?,
+            embed_model: OLLAMA_EMBED_MODEL.into(),
+            myelin_url: self.config.myelin_url.clone(),
         })
     }
 
@@ -436,7 +402,8 @@ impl DistillServerState {
     ) -> Result<(bool, u64), ApiError> {
         validate_doc_id(doc_id)?;
         let collection = self.resolve_collection(collection)?;
-        let chunks = self.store.doc_chunks(&collection, doc_id).await?;
+        let inventory = self.store.inventory(&collection, Some(doc_id)).await?;
+        let chunks = inventory.get(doc_id).copied().unwrap_or(0);
         Ok((chunks > 0, chunks))
     }
 
@@ -448,13 +415,7 @@ impl DistillServerState {
     ) -> Result<u64, ApiError> {
         validate_doc_id(doc_id)?;
         let collection = self.resolve_collection(collection)?;
-        let existing = self.store.doc_chunks(&collection, doc_id).await?;
-        if existing > 0 {
-            self.store
-                .delete_chunks_from(&collection, doc_id, 0)
-                .await?;
-        }
-        Ok(existing)
+        Ok(self.store.forget_document(&collection, doc_id, &[]).await?)
     }
 
     /// Distinct doc ids. `limit` defaults to, and may not exceed,
@@ -476,157 +437,32 @@ impl DistillServerState {
             Some(n) => n,
         };
         let collection = self.resolve_collection(collection)?;
-        let docs = self.store.doc_ids(&collection, limit).await?;
-        Ok(DocList {
-            doc_ids: docs.ids,
-            truncated: docs.truncated,
-        })
-    }
-
-    /// Write a title onto every point of a document.
-    ///
-    /// A **payload** update: the vector is untouched, so this is not a
-    /// re-embed and needs no embedding model. It is how a document that
-    /// was indexed before its catalog row existed gets the title the
-    /// catalog now holds (see [`crate::backfill`]).
-    ///
-    /// The title is rejected if it is empty: a point with an empty title
-    /// is as useless as one with no title, and writing one would hide the
-    /// problem rather than fix it.
-    pub async fn set_title(
-        &self,
-        doc_id: &str,
-        title: &str,
-        collection: Option<&str>,
-    ) -> Result<u64, ApiError> {
-        validate_doc_id(doc_id)?;
-        if title.trim().is_empty() {
-            return Err(ApiError::bad_request("title cannot be empty"));
-        }
-        let collection = self.resolve_collection(collection)?;
-        Ok(self
+        let mut doc_ids: Vec<String> = self
             .store
-            .set_payload_title(&collection, doc_id, title.trim())
-            .await?)
+            .inventory(&collection, None)
+            .await?
+            .into_keys()
+            .collect();
+        let truncated = doc_ids.len() as u64 > limit;
+        doc_ids.truncate(limit as usize);
+        Ok(DocList { doc_ids, truncated })
     }
 
-    /// The title currently stored on each document's points.
-    ///
-    /// The input to the title backfill: a document maps to the title on
-    /// its points, or `None` when it has none.
-    pub async fn payload_titles(
-        &self,
-        collection: Option<&str>,
-    ) -> Result<std::collections::BTreeMap<String, Option<String>>, ApiError> {
-        let collection = self.resolve_collection(collection)?;
-        Ok(self.store.payload_titles(&collection).await?)
-    }
-
-    /// The storage key of each document's markdown, as stored on its points.
-    ///
-    /// The doc_id is *not* the markdown key: a book ingested from Anna's
-    /// Archive has a title-based doc_id while its markdown is keyed by a
-    /// shard of the title. The payload carries the key itself, so the
-    /// backfill reads it from there rather than deriving it.
-    pub async fn payload_markdown_paths(
-        &self,
-        collection: Option<&str>,
-    ) -> Result<std::collections::BTreeMap<String, String>, ApiError> {
-        let collection = self.resolve_collection(collection)?;
-        Ok(self.store.payload_markdown_paths(&collection).await?)
-    }
-
-    /// Drop and recreate a served collection. Destructive; the route is behind
-    /// the backend-token middleware (see `server.rs`).
+    /// Delete every document of a served collection. Destructive; the route
+    /// is behind the backend-token middleware (see `server.rs`). Returns the
+    /// collection and how many chunks were deleted.
     pub async fn reset_collection(
         &self,
         collection: Option<&str>,
     ) -> Result<(String, u64), ApiError> {
         let collection = self.resolve_collection(collection)?;
-        let deleted = self.store.reset(&collection, &self.spec()).await?;
+        let inventory = self.store.inventory(&collection, None).await?;
+        let mut deleted = 0;
+        for doc_id in inventory.keys() {
+            deleted += self.store.forget_document(&collection, doc_id, &[]).await?;
+        }
         Ok((collection, deleted))
     }
-
-    /// Submit the configured HNSW parameters to a served collection (see
-    /// `VectorStore::enable_hnsw`). Returns immediately; never called at
-    /// startup.
-    pub async fn enable_hnsw(
-        &self,
-        collection: Option<&str>,
-    ) -> Result<crate::store::HnswEnable, ApiError> {
-        let collection = self.resolve_collection(collection)?;
-        Ok(self
-            .store
-            .enable_hnsw(&collection, &self.config.hnsw)
-            .await?)
-    }
-
-    /// Drop the embedder's idle model slots now (the GPU broker hands the
-    /// card to another tenant). Busy slots finish their embed and are left
-    /// alone; the next embed reloads through the load gate.
-    pub async fn release_embedder(&self) -> Result<EmbedderRelease, ApiError> {
-        let embedder = Arc::clone(&self.embedder);
-        let released = tokio::task::spawn_blocking(move || embedder.release_idle())
-            .await
-            .map_err(|e| ApiError::from(DistillError::Embedding(format!("release task: {e}"))))?;
-        tracing::info!(released, "embedder released on request");
-        Ok(EmbedderRelease { released })
-    }
-
-    pub async fn scrub_interstitials(
-        &self,
-        dry_run: bool,
-        collection: Option<&str>,
-    ) -> Result<ScrubReport, ApiError> {
-        let collection = self.resolve_collection(collection)?;
-        Ok(self.store.scrub_interstitials(&collection, dry_run).await?)
-    }
-}
-
-/// Fuse the dense and lexical rankings into one result list.
-///
-/// The two channels are combined by rank, not by score (see
-/// [`crate::fusion`]): a cosine similarity and a text-match count are not
-/// on the same scale, and the one that produced the larger numbers would
-/// otherwise win every comparison.
-///
-/// The returned score is the fused RRF score, so it is comparable between
-/// hits of one search and meaningless across searches — the same property
-/// the dense channel's cosine score has.
-fn fuse_channels(
-    dense: &[(String, SearchHit)],
-    lexical: &[(String, SearchHit)],
-    limit: u64,
-) -> Vec<SearchHit> {
-    let dense_list = fusion::RankedList::new(dense.iter().map(|(id, _)| id.clone()).collect());
-    let lexical_list = fusion::RankedList::new(lexical.iter().map(|(id, _)| id.clone()).collect());
-    let fused = fusion::rrf(&[dense_list, lexical_list], fusion::DEFAULT_RRF_K);
-
-    // A hit's payload is needed whichever channel surfaced it. The dense
-    // channel is the one that carries a score, so its copy of the payload
-    // wins; a hit only the lexical channel found has no dense copy.
-    let mut by_id: std::collections::HashMap<&str, &SearchHit> =
-        std::collections::HashMap::with_capacity(dense.len() + lexical.len());
-    for (id, hit) in dense.iter().chain(lexical.iter()) {
-        by_id.entry(id.as_str()).or_insert(hit);
-    }
-
-    // The whole fused list is built, not just the page: the reference
-    // list demotion below needs prose to promote, and prose that was
-    // fused at rank 12 has to still be here for it to be promoted into
-    // the page. Truncating first would leave the demotion nothing to
-    // work with at small limits.
-    let mut hits: Vec<SearchHit> = fused
-        .into_iter()
-        .filter_map(|(id, score)| {
-            let hit = *by_id.get(id.as_str())?;
-            let mut hit = hit.clone();
-            hit.score = score;
-            Some(hit)
-        })
-        .collect();
-    demote_reference_lists(&mut hits, limit);
-    hits
 }
 
 /// Move reference-list chunks below the prose chunks, but only past prose
@@ -765,23 +601,21 @@ fn validate_doc_id(doc_id: &str) -> Result<(), ApiError> {
 mod tests {
     use super::*;
     use crate::client::ReadinessResponse;
-    use crate::testutil::{prose, small_chunk_config, FakeEmbedder, FakeStore, Op};
+    use crate::testutil::{fake_state, prose, FakeOllama, FakeStore, OllamaMode, Op};
     use hs_common::service::protocol::ReadinessInfo;
 
     struct Harness {
         state: DistillServerState,
-        embedder: Arc<FakeEmbedder>,
         store: Arc<FakeStore>,
+        ollama: FakeOllama,
     }
 
-    fn harness() -> Harness {
-        let embedder = Arc::new(FakeEmbedder::new());
-        let store = Arc::new(FakeStore::default());
-        let state = DistillServerState::new(embedder.clone(), store.clone(), small_chunk_config());
+    async fn harness() -> Harness {
+        let (state, store, ollama) = fake_state().await;
         Harness {
             state,
-            embedder,
             store,
+            ollama,
         }
     }
 
@@ -822,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_path_only_request_is_rejected_and_nothing_is_read_or_stored() {
-        let h = harness();
+        let h = harness().await;
         let dir = tempfile::tempdir().unwrap();
         let secret = dir.path().join("passwd.md");
         std::fs::write(&secret, "root:x:0:0 ".repeat(100)).unwrap();
@@ -835,14 +669,13 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::BadRequest);
         assert!(err.message.contains("content"), "{err}");
 
-        assert_eq!(h.embedder.calls(), 0, "nothing may be embedded");
         assert_eq!(h.store.ops(), [], "nothing may be stored");
         assert_eq!(h.state.in_flight.load(Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn index_requests_need_both_a_name_and_content() {
-        let h = harness();
+    #[tokio::test]
+    async fn index_requests_need_both_a_name_and_content() {
+        let h = harness().await;
         assert_eq!(
             kind(h.state.prepare_index(index_req(None, Some("x"), None))),
             ErrorKind::BadRequest
@@ -859,7 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn content_is_indexed_under_the_stem_of_the_name() {
-        let h = harness();
+        let h = harness().await;
         let job = h
             .state
             .prepare_index(index_req(
@@ -871,7 +704,7 @@ mod tests {
         let result = h.state.run_index(job, |_| {}).await.unwrap();
         assert_eq!(result.doc_id, "10.1609_aaai.v38i16.29728");
         assert!(result.chunks_indexed > 0);
-        assert_eq!(result.embedding_device, "Cuda");
+        assert_eq!(result.embedding_device, "cuda");
         assert_eq!(
             h.store
                 .stored("academic_papers", "10.1609_aaai.v38i16.29728")
@@ -906,9 +739,9 @@ mod tests {
 
     // ── RA-26: collection allow-list ───────────────────────────────────
 
-    #[test]
-    fn only_configured_collections_resolve() {
-        let h = harness();
+    #[tokio::test]
+    async fn only_configured_collections_resolve() {
+        let h = harness().await;
         assert_eq!(h.state.resolve_collection(None).unwrap(), "academic_papers");
         for name in ["academic_papers", "paper_abstracts", "personal_docs"] {
             assert_eq!(h.state.resolve_collection(Some(name)).unwrap(), name);
@@ -929,7 +762,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_operation_rejects_an_unknown_collection_without_touching_the_store() {
-        let h = harness();
+        let h = harness().await;
         let c = Some("not_configured");
 
         assert_eq!(
@@ -964,37 +797,40 @@ mod tests {
             kind(h.state.reset_collection(c).await),
             ErrorKind::BadRequest
         );
-        assert_eq!(
-            kind(h.state.scrub_interstitials(true, c).await),
-            ErrorKind::BadRequest
-        );
 
-        assert_eq!(
-            h.store.ops(),
-            [],
-            "no collection may be created, reset or written"
-        );
+        assert_eq!(h.store.ops(), [], "nothing may be written or deleted");
         assert!(h.store.state.lock().searches.is_empty());
-        assert_eq!(h.embedder.calls(), 0);
+        assert!(h.ollama.http.recorded().is_empty());
     }
 
     #[tokio::test]
-    async fn reset_drops_only_the_named_configured_collection() {
-        let h = harness();
+    async fn reset_deletes_only_the_documents_of_the_named_configured_collection() {
+        let h = harness().await;
         h.store.seed("academic_papers", "a", 3);
         h.store.seed("paper_abstracts", "a", 1);
+        h.store.seed("paper_abstracts", "b", 2);
         let (name, deleted) = h
             .state
             .reset_collection(Some("paper_abstracts"))
             .await
             .unwrap();
-        assert_eq!((name.as_str(), deleted), ("paper_abstracts", 1));
+        assert_eq!((name.as_str(), deleted), ("paper_abstracts", 3));
         assert_eq!(h.store.stored("academic_papers", "a").len(), 3);
+        assert!(h.store.stored("paper_abstracts", "a").is_empty());
         assert_eq!(
             h.store.ops(),
-            [Op::Reset {
-                collection: "paper_abstracts".into()
-            }]
+            [
+                Op::Forget {
+                    collection: "paper_abstracts".into(),
+                    doc_id: "a".into(),
+                    keep: vec![]
+                },
+                Op::Forget {
+                    collection: "paper_abstracts".into(),
+                    doc_id: "b".into(),
+                    keep: vec![]
+                },
+            ]
         );
     }
 
@@ -1002,7 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unparseable_year_filter_is_a_400_not_an_unfiltered_search() {
-        let h = harness();
+        let h = harness().await;
         let filters = SearchFilters {
             year: Some("last year".into()),
             ..Default::default()
@@ -1015,63 +851,32 @@ mod tests {
             h.store.state.lock().searches.is_empty(),
             "must not have searched"
         );
-        assert_eq!(h.embedder.calls(), 0);
     }
 
     #[tokio::test]
     async fn search_limit_defaults_and_is_clamped() {
-        // The limit is the number of results the caller gets. The store
-        // is asked for a deeper pool (the fusion needs candidates to
-        // rank, and the reference-list demotion needs prose to
-        // promote), so the pool size is not the limit.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = (0..100).map(|i| hit(&format!("d{i}"), "text")).collect();
-            st.canned_lexical_hits = (0..100).map(|i| hit(&format!("l{i}"), "text")).collect();
-        }
-        h.state.search(search_req("q", None, None)).await.unwrap();
-        h.state
-            .search(search_req("q", Some(25), None))
-            .await
-            .unwrap();
-        h.state
-            .search(search_req("q", Some(u64::MAX), None))
-            .await
-            .unwrap();
-        let limits: Vec<u64> = {
-            let st = h.store.state.lock();
-            st.searches.iter().map(|s| s.1).collect()
-        };
-        // The pool is the page: a wider pool changes the ranking enough
-        // to lose an expected passage.
-        assert_eq!(limits, [10, 25, MAX_SEARCH_LIMIT]);
+        // The store is asked for exactly the page the caller wants; it
+        // does the candidate pooling and reranking itself.
+        let h = harness().await;
+        h.store.state.lock().canned_hits =
+            (0..300).map(|i| hit(&format!("d{i}"), "text")).collect();
 
-        // The page the caller gets is the limit.
+        let mut got = Vec::new();
+        for limit in [None, Some(25), Some(u64::MAX)] {
+            got.push(
+                h.state
+                    .search(search_req("q", limit, None))
+                    .await
+                    .unwrap()
+                    .len(),
+            );
+        }
         assert_eq!(
-            h.state
-                .search(search_req("q", None, None))
-                .await
-                .unwrap()
-                .len(),
-            DEFAULT_SEARCH_LIMIT as usize
+            got,
+            [DEFAULT_SEARCH_LIMIT as usize, 25, MAX_SEARCH_LIMIT as usize]
         );
-        assert_eq!(
-            h.state
-                .search(search_req("q", Some(25), None))
-                .await
-                .unwrap()
-                .len(),
-            25
-        );
-        assert_eq!(
-            h.state
-                .search(search_req("q", Some(u64::MAX), None))
-                .await
-                .unwrap()
-                .len(),
-            MAX_SEARCH_LIMIT as usize
-        );
+        let limits: Vec<u64> = h.store.state.lock().searches.iter().map(|s| s.2).collect();
+        assert_eq!(limits, [10, 25, MAX_SEARCH_LIMIT]);
 
         assert_eq!(
             kind(h.state.search(search_req("q", Some(0), None)).await),
@@ -1084,26 +889,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_search_query_is_rejected_before_it_reaches_the_embedder() {
-        let h = harness();
+    async fn an_oversized_search_query_is_rejected_before_it_reaches_the_store() {
+        let h = harness().await;
         let at_cap = "q".repeat(MAX_SEARCH_QUERY_BYTES);
         h.state
             .search(search_req(&at_cap, None, None))
             .await
             .unwrap();
-        assert_eq!(h.embedder.calls(), 1);
+        assert_eq!(h.store.state.lock().searches.len(), 1);
 
         let over = "q".repeat(MAX_SEARCH_QUERY_BYTES + 1);
         assert_eq!(
             kind(h.state.search(search_req(&over, None, None)).await),
             ErrorKind::BadRequest
         );
-        assert_eq!(h.embedder.calls(), 1, "the oversized query was embedded");
+        assert_eq!(
+            h.store.state.lock().searches.len(),
+            1,
+            "the oversized query reached the store"
+        );
     }
 
     #[tokio::test]
-    async fn search_forwards_parsed_filters_and_the_embedded_query() {
-        let h = harness();
+    async fn search_forwards_the_query_the_collection_and_the_parsed_filters() {
+        let h = harness().await;
         let filters = SearchFilters {
             year: Some(">=2020".into()),
             topic: Some("autism".into()),
@@ -1114,14 +923,14 @@ mod tests {
             .await
             .unwrap();
         let st = h.store.state.lock();
-        let (collection, limit, filter) = &st.searches[0];
-        assert_eq!((collection.as_str(), *limit), ("academic_papers", 5));
+        let (collection, query, limit, filter) = &st.searches[0];
+        assert_eq!(
+            (collection.as_str(), query.as_str(), *limit),
+            ("academic_papers", "find me", 5)
+        );
         assert_eq!(filter.year, Some(crate::store::YearFilter::Gte(2020)));
         assert_eq!(filter.topic.as_deref(), Some("autism"));
-        assert_eq!(h.embedder.texts.lock()[0], ["find me"]);
     }
-
-    // ── hybrid (dense + lexical) search ────────────────────────────
 
     fn hit(doc_id: &str, text: &str) -> SearchHit {
         SearchHit {
@@ -1140,127 +949,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_hit_only_the_lexical_channel_found_is_in_the_result() {
-        // The dense channel missed the passage that actually contains the
-        // term; the lexical channel found it. The fused result must
-        // contain it — that is the whole point of the second channel.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = vec![hit("dense-only", "a passage about something else")];
-            st.canned_lexical_hits = vec![hit("lexical-only", "Hashimoto thyroiditis")];
-        }
-        let hits = h
-            .state
-            .search(search_req("Hashimoto thyroiditis", Some(10), None))
-            .await
-            .unwrap();
-        let ids: Vec<&str> = hits.iter().map(|x| x.doc_id.as_str()).collect();
-        assert!(
-            ids.contains(&"lexical-only"),
-            "the lexical channel's hit is missing: {ids:?}"
-        );
-        assert!(
-            ids.contains(&"dense-only"),
-            "the dense hit is missing: {ids:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_hit_both_channels_found_outranks_one_only_the_dense_channel_found() {
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            // The fake store uses the doc id as the point id, so this is
-            // one point that both channels found.
-            st.canned_hits = vec![hit("both-channels", "in both")];
-            st.canned_lexical_hits = vec![hit("both-channels", "in both")];
-        }
-        let hits = h
-            .state
-            .search(search_req("both", Some(10), None))
-            .await
-            .unwrap();
-        assert_eq!(hits.len(), 1, "the same point must appear once");
-        assert_eq!(hits[0].doc_id, "both-channels");
-    }
-
-    #[tokio::test]
-    async fn the_result_is_capped_at_the_requested_limit() {
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = (0..5).map(|i| hit(&format!("d{i}"), "dense")).collect();
-            st.canned_lexical_hits = (0..5).map(|i| hit(&format!("l{i}"), "lexical")).collect();
-        }
-        let hits = h
-            .state
-            .search(search_req("q", Some(3), None))
-            .await
-            .unwrap();
-        assert_eq!(hits.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn a_query_with_no_lexical_match_keeps_the_dense_ranking() {
-        // No term the text index can match: the dense channel is the whole
-        // answer. This is the complete result for such a query, not a
-        // degraded one.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = vec![hit("d0", "dense")];
-        }
-        let hits = h
-            .state
-            .search(search_req("q", Some(10), None))
-            .await
-            .unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].doc_id, "d0");
-    }
-
-    #[tokio::test]
-    async fn the_lexical_channel_is_asked_for_a_deep_pool() {
-        // The lexical channel's candidate sets are conjunctions of the
-        // query's terms, and the deepest pool is what makes the right
-        // set win: for "Dawson and Krebs" the set "dawson AND krebs"
-        // holds two chunks and "dawson AND tricarboxylic" holds one.
-        // A shallower pool changes that choice, and with it the ranking.
-        let h = harness();
+    async fn search_ids(h: &Harness, hits: Vec<SearchHit>, limit: u64) -> Vec<String> {
+        h.store.state.lock().canned_hits = hits;
         h.state
-            .search(search_req("Hashimoto", Some(10), None))
+            .search(search_req("q", Some(limit), None))
             .await
-            .unwrap();
-        let st = h.store.state.lock();
-        assert_eq!(st.lexical_searches.len(), 1);
-        assert_eq!(st.lexical_searches[0].0, "Hashimoto");
-        assert!(
-            st.lexical_searches[0].1 > 10,
-            "the lexical pool must be deeper than the page"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_fused_score_is_the_rrf_score_not_a_cosine() {
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = vec![hit("both-channels", "dense")];
-            st.canned_lexical_hits = vec![hit("both-channels", "both")];
-        }
-        let hits = h
-            .state
-            .search(search_req("q", Some(10), None))
-            .await
-            .unwrap();
-        // One hit, first in both lists: 1/(1+1) + 1/(1+1) = 1.0.
-        assert!(
-            (hits[0].score - 1.0).abs() < 1e-6,
-            "score {}",
-            hits[0].score
-        );
+            .unwrap()
+            .into_iter()
+            .map(|x| x.doc_id)
+            .collect()
     }
 
     // ── reference-list demotion ────────────────────────────────────
@@ -1278,58 +975,39 @@ mod tests {
 
     #[tokio::test]
     async fn a_reference_list_is_demoted_below_prose_that_outranks_it() {
-        // The dense channel ranks a bibliography entry at the top for a
-        // topic query, because a citation to work about the topic *is*
-        // about the topic. When prose outranks it, the passage that
-        // discusses the topic must come first.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            // The prose heads the dense list, so it outranks the
-            // reference list. The lexical channel also finds the prose,
-            // which lifts it further.
-            st.canned_hits = vec![
+        // A bibliography entry matches a topic query because a citation to
+        // work about the topic *is* about the topic. When prose outranks
+        // it, the passage that discusses the topic must come first.
+        let h = harness().await;
+        let ids = search_ids(
+            &h,
+            vec![
                 hit(
                     "prose",
                     "The hippocampus generates new neurons throughout adulthood.",
                 ),
                 bibliography_chunk("references"),
-            ];
-            st.canned_lexical_hits = vec![hit(
-                "prose",
-                "The hippocampus generates new neurons throughout adulthood.",
-            )];
-        }
-        let hits = h
-            .state
-            .search(search_req("hippocampus neurogenesis", Some(10), None))
-            .await
-            .unwrap();
-        let ids: Vec<&str> = hits.iter().map(|x| x.doc_id.as_str()).collect();
-        assert_eq!(ids, vec!["prose", "references"], "order was {ids:?}");
+            ],
+            10,
+        )
+        .await;
+        assert_eq!(ids, ["prose", "references"]);
     }
 
     #[tokio::test]
-    async fn a_demoted_reference_list_is_still_returned() {
+    async fn a_demoted_reference_list_is_still_returned_with_its_score() {
         // A user asking for a paper's bibliography wants it: the chunk is
         // demoted, not dropped.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = vec![
-                hit(
-                    "prose",
-                    "The hippocampus generates new neurons throughout adulthood.",
-                ),
-                bibliography_chunk("references"),
-            ];
-            // The lexical channel also finds the prose, so the fused
-            // path runs and the hits carry an RRF score.
-            st.canned_lexical_hits = vec![hit(
+        let h = harness().await;
+        let mut references = bibliography_chunk("references");
+        references.score = 0.42;
+        h.store.state.lock().canned_hits = vec![
+            references,
+            hit(
                 "prose",
                 "The hippocampus generates new neurons throughout adulthood.",
-            )];
-        }
+            ),
+        ];
         let hits = h
             .state
             .search(search_req("hippocampus neurogenesis", Some(10), None))
@@ -1337,18 +1015,20 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 2, "the reference list was dropped, not demoted");
         assert_eq!(hits[1].doc_id, "references");
-        // Its score survives: it is still ranked, just lower.
-        assert!(hits[1].score > 0.0, "the demoted hit lost its score");
+        assert!(
+            (hits[1].score - 0.42).abs() < 1e-6,
+            "the demoted hit lost its score"
+        );
     }
 
     #[tokio::test]
     async fn a_mixed_chunk_is_not_demoted() {
         // A chunk that cites a work and then discusses it is useful, and
         // must not be treated as a reference list.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits =
+        let h = harness().await;
+        let ids =
+            search_ids(
+                &h,
                 vec![
                 hit(
                     "mixed",
@@ -1356,47 +1036,34 @@ mod tests {
                      new neuron production in the adult hippocampus remains contested to this day.",
                 ),
                 hit("other", "Something else entirely about a different subject."),
-            ];
-        }
-        let hits = h
-            .state
-            .search(search_req("hippocampus neurogenesis", Some(10), None))
-            .await
-            .unwrap();
-        assert_eq!(hits[0].doc_id, "mixed", "a mixed chunk was demoted");
+            ],
+                10,
+            )
+            .await;
+        assert_eq!(ids[0], "mixed", "a mixed chunk was demoted");
     }
 
     #[tokio::test]
     async fn the_demotion_does_not_change_the_number_of_results() {
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = (0..4)
+        let h = harness().await;
+        let ids = search_ids(
+            &h,
+            (0..4)
                 .map(|i| bibliography_chunk(&format!("refs{i}")))
-                .collect();
-        }
-        let hits = h
-            .state
-            .search(search_req("q", Some(10), None))
-            .await
-            .unwrap();
-        assert_eq!(hits.len(), 4, "results were dropped");
+                .collect(),
+            10,
+        )
+        .await;
+        assert_eq!(ids.len(), 4, "results were dropped");
     }
 
     #[tokio::test]
     async fn a_small_limit_still_demotes_a_reference_list() {
-        // The demotion needs prose to promote, and the prose sits below
-        // the page. A search for three results must still ask the
-        // channels for a deeper pool, or the demotion has nothing to
-        // promote and the reference list stays at the top.
-        //
-        // The fake store's ORDER is the ranking (the fusion assigns the
-        // scores), so the prose comes first in the dense list and the
-        // reference list comes after it.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = vec![
+        let h = harness().await;
+        let ids = search_ids(
+            &h,
+            vec![
+                bibliography_chunk("references"),
                 hit(
                     "prose-1",
                     "The split brain was studied by Sperry and Gazzaniga.",
@@ -1405,22 +1072,13 @@ mod tests {
                     "prose-2",
                     "A second prose passage about hemispheric specialization.",
                 ),
-                bibliography_chunk("references"),
-            ];
-            st.canned_lexical_hits = vec![hit(
-                "prose-1",
-                "The split brain was studied by Sperry and Gazzaniga.",
-            )];
-        }
-        let hits = h
-            .state
-            .search(search_req("split brain", Some(3), None))
-            .await
-            .unwrap();
-        let ids: Vec<&str> = hits.iter().map(|x| x.doc_id.as_str()).collect();
+            ],
+            3,
+        )
+        .await;
         assert_eq!(ids[0], "prose-1", "the prose did not come first: {ids:?}");
         assert!(
-            ids.contains(&"references"),
+            ids.contains(&"references".to_string()),
             "the reference list was dropped, not demoted: {ids:?}"
         );
     }
@@ -1428,60 +1086,36 @@ mod tests {
     #[tokio::test]
     async fn a_reference_list_leads_only_when_there_is_no_prose() {
         // Sometimes the only chunk in the corpus that mentions the term
-        // IS a reference list — for "Dawson and Krebs" it is the
-        // citation of Dawson's paper, and the corpus holds 137 chunks
-        // about a botanist named Dawson and no paper about the Krebs
-        // cycle by that name. With nothing else to show, the reference
-        // list is the answer and keeps its place.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = vec![bibliography_chunk("references")];
-        }
-        let hits = h
-            .state
-            .search(search_req("q", Some(3), None))
-            .await
-            .unwrap();
-        assert_eq!(
-            hits[0].doc_id, "references",
-            "the only answer was demoted below nothing"
-        );
+        // IS a reference list; with nothing else to show, it is the answer
+        // and keeps its place.
+        let h = harness().await;
+        let ids = search_ids(&h, vec![bibliography_chunk("references")], 3).await;
+        assert_eq!(ids[0], "references");
     }
 
     #[tokio::test]
     async fn prose_leads_even_when_a_reference_list_outranks_it() {
-        // The reference list outranks the prose — and the user asked a
-        // question, not for a bibliography. The passage that discusses
-        // the topic is the answer.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = vec![
+        let h = harness().await;
+        let ids = search_ids(
+            &h,
+            vec![
                 bibliography_chunk("references"),
                 hit("prose", "Something about the subject matter."),
-            ];
-        }
-        let hits = h
-            .state
-            .search(search_req("q", Some(3), None))
-            .await
-            .unwrap();
-        assert_eq!(
-            hits[0].doc_id, "prose",
-            "the reference list was not demoted below the prose"
-        );
+            ],
+            3,
+        )
+        .await;
+        assert_eq!(ids[0], "prose");
     }
 
     #[tokio::test]
     async fn a_bibliography_in_a_bare_year_style_is_demoted_below_prose() {
-        // The style the old rules missed: the year is not in
-        // parentheses. Measured 2026-10-21, this shape was the first
-        // hit for 6 of the 25 fixed queries and was not demoted.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = vec![
+        // The year is not in parentheses. Measured 2026-10-21, this shape
+        // was the first hit for 6 of the 25 fixed queries.
+        let h = harness().await;
+        let ids = search_ids(
+            &h,
+            vec![
                 hit(
                     "bibliography",
                     "Sundralingham, P. 1983 Responses of potted seedlings of Dryobalanops \
@@ -1491,27 +1125,19 @@ mod tests {
                      Trenberth, K. E. 1997 The definition of El Nino. Bull. Am. Meteorol. Soc.",
                 ),
                 hit("prose", "Something about the subject matter."),
-            ];
-        }
-        let hits = h
-            .state
-            .search(search_req("q", Some(3), None))
-            .await
-            .unwrap();
-        assert_eq!(
-            hits[0].doc_id, "prose",
-            "the bare-year bibliography was not demoted below the prose"
-        );
+            ],
+            3,
+        )
+        .await;
+        assert_eq!(ids[0], "prose");
     }
 
     #[tokio::test]
     async fn a_bibliography_in_a_numbered_style_is_demoted_below_prose() {
-        // The other style the old rules missed: the reference number is
-        // not "1." or "2.", and the entry is not in parentheses.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = vec![
+        let h = harness().await;
+        let ids = search_ids(
+            &h,
+            vec![
                 hit(
                     "bibliography",
                     "59. Ferguson JN, Aldag JM, Insel TR, Young LJ. Oxytocin in the medial \
@@ -1522,66 +1148,36 @@ mod tests {
                      anxiolysis in male rats. Proc Natl Acad Sci 2007.",
                 ),
                 hit("prose", "Something about the subject matter."),
-            ];
-        }
-        let hits = h
-            .state
-            .search(search_req("q", Some(3), None))
-            .await
-            .unwrap();
-        assert_eq!(
-            hits[0].doc_id, "prose",
-            "the numbered bibliography was not demoted below the prose"
-        );
+            ],
+            3,
+        )
+        .await;
+        assert_eq!(ids[0], "prose");
     }
 
     #[tokio::test]
     async fn a_numbered_prose_paragraph_is_not_demoted() {
         // "22. The idea of the series is, in itself, important …" is a
-        // numbered footnote, not a bibliography. Demoting it would hide
-        // prose from the user.
-        let h = harness();
-        {
-            let mut st = h.store.state.lock();
-            st.canned_hits = vec![hit(
+        // numbered footnote, not a bibliography.
+        let h = harness().await;
+        let ids = search_ids(
+            &h,
+            vec![hit(
                 "prose",
                 "22. The idea of the series is, in itself, important to Eisenman's early \
-                     development. Sandra Kaji-O'Gorman explores the relationship in detail.\n\
-                     19. Eisenman is in an interesting tension with Bergson here, as he often was \
-                     in his writings about the nature of form.",
-            )];
-        }
-        let hits = h
-            .state
-            .search(search_req("q", Some(3), None))
-            .await
-            .unwrap();
-        assert_eq!(
-            hits[0].doc_id, "prose",
-            "a numbered prose paragraph was wrongly demoted"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_dense_pool_is_the_page() {
-        // A wider dense pool changes the ranking enough to lose an
-        // expected passage: for "Dawson and Krebs", the extra candidates
-        // are 137 chunks about a botanist named Dawson, and the chunk
-        // that mentions Dawson and Krebs falls out of the page. So the
-        // dense pool is exactly what the caller asked for.
-        let h = harness();
-        h.state
-            .search(search_req("q", Some(3), None))
-            .await
-            .unwrap();
-        let st = h.store.state.lock();
-        let (_, dense_limit, _) = &st.searches[0];
-        assert_eq!(*dense_limit, 3, "the dense pool was widened");
+                 development. Sandra Kaji-O'Gorman explores the relationship in detail.\n\
+                 19. Eisenman is in an interesting tension with Bergson here, as he often was \
+                 in his writings about the nature of form.",
+            )],
+            3,
+        )
+        .await;
+        assert_eq!(ids[0], "prose");
     }
 
     #[tokio::test]
     async fn list_docs_limit_is_bounded_and_never_silently_truncated() {
-        let h = harness();
+        let h = harness().await;
         for d in ["a", "b", "c"] {
             h.store.seed("academic_papers", d, 1);
         }
@@ -1613,24 +1209,33 @@ mod tests {
     // ── status / health / readiness (RA-90, RA-93) ─────────────────────
 
     #[tokio::test]
-    async fn status_counts_points_and_documents() {
-        let h = harness();
+    async fn status_counts_chunks_and_documents() {
+        let h = harness().await;
         h.store.seed("academic_papers", "a", 3);
         h.store.seed("academic_papers", "b", 2);
+        h.store.seed("paper_abstracts", "c", 7);
         let s = h.state.status(None).await.unwrap();
         assert_eq!((s.points_count, s.documents_count), (5, 2));
         assert!(!s.documents_count_truncated);
-        assert_eq!(s.embed_model, "bge-m3");
+        assert_eq!(s.embed_model, "bge-m3:latest");
+        assert_eq!(s.compute_device, "cuda");
         assert_eq!(s.collection, "academic_papers");
     }
 
     #[tokio::test]
+    async fn status_reports_a_cpu_embedder_rather_than_hiding_it() {
+        let h = harness().await;
+        *h.ollama.mode.lock() = OllamaMode::Cpu;
+        assert_eq!(h.state.status(None).await.unwrap().compute_device, "cpu");
+    }
+
+    #[tokio::test]
     async fn readiness_reports_capacity_and_real_health() {
-        let h = harness();
+        let h = harness().await;
         let r = h.state.readiness().await;
         assert!(r.ready && r.reason.is_none());
-        assert_eq!(r.capacity, 2);
-        assert_eq!(r.available_slots(), 2);
+        assert_eq!(r.capacity, 1, "writes are serialized");
+        assert_eq!(r.available_slots(), 1);
 
         h.state.in_flight.store(5, Ordering::Relaxed);
         let r = h.state.readiness().await;
@@ -1641,63 +1246,71 @@ mod tests {
         );
         h.state.in_flight.store(0, Ordering::Relaxed);
 
-        *h.embedder.health.lock() = crate::embed::EmbedderHealth::Failed("slot 0 poisoned".into());
-        let r = h.state.readiness().await;
-        assert!(!r.ready);
-        assert_eq!(r.available_slots(), 0);
-        let reason = r.reason.unwrap();
-        assert!(reason.contains("embedder unusable"));
-        assert!(
-            !reason.contains("poisoned"),
-            "internal detail leaked: {reason}"
-        );
+        for (mode, want) in [
+            (OllamaMode::Cpu, "embedder not on GPU"),
+            (OllamaMode::Partial, "embedder not on GPU"),
+            (OllamaMode::Down, "embedder unavailable"),
+        ] {
+            *h.ollama.mode.lock() = mode;
+            let r = h.state.readiness().await;
+            assert!(!r.ready, "{mode:?}");
+            assert_eq!(r.available_slots(), 0);
+            let reason = r.reason.unwrap();
+            assert_eq!(reason, want, "{mode:?}");
+            assert!(!reason.contains("ollama is down"), "cause leaked: {reason}");
+        }
 
-        *h.embedder.health.lock() = crate::embed::EmbedderHealth::Healthy;
+        *h.ollama.mode.lock() = OllamaMode::Cuda;
         h.store.state.lock().down = true;
         let r = h.state.readiness().await;
         assert!(!r.ready);
-        assert!(r.reason.unwrap().contains("qdrant"));
+        assert!(r.reason.unwrap().contains("myelin"));
     }
 
     #[tokio::test]
     async fn health_fails_with_503_semantics_when_a_dependency_is_down() {
-        let h = harness();
+        let h = harness().await;
         let ok = h.state.health().await.unwrap();
         assert_eq!(ok.status, "ok");
-        assert_eq!(ok.embed_model, "bge-m3");
-        assert_eq!(ok.qdrant_version, "1.0.0");
+        assert_eq!(ok.compute_device, "cuda");
+        assert_eq!(ok.embed_model, "bge-m3:latest");
+        assert_eq!(ok.backend_version, "fake-myelin 1.0.0");
 
-        *h.embedder.health.lock() = crate::embed::EmbedderHealth::Failed("poisoned".into());
-        assert_eq!(kind(h.state.health().await), ErrorKind::Unavailable);
+        for mode in [OllamaMode::Cpu, OllamaMode::Partial, OllamaMode::Down] {
+            *h.ollama.mode.lock() = mode;
+            assert_eq!(kind(h.state.health().await), ErrorKind::Unavailable);
+        }
 
-        *h.embedder.health.lock() = crate::embed::EmbedderHealth::Healthy;
+        *h.ollama.mode.lock() = OllamaMode::Cuda;
         h.store.state.lock().down = true;
         assert_eq!(kind(h.state.health().await), ErrorKind::Unavailable);
     }
 
-    /// F10/F11: the open probe must not reveal the Qdrant address or the
+    /// F10/F11: the open probe must not reveal the myelin address or the
     /// cause of a failure; the protected `/status` carries the address.
     #[tokio::test]
     async fn the_open_health_probe_leaks_neither_address_nor_cause() {
-        let h = harness();
+        let h = harness().await;
         let ok = serde_json::to_string(&h.state.health().await.unwrap()).unwrap();
         assert!(
-            !ok.contains("qdrant_url") && !ok.contains(&h.state.config.qdrant_url),
+            !ok.contains("myelin_url") && !ok.contains(&h.state.config.myelin_url),
             "{ok}"
         );
 
-        *h.embedder.health.lock() = crate::embed::EmbedderHealth::Failed("slot 0 poisoned".into());
-        let err = h.state.health().await.unwrap_err();
-        assert!(!err.to_string().contains("poisoned"), "{err}");
+        *h.ollama.mode.lock() = OllamaMode::Down;
+        let err = h.state.health().await.unwrap_err().to_string();
+        assert!(!err.contains("ollama is down"), "{err}");
+        assert!(!err.contains(&h.ollama.http.url()), "{err}");
 
-        *h.embedder.health.lock() = crate::embed::EmbedderHealth::Healthy;
+        *h.ollama.mode.lock() = OllamaMode::Cuda;
         h.store.state.lock().down = true;
         let err = h.state.health().await.unwrap_err().to_string();
-        assert!(err.contains("qdrant unavailable"), "{err}");
+        assert!(err.contains("myelin unavailable"), "{err}");
+        assert!(!err.contains("refused"), "{err}");
         h.store.state.lock().down = false;
 
         let status = h.state.status(None).await.unwrap();
-        assert_eq!(status.qdrant_url, h.state.config.qdrant_url);
+        assert_eq!(status.myelin_url, h.state.config.myelin_url);
     }
 
     #[test]
@@ -1711,14 +1324,16 @@ mod tests {
     // ── error classification (RA-93) ───────────────────────────────────
 
     #[test]
-    fn bad_input_is_a_400_and_everything_else_is_a_500() {
+    fn bad_input_is_a_400_a_backend_failure_a_503_and_everything_else_a_500() {
         assert_eq!(
             ApiError::from(DistillError::InvalidInput("x".into())).kind,
             ErrorKind::BadRequest
         );
+        assert_eq!(
+            ApiError::from(DistillError::Backend("x".into())).kind,
+            ErrorKind::Unavailable
+        );
         for e in [
-            DistillError::Qdrant("x".into()),
-            DistillError::Embedding("x".into()),
             DistillError::Metadata("x".into()),
             DistillError::Config("x".into()),
         ] {
@@ -1727,24 +1342,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_store_failure_while_indexing_is_a_500_not_a_400() {
-        let h = harness();
-        h.store.state.lock().fail_upsert_from_call = Some(0);
+    async fn a_store_failure_while_indexing_is_a_503_not_a_400() {
+        let h = harness().await;
+        h.store.state.lock().fail_write_from_call = Some(0);
         let job = h
             .state
             .prepare_index(index_req(Some("d.md"), Some(&prose(6)), None))
             .unwrap();
         assert_eq!(
             kind(h.state.run_index(job, |_| {}).await),
-            ErrorKind::Internal
+            ErrorKind::Unavailable
         );
+    }
+
+    #[tokio::test]
+    async fn indexing_is_refused_while_the_embedding_model_is_off_the_gpu() {
+        let h = harness().await;
+        for mode in [OllamaMode::Cpu, OllamaMode::Partial, OllamaMode::Down] {
+            *h.ollama.mode.lock() = mode;
+            let job = h
+                .state
+                .prepare_index(index_req(Some("d.md"), Some(&prose(6)), None))
+                .unwrap();
+            assert_eq!(
+                kind(h.state.run_index(job, |_| {}).await),
+                ErrorKind::Unavailable,
+                "{mode:?}"
+            );
+        }
+        assert_eq!(h.store.ops(), [], "nothing may be written");
+        assert_eq!(h.state.in_flight.load(Ordering::Relaxed), 0);
     }
 
     // ── per-document operations ────────────────────────────────────────
 
     #[tokio::test]
     async fn delete_reports_how_many_chunks_existed_and_removes_them() {
-        let h = harness();
+        let h = harness().await;
         h.store.seed("academic_papers", "d", 4);
         assert_eq!(h.state.delete_doc("d", None).await.unwrap(), 4);
         assert!(h.store.stored("academic_papers", "d").is_empty());
@@ -1753,8 +1387,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn doc_exists_counts_the_documents_own_chunks() {
+        let h = harness().await;
+        h.store.seed("academic_papers", "d", 4);
+        h.store.seed("academic_papers", "other", 9);
+        assert_eq!(h.state.doc_exists("d", None).await.unwrap(), (true, 4));
+    }
+
+    #[tokio::test]
     async fn doc_ids_that_could_traverse_are_rejected() {
-        let h = harness();
+        let h = harness().await;
         for bad in ["..", ".", "a/b", "a\\b"] {
             assert_eq!(
                 kind(h.state.doc_exists(bad, None).await),
@@ -1772,8 +1414,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_panic_while_indexing_is_a_typed_failure_and_releases_the_slot() {
-        let h = harness();
-        *h.embedder.panic.lock() = true;
+        let h = harness().await;
+        h.store.state.lock().panic_on_write = true;
         let job = h
             .state
             .prepare_index(index_req(Some("d.md"), Some(&prose(6)), None))

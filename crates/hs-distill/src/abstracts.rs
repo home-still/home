@@ -1,4 +1,4 @@
-//! Coalesce + extract paper abstracts for the `paper_abstracts` Qdrant
+//! Coalesce + extract paper abstracts for the `paper_abstracts`
 //! collection.
 //!
 //! Three input sources, evaluated in order:

@@ -1,14 +1,11 @@
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use hs_common::catalog::{CatalogEntry, PageOffset};
 
 use crate::chunker::{chunk_markdown, ChunkerConfig};
 use crate::client::DistillProgress;
 use crate::config::DistillServerConfig;
-use crate::embed::Embedder;
 use crate::error::DistillError;
 use crate::metadata::extract_rule_based;
-use crate::store::VectorStore;
-use crate::types::EmbeddedChunk;
+use crate::store::DocumentStore;
 
 /// What kind of content a collection deliberately carries — decides which
 /// ingress quality gates `index_document` applies. The mapping lives in
@@ -55,28 +52,31 @@ pub struct IndexJob<'a> {
     pub profile: ContentProfile,
 }
 
-/// Index a single markdown document: chunk -> metadata -> embed -> upsert.
+/// Index a single markdown document: chunk -> metadata -> write.
 ///
 /// After this returns `Ok(n)` the collection holds exactly the `n` chunks
 /// produced from `job.content` for `doc_id`, and none left over from an
 /// earlier version of the document:
 ///
-/// * `n > 0`: the new chunks are upserted first, and only after every
-///   upsert succeeded are chunks past the new total (`chunk_index >= n`)
-///   deleted. A failed upsert therefore never leaves a document with fewer
-///   chunks than before, and a stale tail never outlives a re-index.
+/// * `n > 0`: the new generation is written first, and only after the write
+///   succeeded are the records of every earlier generation deleted (all
+///   records of the document except the ones just written). A failed write
+///   therefore never leaves a document with fewer chunks than before, and a
+///   stale generation never outlives a re-index. Records a failed write did
+///   leave behind stay until the next successful index of the document
+///   removes them, and the caller records no success, so the document is
+///   retried.
 /// * `n == 0` (empty document, interstitial stub, no chunk passed the
-///   quality filter): every earlier chunk of the document is deleted before
+///   quality filter): every earlier record of the document is deleted before
 ///   `Ok(0)` is returned, so a caller that stamps the document as skipped
-///   is not contradicted by searchable vectors.
+///   is not contradicted by searchable chunks.
 ///
 /// Any failure — including the deletes — is an `Err` and changes nothing
 /// about what the caller should record.
 pub async fn index_document(
     job: IndexJob<'_>,
     config: &DistillServerConfig,
-    embedder: &dyn Embedder,
-    store: &dyn VectorStore,
+    store: &dyn DocumentStore,
     on_progress: impl Fn(DistillProgress),
 ) -> Result<u32, DistillError> {
     let IndexJob {
@@ -196,7 +196,7 @@ pub async fn index_document(
     // Short-form collections bypass the filter — their single-chunk
     // payloads fail the 50-char `TooShort` rule by design, and dropping
     // points behind the producer's back was causing 2,268 catalog stamps
-    // to point at non-existent Qdrant rows. See ContentProfile.
+    // to point at records that do not exist. See ContentProfile.
     let mut chunks: Vec<_> = if profile == ContentProfile::ShortFormCurated {
         chunks
     } else {
@@ -219,81 +219,29 @@ pub async fn index_document(
     }
 
     // Surviving chunks are renumbered so indices are contiguous 0..n: the
-    // quality filter can drop chunks from the middle, and the stale-tail
-    // delete below relies on "everything >= n is stale".
+    // quality filter can drop chunks from the middle.
     let total_chunks = chunks.len() as u32;
     for (i, chunk) in chunks.iter_mut().enumerate() {
         chunk.chunk_index = i as u32;
         chunk.total_chunks = total_chunks;
     }
 
-    // Embed
+    // Write. The store embeds each chunk (header included) and keeps the
+    // text verbatim.
     on_progress(DistillProgress {
-        stage: "embedding".into(),
+        stage: "writing".into(),
         doc: stem.to_string(),
         chunks_done: 0,
         chunks_total: total_chunks as u64,
-        message: format!("Embedding {} chunks", total_chunks),
+        message: format!("Writing {} chunks", total_chunks),
     });
 
-    // The header-prefixed text exists only to be embedded: move it out of
-    // each chunk instead of copying it.
-    let texts: Vec<String> = chunks
-        .iter_mut()
-        .map(|c| std::mem::take(&mut c.text))
-        .collect();
-    let embeddings = embedder.embed_batch(texts).await?;
-    if embeddings.len() != chunks.len() {
-        // `zip` would silently drop the unmatched chunks.
-        return Err(DistillError::Embedding(format!(
-            "embedder returned {} vectors for {} chunks of {stem}",
-            embeddings.len(),
-            chunks.len()
-        )));
-    }
+    let record_ids = store.write_document(collection_name, stem, &chunks).await?;
 
-    let embedded_chunks: Vec<EmbeddedChunk> = chunks
-        .into_iter()
-        .zip(embeddings)
-        .map(|(chunk, embedding)| EmbeddedChunk { chunk, embedding })
-        .collect();
-
-    // Upsert to Qdrant
-    on_progress(DistillProgress {
-        stage: "upserting".into(),
-        doc: stem.to_string(),
-        chunks_done: 0,
-        chunks_total: total_chunks as u64,
-        message: format!("Upserting {} chunks to Qdrant", total_chunks),
-    });
-
-    // Upsert in config-sized batches, several in flight at once — Qdrant
-    // handles concurrent writes to one collection cheaply, and the old
-    // sequential loop became the slow link once embed got faster.
-    let upsert_batch = config.qdrant_upsert_batch;
-    let parallelism = config.qdrant_upsert_parallelism;
-    if upsert_batch == 0 || parallelism == 0 {
-        return Err(DistillError::Config(
-            "qdrant_upsert_batch and qdrant_upsert_parallelism must be at least 1".into(),
-        ));
-    }
-    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-    for batch in embedded_chunks.chunks(upsert_batch) {
-        in_flight.push(store.upsert(collection_name, batch));
-        if in_flight.len() >= parallelism {
-            if let Some(r) = in_flight.next().await {
-                r?;
-            }
-        }
-    }
-    while let Some(r) = in_flight.next().await {
-        r?;
-    }
-
-    // Only now that every new chunk is stored: drop what an earlier, longer
-    // version of this document left past the new end.
+    // Only now that every new chunk is stored: drop what earlier generations
+    // of this document left.
     store
-        .delete_chunks_from(collection_name, stem, total_chunks)
+        .forget_document(collection_name, stem, &record_ids)
         .await?;
 
     on_progress(DistillProgress {
@@ -309,30 +257,29 @@ pub async fn index_document(
 
 /// Remove every stored chunk of a document that is being skipped.
 async fn remove_document(
-    store: &dyn VectorStore,
+    store: &dyn DocumentStore,
     collection: &str,
     doc_id: &str,
 ) -> Result<(), DistillError> {
-    store.delete_chunks_from(collection, doc_id, 0).await
+    store.forget_document(collection, doc_id, &[]).await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{prose, small_chunk_config, FakeEmbedder, FakeStore, Op};
+    use crate::testutil::{prose, small_chunk_config, FakeStore, Op};
 
     const COLLECTION: &str = "academic_papers";
 
     async fn index(
         store: &FakeStore,
-        embedder: &FakeEmbedder,
         config: &DistillServerConfig,
         doc_id: &str,
         content: &str,
     ) -> Result<u32, DistillError> {
         index_with(
             store,
-            embedder,
             config,
             doc_id,
             content,
@@ -344,7 +291,6 @@ mod tests {
 
     async fn index_with(
         store: &FakeStore,
-        embedder: &FakeEmbedder,
         config: &DistillServerConfig,
         doc_id: &str,
         content: &str,
@@ -361,7 +307,6 @@ mod tests {
                 profile,
             },
             config,
-            embedder,
             store,
             |_| {},
         )
@@ -373,85 +318,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reindexing_with_fewer_chunks_leaves_no_stale_tail() {
+    async fn reindexing_with_fewer_chunks_leaves_no_stale_generation() {
         // RA-42: the old code upserted `doc:0..n` and never deleted `doc:n..`.
-        let (store, embedder, cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
 
-        let long = index(&store, &embedder, &cfg, "doc", &prose(30))
-            .await
-            .unwrap();
+        let long = index(&store, &cfg, "doc", &prose(30)).await.unwrap();
         assert!(long >= 6, "need a multi-chunk document, got {long}");
         assert_eq!(store.stored(COLLECTION, "doc"), range(long));
 
-        let short = index(&store, &embedder, &cfg, "doc", &prose(8))
-            .await
-            .unwrap();
+        let short = index(&store, &cfg, "doc", &prose(8)).await.unwrap();
         assert!(short < long);
         assert_eq!(
             store.stored(COLLECTION, "doc"),
             range(short),
-            "chunks past the new end must be gone"
+            "records of the earlier generation must be gone"
         );
     }
 
     #[tokio::test]
-    async fn stale_tail_is_deleted_only_after_every_upsert_succeeded() {
-        let (store, embedder, mut cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
-        cfg.qdrant_upsert_batch = 2; // several upsert calls
-        cfg.qdrant_upsert_parallelism = 1;
+    async fn the_old_generation_is_deleted_only_after_the_write_succeeded_and_never_the_new_one() {
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
         store.seed(COLLECTION, "doc", 20);
 
-        let n = index(&store, &embedder, &cfg, "doc", &prose(12))
-            .await
-            .unwrap();
+        let n = index(&store, &cfg, "doc", &prose(12)).await.unwrap();
         assert!(n > 2);
 
         let ops = store.ops();
-        let (last, upserts) = ops.split_last().unwrap();
-        assert_eq!(
-            *last,
-            Op::DeleteFrom {
-                collection: COLLECTION.into(),
-                doc_id: "doc".into(),
-                from: n
-            }
-        );
-        assert!(upserts.len() >= 2);
-        assert!(upserts.iter().all(|op| matches!(op, Op::Upsert { .. })));
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        let Op::Write { indexes, .. } = &ops[0] else {
+            panic!("the write comes first: {ops:?}");
+        };
+        assert_eq!(*indexes, range(n));
+        let Op::Forget {
+            collection,
+            doc_id,
+            keep,
+        } = &ops[1]
+        else {
+            panic!("the cleanup comes last: {ops:?}");
+        };
+        assert_eq!((collection.as_str(), doc_id.as_str()), (COLLECTION, "doc"));
+        assert_eq!(keep.len(), n as usize, "keep exactly the new records");
+        assert_eq!(store.stored(COLLECTION, "doc"), range(n));
     }
 
     #[tokio::test]
-    async fn a_failed_upsert_never_deletes_the_previous_chunks() {
-        let (store, embedder, mut cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
-        cfg.qdrant_upsert_batch = 2;
-        cfg.qdrant_upsert_parallelism = 1;
+    async fn a_failed_write_never_deletes_the_previous_chunks() {
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
         store.seed(COLLECTION, "doc", 10);
 
-        // Fail the second upsert call: the first batch is already stored.
-        store.state.lock().fail_upsert_from_call = Some(1);
-        let err = index(&store, &embedder, &cfg, "doc", &prose(12))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DistillError::Qdrant(_)));
+        store.state.lock().fail_write_from_call = Some(0);
+        let err = index(&store, &cfg, "doc", &prose(12)).await.unwrap_err();
+        assert!(matches!(err, DistillError::Backend(_)));
 
         assert!(
-            !store
-                .ops()
-                .iter()
-                .any(|op| matches!(op, Op::DeleteFrom { .. })),
-            "no delete may run when the upsert failed: {:?}",
+            !store.ops().iter().any(|op| matches!(op, Op::Forget { .. })),
+            "no delete may run when the write failed: {:?}",
             store.ops()
         );
         assert_eq!(
@@ -459,6 +381,15 @@ mod tests {
             range(10),
             "the document must not lose chunks because its re-index failed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_cleanup_after_a_good_write_is_an_error_not_a_success() {
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
+        store.seed(COLLECTION, "doc", 3);
+        store.state.lock().fail_forget = true;
+        let err = index(&store, &cfg, "doc", &prose(12)).await.unwrap_err();
+        assert!(matches!(err, DistillError::Backend(_)), "{err}");
     }
 
     #[tokio::test]
@@ -478,81 +409,64 @@ mod tests {
             ("interstitial", stub),
             ("no chunk passes the quality filter", "tiny"),
         ] {
-            let (store, embedder) = (FakeStore::default(), FakeEmbedder::new());
+            let store = FakeStore::default();
             store.seed(COLLECTION, "doc", 7);
-            let n = index(&store, &embedder, &cfg, "doc", content)
-                .await
-                .unwrap();
+            let n = index(&store, &cfg, "doc", content).await.unwrap();
             assert_eq!(n, 0, "{label}");
             assert!(
                 store.stored(COLLECTION, "doc").is_empty(),
                 "{label}: old chunks still stored"
             );
-            assert_eq!(embedder.calls(), 0, "{label}: nothing should be embedded");
+            assert!(
+                store.state.lock().written.is_empty(),
+                "{label}: nothing should be written"
+            );
         }
     }
 
     #[tokio::test]
     async fn skipping_another_document_does_not_touch_this_one() {
-        let (store, embedder, cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
         store.seed(COLLECTION, "keep", 4);
         store.seed(COLLECTION, "skip", 4);
-        index(&store, &embedder, &cfg, "skip", "").await.unwrap();
+        index(&store, &cfg, "skip", "").await.unwrap();
         assert_eq!(store.stored(COLLECTION, "keep"), range(4));
         assert!(store.stored(COLLECTION, "skip").is_empty());
     }
 
     #[tokio::test]
     async fn a_skip_whose_cleanup_fails_is_an_error_not_a_recorded_skip() {
-        let (store, embedder, cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
         store.seed(COLLECTION, "doc", 3);
-        store.state.lock().fail_delete = true;
-        let err = index(&store, &embedder, &cfg, "doc", "").await.unwrap_err();
-        assert!(matches!(err, DistillError::Qdrant(_)));
+        store.state.lock().fail_forget = true;
+        let err = index(&store, &cfg, "doc", "").await.unwrap_err();
+        assert!(matches!(err, DistillError::Backend(_)));
     }
 
     #[tokio::test]
     async fn chunk_indexes_stay_contiguous_when_the_quality_filter_drops_a_middle_chunk() {
         // Three pages -> three chunks; the middle one is a repetition loop.
-        // The survivors must be 0,1 so "delete everything >= n" cannot hit a
-        // live chunk.
-        let (store, embedder, cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
+        // The survivors must be 0,1.
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
         let sep = "\n\n---\n\n";
         let page = prose(3);
         let junk = "a".repeat(200);
         let md = format!("{page}{sep}{junk}{sep}{page}");
         store.seed(COLLECTION, "doc", 6);
 
-        let n = index(&store, &embedder, &cfg, "doc", &md).await.unwrap();
+        let n = index(&store, &cfg, "doc", &md).await.unwrap();
         assert_eq!(n, 2);
         assert_eq!(store.stored(COLLECTION, "doc"), range(2));
         let st = store.state.lock();
-        assert!(st.upserted.iter().all(|c| c.chunk.total_chunks == 2));
-        assert!(st.upserted.iter().all(|c| c.chunk.raw_text != junk));
+        assert!(st.written.iter().all(|c| c.total_chunks == 2));
+        assert!(st.written.iter().all(|c| c.raw_text != junk));
     }
 
     #[tokio::test]
     async fn short_form_collections_keep_short_chunks() {
-        let (store, embedder, cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
         let n = index_with(
             &store,
-            &embedder,
             &cfg,
             "doc",
             "Tiny Title\n\nShort abstract.",
@@ -566,53 +480,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn texts_are_embedded_once_each_with_their_header() {
-        let (store, embedder, cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
-        let n = index(&store, &embedder, &cfg, "doc", &prose(12))
-            .await
-            .unwrap();
-        assert_eq!(embedder.calls(), 1, "one embed call per document");
-        assert_eq!(embedder.embedded_text_count(), n as usize);
-        let texts = embedder.texts.lock();
-        for (i, t) in texts[0].iter().enumerate() {
-            assert!(t.starts_with(&format!("doc > chunk {i}\n\n")), "{t:?}");
+    async fn one_write_per_document_carries_each_chunk_with_its_header() {
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
+        let n = index(&store, &cfg, "doc", &prose(12)).await.unwrap();
+        let st = store.state.lock();
+        assert_eq!(st.write_calls, 1, "one write call per document");
+        assert_eq!(st.written.len(), n as usize);
+        for (i, c) in st.written.iter().enumerate() {
+            assert!(c.text.starts_with(&format!("doc > chunk {i}\n\n")), "{c:?}");
+            assert!(c.text.ends_with(&c.raw_text), "{c:?}");
+            assert!(!c.raw_text.is_empty());
         }
-    }
-
-    #[tokio::test]
-    async fn a_short_embedder_reply_fails_instead_of_dropping_chunks() {
-        let (store, embedder, cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
-        *embedder.short_by.lock() = 1;
-        store.seed(COLLECTION, "doc", 3);
-        let err = index(&store, &embedder, &cfg, "doc", &prose(12))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DistillError::Embedding(_)), "{err}");
-        assert_eq!(store.ops(), [], "nothing may be written");
-        assert_eq!(store.stored(COLLECTION, "doc"), range(3));
-    }
-
-    #[tokio::test]
-    async fn embedder_failure_leaves_the_stored_document_alone() {
-        let (store, embedder, cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
-        *embedder.fail.lock() = Some("cuda oom".into());
-        store.seed(COLLECTION, "doc", 3);
-        assert!(index(&store, &embedder, &cfg, "doc", &prose(12))
-            .await
-            .is_err());
-        assert_eq!(store.stored(COLLECTION, "doc"), range(3));
     }
 
     #[tokio::test]
@@ -623,11 +501,7 @@ mod tests {
         let file = dir.path().join("secret.md");
         std::fs::write(&file, "TOP-SECRET-FILE-CONTENT ".repeat(50)).unwrap();
 
-        let (store, embedder, cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
         index_document(
             IndexJob {
                 doc_id: "secret",
@@ -638,7 +512,6 @@ mod tests {
                 profile: ContentProfile::FullDocument,
             },
             &cfg,
-            &embedder,
             &store,
             |_| {},
         )
@@ -646,20 +519,13 @@ mod tests {
         .unwrap();
 
         let st = store.state.lock();
-        assert!(!st.upserted.is_empty());
-        assert!(st
-            .upserted
-            .iter()
-            .all(|c| !c.chunk.raw_text.contains("TOP-SECRET")));
+        assert!(!st.written.is_empty());
+        assert!(st.written.iter().all(|c| !c.text.contains("TOP-SECRET")));
     }
 
     #[tokio::test]
     async fn catalog_metadata_and_pages_reach_the_chunks() {
-        let (store, embedder, cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
         let catalog = CatalogEntry {
             title: Some("A Real Title".into()),
             doi: Some("10.1/x".into()),
@@ -676,31 +542,24 @@ mod tests {
                 profile: ContentProfile::FullDocument,
             },
             &cfg,
-            &embedder,
             &store,
             |_| {},
         )
         .await
         .unwrap();
         let st = store.state.lock();
-        let meta = &st.upserted[0].chunk.meta;
-        assert_eq!(meta.title.as_deref(), Some("A Real Title"));
-        assert_eq!(meta.doi.as_deref(), Some("10.1/x"));
-        assert_eq!(meta.markdown_path, "markdown/do/doc.md");
-        assert!(embedder.texts.lock()[0][0].starts_with("A Real Title > chunk 0"));
+        let chunk = &st.written[0];
+        assert_eq!(chunk.meta.title.as_deref(), Some("A Real Title"));
+        assert_eq!(chunk.meta.doi.as_deref(), Some("10.1/x"));
+        assert_eq!(chunk.meta.markdown_path, "markdown/do/doc.md");
+        assert!(chunk.text.starts_with("A Real Title > chunk 0"));
     }
 
     #[tokio::test]
     async fn an_invalid_chunker_config_is_an_error_not_a_hang() {
-        let (store, embedder, mut cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
+        let (store, mut cfg) = (FakeStore::default(), small_chunk_config());
         cfg.chunk_max_tokens = 0;
-        let err = index(&store, &embedder, &cfg, "doc", &prose(6))
-            .await
-            .unwrap_err();
+        let err = index(&store, &cfg, "doc", &prose(6)).await.unwrap_err();
         assert!(matches!(err, DistillError::Config(_)));
     }
 
@@ -708,20 +567,14 @@ mod tests {
     async fn llm_metadata_failure_fails_the_document() {
         use crate::testutil::{serve, Reply};
         let fake = serve(|_| Reply::Json(200, r#"{"response":"no json here"}"#.into())).await;
-        let (store, embedder, mut cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
+        let (store, mut cfg) = (FakeStore::default(), small_chunk_config());
         cfg.llm_metadata = true;
         cfg.ollama_url = fake.url();
         store.seed(COLLECTION, "doc", 3);
 
-        let err = index(&store, &embedder, &cfg, "doc", &prose(6))
-            .await
-            .unwrap_err();
+        let err = index(&store, &cfg, "doc", &prose(6)).await.unwrap_err();
         assert!(matches!(err, DistillError::Metadata(_)), "{err}");
-        assert_eq!(embedder.calls(), 0);
+        assert!(store.state.lock().written.is_empty());
         assert_eq!(store.stored(COLLECTION, "doc"), range(3));
     }
 
@@ -735,19 +588,13 @@ mod tests {
             )
         })
         .await;
-        let (store, embedder, mut cfg) = (
-            FakeStore::default(),
-            FakeEmbedder::new(),
-            small_chunk_config(),
-        );
+        let (store, mut cfg) = (FakeStore::default(), small_chunk_config());
         cfg.llm_metadata = true;
         cfg.ollama_url = fake.url();
 
-        index(&store, &embedder, &cfg, "doc", &prose(6))
-            .await
-            .unwrap();
+        index(&store, &cfg, "doc", &prose(6)).await.unwrap();
         let st = store.state.lock();
-        assert_eq!(st.upserted[0].chunk.meta.keywords, ["k"]);
-        assert_eq!(st.upserted[0].chunk.meta.topics, ["t"]);
+        assert_eq!(st.written[0].meta.keywords, ["k"]);
+        assert_eq!(st.written[0].meta.topics, ["t"]);
     }
 }

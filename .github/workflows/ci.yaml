@@ -82,9 +82,9 @@ jobs:
       - run: cargo clippy --locked -p hs-scribe -- -D warnings
       - run: cargo test --locked --workspace --exclude hs-scribe
 
-      # `hs-scribe --features server` and `hs-distill --features server`/`cuda`
+      # `hs-scribe --features server` and `hs-distill --features server`
       # are not part of the workspace invocations above (the `server`-gated
-      # modules — qdrant, server, embed::onnx, the HTTP handlers — only
+      # modules — the myelin store, the HTTP server and its handlers — only
       # compile with the feature). Linux only: that is where release.yaml
       # builds the distill server; the scribe server is also checked on macOS
       # below because release.yaml ships it from there too.
@@ -109,10 +109,9 @@ jobs:
       - run: cargo test --locked -p hs-scribe --features eval --lib eval
         if: matrix.os == 'big'
       # Exactly the feature set release.yaml builds for hs-distill-server
-      # (`--features cuda`, which implies `server`). Compiling is the point:
-      # it needs no GPU, but it does need the pyke ORT CUDA bundle download
-      # that the release build also performs.
-      - run: cargo clippy --locked -p hs-distill --features cuda --all-targets -- -D warnings
+      # (`--features server`). It needs no GPU: embedding runs in ollama,
+      # behind the myelin store.
+      - run: cargo clippy --locked -p hs-distill --features server --all-targets -- -D warnings
         if: matrix.os == 'big'
       - run: cargo test --locked -p hs-distill --features server --lib
         if: matrix.os == 'big'

@@ -155,7 +155,7 @@ struct ListParams {
     #[schemars(description = "Number of items to skip (default: 0)")]
     offset: Option<usize>,
     #[schemars(
-        description = "catalog_list only: filter by embedded-in-Qdrant state. true=only embedded, false=only not-yet-embedded, omit=all."
+        description = "catalog_list only: filter by embedded-in-the-myelin-store state. true=only embedded, false=only not-yet-embedded, omit=all."
     )]
     embedded: Option<bool>,
 }
@@ -1594,7 +1594,7 @@ impl HomeStillMcp {
     // ── Catalog Tools ──────────────────────────────────────────
 
     #[tool(
-        description = "List all papers in the catalog with titles, conversion status, and embedded-in-Qdrant status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed. Flag semantics: `converted` is true iff markdown exists. `conversion_failed` is null, or `{reason, kind}` when the conversion was given up on: `kind` is `retryable` (a backend failed on the document; `hs pipeline reconvert-failed` re-queues it), `bad_source` (the source can never convert) or `unclassified`. `embedded` is true only when Qdrant actually received chunks (`chunks_indexed > 0`).",
+        description = "List all papers in the catalog with titles, conversion status, and embedded-in-the-myelin-store status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed. Flag semantics: `converted` is true iff markdown exists. `conversion_failed` is null, or `{reason, kind}` when the conversion was given up on: `kind` is `retryable` (a backend failed on the document; `hs pipeline reconvert-failed` re-queues it), `bad_source` (the source can never convert) or `unclassified`. `embedded` is true only when the myelin store actually received chunks (`chunks_indexed > 0`).",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2559,7 +2559,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Semantic search over downloaded papers' abstracts. Targets the `paper_abstracts` Qdrant collection — one point per paper (not per chunk), embedded from `{title}\\n\\n{abstract}` where the abstract is sourced from the local OpenAlex catalog (preferred), the paper's catalog abstract, or the converted markdown's `## Abstract` section; papers with no usable abstract are not indexed. Higher-precision than `distill_search` for 'find me the paper that argues X' queries because body-section noise (methods, references, citations) is excluded. Returns ranked hits with score, title, doi, year, and the embedded abstract text.",
+        description = "Semantic search over downloaded papers' abstracts. Targets the `paper_abstracts` collection of the myelin store — one record per paper (not per chunk), embedded from `{title}\\n\\n{abstract}` where the abstract is sourced from the local OpenAlex catalog (preferred), the paper's catalog abstract, or the converted markdown's `## Abstract` section; papers with no usable abstract are not indexed. Higher-precision than `distill_search` for 'find me the paper that argues X' queries because body-section noise (methods, references, citations) is excluded. Returns ranked hits with score, title, doi, year, and the embedded abstract text.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2601,7 +2601,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Get distill system status: Qdrant collection info, document/chunk counts, compute device, server version.",
+        description = "Get distill system status: myelin store collection info, document/chunk counts, compute device (where the embedding model runs), server version.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2690,7 +2690,7 @@ impl HomeStillMcp {
     // write path through MCP.
 
     #[tool(
-        description = "Reports Qdrant doc_ids whose markdown object is missing. DRY-RUN ONLY from MCP: the delete path was removed in rc.306 — use `hs distill reconcile --reembed` or `hs distill purge <doc_id>` for the write path. Any `dry_run=false` argument is ignored with a notice in the response.",
+        description = "Reports doc_ids in the myelin store whose markdown object is missing. DRY-RUN ONLY from MCP: the delete path was removed in rc.306 — use `hs distill reconcile --reembed` or `hs distill purge <doc_id>` for the write path. Any `dry_run=false` argument is ignored with a notice in the response.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -3524,12 +3524,12 @@ impl HomeStillMcp {
                     embed_model: embed_model.clone(),
                     qdrant_version: health
                         .as_ref()
-                        .map(|h| h.qdrant_version.clone())
+                        .map(|h| h.backend_version.clone())
                         .unwrap_or_default(),
                     // Served only by the token-protected /status.
                     qdrant_url: status
                         .as_ref()
-                        .map(|s| s.qdrant_url.clone())
+                        .map(|s| s.myelin_url.clone())
                         .unwrap_or_default(),
                 });
             }

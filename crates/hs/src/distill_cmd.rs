@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use hs_common::auth::client::is_cloud_url;
-use hs_common::compose::{check_command, wait_for_url, ComposeCmd};
+use hs_common::compose::{wait_for_url, ComposeCmd};
 use hs_common::global_args::{GlobalArgs, OutputFormat};
 use hs_common::reporter::Reporter;
 use hs_distill::cli::DistillCmd;
@@ -61,8 +61,6 @@ pub(crate) async fn compose_step(compose: &ComposeCmd, args: &[&str]) -> Result<
         errors.join("; ")
     )
 }
-const QDRANT_REST_PORT: u16 = 6333;
-const QDRANT_GRPC_PORT: u16 = 6334;
 
 pub(crate) async fn resolve_servers(cli_server: Option<&str>) -> Result<Vec<String>> {
     if let Some(s) = cli_server {
@@ -74,66 +72,12 @@ pub(crate) async fn resolve_servers(cli_server: Option<&str>) -> Result<Vec<Stri
     Ok(DistillClientConfig::load()?.require_servers()?.to_vec())
 }
 
-fn distill_compose_path() -> Result<PathBuf> {
-    Ok(hs_common::hidden_dir()?.join("docker-compose-distill.yml"))
-}
-
 fn distill_pid_path() -> Result<PathBuf> {
     Ok(hs_common::hidden_dir()?.join("distill-server.pid"))
 }
 
 /// Executable name of the native distill server a PID file points at.
 const DISTILL_SERVER_EXE: &str = "hs-distill-server";
-
-/// Where the native server's `FASTEMBED_CACHE_DIR` points when the
-/// environment doesn't say: beside the binary if an older version cached its
-/// model there, else `~/.home-still/fastembed_cache`. fastembed would
-/// otherwise default to `CWD/.fastembed_cache`, which breaks under systemd
-/// (CWD = `/`).
-fn fastembed_cache_dir(binary: &Path) -> Result<String> {
-    if let Ok(dir) = std::env::var("FASTEMBED_CACHE_DIR") {
-        return Ok(dir);
-    }
-    let beside_binary = binary.parent().unwrap_or(binary).join(".fastembed_cache");
-    if beside_binary.exists() {
-        return Ok(beside_binary.to_string_lossy().into_owned());
-    }
-    Ok(hs_common::hidden_dir()?
-        .join("fastembed_cache")
-        .to_string_lossy()
-        .into_owned())
-}
-
-/// Convert Qdrant gRPC URL (:6334) to REST URL (:6333) for health checks.
-fn qdrant_rest_from_grpc(grpc_url: &str) -> String {
-    grpc_url.replace(
-        &format!(":{QDRANT_GRPC_PORT}"),
-        &format!(":{QDRANT_REST_PORT}"),
-    )
-}
-
-/// Qdrant's REST base URL, from the distill server's configured gRPC URL.
-pub(crate) fn qdrant_rest_url() -> Result<String> {
-    Ok(qdrant_rest_from_grpc(
-        &DistillServerConfig::load()?.qdrant_url,
-    ))
-}
-
-fn distill_compose_yaml(data_dir: &std::path::Path) -> String {
-    format!(
-        r#"services:
-  qdrant:
-    image: docker.io/qdrant/qdrant:latest
-    ports:
-      - "{QDRANT_REST_PORT}:{QDRANT_REST_PORT}"
-      - "{QDRANT_GRPC_PORT}:{QDRANT_GRPC_PORT}"
-    volumes:
-      - {}:/qdrant/storage
-    restart: on-failure:3
-"#,
-        data_dir.display()
-    )
-}
 
 fn find_distill_binary() -> Result<Option<PathBuf>> {
     // Check ~/.local/bin (install script location)
@@ -172,7 +116,6 @@ pub async fn dispatch(
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
     match cmd {
-        DistillCmd::Init { force } => cmd_init(force, reporter).await,
         DistillCmd::Index {
             force,
             file,
@@ -193,14 +136,6 @@ pub async fn dispatch(
             server,
         } => cmd_search(&query, limit, year, topic, server.as_deref(), global).await,
         DistillCmd::Status { server } => cmd_status(server.as_deref(), reporter).await,
-        DistillCmd::Hnsw {
-            action:
-                hs_distill::cli::HnswCmd::Enable {
-                    collection,
-                    yes,
-                    server,
-                },
-        } => cmd_hnsw_enable(&collection, yes, server.as_deref(), reporter).await,
         DistillCmd::WatchEvents { server } => cmd_watch_events(server, reporter).await,
         DistillCmd::Diagnose { stem, verbose } => cmd_diagnose(&stem, verbose, reporter).await,
         DistillCmd::Reconcile {
@@ -208,9 +143,6 @@ pub async fn dispatch(
             reembed,
             server,
         } => cmd_reconcile(fix_stamps, reembed, server.as_deref(), reporter).await,
-        DistillCmd::BackfillTitles { apply, server } => {
-            cmd_backfill_titles(apply, server.as_deref(), reporter).await
-        }
         DistillCmd::Purge { doc_id, server } => {
             cmd_purge(&doc_id, server.as_deref(), reporter).await
         }
@@ -224,236 +156,6 @@ pub async fn dispatch(
             hs_distill::cli::AbstractsCmd::Status => cmd_abstracts_status(reporter).await,
         },
     }
-}
-
-// ── Backfill titles (driver) ───────────────────────────────────────
-
-/// How many documents' markdown are read at once when deriving titles.
-///
-/// The corpus is ~15,000 documents; a serial read over S3 takes minutes,
-/// and the read is I/O-bound, so the concurrency is what makes the
-/// command usable.
-const MARKDOWN_FETCH_CONCURRENCY: usize = 24;
-
-/// How many documents' titles are written at once.
-///
-/// The write is one round trip to the distill server per document, so
-/// the backfill of thousands of documents takes hours when they are
-/// written one at a time. But the writes land in the same Qdrant
-/// collection the live indexer is writing to, and too many at once make
-/// Qdrant time out — measured, 16 concurrent writes produced 207
-/// timeouts, and 4 completed the same work without one.
-const TITLE_WRITE_CONCURRENCY: usize = 4;
-
-/// Write the titles the catalog holds onto the points that lack them.
-///
-/// A document's title is copied from its catalog row into the Qdrant
-/// payload at index time. A document indexed before its catalog row
-/// existed was indexed with no title, and it stays that way: the corpus is
-/// not re-indexed. This writes the catalog's title onto the document's
-/// points. The **vector is untouched** — it is a payload update, not a
-/// re-embed, so it needs no GPU and no embedding model.
-///
-/// Dry-run by default. Documents the catalog does not know are reported
-/// as untitled, never given a placeholder: a title that looks like a
-/// title but is not one is worse than no title.
-async fn cmd_backfill_titles(
-    apply: bool,
-    server_override: Option<&str>,
-    reporter: &Arc<dyn Reporter>,
-) -> Result<()> {
-    use hs_distill::backfill::{plan, untitled};
-    use std::collections::BTreeMap;
-
-    let cfg = DistillClientConfig::load().context("loading distill client config")?;
-    let storage = cfg.build_storage().context("building storage backend")?;
-
-    let server_url = match server_override {
-        Some(s) => s.to_string(),
-        None => cfg.require_servers()?[0].clone(),
-    };
-    let distill = make_distill_client(&server_url).await?;
-
-    reporter.status("Scan", "reading the titles stored on the indexed points");
-    let payload: BTreeMap<String, Option<String>> = distill
-        .payload_titles()
-        .await
-        .context("reading the indexed points' titles")?;
-    reporter.status("Qdrant", &format!("{} indexed docs", payload.len()));
-
-    reporter.status("Scan", "reading the catalog");
-    let triples = hs_common::catalog::list_catalog_entries_via(&*storage, "catalog")
-        .await
-        .context("listing catalog entries")?;
-    let mut catalog: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for (stem, _, entry) in triples {
-        catalog.insert(stem, entry.title);
-    }
-    reporter.status("Catalog", &format!("{} entries", catalog.len()));
-
-    // The catalog knows far fewer documents than the corpus holds (measured:
-    // 57 % of the title-less documents have no catalog row at all), so the
-    // document's own text is the second source. The catalog wins where it
-    // has a title — it is supplied, while the first line is a guess.
-    //
-    // Only the documents that need a title are read: the corpus is ~15,000
-    // documents, and reading all of them to fix the ~8,000 that have no
-    // title costs minutes for nothing.
-    reporter.status("Scan", "deriving titles from the documents' own text");
-    let mut derived: BTreeMap<String, Option<String>> = BTreeMap::new();
-    {
-        use futures::stream::{self, StreamExt};
-        use std::time::Duration;
-        let paths = distill.payload_markdown_paths().await?;
-        // The documents that need a title: those with none, and those
-        // whose stored title carries the converter's markup or is an
-        // artifact. A document the catalog can title needs no markdown
-        // read at all — the catalog is the source, and it is already
-        // in hand.
-        let needs_title: std::collections::BTreeSet<String> = payload
-            .iter()
-            .filter(|(doc_id, t)| {
-                let has_title = t.as_ref().is_some_and(|t| !t.trim().is_empty());
-                let improvable = t.as_ref().is_some_and(|t| {
-                    hs_distill::backfill::is_unusable_title(t)
-                        || hs_distill::metadata::has_markup(t)
-                });
-                if has_title && !improvable {
-                    return false;
-                }
-                // The catalog is enough for a document it knows.
-                !catalog
-                    .get(*doc_id)
-                    .and_then(|t| t.as_ref())
-                    .is_some_and(|t| !t.trim().is_empty())
-            })
-            .map(|(doc_id, _)| doc_id.clone())
-            .collect();
-        reporter.status(
-            "Scan",
-            &format!("{} documents need a title", needs_title.len()),
-        );
-        let mut stream = stream::iter(
-            paths
-                .into_iter()
-                .filter(|(doc_id, _)| needs_title.contains(doc_id))
-                .map(|(doc_id, path)| {
-                    let storage = storage.clone();
-                    async move {
-                        let res =
-                            tokio::time::timeout(Duration::from_secs(15), storage.get(&path)).await;
-                        (doc_id, res)
-                    }
-                }),
-        )
-        .buffer_unordered(MARKDOWN_FETCH_CONCURRENCY);
-        while let Some((doc_id, res)) = stream.next().await {
-            let title = match res {
-                Ok(Ok(bytes)) => {
-                    hs_distill::metadata::title_from_markdown(&String::from_utf8_lossy(&bytes))
-                }
-                // A document whose markdown cannot be read is reported as
-                // untitled, not as an error: the backfill's job is to fill
-                // what it can and name what it cannot.
-                _ => None,
-            };
-            derived.insert(doc_id, title);
-        }
-    }
-
-    // How good is the derived title? A title taken from the document's
-    // own first line is a guess, and a guess that reads like a body
-    // sentence is worse than no title: it puts a plausible-looking wrong
-    // value into every search result that cites the document. The share
-    // of titles that end in a full stop is the tell, so it is reported.
-    let derived_titles: Vec<&String> = derived.values().filter_map(|t| t.as_ref()).collect();
-    let sentence_like = derived_titles
-        .iter()
-        .filter(|t| t.trim_end().ends_with('.') && t.split_whitespace().count() > 6)
-        .count();
-
-    let planned = plan(&payload, &catalog, &derived);
-    let untitled = untitled(&payload);
-    let fixable = planned.len();
-    // Documents with no title that neither the catalog nor the document's
-    // own text can title.
-    let unfillable = untitled.len().saturating_sub(fixable);
-    // Where each written title comes from, so the report says which
-    // source did the work.
-    let from_catalog = planned
-        .iter()
-        .filter(|b| {
-            catalog
-                .get(&b.doc_id)
-                .and_then(|t| t.as_ref())
-                .is_some_and(|t| !t.trim().is_empty())
-        })
-        .count();
-    let from_document = fixable.saturating_sub(from_catalog);
-
-    reporter.status(
-        "Plan",
-        &format!(
-            "would fix {fixable} (catalog {from_catalog}, own text {from_document})  \
-             untitled-and-unfillable {unfillable}"
-        ),
-    );
-    reporter.status(
-        "Quality",
-        &format!(
-            "derived titles {sentence_like} of {} read as a body sentence, not a title",
-            derived_titles.len()
-        ),
-    );
-
-    if !apply {
-        let sample: Vec<&str> = planned.iter().take(10).map(|b| b.doc_id.as_str()).collect();
-        reporter.finish(&format!(
-            "Dry run: would set the title on {fixable} doc(s) ({from_catalog} from the \
-             catalog, {from_document} from the document's own text); {unfillable} doc(s) have \
-             no title in either source and stay untitled. Samples: {sample:?}. \
-             Pass --apply to write."
-        ));
-        return Ok(());
-    }
-
-    // Write concurrently: the corpus is thousands of documents and each
-    // write is a round trip to the server, so a serial loop takes hours.
-    use futures::stream::{self, StreamExt};
-    let mut written = 0u64;
-    let mut points = 0u64;
-    let mut failures: Vec<String> = Vec::new();
-    let mut stream = stream::iter(planned.iter().filter_map(|b| {
-        let title = b.title.as_deref()?;
-        let distill = distill.clone();
-        let doc_id = b.doc_id.clone();
-        Some(async move {
-            let res = distill.set_title(&doc_id, title).await;
-            (doc_id, res)
-        })
-    }))
-    .buffer_unordered(TITLE_WRITE_CONCURRENCY);
-    while let Some((doc_id, res)) = stream.next().await {
-        match res {
-            Ok(n) => {
-                written += 1;
-                points += n;
-            }
-            Err(e) => failures.push(format!("{doc_id}: {e:#}")),
-        }
-    }
-    failures.sort();
-
-    reporter.finish(&format!(
-        "Backfilled titles on {written} doc(s), {points} point(s). {unfillable} doc(s) remain \
-         untitled (no title in the catalog and none their own text yields).{}",
-        if failures.is_empty() {
-            String::new()
-        } else {
-            format!(" Failures: {}", failures.join("; "))
-        }
-    ));
-    Ok(())
 }
 
 async fn cmd_purge(doc_id: &str, server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -614,8 +316,8 @@ async fn build_abstract_row(
     if result.chunks_indexed == 0 {
         // Server returned success but produced 0 chunks (the pipeline's
         // quality filter dropped them, or the chunker emitted nothing
-        // usable). Don't stamp — the catalog must never lie about Qdrant
-        // state.
+        // usable). Don't stamp — the catalog must never lie about what the
+        // store holds.
         anyhow::bail!("distill produced 0 chunks — not stamping");
     }
     hs_common::catalog::update_abstract_embed_catalog_via(
@@ -630,7 +332,7 @@ async fn build_abstract_row(
     Ok(AbstractRow::Indexed(coalesced.source))
 }
 
-/// Build the `paper_abstracts` Qdrant collection from every catalog entry.
+/// Build the `paper_abstracts` collection from every catalog entry.
 ///
 /// Per the abstracts plan: coalesce (OpenAlex DuckDB, then the catalog's
 /// provider abstract, then markdown `## Abstract`), embed `title + abstract` via the
@@ -717,7 +419,7 @@ async fn cmd_abstracts_build(
 }
 
 /// Report `paper_abstracts` coverage from catalog stamps. Does not touch
-/// Qdrant — pure catalog-walk so it's safe to run while distill is busy.
+/// the store — pure catalog-walk so it's safe to run while distill is busy.
 async fn cmd_abstracts_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
     const CATALOG_PREFIX: &str = "catalog";
     let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -804,106 +506,12 @@ pub(crate) async fn cmd_watch_events(
     .await
 }
 
-// ── Init ────────────────────────────────────────────────────────
-
-async fn cmd_init(force: bool, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let config = DistillServerConfig::load()?;
-    let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
-
-    // Step 1: Check Qdrant availability
-    reporter.status("Step 1/3", "Checking Qdrant availability");
-    let qdrant_reachable = probe_ok(&format!("{qdrant_rest}/healthz")).await?;
-
-    if qdrant_reachable && !force {
-        reporter.status("Qdrant", &format!("already reachable at {qdrant_rest}"));
-    } else {
-        // Need Docker for Qdrant
-        let compose = ComposeCmd::detect().await;
-        if compose.is_none() {
-            if cfg!(target_os = "macos") && check_command("brew", &["--version"]).await {
-                anyhow::bail!(
-                    "No container runtime found. Install with:\n  \
-                     brew install podman docker-compose\n  \
-                     podman machine init && podman machine start"
-                );
-            }
-            anyhow::bail!(
-                "No container runtime found. Install Docker or Podman:\n  \
-                 https://docs.docker.com/get-docker/"
-            );
-        }
-        let compose = compose.unwrap();
-        reporter.status(
-            "Runtime",
-            &format!("{} {}", compose.bin, compose.args_prefix.join(" ")),
-        );
-
-        // Step 2: Write compose config
-        reporter.status("Step 2/3", "Docker Compose config");
-        let compose_path = distill_compose_path()?;
-
-        if compose_path.exists() && !force {
-            reporter.status("Config", "already exists");
-        } else {
-            std::fs::create_dir_all(hs_common::hidden_dir()?)?;
-            std::fs::create_dir_all(&config.qdrant_data_dir)?;
-            std::fs::write(&compose_path, distill_compose_yaml(&config.qdrant_data_dir))?;
-
-            reporter.status("Written", &format!("{}", compose_path.display()));
-        }
-
-        // Step 3: Start Qdrant
-        reporter.status("Step 3/3", "Starting Qdrant");
-        let cf = compose_path.to_string_lossy().to_string();
-        compose_step(&compose, &["-f", &cf, "up", "-d"]).await?;
-        wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
-        reporter.status("Qdrant", "OK");
-    }
-
-    // Check for distill binary
-    if find_distill_binary()?.is_none() {
-        reporter.warn(
-            "hs-distill-server binary not found. Build with:\n  \
-             HS_RELEASE_TAG=<tag> cargo build --release -p hs-distill --features server,cuda\n  \
-             (the `cuda` feature is required — the binary refuses to compile without it).",
-        );
-    } else {
-        reporter.status("Binary", "hs-distill-server found");
-    }
-
-    reporter.finish("Ready! Run: hs distill server start");
-    Ok(())
-}
-
 // ── Server ──────────────────────────────────────────────────────
 
 pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let config = DistillServerConfig::load()?;
-    let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
 
-    // 1. Start Qdrant container if compose file exists
-    let compose_path = distill_compose_path()?;
-    if compose_path.exists() {
-        let compose = ComposeCmd::detect()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("No container runtime found. Run: hs distill init"))?;
-        let cf = compose_path.to_string_lossy().to_string();
-        compose_step(&compose, &["-f", &cf, "up", "-d"]).await?;
-        wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
-        reporter.status("Qdrant", "OK");
-    } else {
-        // No compose file — check if Qdrant is reachable anyway
-        let reachable = probe_ok(&format!("{qdrant_rest}/healthz")).await?;
-        if !reachable {
-            anyhow::bail!(
-                "Qdrant not reachable at {qdrant_rest} and no compose config found.\n\
-                 Run: hs distill init"
-            );
-        }
-        reporter.status("Qdrant", &format!("reachable at {qdrant_rest}"));
-    }
-
-    // 2. Stop any existing distill server (e.g. orphaned from a previous run)
+    // 1. Stop any existing distill server (e.g. orphaned from a previous run)
     let pid_path = distill_pid_path()?;
     match crate::daemon::stop_pid_file_process(&pid_path, DISTILL_SERVER_EXE, &[]).await {
         crate::daemon::StopOutcome::Stopped(pid) => {
@@ -920,7 +528,7 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let binary = find_distill_binary()?.ok_or_else(|| {
         anyhow::anyhow!(
             "hs-distill-server binary not found. Build with:\n  \
-             HS_RELEASE_TAG=<tag> cargo build --release -p hs-distill --features server,cuda"
+             HS_RELEASE_TAG=<tag> cargo build --release -p hs-distill --features server"
         )
     })?;
 
@@ -933,21 +541,7 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
         .open(&log_path)?;
     let log_err = log_file.try_clone()?;
 
-    // Ensure ONNX Runtime CUDA provider .so files can be found at runtime.
-    // They live in the ort cache dir alongside the static lib. The scribe
-    // server gets the same path from the same place: a service that
-    // loads the CUDA provider and does not have this path fails to load
-    // it, and the failure reads as "the execution provider could not be
-    // registered", not as a missing loader path.
-    let ld_path = hs_common::cuda_libs::cuda_ld_library_path(
-        &std::env::var("LD_LIBRARY_PATH").unwrap_or_default(),
-    );
-
-    let fastembed_cache = fastembed_cache_dir(&binary)?;
-
     let child = std::process::Command::new(&binary)
-        .env("LD_LIBRARY_PATH", &ld_path)
-        .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
         .stdout(log_file)
         .stderr(log_err)
         .stdin(std::process::Stdio::null())
@@ -983,7 +577,6 @@ pub async fn cmd_server_start(reporter: &Arc<dyn Reporter>) -> Result<()> {
 }
 
 pub async fn cmd_server_stop(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    // 1. Stop native distill server
     let pid_path = distill_pid_path()?;
     match crate::daemon::stop_pid_file_process(&pid_path, DISTILL_SERVER_EXE, &[]).await {
         crate::daemon::StopOutcome::Stopped(pid) => {
@@ -1000,72 +593,20 @@ pub async fn cmd_server_stop(reporter: &Arc<dyn Reporter>) -> Result<()> {
         crate::daemon::StopOutcome::NoPidFile => reporter.status("Distill", "not running"),
     }
 
-    // 2. Stop Qdrant container
-    let compose_path = distill_compose_path()?;
-    if compose_path.exists() {
-        match ComposeCmd::detect().await {
-            Some(compose) => {
-                let cf = compose_path.to_string_lossy().to_string();
-                compose_step(&compose, &["-f", &cf, "down"]).await?;
-                reporter.status("Qdrant", "stopped");
-            }
-            None => reporter.warn(&format!(
-                "{} exists but no container runtime was found; Qdrant was not stopped",
-                compose_path.display()
-            )),
-        }
-    }
-
     Ok(())
 }
 
 // ── Public API for `hs serve` ──────────────────────────────────
 
-/// Idempotent init: ensures Qdrant and compose config are ready.
-/// Skips steps that are already done. Does NOT start the distill server.
-pub async fn ensure_init(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    cmd_init(false, reporter).await
-}
-
 /// Start the distill server in the foreground (blocks until shutdown).
 /// Runs the native binary directly instead of as a background daemon.
 pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let config = DistillServerConfig::load()?;
-    let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
-
-    // Ensure Qdrant is running
-    let compose_path = distill_compose_path()?;
-    if compose_path.exists() {
-        let compose = ComposeCmd::detect()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("No container runtime found. Run: hs distill init"))?;
-        let cf = compose_path.to_string_lossy().to_string();
-        compose_step(&compose, &["-f", &cf, "up", "-d"]).await?;
-        hs_common::compose::wait_for_url(&format!("{qdrant_rest}/healthz"), 60, "Qdrant").await?;
-        reporter.status("Qdrant", "OK");
-    } else {
-        let reachable = probe_ok(&format!("{qdrant_rest}/healthz")).await?;
-        if !reachable {
-            anyhow::bail!(
-                "Qdrant not reachable at {qdrant_rest} and no compose config found.\n\
-                 Run: hs distill init"
-            );
-        }
-    }
-
     let binary = find_distill_binary()?.ok_or_else(|| {
         anyhow::anyhow!(
             "hs-distill-server binary not found. Build with:\n  \
-             HS_RELEASE_TAG=<tag> cargo build --release -p hs-distill --features server,cuda"
+             HS_RELEASE_TAG=<tag> cargo build --release -p hs-distill --features server"
         )
     })?;
-
-    // Build environment (same logic as cmd_server_start)
-    let ld_path = hs_common::cuda_libs::cuda_ld_library_path(
-        &std::env::var("LD_LIBRARY_PATH").unwrap_or_default(),
-    );
-
-    let fastembed_cache = fastembed_cache_dir(&binary)?;
 
     reporter.status(
         "Distill",
@@ -1076,7 +617,8 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
     let index_port = port;
     tokio::spawn(async move {
         let check_url = format!("http://localhost:{index_port}/health");
-        // Wait for the server to become healthy (up to 5 minutes for model load)
+        // Wait for the server to become healthy (up to 5 minutes: it starts
+        // only once myelin answers and the embedding model is on the GPU)
         for _ in 0..300 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let up = match probe_ok(&check_url).await {
@@ -1104,8 +646,6 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
 
     // Run in foreground — inherit stdout/stderr, block until exit
     let status = tokio::process::Command::new(&binary)
-        .env("LD_LIBRARY_PATH", &ld_path)
-        .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
         .env("HS_DISTILL_PORT", port.to_string())
         .kill_on_drop(true)
         .status()
@@ -1160,17 +700,6 @@ pub async fn ensure_index_running() -> Result<bool> {
 }
 
 async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let config = DistillServerConfig::load()?;
-    let qdrant_rest = qdrant_rest_from_grpc(&config.qdrant_url);
-
-    // Qdrant health
-    let qdrant_ok = probe_ok(&format!("{qdrant_rest}/healthz")).await?;
-    if qdrant_ok {
-        reporter.status("Qdrant", &format!("OK ({qdrant_rest})"));
-    } else {
-        reporter.error(&format!("Qdrant: not reachable at {qdrant_rest}"));
-    }
-
     // The distill server's liveness.
     //
     // The signal is a **ping**: the server's own `/health` endpoint
@@ -1202,6 +731,7 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
             reporter.status("Server", &running);
             reporter.status("Address", &servers[0]);
             reporter.status("Version", &h.version);
+            reporter.status("Backend", &h.backend_version);
         }
         Err(e) => {
             reporter.error(&format!(
@@ -1215,7 +745,7 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
     match client.status().await {
         Ok(status) => {
             reporter.status("Collection", &status.collection);
-            reporter.status("Points", &status.points_count.to_string());
+            reporter.status("Chunks", &status.points_count.to_string());
             reporter.status("Device", &status.compute_device);
         }
         Err(e) => {
@@ -1855,70 +1385,9 @@ async fn cmd_diagnose(stem: &str, verbose: bool, reporter: &Arc<dyn Reporter>) -
     Ok(())
 }
 
-// ── HNSW ────────────────────────────────────────────────────────
-
-/// `hs distill hnsw enable`: ask the distill server to enable HNSW on one
-/// collection. This starts a background index build over the whole
-/// collection on the shared Qdrant host, so it needs an explicit `--yes`.
-async fn cmd_hnsw_enable(
-    collection: &str,
-    yes: bool,
-    server: Option<&str>,
-    reporter: &Arc<dyn Reporter>,
-) -> Result<()> {
-    let servers = resolve_servers(server).await?;
-    let client = make_distill_client(&servers[0]).await?;
-    hnsw_enable(&client, &servers[0], collection, yes, reporter).await
-}
-
-async fn hnsw_enable(
-    client: &DistillClient,
-    server_url: &str,
-    collection: &str,
-    yes: bool,
-    reporter: &Arc<dyn Reporter>,
-) -> Result<()> {
-    if !yes {
-        reporter.status(
-            "Would enable",
-            &format!(
-                "HNSW on collection `{collection}` via {server_url}: Qdrant would build the \
-                 graph in the background over the whole collection (CPU/disk load on the \
-                 shared host, capped by the server's hnsw.max_indexing_threads)"
-            ),
-        );
-        anyhow::bail!("not submitted: re-run with --yes to start the index build");
-    }
-    let result = client.enable_hnsw(Some(collection)).await.map_err(|e| {
-        match e.downcast_ref::<hs_distill::client::ServerError>() {
-            Some(se) if se.status == reqwest::StatusCode::UNAUTHORIZED => anyhow::anyhow!(
-                "distill rejected the request (401): the backend token is missing or wrong; \
-                 set HS_BACKEND_TOKEN to the token the server was started with"
-            ),
-            _ => e,
-        }
-    })?;
-    if result.submitted {
-        reporter.finish(&format!(
-            "submitted: HNSW enable on `{}` (m={}, ef_construct={}, max_indexing_threads={}); {}",
-            result.collection,
-            result.m,
-            result.ef_construct,
-            result.max_indexing_threads,
-            result.message
-        ));
-    } else {
-        reporter.finish(&format!(
-            "already enabled: `{}` (m={}, ef_construct={}); nothing submitted",
-            result.collection, result.m, result.ef_construct
-        ));
-    }
-    Ok(())
-}
-
 // ── Reconcile (driver) ──────────────────────────────────────────
 
-/// Walk markdown, Qdrant and catalog; heal the divergences that let
+/// Walk markdown, the store and the catalog; heal the divergences that let
 /// phantom "unembedded" docs accumulate. See `hs_distill::reconcile` for
 /// the pure classification logic; this function is the IO driver.
 async fn cmd_reconcile(
@@ -1956,16 +1425,15 @@ async fn cmd_reconcile(
         .collect();
     reporter.status("Markdown", &format!("{} stems", markdown_stems.len()));
 
-    reporter.status("Scan", "fetching indexed doc_ids from Qdrant");
-    // `list_docs` returns the distinct doc_id facet over the entire
-    // collection. 500k is well above our expected corpus size for years.
+    reporter.status("Scan", "fetching indexed doc_ids from the store");
+    // `list_docs` returns every distinct doc_id of the collection. 500k is well above our expected corpus size for years.
     let indexed: HashSet<String> = distill
         .list_docs(500_000)
         .await
-        .context("listing Qdrant doc_ids")?
+        .context("listing indexed doc_ids")?
         .into_iter()
         .collect();
-    reporter.status("Qdrant", &format!("{} indexed docs", indexed.len()));
+    reporter.status("Indexed", &format!("{} docs", indexed.len()));
 
     reporter.status("Scan", "reading catalog entries");
     let catalog_triples = hs_common::catalog::list_catalog_entries_via(&*storage, "catalog")
@@ -2541,7 +2009,7 @@ mod status_tests {
                     "compute_device": "Cuda",
                     "collection": "academic_papers",
                     "version": "0.0.1-rc.374",
-                    "qdrant_version": "1.19.2",
+                    "backend_version": "myelin-mcp 0.1.0",
                     "embed_model": "bge-m3",
                     "pid": pid,
                 }),
@@ -2552,7 +2020,7 @@ mod status_tests {
                     "collection": "academic_papers",
                     "points_count": 445451,
                     "compute_device": "Cuda",
-                    "qdrant_url": "http://localhost:6334",
+                    "myelin_url": "http://127.0.0.1:7462/mcp",
                 }),
             ),
             _ => Response::json(404, &serde_json::json!({})),
@@ -2584,8 +2052,6 @@ mod status_tests {
             "the server's own PID was not reported: {line:?}"
         );
         // The *server* is up, so the command must not say otherwise.
-        // The Qdrant probe is a separate thing — it is not running in
-        // CI — so it is not this test's subject.
         assert!(
             !reporter
                 .errors
@@ -2633,75 +2099,10 @@ mod status_tests {
             .unwrap()
             .iter()
             .any(|e| e.contains("not running"));
-        let reports_points = statuses.iter().any(|(verb, _)| verb == "Points");
+        let reports_points = statuses.iter().any(|(verb, _)| verb == "Chunks");
         assert!(
             !(says_down && reports_points),
             "the report says the server is down and still reports its numbers: {statuses:?}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod hnsw_tests {
-    use super::*;
-    use crate::test_http::{FakeServer, Response};
-
-    fn reporter() -> Arc<dyn Reporter> {
-        Arc::new(hs_common::reporter::SilentReporter)
-    }
-
-    async fn server(status: u16, body: serde_json::Value) -> FakeServer {
-        FakeServer::start(move |_| Response::json(status, &body)).await
-    }
-
-    fn ok_body(submitted: bool) -> serde_json::Value {
-        serde_json::json!({"collection": "academic_papers", "submitted": submitted, "m": 16,
-            "ef_construct": 100, "max_indexing_threads": 4, "message": "building"})
-    }
-
-    #[tokio::test]
-    async fn without_yes_nothing_is_sent_and_the_command_fails() {
-        let s = server(200, ok_body(true)).await;
-        let c = DistillClient::new(&s.base).unwrap();
-        let err = hnsw_enable(&c, &s.base, "academic_papers", false, &reporter())
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("--yes"));
-        assert!(s.requests().is_empty());
-    }
-
-    #[tokio::test]
-    async fn with_yes_the_named_collection_is_posted() {
-        for submitted in [true, false] {
-            let s = server(200, ok_body(submitted)).await;
-            let c = DistillClient::new(&s.base).unwrap();
-            hnsw_enable(&c, &s.base, "academic_papers", true, &reporter())
-                .await
-                .unwrap();
-            let reqs = s.requests();
-            assert_eq!(reqs.len(), 1);
-            assert_eq!(reqs[0].method, "POST");
-            assert_eq!(reqs[0].path, "/collection/hnsw?collection=academic_papers");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_401_names_the_backend_token_and_a_400_is_shown_verbatim() {
-        let s = server(401, serde_json::json!({"error": "unauthorized"})).await;
-        let c = DistillClient::new(&s.base).unwrap();
-        let err = hnsw_enable(&c, &s.base, "x", true, &reporter())
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("HS_BACKEND_TOKEN"), "{err:#}");
-
-        let s = server(400, serde_json::json!({"error": "unknown collection nope"})).await;
-        let c = DistillClient::new(&s.base).unwrap();
-        let err = hnsw_enable(&c, &s.base, "nope", true, &reporter())
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("unknown collection nope"),
-            "{err:#}"
         );
     }
 }

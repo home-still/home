@@ -4,13 +4,7 @@ use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
 pub enum DistillCmd {
-    /// Set up Qdrant and distill server environment
-    Init {
-        /// Re-create compose config even if it exists
-        #[arg(long)]
-        force: bool,
-    },
-    /// Index markdown files into Qdrant via distill server
+    /// Index markdown files into the myelin store via distill server
     Index {
         /// Re-index all documents (ignore cache)
         #[arg(long)]
@@ -49,12 +43,7 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
     },
-    /// Manage HNSW indexing of the Qdrant collections
-    Hnsw {
-        #[command(subcommand)]
-        action: HnswCmd,
-    },
-    /// Show distill system status (Qdrant, server, collection)
+    /// Show distill system status (server, backend, collection)
     Status {
         /// Override server URL
         #[arg(long)]
@@ -78,52 +67,32 @@ pub enum DistillCmd {
         #[arg(long)]
         verbose: bool,
     },
-    /// Reconcile markdown ↔ Qdrant ↔ catalog. Finds docs that were
+    /// Reconcile markdown ↔ myelin store ↔ catalog. Finds docs that were
     /// embedded but lost their catalog stamp (`--fix-stamps` backfills)
-    /// and docs whose markdown exists but never reached Qdrant
+    /// and docs whose markdown exists but never reached the store
     /// (`--reembed` re-indexes). Safe to run anytime: default is dry-run.
     Reconcile {
-        /// Backfill missing `embedding` stamps for docs already in Qdrant
+        /// Backfill missing `embedding` stamps for docs already in the store
         #[arg(long)]
         fix_stamps: bool,
-        /// Re-index markdown that never reached Qdrant
+        /// Re-index markdown that never reached the store
         #[arg(long)]
         reembed: bool,
         /// Override server URL
         #[arg(long)]
         server: Option<String>,
     },
-    /// Backfill missing titles onto indexed points from the catalog.
-    ///
-    /// A document's title is copied from its catalog row into the Qdrant
-    /// payload at index time, so a document indexed before its catalog row
-    /// existed was indexed with no title — and it stays that way, because
-    /// the corpus is not re-indexed. This writes the title the catalog now
-    /// holds onto the document's points. The **vector is untouched**: it is
-    /// a payload update, not a re-embed, so it needs no GPU and no
-    /// embedding model.
-    ///
-    /// Dry-run by default; `--apply` writes. Documents the catalog does
-    /// not know are reported as untitled, never given a placeholder.
-    BackfillTitles {
-        /// Write the titles. Without this, report what would change.
-        #[arg(long)]
-        apply: bool,
-        /// Override server URL
-        #[arg(long)]
-        server: Option<String>,
-    },
-    /// Delete every Qdrant chunk for a doc_id. CLI-only (no MCP) because
-    /// this is a destructive write — use to clear orphaned vectors after
+    /// Delete every stored chunk for a doc_id. CLI-only (no MCP) because
+    /// this is a destructive write — use to clear orphaned chunks after
     /// markdown has been removed, or to force a clean re-index.
     Purge {
-        /// doc_id whose chunks should be deleted from Qdrant
+        /// doc_id whose chunks should be deleted
         doc_id: String,
         /// Override server URL
         #[arg(long)]
         server: Option<String>,
     },
-    /// Manage the `paper_abstracts` Qdrant collection — a per-paper
+    /// Manage the `paper_abstracts` collection — a per-paper
     /// (not per-chunk) embedding of `{title}\n\n{abstract}` for high-
     /// precision semantic search over papers' core arguments. Distinct
     /// from `academic_papers` (per-chunk body text). Abstract source is
@@ -158,21 +127,4 @@ pub enum AbstractsCmd {
     /// Report coverage: total catalog entries vs. abstract_embed stamps
     /// broken down by source (openalex / catalog / markdown).
     Status,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum HnswCmd {
-    /// Enable HNSW on a configured collection. Starts a background
-    /// whole-collection index build on the Qdrant host: requires --yes.
-    Enable {
-        /// Collection name (the server accepts only configured collections)
-        #[arg(long)]
-        collection: String,
-        /// Confirm starting the background index build
-        #[arg(long)]
-        yes: bool,
-        /// Override server URL
-        #[arg(long)]
-        server: Option<String>,
-    },
 }

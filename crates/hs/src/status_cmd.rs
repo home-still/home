@@ -241,7 +241,7 @@ async fn collect_data() -> DashboardData {
 async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
     use serde_json::Value;
 
-    let client = crate::mcp_client::McpClient::from_default_creds().await?;
+    let client = hs_common::mcp_client::McpClient::from_default_creds().await?;
     let called = client
         .call_tool("system_status", Value::Object(Default::default()))
         .await;
@@ -275,9 +275,9 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         .qdrant
         .as_ref()
         .map(|q| {
-            // Prefer the real Qdrant endpoint reported by distill's /health;
+            // Prefer the real myelin endpoint reported by distill's /status;
             // fall back to "gateway" only for older distill servers that
-            // don't yet surface qdrant_url (backward-compat via serde default).
+            // don't yet surface the store URL (backward-compat via serde default).
             let url_part = if q.qdrant_url.is_empty() {
                 "gateway".to_string()
             } else {
@@ -979,7 +979,7 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
         None => (data.qdrant_url.clone(), String::new()),
     };
     rows.push(Row::new(vec![
-        Cell::from("Qdrant"),
+        Cell::from("Store"),
         Cell::from(q_indicator).style(q_style),
         Cell::from(q_status.to_string()),
         Cell::from(q_url),
@@ -1283,7 +1283,7 @@ fn render_history(frame: &mut Frame, area: Rect, data: &DashboardData) {
 
 async fn run_oneshot_json(ndjson: bool) -> Result<()> {
     use serde_json::Value;
-    let client = crate::mcp_client::McpClient::from_default_creds().await?;
+    let client = hs_common::mcp_client::McpClient::from_default_creds().await?;
     let called = client
         .call_tool("system_status", Value::Object(Default::default()))
         .await;
@@ -1372,7 +1372,7 @@ async fn run_oneshot_text() -> Result<()> {
     }
     let qdot = if data.qdrant_healthy { "●" } else { "○" };
     println!(
-        "  {qdot} qdrant   {:<35}  {}",
+        "  {qdot} store    {:<35}  {}",
         data.qdrant_url, data.qdrant_version
     );
     println!();

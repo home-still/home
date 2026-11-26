@@ -117,156 +117,96 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<Recorded> {
     })
 }
 
-// ── In-memory embedder and vector store ────────────────────────────────
+// ── In-memory document store and ollama stand-in ───────────────────────
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 
 use crate::client::SearchHit;
-use crate::collection::CollectionSpec;
-use crate::config::{ComputeDevice, DistillServerConfig, EmbeddingConfig};
-use crate::embed::{Embedder, EmbedderHealth};
+use crate::config::DistillServerConfig;
 use crate::error::DistillError;
-use crate::store::{DocIds, SearchFilter, VectorStore};
-use crate::types::{EmbeddedChunk, EmbeddingOutput, ScrubReport};
+use crate::store::{DocumentStore, SearchFilter};
+use crate::types::{Chunk, ChunkSpan, DocumentMeta};
 
-pub(crate) const FAKE_DIM: usize = 4;
-
-/// Embedder that returns a fixed-width vector per text and records what it
-/// was asked to embed.
-pub(crate) struct FakeEmbedder {
-    pub texts: Mutex<Vec<Vec<String>>>,
-    pub fail: Mutex<Option<String>>,
-    pub health: Mutex<EmbedderHealth>,
-    /// Return this many fewer vectors than texts (to model a short batch).
-    pub short_by: Mutex<usize>,
-    pub slots: usize,
-    /// Panic inside `embed_batch` (to model a bug in the embed path).
-    pub panic: Mutex<bool>,
-}
-
-impl FakeEmbedder {
-    pub fn new() -> Self {
-        Self {
-            texts: Mutex::new(Vec::new()),
-            fail: Mutex::new(None),
-            health: Mutex::new(EmbedderHealth::Healthy),
-            short_by: Mutex::new(0),
-            slots: 2,
-            panic: Mutex::new(false),
-        }
-    }
-
-    pub fn calls(&self) -> usize {
-        self.texts.lock().len()
-    }
-
-    pub fn embedded_text_count(&self) -> usize {
-        self.texts.lock().iter().map(Vec::len).sum()
-    }
-}
-
-#[async_trait]
-impl Embedder for FakeEmbedder {
-    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<EmbeddingOutput>, DistillError> {
-        if *self.panic.lock() {
-            panic!("simulated embedder bug");
-        }
-        if let Some(msg) = self.fail.lock().clone() {
-            return Err(DistillError::Embedding(msg));
-        }
-        let n = texts.len().saturating_sub(*self.short_by.lock());
-        let out = texts
-            .iter()
-            .take(n)
-            .map(|t| EmbeddingOutput {
-                dense: vec![t.len() as f32; FAKE_DIM],
-            })
-            .collect();
-        self.texts.lock().push(texts);
-        Ok(out)
-    }
-
-    fn dimension(&self) -> usize {
-        FAKE_DIM
-    }
-
-    fn device(&self) -> &ComputeDevice {
-        &ComputeDevice::Cuda
-    }
-
-    fn health(&self) -> EmbedderHealth {
-        self.health.lock().clone()
-    }
-
-    fn slots(&self) -> usize {
-        self.slots
-    }
-}
-
+/// What the fake store was asked to do, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Op {
-    Upsert {
+    Write {
         collection: String,
         doc_id: String,
+        /// Chunk indexes, in the order written.
         indexes: Vec<u32>,
     },
-    DeleteFrom {
+    Forget {
         collection: String,
         doc_id: String,
-        from: u32,
-    },
-    Reset {
-        collection: String,
-    },
-    EnableHnsw {
-        collection: String,
-        threads: u64,
-    },
-    Scrub {
-        collection: String,
-        dry_run: bool,
+        keep: Vec<String>,
     },
 }
 
 #[derive(Default)]
 pub(crate) struct StoreState {
-    /// (collection, doc_id) -> stored chunk indexes.
-    pub docs: BTreeMap<(String, String), BTreeSet<u32>>,
+    /// (collection, doc_id) -> every stored record, whatever its generation.
+    pub docs: BTreeMap<(String, String), Vec<(String, Chunk)>>,
     pub ops: Vec<Op>,
-    pub searches: Vec<(String, u64, SearchFilter)>,
-    /// Fail the n-th (0-based) `upsert` call and every later one.
-    pub fail_upsert_from_call: Option<usize>,
-    pub upsert_calls: usize,
-    pub fail_delete: bool,
+    /// (collection, query, limit, filter) of every search.
+    pub searches: Vec<(String, String, u64, SearchFilter)>,
+    /// Fail the n-th (0-based) `write_document` call and every later one.
+    pub fail_write_from_call: Option<usize>,
+    pub write_calls: usize,
+    pub fail_forget: bool,
+    /// Panic inside `write_document` (to model a bug in the write path).
+    pub panic_on_write: bool,
     pub down: bool,
+    /// What `search` returns, in ranking order.
     pub canned_hits: Vec<SearchHit>,
-    /// What the lexical channel returns, and every lexical query it was
-    /// asked. A test asserts on the queries to show the channel ran (or
-    /// did not) and on the hits to show what it contributed.
-    pub canned_lexical_hits: Vec<SearchHit>,
-    pub lexical_searches: Vec<(String, u64)>,
-    /// Collections whose HNSW already matches the configured parameters.
-    pub hnsw_enabled: BTreeSet<String>,
-    /// Every chunk ever upserted, in order.
-    pub upserted: Vec<EmbeddedChunk>,
+    next_record: u64,
+    /// Every chunk ever written, in order.
+    pub written: Vec<Chunk>,
 }
 
-/// In-memory [`VectorStore`]: tracks which chunk indexes each document has,
-/// so tests can assert what is actually stored after a sequence of calls.
+/// In-memory [`DocumentStore`]: tracks which records each document has, so
+/// tests can assert what is actually stored after a sequence of calls.
 #[derive(Default)]
 pub(crate) struct FakeStore {
     pub state: Mutex<StoreState>,
 }
 
+/// A chunk with no header, for seeding records.
+pub(crate) fn blank_chunk(doc_id: &str, index: u32) -> Chunk {
+    Chunk {
+        doc_id: doc_id.into(),
+        chunk_index: index,
+        total_chunks: 0,
+        text: String::new(),
+        raw_text: String::new(),
+        span: ChunkSpan {
+            line_start: 0,
+            line_end: 0,
+            char_start: 0,
+            char_end: 0,
+        },
+        page: None,
+        meta: DocumentMeta::default(),
+    }
+}
+
+impl StoreState {
+    fn new_record(&mut self) -> String {
+        self.next_record += 1;
+        format!("record-{}", self.next_record)
+    }
+}
+
 impl FakeStore {
+    /// Chunk indexes of the records stored for `doc_id`, in storage order.
     pub fn stored(&self, collection: &str, doc_id: &str) -> Vec<u32> {
         self.state
             .lock()
             .docs
             .get(&(collection.to_string(), doc_id.to_string()))
-            .map(|s| s.iter().copied().collect())
+            .map(|records| records.iter().map(|(_, c)| c.chunk_index).collect())
             .unwrap_or_default()
     }
 
@@ -275,251 +215,177 @@ impl FakeStore {
     }
 
     pub fn seed(&self, collection: &str, doc_id: &str, chunks: u32) {
-        self.state
-            .lock()
-            .docs
-            .insert((collection.into(), doc_id.into()), (0..chunks).collect());
+        let mut st = self.state.lock();
+        let records = (0..chunks)
+            .map(|i| (st.new_record(), blank_chunk(doc_id, i)))
+            .collect();
+        st.docs.insert((collection.into(), doc_id.into()), records);
     }
 }
 
 #[async_trait]
-impl VectorStore for FakeStore {
+impl DocumentStore for FakeStore {
     async fn health(&self) -> Result<String, DistillError> {
         if self.state.lock().down {
-            return Err(DistillError::Qdrant("qdrant unreachable: refused".into()));
+            return Err(DistillError::Backend("myelin unreachable: refused".into()));
         }
-        Ok("1.0.0".into())
+        Ok("fake-myelin 1.0.0".into())
     }
 
-    async fn upsert(&self, collection: &str, chunks: &[EmbeddedChunk]) -> Result<(), DistillError> {
-        let mut st = self.state.lock();
-        let call = st.upsert_calls;
-        st.upsert_calls += 1;
-        if st.fail_upsert_from_call.is_some_and(|n| call >= n) {
-            return Err(DistillError::Qdrant("upsert failed".into()));
-        }
-        let Some(first) = chunks.first() else {
-            return Ok(());
-        };
-        let doc_id = first.chunk.doc_id.clone();
-        st.upserted.extend(chunks.iter().cloned());
-        let indexes: Vec<u32> = chunks.iter().map(|c| c.chunk.chunk_index).collect();
-        st.docs
-            .entry((collection.to_string(), doc_id.clone()))
-            .or_default()
-            .extend(indexes.iter().copied());
-        st.ops.push(Op::Upsert {
-            collection: collection.into(),
-            doc_id,
-            indexes,
-        });
-        Ok(())
-    }
-
-    async fn delete_chunks_from(
+    async fn write_document(
         &self,
         collection: &str,
         doc_id: &str,
-        from_chunk: u32,
-    ) -> Result<(), DistillError> {
+        chunks: &[Chunk],
+    ) -> Result<Vec<String>, DistillError> {
         let mut st = self.state.lock();
-        if st.fail_delete {
-            return Err(DistillError::Qdrant("delete failed".into()));
+        if st.panic_on_write {
+            panic!("simulated store bug");
         }
-        if let Some(set) = st
-            .docs
-            .get_mut(&(collection.to_string(), doc_id.to_string()))
-        {
-            set.retain(|&i| i < from_chunk);
+        let call = st.write_calls;
+        st.write_calls += 1;
+        if st.fail_write_from_call.is_some_and(|n| call >= n) {
+            return Err(DistillError::Backend("write failed".into()));
         }
-        st.ops.push(Op::DeleteFrom {
+        let mut ids = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let id = st.new_record();
+            ids.push(id.clone());
+            st.docs
+                .entry((collection.to_string(), doc_id.to_string()))
+                .or_default()
+                .push((id, chunk.clone()));
+        }
+        st.written.extend(chunks.iter().cloned());
+        st.ops.push(Op::Write {
             collection: collection.into(),
             doc_id: doc_id.into(),
-            from: from_chunk,
+            indexes: chunks.iter().map(|c| c.chunk_index).collect(),
         });
-        Ok(())
+        Ok(ids)
     }
 
-    async fn doc_chunks(&self, collection: &str, doc_id: &str) -> Result<u64, DistillError> {
-        Ok(self.stored(collection, doc_id).len() as u64)
+    async fn forget_document(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        keep: &[String],
+    ) -> Result<u64, DistillError> {
+        let mut st = self.state.lock();
+        if st.fail_forget {
+            return Err(DistillError::Backend("forget failed".into()));
+        }
+        st.ops.push(Op::Forget {
+            collection: collection.into(),
+            doc_id: doc_id.into(),
+            keep: keep.to_vec(),
+        });
+        let key = (collection.to_string(), doc_id.to_string());
+        let Some(records) = st.docs.get_mut(&key) else {
+            return Ok(0);
+        };
+        let before = records.len();
+        records.retain(|(id, _)| keep.contains(id));
+        let removed = (before - records.len()) as u64;
+        if records.is_empty() {
+            st.docs.remove(&key);
+        }
+        Ok(removed)
     }
 
     async fn search(
         &self,
         collection: &str,
-        _vector: Vec<f32>,
+        query: &str,
         limit: u64,
         filter: &SearchFilter,
-    ) -> Result<Vec<(String, SearchHit)>, DistillError> {
+    ) -> Result<Vec<SearchHit>, DistillError> {
         let mut st = self.state.lock();
-        st.searches.push((collection.into(), limit, filter.clone()));
-        // The point id is the doc id, so a hit the fake store returns in
-        // both channels is the same point — which is what lets a test show
-        // the two channels agreeing on one document.
+        st.searches
+            .push((collection.into(), query.into(), limit, filter.clone()));
         Ok(st
             .canned_hits
             .iter()
-            .map(|h| (h.doc_id.clone(), h.clone()))
+            .take(limit as usize)
+            .cloned()
             .collect())
     }
 
-    async fn lexical_search(
-        &self,
-        _collection: &str,
-        query: &str,
-        limit: u64,
-        _filter: &SearchFilter,
-    ) -> Result<Vec<(String, SearchHit)>, DistillError> {
-        let mut st = self.state.lock();
-        st.lexical_searches.push((query.to_string(), limit));
-        Ok(st
-            .canned_lexical_hits
-            .iter()
-            .map(|h| (h.doc_id.clone(), h.clone()))
-            .collect())
-    }
-
-    async fn payload_titles(
+    async fn inventory(
         &self,
         collection: &str,
-    ) -> Result<std::collections::BTreeMap<String, Option<String>>, DistillError> {
-        let st = self.state.lock();
-        let mut out = std::collections::BTreeMap::new();
-        for (c, doc) in st.docs.keys() {
-            if c == collection {
-                out.insert(doc.clone(), None);
-            }
-        }
-        Ok(out)
-    }
-
-    async fn payload_markdown_paths(
-        &self,
-        collection: &str,
-    ) -> Result<std::collections::BTreeMap<String, String>, DistillError> {
-        let st = self.state.lock();
-        let mut out = std::collections::BTreeMap::new();
-        for (c, doc) in st.docs.keys() {
-            if c == collection {
-                out.insert(
-                    doc.clone(),
-                    format!("markdown/{}/{}.md", &doc[..2.min(doc.len())], doc),
-                );
-            }
-        }
-        Ok(out)
-    }
-
-    async fn set_payload_title(
-        &self,
-        _collection: &str,
-        doc_id: &str,
-        _title: &str,
-    ) -> Result<u64, DistillError> {
+        doc_id: Option<&str>,
+    ) -> Result<BTreeMap<String, u64>, DistillError> {
         let st = self.state.lock();
         Ok(st
             .docs
             .iter()
-            .filter(|((_, d), _)| d == doc_id)
-            .map(|(_, chunks)| chunks.len() as u64)
-            .sum())
-    }
-
-    async fn points_count(&self, collection: &str) -> Result<u64, DistillError> {
-        Ok(self
-            .state
-            .lock()
-            .docs
-            .iter()
-            .filter(|((c, _), _)| c == collection)
-            .map(|(_, s)| s.len() as u64)
-            .sum())
-    }
-
-    async fn doc_ids(&self, collection: &str, limit: u64) -> Result<DocIds, DistillError> {
-        let st = self.state.lock();
-        let mut ids: Vec<String> = st
-            .docs
-            .iter()
-            .filter(|((c, _), s)| c == collection && !s.is_empty())
-            .map(|((_, d), _)| d.clone())
-            .collect();
-        let truncated = ids.len() as u64 > limit;
-        ids.truncate(limit as usize);
-        Ok(DocIds { ids, truncated })
-    }
-
-    async fn enable_hnsw(
-        &self,
-        collection: &str,
-        hnsw: &crate::config::HnswConfig,
-    ) -> Result<crate::store::HnswEnable, DistillError> {
-        let mut st = self.state.lock();
-        let already = !st.hnsw_enabled.insert(collection.to_string());
-        if !already {
-            st.ops.push(Op::EnableHnsw {
-                collection: collection.into(),
-                threads: hnsw.max_indexing_threads,
-            });
-        }
-        Ok(crate::store::HnswEnable {
-            collection: collection.into(),
-            submitted: !already,
-            m: hnsw.m,
-            ef_construct: hnsw.ef_construct,
-            max_indexing_threads: if already {
-                0
-            } else {
-                hnsw.max_indexing_threads
-            },
-            message: String::new(),
-        })
-    }
-
-    async fn reset(&self, collection: &str, _spec: &CollectionSpec) -> Result<u64, DistillError> {
-        let mut st = self.state.lock();
-        let prior: u64 = st
-            .docs
-            .iter()
-            .filter(|((c, _), _)| c == collection)
-            .map(|(_, s)| s.len() as u64)
-            .sum();
-        st.docs.retain(|(c, _), _| c != collection);
-        st.ops.push(Op::Reset {
-            collection: collection.into(),
-        });
-        Ok(prior)
-    }
-
-    async fn scrub_interstitials(
-        &self,
-        collection: &str,
-        dry_run: bool,
-    ) -> Result<ScrubReport, DistillError> {
-        self.state.lock().ops.push(Op::Scrub {
-            collection: collection.into(),
-            dry_run,
-        });
-        Ok(ScrubReport {
-            total_scanned: 0,
-            matched: 0,
-            deleted: 0,
-            samples: Vec::new(),
-        })
+            .filter(|((c, d), records)| {
+                c == collection && doc_id.is_none_or(|want| want == d) && !records.is_empty()
+            })
+            .map(|((_, d), records)| (d.clone(), records.len() as u64))
+            .collect())
     }
 }
 
+/// Where the ollama stand-in says the embedding model is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OllamaMode {
+    Cuda,
+    Cpu,
+    Partial,
+    /// Every request is a 500.
+    Down,
+}
+
+/// A loopback ollama: `/api/ps` reports the embedding model as resident
+/// where [`OllamaMode`] says (so no probe load is ever needed).
+pub(crate) struct FakeOllama {
+    pub http: FakeHttp,
+    pub mode: Arc<Mutex<OllamaMode>>,
+}
+
+pub(crate) async fn fake_ollama(initial: OllamaMode) -> FakeOllama {
+    let mode = Arc::new(Mutex::new(initial));
+    let seen = mode.clone();
+    let http = serve(move |_| {
+        let (size, size_vram) = match *seen.lock() {
+            OllamaMode::Cuda => (1_200_u64, 1_200_u64),
+            OllamaMode::Cpu => (1_200, 0),
+            OllamaMode::Partial => (1_200, 600),
+            OllamaMode::Down => return Reply::Json(500, "ollama is down".into()),
+        };
+        Reply::Json(
+            200,
+            serde_json::json!({"models": [{
+                "name": crate::embed_device::OLLAMA_EMBED_MODEL,
+                "size": size, "size_vram": size_vram}]})
+            .to_string(),
+        )
+    })
+    .await;
+    FakeOllama { http, mode }
+}
+
+/// A server state over fakes: the in-memory store, an ollama stand-in with
+/// the model on the GPU, and the small-chunk config.
+pub(crate) async fn fake_state() -> (crate::api::DistillServerState, Arc<FakeStore>, FakeOllama) {
+    let ollama = fake_ollama(OllamaMode::Cuda).await;
+    let store = Arc::new(FakeStore::default());
+    let config = DistillServerConfig {
+        ollama_url: ollama.http.url(),
+        ..small_chunk_config()
+    };
+    let state = crate::api::DistillServerState::new(store.clone(), reqwest::Client::new(), config);
+    (state, store, ollama)
+}
+
 /// A config small enough to produce several chunks from a few sentences:
-/// ~240-char chunks with a ~40-char overlap, and an embedder window that
-/// satisfies the chunk/window rule.
+/// ~240-char chunks with a ~40-char overlap.
 pub(crate) fn small_chunk_config() -> DistillServerConfig {
     DistillServerConfig {
         chunk_max_tokens: 60,
         chunk_overlap: 10,
-        embedding: EmbeddingConfig {
-            max_length: 128,
-            ..EmbeddingConfig::default()
-        },
         ..DistillServerConfig::default()
     }
 }

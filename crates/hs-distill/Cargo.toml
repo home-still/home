@@ -11,17 +11,12 @@ default = ["client"]
 client = ["dep:regex"]
 server = [
     "dep:axum",
-    "dep:fastembed",
-    "dep:ort",
-    "dep:qdrant-client",
     "dep:regex",
     "dep:xxhash-rust",
-    "dep:uuid",
     "dep:tokio-stream",
     "dep:tempfile",
     "dep:tracing-subscriber",
 ]
-cuda = ["server", "ort/cuda"]
 
 [[bin]]
 name = "hs-distill-server"
@@ -48,12 +43,8 @@ parking_lot = "0.12"
 
 # Server only
 axum = { workspace = true, optional = true }
-fastembed = { workspace = true, optional = true }
-ort = { version = "=2.0.0-rc.11", optional = true }
-qdrant-client = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true }
 tokio-stream = { version = "0.1", optional = true }
 tempfile = { version = "3", optional = true }
 tracing-subscriber = { workspace = true, optional = true }
