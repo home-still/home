@@ -3136,3 +3136,95 @@ untagged. myelin `main` at `7625783`.
 4. **Owner: release or not**, once item 2 is in. Qdrant stays until then.
 5. **Production's 137 indexed documents without markdown**: purge or
    explain.
+
+## 2026-11-26-03 — gate at the default depth after the fixes: 24/25 against 25/25, short by one query; held-out 47/50 against 46/50
+
+**Evidence.** Every document was indexed again, then both query files were
+run against both servers at the store's default settings (rerank depth
+25), baseline first, in one session. The run was repeated after one more
+store fix (below). The baseline's rows are identical in the two runs.
+
+**Re-index.** 19,331 stems, 475,897 chunks, 0 failed, 26,546 s (7.4 h),
+ended 23:27 UTC. `academic` holds 19,268 documents; 63 stems produce no
+chunk, as in entry 01. Ledger rows equal index points in all four tenants
+(378,919 / 96,978 / 3,834 / 3,462). Of 120 records over 4,000 characters
+sampled at random, every stored vector equals the vector of the record's
+whole text (cosine 1.000). The 18 `personal` documents holding such
+records were indexed again, 0 failed. Not done: 33 `abstracts` entries
+(36 records), which only a forced full abstracts build re-embeds; that
+build is deferred by the owner.
+
+**Before / after.** Depth 25 in every column.
+
+| What | Entry 01 | After the re-index | After the beam fix |
+|---|---|---|---|
+| Gate `RECALL@10`, baseline | 25/25 | 25/25 | 25/25 |
+| Gate `RECALL@10`, candidate | 23/25 (q09, q11 miss) | 23/25 (q09, q11 miss) | 24/25 (q09 misses) |
+| First hit is a reference list, baseline / candidate | 2/25 / 2/25 | 2/25 / 2/25 | 2/25 / 2/25 |
+| Reference-list share of the page, baseline / candidate | 28/250 / 22/250 | 28/250 / 23/250 | 28/250 / 24/250 |
+| Held-out: expected document in the top 10, baseline / candidate | not scored | 46/50 / 47/50 | 46/50 / 47/50 |
+| Held-out: expected document first, baseline / candidate | not scored | 35/50 / 43/50 | 35/50 / 43/50 |
+
+**Rules.** The 25-query rule fails on recall (24 against 25); its two
+reference-list conditions hold. The held-out rule holds (47 against 46).
+The owner's bar asks for a pass at the default depth, so it is not met.
+
+**The beam fix.** The store's dense search is approximate. Against exact
+search, on 100 sentences taken from random chunks (none from a query
+file), top 50, 483,193 points:
+
+| Qdrant `hnsw_ef` | recall@50 | exact first hit returned | median |
+|---|---|---|---|
+| unset (100) | 0.942 | 95/100 | 3 ms |
+| 128 | 0.958 | 95/100 | 4 ms |
+| 256 | 0.984 | 98/100 | 6 ms |
+| 512 | 0.995 | 100/100 | 10 ms |
+| 1024 | 0.999 | 100/100 | 15 ms |
+
+Over those 100 and the 75 gate and held-out queries, 36 of 175 lost at
+least one of their ten exact nearest records at the default, 1 of 175 at
+512. myelin now searches with 512 (`home-still/myelin#219`), the smallest
+value that returned 99 of every 100 exact neighbours. The value was picked
+by that rule, not by a retrieval score. It is why q11 passes now: the two
+chunks exact search ranks 2nd and 6th for it, both holding `Korsakoff`,
+were absent from the approximate top 50 at 100, 128 and 256 and are
+present at 512. No held-out rank moved. BACKLOG P1-44 suspected the
+averaged vectors of entry 02; they are gone and the recall was still low,
+so they were not the cause.
+
+**q09, the remaining miss** (`proximal humeral epiphyseal ossification`,
+a hit must hold `epiphyseal`). Four `academic` chunks hold the word; they
+are 13th, 22nd, 23rd and 24th in the lexical list and absent from the
+dense top 50, exact search included. Fusion hands the reranker about the
+first 12 of each list, so none is scored. The 13th ties with the dense
+list's 13th for the last place and loses on record id (BACKLOG P1-45).
+Scoring it as well, tried outside the store with the same reranker, gives
+it -4.43 where the tenth result scores -3.62: still a miss. One
+`references` chunk holding the word is scored, at -5.39. The baseline's
+five hits holding the word hold none of the query's other three words.
+
+**Held-out disagreements.** h23 and h24: candidate first, baseline misses.
+h30: baseline second, candidate misses; the expected chunk is first in the
+candidate's fused list and the reranker puts ten chunks from four other
+documents on caregiver burden in schizophrenia and bipolar disorder above
+it. h13 and h35: both miss.
+
+**Gates.** myelin: `cargo clippy --workspace --all-targets -- -D warnings`
+clean; `cargo nextest run -p myelin-core --lib`: 305 passed. No home-still
+code changed in this entry.
+
+**Version.** Branch `myelin-cutover` at `7d8127b` before this entry,
+untagged. myelin `main` at `18f0dbf`.
+
+### Top 5 remaining items
+
+1. **Owner: q09.** The gate is one query short at the default depth and
+   no store defect explains it. Release with this account, or hold.
+2. **Abstracts store**: build it with `--force` after the cutover; 33 of
+   its 2,860 entries still hold a vector from before the pooling fix.
+3. **myelin: the rerank head cuts a tie on record id** (BACKLOG P1-45).
+4. **Production's 137 indexed documents without markdown**: purge or
+   explain.
+5. **myelin: the gaps left by the refused-write fix** (BACKLOG P1-41): the
+   derived-record leg is not atomic, and a second store's failure leaves
+   the first store's write.

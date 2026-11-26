@@ -1511,6 +1511,15 @@ on that set. Until then the 2026-11-26 result is "passes at a fitted depth", not
 one document and written from an inner passage of it, approved by the owner before any scoring.
 Rule: at default settings the candidate finds at least as many expected documents in the top 10
 as the baseline. Not scored yet: the store is being indexed again (P1-43).
+**Scored 2026-11-26, depth 25, after the re-index and the beam fix (P1-44).** Gate: candidate
+24/25 against the baseline's 25/25, so the 25-query rule fails on recall; first hit a reference
+list 2/25 against 2/25, reference share 24/250 against 28/250. Held-out: candidate 47/50 against
+46/50, so its rule holds; the expected document is first for 43 against 35. Disagreements: h23
+and h24 (candidate first, baseline misses), h30 (baseline second, candidate misses), h13 and h35
+(both miss). The gate's miss is q09: the chunks holding `epiphyseal` are 13th and lower in the
+lexical list and outside the dense top 50, so the reranker scores none of them; scoring the 13th
+too gives it -4.43 against the tenth result's -3.62. No store defect was found behind it. The
+owner's bar (a pass at the default depth) is not met. `docs/loop/log.md`, 2026-11-26-03.
 
 ### P1-43. myelin gave the two pieces of a record over 4,000 characters equal weight, so a fifth of the records had a vector that was half their last lines (found 2026-11-26)
 **Symptom.** Measured on the candidate store. A record is a header line and a chunk of up to
@@ -1529,17 +1538,38 @@ returned the unweighted mean of the pieces' vectors.
 **Fix.** Done in myelin (`home-still/myelin#218`): the mean is weighted by piece length, and the
 cap is a setting, `MYELIN_EMBED__MAX_CHARS`. The store runs with 4,500, so every home-still
 record is embedded whole (needs the embedder of P1-40). After indexing one document again its
-records' vectors equal their whole-text vectors (cosine 1.0). Every document is being indexed
-again (started 2026-11-26 16:04 UTC). Not shown: that this is why the gate missed q09 and q11 at
-depth 25. The chunks that answer them are not split, and q09's best chunk has 8,361 records
-above it in dense score.
+records' vectors equal their whole-text vectors (cosine 1.0). Every document was indexed again
+on 2026-11-26 (19,331 stems, 475,897 chunks, 0 failed, 7.4 h); of 120 long records sampled
+afterwards every stored vector equals the whole text's. The 18 `personal` documents were
+indexed again too. Open: 33 `abstracts` entries (36 records) keep the old vector until the
+abstracts store is built with `--force`.
+**Was it why the gate missed q09 and q11? No (measured).** After the re-index the gate at depth
+25 missed the same two queries. q11 was the approximate search (P1-44); q09 is the reranker's
+order (P1-42).
 
 ### P1-44. The store's approximate dense search misses records an exact search returns (found 2026-11-26)
 **Symptom.** Measured on the candidate store's Qdrant (483,082 points, HNSW `m` 16,
 `ef_construct` 100, no quantization): the approximate top 25 dense hits share 17 of 25 with the
 exact top 25 for gate query q11, and 22 of 25 for q09. For q11 the approximate search misses the
 exact search's first hit, a chunk about the query's subject.
-**Cause.** Not established. Two queries, both taken while a fifth of the vectors were the
-averages of P1-43, which sit close to many queries.
-**Fix.** Measure again on the re-indexed store, over the whole query set. Only when recall is
-still low: raise the search `ef` in myelin, and judge it on the held-out queries, not the gate's.
+**Cause.** The search beam. Qdrant searches with the collection's `ef_construct` (100) when no
+`hnsw_ef` is sent, and myelin sent none. This item first suspected the averaged vectors of
+P1-43; that was wrong: with them gone, recall@50 against exact search was 0.942 on 100 sentences
+from random chunks, and the exact first hit was missing for 5 of them.
+**Fix.** Done in myelin (`home-still/myelin#219`): every dense search sends `hnsw_ef` 512
+(`MYELIN_QDRANT__DENSE_HNSW_EF`), the smallest value measured that returns 99 of every 100
+exact neighbours (0.995; exact first hit 100/100; 10 ms against 3 ms). Chosen on those 100
+sentences, not on a query file. After it q11 passes at depth 25 (its 2nd and 6th exact
+neighbours, both holding `Korsakoff`, come back) and no held-out rank moved (47/50 before and
+after).
+
+### P1-45. myelin's rerank head cuts a tie between the lexical and dense lists on record id (found 2026-11-26)
+**Symptom.** myelin fuses the two lists with reciprocal rank at `k = 1` and reranks the first 25.
+The lists rarely share a record (0 to 2 of 50 for the two gate queries looked at), so the 25th and 26th
+fused records are the two lists' 13th, with equal scores, and the record id decides which one
+the reranker sees. For gate query q09 the lexical 13th, the first chunk holding `epiphyseal`,
+lost that way.
+**Cause.** `rrf` breaks ties on id and `recall` takes a fixed number of fused records.
+**Fix.** Not made. Taking every record tied with the last would be the plain repair. It does not
+change q09: the reranker scores that chunk -4.43 and the tenth result -3.62 (measured outside
+the store with the same reranker). Filed as `home-still/myelin#220`.
