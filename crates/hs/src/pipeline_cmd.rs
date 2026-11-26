@@ -356,7 +356,7 @@ async fn publish_papers_ingested(
 
 /// Print the first errors, then turn any error (or an interruption) into a
 /// failed command. A pipeline command that lost work must not exit 0.
-fn fail_if_errors(command: &str, errors: &[String], interrupted: bool) -> Result<()> {
+pub(crate) fn fail_if_errors(command: &str, errors: &[String], interrupted: bool) -> Result<()> {
     for e in errors.iter().take(10) {
         eprintln!("  error: {e}");
     }

@@ -350,6 +350,24 @@ mod convert {
         assert_eq!(bus.published.lock().unwrap().len(), 1);
     }
 
+    /// A PDF that was converted before word boxes existed (or whose request
+    /// was lost) gets its sidecar asked for along with the announcement.
+    #[tokio::test]
+    async fn an_already_converted_pdf_without_word_boxes_has_them_requested() {
+        let storage = FaultyStorage::new();
+        let source_key = put_source(&storage, "scan", "pdf", b"%PDF-1.4").await;
+        seed_markdown(&*storage, "scan", "# Already here\n\nBody text.").await;
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage.clone(), bus.clone());
+
+        mcp.convert_source(&stem("scan")).await.unwrap();
+
+        let published = bus.published.lock().unwrap().clone();
+        let subjects: Vec<&str> = published.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(subjects, ["scribe.completed", "scribe.boxes"]);
+        assert_eq!(published[1].1, serde_json::json!({ "key": source_key }));
+    }
+
     /// The queue tool's whole point: the conversion is announced, not run.
     /// A caller that gets `queued: true` back must be able to see the event
     /// the watcher will consume, with the keys the watcher reads.
@@ -413,77 +431,748 @@ mod convert {
     }
 }
 
-mod doc_link {
+mod cite {
+    use std::sync::Mutex;
+
+    use base64::Engine as _;
+
     use super::*;
     use crate::stem::Stem;
-    use crate::testkit::{server_with_links, RecordingBus};
+    use crate::testkit::{server_with_docs_service, server_with_links, RecordingBus};
+    use crate::tools::cite::CiteParams;
+    use crate::HomeStillMcp;
+    use hs_common::catalog::{AuthorEntry, CatalogEntry, ConversionMeta};
+    use hs_common::docs::SHORT_LINK_PREFIX;
+    use hs_common::markdown::PAGE_SEPARATOR;
     use hs_common::storage::Storage;
+    use hs_common::stores::{ABSTRACTS, ACADEMIC, MEMORY, PERSONAL, REFERENCES};
+    use hs_common::word_boxes::{self, PageWords, WordBoxes, WordOrigin, WORD_BOXES_VERSION};
 
-    fn link(stem: &str, short: bool) -> Parameters<crate::DocLinkParams> {
-        Parameters(crate::DocLinkParams {
-            stem: Stem::parse(stem).unwrap(),
-            format: None,
-            page: None,
-            collection: None,
-            short,
-        })
+    const STEM: &str = "10.1234_abcd";
+    const PAGE_ONE: &str =
+        "# A study of rivers\n\nRivers carry sediment from the mountains to the sea.";
+    const PAGE_TWO: &str = "The delta grows where the current slows and the silt settles out.";
+    /// Words 4 to 11 of page two.
+    const QUOTE: &str = "the current slows and the silt settles out";
+    /// The markdown line page two's text is on.
+    const QUOTE_LINE: u32 = 7;
+    /// [`QUOTE`] with one word the document does not say.
+    const MISQUOTE: &str = "the current slows and the mud settles out";
+    const ABSTRACT: &str = "We measure how deltas grow when rivers slow near the coast.";
+
+    // The sidecar's pages: words on a grid, six to a line.
+    const WORDS_PER_LINE: usize = 6;
+    const PAGE_WIDTH_PT: f32 = 612.0;
+    const PAGE_HEIGHT_PT: f32 = 792.0;
+    const FIRST_LINE_TOP: u16 = 1_000;
+    const LINE_PITCH: u16 = 300;
+    const LINE_HEIGHT: u16 = 200;
+    const FIRST_WORD_LEFT: u16 = 1_000;
+    const WORD_PITCH: u16 = 800;
+    const WORD_WIDTH: u16 = 700;
+
+    /// The boxes of the quote's words on that grid, one per line: the last
+    /// two words of page two's first line, and the whole of its second.
+    const QUOTE_LINES: [[u64; 4]; 2] = [[4_200, 1_000, 5_700, 1_200], [1_000, 1_300, 5_700, 1_500]];
+
+    /// The right edge of the word before the quote, which no rectangle may
+    /// reach.
+    const WORD_BEFORE_QUOTE_RIGHT: u64 = 4_100;
+
+    /// Whether `rect` (`[x0, y0, x1, y1]`) holds the whole of `words`. A
+    /// line's rectangle is padded and the gap between lines closed, which
+    /// `hs_common::quote` tests; here the question is the reader's: is
+    /// every quoted word inside a box?
+    fn covers(rect: &serde_json::Value, words: [u64; 4]) -> bool {
+        let edge = |i: usize| rect[i].as_u64();
+        matches!(
+            (edge(0), edge(1), edge(2), edge(3)),
+            (Some(x0), Some(y0), Some(x1), Some(y1))
+                if x0 <= words[0] && y0 <= words[1] && x1 >= words[2] && y1 >= words[3]
+        )
+    }
+
+    /// The highlight a link to the quote carries: page 2, words 4 to 11.
+    const QUOTE_HIGHLIGHT: &str = "&page=2&hl=2.4-12&sig=";
+
+    fn markdown() -> String {
+        format!("{PAGE_ONE}{PAGE_SEPARATOR}{PAGE_TWO}")
+    }
+
+    /// A page whose words are `text`'s, laid out on the grid.
+    fn page(number: u32, text: &str) -> PageWords {
+        let mut page = PageWords::new(number, WordOrigin::TextLayer, PAGE_WIDTH_PT, PAGE_HEIGHT_PT);
+        for (index, word) in text.split_whitespace().enumerate() {
+            let top = FIRST_LINE_TOP + LINE_PITCH * u16::try_from(index / WORDS_PER_LINE).unwrap();
+            let left =
+                FIRST_WORD_LEFT + WORD_PITCH * u16::try_from(index % WORDS_PER_LINE).unwrap();
+            page.push(
+                word.to_string(),
+                [left, top, left + WORD_WIDTH, top + LINE_HEIGHT],
+            );
+        }
+        page
+    }
+
+    fn sidecar(pages: Vec<PageWords>) -> WordBoxes {
+        WordBoxes {
+            version: WORD_BOXES_VERSION,
+            source_sha256: "0".repeat(64),
+            pages,
+        }
+    }
+
+    /// The document's own pages, as its word boxes.
+    fn own_boxes() -> WordBoxes {
+        sidecar(vec![page(1, PAGE_ONE), page(2, PAGE_TWO)])
+    }
+
+    /// The document's catalog entry, as a conversion leaves it.
+    fn card() -> CatalogEntry {
+        CatalogEntry {
+            title: Some("A study of rivers".into()),
+            authors: vec![
+                AuthorEntry {
+                    name: "Ada Lovelace".into(),
+                },
+                AuthorEntry {
+                    name: "Grace Hopper".into(),
+                },
+            ],
+            doi: Some("10.1234/abcd".into()),
+            publication_date: Some("2019-05-02".into()),
+            abstract_text: Some(ABSTRACT.into()),
+            conversion: Some(ConversionMeta {
+                server: "test".into(),
+                duration_secs: 0.0,
+                total_pages: 2,
+                converted_at: "2026-01-01T00:00:00Z".into(),
+                pages: hs_common::catalog::compute_page_offsets(&markdown()),
+                converted_by: None,
+                attempts_log: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn linked(storage: &Arc<FaultyStorage>) -> HomeStillMcp {
+        server_with_links(storage.clone(), Arc::new(RecordingBus::default()))
+    }
+
+    /// Put the document into the academic store: a source with `extension`,
+    /// its converted text and `card`.
+    async fn seed_with(
+        mcp: &HomeStillMcp,
+        storage: &dyn Storage,
+        extension: &str,
+        card: &CatalogEntry,
+    ) {
+        let (_, layout) = mcp.stores.documents(ACADEMIC).unwrap();
+        storage
+            .put(&layout.source_key(STEM, extension), b"the source".to_vec())
+            .await
+            .unwrap();
+        storage
+            .put(&layout.markdown_key(STEM), markdown().into_bytes())
+            .await
+            .unwrap();
+        hs_common::catalog::write_catalog_entry_via(storage, &layout.catalog_prefix, STEM, card)
+            .await
+            .unwrap();
+    }
+
+    async fn seed(mcp: &HomeStillMcp, storage: &dyn Storage, extension: &str) {
+        seed_with(mcp, storage, extension, &card()).await;
+    }
+
+    async fn seed_boxes(mcp: &HomeStillMcp, storage: &dyn Storage, boxes: &WordBoxes) {
+        let (_, layout) = mcp.stores.documents(ACADEMIC).unwrap();
+        storage
+            .put(
+                &word_boxes::boxes_key(layout, STEM),
+                word_boxes::encode(boxes).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn ask(quote: &str) -> CiteParams {
+        CiteParams {
+            store: None,
+            doc_id: Stem::parse(STEM).unwrap(),
+            quote: quote.to_string(),
+            near_line: None,
+            image: false,
+            short: None,
+        }
+    }
+
+    fn ask_in(store: &str, quote: &str) -> CiteParams {
+        CiteParams {
+            store: Some(store.to_string()),
+            ..ask(quote)
+        }
+    }
+
+    async fn cite(mcp: &HomeStillMcp, params: CiteParams) -> serde_json::Value {
+        serde_json::to_value(mcp.cite_quote(params).await.unwrap().citation).unwrap()
+    }
+
+    async fn short_links(storage: &FaultyStorage) -> usize {
+        storage.list(SHORT_LINK_PREFIX).await.unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn a_located_quote_comes_back_with_its_page_its_rectangles_and_its_links() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+        seed_boxes(&mcp, &*storage, &own_boxes()).await;
+
+        let out = cite(&mcp, ask(QUOTE)).await;
+
+        assert_eq!(out["store"], ACADEMIC);
+        assert_eq!(out["doc_id"], STEM);
+        assert_eq!(out["title"], "A study of rivers");
+        assert_eq!(
+            out["authors"],
+            serde_json::json!(["Ada Lovelace", "Grace Hopper"])
+        );
+        assert_eq!(out["year"], 2019);
+        assert_eq!(out["doi"], "10.1234/abcd");
+        assert_eq!(
+            out["quote"],
+            serde_json::json!({
+                "text": QUOTE,
+                "exact": true,
+                "found_in": "document",
+                "page": 2,
+                "line_start": QUOTE_LINE,
+                "line_end": QUOTE_LINE,
+            })
+        );
+        let boxes = &out["boxes"];
+        assert_eq!(boxes["status"], "located");
+        assert_eq!(boxes["origin"], "text_layer");
+        assert_eq!(boxes["matched_ratio"], 1.0);
+        let pages = boxes["pages"].as_array().unwrap();
+        assert_eq!(pages.len(), 1, "{boxes}");
+        assert_eq!(pages[0]["page"], 2);
+        let rects = pages[0]["rects"].as_array().unwrap();
+        assert_eq!(rects.len(), QUOTE_LINES.len(), "{boxes}");
+        for (rect, words) in rects.iter().zip(QUOTE_LINES) {
+            assert!(covers(rect, words), "{rect} does not hold {words:?}");
+        }
+        assert!(
+            rects[0][0].as_u64().unwrap() > WORD_BEFORE_QUOTE_RIGHT,
+            "a box takes in the word before the quote: {boxes}"
+        );
+
+        let links = &out["links"];
+        let viewer = links["viewer"]["lan"].as_str().unwrap();
+        assert!(
+            viewer.starts_with(&format!("http://host:7446/docs/v1/{STEM}/viewer?")),
+            "{viewer}"
+        );
+        assert!(viewer.contains("&col=academic&"), "{viewer}");
+        assert!(viewer.contains(QUOTE_HIGHLIGHT), "{viewer}");
+        let page = links["page"]["remote"].as_str().unwrap();
+        assert!(
+            page.starts_with(&format!("https://public.example/docs/v1/{STEM}/page?")),
+            "{page}"
+        );
+        assert!(page.contains(QUOTE_HIGHLIGHT), "{page}");
+        let source = links["source"]["lan"].as_str().unwrap();
+        assert!(source.contains("/source?"), "{source}");
+        assert!(source.ends_with("#page=2"), "{source}");
+        let text = links["markdown"]["lan"].as_str().unwrap();
+        assert!(text.contains("/markdown?"), "{text}");
+        assert!(text.contains("#:~:text="), "{text}");
+        assert!(links["short"].is_null(), "{links}");
+        assert!(links["original_url"].is_null(), "{links}");
+    }
+
+    /// The passage is returned as the document has it, and `exact` says
+    /// when that is not how it was typed.
+    #[tokio::test]
+    async fn a_quote_typed_differently_comes_back_in_the_documents_words() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+
+        let out = cite(&mcp, ask("The  CURRENT slows,\nand the silt settles out")).await;
+
+        assert_eq!(out["quote"]["exact"], false);
+        assert_eq!(out["quote"]["text"], QUOTE);
+    }
+
+    /// A PDF whose word boxes are not built yet is still cited: the page
+    /// comes from the offsets the conversion recorded, and the links that
+    /// need a highlight are left out rather than minted without one.
+    #[tokio::test]
+    async fn a_pdf_without_word_boxes_is_pending_and_takes_its_page_from_the_catalog() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+
+        let out = cite(&mcp, ask(QUOTE)).await;
+
+        assert_eq!(out["boxes"], serde_json::json!({ "status": "pending" }));
+        assert_eq!(out["quote"]["page"], 2);
+        let links = out["links"].as_object().unwrap();
+        assert!(!links.contains_key("viewer"), "{links:?}");
+        assert!(!links.contains_key("page"), "{links:?}");
+        assert!(
+            links["source"]["lan"]
+                .as_str()
+                .unwrap()
+                .ends_with("#page=2"),
+            "{links:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn word_boxes_that_do_not_hold_the_quote_leave_it_not_located() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+        let other = sidecar(vec![
+            page(1, "zebra quartz xylophone jumped over wizard boxes"),
+            page(2, "nine vexed sphinxes judge my quick waltz"),
+        ]);
+        seed_boxes(&mcp, &*storage, &other).await;
+
+        let out = cite(&mcp, ask(QUOTE)).await;
+
+        assert_eq!(out["boxes"], serde_json::json!({ "status": "not_located" }));
+        assert_eq!(out["quote"]["line_start"], QUOTE_LINE);
+        assert!(out["links"].get("viewer").is_none(), "{out}");
+    }
+
+    /// A sidecar that cannot be read is a fault, not "no boxes yet": the
+    /// caller would wait for a catch-up that has nothing to do.
+    #[tokio::test]
+    async fn word_boxes_that_cannot_be_read_are_an_error() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+        let (_, layout) = mcp.stores.documents(ACADEMIC).unwrap();
+        storage
+            .put(
+                &word_boxes::boxes_key(layout, STEM),
+                b"not a sidecar".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let err = mcp.cite_quote(ask(QUOTE)).await.unwrap_err();
+
+        assert!(err.contains("word boxes"), "{err}");
+    }
+
+    /// An HTML source has no pages to box anything on; its card's address
+    /// is the page the document was captured from, and the link to it
+    /// selects the passage.
+    #[tokio::test]
+    async fn an_html_document_has_no_boxes_and_links_to_where_it_was_captured() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        let card = CatalogEntry {
+            source_url: Some("https://example.org/rivers#top".into()),
+            ..card()
+        };
+        seed_with(&mcp, &*storage, "html", &card).await;
+
+        let out = cite(&mcp, ask(QUOTE)).await;
+
+        assert_eq!(
+            out["boxes"],
+            serde_json::json!({ "status": "not_applicable" })
+        );
+        assert!(out["quote"]["page"].is_null(), "{out}");
+        assert_eq!(out["source_url"], "https://example.org/rivers#top");
+        let original = out["links"]["original_url"].as_str().unwrap();
+        assert!(
+            original.starts_with("https://example.org/rivers#:~:text="),
+            "{original}"
+        );
+    }
+
+    /// The reason the tool exists: words the document does not say are
+    /// refused, the caller is shown what it does say, and nothing is stored.
+    #[tokio::test]
+    async fn a_quote_the_document_does_not_say_is_a_tool_error_naming_the_closest_passage() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+        seed_boxes(&mcp, &*storage, &own_boxes()).await;
+
+        let result = mcp
+            .cite(Parameters(CiteParams {
+                short: Some("source".into()),
+                ..ask(MISQUOTE)
+            }))
+            .await;
+
+        let result = serde_json::to_value(result.unwrap()).unwrap();
+        assert_eq!(result["isError"], true, "{result}");
+        let said = result["content"][0]["text"].as_str().unwrap();
+        assert!(said.contains("does not contain the quote"), "{said}");
+        assert!(said.contains("the silt settles out"), "{said}");
+        assert_eq!(short_links(&storage).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_store_the_memory_store_and_an_unknown_document_are_refused() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+
+        let err = mcp.cite_quote(ask_in("nope", QUOTE)).await.unwrap_err();
+        assert!(err.contains("no store named \"nope\""), "{err}");
+
+        let err = mcp.cite_quote(ask_in(MEMORY, QUOTE)).await.unwrap_err();
+        assert!(err.contains("holds no documents"), "{err}");
+
+        let err = mcp
+            .cite_quote(CiteParams {
+                doc_id: Stem::parse("ghost").unwrap(),
+                ..ask(QUOTE)
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("has no document \"ghost\""), "{err}");
+    }
+
+    /// The same answer for "no such document" during an outage would send
+    /// the caller looking for a document that is there.
+    #[tokio::test]
+    async fn a_storage_outage_is_not_read_as_a_missing_document() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+
+        FaultyStorage::set(&storage.fail_head, true);
+        let err = mcp.cite_quote(ask(QUOTE)).await.unwrap_err();
+
+        assert!(err.contains("simulated storage outage"), "{err}");
+    }
+
+    /// A hit from `abstracts` is the catalog entry's abstract, not a line
+    /// of the document: that is the text the quote is checked against, and
+    /// the links are the parent store's.
+    #[tokio::test]
+    async fn an_abstract_is_checked_against_the_catalog_entry() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+        seed_boxes(&mcp, &*storage, &own_boxes()).await;
+
+        let out = cite(&mcp, ask_in(ABSTRACTS, "deltas grow when rivers slow")).await;
+
+        assert_eq!(out["store"], ABSTRACTS);
+        assert_eq!(
+            out["quote"],
+            serde_json::json!({
+                "text": "deltas grow when rivers slow",
+                "exact": true,
+                "found_in": "abstract",
+                "page": null,
+                "line_start": null,
+                "line_end": null,
+            })
+        );
+        assert_eq!(
+            out["boxes"],
+            serde_json::json!({ "status": "not_applicable" })
+        );
+        let source = out["links"]["source"]["lan"].as_str().unwrap();
+        assert!(source.contains("&col=academic&"), "{source}");
+        let text = out["links"]["markdown"]["lan"].as_str().unwrap();
+        assert!(!text.contains('#'), "{text}");
+
+        // The document's own words are not the abstract's.
+        let err = mcp.cite_quote(ask_in(ABSTRACTS, QUOTE)).await.unwrap_err();
+        assert!(err.contains("the abstract of"), "{err}");
+
+        let err = mcp
+            .cite_quote(CiteParams {
+                near_line: Some(QUOTE_LINE),
+                ..ask_in(ABSTRACTS, "deltas grow when rivers slow")
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("near_line"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_abstract_the_catalog_entry_does_not_hold_points_at_the_document() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        let card = CatalogEntry {
+            abstract_text: None,
+            ..card()
+        };
+        seed_with(&mcp, &*storage, "pdf", &card).await;
+
+        let err = mcp
+            .cite_quote(ask_in(ABSTRACTS, "deltas grow when rivers slow"))
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("holds no abstract"), "{err}");
+        assert!(err.contains("\"academic\""), "{err}");
+    }
+
+    /// A reference list is part of its document: the quote is checked
+    /// against the document and the links open it.
+    #[tokio::test]
+    async fn a_reference_is_cited_from_the_document_it_belongs_to() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+
+        let out = cite(&mcp, ask_in(REFERENCES, QUOTE)).await;
+
+        assert_eq!(out["store"], REFERENCES);
+        assert_eq!(out["quote"]["found_in"], "document");
+        let source = out["links"]["source"]["lan"].as_str().unwrap();
+        assert!(source.contains("&col=academic&"), "{source}");
+    }
+
+    /// The personal store keeps a document's card beside the document.
+    #[tokio::test]
+    async fn a_personal_document_is_cited_with_the_card_beside_it() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        let (_, layout) = mcp.stores.documents(PERSONAL).unwrap();
+        let card = CatalogEntry {
+            title: Some("Field notes".into()),
+            ..Default::default()
+        };
+        for (key, bytes) in [
+            (layout.source_key(STEM, "txt"), b"the source".to_vec()),
+            (layout.markdown_key(STEM), markdown().into_bytes()),
+            (
+                layout.source_key(STEM, "catalog.yaml"),
+                serde_yaml_ng::to_string(&card).unwrap().into_bytes(),
+            ),
+        ] {
+            storage.put(&key, bytes).await.unwrap();
+        }
+
+        let out = cite(&mcp, ask_in(PERSONAL, QUOTE)).await;
+
+        assert_eq!(out["title"], "Field notes");
+        assert_eq!(
+            out["boxes"],
+            serde_json::json!({ "status": "not_applicable" })
+        );
+        let source = out["links"]["source"]["lan"].as_str().unwrap();
+        assert!(source.contains("&col=personal&"), "{source}");
     }
 
     /// A short link is an alias, and minting one is a write: the code has to
-    /// exist in the corpus before the caller is told it works, because a code
-    /// the service cannot resolve is a 404 the user would find instead of the
-    /// document.
+    /// exist in the corpus before the caller is told it works, and what it
+    /// redirects to is the link the caller was also given.
     #[tokio::test]
-    async fn a_short_link_is_stored_and_its_code_resolves_to_the_signed_path() {
-        let storage = crate::testkit::FaultyStorage::new();
-        let mcp = server_with_links(storage.clone(), Arc::new(RecordingBus::default()));
+    async fn a_short_link_is_stored_and_redirects_to_the_link_it_names() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+        seed_boxes(&mcp, &*storage, &own_boxes()).await;
 
-        let out = mcp.doc_link(link("10.1234_abcd", true)).await.unwrap();
+        let out = cite(
+            &mcp,
+            CiteParams {
+                short: Some("viewer".into()),
+                ..ask(QUOTE)
+            },
+        )
+        .await;
 
-        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
-        let code = out["short"]["code"].as_str().unwrap();
-        assert_eq!(out["short"]["lan"], format!("http://host:7446/s/{code}"));
-        assert_eq!(
-            out["short"]["remote"],
-            format!("https://public.example/s/{code}")
-        );
-        // The long links are still there: the code is an addition, not a
-        // replacement.
-        assert!(out["lan"].as_str().unwrap().contains("/docs/v1/"));
-
+        let short = &out["links"]["short"];
+        let code = short["code"].as_str().unwrap();
+        assert_eq!(short["lan"], format!("http://host:7446/s/{code}"));
+        assert_eq!(short["remote"], format!("https://public.example/s/{code}"));
         let stored = hs_common::docs::ShortLinks::new(storage.clone())
             .get(code)
             .await
             .unwrap()
             .expect("the code the caller was given must resolve");
-        assert!(
-            stored.target.starts_with("/docs/v1/10.1234_abcd/source?"),
-            "{}",
-            stored.target
+        assert_eq!(
+            format!("http://host:7446{}", stored.location()),
+            out["links"]["viewer"]["lan"].as_str().unwrap()
         );
-        assert_eq!(stored.target, {
-            // What the redirect must land on is exactly the signed link the
-            // caller was also given, so the two cannot drift.
-            let lan = out["lan"].as_str().unwrap();
-            lan.trim_start_matches("http://host:7446").to_string()
-        });
     }
 
-    /// Without `short` nothing is written: a search hit must not fill the corpus
-    /// with aliases.
+    /// Without `short` nothing is written: a citation must not fill the
+    /// corpus with aliases.
     #[tokio::test]
-    async fn a_link_without_short_stores_nothing() {
-        let storage = crate::testkit::FaultyStorage::new();
-        let mcp = server_with_links(storage.clone(), Arc::new(RecordingBus::default()));
+    async fn a_citation_without_short_stores_nothing() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
 
-        let out = mcp.doc_link(link("10.1234_abcd", false)).await.unwrap();
+        let out = cite(&mcp, ask(QUOTE)).await;
 
-        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert!(out.get("short").is_none(), "{out}");
-        assert!(
-            storage.list("short-links").await.unwrap().is_empty(),
-            "a link without `short` must not write a code"
+        assert!(out["links"]["short"].is_null(), "{out}");
+        assert_eq!(short_links(&storage).await, 0);
+    }
+
+    /// The viewer and the page view exist only for a located passage, so a
+    /// code for either has nothing to stand for.
+    #[tokio::test]
+    async fn a_short_link_to_a_view_the_passage_does_not_have_is_refused() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+
+        let err = mcp
+            .cite_quote(CiteParams {
+                short: Some("page".into()),
+                ..ask(QUOTE)
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("`pending`"), "{err}");
+
+        let err = mcp
+            .cite_quote(CiteParams {
+                short: Some("pdf".into()),
+                ..ask(QUOTE)
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown short link \"pdf\""), "{err}");
+        assert_eq!(short_links(&storage).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_mints_no_links_says_which_settings_are_missing() {
+        let storage = FaultyStorage::new();
+        let mcp = server(storage.clone(), None);
+
+        let err = mcp.cite_quote(ask(QUOTE)).await.unwrap_err();
+
+        assert!(err.contains("docs.lan_base_url"), "{err}");
+        assert!(err.contains("docs.remote_base_url"), "{err}");
+    }
+
+    /// A stand-in docs service: answers every page image request the same
+    /// way and remembers the query of each.
+    struct FakeDocs {
+        url: String,
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeDocs {
+        async fn start(status: axum::http::StatusCode, media_type: &'static str) -> Self {
+            let queries = Arc::new(Mutex::new(Vec::new()));
+            let seen = queries.clone();
+            let app = axum::Router::new().route(
+                "/docs/v1/{stem}/page.png",
+                axum::routing::get(
+                    move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().unwrap().push(query.unwrap_or_default());
+                            (
+                                status,
+                                [(axum::http::header::CONTENT_TYPE, media_type)],
+                                PAGE_PNG.to_vec(),
+                            )
+                        }
+                    },
+                ),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self { url, queries }
+        }
+    }
+
+    /// What the stand-in answers with. `cite` relays the bytes; it does not
+    /// decode them.
+    const PAGE_PNG: &[u8] = b"\x89PNG\r\n\x1a\nthe page, the passage boxed";
+
+    async fn located_behind(docs: &FakeDocs) -> HomeStillMcp {
+        let storage = FaultyStorage::new();
+        let mcp = server_with_docs_service(storage.clone(), &docs.url);
+        seed(&mcp, &*storage, "pdf").await;
+        seed_boxes(&mcp, &*storage, &own_boxes()).await;
+        mcp
+    }
+
+    fn ask_image() -> CiteParams {
+        CiteParams {
+            image: true,
+            ..ask(QUOTE)
+        }
+    }
+
+    /// `image: true` is the page as the docs service draws it: the request
+    /// is the signed page-image link, highlight included, and the picture
+    /// follows the citation in the result.
+    #[tokio::test]
+    async fn an_image_is_the_boxed_page_the_docs_service_draws() {
+        let docs = FakeDocs::start(axum::http::StatusCode::OK, "image/png").await;
+        let mcp = located_behind(&docs).await;
+
+        let cited = mcp.cite_quote(ask_image()).await.unwrap();
+
+        assert_eq!(cited.page_image.as_deref(), Some(PAGE_PNG));
+        let queries = docs.queries.lock().unwrap().clone();
+        assert_eq!(queries.len(), 1, "{queries:?}");
+        assert!(queries[0].contains(QUOTE_HIGHLIGHT), "{queries:?}");
+
+        let content = serde_json::to_value(cited.into_contents().unwrap()).unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(content[1]["data"].as_str().unwrap())
+                .unwrap(),
+            PAGE_PNG
         );
+    }
+
+    /// The link is a capability: a failure to fetch it must not hand it to
+    /// whoever reads the error.
+    #[tokio::test]
+    async fn a_page_image_the_docs_service_refuses_is_an_error_without_the_signed_link() {
+        let docs = FakeDocs::start(axum::http::StatusCode::NOT_FOUND, "text/plain").await;
+        let mcp = located_behind(&docs).await;
+
+        let err = mcp.cite_quote(ask_image()).await.unwrap_err();
+
+        assert!(err.contains("404"), "{err}");
+        assert!(!err.contains("sig="), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_a_png_is_not_passed_on_as_the_page() {
+        let docs = FakeDocs::start(axum::http::StatusCode::OK, "text/html").await;
+        let mcp = located_behind(&docs).await;
+
+        let err = mcp.cite_quote(ask_image()).await.unwrap_err();
+
+        assert!(err.contains("text/html"), "{err}");
+    }
+
+    /// No boxes, no picture: the call says why instead of returning a
+    /// citation that silently lacks the image that was asked for.
+    #[tokio::test]
+    async fn an_image_of_a_passage_that_is_not_located_is_refused() {
+        let storage = FaultyStorage::new();
+        let mcp = linked(&storage);
+        seed(&mcp, &*storage, "pdf").await;
+
+        let err = mcp.cite_quote(ask_image()).await.unwrap_err();
+
+        assert!(err.contains("`pending`"), "{err}");
     }
 }
 

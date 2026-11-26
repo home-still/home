@@ -86,10 +86,10 @@ pub enum ScribeCmd {
         #[arg(long)]
         server: Option<String>,
     },
-    /// Subscribe to `papers.ingested` on the configured event bus,
-    /// convert each PDF via the scribe server, and upload the markdown
-    /// back to storage. Event-driven replacement for the filesystem
-    /// watcher.
+    /// Subscribe to `papers.ingested` and `scribe.boxes` on the configured
+    /// event bus. Each ingested document is converted via the scribe
+    /// server and its markdown uploaded back to storage; each `scribe.boxes`
+    /// request has the PDF's word-box sidecar built and stored.
     WatchEvents {
         /// Server URL override
         #[arg(long)]
@@ -115,6 +115,12 @@ pub enum ScribeCmd {
     Reconvert {
         /// Catalog stem (no extension), e.g. `10.48550_arxiv.2312.10997`.
         stem: String,
+    },
+    /// Word-box sidecars: where every word of a PDF sits on its page, which
+    /// is what lets a quotation be highlighted in the document it is from.
+    Boxes {
+        #[command(subcommand)]
+        action: crate::scribe_boxes::BoxesAction,
     },
 }
 
@@ -157,6 +163,7 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         }
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
         ScribeCmd::Reconvert { stem } => cmd_reconvert(&stem, reporter).await,
+        ScribeCmd::Boxes { action } => crate::scribe_boxes::dispatch(action, reporter).await,
     }
 }
 
@@ -394,10 +401,14 @@ pub(crate) async fn cmd_watch_events(
     server_override: Option<String>,
     _reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
+    use hs_common::event_bus::specs;
     use hs_common::service::pool::{NoAdmittingHost, ServicePool};
+    use hs_scribe::box_watch::{build_and_store, BoxServers, BoxesEvent};
     use hs_scribe::client::ScribeClient;
     use hs_scribe::config::ScribeConfig;
-    use hs_scribe::event_watch::{convert_and_upload, run_subscriber};
+    use hs_scribe::event_watch::{
+        convert_and_upload, run_side_by_side, run_subscriber, IngestedEvent,
+    };
 
     // Every PDF the watcher dispatches is counted by pdfium first; a host
     // without libpdfium must not subscribe, ack events and then refuse each
@@ -409,6 +420,7 @@ pub(crate) async fn cmd_watch_events(
     let cfg = ScribeConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = cfg.build_storage()?;
     let bus = cfg.build_event_bus().await?;
+    let stores = Arc::new(hs_common::stores::Stores::load().context("reading the store registry")?);
     let events_cfg = cfg
         .events
         .as_ref()
@@ -472,8 +484,21 @@ pub(crate) async fn cmd_watch_events(
     let timeout_policy = Arc::new(cfg.timeout_policy.clone());
     let epub_limits = Arc::new(cfg.epub.clone());
 
+    // Word boxes need no VLM, so every configured server builds them in
+    // turn, whatever its backend tier; one build per server at a time.
+    let box_servers = Arc::new(BoxServers::new(
+        labelled_servers
+            .iter()
+            .map(|(url, _, _)| {
+                ScribeClient::new_with_timeout(url, hs_scribe::client::WORD_BOXES_TIMEOUT)
+            })
+            .collect::<Result<_>>()?,
+    )?);
+    let box_concurrency = box_servers.count();
+
     let storage_for_handler = storage.clone();
     let bus_for_handler = bus.clone();
+    let stores_for_handler = stores.clone();
     // Global admission cap = sum of the per-tier concurrency caps, so the
     // watcher admits exactly as many concurrent papers as the tiers can
     // actually run. The per-tier semaphores enforce the per-backend split;
@@ -484,6 +509,7 @@ pub(crate) async fn cmd_watch_events(
         tiers = ?tier_order,
         servers = ?labelled_servers.iter().map(|(u, _, _)| u.clone()).collect::<Vec<_>>(),
         concurrency,
+        box_concurrency,
         convert_timeout_secs = cfg.convert_timeout_secs,
         base_secs = timeout_policy.base_secs,
         per_page_secs = timeout_policy.per_page_secs,
@@ -495,229 +521,266 @@ pub(crate) async fn cmd_watch_events(
     // single event is pulled (and so before any delivery is burned).
     let server_urls: Vec<String> = labelled_servers.iter().map(|(u, _, _)| u.clone()).collect();
     hs_scribe::event_watch::preflight_token(&server_urls, convert_timeout).await?;
-    run_subscriber(bus.clone(), storage.clone(), concurrency, drain_timeout, ack_wait, move |event| {
-        let storage = storage_for_handler.clone();
-        let bus = bus_for_handler.clone();
-        let tiers = tiers.clone();
-        let timeout_policy = timeout_policy.clone();
-        let epub_limits = epub_limits.clone();
-        async move {
-            // Dispatch through the backend tiers in order. The first tier
-            // (primary backend) gets the paper via its own least-loaded pick.
-            // On `Escalate` or `Transient`, fall through to the NEXT tier —
-            // a genuinely different backend on a different host, so this is
-            // real failover (olmocr scan-fail → glm). On `Permanent`,
-            // short-circuit immediately — the source is intrinsically
-            // unconvertable and no other backend will help. On success, the
-            // host's own catalog stamp captures converted_by + attempts_log.
-            let mut attempts_log: Vec<hs_common::catalog::AttemptEntry> = Vec::new();
-            let mut last_err: Option<hs_scribe::event_watch::HandlerError> = None;
+    // Two consumers, one process: when either ends, the other is stopped
+    // and the watcher exits, so the supervisor restarts both.
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let conversions = run_subscriber(
+        &specs::PAPERS_INGESTED,
+        bus.clone(),
+        concurrency,
+        drain_timeout,
+        ack_wait,
+        stopped.clone(),
+        move |event: IngestedEvent| {
+            let storage = storage_for_handler.clone();
+            let bus = bus_for_handler.clone();
+            let stores = stores_for_handler.clone();
+            let tiers = tiers.clone();
+            let timeout_policy = timeout_policy.clone();
+            let epub_limits = epub_limits.clone();
+            async move {
+                // Dispatch through the backend tiers in order. The first tier
+                // (primary backend) gets the paper via its own least-loaded pick.
+                // On `Escalate` or `Transient`, fall through to the NEXT tier —
+                // a genuinely different backend on a different host, so this is
+                // real failover (olmocr scan-fail → glm). On `Permanent`,
+                // short-circuit immediately — the source is intrinsically
+                // unconvertable and no other backend will help. On success, the
+                // host's own catalog stamp captures converted_by + attempts_log.
+                let mut attempts_log: Vec<hs_common::catalog::AttemptEntry> = Vec::new();
+                let mut last_err: Option<hs_scribe::event_watch::HandlerError> = None;
 
-            // Fetch + parse the source ONCE per event. Every backend
-            // attempt reuses the same Arc'd bytes and page count —
-            // escalation used to re-download and re-parse the whole
-            // book from storage per backend. prepare_source handles
-            // its own failure stamping (source_missing) and
-            // classification: Permanent → TERM, Transient → NAK.
-            let source =
-                match hs_scribe::event_watch::prepare_source(storage.as_ref(), &event).await {
-                    Ok(hs_scribe::event_watch::SourcePrep::AlreadyConverted(md_key)) => {
-                        // An earlier attempt wrote the markdown; it may have
-                        // died before telling distill. Say it again.
-                        return hs_scribe::event_watch::announce_completed(
-                            bus.as_ref(),
-                            &md_key,
-                            &event.key,
-                        )
-                        .await;
-                    }
-                    Ok(hs_scribe::event_watch::SourcePrep::Fetched(src)) => src,
-                    Err(e) => return Err(e),
-                };
+                // Fetch + parse the source ONCE per event. Every backend
+                // attempt reuses the same Arc'd bytes and page count —
+                // escalation used to re-download and re-parse the whole
+                // book from storage per backend. prepare_source handles
+                // its own failure stamping (source_missing) and
+                // classification: Permanent → TERM, Transient → NAK.
+                let source =
+                    match hs_scribe::event_watch::prepare_source(storage.as_ref(), &event).await {
+                        Ok(hs_scribe::event_watch::SourcePrep::AlreadyConverted(md_key)) => {
+                            // An earlier attempt wrote the markdown; it may have
+                            // died before telling distill, or before asking for
+                            // the PDF's word boxes. Say both again.
+                            return hs_scribe::event_watch::announce_already_converted(
+                                bus.as_ref(),
+                                storage.as_ref(),
+                                &stores,
+                                &md_key,
+                                &event.key,
+                            )
+                            .await;
+                        }
+                        Ok(hs_scribe::event_watch::SourcePrep::Fetched(src)) => src,
+                        Err(e) => return Err(e),
+                    };
 
-            for (backend, pool, tier_sem) in tiers.iter() {
-                // Acquire this backend's concurrency permit BEFORE picking a
-                // host — this caps how many converts the tier runs at once
-                // (config `concurrency`), so a heavy model can't fan out to
-                // the host's full advertised slot count and thrash it. Held
-                // across the convert, released when the permit drops at the
-                // end of this loop iteration (so the next tier / next event
-                // sees a freed slot). The semaphore is never closed, so
-                // `acquire` only errors on a closed semaphore — treat that as
-                // transient and fall through.
-                let _tier_permit = match tier_sem.acquire().await {
-                    Ok(permit) => permit,
-                    Err(e) => {
-                        last_err = Some(hs_scribe::event_watch::HandlerError::Transient(
-                            anyhow::anyhow!("tier semaphore closed: {e}"),
-                        ));
-                        continue;
-                    }
-                };
-                // Least-loaded pick WITHIN this backend tier. `pick_server`
-                // polls if the tier is saturated or unreachable, so a busy
-                // tier parks here rather than NAKing. The PickGuard holds this
-                // host's client-side reservation for the convert and frees it
-                // at loop-end, so the next pick (a concurrent event, or this
-                // event's next tier) sees accurate load. A tier with no ready
-                // host records a transient error and falls through to the
-                // next tier rather than aborting the whole chain. A tier whose
-                // every host refuses at its admission gate fails the pick at
-                // once; an earlier tier's outcome then stands, since it says
-                // more about this paper than "nobody can take it right now".
-                let (client, _pick_guard) = match pool.pick_server().await {
-                    Ok(picked) => picked,
-                    Err(e) => {
-                        if e.is::<NoAdmittingHost>() && last_err.is_some() {
-                            tracing::info!(
-                                backend = %backend,
-                                key = %event.key,
-                                "tier skipped: every host refusing at its admission gate"
-                            );
+                for (backend, pool, tier_sem) in tiers.iter() {
+                    // Acquire this backend's concurrency permit BEFORE picking a
+                    // host — this caps how many converts the tier runs at once
+                    // (config `concurrency`), so a heavy model can't fan out to
+                    // the host's full advertised slot count and thrash it. Held
+                    // across the convert, released when the permit drops at the
+                    // end of this loop iteration (so the next tier / next event
+                    // sees a freed slot). The semaphore is never closed, so
+                    // `acquire` only errors on a closed semaphore — treat that as
+                    // transient and fall through.
+                    let _tier_permit = match tier_sem.acquire().await {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            last_err = Some(hs_scribe::event_watch::HandlerError::Transient(
+                                anyhow::anyhow!("tier semaphore closed: {e}"),
+                            ));
                             continue;
                         }
-                        last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
-                        continue;
-                    }
-                };
-                let url = client.url().to_string();
-                tracing::info!(
-                    server = %url,
-                    backend = %backend,
-                    key = %event.key,
-                    attempt = attempts_log.len() + 1,
-                    "pool dispatch (tiered least-loaded)"
-                );
-                let result = convert_and_upload(
-                    storage.as_ref(),
-                    client,
-                    bus.as_ref(),
-                    &event,
-                    timeout_policy.as_ref(),
-                    epub_limits.as_ref(),
-                    &source,
-                    Some(backend.clone()),
-                    attempts_log.clone(),
-                )
-                .await;
-
-                let now = chrono::Utc::now().to_rfc3339();
-                match result {
-                    Ok(_) => return Ok(()),
-                    Err(hs_scribe::event_watch::HandlerError::Permanent(e)) => {
-                        let classification = classify_convert_failure(&e);
-                        let reason = classification.reason().to_string();
-                        let outcome = match &classification {
-                            ConvertClassification::Permanent(_) => "permanent",
-                            ConvertClassification::Escalate(_) => "escalate",
-                        };
-                        attempts_log.push(hs_common::catalog::AttemptEntry {
-                            backend: backend.clone(),
-                            outcome: outcome.to_string(),
-                            reason: Some(reason.clone()),
-                            at: now,
-                        });
-                        match classification {
-                            ConvertClassification::Permanent(_) => {
-                                tracing::warn!(
-                                    backend = %backend,
-                                    key = %event.key,
-                                    reason = %reason,
-                                    "pool dispatch: permanent failure — no host will help"
-                                );
-                                if let Some(stem) = stem_from_event_key(&event.key) {
-                                    if let Err(stamp_err) =
-                                        hs_common::catalog::update_conversion_failed_via(
-                                            storage.as_ref(),
-                                            "catalog",
-                                            &stem,
-                                            &reason,
-                                            attempts_log.clone(),
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            stem = %stem,
-                                            reason = %reason,
-                                            error = %stamp_err,
-                                            "failed to stamp conversion_failed; terminating anyway"
-                                        );
-                                    }
-                                }
-                                return Err(hs_scribe::event_watch::HandlerError::Permanent(e));
-                            }
-                            ConvertClassification::Escalate(_) => {
+                    };
+                    // Least-loaded pick WITHIN this backend tier. `pick_server`
+                    // polls if the tier is saturated or unreachable, so a busy
+                    // tier parks here rather than NAKing. The PickGuard holds this
+                    // host's client-side reservation for the convert and frees it
+                    // at loop-end, so the next pick (a concurrent event, or this
+                    // event's next tier) sees accurate load. A tier with no ready
+                    // host records a transient error and falls through to the
+                    // next tier rather than aborting the whole chain. A tier whose
+                    // every host refuses at its admission gate fails the pick at
+                    // once; an earlier tier's outcome then stands, since it says
+                    // more about this paper than "nobody can take it right now".
+                    let (client, _pick_guard) = match pool.pick_server().await {
+                        Ok(picked) => picked,
+                        Err(e) => {
+                            if e.is::<NoAdmittingHost>() && last_err.is_some() {
                                 tracing::info!(
                                     backend = %backend,
                                     key = %event.key,
-                                    reason = %reason,
-                                    "pool dispatch: backend escalated — falling through to next tier"
+                                    "tier skipped: every host refusing at its admission gate"
                                 );
-                                last_err = Some(hs_scribe::event_watch::HandlerError::Permanent(e));
+                                continue;
+                            }
+                            last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
+                            continue;
+                        }
+                    };
+                    let url = client.url().to_string();
+                    tracing::info!(
+                        server = %url,
+                        backend = %backend,
+                        key = %event.key,
+                        attempt = attempts_log.len() + 1,
+                        "pool dispatch (tiered least-loaded)"
+                    );
+                    let result = convert_and_upload(
+                        storage.as_ref(),
+                        client,
+                        bus.as_ref(),
+                        &event,
+                        timeout_policy.as_ref(),
+                        epub_limits.as_ref(),
+                        &source,
+                        Some(backend.clone()),
+                        attempts_log.clone(),
+                    )
+                    .await;
+
+                    let now = chrono::Utc::now().to_rfc3339();
+                    match result {
+                        Ok(_) => return Ok(()),
+                        Err(hs_scribe::event_watch::HandlerError::Permanent(e)) => {
+                            let classification = classify_convert_failure(&e);
+                            let reason = classification.reason().to_string();
+                            let outcome = match &classification {
+                                ConvertClassification::Permanent(_) => "permanent",
+                                ConvertClassification::Escalate(_) => "escalate",
+                            };
+                            attempts_log.push(hs_common::catalog::AttemptEntry {
+                                backend: backend.clone(),
+                                outcome: outcome.to_string(),
+                                reason: Some(reason.clone()),
+                                at: now,
+                            });
+                            match classification {
+                                ConvertClassification::Permanent(_) => {
+                                    tracing::warn!(
+                                        backend = %backend,
+                                        key = %event.key,
+                                        reason = %reason,
+                                        "pool dispatch: permanent failure — no host will help"
+                                    );
+                                    if let Some(stem) = stem_from_event_key(&event.key) {
+                                        if let Err(stamp_err) =
+                                            hs_common::catalog::update_conversion_failed_via(
+                                                storage.as_ref(),
+                                                "catalog",
+                                                &stem,
+                                                &reason,
+                                                attempts_log.clone(),
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                stem = %stem,
+                                                reason = %reason,
+                                                error = %stamp_err,
+                                                "failed to stamp conversion_failed; terminating anyway"
+                                            );
+                                        }
+                                    }
+                                    return Err(hs_scribe::event_watch::HandlerError::Permanent(e));
+                                }
+                                ConvertClassification::Escalate(_) => {
+                                    tracing::info!(
+                                        backend = %backend,
+                                        key = %event.key,
+                                        reason = %reason,
+                                        "pool dispatch: backend escalated — falling through to next tier"
+                                    );
+                                    last_err =
+                                        Some(hs_scribe::event_watch::HandlerError::Permanent(e));
+                                }
                             }
                         }
-                    }
-                    Err(hs_scribe::event_watch::HandlerError::Transient(e)) => {
-                        // Transient failure on this host (network flake,
-                        // scribe 5xx) — fall through to the next backend tier
-                        // before NAKing the event back to JetStream. The next
-                        // tier is a different process on a different host and
-                        // network path, so it may not share the transient
-                        // condition; if every tier is exhausted the event is
-                        // NAKed and JetStream redelivers the whole chain.
-                        attempts_log.push(hs_common::catalog::AttemptEntry {
-                            backend: backend.clone(),
-                            outcome: "transient".to_string(),
-                            reason: Some(format!("{e:#}")),
-                            at: now,
-                        });
-                        tracing::warn!(
-                            backend = %backend,
-                            key = %event.key,
-                            error = %e,
-                            "pool dispatch: transient — falling through to next tier"
-                        );
-                        last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
-                    }
-                }
-            }
-
-            // Pool exhausted (every host tried). Whatever the last error
-            // was, surface it — `last_err` is `Some` because the loop ran
-            // at least once (the pool is non-empty by construction). If the
-            // last surviving error was Permanent, stamp it; if it was
-            // Transient, NAK and let JetStream redeliver.
-            match last_err {
-                Some(hs_scribe::event_watch::HandlerError::Permanent(e)) => {
-                    let reason = classify_convert_failure(&e).reason().to_string();
-                    if let Some(stem) = stem_from_event_key(&event.key) {
-                        if let Err(stamp_err) = hs_common::catalog::update_conversion_failed_via(
-                            storage.as_ref(),
-                            "catalog",
-                            &stem,
-                            &reason,
-                            attempts_log,
-                        )
-                        .await
-                        {
+                        Err(hs_scribe::event_watch::HandlerError::Transient(e)) => {
+                            // Transient failure on this host (network flake,
+                            // scribe 5xx) — fall through to the next backend tier
+                            // before NAKing the event back to JetStream. The next
+                            // tier is a different process on a different host and
+                            // network path, so it may not share the transient
+                            // condition; if every tier is exhausted the event is
+                            // NAKed and JetStream redelivers the whole chain.
+                            attempts_log.push(hs_common::catalog::AttemptEntry {
+                                backend: backend.clone(),
+                                outcome: "transient".to_string(),
+                                reason: Some(format!("{e:#}")),
+                                at: now,
+                            });
                             tracing::warn!(
-                                stem = %stem,
-                                reason = %reason,
-                                error = %stamp_err,
-                                "failed to stamp pool-exhausted conversion_failed"
+                                backend = %backend,
+                                key = %event.key,
+                                error = %e,
+                                "pool dispatch: transient — falling through to next tier"
                             );
+                            last_err = Some(hs_scribe::event_watch::HandlerError::Transient(e));
                         }
                     }
-                    Err(hs_scribe::event_watch::HandlerError::Permanent(e))
                 }
-                Some(e) => Err(e),
-                None => Err(hs_scribe::event_watch::HandlerError::Transient(
-                    anyhow::anyhow!("scribe pool was empty"),
-                )),
+
+                // Pool exhausted (every host tried). Whatever the last error
+                // was, surface it — `last_err` is `Some` because the loop ran
+                // at least once (the pool is non-empty by construction). If the
+                // last surviving error was Permanent, stamp it; if it was
+                // Transient, NAK and let JetStream redeliver.
+                match last_err {
+                    Some(hs_scribe::event_watch::HandlerError::Permanent(e)) => {
+                        let reason = classify_convert_failure(&e).reason().to_string();
+                        if let Some(stem) = stem_from_event_key(&event.key) {
+                            if let Err(stamp_err) =
+                                hs_common::catalog::update_conversion_failed_via(
+                                    storage.as_ref(),
+                                    "catalog",
+                                    &stem,
+                                    &reason,
+                                    attempts_log,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    stem = %stem,
+                                    reason = %reason,
+                                    error = %stamp_err,
+                                    "failed to stamp pool-exhausted conversion_failed"
+                                );
+                            }
+                        }
+                        Err(hs_scribe::event_watch::HandlerError::Permanent(e))
+                    }
+                    Some(e) => Err(e),
+                    None => Err(hs_scribe::event_watch::HandlerError::Transient(
+                        anyhow::anyhow!("scribe pool was empty"),
+                    )),
+                }
             }
-        }
-    })
-    .await
+        },
+    );
+
+    let storage_for_boxes = storage.clone();
+    let boxes = run_subscriber(
+        &specs::SCRIBE_BOXES,
+        bus.clone(),
+        box_concurrency,
+        drain_timeout,
+        ack_wait,
+        stopped,
+        move |event: BoxesEvent| {
+            let storage = storage_for_boxes.clone();
+            let stores = stores.clone();
+            let servers = box_servers.clone();
+            async move {
+                build_and_store(storage.as_ref(), &stores, &servers, &event)
+                    .await
+                    .map(|_| ())
+            }
+        },
+    );
+    run_side_by_side(stop, conversions, boxes).await
 }
 
 // ── Convert ─────────────────────────────────────────────────────

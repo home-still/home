@@ -1,8 +1,5 @@
 use crate::models::layout::BBox;
-
-/// The byte sequence that separates pages in every markdown document this
-/// crate produces. See [`join_pages`] for why it is reserved.
-pub const PAGE_SEPARATOR: &str = "\n\n---\n\n";
+use hs_common::markdown::PAGE_SEPARATOR;
 
 /// Join per-page markdown strings into a single document.
 ///

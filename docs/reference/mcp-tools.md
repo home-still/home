@@ -162,19 +162,34 @@ Changes state: no.
 |---|---|---|---|
 | `stem` | stem | required | Paper stem. |
 
-### `doc_link`
+### `cite`
 
-Mint a fresh, signed, expiring link to a document. The link opens the original document (PDF, HTML or EPUB for `academic`; PDF, EPUB, DOCX, Markdown or text for `personal`) or its converted markdown, on the LAN and from outside it. Returns `stem`, `format`, `lan`, `remote` and `expires_at`, plus `short` (`lan`, `remote`, `code`) when `short` is set. Fails when `docs.lan_base_url` or `docs.remote_base_url` is not set, or when the signing key is unavailable. See [Open documents with links](../how-to/open-documents-with-links.md).
+Check a quote against the document it is from and return a citation a reader can verify. The quote is matched against the document's own text: markup, line breaks, spacing, hyphenation, case and typography may differ, the words may not. **A quote the document does not contain is a tool error** that names the closest passage, its lines and the share of the quote's words it holds; no citation is returned for it.
+
+For a quote the document contains, the result is JSON:
+
+| Field | Meaning |
+|---|---|
+| `store`, `doc_id` | What was asked. |
+| `title`, `authors`, `year`, `doi`, `source_url` | From the document's catalog entry: `null`, or `[]` for `authors`, where the entry has none. |
+| `quote` | `text` (the passage as the document has it), `exact` (`false` when the quote was found as the same words in the same order rather than as typed), `found_in` (`document` or `abstract`), `page`, `line_start` and `line_end`. `page` is the page the passage starts on: read from the word boxes when `boxes.status` is `located`, otherwise from the page offsets the conversion recorded for a PDF, otherwise `null`. The lines are lines of the converted text, and `null` for an abstract. |
+| `boxes` | `status` is `located`, `not_located` (the word boxes are built and the passage could not be placed in them), `pending` (a PDF whose word boxes are not built yet) or `not_applicable` (the source is not a PDF, or the quote is from an abstract). `not_located` says the converted text and the words read from the PDF's pages disagree at the passage, so the quote is not confirmed on the page: in 100 sentences sampled from 20 converted papers (2026-11-25), all 5 that came back `not_located` were text the conversion had made up. `located` also carries `origin` (`text_layer`, or `ocr` when a page the passage is on was read by character recognition), `matched_ratio` (the share of the passage's words found on the page, in order) and `pages`: for each page the passage is on, `page` and `rects`, one `[x0, y0, x1, y1]` per line of the passage, in ten-thousandths of the page's width and height from its top left corner. |
+| `links` | `source` (the original document, at the passage's page when it is known) and `markdown` (the converted text, the passage selected), each a `lan` and a `remote` URL. When `boxes.status` is `located`, also `viewer` (the whole PDF, opened on the boxed passage) and `page` (that page as a picture, the passage boxed). `original_url` is `source_url` with a text fragment that selects the passage, or `null`. `short` is `lan`, `remote` and `code` when `short` was asked for, otherwise `null`. `expires_at` is when the links stop working. |
+
+With `image` the result has a second content item: the page the passage starts on as a PNG, the passage boxed. The MCP server fetches it from the docs service at `docs.lan_base_url`.
+
+For `references` the quote is checked against the document the reference list belongs to, and for `abstracts` against the abstract in the document's catalog entry. Links are signed for the store that holds the document. The call fails when `docs.lan_base_url` or `docs.remote_base_url` is not set, when the signing key is unavailable, when the store or the document is unknown, when the document has no converted text yet, and for `memory`, which holds no documents. See [Open documents with links](../how-to/open-documents-with-links.md).
 
 Changes state: only with `short`, which stores the code in the corpus.
 
 | Parameter | Type | Required or default | Meaning |
 |---|---|---|---|
-| `stem` | stem | required | Paper stem. |
-| `format` | string | `source` | `source` (the original document) or `markdown` (the converted text). Anything else is an error. |
-| `page` | integer | none | Page to open, 1-based. The link opens that page and points at it. The markdown's pages are the source document's pages. |
-| `collection` | string | `academic` | `academic` or `personal`. The collection is part of the link's signature, so a link for one store cannot be edited into a link for the other. |
-| `short` | boolean | `false` | Also mint a 12-character code, returned as `<base>/s/<code>` under `short`. The docs service answers the code with a redirect to the signed link, carrying its fragment, so the code expires with the link and is pruned by `hs docs prune`. Storing it writes one small record to the corpus. |
+| `store` | string | `academic` | The store the passage was found in: the `store` of the hit. |
+| `doc_id` | stem | required | The document's id: `meta.doc_id` of the hit. |
+| `quote` | string | required | The passage, word for word: at least 4 words, at most 2000 characters. |
+| `near_line` | integer | none | A line of the document near the passage. When the document says the quote more than once, the occurrence nearest this line is the one cited. Refused for `abstracts`. |
+| `image` | boolean | `false` | Also return the page as an image with the passage boxed. The call fails unless `boxes.status` is `located`. |
+| `short` | string | none | `viewer`, `page`, `source` or `markdown`: also store a 12-character code that redirects to that link, returned as `<base>/s/<code>` under `links.short`. The docs service answers the code with a redirect to the signed link, carrying its fragment, so the code expires with the link and is pruned by `hs docs prune`. `viewer` and `page` are refused unless `boxes.status` is `located`. Storing the code writes one small record to the corpus. |
 
 ### `catalog_repair`
 
@@ -254,6 +269,8 @@ Changes state: yes.
 ### `scribe_convert`
 
 Blocks until the conversion finishes; use `scribe_queue` instead unless the markdown is needed inside this call. A conversion is bounded by the scribe timeout ceiling of 3600 s. Converts a stored source document (PDF, HTML or EPUB; PDF is preferred when several exist) to markdown through the code path the scribe event watcher uses. PDFs go to the scribe server; HTML and EPUB are parsed locally. Writes the markdown to storage, stamps the catalog and announces `scribe.completed`. Markdown that already exists is not converted again; it is re-announced (`hs scribe reconvert` forces a fresh conversion). Fails, naming the cause, when storage is unreachable, the source is missing, the document is refused (not a PDF, a paywall page, empty or looping output) or the catalog stamp did not land. While a conversion runs, the tool sends a progress notification about every 20 seconds. Use `markdown_read` to fetch the content. Needs the event bus.
+
+When a PDF's markdown is stored, and when a PDF is found already converted without word boxes, the tool also publishes `scribe.boxes`; the scribe watcher builds the word boxes after the call returns.
 
 Changes state: yes.
 
@@ -400,6 +417,8 @@ Changes state: no.
 
 Ingest a file already staged in the personal inbox. Takes a file name, not a path: absolute paths, path separators and a leading dot are rejected. The file must already be in the configured inbox directory. The tool runs the same ingest pipeline as `hs personal add`, blocks until indexing finishes (a long PDF can take many minutes) and reports the assigned stem, title and category. Sends progress notifications.
 
+For a PDF the tool also publishes `scribe.boxes` once the document is stored and indexed, and the scribe watcher builds its word boxes after the call returns. A PDF is refused before it is converted when the broker cannot be reached.
+
 Changes state: yes.
 
 | Parameter | Type | Required or default | Meaning |
@@ -512,12 +531,12 @@ The server reads `~/.home-still/config.yaml` once at startup and `~/.home-still/
 | Section | Required | Used for |
 |---|---|---|
 | `storage:` | yes | Catalog, papers and markdown objects. |
-| `events:` | yes | `papers.ingested` and `scribe.completed` announcements. |
+| `events:` | yes | `papers.ingested`, `scribe.completed` and `scribe.boxes` announcements. |
 | `scribe:` (`servers`, `convert_timeout_secs`, `timeout_policy`, `epub`) | no | `scribe_health`, `scribe_convert`. |
 | `distill:` (`servers`) | no | Distill and personal search and indexing tools. |
 | `paper:` | no | Provider settings for `paper_*` tools. |
-| `docs:` (`lan_base_url`, `remote_base_url`, `link_ttl_secs`, `default_subject`) | no | Signed links in search hits and `doc_link`. Links are off until both base URLs are set. |
-| `storage:` | yes | Short-link codes (`doc_link` with `short`) are records beside the documents. |
+| `docs:` (`lan_base_url`, `remote_base_url`, `link_ttl_secs`, `default_subject`) | no | Signed links in search hits and `cite`. Links are off, and `cite` fails, until both base URLs are set. |
+| `storage:` | yes | Short-link codes (`cite` with `short`) are records beside the documents. |
 | `openalex:` (`db_path`) | no | The local OpenAlex database for the `openalex_*` tools. |
 
 | Variable | Used for |

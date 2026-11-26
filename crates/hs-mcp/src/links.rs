@@ -14,7 +14,7 @@
 //! URL. It is minted only when a caller asks, because minting one is a
 //! storage write and a search hit is not the right place to make one.
 
-use hs_common::docs::{LinkFormat, LinkKey};
+use hs_common::docs::{Highlight, LinkFormat, LinkKey, LinkParams, ShortLink};
 
 /// The `links` object on a document-returning tool's response.
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -97,19 +97,62 @@ impl LinkMinter {
         self.key.is_some() && self.lan_base_url.is_some() && self.remote_base_url.is_some()
     }
 
-    /// Mint the links for one document.
+    /// Sign one link to one view of a document.
     ///
-    /// `None` when links are not configured, or when the document's
-    /// stem is not a stem: a document with no valid stem has no link.
+    /// `None` when this host holds no signing key, or when the link is one
+    /// the signer refuses: a stem that is not a stem, or a page view that
+    /// names no page.
     ///
-    /// `page` is the page the passage is on, and `passage` is its
-    /// first line. The page is what a PDF viewer scrolls to; the first
-    /// line is what a text fragment quotes, so the browser selects the
-    /// passage itself.
+    /// `page` is the page the passage is on, `passage` the text to select
+    /// (a quote, or the passage's first line) and `highlight` the words to
+    /// box. The page is what a PDF viewer scrolls to; the text is what a
+    /// text fragment names, so the browser selects the passage itself; the
+    /// highlight is what the viewer, the page view and the page image draw.
     ///
     /// `collection` is the store the document is in. It is part of the
     /// signature, so a link for a personal document is a capability for
     /// that document and not for an academic one with the same stem.
+    pub fn link(
+        &self,
+        stem: &str,
+        collection: &str,
+        format: LinkFormat,
+        page: Option<u32>,
+        passage: Option<&str>,
+        highlight: Option<&Highlight>,
+    ) -> Option<MintedLink> {
+        let params = hs_common::docs::mint(
+            self.key.as_ref()?,
+            stem,
+            format,
+            &self.subject,
+            collection,
+            page,
+            highlight,
+            self.link_ttl_secs,
+        )
+        .ok()?;
+        Some(MintedLink {
+            fragment: fragment_for(format, params.page, passage),
+            params,
+        })
+    }
+
+    /// The two URLs a signed link is opened on. `None` when the base URLs
+    /// are not configured.
+    pub fn urls(&self, link: &MintedLink) -> Option<LinkPair> {
+        Some(LinkPair {
+            lan: url(self.lan_base_url.as_ref()?, link),
+            remote: url(self.remote_base_url.as_ref()?, link),
+        })
+    }
+
+    /// Mint the source and markdown links of one document: what a search
+    /// hit and a catalog entry carry.
+    ///
+    /// `None` when links are not configured, or when the document's
+    /// stem is not a stem: a document with no valid stem has no link.
+    /// `page`, `passage` and `collection` are as for [`LinkMinter::link`].
     pub fn mint(
         &self,
         stem: &str,
@@ -117,74 +160,20 @@ impl LinkMinter {
         page: Option<u32>,
         passage: Option<&str>,
     ) -> Option<DocumentLinks> {
-        let key = self.key.as_ref()?;
-        let lan_base = self.lan_base_url.as_ref()?;
-        let remote_base = self.remote_base_url.as_ref()?;
-
-        let mut out = DocumentLinks {
-            source: None,
-            markdown: None,
-            expires_at: String::new(),
-        };
-        let mut expires_at = 0u64;
-        for (format, slot) in [
-            (LinkFormat::Source, &mut out.source),
-            (LinkFormat::Markdown, &mut out.markdown),
-        ] {
-            let Ok(params) = hs_common::docs::mint(
-                key,
-                stem,
-                format,
-                &self.subject,
-                collection,
-                page,
-                self.link_ttl_secs,
-            ) else {
-                continue;
-            };
-            expires_at = expires_at.max(params.expires_at);
-            let fragment = fragment_for(format, params.page, passage);
-            *slot = Some(LinkPair {
-                lan: url(lan_base, &params, &fragment),
-                remote: url(remote_base, &params, &fragment),
-            });
-        }
-        if out.source.is_none() && out.markdown.is_none() {
+        if !self.is_enabled() {
             return None;
         }
-        out.expires_at = expires_at_iso(expires_at);
-        Some(out)
-    }
-
-    /// The target a short link for one document and one format points at.
-    ///
-    /// `passage` is the markdown's first line, as for [`LinkMinter::mint`]: the
-    /// fragment is stored with the code because a redirect cannot put one
-    /// back — the browser is already following a `Location` by the time it
-    /// would matter.
-    pub fn short_target(
-        &self,
-        stem: &str,
-        collection: &str,
-        page: Option<u32>,
-        passage: Option<&str>,
-        format: LinkFormat,
-    ) -> Option<ShortLinkTarget> {
-        let key = self.key.as_ref()?;
-        let params = hs_common::docs::mint(
-            key,
-            stem,
-            format,
-            &self.subject,
-            collection,
-            page,
-            self.link_ttl_secs,
-        )
-        .ok()?;
-        Some(ShortLinkTarget {
-            target: params.to_path(),
-            fragment: fragment_for(format, params.page, passage),
-            expires_at: params.expires_at,
+        let source = self.link(stem, collection, LinkFormat::Source, page, passage, None);
+        let markdown = self.link(stem, collection, LinkFormat::Markdown, page, passage, None);
+        let expires_at = source
+            .iter()
+            .chain(&markdown)
+            .map(MintedLink::expires_at)
+            .max()?;
+        Some(DocumentLinks {
+            source: source.as_ref().and_then(|link| self.urls(link)),
+            markdown: markdown.as_ref().and_then(|link| self.urls(link)),
+            expires_at: expires_at_iso(expires_at),
         })
     }
 
@@ -218,39 +207,59 @@ pub struct DocsConfig {
 /// The default link lifetime, in seconds.
 pub const DEFAULT_TTL_SECS: u64 = 3600;
 
-/// The URL for a link's parameters.
+/// The URL of a signed link on one origin.
 ///
 /// The fragment points the browser at the passage: a page for a PDF, a
 /// quoted line for the markdown. The page is *also* in the query
 /// string, where the signature covers it.
-fn url(base: &str, params: &hs_common::docs::LinkParams, fragment: &str) -> String {
+fn url(base: &str, link: &MintedLink) -> String {
     let base = base.trim_end_matches('/');
-    format!("{base}{}{fragment}", params.to_path())
+    format!("{base}{}{}", link.params.to_path(), link.fragment)
 }
 
-/// A short link's target: the redirect's path, its fragment and its expiry.
+/// One signed link: the request the docs service verifies, and where the
+/// browser lands in what the service answers.
 ///
-/// Built by [`LinkMinter::short_target`], which returns nothing when links are
-/// not configured, the stem is not a stem, or the format is one this
-/// deployment does not serve — the same conditions that make
-/// [`LinkMinter::mint`] return nothing for that format.
+/// Built by [`LinkMinter::link`]. The long URLs ([`LinkMinter::urls`]) and
+/// the short link's record ([`MintedLink::short_link`]) are read from the
+/// same signature, so a code redirects to exactly the link the caller was
+/// also given.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShortLinkTarget {
-    /// The path from the site root the redirect points at.
-    pub target: String,
-    /// The fragment the redirect appends.
-    pub fragment: String,
-    /// When the signed link behind the code stops working.
-    pub expires_at: u64,
+pub struct MintedLink {
+    params: LinkParams,
+    fragment: String,
+}
+
+impl MintedLink {
+    /// When the link stops working, as a Unix timestamp in seconds.
+    pub fn expires_at(&self) -> u64 {
+        self.params.expires_at
+    }
+
+    /// What a short link to this link is stored as.
+    ///
+    /// The target is a path, so one code works on whichever origin served
+    /// it. The fragment is stored with it because a redirect cannot put one
+    /// back: the browser is already following a `Location` by the time it
+    /// would matter.
+    pub fn short_link(&self) -> ShortLink {
+        ShortLink {
+            target: self.params.to_path(),
+            fragment: self.fragment.clone(),
+            expires_at: self.params.expires_at,
+        }
+    }
 }
 
 /// The fragment that points a browser at the part of the document a link is
 /// about.
 ///
 /// The source is a PDF or an HTML page: the browser can only scroll it to a
-/// page. The markdown is text: the browser can select the passage in it. One
-/// function, because a long link and the short link that redirects to it must
-/// land the reader in the same place.
+/// page. The markdown is text: the browser can select the passage in it. The
+/// viewer, the page view and the page image show the passage themselves, from
+/// the page and the highlight in the query, where the signature covers them.
+/// One function, because a long link and the short link that redirects to it
+/// must land the reader in the same place.
 fn fragment_for(format: LinkFormat, page: Option<u32>, passage: Option<&str>) -> String {
     match format {
         LinkFormat::Source => page
@@ -259,6 +268,7 @@ fn fragment_for(format: LinkFormat, page: Option<u32>, passage: Option<&str>) ->
         LinkFormat::Markdown => passage
             .map(hs_common::docs::text_fragment)
             .unwrap_or_default(),
+        LinkFormat::Viewer | LinkFormat::Page | LinkFormat::PageImage => String::new(),
     }
 }
 
@@ -283,7 +293,7 @@ fn short_link_urls(lan_base: &str, remote_base: &str, code: &str) -> ShortLinkPa
 }
 
 /// The expiry, as an ISO timestamp.
-fn expires_at_iso(unix_secs: u64) -> String {
+pub(crate) fn expires_at_iso(unix_secs: u64) -> String {
     let dt = chrono::DateTime::from_timestamp(unix_secs as i64, 0).unwrap_or_else(|| {
         chrono::DateTime::from_timestamp(0, 0).expect("the epoch is a timestamp")
     });
@@ -386,42 +396,108 @@ mod tests {
     }
 
     #[test]
-    fn a_short_target_carries_the_page_and_the_fragment() {
+    fn a_short_link_carries_the_page_and_the_fragment() {
         // The redirect points at a path, so the same code works on whichever
         // origin served it; the page travels in the query *and* in the fragment
         // because a browser cannot be made to re-add a fragment after a
         // redirect.
-        let target = minter()
-            .short_target(
+        let short = minter()
+            .link(
                 "10.1234_abcd",
                 "academic",
+                LinkFormat::Source,
                 Some(11),
                 None,
-                LinkFormat::Source,
+                None,
             )
-            .unwrap();
+            .unwrap()
+            .short_link();
         assert!(
-            target.target.starts_with("/docs/v1/10.1234_abcd/source?"),
-            "{target:?}"
+            short.target.starts_with("/docs/v1/10.1234_abcd/source?"),
+            "{short:?}"
         );
-        assert!(target.target.contains("page=11"));
-        assert_eq!(target.fragment, "#page=11");
-        assert!(target.expires_at > hs_common::docs::now_secs());
+        assert!(short.target.contains("page=11"));
+        assert_eq!(short.fragment, "#page=11");
+        assert!(short.expires_at > hs_common::docs::now_secs());
     }
 
     #[test]
-    fn a_markdown_short_target_quotes_the_passage() {
-        let target = minter()
-            .short_target(
+    fn a_markdown_short_link_quotes_the_passage() {
+        let short = minter()
+            .link(
                 "10.1234_abcd",
                 "academic",
+                LinkFormat::Markdown,
                 Some(11),
                 Some("The passage's first line"),
-                LinkFormat::Markdown,
+                None,
+            )
+            .unwrap()
+            .short_link();
+        assert!(short.target.contains("/markdown?"), "{short:?}");
+        assert!(short.fragment.starts_with("#:~:text="), "{short:?}");
+    }
+
+    /// The code and the long URL are read from one signature: what the
+    /// redirect lands on is the link the caller was also given.
+    #[test]
+    fn a_short_link_redirects_to_the_long_link() {
+        let m = minter();
+        let link = m
+            .link(
+                "10.1234_abcd",
+                "academic",
+                LinkFormat::Source,
+                Some(11),
+                None,
+                None,
             )
             .unwrap();
-        assert!(target.target.contains("/markdown?"), "{target:?}");
-        assert!(target.fragment.starts_with("#:~:text="), "{target:?}");
+        let lan = m.urls(&link).unwrap().lan;
+        assert_eq!(
+            format!("http://host:7446{}", link.short_link().location()),
+            lan
+        );
+    }
+
+    /// The viewer and the page view show the passage themselves: the words
+    /// to box travel in the query, where the signature covers them, and the
+    /// link needs no fragment.
+    #[test]
+    fn a_viewer_link_carries_the_highlight_in_its_query() {
+        let highlight = Highlight::parse("11.4-9").unwrap();
+        let m = minter();
+        for format in [LinkFormat::Viewer, LinkFormat::Page] {
+            let link = m
+                .link(
+                    "10.1234_abcd",
+                    "academic",
+                    format,
+                    Some(11),
+                    Some("The passage's first line"),
+                    Some(&highlight),
+                )
+                .unwrap();
+            let lan = m.urls(&link).unwrap().lan;
+            assert!(lan.contains("page=11&hl=11.4-9&sig="), "{lan}");
+            assert!(!lan.contains('#'), "{lan}");
+        }
+    }
+
+    /// A page view is one page of the document: a link to it that names no
+    /// page is refused when it is signed, not answered with a 404 later.
+    #[test]
+    fn a_page_link_without_a_page_is_not_minted() {
+        assert!(minter()
+            .link(
+                "10.1234_abcd",
+                "academic",
+                LinkFormat::Page,
+                None,
+                None,
+                None
+            )
+            .is_none());
     }
 
     #[test]

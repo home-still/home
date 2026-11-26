@@ -5,16 +5,14 @@ use figment::{
     Figment,
 };
 use hs_common::config_file::{env_key_path, unknown_env_names, ConfigError, ConfigFile};
+use hs_common::event_bus::{EventBus, EventBusConfig};
 use hs_common::storage::{Storage, StorageConfig};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Prefix of the environment variables that override config keys.
 const ENV_PREFIX: &str = "HOME_STILL_";
-
-/// The system-wide config file, merged under the user's.
-const SYSTEM_CONFIG_PATH: &str = "/etc/home-still/config.yaml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -48,6 +46,12 @@ pub struct Config {
     /// they cannot drift apart.
     #[serde(skip)]
     pub storage: StorageConfig,
+    /// Event bus (top-level `events:` section); `None` when the config has
+    /// none. Ingesting a PDF asks the scribe watcher for its word boxes
+    /// over the bus, so without one a PDF ingest is refused
+    /// ([`Config::build_event_bus`]).
+    #[serde(skip)]
+    pub events: Option<EventBusConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +69,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             collection_name: "personal_docs".to_string(),
-            storage_dir: "personal".to_string(),
+            storage_dir: hs_common::stores::PERSONAL_PREFIX_DEFAULT.to_string(),
             ingest_inbox: "inbox".to_string(),
             naming: NamingConfig::default(),
             distill_url: "http://localhost:7434".to_string(),
@@ -76,6 +80,7 @@ impl Default for Config {
                 .collect(),
             project_dir: hs_common::default_project_dir(),
             storage: StorageConfig::default(),
+            events: None,
         }
     }
 }
@@ -126,8 +131,7 @@ impl Config {
             .ok_or(ConfigError::NoHomeDir)
             .map_err(config_error)?;
         let user = ConfigFile::load_in(&home).map_err(config_error)?;
-        let system =
-            ConfigFile::load_at(Path::new(SYSTEM_CONFIG_PATH), &home).map_err(config_error)?;
+        let system = user.load_system().map_err(config_error)?;
         Self::load_from(&system, &user)
     }
 
@@ -183,6 +187,11 @@ impl Config {
         })?;
         // A `personal:` key cannot move the project directory.
         cfg.project_dir = project_dir;
+        // `storage_dir` is the store's prefix in the corpus's storage. The
+        // registry of stores resolves and checks it (same files, same
+        // environment variable), so this store and every service that
+        // reads its documents agree on where they are.
+        cfg.storage_dir = hs_common::stores::personal_prefix(system, user).map_err(config_error)?;
         // The storage backend comes from the top-level `storage:`
         // section — the same one the corpus uses — not from a
         // `personal:` key, so there is one place that says where the
@@ -205,6 +214,7 @@ impl Config {
         } else {
             user.default_storage().map_err(config_error)?
         };
+        cfg.events = EventBusConfig::from_file(user).map_err(config_error)?;
 
         if cfg.collection_name.trim().is_empty() {
             return Err(PersonalError::Config(
@@ -247,6 +257,12 @@ impl Config {
     /// code and drift apart.
     pub fn build_storage(&self) -> anyhow::Result<Arc<dyn Storage>> {
         self.storage.build()
+    }
+
+    /// Build the configured event bus. A config without an `events:` section
+    /// has none: this is an error, never a bus that drops everything.
+    pub async fn build_event_bus(&self) -> anyhow::Result<Arc<dyn EventBus>> {
+        EventBusConfig::build_required(self.events.as_ref()).await
     }
 
     pub fn markdown_dir(&self) -> PathBuf {

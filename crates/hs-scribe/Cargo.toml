@@ -7,13 +7,16 @@ edition = "2021"
 [features]
 default = ["client"]
 client = []
+# Rasterising a page (`render`): pdfium's bitmap as an `image`. On its own
+# for the binaries that draw pages and run no model (the docs service).
+render = ["pdfium-render/image", "dep:image"]
 server = [
+    "render",
     "dep:axum",
     "dep:tempfile",
-    "pdfium-render/image",
     "dep:ort",
     "dep:ndarray",
-    "dep:image",
+    "dep:oar-ocr",
     "dep:ollama-rs",
     "dep:base64",
     "dep:futures",
@@ -36,15 +39,15 @@ tokio = { workspace = true }
 reqwest = { workspace = true, features = ["multipart", "stream"] }
 figment = { workspace = true }
 dirs = "6"
-hs-common = { workspace = true, features = ["service", "storage-s3", "events-nats", "logging", "catalog", "auth", "catch-panic"] }
+hs-common = { workspace = true, features = ["service", "storage-s3", "events-nats", "logging", "catalog", "auth", "catch-panic", "boxes"] }
 async-trait = "0.1.92"
 futures-util = "0.3"
 unicode-segmentation = "1"
 scraper = "0.22"
 chrono = { workspace = true }
-# The one PDF parser (page counting and rendering): libpdfium, bound at
-# runtime. `thread_safe` serialises every pdfium call process-wide; the
-# `image` feature (rasterising) is enabled by `server` only.
+# The one PDF parser (page counting, text layer and rendering): libpdfium,
+# bound at runtime. `thread_safe` serialises every pdfium call process-wide;
+# the `image` feature (rasterising) is enabled by `render` only.
 pdfium-render = { version = "0.8.35", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 bytes = "1"
 # The EPUB reader (src/epub.rs): zip entries read under byte caps, package XML
@@ -65,6 +68,12 @@ tracing-subscriber = { version = "0.3", features = [
 ], optional = true }
 image = { version = "0.25", optional = true }
 ort = { version = "=2.0.0-rc.11", features = ["ndarray"], optional = true }
+# The words of a page that has no text layer (`word_ocr`): PP-OCRv5
+# detection and recognition on ONNX Runtime. Pinned to the last release
+# that builds on the `ort` above: `ort-sys` links one onnxruntime for the
+# whole workspace, fastembed 5 (hs-distill) fixes it at 2.0.0-rc.11, and
+# oar-ocr 0.6.2 onwards needs rc.12 or later.
+oar-ocr = { version = "=0.6.1", default-features = false, optional = true }
 ndarray = { version = "0.17", optional = true }
 ollama-rs = { version = "0.3", features = ["stream"], optional = true }
 base64 = { version = "0.22", optional = true }

@@ -243,6 +243,39 @@ pub(crate) mod tests {
         assemble("", &objs)
     }
 
+    /// A PDF whose page `i` shows `pages[i]`, one string a line, set in
+    /// 12 pt Helvetica with the first baseline at (72, 720) and 14 pt from
+    /// one line to the next. A page given no lines has no text layer. The
+    /// strings must not hold `(`, `)` or `\`.
+    pub(crate) fn pdf_with_text(pages: &[&[&str]]) -> Vec<u8> {
+        let kids = (0..pages.len())
+            .map(|i| format!("{} 0 R", 4 + 2 * i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut objs = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        for (i, lines) in pages.iter().enumerate() {
+            let mut content = String::from("BT /F1 12 Tf 14 TL 72 720 Td\n");
+            for line in *lines {
+                writeln!(content, "({line}) Tj T*").unwrap();
+            }
+            content.push_str("ET");
+            objs.push(format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
+                5 + 2 * i
+            ));
+            objs.push(format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ));
+        }
+        assemble("", &objs)
+    }
+
     fn nested(depth: usize) -> String {
         format!("{}{}", "[".repeat(depth), "]".repeat(depth))
     }

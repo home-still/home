@@ -12,8 +12,10 @@ use crate::models::{Category, SourceFormat};
 use crate::services::{catalog, distill::PersonalDistill, naming};
 use chrono::Utc;
 use hs_common::catalog::{CatalogEntry, ConversionMeta};
+use hs_common::event_bus::EventBus;
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Default, Clone)]
 pub struct IngestOptions {
@@ -56,6 +58,21 @@ pub async fn ingest(cfg: &Config, file: &Path, opts: IngestOptions) -> Result<In
     if let (false, Some(existing)) = (opts.force, same_content.first()) {
         return Err(PersonalError::DuplicateContent(existing.clone()));
     }
+
+    // A PDF's word boxes are built by the scribe watcher on request, and the
+    // request is the last step of the commit below. The bus is opened now so
+    // that a host without one refuses the PDF before the (possibly
+    // minutes-long) conversion, not after it.
+    let boxes_bus = if format.as_str() == hs_scribe::box_watch::BOXED_SOURCE_EXTENSION {
+        Some(cfg.build_event_bus().await.map_err(|e| {
+            PersonalError::Other(anyhow::anyhow!(
+                "a PDF's word boxes are requested over the event bus, which could not be \
+                 opened: {e:#}"
+            ))
+        })?)
+    } else {
+        None
+    };
 
     // Convert first so the LLM has the actual extracted text, not raw bytes.
     let stem_hint = file
@@ -112,6 +129,7 @@ pub async fn ingest(cfg: &Config, file: &Path, opts: IngestOptions) -> Result<In
         bytes,
         markdown,
         already_stored,
+        boxes_bus,
     };
     // The unit runs as its own task. A caller that gives up (an MCP session
     // closing, a client timeout) drops this future; a unit dropped between
@@ -170,6 +188,9 @@ struct Commit {
     markdown: String,
     /// The stem already had files before this call (`--force` over it).
     already_stored: bool,
+    /// Where to ask for the document's word boxes; `None` for a format that
+    /// has none.
+    boxes_bus: Option<Arc<dyn EventBus>>,
 }
 
 /// Write the files and index the document, as one unit: if any step fails the
@@ -192,6 +213,7 @@ async fn commit(job: Commit) -> Result<u32> {
         bytes,
         markdown,
         already_stored,
+        boxes_bus,
     } = job;
     let (dest_orig, dest_md, dest_cat) = store_keys(&cfg, &stem, format);
     let storage = cfg.build_storage().map_err(|e| {
@@ -230,9 +252,21 @@ async fn commit(job: Commit) -> Result<u32> {
 
         let distill = PersonalDistill::new(&cfg)?;
         index_attempted = true;
-        distill
+        let indexed = distill
             .index(&format!("{stem}.md"), &markdown, &entry)
-            .await
+            .await?;
+        // Last: nothing is asked of the watcher for a document that was not
+        // stored and indexed.
+        if let Some(bus) = &boxes_bus {
+            hs_scribe::box_watch::request_boxes(bus.as_ref(), &dest_orig)
+                .await
+                .map_err(|e| {
+                    PersonalError::Other(anyhow::anyhow!(
+                        "requesting the word boxes of {dest_orig}: {e}"
+                    ))
+                })?;
+        }
+        Ok(indexed)
     }
     .await;
     match stored {
@@ -671,5 +705,133 @@ mod tests {
         assert!(!present(&orig).await && !present(&md).await && !present(&sidecar).await);
         let (orig, md, sidecar) = store_keys(&cfg, &second.stem, SourceFormat::Markdown);
         assert!(present(&orig).await && present(&md).await && present(&sidecar).await);
+    }
+
+    /// A bus that records what is published, or refuses every publish.
+    #[derive(Default)]
+    struct RecordingBus {
+        published: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+        refuse: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EventBus for RecordingBus {
+        async fn publish(&self, subject: &str, payload: &[u8]) -> anyhow::Result<()> {
+            if self.refuse {
+                anyhow::bail!("broker unreachable");
+            }
+            self.published
+                .lock()
+                .unwrap()
+                .push((subject.to_string(), serde_json::from_slice(payload)?));
+            Ok(())
+        }
+
+        async fn consume(
+            &self,
+            _spec: &hs_common::event_bus::ConsumerSpec,
+        ) -> anyhow::Result<hs_common::event_bus::EventStream> {
+            anyhow::bail!("this bus only records publishes")
+        }
+    }
+
+    /// The store-and-index unit of a converted PDF.
+    fn pdf_commit(cfg: &Config, bus: Arc<RecordingBus>) -> Commit {
+        Commit {
+            cfg: cfg.clone(),
+            stem: "scan-0a1b2c3d".into(),
+            format: SourceFormat::Pdf,
+            title: "Scan".into(),
+            category: Category::Other,
+            size: 8,
+            sha: "0a1b2c3d".into(),
+            bytes: b"%PDF-1.4".to_vec(),
+            markdown: "# Scan\n\nBody text.".into(),
+            already_stored: false,
+            boxes_bus: Some(bus),
+        }
+    }
+
+    async fn stored(cfg: &Config, key: &str) -> bool {
+        cfg.build_storage()
+            .unwrap()
+            .head(key)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn a_stored_and_indexed_pdf_has_its_word_boxes_requested_at_its_stored_key() {
+        let mut server = mockito::Server::new_async().await;
+        let (_dir, cfg, _index) = store_with_distill(&mut server).await;
+        let bus = Arc::new(RecordingBus::default());
+
+        commit(pdf_commit(&cfg, bus.clone())).await.unwrap();
+
+        let (orig, _, _) = store_keys(&cfg, "scan-0a1b2c3d", SourceFormat::Pdf);
+        assert!(stored(&cfg, &orig).await);
+        assert_eq!(
+            *bus.published.lock().unwrap(),
+            [(
+                "scribe.boxes".to_string(),
+                serde_json::json!({ "key": orig })
+            )]
+        );
+        // The key is one the watcher's consumer accepts: where the personal
+        // store keeps that stem's PDF.
+        let stores = hs_common::stores::Stores::with_personal_prefix(&cfg.storage_dir).unwrap();
+        let (_, layout) = stores.documents(hs_common::stores::PERSONAL).unwrap();
+        assert_eq!(layout.source_key("scan-0a1b2c3d", "pdf"), orig);
+    }
+
+    #[tokio::test]
+    async fn a_pdf_whose_word_boxes_cannot_be_requested_is_not_left_in_the_store() {
+        let mut server = mockito::Server::new_async().await;
+        let (_dir, cfg, _index) = store_with_distill(&mut server).await;
+        let purge = server
+            .mock(
+                "DELETE",
+                mockito::Matcher::Regex("^/doc/scan-0a1b2c3d".into()),
+            )
+            .with_status(200)
+            .with_body(r#"{"deleted":2}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let bus = Arc::new(RecordingBus {
+            refuse: true,
+            ..RecordingBus::default()
+        });
+
+        let err = commit(pdf_commit(&cfg, bus)).await.unwrap_err();
+
+        assert!(err.to_string().contains("word boxes"), "{err}");
+        purge.assert_async().await;
+        let (orig, md, sidecar) = store_keys(&cfg, "scan-0a1b2c3d", SourceFormat::Pdf);
+        for key in [&orig, &md, &sidecar] {
+            assert!(!stored(&cfg, key).await, "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pdf_is_refused_before_conversion_on_a_host_with_no_event_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            project_dir: dir.path().to_path_buf(),
+            // Nothing listens here: reaching the conversion would fail with
+            // a converter error instead of the one asserted below.
+            scribe_url: "http://127.0.0.1:1".into(),
+            storage: storage_at(dir.path()),
+            ..Config::default()
+        };
+        let pdf = dir.path().join("scan.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4").unwrap();
+
+        let err = ingest(&cfg, &pdf, titled("Scan", false)).await.unwrap_err();
+
+        let shown = err.to_string();
+        assert!(shown.contains("event bus"), "{shown}");
+        assert!(shown.contains("`events:`"), "{shown}");
     }
 }

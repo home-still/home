@@ -1,6 +1,7 @@
 //! The one binding to libpdfium, and the PDF reads that need no raster:
-//! opening a document and counting its pages. Rendering (`render_page`)
-//! lives in `pipeline::pdf_parser` and needs the `server` feature.
+//! opening a document and counting its pages. Reading a page's text layer
+//! is in `text_layer`; rendering (`render_page`) is in `render` and needs
+//! the `render` feature.
 //!
 //! pdfium is the ONE PDF parser of the workspace — the renderer, and the
 //! page counter every dispatcher consults before it sends a document
@@ -339,6 +340,15 @@ impl PdfParser {
             .map_err(|e| document_error(e, &path.display().to_string()))
     }
 
+    /// Open a document held in memory, read in place. Same contract as
+    /// [`Self::open`]; a document that does not parse is always a verdict
+    /// on the bytes.
+    pub fn open_bytes<'a>(&'a self, bytes: &'a [u8]) -> Result<PdfDocument<'a>> {
+        self.pdfium
+            .load_pdf_from_byte_slice(bytes, None)
+            .map_err(|e| document_error(e, "the in-memory PDF"))
+    }
+
     /// Page count of the document at `path`, without rasterizing anything —
     /// a cheap metadata read. See [`Self::count_pages_in_bytes`].
     pub fn page_count(&self, path: &str) -> Result<usize> {
@@ -404,7 +414,6 @@ fn document_error(e: PdfiumError, what: &str) -> anyhow::Error {
 }
 
 /// A page that cannot be loaded: a document fault where pdfium says so.
-#[cfg(feature = "server")]
 pub(crate) fn page_error(e: PdfiumError, idx: u16) -> anyhow::Error {
     if is_document_fault(&e) {
         ConvertFailure::err(
@@ -422,7 +431,7 @@ pub(crate) fn page_error(e: PdfiumError, idx: u16) -> anyhow::Error {
 /// a null bitmap, and the size was already bounded by `plan_render`, so it
 /// is an allocation failure that a later attempt can survive. Every other
 /// error stays untyped, hence transient.
-#[cfg(feature = "server")]
+#[cfg(feature = "render")]
 pub(crate) fn render_error(e: PdfiumError, idx: u16) -> anyhow::Error {
     let bitmap_allocation_failed = matches!(
         e,
@@ -438,7 +447,7 @@ pub(crate) fn render_error(e: PdfiumError, idx: u16) -> anyhow::Error {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "render"))]
 mod tests {
     use super::*;
     use crate::classify::{classify, failure_code, FailureClass};

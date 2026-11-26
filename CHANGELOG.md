@@ -4,11 +4,72 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
 
 ## v0.0.1-rc.394
 
-- `doc_link` takes `short: true`, and `hs docs link --short` mints a
-  12-character short link (`<base>/s/<code>`) that redirects to the signed
-  URL. The code is a record in the storage backend and expires with the link
-  behind it; `hs docs prune` deletes the expired ones. Search hits never mint
-  one.
+- The scribe server answers `POST /scribe/boxes`: the body is a PDF, the
+  response its word-box sidecar (every word of every page with its box),
+  read from the text layer, or by a word OCR on the CPU for a page that has
+  none. **Each host that runs a scribe server needs three more model files
+  in `~/.home-still/models/` before it can read a scanned page**:
+  `pp-ocrv5_mobile_det.onnx`, `en_pp-ocrv5_mobile_rec.onnx` and
+  `ppocrv5_en_dict.txt`, from
+  `https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/<file>`.
+  Without them a PDF with a text layer still gets its sidecar and a scanned
+  one is answered `500` naming the missing file. The keys
+  `scribe_server.ocr_detection_model_path`, `ocr_recognition_model_path` and
+  `ocr_dictionary_path` name other files.
+- `hs scribe watch-events` reads a second queue, `scribe.boxes`, and builds
+  the word boxes of each PDF it names through `/scribe/boxes`. The request is
+  published when a PDF's markdown is stored and by `hs personal add` for a
+  PDF. **Upgrade the scribe servers before the watcher**: a server without
+  `/scribe/boxes` answers 404, and a request no server can answer is retried
+  and then dropped after `events.nats.max_deliver` deliveries. **`hs personal
+  add` and `personal_add` now need the `events:` section and a reachable
+  broker for a PDF**, and refuse the PDF before converting it without them.
+  PDFs converted before this release have no word boxes: once the upgraded
+  watcher is running, run `hs scribe boxes catch-up` and watch
+  `hs scribe boxes status` until `missing`, `queued` and `building` are 0.
+- Document links are signed under a new rule that also covers the words a
+  link highlights. **A link or short link minted before the upgrade is
+  refused with `403` by an upgraded docs service, and a link minted by an
+  upgraded host is refused by a docs service that is not**: upgrade the docs
+  service and every host that mints links (`hs docs link`, the MCP server)
+  together. Links last an hour unless `docs.link_ttl_secs` says otherwise, so
+  nothing has to be minted again by hand.
+- The docs service answers three more routes for a PDF:
+  `/docs/v1/{stem}/page.png` (one page as a picture, the cited words boxed),
+  `/docs/v1/{stem}/page` (that picture in a page of HTML) and
+  `/docs/v1/{stem}/viewer` (the whole PDF in a pdf.js viewer), and serves the
+  viewer's scripts under `/docs/assets/`. **The host that runs `hs serve docs`
+  now needs libpdfium** (in `~/.local/lib`, `~/.home-still/dyld-libs` or the
+  system library path, as a scribe host has it) **and the service refuses to
+  start without it.** The gateway already forwards `/docs/*`, so nothing
+  changes there.
+- **The MCP tool `doc_link` is removed; `cite` replaces it.** `cite` takes
+  `store`, `doc_id` and `quote`, checks the quote against the document's
+  text and refuses a quote the document does not contain, naming the
+  closest passage. For a quote it finds it returns the passage as the
+  document has it, the document's title, authors, year and DOI, the
+  passage's lines, page and word rectangles (`boxes.status` is `located`,
+  `not_located`, `pending` or `not_applicable`) and signed links: `source`,
+  `markdown` and, for a located passage, `viewer` and `page`. `short`
+  (`viewer`, `page`, `source` or `markdown`) stores a short link, as
+  `doc_link`'s `short: true` did. A client that called `doc_link` for a link
+  to a stem it knew calls `cite` with a quote, or reads `links` from
+  `catalog_read`. **With `image: true` the MCP server fetches the page
+  image from the docs service at `docs.lan_base_url`, so that address has
+  to be reachable from the host the MCP server runs on.**
+- `hs docs link --collection` and `cite`'s `store` are checked against the
+  list of stores. **A name that is not a store is now refused when the link
+  is minted**; it used to be signed and then answered with a 404.
+- `personal.storage_dir` is checked at startup by every command that reads
+  it, the docs service and the MCP server: it must be a relative path
+  without `.` or `..` parts and must not overlap another store's prefix
+  (`papers`, `markdown`, `catalog`, `boxes`, `web`, `syntheses`). The docs
+  service now serves personal documents from this prefix; it used to read
+  `personal/` whatever the setting said.
+- `hs docs link --short` mints a 12-character short link (`<base>/s/<code>`)
+  that redirects to the signed URL. The code is a record in the storage
+  backend and expires with the link behind it; `hs docs prune` deletes the
+  expired ones. Search hits never mint one.
 - The docs service answers `/s/{code}` with a `302` to the signed link, and
   the gateway forwards `/s/*` unauthenticated for the same reason it forwards
   `/docs/*`: a browser following the redirect has no bearer token.

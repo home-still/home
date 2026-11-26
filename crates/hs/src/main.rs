@@ -11,8 +11,10 @@ pub mod daemon;
 mod distill_cmd;
 mod docs_cmd;
 mod docs_service;
+mod docs_shape;
 #[cfg(test)]
 mod docs_tests;
+mod docs_views;
 mod installer;
 mod mcp_client;
 mod mcp_cmd;
@@ -21,6 +23,7 @@ mod migrate_personal;
 mod openalex_cmd;
 mod pipeline_cmd;
 mod restart_cmd;
+mod scribe_boxes;
 mod scribe_cmd;
 mod scribe_inbox;
 mod scribe_inbox_install;

@@ -328,6 +328,12 @@ impl AuthedRequest {
         self
     }
 
+    /// A raw request body, sent as it is.
+    pub fn body(mut self, body: impl Into<reqwest::Body>) -> Self {
+        self.builder = self.builder.body(body);
+        self
+    }
+
     pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
         self.builder = self.builder.timeout(timeout);
         self

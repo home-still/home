@@ -8,6 +8,7 @@ use crate::config::{AppConfig, ConverterMode};
 use crate::ocr::RepetitionLoopError;
 use crate::pdf_meta::{check_header, HEADER_PROBE_BYTES, MAX_PDF_BYTES};
 use crate::pipeline::processor::Processor;
+use crate::word_ocr::{LazyWordOcr, OcrModels};
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Multipart, State},
@@ -122,6 +123,13 @@ pub struct ServerState {
     /// When the admission gate last ran `gpu_make_room_cmd`; rate-limits
     /// the hook to one attempt per [`MAKE_ROOM_INTERVAL`].
     pub make_room_at: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// The OCR that reads pages with no text layer for `/scribe/boxes`,
+    /// loaded by the first page that needs it.
+    pub word_ocr: Arc<LazyWordOcr>,
+    /// One permit: the server builds one document's word boxes at a time. A
+    /// build holds its whole PDF in memory and the OCR takes
+    /// several cores; they queue here instead of piling up.
+    pub box_builds: Arc<tokio::sync::Semaphore>,
 }
 
 impl ServerState {
@@ -136,6 +144,7 @@ impl ServerState {
             ConverterMode::Olmocr => ConverterBackend::Olmocr,
         };
         let admission = Arc::new(tokio::sync::Semaphore::new(config.vlm_concurrency));
+        let word_ocr = Arc::new(LazyWordOcr::new(OcrModels::from_config(&config)));
         Ok(Self {
             converter,
             config,
@@ -145,6 +154,8 @@ impl ServerState {
             backend_state: Arc::new(tokio::sync::Mutex::new(None)),
             admission,
             make_room_at: tokio::sync::Mutex::new(None),
+            word_ocr,
+            box_builds: Arc::new(tokio::sync::Semaphore::new(CONCURRENT_BOX_BUILDS)),
         })
     }
 
@@ -299,6 +310,7 @@ pub fn app_with_body_limit(
     require_token_on_all_but_probes(
         Router::new()
             .route("/scribe/stream", post(handle_scribe_stream))
+            .route("/scribe/boxes", post(handle_scribe_boxes))
             .route("/health", get(handle_health))
             .route("/readiness", get(handle_readiness))
             .route("/info", get(handle_info)),
@@ -684,6 +696,126 @@ async fn guarded_conversion<T>(
     }
 }
 
+/// Word-box builds the server runs at once.
+const CONCURRENT_BOX_BUILDS: usize = 1;
+
+/// Media type of a word-box sidecar: gzip-compressed JSON.
+const SIDECAR_CONTENT_TYPE: &str = "application/gzip";
+
+/// Read the body of a `/scribe/boxes` request, which is the PDF itself.
+/// Refused when it stalls (408), grows past `max_bytes` (413) or does not
+/// start like a PDF (415, with the failure code as the body).
+#[allow(clippy::result_large_err)]
+async fn receive_pdf_bytes(
+    body: Body,
+    idle: Duration,
+    max_bytes: usize,
+) -> Result<Vec<u8>, Response> {
+    use futures::StreamExt as _;
+
+    let mut chunks = body.into_data_stream();
+    let mut pdf = Vec::new();
+    while let Some(chunk) = within_idle(idle, chunks.next()).await? {
+        let chunk = chunk.map_err(|e| {
+            upload_refusal(StatusCode::BAD_REQUEST, format!("reading the upload: {e}"))
+        })?;
+        if pdf.len() + chunk.len() > max_bytes {
+            return Err(upload_refusal(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("PDF exceeds the {max_bytes}-byte limit"),
+            ));
+        }
+        pdf.extend_from_slice(&chunk);
+    }
+    check_header(&pdf).map_err(|failure| {
+        tracing::warn!(
+            reason = failure.code().wire(),
+            "rejecting non-PDF body at the /scribe/boxes gate"
+        );
+        upload_refusal(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            failure.code().wire().to_string(),
+        )
+    })?;
+    Ok(pdf)
+}
+
+/// The response for a word-box build that failed. A failure with a code is
+/// a verdict on the document (422, never worth retrying); any other is the
+/// state of this host (500).
+fn boxes_failure(err: &anyhow::Error) -> Response {
+    let message = format!("{err:#}");
+    match failure_code(err) {
+        Some(code) => {
+            tracing::warn!(reason = code.wire(), error = %message, "word boxes: the document cannot be read");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(serde_json::json!({ "error": message, "code": code.wire() })),
+            )
+                .into_response()
+        }
+        None => {
+            tracing::error!(error = %message, "word boxes: the build failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /scribe/boxes`: the body is a PDF, the response its word-box
+/// sidecar (`hs_common::word_boxes`). Needs no VLM, so it is not behind the
+/// conversion admission gate; builds run one at a time.
+async fn handle_scribe_boxes(State(state): State<Arc<ServerState>>, body: Body) -> Response {
+    // Taken before the upload is read, so waiting requests hold no PDF, and
+    // moved into the build, so a client that hangs up does not free the
+    // slot while its build still runs.
+    let Ok(permit) = Arc::clone(&state.box_builds).acquire_owned().await else {
+        return upload_refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server is shutting down",
+        );
+    };
+    let pdf = match receive_pdf_bytes(body, UPLOAD_IDLE_TIMEOUT, MAX_PDF_BYTES).await {
+        Ok(pdf) => pdf,
+        Err(refusal) => return refusal,
+    };
+
+    let word_ocr = Arc::clone(&state.word_ocr);
+    let max_render_pixels = state.config.max_render_pixels;
+    let built = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let boxes = crate::word_boxes::build_word_boxes(&pdf, max_render_pixels, |page| {
+            word_ocr.get()?.read(page)
+        })?;
+        Ok::<_, anyhow::Error>(hs_common::word_boxes::encode(&boxes)?)
+    })
+    .await;
+
+    match built {
+        Ok(Ok(sidecar)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, SIDECAR_CONTENT_TYPE)],
+            sidecar,
+        )
+            .into_response(),
+        Ok(Err(err)) => boxes_failure(&err),
+        Err(panic) => {
+            tracing::error!(
+                route = "/scribe/boxes",
+                panic = %panic,
+                "word-box build PANICKED — failing this document permanently"
+            );
+            boxes_failure(&ConvertFailure::err(
+                FailureCode::ConversionPanicked,
+                format!("the scribe server panicked reading this document's words: {panic}"),
+            ))
+        }
+    }
+}
+
 async fn handle_scribe_stream(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -979,6 +1111,60 @@ mod tests {
                 .unwrap_err();
             assert_eq!(refused.status(), StatusCode::REQUEST_TIMEOUT, "{sent:?}");
         }
+    }
+
+    /// What `receive_pdf_bytes` answers to a body it refuses.
+    async fn boxes_upload_refusal(body: Body, max_bytes: usize) -> (StatusCode, String) {
+        let refused = receive_pdf_bytes(body, Duration::from_millis(150), max_bytes)
+            .await
+            .unwrap_err();
+        let status = refused.status();
+        let text = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(text.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_word_box_upload_is_refused_when_it_is_too_big_not_a_pdf_or_stalled() {
+        use futures::StreamExt;
+        const LIMIT: usize = 64;
+
+        let (status, text) = boxes_upload_refusal(Body::from(vec![b'%'; LIMIT + 1]), LIMIT).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{text}");
+
+        let html = Body::from("<!DOCTYPE html><html>log in</html>");
+        assert_eq!(
+            boxes_upload_refusal(html, LIMIT).await,
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_content_type:html".to_string()
+            )
+        );
+        assert_eq!(
+            boxes_upload_refusal(Body::empty(), LIMIT).await,
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_content_type:binary".to_string()
+            )
+        );
+
+        let stalled = Body::from_stream(
+            futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"%PDF-1.4 and then the link died",
+            ))])
+            .chain(futures::stream::pending()),
+        );
+        let (status, text) = boxes_upload_refusal(stalled, LIMIT).await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{text}");
+
+        // A body of exactly the limit is taken whole.
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        pdf.resize(LIMIT, b' ');
+        let received = receive_pdf_bytes(Body::from(pdf.clone()), Duration::from_secs(5), LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(received, pdf);
     }
 
     // ── the real router over loopback, olmocr mode with a stand-in CLI ──
@@ -1320,6 +1506,8 @@ mod tests {
         fn probes_of_the_surface() -> Vec<(&'static str, &'static str)> {
             vec![
                 ("POST", "/scribe/stream"),
+                ("POST", "/scribe/boxes"),
+                ("GET", "/scribe/boxes"),
                 ("GET", "/scribe/stream"),
                 ("DELETE", "/scribe/stream"),
                 ("GET", "/info"),
@@ -1493,6 +1681,121 @@ mod tests {
                 "{message}"
             );
             backend_token(|_| Ok(TOKEN.into())).unwrap();
+        }
+
+        // ── word boxes ──────────────────────────────────────────────────
+
+        /// A server whose word OCR looks for its models in `models`, so a
+        /// test does not depend on what this host has installed.
+        async fn boxes_server(models: &std::path::Path) -> String {
+            let model = |name: &str| models.join(name).to_string_lossy().into_owned();
+            let config = AppConfig {
+                converter: ConverterMode::Olmocr,
+                olmocr_endpoint: "http://127.0.0.1:1/v1".into(),
+                vlm_concurrency: 1,
+                ocr_detection_model_path: model("detection.onnx"),
+                ocr_recognition_model_path: model("recognition.onnx"),
+                ocr_dictionary_path: model("dictionary.txt"),
+                ..AppConfig::default()
+            };
+            let state = Arc::new(ServerState::new(config).unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app(state, token())).await });
+            base
+        }
+
+        async fn post_boxes(base: &str, pdf: Vec<u8>) -> reqwest::Response {
+            authed_client()
+                .post(format!("{base}/scribe/boxes"))
+                .body(pdf)
+                .send()
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn the_words_of_a_pdf_come_back_as_its_sidecar_without_the_vlm_or_the_ocr() {
+            use crate::pdf_meta::tests::pdf_with_text;
+            skip_without_pdfium!(
+                "the_words_of_a_pdf_come_back_as_its_sidecar_without_the_vlm_or_the_ocr"
+            );
+            // No OCR model is installed and the VLM backend is unreachable:
+            // a text layer needs neither.
+            let models = tempfile::tempdir().unwrap();
+            let base = boxes_server(models.path()).await;
+            let pdf = pdf_with_text(&[
+                &["The quick brown fox", "jumps over the lazy dog"],
+                &["A second page of five words"],
+            ]);
+
+            let resp = post_boxes(&base, pdf.clone()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers()[header::CONTENT_TYPE], SIDECAR_CONTENT_TYPE);
+            let sidecar =
+                hs_common::word_boxes::decode(&resp.bytes().await.unwrap()).expect("a sidecar");
+            assert_eq!(
+                sidecar.source_sha256,
+                hs_common::word_boxes::source_sha256(&pdf)
+            );
+            let pages: Vec<(u32, Vec<&str>)> = sidecar
+                .pages
+                .iter()
+                .map(|p| (p.page, p.words.iter().map(String::as_str).collect()))
+                .collect();
+            assert_eq!(
+                pages,
+                [
+                    (
+                        1,
+                        vec!["The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog"]
+                    ),
+                    (2, vec!["A", "second", "page", "of", "five", "words"]),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_scanned_page_without_the_ocr_models_is_this_hosts_failure_and_names_the_file() {
+            skip_without_pdfium!(
+                "a_scanned_page_without_the_ocr_models_is_this_hosts_failure_and_names_the_file"
+            );
+            let models = tempfile::tempdir().unwrap();
+            let base = boxes_server(models.path()).await;
+
+            // A page with no text layer has to be read by the OCR.
+            let resp = post_boxes(&base, pdf_with_pages(1)).await;
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            let error = body["error"].as_str().unwrap();
+            let missing = models.path().join("detection.onnx");
+            assert!(error.contains(&missing.display().to_string()), "{error}");
+            assert!(
+                body.get("code").is_none(),
+                "not a verdict on the PDF: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_pdf_that_cannot_be_read_is_422_with_its_failure_code() {
+            skip_without_pdfium!("a_pdf_that_cannot_be_read_is_422_with_its_failure_code");
+            let models = tempfile::tempdir().unwrap();
+            let base = boxes_server(models.path()).await;
+
+            let resp = post_boxes(&base, b"%PDF-1.7\nnot a document".to_vec()).await;
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["code"], FailureCode::PdfParseError.wire(), "{body}");
+            assert!(body["error"].as_str().is_some_and(|e| !e.is_empty()));
+        }
+
+        #[tokio::test]
+        async fn a_body_that_is_not_a_pdf_is_415_on_the_boxes_route_too() {
+            let models = tempfile::tempdir().unwrap();
+            let base = boxes_server(models.path()).await;
+            let resp = post_boxes(&base, b"<!DOCTYPE html><html>log in</html>".to_vec()).await;
+            assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(resp.text().await.unwrap(), "unsupported_content_type:html");
         }
     }
 }

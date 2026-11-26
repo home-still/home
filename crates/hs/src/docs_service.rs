@@ -16,11 +16,19 @@
 //! # The client never names a file
 //!
 //! A request names a *stem*. The service decides where that stem's
-//! source object lives, by probing, for an academic stem, the same
-//! `pdf` → `html` → `epub` order the MCP server uses, and, for a
-//! personal stem, the formats the personal store accepts. A client that
-//! asks for `papers/10/whatever.pdf` is refused: it asked for a storage
-//! key, and storage keys are not a public interface.
+//! source object lives, by probing the extensions the link's store lists
+//! in the registry of stores (`hs_common::stores`): `pdf` → `html` →
+//! `epub` for an academic stem, the formats the personal store accepts
+//! for a personal one. A client that asks for `papers/10/whatever.pdf` is
+//! refused: it asked for a storage key, and storage keys are not a public
+//! interface.
+//!
+//! # More than the stored objects
+//!
+//! A PDF is also answered as pictures of its pages and in a viewer, with
+//! the passage a link highlights boxed on the page. Those views are made
+//! on request, not read from storage: they are in `docs_views`, behind
+//! the same check of the link ([`verify_request`]) as everything here.
 
 use std::sync::Arc;
 
@@ -34,30 +42,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use hs_common::docs::{LinkFormat, LinkKey, LinkQuery, Revocations};
 use hs_common::storage::{ByteRange, Storage};
-
-/// The extensions an academic source object may have, in probe order.
-///
-/// The same order the MCP server's `find_source_key` uses, so a link
-/// and a tool agree on which file a stem means.
-const ACADEMIC_SOURCE_EXTENSIONS: [&str; 3] = ["pdf", "html", "epub"];
-
-/// The extensions a personal source object may have, in probe order.
-///
-/// The personal store keeps a document under its own extension (see
-/// `personal::models::SourceFormat`): a scan stored as `.docx` or notes
-/// ingested as markdown have no PDF at all. Probing only the academic
-/// list gave 12 of 86 personal documents a source link that answered
-/// 404.
-const PERSONAL_SOURCE_EXTENSIONS: [&str; 5] = ["pdf", "epub", "docx", "md", "txt"];
-
-/// The separator between the pages of a converted markdown.
-///
-/// It is **reserved** by the scribe pipeline
-/// (`crates/hs-scribe/src/pipeline/markdown_generator.rs`): a `---` a
-/// model emits inside a page is rewritten to `***` first, so this exact
-/// byte sequence only ever appears between two pages. The markdown's
-/// page N is therefore the source document's page N.
-const PAGE_SEPARATOR: &str = "\n\n---\n\n";
+use hs_common::stores::{DocumentLayout, Stores};
 
 /// What the service needs to answer a request.
 pub struct DocsState {
@@ -67,65 +52,18 @@ pub struct DocsState {
     pub key: LinkKey,
     /// The subjects whose links are revoked.
     pub revocations: Revocations,
-    /// The collections this service serves, and where each one's objects
-    /// live.
+    /// The stores of the corpus, and where each one's objects live.
     ///
-    /// The corpus holds more than one store: the academic papers and the
-    /// personal documents are separate, and a stem can name a document in
-    /// either. The collection is part of the link's signature, so a link
-    /// names one document in one store and cannot be edited into a
-    /// document in another. A collection the service does not serve is a
-    /// 404 — there is one path, and it is the one this list names.
-    pub collections: Vec<CollectionLayout>,
+    /// The corpus holds more than one store, and a stem can name a
+    /// document in several. The store is part of the link's signature
+    /// (`col`), so a link names one document in one store and cannot be
+    /// edited into a document in another. A store the registry does not
+    /// hold, or one that holds no documents, is a 404.
+    pub stores: Stores,
     /// The short links this deployment has minted. Codes live in the corpus's
     /// storage beside the documents, so a code minted by the MCP server on one
     /// host resolves here.
     pub short_links: hs_common::docs::ShortLinks,
-}
-
-/// Where one collection's objects live.
-#[derive(Debug, Clone)]
-pub struct CollectionLayout {
-    /// The collection's name, as it appears in a link.
-    pub name: String,
-    /// The prefix the source objects live under.
-    pub papers_prefix: String,
-    /// The prefix the markdown lives under.
-    pub markdown_prefix: String,
-    /// The source extensions this collection's documents may have, in
-    /// probe order.
-    pub source_extensions: &'static [&'static str],
-}
-
-impl CollectionLayout {
-    /// The academic corpus: the sources under `papers/`, the converted
-    /// text under `markdown/`.
-    pub fn academic(papers_prefix: &str, markdown_prefix: &str) -> Self {
-        Self {
-            name: "academic".to_string(),
-            papers_prefix: papers_prefix.to_string(),
-            markdown_prefix: markdown_prefix.to_string(),
-            source_extensions: &ACADEMIC_SOURCE_EXTENSIONS,
-        }
-    }
-
-    /// The personal store.
-    ///
-    /// Its layout is the corpus's layout, one prefix deeper: the
-    /// sources are under `<prefix>/<shard>/<stem>.pdf` and the
-    /// converted text under `<prefix>/markdown/<shard>/<stem>.md`.
-    ///
-    /// A personal source is whatever the document was ingested as, so
-    /// this collection probes every format the personal store accepts,
-    /// not the academic list.
-    pub fn personal(prefix: &str) -> Self {
-        Self {
-            name: "personal".to_string(),
-            papers_prefix: prefix.to_string(),
-            markdown_prefix: format!("{}/markdown", prefix.trim_end_matches('/')),
-            source_extensions: &PERSONAL_SOURCE_EXTENSIONS,
-        }
-    }
 }
 
 /// Build the service's router.
@@ -134,6 +72,21 @@ pub fn router(state: Arc<DocsState>) -> Router {
         .route("/health", get(health))
         .route("/docs/v1/{stem}/source", get(serve_source))
         .route("/docs/v1/{stem}/markdown", get(serve_markdown))
+        // The rendered views of a PDF, and the scripts and the stylesheet
+        // the two HTML ones load.
+        .route(
+            "/docs/v1/{stem}/page.png",
+            get(crate::docs_views::serve_page_image),
+        )
+        .route("/docs/v1/{stem}/page", get(crate::docs_views::serve_page))
+        .route(
+            "/docs/v1/{stem}/viewer",
+            get(crate::docs_views::serve_viewer),
+        )
+        .route(
+            "/docs/assets/{version}/{file}",
+            get(crate::docs_views::serve_asset),
+        )
         // A short link: `<base>/s/<code>` is answered with a redirect to the
         // signed link it stands for. The redirect is relative, so one code
         // works on whichever origin served it — the LAN base URL and the
@@ -148,8 +101,14 @@ async fn catch_panic(request: axum::extract::Request, next: axum::middleware::Ne
     hs_common::panic_guard::http::catch_panic(request, next).await
 }
 
-/// The service's health: it is up if it can read the corpus.
+/// The service's health: it is up if it can read the corpus and render a
+/// page.
 async fn health(State(state): State<Arc<DocsState>>) -> Response {
+    // A pdfium that is wedged or poisoned renders nothing, and the process
+    // is about to exit so its supervisor restarts it.
+    if let Err(reason) = hs_scribe::pdfium::healthy() {
+        return (StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+    }
     // A health check that never touches storage cannot tell a working
     // service from one whose backend is gone.
     let probe = "markdown";
@@ -184,6 +143,118 @@ fn bad_request() -> Response {
         "bad request",
     )
         .into_response()
+}
+
+/// The service's own failure: storage could not be read, or pdfium could
+/// not render. The cause is in the log; the client is told only this,
+/// which says nothing of the storage layout.
+fn failed() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "the document could not be read",
+    )
+        .into_response()
+}
+
+/// Why a request is not answered with what it asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The request is malformed: its stem is not a stem.
+    BadRequest,
+    /// The link is not genuine, has expired, was signed for another
+    /// route, or its subject is revoked.
+    Refused,
+    /// The link is genuine and names something this deployment does not
+    /// hold.
+    NotFound,
+    /// The service could not do its part. Whoever returns this has logged
+    /// why.
+    Failed,
+}
+
+impl IntoResponse for Refusal {
+    fn into_response(self) -> Response {
+        match self {
+            Self::BadRequest => bad_request(),
+            Self::Refused => refused(),
+            Self::NotFound => not_found(),
+            Self::Failed => failed(),
+        }
+    }
+}
+
+/// A request that came with a genuine, unexpired link for the route it
+/// came in on, from a subject that is not revoked.
+pub(crate) struct Verified<'a> {
+    /// What the link's query said. The signature covers every field.
+    pub link: LinkQuery,
+    /// Where the link's store keeps its objects.
+    pub layout: &'a DocumentLayout,
+}
+
+/// Check a request before anything is read for it: the one check every
+/// route that serves a document goes through.
+///
+/// `format` is the route's: a link signed for the markdown must not open
+/// the source.
+pub(crate) fn verify_request<'a>(
+    state: &'a DocsState,
+    stem: &str,
+    query: &HashMap<String, String>,
+    format: LinkFormat,
+) -> Result<Verified<'a>, Refusal> {
+    // The stem is the client's input and it names a file, so it is
+    // validated before anything else happens. `validate_stem` rejects
+    // `..`, absolute paths, NUL and backslashes.
+    if hs_common::validate_stem(stem).is_err() {
+        return Err(Refusal::BadRequest);
+    }
+    let Ok(link) = LinkQuery::parse(&encode_query(query)) else {
+        return Err(Refusal::Refused);
+    };
+    if link.format != format {
+        return Err(Refusal::Refused);
+    }
+    if hs_common::docs::verify(
+        &state.key,
+        &hs_common::docs::SignedFields {
+            stem: stem.to_string(),
+            format,
+            subject: link.subject.clone(),
+            collection: link.collection.clone(),
+            page: link.page,
+            highlight: link.highlight.clone(),
+            issued_at: link.issued_at,
+            expires_at: link.expires_at,
+        },
+        &link.signature,
+    )
+    .is_err()
+    {
+        return Err(Refusal::Refused);
+    }
+    // The store decides where the objects live. A store the registry
+    // does not hold is a 404: the link is genuine, but it names
+    // something this deployment does not have.
+    let Ok((_, layout)) = state.stores.documents(&link.collection) else {
+        return Err(Refusal::NotFound);
+    };
+    // A link minted before its subject was revoked is refused. The
+    // link carries its issue time, so a subject that was revoked and
+    // then re-enrolled gets fresh links.
+    if state.revocations.is_revoked(&link.subject, link.issued_at) {
+        return Err(Refusal::Refused);
+    }
+    Ok(Verified { link, layout })
+}
+
+/// `Cache-Control` for the answer to a signed link: it is the reader's
+/// own, and a link expires, so the answer must not outlive it in a cache.
+pub(crate) fn private_cache_control(expires_at: u64) -> HeaderValue {
+    let remaining = expires_at.saturating_sub(hs_common::docs::now_secs());
+    HeaderValue::from_str(&format!("private, max-age={remaining}"))
+        .unwrap_or(HeaderValue::from_static("private, no-store"))
 }
 
 /// A short link, answered with a redirect to the signed link it stands for.
@@ -262,56 +333,13 @@ async fn serve(
     requested_range: RequestedRange,
     format: LinkFormat,
 ) -> Response {
-    // The stem is the client's input and it names a file, so it is
-    // validated before anything else happens. `validate_stem` rejects
-    // `..`, absolute paths, NUL and backslashes.
-    if hs_common::validate_stem(&stem).is_err() {
-        return bad_request();
-    }
-    // The format in the query must match the route: a link signed for
-    // the markdown must not open the source.
-    let Ok(params) = LinkQuery::parse(&encode_query(&query)) else {
-        return refused();
+    let Verified {
+        link: params,
+        layout,
+    } = match verify_request(&state, &stem, &query, format) {
+        Ok(verified) => verified,
+        Err(refusal) => return refusal.into_response(),
     };
-    if params.format != format {
-        return refused();
-    }
-    if hs_common::docs::verify(
-        &state.key,
-        &hs_common::docs::SignedFields {
-            stem: stem.clone(),
-            format,
-            subject: params.subject.clone(),
-            collection: params.collection.clone(),
-            page: params.page,
-            issued_at: params.issued_at,
-            expires_at: params.expires_at,
-        },
-        &params.signature,
-    )
-    .is_err()
-    {
-        return refused();
-    }
-    // The collection decides where the objects live. A collection this
-    // service does not serve is a 404: the link is genuine, but it
-    // names a store this host does not have.
-    let Some(layout) = state
-        .collections
-        .iter()
-        .find(|c| c.name == params.collection)
-    else {
-        return not_found();
-    };
-    // A link minted before its subject was revoked is refused. The
-    // link carries its issue time, so a subject that was revoked and
-    // then re-enrolled gets fresh links.
-    if state
-        .revocations
-        .is_revoked(&params.subject, params.issued_at)
-    {
-        return refused();
-    }
 
     // The key: where this stem's object lives. The client never says.
     // `body` is `Some` when the link names a page of the markdown: that
@@ -322,11 +350,7 @@ async fn serve(
             None => return not_found(),
         },
         LinkFormat::Markdown => {
-            let key = format!(
-                "{}/{}",
-                layout.markdown_prefix.trim_end_matches('/'),
-                hs_common::sharded_key(&stem, "md")
-            );
+            let key = layout.markdown_key(&stem);
             if state.storage.head(&key).await.ok().flatten().is_none() {
                 return not_found();
             }
@@ -343,7 +367,8 @@ async fn serve(
                         Err(_) => return not_found(),
                     };
                     let text = String::from_utf8_lossy(&bytes);
-                    let pages: Vec<&str> = text.split(PAGE_SEPARATOR).collect();
+                    let pages: Vec<&str> =
+                        text.split(hs_common::markdown::PAGE_SEPARATOR).collect();
                     // The pages are 1-based. A page the document does
                     // not have is a 404, not an empty page: the link
                     // named something that is not there.
@@ -360,6 +385,9 @@ async fn serve(
                 body,
             )
         }
+        // The rendered views of a PDF are not objects in storage, and
+        // their routes do not come through here (`docs_views`).
+        LinkFormat::Viewer | LinkFormat::Page | LinkFormat::PageImage => return not_found(),
     };
 
     let Some(meta) = state.storage.head(&key).await.ok().flatten() else {
@@ -391,14 +419,7 @@ async fn serve(
         None => match state.storage.get_stream(&key, range).await {
             Ok(pair) => pair,
             Err(e) if hs_common::storage::is_not_found(&e) => return not_found(),
-            Err(_) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                    "the document could not be read",
-                )
-                    .into_response()
-            }
+            Err(_) => return failed(),
         },
     };
 
@@ -473,14 +494,9 @@ async fn serve(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    // A link expires, so the response must not outlive it in a cache.
-    let remaining = params
-        .expires_at
-        .saturating_sub(hs_common::docs::now_secs());
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_str(&format!("private, max-age={remaining}"))
-            .unwrap_or(HeaderValue::from_static("private, no-store")),
+        private_cache_control(params.expires_at),
     );
 
     // A read failure mid-stream ends the response; the bytes already
@@ -518,21 +534,17 @@ where
 
 use axum::extract::FromRequestParts;
 
-/// Find a stem's source object, probing the collection's extensions in
+/// Find a stem's source object, probing the store's extensions in
 /// order.
 ///
 /// Returns the key, the content type and the extension.
-async fn find_source_key(
+pub(crate) async fn find_source_key(
     storage: &dyn Storage,
-    layout: &CollectionLayout,
+    layout: &DocumentLayout,
     stem: &str,
 ) -> Option<(String, String, String)> {
     for ext in layout.source_extensions {
-        let key = format!(
-            "{}/{}",
-            layout.papers_prefix.trim_end_matches('/'),
-            hs_common::sharded_key(stem, ext)
-        );
+        let key = layout.source_key(stem, ext);
         if storage.head(&key).await.ok().flatten().is_some() {
             let content_type = match *ext {
                 "pdf" => "application/pdf",
@@ -554,7 +566,7 @@ async fn find_source_key(
 /// The stem is a document id, and it is not necessarily safe to put in
 /// a header verbatim, so everything that is not a letter, a digit, a
 /// dot, a dash or an underscore is dropped.
-fn filename_for(stem: &str, extension: &str) -> String {
+pub(crate) fn filename_for(stem: &str, extension: &str) -> String {
     let base: String = stem
         .chars()
         .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
@@ -660,12 +672,12 @@ fn encode_query(query: &HashMap<String, String>) -> String {
 use std::collections::HashMap;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hs_common::storage::LocalFsStorage;
 
     /// A service over a temporary directory, with a fixed key.
-    async fn service(
+    pub(crate) async fn service(
         dir: &std::path::Path,
     ) -> (Router, hs_common::docs::LinkKey, std::sync::Arc<DocsState>) {
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(dir));
@@ -675,10 +687,8 @@ mod tests {
             storage,
             key: key.clone(),
             revocations: Revocations::default(),
-            collections: vec![
-                CollectionLayout::academic("papers", "markdown"),
-                CollectionLayout::personal("personal"),
-            ],
+            stores: Stores::with_personal_prefix(hs_common::stores::PERSONAL_PREFIX_DEFAULT)
+                .unwrap(),
         });
         (router(state.clone()), key, state)
     }
@@ -689,7 +699,7 @@ mod tests {
     /// HTTP client, so the test exercises the same path a browser does:
     /// the headers, the status and the body are the wire's, not the
     /// router's internals.
-    async fn call(app: &Router, uri: &str, range: Option<&str>) -> TestResponse {
+    pub(crate) async fn call(app: &Router, uri: &str, range: Option<&str>) -> TestResponse {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = app.clone();
@@ -729,14 +739,14 @@ mod tests {
 
     /// What a request came back with.
     #[derive(Debug)]
-    struct TestResponse {
-        status: u16,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
+    pub(crate) struct TestResponse {
+        pub(crate) status: u16,
+        pub(crate) headers: Vec<(String, String)>,
+        pub(crate) body: Vec<u8>,
     }
 
     impl TestResponse {
-        fn header(&self, name: &str) -> Option<&str> {
+        pub(crate) fn header(&self, name: &str) -> Option<&str> {
             self.headers
                 .iter()
                 .find(|(k, _)| k == name)
@@ -782,7 +792,8 @@ mod tests {
         collection: &str,
     ) -> String {
         let params =
-            hs_common::docs::mint(key, stem, format, subject, collection, None, 3600).unwrap();
+            hs_common::docs::mint(key, stem, format, subject, collection, None, None, 3600)
+                .unwrap();
         format!("/docs/v1/{stem}/{format}?{}", params.to_query())
     }
 
@@ -960,6 +971,7 @@ mod tests {
             "laptop",
             "academic",
             None,
+            None,
             0,
         )
         .unwrap();
@@ -996,7 +1008,7 @@ mod tests {
             storage: state.storage.clone(),
             key: state.key.clone(),
             revocations,
-            collections: state.collections.clone(),
+            stores: state.stores.clone(),
         });
         let app = router(state);
         assert_eq!(call(&app, &uri, None).await.status, 403);
@@ -1165,6 +1177,7 @@ mod tests {
             "laptop",
             "academic",
             Some(2),
+            None,
             3600,
         )
         .unwrap();
@@ -1193,6 +1206,7 @@ mod tests {
             "laptop",
             "academic",
             Some(99),
+            None,
             3600,
         )
         .unwrap();
@@ -1216,6 +1230,7 @@ mod tests {
             "laptop",
             "academic",
             Some(2),
+            None,
             3600,
         )
         .unwrap();
@@ -1231,9 +1246,12 @@ mod tests {
     /// until the docs service can serve it.
     #[test]
     fn the_personal_probe_covers_every_format_the_personal_store_accepts() {
+        let stores =
+            Stores::with_personal_prefix(hs_common::stores::PERSONAL_PREFIX_DEFAULT).unwrap();
+        let (_, layout) = stores.documents(hs_common::stores::PERSONAL).unwrap();
         for format in personal::models::SourceFormat::ALL {
             assert!(
-                PERSONAL_SOURCE_EXTENSIONS.contains(&format.as_str()),
+                layout.source_extensions.contains(&format.as_str()),
                 "the personal store accepts {format:?}, but the docs service never probes \
                  {}.{ext} — a personal document ingested as one would answer 404",
                 "personal/<shard>/<stem>",
@@ -1241,7 +1259,7 @@ mod tests {
             );
         }
         assert_eq!(
-            PERSONAL_SOURCE_EXTENSIONS.len(),
+            layout.source_extensions.len(),
             personal::models::SourceFormat::ALL.len(),
             "the probe list and the personal store's formats have drifted apart"
         );
@@ -1334,9 +1352,9 @@ mod tests {
         );
     }
 
-    /// The academic collection's probe list is unchanged: a `papers/`
-    /// object stored only as a `.docx` is not a source. The two
-    /// collections do not share a list.
+    /// The academic store's probe list is its own: a `papers/` object
+    /// stored only as a `.docx` is not a source. The two stores do not
+    /// share a list.
     #[tokio::test]
     async fn an_academic_stem_with_only_a_docx_is_a_404() {
         let tmp = tempfile::tempdir().unwrap();

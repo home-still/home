@@ -131,6 +131,10 @@ struct HomeYaml {
     log_dir: Option<String>,
 }
 
+/// The system-wide config file, which the loaders that honour it merge
+/// under the user's.
+pub const SYSTEM_CONFIG_PATH: &str = "/etc/home-still/config.yaml";
+
 impl ConfigFile {
     /// Read `$HOME/.home-still/config.yaml`.
     pub fn load() -> Result<Self, ConfigError> {
@@ -143,6 +147,12 @@ impl ConfigFile {
     /// `$HOME`.
     pub fn load_in(home: &Path) -> Result<Self, ConfigError> {
         Self::load_at(&home.join(CONFIG_REL_PATH), home)
+    }
+
+    /// Read the system-wide file ([`SYSTEM_CONFIG_PATH`]) for the same home
+    /// directory as this, the user's, file.
+    pub fn load_system(&self) -> Result<Self, ConfigError> {
+        Self::load_at(Path::new(SYSTEM_CONFIG_PATH), &self.home)
     }
 
     /// Read the config file at `path` (the system-wide

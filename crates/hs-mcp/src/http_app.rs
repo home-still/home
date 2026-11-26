@@ -410,7 +410,7 @@ mod tests {
         let run = start(Duration::from_secs(60)).await;
         let session = open_session(&run).await;
         let fields = stem_fields();
-        // Ten: catalog_read, doc_link, markdown_read, scribe_queue,
+        // Ten: catalog_read, cite, markdown_read, scribe_queue,
         // scribe_convert, distill_exists, distill_index, distill_reindex,
         // personal_read, personal_reindex. The number is asserted so that a tool
         // that starts taking a stem — or stops — is a deliberate change here, and
@@ -421,11 +421,13 @@ mod tests {
             "expected every tool that takes a stem; found {fields:?}"
         );
         for (tool, field) in &fields {
+            // `cite` takes the id as a hit names it (`meta.doc_id`); every
+            // other tool still calls it `stem`.
+            let expected = if tool == "cite" { "doc_id" } else { "stem" };
             assert_eq!(
-                field, "stem",
-                "{tool} names its stem `{field}`; every tool that takes a stem must call it \
-                 `stem` — an agent passing `stem` to one that does not is refused with `missing \
-                 field`"
+                field, expected,
+                "{tool} names its stem `{field}`, not `{expected}`: an agent passing \
+                 `{expected}` is refused with `missing field`"
             );
         }
         let mut id = 10;
@@ -435,7 +437,13 @@ mod tests {
                 let reply = rpc(
                     &run,
                     &session,
-                    call(id, tool, serde_json::json!({ field: bad })),
+                    // The quote is there so that the stem is the only thing
+                    // `cite` can refuse; the other tools ignore it.
+                    call(
+                        id,
+                        tool,
+                        serde_json::json!({ field: bad, "quote": "four words at least" }),
+                    ),
                 )
                 .await;
                 assert_eq!(

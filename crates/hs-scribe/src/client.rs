@@ -17,6 +17,28 @@ const MAX_CONTROL_REPLY_BYTES: usize = 1024 * 1024;
 /// a short error text).
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
+/// Longest one word-box build is waited for. A server builds one sidecar at
+/// a time and reads a scanned page in about two seconds, so an hour covers a
+/// scanned book of a thousand pages queued behind another. This bounds a
+/// server that has stopped answering; the caller keeps its event alive by
+/// heartbeat meanwhile.
+pub const WORD_BOXES_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// Upper bound on a word-box sidecar reply. A dense page gzips to a few
+/// kilobytes, so this is far above any document a server accepts.
+const MAX_WORD_BOXES_REPLY_BYTES: usize = 64 * 1024 * 1024;
+
+/// The failure code a refused word-box request carries: the whole body (the
+/// 415 content gate) or the `code` member of a JSON body (422, a PDF that
+/// cannot be read).
+fn refusal_code(body: &str) -> Option<FailureCode> {
+    let body = body.trim();
+    FailureCode::from_wire(body).or_else(|| {
+        let reply: serde_json::Value = serde_json::from_str(body).ok()?;
+        FailureCode::from_wire(reply.get("code")?.as_str()?)
+    })
+}
+
 /// Read a response body, failing the moment it crosses `max` bytes (declared
 /// `Content-Length` or decoded bytes actually received) rather than buffering
 /// whatever a peer sends.
@@ -551,6 +573,55 @@ impl ScribeClient {
                 })
             }
         }
+    }
+
+    /// Have the server build the word-box sidecar (`hs_common::word_boxes`)
+    /// of a PDF: `POST /scribe/boxes`. Returns the sidecar as the server
+    /// encoded it.
+    ///
+    /// A refusal that is a verdict on the document (415: not a PDF; 422: a
+    /// PDF that cannot be read) carries its [`FailureCode`]. Every other
+    /// failure is the state of the server or of the network.
+    pub async fn word_boxes(&self, pdf_bytes: impl Into<bytes::Bytes>) -> Result<Vec<u8>> {
+        let url = format!("{}/scribe/boxes", self.server_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE.as_str(), "application/pdf")
+            .body(reqwest::Body::from(pdf_bytes.into()))
+            .timeout(WORD_BOXES_TIMEOUT)
+            .send()
+            .await
+            .context("Failed to send PDF")?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!(
+                "scribe server {} has no /scribe/boxes endpoint — binary predates word boxes; \
+                 run `hs upgrade` on that host",
+                self.server_url
+            );
+        }
+
+        if let Some(rejected) = token_rejection(&self.server_url, &resp) {
+            return Err(anyhow::Error::new(rejected));
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = match read_capped(resp, MAX_ERROR_BODY_BYTES).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(e) => format!("<body unreadable: {e:#}>"),
+            };
+            let message = format!("Server error {status}: {body}");
+            return Err(match refusal_code(&body) {
+                Some(code) => ConvertFailure::err(code, message),
+                None => anyhow::anyhow!(message),
+            });
+        }
+
+        read_capped(resp, MAX_WORD_BOXES_REPLY_BYTES)
+            .await
+            .context("reading the word-box sidecar")
     }
 }
 

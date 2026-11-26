@@ -1,3 +1,6 @@
 # Shell scripts are executed by bash on every CI runner, Windows included,
 # where git's default core.autocrlf=true would otherwise hand bash CRLF.
 *.sh text eol=lf
+# The docs service compiles these into the binary and serves them under a
+# hash of their bytes, so they are the same bytes on every platform.
+crates/hs/assets/docs/** -text

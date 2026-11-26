@@ -97,8 +97,8 @@ an event announcing it waits on the bus for a converter.
 
 ## 5. Set up conversion
 
-The scribe server needs three things: the model that reads text, two small
-layout models, and the PDF library pdfium.
+The scribe server needs four things: the model that reads text, two small
+layout models, the word OCR's files, and the PDF library pdfium.
 
 Pull the reading model into Ollama:
 
@@ -118,6 +118,17 @@ ls ~/.home-still/models
 ```
 
 `ls` lists `pp-doclayoutv3.onnx` and `slanet-plus.onnx`.
+
+Put the word OCR's three files beside them. The server uses them to find the
+words on a scanned page, so that a quotation can be highlighted in a PDF that
+has no text layer:
+
+```sh
+cd ~/.home-still/models
+for f in pp-ocrv5_mobile_det.onnx en_pp-ocrv5_mobile_rec.onnx ppocrv5_en_dict.txt; do
+  curl -fLO "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/$f"
+done
+```
 
 Install pdfium and the scribe server from their releases:
 
@@ -164,7 +175,9 @@ hs scribe watch-events
 
 It picks up the event your download left in step 4, sends the PDF to the
 scribe server, and stores the markdown under `~/home-still/markdown/10/` with
-a catalog entry under `~/home-still/catalog/`. Leave it running.
+a catalog entry under `~/home-still/catalog/`. It then has the server build
+the PDF's word boxes, which record where each word sits on its page, and
+stores them under `~/home-still/boxes/`. Leave it running.
 
 ## 7. Index and search
 

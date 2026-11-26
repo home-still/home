@@ -17,7 +17,7 @@ thiserror = { workspace = true }
 figment = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
-hs-common = { workspace = true, features = ["cli", "catalog", "storage-s3", "events-nats", "logging"] }
+hs-common = { workspace = true, features = ["cli", "catalog", "storage-s3", "events-nats", "logging", "boxes"] }
 hs-scribe = { path = "../crates/hs-scribe" }
 hs-distill = { path = "../crates/hs-distill" }
 sha2 = "0.10"
@@ -29,5 +29,6 @@ dirs = "6"
 [dev-dependencies]
 tempfile = "3"
 mockito = "1"
+async-trait = { workspace = true }
 # `Jail`: tests that set environment variables run serialised and restore them.
 figment = { workspace = true, features = ["test"] }

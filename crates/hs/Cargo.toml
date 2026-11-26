@@ -8,12 +8,13 @@ name = "hs"
 path = "src/main.rs"
 
 [dependencies]
-hs-scribe = { path = "../hs-scribe", features = ["client"] }
+# `render`: the docs service draws the picture of a PDF page.
+hs-scribe = { path = "../hs-scribe", features = ["client", "render"] }
 hs-distill = { path = "../hs-distill", features = ["client"] }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-hs-common = { workspace = true, features = ["cli", "service", "catalog", "compose", "auth", "docs", "storage", "storage-s3", "events", "events-nats", "logging"] }
+hs-common = { workspace = true, features = ["cli", "service", "catalog", "compose", "auth", "docs", "quote", "storage", "storage-s3", "events", "events-nats", "logging"] }
 axum = { workspace = true }
 gethostname = "0.5"
 owo-colors = { workspace = true }
@@ -30,6 +31,9 @@ reqwest = { workspace = true }
 futures = "0.3"
 tempfile = "3"
 sha2 = "0.10"
+# The picture of a page the docs service answers `page.png` with: drawing
+# the highlight on pdfium's bitmap and encoding the result.
+image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 tracing = { workspace = true }
 chrono = "0.4"

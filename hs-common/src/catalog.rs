@@ -19,6 +19,11 @@ pub struct CatalogEntry {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub download_urls: Vec<String>,
+    /// The address the document was captured from: the page a saved web
+    /// document is a copy of. `None` for a document that was not captured
+    /// from an address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 
     // File references
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -228,9 +233,10 @@ pub struct AuthorEntry {
 }
 
 /// Compute page-to-character offsets from the final markdown.
-/// Pages are separated by `\n\n---\n\n` in the joined output.
+/// Pages are separated by [`crate::markdown::PAGE_SEPARATOR`] in the joined
+/// output.
 pub fn compute_page_offsets(markdown: &str) -> Vec<PageOffset> {
-    let separator = "\n\n---\n\n";
+    let separator = crate::markdown::PAGE_SEPARATOR;
     let mut offsets = Vec::new();
     let mut pos = 0;
     for (i, page) in markdown.split(separator).enumerate() {

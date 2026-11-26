@@ -8,7 +8,8 @@ conversions that failed or never ran. How conversion works is explained in
 
 - A scribe host needs `hs-scribe-server` in `~/.local/bin/`, libpdfium in
   `~/.local/lib/` (or `~/.home-still/dyld-libs/`, or the system library
-  path), the layout and table models in `~/.home-still/models/`, a VLM backend
+  path), the layout and table models and the word OCR's three files in
+  `~/.home-still/models/`, a VLM backend
   (Ollama with `glm-ocr` by default), and `HS_BACKEND_TOKEN` in
   `~/.home-still/secrets.env`. [Build your first research
   library](../tutorials/first-library.md#5-set-up-conversion) walks through
@@ -82,7 +83,8 @@ hs scribe convert paper.pdf --server http://<scribe-host>:7433 --out paper.md
 
 The scribe watcher takes each `papers.ingested` event, sends the document to
 the scribe tiers in `scribe.servers`, and stores the markdown and catalog
-entry.
+entry. For a PDF it then has a scribe server build the word boxes, which
+record where each word sits on its page, and stores those too.
 
 1. Install it as a user service:
 
@@ -128,6 +130,29 @@ hs scribe reconvert 10.48550_arxiv.2312.10997
 
 This clears the document's conversion and failure stamps and announces it
 again, so the watcher converts it from scratch.
+
+## Build the word boxes that are missing
+
+The watcher builds a PDF's word boxes after its conversion. A PDF converted
+before the watcher did that, or whose build kept failing, has none.
+
+1. See how many are missing and how many builds are queued:
+
+   ```sh
+   hs scribe boxes status
+   ```
+
+2. When `queued` and `building` are 0, queue the missing ones:
+
+   ```sh
+   hs scribe boxes catch-up
+   ```
+
+   `--dry-run` prints the keys instead of queueing them, and
+   `--store personal` limits the run to one store.
+
+3. Run `hs scribe boxes status` again until `missing` is 0. The watcher's log
+   names each PDF it could not build word boxes for, and why.
 
 ## Queue documents that were never converted
 

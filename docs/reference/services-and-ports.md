@@ -60,6 +60,7 @@ the gateway) sets the same value in `~/.home-still/secrets.env`.
 | `/readiness` | GET | no | `ready`, `vlm_slots_total`, `vlm_slots_available` (0 while the backend gate is closed) and `in_flight_conversions`. Clients dispatch by these numbers. |
 | `/info` | GET | yes | Version and capabilities (`layout`, `tables`). |
 | `/scribe/stream` | POST | yes | Multipart upload of one document; streams progress and then the markdown as NDJSON. |
+| `/scribe/boxes` | POST | yes | The request body is one PDF; the response is its word-box sidecar (gzip-compressed JSON: every word of every page with its box), read from the text layer, or by the word OCR for a page that has none. Runs one document at a time on the CPU and does not wait for the VLM backend. `415` for a body that is not a PDF, `413` past 256 MiB, `422` with `{"error","code"}` for a PDF that cannot be read, `500` with `{"error"}` when the host cannot do it (a missing OCR model file is named). |
 
 ## Distill server endpoints
 
@@ -88,22 +89,41 @@ Bad input is a 400, a missing dependency a 503, anything else a 500.
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/health` | GET | Liveness. |
+| `/health` | GET | Liveness: storage is readable and pdfium is working. |
 | `/docs/v1/{stem}/source` | GET | The original document: PDF, HTML or EPUB for `academic`; PDF, EPUB, DOCX, Markdown or text for `personal`. Honours `Range`. |
 | `/docs/v1/{stem}/markdown` | GET | The converted markdown, or one page of it with `page=N`. |
+| `/docs/v1/{stem}/page.png` | GET | Page `page=N` of a PDF as a PNG 1,400 pixels wide, with the words `hl` names boxed. |
+| `/docs/v1/{stem}/page` | GET | That picture in a page of HTML, with links to the pages before and after, the viewer, the PDF and the converted text. |
+| `/docs/v1/{stem}/viewer` | GET | The whole PDF in a viewer that draws it in the browser (pdf.js), scrolled to the words `hl` names or to `page=N`. |
+| `/docs/assets/{version}/{file}` | GET | The viewer's scripts and the stylesheet. No signature; `{version}` is a hash of the files, and any other is `404`. |
 | `/s/{code}` | GET | A short link: `302` to the signed link the code stands for, with its fragment. An unknown or expired code is `404`. |
 
-A request is served only with a valid signature in the query string:
-`iat` (issued), `exp` (expiry), `sub` (subject), `col` (collection:
-`academic` or `personal`), `fmt` (`source` or `markdown`), optional `page`, and
-`sig`, an HMAC-SHA256 over the stem and those fields with the key in
+A request for a document is served only with a valid signature in the query
+string: `iat` (issued), `exp` (expiry), `sub` (subject), `col` (collection:
+`academic` or `personal`), `fmt` (`source`, `markdown`, `page.png`, `page` or
+`viewer`: the route the link opens, and no other), optional `page`, optional
+`hl` and `sig`, an HMAC-SHA256 over the stem and those fields with the key in
 `~/.home-still/docs-link.key`. A host that mints links (`hs docs link`, the
-MCP `doc_link` tool and the tools that attach links) must hold the same key.
+MCP `cite` tool and the tools that attach links) must hold the same key.
+
+`hl` is the highlight: up to eight runs of words, each written
+`<page>.<first word>-<word after the last>` and joined with `~` (`3.41-58`
+is words 41 to 57 of page 3), counted from 0 in the page's word boxes
+(`boxes/`, built by `hs scribe watch-events`).
+The three page routes exist for a PDF only and answer `404` for any other
+source, for a page the PDF does not have, and for an `hl` the word boxes
+cannot answer. `page.png` and `page` need `page`. Every link a page view or
+the viewer carries is signed by the service for the same subject and expiry
+as the link it was opened with.
+
+The service renders pages with libpdfium, which it binds from `~/.local/lib`,
+`~/.home-still/dyld-libs` or the system library path, and it refuses to start
+without it.
 
 A short link needs no signature of its own: `/s/{code}` redirects to one of the
 signed links above, and that link is checked in full. The code is a record
 under `short-links/` in the storage backend, written by `hs docs link --short`
-or `doc_link` with `short: true` and deleted by `hs docs prune` once the link
+or `cite` with `short` and deleted by `hs docs prune` once the link
 behind it expires.
 
 The service reads the revocation list `~/.home-still/cloud-revoked.json`,
@@ -190,6 +210,7 @@ messages and an unacknowledged message is delivered again (at-least-once).
 |---|---|---|---|---|
 | `papers.ingested` | `PAPERS` | a source document is stored (download, inbox, `hs pipeline catch-up`, `hs scribe reconvert`) | `scribe-workers` | `hs scribe watch-events` |
 | `scribe.completed` | `SCRIBE` | a conversion's markdown is stored | `distill-workers` | `hs distill watch-events` |
+| `scribe.boxes` | `SCRIBE` | a PDF's markdown is stored, a PDF is added to the personal store, or `hs scribe boxes catch-up` finds a converted PDF without word boxes | `box-workers` | `hs scribe watch-events` |
 
 The `DISTILL` stream holds `distill.>` subjects. `hs pipeline events-reset`
 deletes the `PAPERS`, `SCRIBE` and `DISTILL` streams and recreates them from

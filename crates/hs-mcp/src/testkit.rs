@@ -175,6 +175,10 @@ fn deps(
         openalex_db: None,
         // The tests do not configure links, so the tools carry none.
         link_minter: None,
+        stores: hs_common::stores::Stores::with_personal_prefix(
+            hs_common::stores::PERSONAL_PREFIX_DEFAULT,
+        )
+        .unwrap(),
     }
 }
 
@@ -233,6 +237,16 @@ pub fn server_with_bus(storage: Arc<dyn Storage>, bus: Arc<RecordingBus>) -> Hom
 /// The base URLs are fixed, the key is fixed, and the corpus is whatever
 /// `storage` holds — which is what a short link's record is written into.
 pub fn server_with_links(storage: Arc<dyn Storage>, bus: Arc<RecordingBus>) -> HomeStillMcp {
+    linked(storage, bus, "http://host:7446")
+}
+
+/// [`server_with_links`] whose LAN links point at `lan_base`: a docs
+/// service a test stands up.
+pub fn server_with_docs_service(storage: Arc<dyn Storage>, lan_base: &str) -> HomeStillMcp {
+    linked(storage, Arc::new(RecordingBus::default()), lan_base)
+}
+
+fn linked(storage: Arc<dyn Storage>, bus: Arc<RecordingBus>, lan_base: &str) -> HomeStillMcp {
     let mut d = deps(
         storage,
         bus,
@@ -241,7 +255,7 @@ pub fn server_with_links(storage: Arc<dyn Storage>, bus: Arc<RecordingBus>) -> H
     );
     d.link_minter = Some(crate::links::LinkMinter::for_test(
         hs_common::docs::LinkKey::from_bytes(vec![9u8; 32]).unwrap(),
-        "http://host:7446",
+        lan_base,
         "https://public.example",
     ));
     HomeStillMcp::from_deps(d).unwrap()

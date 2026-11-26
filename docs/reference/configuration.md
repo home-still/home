@@ -9,7 +9,7 @@ Every home-still binary reads one file, `~/.home-still/config.yaml`, and one opt
 | `~/.home-still/config.yaml` | The configuration file. |
 | `~/.home-still/secrets.env` | `KEY=VALUE` secrets exported into each process's environment. See [secrets.env](#secretsenv). |
 | `/etc/home-still/config.yaml` | System-wide file. Only the paper and personal loaders read it; the user file is merged over it. |
-| `~/.home-still/models/` | Where bare model file names (`pp-doclayoutv3.onnx`, `slanet-plus.onnx`) are looked up. |
+| `~/.home-still/models/` | Where bare model file names (`pp-doclayoutv3.onnx`, `slanet-plus.onnx`, the word OCR's three files) are looked up. |
 | `~/.home-still/cloud-secret.key` | Default gateway signing secret (`cloud.gateway.secret_path`). |
 | `~/.home-still/docs-link.key` | Signing key for document links. Created on first use with mode `0600`. |
 
@@ -118,7 +118,7 @@ Where papers, markdown and the catalog live. An unknown key is an error. Read by
 
 ## `events`
 
-The event bus. An unknown key is an error. There is no default: the section is required by `hs paper download`, the scribe and distill watchers, `hs scribe inbox`, `hs scribe reconvert`, `hs pipeline`, `hs migrate` and `hs-mcp`. A command that needs a bus and finds no `events:` section stops and names the key to set.
+The event bus. An unknown key is an error. There is no default: the section is required by `hs paper download`, the scribe and distill watchers, `hs scribe inbox`, `hs scribe reconvert`, `hs scribe boxes`, `hs personal add` for a PDF, `hs pipeline`, `hs migrate` and `hs-mcp`. A command that needs a bus and finds no `events:` section stops and names the key to set.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -256,6 +256,9 @@ The scribe server (`hs serve scribe`, `hs-scribe-server`). Every key is also an 
 | `use_cuda` | `HS_SCRIBE_USE_CUDA` | `true`; `false` on macOS | Run ONNX layout detection on CUDA. `true` on macOS is a start-up error. |
 | `layout_model_path` | `HS_SCRIBE_LAYOUT_MODEL_PATH` | `pp-doclayoutv3.onnx` | Layout model. A bare file name is looked up in `~/.home-still/models/`; an existing path is used as given. |
 | `table_model_path` | `HS_SCRIBE_TABLE_MODEL_PATH` | `slanet-plus.onnx` | Table-structure model, resolved the same way. |
+| `ocr_detection_model_path` | `HS_SCRIBE_OCR_DETECTION_MODEL_PATH` | `pp-ocrv5_mobile_det.onnx` | Text-line detector of the word OCR, which `/scribe/boxes` runs on pages without a text layer. Resolved the same way. The three OCR files are read when the first such page arrives, not at start-up; a missing one fails that document's request and names the file. |
+| `ocr_recognition_model_path` | `HS_SCRIBE_OCR_RECOGNITION_MODEL_PATH` | `en_pp-ocrv5_mobile_rec.onnx` | Text recogniser of the word OCR (PP-OCRv5 mobile, Latin letters and digits). |
+| `ocr_dictionary_path` | `HS_SCRIBE_OCR_DICTIONARY_PATH` | `ppocrv5_en_dict.txt` | Character list of the recogniser. It must be the one published with that recognition model. |
 
 `vlm_concurrency`, `page_parallel` and `parallel` must not exceed the number of permits a Tokio semaphore can hold.
 
@@ -410,7 +413,7 @@ The personal-documents store. See [Manage personal documents](../how-to/manage-p
 | Key | Default | Meaning |
 |---|---|---|
 | `collection_name` | `personal_docs` | Qdrant collection for the store. Must be non-empty. |
-| `storage_dir` | `personal` | Directory under the project directory that holds the store. |
+| `storage_dir` | `personal` | Prefix of the store's objects in the storage backend, and the store's directory under the project directory. Must be a relative path without `.` or `..` parts, and must not overlap another store's prefix (`papers`, `markdown`, `catalog`, `boxes`, `web`, `syntheses`). |
 | `ingest_inbox` | `inbox` | Directory that `personal_add` resolves file names against. A relative value is joined under `<project_dir>/<storage_dir>`; an absolute value is used as given. |
 | `distill_url` | `http://localhost:7434` | Distill server URL. |
 | `scribe_url` | `http://localhost:7433` | Scribe server URL. |
