@@ -6,10 +6,11 @@
 //! document it looks that document up at each stage. A source that cannot
 //! answer is reported where its answer would be; the others still answer.
 
+use hs_common::catalog::{CatalogEntry, EmbeddingSkip};
 use hs_common::event_bus::specs::{PAPERS_INGESTED, SCRIBE_BOXES, SCRIBE_COMPLETED};
 use hs_common::event_bus::ConsumerSpec;
 use hs_common::storage::Storage;
-use hs_common::stores::{StoreKind, StoreSpec};
+use hs_common::stores::{DerivedText, StoreKind, StoreSpec};
 use rmcp::schemars;
 use serde_json::{json, Value};
 
@@ -31,6 +32,10 @@ const QUEUES: [(&ConsumerSpec, &str); 3] = [
     (&SCRIBE_BOXES, "PDFs waiting for their word boxes"),
 ];
 
+/// How long the broker gets to answer for one queue. A broker that cannot
+/// be reached must not keep the index and the converters from answering.
+const QUEUE_DEPTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The arguments of `status`.
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct StatusParams {
@@ -47,6 +52,25 @@ pub struct StatusParams {
 /// Where an answer would be, when its source could not give one.
 fn unavailable(error: impl std::fmt::Display) -> Value {
     json!({ "error": error.to_string() })
+}
+
+/// The indexing failure that stands for a document. A skip also records a
+/// document found to hold nothing to index, which is no failure; and the
+/// catalog keeps a skip when the document is indexed later, so one from
+/// before the last indexing is history.
+fn standing_indexing_failure(entry: &CatalogEntry) -> Option<&EmbeddingSkip> {
+    let skip = entry.embedding_skip.as_ref()?;
+    if !hs_distill::reconcile::is_embed_failure(Some(skip.reason.as_str())) {
+        return None;
+    }
+    let time = |at: &str| chrono::DateTime::parse_from_rfc3339(at).ok();
+    let indexed_since = entry
+        .embedding
+        .as_ref()
+        .and_then(|stamp| time(&stamp.embedded_at))
+        .zip(time(&skip.at))
+        .is_some_and(|(indexed, failed)| indexed >= failed);
+    (!indexed_since).then_some(skip)
 }
 
 impl HomeStillMcp {
@@ -66,12 +90,14 @@ impl HomeStillMcp {
 
         let mut queues = Vec::with_capacity(QUEUES.len());
         for (queue, holds) in QUEUES {
-            let depth = match self.events.queue_depth(queue).await {
-                Ok(depth) => json!({
+            let asked = tokio::time::timeout(QUEUE_DEPTH_TIMEOUT, self.events.queue_depth(queue));
+            let depth = match asked.await {
+                Ok(Ok(depth)) => json!({
                     "waiting": depth.pending,
                     "in_progress": depth.ack_pending,
                 }),
-                Err(e) => unavailable(format!("{e:#}")),
+                Ok(Err(e)) => unavailable(format!("{e:#}")),
+                Err(_) => unavailable("timed out asking the broker for the queue's depth"),
             };
             queues.push(json!({ "queue": queue.subject, "holds": holds, "depth": depth }));
         }
@@ -155,7 +181,7 @@ impl HomeStillMcp {
                     "attempts": failed.attempts,
                 }));
             }
-            entry.embedding_skip.as_ref().map(|skipped| {
+            standing_indexing_failure(entry).map(|skipped| {
                 json!({ "stage": "indexing", "reason": skipped.reason, "at": skipped.at })
             })
         });
@@ -172,12 +198,20 @@ impl HomeStillMcp {
         }))
     }
 
-    /// The stores a document store's documents are indexed into: the store
-    /// itself, then those derived from it.
+    /// The stores whose record counts say where a document of `holder` is
+    /// indexed: the store itself, then those derived from it. The store of
+    /// its reference lists is not asked: the index counts a document's
+    /// chunks whole, so those are in the store's own figure.
     fn stores_fed_by<'a>(&'a self, holder: &'a StoreSpec) -> Vec<&'a StoreSpec> {
-        let derived = self.stores.iter().filter(
-            |spec| matches!(&spec.kind, StoreKind::Derived { of, .. } if *of == holder.name),
-        );
+        let derived = self.stores.derived_from(holder.name).filter(|spec| {
+            !matches!(
+                &spec.kind,
+                StoreKind::Derived {
+                    text: DerivedText::ReferenceChunks,
+                    ..
+                }
+            )
+        });
         std::iter::once(holder).chain(derived).collect()
     }
 }

@@ -273,9 +273,8 @@ fn load_key(path: &std::path::Path) -> Result<LinkKey> {
 
 /// The expiry, as an ISO timestamp.
 fn expires_at_iso(unix_secs: u64) -> String {
-    let dt = chrono::DateTime::from_timestamp(unix_secs as i64, 0).unwrap_or_else(|| {
-        chrono::DateTime::from_timestamp(0, 0).expect("the epoch is a timestamp")
-    });
+    let dt = chrono::DateTime::from_timestamp(unix_secs as i64, 0)
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH);
     dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 

@@ -521,10 +521,8 @@ impl DistillServerState {
     pub async fn delete_doc(&self, doc_id: &str, store: Option<&str>) -> Result<u64, ApiError> {
         validate_doc_id(doc_id)?;
         let (spec, _) = self.document_store(store)?;
-        let mut deleted = 0;
-        for holder in self.chunk_stores(spec) {
-            deleted += self.store.forget_document(holder, doc_id, &[]).await?;
-        }
+        let deleted =
+            pipeline::remove_document(self.store.as_ref(), self.chunk_stores(spec), doc_id).await?;
         Ok(deleted)
     }
 

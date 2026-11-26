@@ -262,20 +262,25 @@ fn secrets_as_json() -> Result<Option<serde_json::Value>> {
     Ok(Some(serde_json::Value::Object(map)))
 }
 
+/// The gateway both servers are reached through, as a bare https origin.
+/// It is written into the client's configuration and the client signs in
+/// to it, so a URL that is not one is refused here, not found out later
+/// as two servers that never connect.
 async fn resolve_gateway_url(explicit: Option<String>) -> Result<String> {
-    if let Some(url) = explicit {
-        return Ok(url);
-    }
-    // Try to read from cloud credentials
-    let cred_path = hs_common::auth::client::CloudCredentials::default_path()?;
-    if cred_path.exists() {
-        let creds = hs_common::auth::client::CloudCredentials::load(&cred_path)?;
-        return Ok(creds.gateway_url);
-    }
-    anyhow::bail!(
-        "No gateway URL provided and no cloud credentials found.\n\
-         Either pass --gateway-url or run `hs cloud enroll` first."
-    );
+    let url = match explicit {
+        Some(url) => url,
+        None => {
+            let cred_path = hs_common::auth::client::CloudCredentials::default_path()?;
+            if !cred_path.exists() {
+                anyhow::bail!(
+                    "No gateway URL provided and no cloud credentials found.\n\
+                     Either pass --gateway-url or run `hs cloud enroll` first."
+                );
+            }
+            hs_common::auth::client::CloudCredentials::load(&cred_path)?.gateway_url
+        }
+    };
+    super::cloud_cmd::require_https_origin(&url)
 }
 
 /// How a client reaches the two servers.

@@ -341,10 +341,17 @@ async fn forward_request(
             if e.is_connect() {
                 state.balancer.mark_failed(service, index);
             }
-            // The backend address is internal; log it (with the transport
-            // cause, which reqwest's Display omits), don't hand it to the client.
-            tracing::error!("backend request to {backend_url} failed: {e:?}");
-            return if e.is_timeout() {
+            // The backend address is internal, and the query of a document
+            // link is a credential: the client gets neither, and the log gets
+            // the address without its query (with the transport cause, which
+            // reqwest's Display omits).
+            let timed_out = e.is_timeout();
+            let logged_url = backend_url.split('?').next().unwrap_or(&backend_url);
+            tracing::error!(
+                "backend request to {logged_url} failed: {:?}",
+                e.without_url()
+            );
+            return if timed_out {
                 (StatusCode::GATEWAY_TIMEOUT, "Backend timed out").into_response()
             } else {
                 (StatusCode::BAD_GATEWAY, "Backend unreachable").into_response()
@@ -353,6 +360,21 @@ async fn forward_request(
     };
 
     let status = backend_resp.status();
+    // A client that reaches a service it needs a scope for holds a token the
+    // gateway accepted, so a 401 from that backend is about the gateway's own
+    // credential. Passed through, it would tell the client to sign in again,
+    // which cannot fix a backend token that does not match.
+    if status == StatusCode::UNAUTHORIZED && auth::SERVICES.contains(&service) {
+        tracing::error!(
+            "the {service} backend refused the gateway's backend token (HTTP 401): the \
+             token that backend checks is not the gateway's"
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            "Backend refused the gateway's credentials",
+        )
+            .into_response();
+    }
     let headers = filtered_headers(backend_resp.headers(), |_| false);
     let stream = backend_resp.bytes_stream().map(move |chunk| {
         let _held = &permit;
@@ -827,6 +849,29 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::FOUND);
         assert_eq!(resp.headers()["location"], "http://169.254.169.254/latest");
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_refuses_the_gateway_is_502_not_a_request_to_sign_in_again() {
+        async fn refuse() -> impl IntoResponse {
+            (
+                StatusCode::UNAUTHORIZED,
+                [("www-authenticate", "Bearer")],
+                "invalid backend token",
+            )
+        }
+        let backend = spawn_backend(Router::new().route("/mcp/x", get(refuse))).await;
+        let state = test_state(&[("mcp", &backend)]).await;
+        let token = access(&state, &["mcp"]);
+        let resp = call(
+            &state,
+            bearer_req(Method::GET, "/mcp/x", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(!resp.headers().contains_key("www-authenticate"));
     }
 
     #[tokio::test]

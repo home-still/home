@@ -1300,7 +1300,7 @@ mod status {
     use crate::testkit::FAKE_RECORDS_PER_DOC;
     use crate::tools::status::StatusParams;
     use hs_common::storage::Storage;
-    use hs_common::stores::{ABSTRACTS, ACADEMIC, REFERENCES};
+    use hs_common::stores::{ABSTRACTS, ACADEMIC};
 
     const DOC: &str = "paper-a";
 
@@ -1334,7 +1334,8 @@ mod status {
         assert_eq!(out["converted"], true);
         assert_eq!(out["boxes"], "pending", "a PDF whose boxes are not built");
         assert!(out["failure"].is_null(), "{out}");
-        // The paper's own store first, then the stores made from it.
+        // The paper's own store first, then the stores made from it. Its
+        // reference lists are counted in its own store's figure.
         let records = out["records"].as_array().unwrap();
         assert_eq!(
             records[0],
@@ -1344,10 +1345,7 @@ mod status {
             .iter()
             .map(|r| r["store"].as_str().unwrap())
             .collect();
-        assert!(
-            stores.contains(&REFERENCES) && stores.contains(&ABSTRACTS),
-            "{stores:?}"
-        );
+        assert_eq!(stores, [ACADEMIC, ABSTRACTS]);
     }
 
     /// "Not here yet" is an answer, and an index that cannot be asked says
@@ -1388,6 +1386,43 @@ mod status {
         assert_eq!(out["converted"], false);
         assert_eq!(out["failure"]["stage"], "conversion");
         assert_eq!(out["failure"]["reason"], "unsupported_content_type:html");
+    }
+
+    /// The catalog keeps a skip for good, and a skip also records a
+    /// document that holds nothing to index.
+    #[tokio::test]
+    async fn only_an_indexing_failure_that_still_stands_is_reported() {
+        let storage = FaultyStorage::new();
+        let mcp = server(storage.clone(), None);
+        let (_, layout) = mcp.stores.documents(ACADEMIC).unwrap();
+        let prefix = &layout.catalog_prefix;
+
+        hs_common::catalog::update_embedding_skip_via(
+            &*storage,
+            prefix,
+            DOC,
+            "zero_chunks_or_empty",
+        )
+        .await
+        .unwrap();
+        let out = parsed(&mcp.report_status(of(DOC)).await.unwrap());
+        assert!(out["failure"].is_null(), "nothing to index: {out}");
+
+        let reason = "embed_failed: the store did not answer";
+        hs_common::catalog::update_embedding_skip_via(&*storage, prefix, DOC, reason)
+            .await
+            .unwrap();
+        let out = parsed(&mcp.report_status(of(DOC)).await.unwrap());
+        assert_eq!(out["failure"]["stage"], "indexing");
+        assert_eq!(out["failure"]["reason"], reason);
+
+        hs_common::catalog::update_embedding_catalog_via(
+            &*storage, prefix, DOC, "distill", 3, "cuda",
+        )
+        .await
+        .unwrap();
+        let out = parsed(&mcp.report_status(of(DOC)).await.unwrap());
+        assert!(out["failure"].is_null(), "indexed since it failed: {out}");
     }
 
     /// One part that cannot answer does not cost the others their answer.

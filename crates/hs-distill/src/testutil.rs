@@ -163,6 +163,9 @@ pub(crate) struct StoreState {
     pub fail_forget: bool,
     /// Panic inside `write_document` (to model a bug in the write path).
     pub panic_on_write: bool,
+    /// Give other tasks a turn once a write is stored, as a real store does
+    /// while it waits for its answer.
+    pub yield_after_write: bool,
     pub down: bool,
     /// What `search` returns, in ranking order.
     pub canned_hits: Vec<SearchHit>,
@@ -252,30 +255,36 @@ impl DocumentStore for FakeStore {
         doc_id: &str,
         chunks: &[Chunk],
     ) -> Result<Vec<String>, DistillError> {
-        let mut st = self.state.lock();
-        if st.panic_on_write {
-            panic!("simulated store bug");
+        let (ids, yield_now) = {
+            let mut st = self.state.lock();
+            if st.panic_on_write {
+                panic!("simulated store bug");
+            }
+            let call = st.write_calls;
+            st.write_calls += 1;
+            if st.fail_write_from_call.is_some_and(|n| call >= n) {
+                return Err(DistillError::Backend("write failed".into()));
+            }
+            let mut ids = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                let id = st.new_record();
+                ids.push(id.clone());
+                st.docs
+                    .entry((store.to_string(), doc_id.to_string()))
+                    .or_default()
+                    .push((id, chunk.clone()));
+            }
+            st.written.extend(chunks.iter().cloned());
+            st.ops.push(Op::Write {
+                store: store.into(),
+                doc_id: doc_id.into(),
+                indexes: chunks.iter().map(|c| c.chunk_index).collect(),
+            });
+            (ids, st.yield_after_write)
+        };
+        if yield_now {
+            tokio::task::yield_now().await;
         }
-        let call = st.write_calls;
-        st.write_calls += 1;
-        if st.fail_write_from_call.is_some_and(|n| call >= n) {
-            return Err(DistillError::Backend("write failed".into()));
-        }
-        let mut ids = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            let id = st.new_record();
-            ids.push(id.clone());
-            st.docs
-                .entry((store.to_string(), doc_id.to_string()))
-                .or_default()
-                .push((id, chunk.clone()));
-        }
-        st.written.extend(chunks.iter().cloned());
-        st.ops.push(Op::Write {
-            store: store.into(),
-            doc_id: doc_id.into(),
-            indexes: chunks.iter().map(|c| c.chunk_index).collect(),
-        });
         Ok(ids)
     }
 

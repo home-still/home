@@ -304,11 +304,11 @@ async fn cmd_revoke(subject: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
 /// The gateway URL the user typed, as the bare https origin it must be. It is
 /// what the credentials will be sent to for the rest of their life, so it is
 /// never taken from anything the server says.
-fn require_https_origin(raw: &str) -> Result<String> {
+pub(crate) fn require_https_origin(raw: &str) -> Result<String> {
     let url = reqwest::Url::parse(raw.trim())
         .with_context(|| format!("gateway URL {raw:?} is not a valid URL"))?;
     if url.scheme() != "https" {
-        bail!("gateway URL {raw:?} must use https (enrollment sends a credential to it)");
+        bail!("gateway URL {raw:?} must use https: credentials are sent to it");
     }
     let Some(host) = url.host_str() else {
         bail!("gateway URL {raw:?} has no host");

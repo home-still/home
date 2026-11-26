@@ -198,7 +198,7 @@ impl HomeStillMcp {
         let paper_config = paper::config::Config::load()
             .map_err(|e| anyhow::anyhow!("paper config invalid: {e:#}"))?;
 
-        let link_minter = Arc::new(crate::links::LinkMinter::from_config(&file));
+        let link_minter = Arc::new(crate::links::LinkMinter::from_config(&file)?);
         if link_minter.is_enabled() {
             tracing::info!("document links are enabled");
         } else {

@@ -126,6 +126,18 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
   (`store`, `compute_device`, `embed_model`, `version`, `url`) where it had
   `qdrant`, and the distill server's `/status` reports `records_count` where
   it had `points_count`. `hs status` labels the row `Store`.
+- `hs mcp install --remote` takes the gateway only as a bare https origin
+  (`https://host[:port]`), the same rule as `hs cloud enroll`. A URL with a
+  path, a query or another scheme is refused before anything is written.
+- `hs-mcp` stops at start-up when the `docs:` section of the config cannot
+  be read. It used to start without document links and report them as not
+  configured.
+- The gateway answers `502` (`Backend refused the gateway's credentials`)
+  when a backend refuses the gateway's own token with a `401`. It used to
+  pass the `401` on, which told a signed-in client to sign in again. **On
+  `/memory/mcp` that answer means `MYELIN_MCP_TOKEN` on the memory host is
+  not the gateway's `HS_BACKEND_TOKEN`**; the gateway's log names the
+  service.
 
 ## v0.0.1-rc.394
 

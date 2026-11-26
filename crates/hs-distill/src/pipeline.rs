@@ -95,6 +95,8 @@ pub struct IndexJob<'a> {
 /// `total_chunks` count the whole document across both stores, and `n` is
 /// that total.
 ///
+/// Two calls for one document never interleave: `GENERATION_LOCK`.
+///
 /// Any failure, including the deletes, is an `Err` and changes nothing
 /// about what the caller should record.
 pub async fn index_document(
@@ -124,7 +126,7 @@ pub async fn index_document(
 
     if markdown.trim().is_empty() {
         tracing::warn!("Skipping empty document: {}", stem);
-        remove_document(store, targets, stem).await?;
+        remove_document(store, targets.into_iter().flatten(), stem).await?;
         return Ok(0);
     }
 
@@ -158,7 +160,7 @@ pub async fn index_document(
             len = markdown.len(),
             "Skipping paywall/interstitial markdown stub"
         );
-        remove_document(store, targets, stem).await?;
+        remove_document(store, targets.into_iter().flatten(), stem).await?;
         return Ok(0);
     }
 
@@ -238,7 +240,7 @@ pub async fn index_document(
 
     if chunks.is_empty() {
         tracing::warn!("No chunks produced for {}", stem);
-        remove_document(store, targets, stem).await?;
+        remove_document(store, targets.into_iter().flatten(), stem).await?;
         return Ok(0);
     }
 
@@ -266,6 +268,8 @@ pub async fn index_document(
         chunks_total: total_chunks as u64,
         message: format!("Writing {} chunks", total_chunks),
     });
+
+    let _replacing = GENERATION_LOCK.lock().await;
 
     // (store, the records of this generation in it). A store that gets no
     // chunk of this generation is written nothing and keeps nothing.
@@ -297,17 +301,30 @@ pub async fn index_document(
     Ok(total_chunks)
 }
 
-/// Remove every stored chunk of a document that is being skipped, from
-/// every store that can hold one.
-async fn remove_document(
+/// Held while the stored records of a document are replaced or removed.
+///
+/// Writing a generation and deleting every other record of the document
+/// are separate store calls. Were two replacements of one document to
+/// interleave, each would keep only its own records and erase the other's,
+/// and the document would be left with none while both callers recorded it
+/// as indexed. One lock for every document costs nothing: the store takes
+/// one write at a time, so replacements never ran side by side.
+static GENERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Remove every stored chunk of a document from `targets`, the stores that
+/// can hold one; returns how many there were. A replacement of the document
+/// that is under way finishes first.
+pub async fn remove_document(
     store: &dyn DocumentStore,
-    targets: [Option<&str>; 2],
+    targets: impl IntoIterator<Item = &str>,
     doc_id: &str,
-) -> Result<(), DistillError> {
-    for target in targets.into_iter().flatten() {
-        store.forget_document(target, doc_id, &[]).await?;
+) -> Result<u64, DistillError> {
+    let _removing = GENERATION_LOCK.lock().await;
+    let mut removed = 0;
+    for target in targets {
+        removed += store.forget_document(target, doc_id, &[]).await?;
     }
-    Ok(())
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -405,6 +422,26 @@ mod tests {
             store.stored(STORE, "doc"),
             range(short),
             "records of the earlier generation must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_indexings_of_one_document_at_once_leave_one_whole_generation() {
+        let (store, cfg) = (FakeStore::default(), small_chunk_config());
+        store.state.lock().yield_after_write = true;
+
+        let (long_text, short_text) = (prose(30), prose(8));
+        let (long, short) = tokio::join!(
+            index(&store, &cfg, "doc", &long_text),
+            index(&store, &cfg, "doc", &short_text),
+        );
+        let (long, short) = (long.unwrap(), short.unwrap());
+        assert!(short < long, "need two generations of different sizes");
+
+        let stored = store.stored(STORE, "doc");
+        assert!(
+            stored == range(long) || stored == range(short),
+            "each indexing erased the other's records: {stored:?}"
         );
     }
 

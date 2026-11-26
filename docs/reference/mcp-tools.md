@@ -291,9 +291,9 @@ With `doc_id` the result is JSON:
 | `source` | `stored`, and `extension`: the format the source is stored in. |
 | `catalog_entry` | Whether the document has a catalog entry. |
 | `converted` | Whether the document has text. |
-| `records` | For the document's own store and each store derived from it, how many records the index holds for the document. |
+| `records` | How many records the index holds for the document: in its own store, where the chunks of its reference list are counted too, and in each other store made from it. |
 | `boxes` | `built`, `pending` or `not_applicable` (the source is not a PDF). |
-| `failure` | `null`, or the failure recorded for the document: `stage` (`conversion` or `indexing`), `reason` and `at`. |
+| `failure` | `null`, or the failure that stands for the document: `stage` (`conversion` or `indexing`), `reason` and `at`. An indexing failure from before the document was last indexed is not reported, and neither is a document found to hold nothing to index. |
 
 A document nothing is known about is an answer, not an error: its source is not stored and it is not converted.
 
