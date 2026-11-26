@@ -39,11 +39,17 @@ pub enum DistillCmd {
         #[arg(long)]
         topic: Option<String>,
 
+        /// Store to search, by name (`academic`, `abstracts`, `references`,
+        /// `personal`, `web`, `syntheses`). Repeat it to search several.
+        /// Without it the server searches its default stores.
+        #[arg(long = "store", value_name = "NAME")]
+        stores: Vec<String>,
+
         /// Override server URL
         #[arg(long)]
         server: Option<String>,
     },
-    /// Show distill system status (server, backend, collection)
+    /// Show distill system status (server, backend, the `academic` store)
     Status {
         /// Override server URL
         #[arg(long)]
@@ -92,10 +98,10 @@ pub enum DistillCmd {
         #[arg(long)]
         server: Option<String>,
     },
-    /// Manage the `paper_abstracts` collection — a per-paper
+    /// Manage the `abstracts` store — a per-paper
     /// (not per-chunk) embedding of `{title}\n\n{abstract}` for high-
     /// precision semantic search over papers' core arguments. Distinct
-    /// from `academic_papers` (per-chunk body text). Abstract source is
+    /// from the `academic` store (per-chunk body text). Abstract source is
     /// `openalex` (DOI lookup) > `catalog` (provider abstract) > `markdown`
     /// (`## Abstract` extraction); a paper with none of them is skipped.
     #[command(subcommand)]
@@ -105,7 +111,7 @@ pub enum DistillCmd {
 #[derive(Subcommand, Debug)]
 pub enum AbstractsCmd {
     /// Iterate every catalog entry, coalesce title+abstract, embed into
-    /// the `paper_abstracts` collection, and stamp the catalog. Idempotent
+    /// the `abstracts` store, and stamp the catalog. Idempotent
     /// — entries with an `abstract_embed` stamp are skipped unless
     /// `--force`.
     Build {

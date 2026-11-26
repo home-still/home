@@ -248,7 +248,7 @@ distill:
     - http://localhost:7434
 
 distill_server:
-  qdrant_url: http://<qdrant-host>:6334
+  myelin_url: http://127.0.0.1:7462/mcp
 ```
 
 Every program on the host reads this file. `events:` is required, `storage:`
@@ -335,36 +335,30 @@ with JSON whose `status` is `ok`. If it does not, read the unit's log with
 
 ## 9. Start the distill server
 
-The distill server turns markdown into vectors on the GPU and writes them to
-Qdrant. It runs only on CUDA: there is no build and no setting that makes it
-fall back to the CPU.
+The distill server cuts markdown into passages and stores them in a myelin
+server, which embeds them with a model that Ollama runs on the GPU. The
+distill server refuses work while that model is not on the GPU: there is no
+setting that makes it accept a CPU embedder.
 
-First check that the server can reach Qdrant:
-
-```sh
-hs distill init
-```
-
-`hs distill init` prints that Qdrant is already reachable at
-`http://<qdrant-host>:6333` and that it found the `hs-distill-server` binary.
-Then install the server:
+It needs the myelin server named by `distill_server.myelin_url` and Ollama at
+`distill_server.ollama_url` to be running first. Install the server:
 
 ```sh
 hs serve distill --install
 journalctl -u hs-serve-distill -f
 ```
 
-The first start downloads the embedding model, which takes several minutes.
-When the log reports that CUDA is verified and the model is on the GPU, press
-Ctrl+C and check the server:
+The server defines its stores in myelin and then listens; if myelin refuses
+them it exits and the log says why. Press Ctrl+C and check the server:
 
 ```sh
 curl -fsS http://localhost:7434/health
 hs distill status
 ```
 
-`/health` answers with HTTP 200, and `hs distill status` shows the collection
-in Qdrant and the compute device `cuda`. If the server exits instead, see
+`/health` answers with HTTP 200 once the embedding model is on the GPU, and
+`hs distill status` shows the `academic` store and the compute device `cuda`.
+If the server exits instead, see
 [Troubleshoot](../how-to/troubleshoot.md#a-scribe-or-distill-server-does-not-start).
 
 ## 10. Start the MCP and docs servers and open the ports

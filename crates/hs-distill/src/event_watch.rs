@@ -169,7 +169,12 @@ pub async fn index_and_publish(
         .map_err(|e| classify(e.context(format!("catalog read for {stem}"))))?;
 
     let result = match distill
-        .index_from_storage_with_catalog(storage, &event.key, catalog.as_ref())
+        .index_from_storage_with_catalog(
+            hs_common::stores::ACADEMIC,
+            storage,
+            &event.key,
+            catalog.as_ref(),
+        )
         .await
     {
         Ok(r) => r,
@@ -277,7 +282,7 @@ fn fatal_stop(cause: anyhow::Error) -> anyhow::Error {
 /// consumed. Any other failure (server down, slow) is only warned about: the
 /// per-event handling already copes with an unavailable server.
 pub async fn preflight(distill: &DistillClient) -> Result<()> {
-    match distill.status().await {
+    match distill.status(hs_common::stores::ACADEMIC).await {
         Ok(_) => Ok(()),
         Err(e) if e.chain().any(|c| c.is::<crate::client::Unauthorized>()) => Err(fatal_stop(e)),
         Err(e) => {
@@ -778,7 +783,7 @@ mod tests {
         let ok = serve(|_| {
             Reply::Json(
                 200,
-                r#"{"collection":"c","points_count":0,"compute_device":"Cuda"}"#.into(),
+                r#"{"store":"academic","points_count":0,"compute_device":"Cuda"}"#.into(),
             )
         })
         .await;

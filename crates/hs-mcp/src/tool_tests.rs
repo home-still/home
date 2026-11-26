@@ -182,10 +182,10 @@ mod reconcile {
         );
     }
 
-    /// The tool asks the server for the whole list; the old 100 000 default
-    /// made a larger collection fail outright.
+    /// The tool asks the server for the academic store's whole list; the old
+    /// 100 000 default made a larger store fail outright.
     #[tokio::test]
-    async fn the_whole_collection_is_requested() {
+    async fn the_whole_store_is_requested() {
         let storage: Arc<FaultyStorage> = FaultyStorage::new();
         let distill = FakeDistill::start(vec![]).await;
         let mcp = server(storage, Some(&distill));
@@ -200,7 +200,11 @@ mod reconcile {
         assert_eq!(docs_requests.len(), 1);
         assert_eq!(
             docs_requests[0].query,
-            format!("limit={}", hs_distill::client::MAX_DOC_LIST_LIMIT)
+            format!(
+                "store={}&limit={}",
+                hs_common::stores::ACADEMIC,
+                hs_distill::client::MAX_DOC_LIST_LIMIT
+            )
         );
     }
 }

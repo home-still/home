@@ -306,36 +306,29 @@ The distill server (`hs serve distill`, `hs-distill-server`). The server refuses
 |---|---|---|
 | `host` | `0.0.0.0` | Bind address. The `--host` flag wins. |
 | `port` | `7434` | Listen port. The `--port` flag wins; `hs serve distill --port` passes it as `HS_DISTILL_PORT`. Must not be 0. |
-| `qdrant_url` | `http://localhost:6334` | Qdrant gRPC endpoint. |
-| `qdrant_data_dir` | `<project_dir>/data/qdrant` | Qdrant storage directory. |
-| `collection_name` | `academic_papers` | Default collection; a request that names none uses it. |
-| `collections` | `[paper_abstracts, personal_docs]` | Further collections a request may name. Every configured collection is created or verified at start-up; a request naming any other collection gets HTTP 400. |
-| `chunk_max_tokens` | `1000` | Maximum tokens per chunk. |
+| `myelin_url` | `http://127.0.0.1:7462/mcp` | MCP endpoint of the myelin server that stores and searches the chunks. It must be myelin's full surface, not its agent surface: the distill server defines its stores there at start-up, and writes and deletes documents in them. |
+| `chunk_max_tokens` | `1000` | Maximum tokens per chunk. `chunk_max_tokens + 48` must fit the embedding model's 8192-token context. |
 | `chunk_overlap` | `100` | Token overlap between chunks; smaller than `chunk_max_tokens`. |
-| `qdrant_upsert_batch` | `1000` | Chunks per Qdrant upsert request; at least 1. |
-| `qdrant_upsert_parallelism` | `4` | Upsert requests in flight per document; at least 1. |
 | `llm_metadata` | `false` | Extract keywords and topics with Ollama. A failed call fails that document. |
 | `metadata_model` | `llama3.2:latest` | Ollama model for metadata. Must be non-empty when `llm_metadata` is `true`. |
-| `ollama_url` | `http://localhost:11434` | Ollama URL including the port. Used only when `llm_metadata` is `true`. |
-| `ollama_timeout_secs` | `120` | Upper bound on one metadata call; at least 1 when `llm_metadata` is `true`. |
-| `embedding.dimension` | `1024` | Expected vector width. Compared with what the model returns at start-up; a mismatch stops the server. |
-| `embedding.max_length` | `1280` | Tokens the model sees per text; longer input is truncated. `chunk_max_tokens + 48` must fit. At most `8192`. |
-| `embedding.batch_size` | unset (starts at 32) | Rows per forward pass, and the starting point when `adaptive_batch` is on. At least 1 and at most 128 × 512² ÷ `max_length²` rows. |
-| `embedding.pool_size` | unset (1) | Model copies; at least 1. |
-| `embedding.adaptive_batch` | `true` | Tune the batch size in-process against observed throughput. A batch the accelerator cannot allocate also tunes it, downward. |
-| `embedding.compute_device` | `cuda` | Only `cuda` is accepted; any other value fails to load. |
-| `embedding.idle_release_secs` | unset | Drop the model from GPU memory after this many idle seconds; at least 1. The next request reloads it. Unset keeps it resident. |
-| `embedding.vram_floor_mb` | `5000` | Free VRAM required before (re)loading the model. Below it the load fails and names the GPU holders. Hosts without an NVIDIA GPU skip the check. |
-| `embedding.gpu_yield_file` | unset | A host GPU broker's yield file (`{"for","since","expires"}`). While it names an unexpired tenant a (re)load fails with `gpu busy: yielded to <tenant>`, so the event is NAK'd and redelivered. |
-| `embedding.gpu_make_room_cmd` | unset | Argv run once, with `--need-mib <vram_floor_mb>` appended, when a (re)load is blocked; exit 0 means "try again now". |
-| `hnsw.m` | `16` | Edges per node for new collections; 4 to 128. |
-| `hnsw.ef_construct` | `100` | Candidates considered while building the graph; from `m` to 1024. |
-| `hnsw.search_ef` | `128` | Candidates considered per query; 1 to 4096. |
-| `hnsw.max_indexing_threads` | `4` | Threads Qdrant may use when HNSW is enabled on an existing collection; 1 to 64. |
+| `ollama_url` | `http://localhost:11434` | Ollama URL including the port. Ollama runs the embedding model behind myelin: the server asks it where that model is loaded, and calls it for metadata when `llm_metadata` is `true`. |
+| `ollama_timeout_secs` | `120` | Upper bound on one call to Ollama; at least 1. |
 
-Keys `embedding.model` and `embedding.sparse_enabled` have no effect; the server logs a warning when they are set. The HNSW settings apply when a collection is created; an existing collection keeps the graph it was built with.
+A key the server no longer has, such as `collection_name`, `collections`, `qdrant_url` or an `embedding.*` or `hnsw.*` key, has no effect; the server logs a warning when one is set.
 
-Collection names are 1 to 64 characters of `[A-Za-z0-9_-]`, starting with a letter or digit, and must be unique across `collection_name` and `collections`.
+### Stores
+
+The distill server files every document in a named store. The stores are fixed by the program, not by configuration. The server defines all of them in myelin at start-up and stops if myelin refuses one. A request that names any other store gets HTTP 400.
+
+| Store | Holds | Searched when a search names no store |
+|---|---|---|
+| `academic` | The full text of the academic papers, in passages that carry their page and lines. | yes |
+| `references` | The reference lists of the academic papers. The server fills it while it indexes a paper into `academic`; it takes no documents of its own. | no |
+| `abstracts` | One record per academic paper: its title and abstract. `hs distill abstracts build` fills it. | no |
+| `personal` | The personal documents. `hs personal` fills it. | no |
+| `web` | Web pages an agent captured. | no |
+| `syntheses` | Answers an agent saved. | no |
+| `memory` | What agents were asked to remember. Agents write it through myelin; the distill server defines it and indexes nothing into it. | no |
 
 ### `HS_DISTILL_<KEY>` overrides
 
@@ -344,10 +337,10 @@ The variable name is `HS_DISTILL_` followed by the key in upper case. The loader
 | Variable | Effect |
 |---|---|
 | `HS_DISTILL_PORT` | `distill_server.port`. |
-| `HS_DISTILL_QDRANT_URL` | `distill_server.qdrant_url`. |
+| `HS_DISTILL_MYELIN_URL` | `distill_server.myelin_url`. |
 | `HS_DISTILL_CONCURRENCY` | `distill.concurrency`. |
 
-A name that is a top-level key of neither section is a warning. Nested keys such as `embedding.max_length` can only be set in the file.
+A name that is a top-level key of neither section is a warning.
 
 ## `docs`
 
@@ -412,7 +405,6 @@ The personal-documents store. See [Manage personal documents](../how-to/manage-p
 
 | Key | Default | Meaning |
 |---|---|---|
-| `collection_name` | `personal_docs` | Qdrant collection for the store. Must be non-empty. |
 | `storage_dir` | `personal` | Prefix of the store's objects in the storage backend, and the store's directory under the project directory. Must be a relative path without `.` or `..` parts, and must not overlap another store's prefix (`papers`, `markdown`, `catalog`, `boxes`, `web`, `syntheses`). |
 | `ingest_inbox` | `inbox` | Directory that `personal_add` resolves file names against. A relative value is joined under `<project_dir>/<storage_dir>`; an absolute value is used as given. |
 | `distill_url` | `http://localhost:7434` | Distill server URL. |

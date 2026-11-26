@@ -22,7 +22,7 @@ hs serve docs
 | Service | Default port | Before the first run |
 |---|---|---|
 | `hs serve scribe` | 7433 | The host has the layout and table models, libpdfium, a VLM backend and `HS_BACKEND_TOKEN`. The command provisions nothing. See [Convert documents](convert-documents.md). |
-| `hs serve distill` | 7434 | An NVIDIA GPU with CUDA. The command sets up Qdrant first, as `hs distill init` does. See [Index and search your library](index-and-search.md). |
+| `hs serve distill` | 7434 | An NVIDIA GPU with CUDA, and a myelin server and Ollama running. The command provisions neither. See [Index and search your library](index-and-search.md). |
 | `hs serve mcp` | 7445 | `storage:` and `events:` in the configuration. See [Connect Claude and agents](connect-claude-and-agents.md). |
 | `hs serve docs` | 7446 | `storage:` in the configuration, and libpdfium on the host. See [Open documents with links](open-documents-with-links.md). |
 

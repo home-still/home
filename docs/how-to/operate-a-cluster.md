@@ -172,13 +172,12 @@ A second GPU host adds conversion and indexing capacity.
 1. On the new host, install home-still and save the shared secret as in steps 1
    and 2 of the
    [cluster tutorial](../tutorials/home-cloud-cluster.md#1-install-home-still-on-the-gateway-host-the-gpu-host-and-the-laptop).
-2. Set `distill_server.qdrant_url` in `~/.home-still/config.yaml` to
-   `http://<qdrant-host>:6334`, and prepare the card, the layout models,
+2. Set `distill_server.myelin_url` in `~/.home-still/config.yaml` to the
+   myelin server's MCP endpoint, and prepare the card, the layout models,
    pdfium and the scribe server as in steps 6 and 8 of the tutorial.
 3. Start the servers as services:
 
    ```sh
-   hs distill init
    hs serve scribe --install
    hs serve distill --install
    ```

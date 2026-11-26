@@ -4,7 +4,7 @@ Keep medical, financial and other private records in a store that is separate fr
 
 ## Before you start
 
-- A distill server is running and serves the `personal_docs` collection, which it creates by default. See [Index and search your library](index-and-search.md).
+- A distill server is running. It files personal documents in its `personal` store, which it defines when it starts. See [Index and search your library](index-and-search.md).
 - A scribe server is running if you add PDFs. Other formats convert on your machine: `docx`, `epub`, `md`, `markdown` and `txt`. See [Convert documents](convert-documents.md).
 - The `events:` section is set and a NATS broker is running if you add PDFs. The ingest asks the scribe watcher to build the PDF's word boxes, which is what lets a quotation be highlighted on its page. Without the bus a PDF is refused before it is converted.
 - Ollama runs on the machine where you run `hs personal add`, with the naming model pulled (`qwen2.5:7b` by default), unless you pin both the title and the category.

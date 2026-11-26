@@ -1,16 +1,21 @@
-//! [`DocumentStore`] over a myelin MCP server (`myelin-mcp`, streamable HTTP).
+//! [`DocumentStore`] over a myelin MCP server (`myelin-mcp`, streamable HTTP,
+//! the full surface).
 //!
 //! # Mapping
 //!
 //! | home-still                         | myelin                                 |
 //! |------------------------------------|----------------------------------------|
-//! | collection (`academic_papers`, …)  | `tenant`                               |
+//! | store (`academic`, `personal`, …)  | the store of that name, on its tenant  |
 //! | `doc_id`                           | `namespace`                            |
 //! | one chunk                          | one episode (`speaker: "document"`)    |
 //! | chunk metadata (title, year, page) | the turn's caller `meta`               |
 //!
-//! Papers are stored verbatim: `extract` is off, so myelin embeds the chunk
-//! text and keeps it as the record's value; nothing is summarised or merged.
+//! [`DocumentStore::define_store`] binds each store's name to its tenant;
+//! every other call names the store, never the tenant.
+//!
+//! Documents are stored verbatim: `extract` is off, so myelin embeds the
+//! chunk text and keeps it as the record's value; nothing is summarised or
+//! merged.
 //!
 //! # Generations
 //!
@@ -31,6 +36,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use hs_common::auth::client::AuthedHttp;
 use hs_common::mcp_client::McpClient;
+use hs_common::stores::StoreSpec;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -122,8 +128,10 @@ pub(crate) fn sanitize_year(publication_date: Option<&str>) -> Option<i64> {
     (1900..=now_year + 1).contains(&year).then_some(year)
 }
 
-/// The caller metadata stored with one chunk's record. Everything a search
-/// hit needs besides the text itself.
+/// The caller metadata stored with one chunk's record: what a search hit
+/// and an agent reading the store need besides the text itself. Where the
+/// document's files are is not part of it; a document is named by its
+/// store and `doc_id`.
 fn chunk_meta(chunk: &Chunk) -> Result<Map<String, Value>, DistillError> {
     // myelin stores `text` (header included, so it is embedded); a hit's
     // `chunk_text` is the part after the header.
@@ -134,31 +142,35 @@ fn chunk_meta(chunk: &Chunk) -> Result<Map<String, Value>, DistillError> {
         )));
     }
     let meta = &chunk.meta;
-    let value = json!({
-        "doc_id": chunk.doc_id,
-        "chunk_index": chunk.chunk_index,
-        "total_chunks": chunk.total_chunks,
-        "raw_offset": chunk.text.len() - chunk.raw_text.len(),
-        "title": meta.title,
-        "authors": meta.authors,
-        "doi": meta.doi,
-        "year": sanitize_year(meta.publication_date.as_deref()),
-        "topics": meta.topics,
-        "keywords": meta.keywords,
-        "pdf_path": meta.pdf_path,
-        "markdown_path": meta.markdown_path,
-        "line_start": chunk.span.line_start as i64,
-        "line_end": chunk.span.line_end as i64,
-        "page": chunk.page.map(|p| p as i64),
-        "cited_by_count": meta.cited_by_count,
-        "category": meta.category,
-        "original_format": meta.original_format,
-        "ingested_at": meta.ingested_at,
-    });
-    match value {
-        Value::Object(map) => Ok(map),
-        _ => unreachable!("json! of an object literal is an object"),
+    let mut fields: Map<String, Value> = [
+        ("doc_id", json!(chunk.doc_id)),
+        ("chunk_index", json!(chunk.chunk_index)),
+        ("total_chunks", json!(chunk.total_chunks)),
+        ("raw_offset", json!(chunk.text.len() - chunk.raw_text.len())),
+        ("line_start", json!(chunk.span.line_start)),
+        ("line_end", json!(chunk.span.line_end)),
+        ("page", json!(chunk.page)),
+        ("title", json!(meta.title)),
+        ("authors", json!(meta.authors)),
+        (
+            "year",
+            json!(sanitize_year(meta.publication_date.as_deref())),
+        ),
+        ("doi", json!(meta.doi)),
+        ("topics", json!(meta.topics)),
+        ("keywords", json!(meta.keywords)),
+        ("category", json!(meta.category)),
+        ("original_format", json!(meta.original_format)),
+        ("cited_by_count", json!(meta.cited_by_count)),
+        ("ingested_at", json!(meta.ingested_at)),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect();
+    if let Some(source_url) = &meta.source_url {
+        fields.insert("source_url".to_string(), json!(source_url));
     }
+    Ok(fields)
 }
 
 /// What a stored chunk's metadata says about a search hit.
@@ -170,7 +182,6 @@ struct ChunkMeta {
     authors: Option<Vec<String>>,
     year: Option<u64>,
     doi: Option<String>,
-    pdf_path: Option<String>,
     line_start: Option<usize>,
     line_end: Option<usize>,
     page: Option<usize>,
@@ -208,6 +219,8 @@ struct RecallHit {
     record_id: String,
     score: f32,
     meta: Option<Value>,
+    /// The store the record was read from.
+    store: String,
 }
 
 #[derive(Deserialize)]
@@ -254,9 +267,26 @@ impl DocumentStore for MyelinStore {
         Ok(format!("{name} {version}"))
     }
 
+    async fn define_store(&self, spec: &StoreSpec) -> Result<(), DistillError> {
+        let _write = self.write_lock.lock().await;
+        self.call(
+            "define_store",
+            json!({
+                "name": spec.name,
+                "tenant": spec.tenant,
+                "description": spec.description,
+                "default_read": spec.default_read,
+                "agent_writes": spec.agent_writes,
+                "dated": spec.dated,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn write_document(
         &self,
-        collection: &str,
+        store: &str,
         doc_id: &str,
         chunks: &[Chunk],
     ) -> Result<Vec<String>, DistillError> {
@@ -292,7 +322,7 @@ impl DocumentStore for MyelinStore {
             .call(
                 "observe",
                 json!({
-                    "tenant": collection,
+                    "store": store,
                     "namespace": doc_id,
                     "agent": AGENT,
                     "unit": unit,
@@ -324,7 +354,7 @@ impl DocumentStore for MyelinStore {
 
     async fn forget_document(
         &self,
-        collection: &str,
+        store: &str,
         doc_id: &str,
         keep: &[String],
     ) -> Result<u64, DistillError> {
@@ -333,7 +363,7 @@ impl DocumentStore for MyelinStore {
             .call(
                 "forget_scope",
                 json!({
-                    "tenant": collection,
+                    "store": store,
                     "namespace": doc_id,
                     "keep": keep,
                     "confirm": true,
@@ -346,7 +376,7 @@ impl DocumentStore for MyelinStore {
 
     async fn search(
         &self,
-        collection: &str,
+        stores: &[&str],
         query: &str,
         limit: u64,
         filter: &SearchFilter,
@@ -356,10 +386,9 @@ impl DocumentStore for MyelinStore {
                 "recall",
                 json!({
                     "query": query,
-                    "tenant": collection,
+                    "stores": stores,
                     "k": limit,
                     "budget_tokens": limit.saturating_mul(BUDGET_TOKENS_PER_HIT),
-                    "dated": false,
                     "filter": filter_conditions(filter),
                 }),
             )
@@ -394,6 +423,7 @@ impl DocumentStore for MyelinStore {
             ranked.push((
                 hit.record_id,
                 SearchHit {
+                    store: hit.store,
                     doc_id: meta.doc_id,
                     title: meta.title,
                     authors: meta.authors.unwrap_or_default(),
@@ -401,7 +431,6 @@ impl DocumentStore for MyelinStore {
                     doi: meta.doi,
                     chunk_text: chunk_text.to_string(),
                     score: hit.score,
-                    pdf_path: meta.pdf_path,
                     line_start: meta.line_start.unwrap_or(0),
                     line_end: meta.line_end.unwrap_or(0),
                     page: meta.page,
@@ -420,10 +449,10 @@ impl DocumentStore for MyelinStore {
 
     async fn inventory(
         &self,
-        collection: &str,
+        store: &str,
         doc_id: Option<&str>,
     ) -> Result<BTreeMap<String, u64>, DistillError> {
-        let mut arguments = json!({ "tenant": collection });
+        let mut arguments = json!({ "store": store });
         if let Some(doc_id) = doc_id {
             arguments["namespace"] = json!(doc_id);
         }
@@ -542,7 +571,6 @@ mod tests {
                 authors: vec!["A. Author".into()],
                 doi: Some("10.1/x".into()),
                 publication_date: Some("2021-03-04".into()),
-                markdown_path: format!("markdown/xx/{doc_id}.md"),
                 topics: vec!["autism".into()],
                 ..Default::default()
             },
@@ -563,7 +591,7 @@ mod tests {
             chunk("doc", 1, 2, "second body"),
         ];
         let ids = store(&fake)
-            .write_document("academic_papers", "doc", &chunks)
+            .write_document("academic", "doc", &chunks)
             .await
             .unwrap();
         assert_eq!(ids, ["r0", "r1"]);
@@ -572,7 +600,11 @@ mod tests {
         assert_eq!(calls.len(), 1);
         let (tool, args) = &calls[0];
         assert_eq!(tool, "observe");
-        assert_eq!(args["tenant"], "academic_papers");
+        assert_eq!(args["store"], "academic");
+        assert!(
+            args.get("tenant").is_none(),
+            "a store is named, not a tenant"
+        );
         assert_eq!(args["namespace"], "doc");
         assert_eq!(args["agent"], "hs-distill");
         assert_eq!(args["extract"], false, "papers are written verbatim");
@@ -599,12 +631,65 @@ mod tests {
                 chunks[i].text.len() - chunks[i].raw_text.len()
             );
             assert!(meta.get("chunk_text").is_none(), "the text is the record");
+            for absent in ["pdf_path", "markdown_path", "source_url"] {
+                assert!(meta.get(absent).is_none(), "{absent} is not stored");
+            }
         }
         // The session is closed.
         assert!(fake
             .recorded()
             .iter()
             .any(|r| r.request_line.starts_with("DELETE")));
+    }
+
+    #[tokio::test]
+    async fn a_source_url_is_stored_when_the_document_has_one() {
+        let fake = stand_in(|_, _| observe_ok(&["r0"])).await;
+        let mut page = chunk("doc", 0, 1, "body");
+        page.meta.source_url = Some("https://example.org/a".into());
+        store(&fake)
+            .write_document("web", "doc", &[page])
+            .await
+            .unwrap();
+        let (_, args) = &tool_calls(&fake)[0];
+        assert_eq!(
+            args["turns"][0]["meta"]["source_url"],
+            "https://example.org/a"
+        );
+    }
+
+    // ── define_store ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn defining_a_store_states_its_name_tenant_and_flags() {
+        let fake = stand_in(|_, _| json!({"name": "memory", "tenant": "user_memory"})).await;
+        let stores = hs_common::stores::Stores::with_personal_prefix("personal").unwrap();
+        let memory = stores.get(hs_common::stores::MEMORY).unwrap();
+        store(&fake).define_store(memory).await.unwrap();
+        let (tool, args) = &tool_calls(&fake)[0];
+        assert_eq!(tool, "define_store");
+        assert_eq!(
+            *args,
+            json!({
+                "name": memory.name, "tenant": memory.tenant,
+                "description": memory.description,
+                "default_read": memory.default_read,
+                "agent_writes": memory.agent_writes, "dated": memory.dated,
+            })
+        );
+        assert_eq!(
+            (args["name"].as_str(), args["tenant"].as_str()),
+            (Some("memory"), Some("user_memory"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_store_definition_is_a_backend_error() {
+        let fake = serve(|_| Reply::Json(503, "down".into())).await;
+        let stores = hs_common::stores::Stores::with_personal_prefix("personal").unwrap();
+        let academic = stores.get(hs_common::stores::ACADEMIC).unwrap();
+        let err = store(&fake).define_store(academic).await.unwrap_err();
+        assert!(matches!(err, DistillError::Backend(_)), "{err}");
     }
 
     #[tokio::test]
@@ -708,11 +793,13 @@ mod tests {
 
     // ── search ─────────────────────────────────────────────────────
 
-    fn recall_reply(rows: &[(&str, f32, &str, Option<Value>)]) -> Value {
+    /// A `recall` result: (record id, score, value, metadata, store) rows.
+    fn recall_reply(rows: &[(&str, f32, &str, Option<Value>, &str)]) -> Value {
         json!({
-            "items": rows.iter().map(|(_, _, v, _)| json!({"value": v})).collect::<Vec<_>>(),
-            "hits": rows.iter().map(|(id, score, _, meta)| json!({
-                "record_id": id, "source": "s", "score": score, "meta": meta})).collect::<Vec<_>>(),
+            "items": rows.iter().map(|(_, _, v, _, _)| json!({"value": v})).collect::<Vec<_>>(),
+            "hits": rows.iter().map(|(id, score, _, meta, store)| json!({
+                "record_id": id, "source": "s", "score": score, "meta": meta,
+                "store": store})).collect::<Vec<_>>(),
         })
     }
 
@@ -720,7 +807,7 @@ mod tests {
         json!({
             "doc_id": doc_id, "raw_offset": raw_offset, "title": "A Title",
             "authors": ["A. Author"], "year": 2021, "doi": "10.1/x",
-            "pdf_path": "pdf/xx/doc.pdf", "line_start": 3, "line_end": 9,
+            "line_start": 3, "line_end": 9,
             "page": 4, "category": null,
         })
     }
@@ -736,25 +823,33 @@ mod tests {
                     0.7,
                     &format!("document: {header}middle text"),
                     Some(stored_meta(header.len(), "d-b")),
+                    "personal",
                 ),
                 (
                     "a",
                     0.9,
                     &format!("document: {header}best text"),
                     Some(stored_meta(header.len(), "d-a")),
+                    "academic",
                 ),
                 (
                     "c",
                     0.7,
                     &format!("document: {header}tied text"),
                     Some(stored_meta(header.len(), "d-c")),
+                    "academic",
                 ),
-                ("z", 0.5, "document: x", None),
+                ("z", 0.5, "document: x", None, "academic"),
             ])
         })
         .await;
         let hits = store(&fake)
-            .search("academic_papers", "a query", 10, &SearchFilter::default())
+            .search(
+                &["academic", "personal"],
+                "a query",
+                10,
+                &SearchFilter::default(),
+            )
             .await
             .unwrap();
         let order: Vec<(&str, &str)> = hits
@@ -770,6 +865,8 @@ mod tests {
             ],
             "ties break by record id; a record with no metadata is not a chunk"
         );
+        let from: Vec<&str> = hits.iter().map(|h| h.store.as_str()).collect();
+        assert_eq!(from, ["academic", "personal", "academic"]);
         let best = &hits[0];
         assert_eq!(best.title.as_deref(), Some("A Title"));
         assert_eq!(best.year, Some(2021));
@@ -780,10 +877,17 @@ mod tests {
         let (tool, args) = &tool_calls(&fake)[0];
         assert_eq!(tool, "recall");
         assert_eq!(args["query"], "a query");
-        assert_eq!(args["tenant"], "academic_papers");
+        assert_eq!(args["stores"], json!(["academic", "personal"]));
+        assert!(
+            args.get("tenant").is_none(),
+            "stores are named, not tenants"
+        );
         assert_eq!(args["k"], 10);
         assert_eq!(args["budget_tokens"], 10 * 2048);
-        assert_eq!(args["dated"], false);
+        assert!(
+            args.get("dated").is_none(),
+            "whether a store is dated is the store's own property"
+        );
         assert_eq!(args["filter"], json!([]));
     }
 
@@ -791,14 +895,14 @@ mod tests {
     async fn at_most_limit_hits_come_back() {
         let fake = stand_in(|_, _| {
             recall_reply(&[
-                ("a", 0.9, "document: one", Some(stored_meta(0, "d"))),
-                ("b", 0.8, "document: two", Some(stored_meta(0, "d"))),
-                ("c", 0.7, "document: three", Some(stored_meta(0, "d"))),
+                ("a", 0.9, "document: one", Some(stored_meta(0, "d")), "c"),
+                ("b", 0.8, "document: two", Some(stored_meta(0, "d")), "c"),
+                ("c", 0.7, "document: three", Some(stored_meta(0, "d")), "c"),
             ])
         })
         .await;
         let hits = store(&fake)
-            .search("c", "q", 2, &SearchFilter::default())
+            .search(&["c"], "q", 2, &SearchFilter::default())
             .await
             .unwrap();
         assert_eq!(hits.len(), 2);
@@ -814,10 +918,10 @@ mod tests {
             ..Default::default()
         };
         for y in [">=2021", ">2020", "<2019", "<=2018", "2023"] {
-            s.search("c", "q", 5, &filter(y)).await.unwrap();
+            s.search(&["c"], "q", 5, &filter(y)).await.unwrap();
         }
         s.search(
-            "c",
+            &["c"],
             "q",
             5,
             &SearchFilter {
@@ -864,11 +968,11 @@ mod tests {
     #[tokio::test]
     async fn a_recalled_value_without_the_document_prefix_is_an_error() {
         let fake = stand_in(|_, _| {
-            recall_reply(&[("a", 0.9, "someone: text", Some(stored_meta(0, "d")))])
+            recall_reply(&[("a", 0.9, "someone: text", Some(stored_meta(0, "d")), "c")])
         })
         .await;
         let err = store(&fake)
-            .search("c", "q", 5, &SearchFilter::default())
+            .search(&["c"], "q", 5, &SearchFilter::default())
             .await
             .unwrap_err();
         assert!(
@@ -881,7 +985,7 @@ mod tests {
     async fn items_and_hits_that_are_not_aligned_are_an_error() {
         let fake = stand_in(|_, _| json!({"items": [{"value": "document: x"}], "hits": []})).await;
         let err = store(&fake)
-            .search("c", "q", 5, &SearchFilter::default())
+            .search(&["c"], "q", 5, &SearchFilter::default())
             .await
             .unwrap_err();
         assert!(matches!(err, DistillError::Backend(_)), "{err}");
@@ -890,11 +994,17 @@ mod tests {
     #[tokio::test]
     async fn a_header_offset_past_the_text_is_an_error_not_a_panic() {
         let fake = stand_in(|_, _| {
-            recall_reply(&[("a", 0.9, "document: short", Some(stored_meta(500, "d")))])
+            recall_reply(&[(
+                "a",
+                0.9,
+                "document: short",
+                Some(stored_meta(500, "d")),
+                "c",
+            )])
         })
         .await;
         let err = store(&fake)
-            .search("c", "q", 5, &SearchFilter::default())
+            .search(&["c"], "q", 5, &SearchFilter::default())
             .await
             .unwrap_err();
         assert!(matches!(err, DistillError::Backend(_)), "{err}");
@@ -906,7 +1016,7 @@ mod tests {
     async fn forgetting_a_document_keeps_the_named_records() {
         let fake = stand_in(|_, _| json!({"affected": 3, "ids": ["x", "y", "z"]})).await;
         let affected = store(&fake)
-            .forget_document("academic_papers", "doc", &["keep-1".to_string()])
+            .forget_document("academic", "doc", &["keep-1".to_string()])
             .await
             .unwrap();
         assert_eq!(affected, 3);
@@ -915,7 +1025,7 @@ mod tests {
         assert_eq!(
             *args,
             json!({
-                "tenant": "academic_papers", "namespace": "doc",
+                "store": "academic", "namespace": "doc",
                 "keep": ["keep-1"], "confirm": true, "actor": "hs-distill",
             })
         );
@@ -935,13 +1045,13 @@ mod tests {
         })
         .await;
         let s = store(&fake);
-        let all = s.inventory("academic_papers", None).await.unwrap();
+        let all = s.inventory("academic", None).await.unwrap();
         assert_eq!(all, BTreeMap::from([("a".into(), 3), ("b".into(), 1)]));
-        let one = s.inventory("academic_papers", Some("a")).await.unwrap();
+        let one = s.inventory("academic", Some("a")).await.unwrap();
         assert_eq!(one, BTreeMap::from([("a".into(), 3)]));
         let calls = tool_calls(&fake);
-        assert!(calls[0].1.get("namespace").is_none());
-        assert_eq!(calls[1].1["namespace"], "a");
+        assert_eq!(calls[0].1, json!({"store": "academic"}));
+        assert_eq!(calls[1].1, json!({"store": "academic", "namespace": "a"}));
     }
 
     #[tokio::test]
@@ -967,19 +1077,32 @@ mod tests {
 
     // ── Against a real myelin ──────────────────────────────────────
 
-    /// Round trip against a live `myelin-mcp` in a scratch tenant:
-    /// `HS_DISTILL_LIVE_MYELIN_URL=http://127.0.0.1:7462/mcp cargo test -p
+    /// Round trip against a live `myelin-mcp` in a scratch store:
+    /// `HS_DISTILL_LIVE_MYELIN_URL=http://127.0.0.1:<port>/mcp cargo test -p
     /// hs-distill --features server -- --ignored live_myelin`. The scratch
-    /// tenant is emptied afterwards; the home-still collections are never
-    /// touched.
+    /// store is emptied afterwards, but myelin has no call that removes a
+    /// store's definition, so point this at a myelin you can throw away:
+    /// on a shared one the scratch store stays in its `stores` listing.
     #[tokio::test]
-    #[ignore = "needs a running myelin-mcp (HS_DISTILL_LIVE_MYELIN_URL)"]
+    #[ignore = "needs a throwaway myelin-mcp (HS_DISTILL_LIVE_MYELIN_URL)"]
     async fn live_myelin_round_trip() {
-        const TENANT: &str = "hs_distill_live_test";
+        const STORE: &str = "hs_distill_live_test";
         let url = std::env::var("HS_DISTILL_LIVE_MYELIN_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:7462/mcp".into());
+            .expect("HS_DISTILL_LIVE_MYELIN_URL names the myelin to test against");
         let store = MyelinStore::new(&url).unwrap();
         assert!(store.health().await.unwrap().starts_with("myelin-mcp "));
+        store
+            .define_store(&StoreSpec {
+                name: STORE,
+                tenant: STORE,
+                description: "Scratch store of the hs-distill live test.",
+                default_read: false,
+                agent_writes: false,
+                dated: false,
+                kind: hs_common::stores::StoreKind::Memory,
+            })
+            .await
+            .unwrap();
 
         let mut first = chunk(
             "live-doc",
@@ -992,17 +1115,17 @@ mod tests {
         second.meta.publication_date = Some("2024-05-01".into());
         let result = async {
             let ids = store
-                .write_document(TENANT, "live-doc", &[first.clone(), second.clone()])
+                .write_document(STORE, "live-doc", &[first.clone(), second.clone()])
                 .await?;
             assert_eq!(ids.len(), 2);
             // Identical content: the same records, nothing new, nothing to forget.
             let again = store
-                .write_document(TENANT, "live-doc", &[first.clone(), second.clone()])
+                .write_document(STORE, "live-doc", &[first.clone(), second.clone()])
                 .await?;
             assert_eq!(again, ids);
-            assert_eq!(store.forget_document(TENANT, "live-doc", &ids).await?, 0);
+            assert_eq!(store.forget_document(STORE, "live-doc", &ids).await?, 0);
             assert_eq!(
-                store.inventory(TENANT, None).await?,
+                store.inventory(STORE, None).await?,
                 BTreeMap::from([("live-doc".to_string(), 2)])
             );
 
@@ -1010,25 +1133,26 @@ mod tests {
                 year: Some(YearFilter::Gte(2021)),
                 ..Default::default()
             };
-            let hits = store.search(TENANT, "split brain", 5, &filter).await?;
+            let hits = store.search(&[STORE], "split brain", 5, &filter).await?;
             assert_eq!(hits.len(), 1, "{hits:?}");
+            assert_eq!(hits[0].store, STORE);
             assert_eq!(hits[0].chunk_text, "Gazzaniga studied the split brain.");
             assert_eq!(hits[0].year, Some(2024));
             assert_eq!(hits[0].title.as_deref(), Some("A Title"));
             assert_eq!(hits[0].page, Some(2));
 
             let all = store
-                .search(TENANT, "Hashimoto", 5, &SearchFilter::default())
+                .search(&[STORE], "Hashimoto", 5, &SearchFilter::default())
                 .await?;
             assert!(all[0].chunk_text.contains("Hashimoto"), "{all:?}");
             assert!(all.windows(2).all(|w| w[0].score >= w[1].score));
             Ok::<_, DistillError>(())
         }
         .await;
-        let removed = store.forget_document(TENANT, "live-doc", &[]).await;
+        let removed = store.forget_document(STORE, "live-doc", &[]).await;
         result.unwrap();
         assert_eq!(removed.unwrap(), 2);
-        assert!(store.inventory(TENANT, None).await.unwrap().is_empty());
+        assert!(store.inventory(STORE, None).await.unwrap().is_empty());
     }
 
     // ── sanitize_year ──────────────────────────────────────────────

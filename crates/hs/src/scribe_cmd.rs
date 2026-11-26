@@ -241,13 +241,16 @@ async fn cmd_reconvert(stem: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
     if entry.embedding.is_some() || entry.embedding_skip.is_some() {
         let servers = crate::distill_cmd::resolve_servers(None).await?;
         let client = crate::distill_cmd::make_distill_client(&servers[0]).await?;
-        let deleted = client.delete_doc(stem).await.with_context(|| {
-            format!(
-                "purge old Qdrant chunks for {stem} via {} — start the distill \
+        let deleted = client
+            .delete_doc(hs_common::stores::ACADEMIC, stem)
+            .await
+            .with_context(|| {
+                format!(
+                    "purge old chunks for {stem} via {} — start the distill \
                  server (or fix the URL in config) and re-run",
-                servers[0]
-            )
-        })?;
+                    servers[0]
+                )
+            })?;
         reporter.status("Purged", &format!("{deleted} stale chunk(s) for {stem}"));
     }
 

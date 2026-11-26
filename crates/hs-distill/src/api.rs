@@ -1,15 +1,17 @@
 //! Transport-independent request handling for the distill server.
 //!
 //! `server` is a thin axum adapter over [`DistillServerState`]; everything
-//! that decides what a request means — validation, collection routing,
+//! that decides what a request means — validation, store routing,
 //! limits, error classification — lives here so it runs (and is tested)
 //! without a socket, a GPU, or a myelin.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use hs_common::service::inflight::InFlightGuard;
+use hs_common::stores::{DerivedText, StoreKind, StoreSpec, Stores};
 use serde::Deserialize;
 
 use crate::client::{
@@ -20,7 +22,6 @@ use crate::config::DistillServerConfig;
 use crate::embed_device::{ollama_embed_device, DEVICE_CUDA, OLLAMA_EMBED_MODEL};
 use crate::error::DistillError;
 use crate::pipeline::{self, ContentProfile, IndexJob};
-use crate::reference_list;
 use crate::store::{DocumentStore, SearchFilter};
 
 /// How long `/readiness` waits for each backend (myelin, ollama) before
@@ -96,19 +97,11 @@ impl From<DistillError> for ApiError {
     }
 }
 
-/// Body of `POST /embedder/release`.
-#[derive(Debug, serde::Serialize)]
-pub struct EmbedderRelease {
-    /// Model slots dropped from the GPU.
-    pub released: usize,
-}
-
 /// Body of `POST /distill` and `POST /distill/stream`.
 #[derive(Deserialize)]
 pub struct IndexRequest {
-    /// Document name. Only its file stem is used (it becomes the `doc_id`
-    /// and, with the catalog, the stored `markdown_path`); the file it
-    /// names is never opened.
+    /// Document name. Only its file stem is used (it becomes the
+    /// `doc_id`); the file it names is never opened.
     pub path: Option<String>,
     /// The markdown to index. Required: the server indexes the text it is
     /// sent and never reads documents from disk.
@@ -116,10 +109,11 @@ pub struct IndexRequest {
     /// Catalog entry for the document. Without one the chunks carry no
     /// title/authors/DOI/year.
     pub catalog: Option<hs_common::catalog::CatalogEntry>,
-    /// Target collection; must be one the server is configured to serve.
-    /// Missing means the default collection.
+    /// The store to index into, by name. Required: it must be a store
+    /// documents are sent to, not one filled from another store's
+    /// documents.
     #[serde(default)]
-    pub collection: Option<String>,
+    pub store: Option<String>,
 }
 
 /// Body of `POST /search`.
@@ -130,17 +124,21 @@ pub struct SearchRequest {
     /// are clamped).
     pub limit: Option<u64>,
     pub filters: Option<SearchFilters>,
+    /// The stores to search, by name. None named means every store a read
+    /// covers by default.
     #[serde(default)]
-    pub collection: Option<String>,
+    pub stores: Vec<String>,
 }
 
 /// A validated index request.
 pub struct PreparedIndex {
     doc_id: String,
-    path_hint: String,
     content: String,
     catalog: Option<hs_common::catalog::CatalogEntry>,
-    collection: String,
+    store: &'static str,
+    /// The store the document's reference-list chunks go to.
+    references: Option<&'static str>,
+    profile: ContentProfile,
 }
 
 /// Documents returned by `/docs`.
@@ -156,6 +154,9 @@ pub struct DistillServerState {
     /// store (`config.ollama_url`).
     pub ollama: reqwest::Client,
     pub config: DistillServerConfig,
+    /// The registry of stores. A request names one of them; the server
+    /// serves every one that holds documents.
+    pub stores: Stores,
     pub in_flight: Arc<AtomicUsize>,
 }
 
@@ -164,33 +165,118 @@ impl DistillServerState {
         store: Arc<dyn DocumentStore>,
         ollama: reqwest::Client,
         config: DistillServerConfig,
+        stores: Stores,
     ) -> Self {
         Self {
             store,
             ollama,
             config,
+            stores,
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// The collection a request targets. Missing means the configured
-    /// default; any other name must be one of the collections configured —
-    /// a request can never reach an arbitrary myelin tenant by naming it.
-    pub fn resolve_collection(&self, requested: Option<&str>) -> Result<String, ApiError> {
-        let Some(name) = requested else {
-            return Ok(self.config.collection_name.clone());
-        };
-        if self.config.served_collections().any(|c| c == name) {
-            return Ok(name.to_string());
+    /// Bind every store of the registry to its tenant in the backend, the
+    /// memory store included: the registry says which tenant each name
+    /// means, for an agent reading myelin as much as for this server. The
+    /// server calls this before it listens and refuses to start on an
+    /// `Err`: a name the backend holds for another tenant would file
+    /// documents where no reader looks.
+    pub async fn define_stores(&self) -> Result<(), ApiError> {
+        for spec in self.stores.iter() {
+            self.store.define_store(spec).await.map_err(|e| {
+                ApiError::unavailable(format!(
+                    "cannot define store {:?} (tenant {:?}): {e}",
+                    spec.name, spec.tenant
+                ))
+            })?;
         }
-        Err(ApiError::bad_request(format!(
-            "unknown collection {name:?}; this server serves: {}. Add it to \
-             distill_server.collections to serve it",
-            self.config
-                .served_collections()
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
+        Ok(())
+    }
+
+    /// The stores this server serves: every store of the registry that
+    /// holds documents. The memory store holds statements an agent wrote,
+    /// which reach myelin without this server.
+    fn served_stores(&self) -> impl Iterator<Item = &StoreSpec> {
+        self.stores
+            .iter()
+            .filter(|spec| !matches!(spec.kind, StoreKind::Memory))
+    }
+
+    fn served_names(&self) -> String {
+        self.served_stores()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The store a request names. It must be named, and be one this server
+    /// serves: a request can never reach an arbitrary myelin tenant by
+    /// naming it.
+    pub fn resolve_store(&self, requested: Option<&str>) -> Result<&StoreSpec, ApiError> {
+        let name = requested.ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "`store` is required; this server serves: {}",
+                self.served_names()
+            ))
+        })?;
+        self.served_stores()
+            .find(|spec| spec.name == name)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "unknown store {name:?}; this server serves: {}",
+                    self.served_names()
+                ))
+            })
+    }
+
+    /// The store that holds the reference-list chunks of the documents of
+    /// `spec`, when it has one.
+    fn reference_store(&self, spec: &StoreSpec) -> Option<&'static str> {
+        self.stores
+            .derived(spec.name, DerivedText::ReferenceChunks)
+            .map(|child| child.name)
+    }
+
+    /// Every store that holds chunks of the documents of `spec`: the store
+    /// itself and its reference store.
+    fn chunk_stores(&self, spec: &StoreSpec) -> impl Iterator<Item = &'static str> {
+        std::iter::once(spec.name).chain(self.reference_store(spec))
+    }
+
+    /// A store documents are sent to and deleted from, and the gates for
+    /// what it is sent. A store of reference lists is refused: its records
+    /// are written and deleted with the documents they come from, so that
+    /// a document's chunks are always counted whole.
+    fn document_store(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<(&StoreSpec, ContentProfile), ApiError> {
+        let spec = self.resolve_store(requested)?;
+        let profile = ContentProfile::for_kind(&spec.kind).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "the store {:?} takes no documents of its own: it is filled and emptied with \
+                 the documents of the store it is derived from",
+                spec.name
+            ))
+        })?;
+        Ok((spec, profile))
+    }
+
+    /// doc_id -> its chunks, counted over every store that holds chunks of
+    /// the documents of `spec`.
+    async fn chunk_counts(
+        &self,
+        spec: &StoreSpec,
+        doc_id: Option<&str>,
+    ) -> Result<BTreeMap<String, u64>, ApiError> {
+        let mut counts = BTreeMap::new();
+        for store in self.chunk_stores(spec) {
+            for (doc, chunks) in self.store.inventory(store, doc_id).await? {
+                *counts.entry(doc).or_insert(0) += chunks;
+            }
+        }
+        Ok(counts)
     }
 
     /// Where ollama has the embedding model: `"cuda"`, `"cpu"` or
@@ -231,13 +317,14 @@ impl DistillServerState {
             )
         })?;
         let doc_id = doc_id_from_hint(&path_hint)?;
-        let collection = self.resolve_collection(req.collection.as_deref())?;
+        let (spec, profile) = self.document_store(req.store.as_deref())?;
         Ok(PreparedIndex {
             doc_id,
-            path_hint,
             content,
             catalog: req.catalog,
-            collection,
+            store: spec.name,
+            references: self.reference_store(spec),
+            profile,
         })
     }
 
@@ -250,10 +337,11 @@ impl DistillServerState {
         let _guard = InFlightGuard::new(&self.in_flight);
         let PreparedIndex {
             doc_id,
-            path_hint,
             content,
             catalog,
-            collection,
+            store,
+            references,
+            profile,
         } = job;
         // Embedding happens inside the store's write; refuse to start one
         // while the model is not on the GPU.
@@ -261,11 +349,11 @@ impl DistillServerState {
         let work = pipeline::index_document(
             IndexJob {
                 doc_id: &doc_id,
-                markdown_path: &path_hint,
                 content: &content,
                 catalog,
-                collection: &collection,
-                profile: ContentProfile::for_collection(&collection),
+                store,
+                references,
+                profile,
             },
             &self.config,
             self.store.as_ref(),
@@ -297,6 +385,26 @@ impl DistillServerState {
 
     // ── search ─────────────────────────────────────────────────────
 
+    /// The stores a search reads: the ones it names, each once, or with
+    /// none named every served store a read covers by default.
+    fn search_stores(&self, requested: &[String]) -> Result<Vec<&'static str>, ApiError> {
+        if requested.is_empty() {
+            return Ok(self
+                .served_stores()
+                .filter(|spec| spec.default_read)
+                .map(|spec| spec.name)
+                .collect());
+        }
+        let mut names = Vec::with_capacity(requested.len());
+        for name in requested {
+            let spec = self.resolve_store(Some(name))?;
+            if !names.contains(&spec.name) {
+                names.push(spec.name);
+            }
+        }
+        Ok(names)
+    }
+
     pub async fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
         if req.query.trim().is_empty() {
             return Err(ApiError::bad_request("Search query cannot be empty"));
@@ -307,7 +415,7 @@ impl DistillServerState {
                 req.query.len()
             )));
         }
-        let collection = self.resolve_collection(req.collection.as_deref())?;
+        let stores = self.search_stores(&req.stores)?;
         let filter = SearchFilter::from_request(req.filters.as_ref())?;
         let limit = match req.limit {
             None => DEFAULT_SEARCH_LIMIT,
@@ -316,13 +424,11 @@ impl DistillServerState {
         };
 
         // The store ranks: dense and BM25 candidates fused by rank, then
-        // reordered by a cross-encoder.
-        let mut hits = self
+        // reordered by a cross-encoder, over every named store at once.
+        Ok(self
             .store
-            .search(&collection, &req.query, limit, &filter)
-            .await?;
-        demote_reference_lists(&mut hits, limit);
-        Ok(hits)
+            .search(&stores, &req.query, limit, &filter)
+            .await?)
     }
 
     // ── health / readiness / status ────────────────────────────────
@@ -338,7 +444,6 @@ impl DistillServerState {
         Ok(HealthResponse {
             status: "ok".into(),
             compute_device,
-            collection: self.config.collection_name.clone(),
             version: env!("HS_VERSION").to_string(),
             backend_version,
             embed_model: OLLAMA_EMBED_MODEL.into(),
@@ -379,13 +484,15 @@ impl DistillServerState {
         }
     }
 
-    pub async fn status(&self, collection: Option<&str>) -> Result<StatusResponse, ApiError> {
-        let collection = self.resolve_collection(collection)?;
-        let inventory = self.store.inventory(&collection, None).await?;
+    /// What a store holds. A document's chunks are counted whole: the ones
+    /// in the store and the reference lists kept beside it.
+    pub async fn status(&self, store: Option<&str>) -> Result<StatusResponse, ApiError> {
+        let spec = self.resolve_store(store)?;
+        let counts = self.chunk_counts(spec, None).await?;
         Ok(StatusResponse {
-            collection,
-            points_count: inventory.values().sum(),
-            documents_count: inventory.len() as u64,
+            store: spec.name.to_string(),
+            points_count: counts.values().sum(),
+            documents_count: counts.len() as u64,
             documents_count_truncated: false,
             compute_device: self.embedder_device().await?,
             embed_model: OLLAMA_EMBED_MODEL.into(),
@@ -395,27 +502,30 @@ impl DistillServerState {
 
     // ── per-document and maintenance operations ────────────────────
 
+    /// Whether `doc_id` has chunks, and how many (reference lists
+    /// included).
     pub async fn doc_exists(
         &self,
         doc_id: &str,
-        collection: Option<&str>,
+        store: Option<&str>,
     ) -> Result<(bool, u64), ApiError> {
         validate_doc_id(doc_id)?;
-        let collection = self.resolve_collection(collection)?;
-        let inventory = self.store.inventory(&collection, Some(doc_id)).await?;
-        let chunks = inventory.get(doc_id).copied().unwrap_or(0);
+        let spec = self.resolve_store(store)?;
+        let counts = self.chunk_counts(spec, Some(doc_id)).await?;
+        let chunks = counts.get(doc_id).copied().unwrap_or(0);
         Ok((chunks > 0, chunks))
     }
 
-    /// Delete every chunk of `doc_id`; returns how many existed.
-    pub async fn delete_doc(
-        &self,
-        doc_id: &str,
-        collection: Option<&str>,
-    ) -> Result<u64, ApiError> {
+    /// Delete every chunk of `doc_id`, its reference lists included;
+    /// returns how many existed.
+    pub async fn delete_doc(&self, doc_id: &str, store: Option<&str>) -> Result<u64, ApiError> {
         validate_doc_id(doc_id)?;
-        let collection = self.resolve_collection(collection)?;
-        Ok(self.store.forget_document(&collection, doc_id, &[]).await?)
+        let (spec, _) = self.document_store(store)?;
+        let mut deleted = 0;
+        for holder in self.chunk_stores(spec) {
+            deleted += self.store.forget_document(holder, doc_id, &[]).await?;
+        }
+        Ok(deleted)
     }
 
     /// Distinct doc ids. `limit` defaults to, and may not exceed,
@@ -424,7 +534,7 @@ impl DistillServerState {
     pub async fn list_docs(
         &self,
         limit: Option<u64>,
-        collection: Option<&str>,
+        store: Option<&str>,
     ) -> Result<DocList, ApiError> {
         let limit = match limit {
             None => MAX_DOC_LIST_LIMIT,
@@ -436,136 +546,27 @@ impl DistillServerState {
             }
             Some(n) => n,
         };
-        let collection = self.resolve_collection(collection)?;
-        let mut doc_ids: Vec<String> = self
-            .store
-            .inventory(&collection, None)
-            .await?
-            .into_keys()
-            .collect();
+        let spec = self.resolve_store(store)?;
+        let mut doc_ids: Vec<String> = self.chunk_counts(spec, None).await?.into_keys().collect();
         let truncated = doc_ids.len() as u64 > limit;
         doc_ids.truncate(limit as usize);
         Ok(DocList { doc_ids, truncated })
     }
 
-    /// Delete every document of a served collection. Destructive; the route
-    /// is behind the backend-token middleware (see `server.rs`). Returns the
-    /// collection and how many chunks were deleted.
-    pub async fn reset_collection(
-        &self,
-        collection: Option<&str>,
-    ) -> Result<(String, u64), ApiError> {
-        let collection = self.resolve_collection(collection)?;
-        let inventory = self.store.inventory(&collection, None).await?;
+    /// Delete every document of a store, reference lists included.
+    /// Destructive; the route is behind the backend-token middleware (see
+    /// `server.rs`). Returns the store and how many chunks were deleted.
+    pub async fn reset_store(&self, store: Option<&str>) -> Result<(&'static str, u64), ApiError> {
+        let (spec, _) = self.document_store(store)?;
         let mut deleted = 0;
-        for doc_id in inventory.keys() {
-            deleted += self.store.forget_document(&collection, doc_id, &[]).await?;
+        for holder in self.chunk_stores(spec) {
+            let inventory = self.store.inventory(holder, None).await?;
+            for doc_id in inventory.keys() {
+                deleted += self.store.forget_document(holder, doc_id, &[]).await?;
+            }
         }
-        Ok((collection, deleted))
+        Ok((spec.name, deleted))
     }
-}
-
-/// Move reference-list chunks below the prose chunks, but only past prose
-/// that is *competitive with them*.
-///
-/// A bibliography entry matches a query about a topic perfectly well in
-/// a dense embedding — semantically, a citation to work about
-/// hippocampal neurogenesis *is* about hippocampal neurogenesis — so the
-/// dense channel ranks it at the top. Measured on this corpus, a
-/// reference list was the best-ranked hit for "Gazzaniga split brain",
-/// and 24 % of the top 3 results across a fixed query set were
-/// reference lists.
-///
-/// The chunks are **demoted, not dropped**: a user asking for a
-/// paper's bibliography wants it, so it stays in the result, keeps its
-/// score, and is reachable by asking for more. Only its position
-/// changes — a prose chunk about the topic now comes first.
-///
-/// **A reference list is only demoted past prose that outranks it.**
-/// Otherwise the demotion is a sort, and a sort can push the *answer*
-/// out of the page: measured, demoting every reference list past every
-/// prose chunk lost the expected passage for two of the 25 fixed
-/// queries (recall 25/25 → 23/25), because for those queries the
-/// expected passage was itself a reference list — the one chunk in the
-/// corpus that mentions the term. A user asking "what does this corpus
-/// say about Dawson and Krebs?" wants that chunk whether or not it is
-/// formatted as a bibliography.
-///
-/// So a reference list moves down only past prose that beats it. If
-/// nothing beats it, it keeps the lead: it was the best answer the
-/// retrieval found.
-///
-/// The demotion is applied to the fused list before the page is cut, so
-/// prose from below the page can be promoted into it — and the page is
-/// cut to the caller's limit *after* the demotion, so the promotion
-/// cannot change how many results the caller gets. Measured: demoting a
-/// 50-candidate pool and then taking the top 10 drops recall to 23/25 —
-/// it pushes good hits out of the window to make room for prose that was
-/// never close.
-fn demote_reference_lists(hits: &mut Vec<SearchHit>, limit: u64) {
-    // A reference list is demoted below prose, but the demotion must
-    // never change *which* hits are in the page. Two properties:
-    //
-    //   * the page keeps exactly the hits it had — the demotion
-    //     reorders, it does not add or drop;
-    //   * a reference list that outranked every prose chunk keeps its
-    //     place, because then it was the best answer the retrieval
-    //     found. (Measured: demoting every reference list past every
-    //     prose chunk lost the expected passage for two of the 25 fixed
-    //     queries, because for those the expected passage was itself a
-    //     reference list — the one chunk in the corpus that mentions
-    //     the term.)
-    //
-    // So: the prose keeps its relative order, the reference lists keep
-    // theirs, and a reference list moves down only past prose that
-    // beats it.
-    let mut prose: Vec<SearchHit> = Vec::with_capacity(hits.len());
-    let mut references: Vec<SearchHit> = Vec::with_capacity(hits.len());
-    for hit in hits.drain(..) {
-        if reference_list::is_reference_list(&hit.chunk_text) {
-            references.push(hit);
-        } else {
-            prose.push(hit);
-        }
-    }
-    if references.is_empty() || prose.is_empty() {
-        // Nothing to demote past: either every hit is prose, or every
-        // hit is a reference list and the user asked for the
-        // bibliography.
-        let mut merged = prose.into_iter().chain(references).collect::<Vec<_>>();
-        merged.truncate(limit as usize);
-        *hits = merged;
-        return;
-    }
-
-    // The prose keeps its fused order and the reference lists keep
-    // theirs; the prose is placed first, and the reference lists follow.
-    //
-    // This is a **stable partition**: the relative order of the hits
-    // within each group is the fused order, unchanged. A merge that
-    // re-sorted by score would disturb the fused ranking of hits that
-    // scored the same, and that costs recall.
-    //
-    // The prose leads **when there is prose**. A reference list that
-    // outranks every prose chunk is not thereby the answer: for "Gazzaniga
-    // split brain" the best-ranked hit was a chunk of `doi:` lines
-    // scoring 0.500, while the passage that discusses the topic scored
-    // 0.250 — and the user asked a question, not for a bibliography.
-    // The passage that discusses the topic is the answer.
-    //
-    // When the page holds **no** prose at all, the reference list is
-    // the answer and keeps its place: sometimes the only chunk in the
-    // corpus that mentions a term is a citation of it, and there is
-    // nothing else to show. (For "Dawson and Krebs" that was the case:
-    // the corpus has 137 chunks about a botanist named Dawson and no
-    // paper about the Krebs cycle by that name.)
-    let mut merged: Vec<SearchHit> = Vec::with_capacity(prose.len() + references.len());
-    merged.extend(prose);
-    merged.extend(references);
-    // The page is unchanged in size: the demotion reorders, and the
-    // caller's limit still decides how many results there are.
-    merged.truncate(limit as usize);
-    *hits = merged;
 }
 
 /// The doc id a document name designates: the file stem of `path`, which
@@ -601,8 +602,13 @@ fn validate_doc_id(doc_id: &str) -> Result<(), ApiError> {
 mod tests {
     use super::*;
     use crate::client::ReadinessResponse;
-    use crate::testutil::{fake_state, prose, FakeOllama, FakeStore, OllamaMode, Op};
+    use crate::testutil::{fake_state, prose, FakeOllama, FakeStore, OllamaMode, Op, BIBLIOGRAPHY};
+    use hs_common::markdown::PAGE_SEPARATOR;
     use hs_common::service::protocol::ReadinessInfo;
+    use hs_common::stores::{ABSTRACTS, ACADEMIC, MEMORY, PERSONAL, REFERENCES, SYNTHESES, WEB};
+
+    /// The store most tests address.
+    const IN_ACADEMIC: Option<&str> = Some(ACADEMIC);
 
     struct Harness {
         state: DistillServerState,
@@ -619,16 +625,12 @@ mod tests {
         }
     }
 
-    fn index_req(
-        path: Option<&str>,
-        content: Option<&str>,
-        collection: Option<&str>,
-    ) -> IndexRequest {
+    fn index_req(path: Option<&str>, content: Option<&str>, store: Option<&str>) -> IndexRequest {
         IndexRequest {
             path: path.map(str::to_string),
             content: content.map(str::to_string),
             catalog: None,
-            collection: collection.map(str::to_string),
+            store: store.map(str::to_string),
         }
     }
 
@@ -641,13 +643,27 @@ mod tests {
             query: query.into(),
             limit,
             filters,
-            collection: None,
+            stores: vec![],
+        }
+    }
+
+    fn search_in(stores: &[&str]) -> SearchRequest {
+        SearchRequest {
+            stores: stores.iter().map(|s| s.to_string()).collect(),
+            ..search_req("q", None, None)
         }
     }
 
     fn kind<T>(r: Result<T, ApiError>) -> ErrorKind {
         match r {
             Err(e) => e.kind,
+            Ok(_) => panic!("expected an error"),
+        }
+    }
+
+    fn refusal<T>(r: Result<T, ApiError>) -> ApiError {
+        match r {
+            Err(e) => e,
             Ok(_) => panic!("expected an error"),
         }
     }
@@ -661,11 +677,10 @@ mod tests {
         let secret = dir.path().join("passwd.md");
         std::fs::write(&secret, "root:x:0:0 ".repeat(100)).unwrap();
 
-        let err = h
-            .state
-            .prepare_index(index_req(secret.to_str(), None, None))
-            .err()
-            .expect("path-only must be rejected");
+        let err = refusal(
+            h.state
+                .prepare_index(index_req(secret.to_str(), None, IN_ACADEMIC)),
+        );
         assert_eq!(err.kind, ErrorKind::BadRequest);
         assert!(err.message.contains("content"), "{err}");
 
@@ -674,20 +689,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_requests_need_both_a_name_and_content() {
+    async fn index_requests_need_a_name_content_and_a_store() {
         let h = harness().await;
-        assert_eq!(
-            kind(h.state.prepare_index(index_req(None, Some("x"), None))),
-            ErrorKind::BadRequest
-        );
-        assert_eq!(
-            kind(h.state.prepare_index(index_req(Some("a.md"), None, None))),
-            ErrorKind::BadRequest
-        );
-        assert_eq!(
-            kind(h.state.prepare_index(index_req(None, None, None))),
-            ErrorKind::BadRequest
-        );
+        for (path, content, store, missing) in [
+            (None, Some("x"), IN_ACADEMIC, "`path`"),
+            (Some("a.md"), None, IN_ACADEMIC, "`content`"),
+            (None, None, IN_ACADEMIC, "`content`"),
+            (Some("a.md"), Some("x"), None, "`store`"),
+        ] {
+            let err = refusal(h.state.prepare_index(index_req(path, content, store)));
+            assert_eq!(err.kind, ErrorKind::BadRequest, "{err}");
+            assert!(err.message.contains(missing), "{err}");
+        }
     }
 
     #[tokio::test]
@@ -698,7 +711,7 @@ mod tests {
             .prepare_index(index_req(
                 Some("markdown/ab/10.1609_aaai.v38i16.29728.md"),
                 Some(&prose(6)),
-                None,
+                IN_ACADEMIC,
             ))
             .unwrap();
         let result = h.state.run_index(job, |_| {}).await.unwrap();
@@ -706,9 +719,7 @@ mod tests {
         assert!(result.chunks_indexed > 0);
         assert_eq!(result.embedding_device, "cuda");
         assert_eq!(
-            h.store
-                .stored("academic_papers", "10.1609_aaai.v38i16.29728")
-                .len() as u32,
+            h.store.stored(ACADEMIC, "10.1609_aaai.v38i16.29728").len() as u32,
             result.chunks_indexed
         );
         assert_eq!(
@@ -737,66 +748,104 @@ mod tests {
         }
     }
 
-    // ── RA-26: collection allow-list ───────────────────────────────────
+    // ── RA-26: only the registry's document stores are served ──────────
 
     #[tokio::test]
-    async fn only_configured_collections_resolve() {
+    async fn only_the_stores_that_hold_documents_resolve() {
         let h = harness().await;
-        assert_eq!(h.state.resolve_collection(None).unwrap(), "academic_papers");
-        for name in ["academic_papers", "paper_abstracts", "personal_docs"] {
-            assert_eq!(h.state.resolve_collection(Some(name)).unwrap(), name);
+        for name in [ACADEMIC, REFERENCES, ABSTRACTS, PERSONAL, WEB, SYNTHESES] {
+            assert_eq!(h.state.resolve_store(Some(name)).unwrap().name, name);
         }
         for name in [
             "other",
             "",
-            "academic_papers ",
-            "ACADEMIC_PAPERS",
+            "academic ",
+            "ACADEMIC",
+            // A myelin tenant is not a store name.
+            "academic_papers",
             "../x",
             "x'; drop",
+            // Statements an agent wrote, not documents.
+            MEMORY,
         ] {
-            let e = h.state.resolve_collection(Some(name)).expect_err(name);
+            let e = h.state.resolve_store(Some(name)).expect_err(name);
             assert_eq!(e.kind, ErrorKind::BadRequest, "{name:?}");
-            assert!(e.message.contains("distill_server.collections"), "{e}");
+            assert!(e.message.contains("this server serves:"), "{e}");
+            assert!(e.message.contains(PERSONAL), "{e}");
         }
+        let e = h.state.resolve_store(None).expect_err("no store named");
+        assert_eq!(e.kind, ErrorKind::BadRequest);
+        assert!(e.message.contains("`store` is required"), "{e}");
     }
 
     #[tokio::test]
-    async fn every_operation_rejects_an_unknown_collection_without_touching_the_store() {
+    async fn every_store_of_the_registry_is_defined_and_a_refusal_is_an_error() {
         let h = harness().await;
-        let c = Some("not_configured");
+        h.state.define_stores().await.unwrap();
+        let mut defined: Vec<(&str, &str)> = h
+            .store
+            .state
+            .lock()
+            .defined
+            .iter()
+            .map(|spec| (spec.name, spec.tenant))
+            .collect();
+        defined.sort_unstable();
+        assert_eq!(
+            defined,
+            [
+                (ABSTRACTS, "paper_abstracts"),
+                (ACADEMIC, "academic_papers"),
+                (MEMORY, "user_memory"),
+                (PERSONAL, "personal_docs"),
+                (REFERENCES, "academic_references"),
+                (SYNTHESES, "syntheses"),
+                (WEB, "web_pages"),
+            ]
+        );
 
-        assert_eq!(
-            kind(h.state.prepare_index(index_req(Some("a.md"), Some("x"), c))),
-            ErrorKind::BadRequest
+        h.store.state.lock().fail_define = true;
+        let e = h.state.define_stores().await.expect_err("refused");
+        assert_eq!(e.kind, ErrorKind::Unavailable);
+        assert!(
+            e.message.contains("cannot define store") && e.message.contains("define refused"),
+            "{e}"
         );
-        assert_eq!(
-            kind(
-                h.state
-                    .search(SearchRequest {
-                        collection: c.map(str::to_string),
-                        ..search_req("q", None, None)
-                    })
-                    .await
-            ),
-            ErrorKind::BadRequest
-        );
-        assert_eq!(kind(h.state.status(c).await), ErrorKind::BadRequest);
-        assert_eq!(
-            kind(h.state.doc_exists("d", c).await),
-            ErrorKind::BadRequest
-        );
-        assert_eq!(
-            kind(h.state.delete_doc("d", c).await),
-            ErrorKind::BadRequest
-        );
-        assert_eq!(
-            kind(h.state.list_docs(None, c).await),
-            ErrorKind::BadRequest
-        );
-        assert_eq!(
-            kind(h.state.reset_collection(c).await),
-            ErrorKind::BadRequest
-        );
+    }
+
+    #[tokio::test]
+    async fn every_operation_rejects_an_unserved_store_without_touching_the_store() {
+        let h = harness().await;
+
+        for c in [Some("not_a_store"), Some(MEMORY), None] {
+            assert_eq!(
+                kind(h.state.prepare_index(index_req(Some("a.md"), Some("x"), c))),
+                ErrorKind::BadRequest,
+                "{c:?}"
+            );
+            assert_eq!(kind(h.state.status(c).await), ErrorKind::BadRequest);
+            assert_eq!(
+                kind(h.state.doc_exists("d", c).await),
+                ErrorKind::BadRequest
+            );
+            assert_eq!(
+                kind(h.state.delete_doc("d", c).await),
+                ErrorKind::BadRequest
+            );
+            assert_eq!(
+                kind(h.state.list_docs(None, c).await),
+                ErrorKind::BadRequest
+            );
+            assert_eq!(kind(h.state.reset_store(c).await), ErrorKind::BadRequest);
+        }
+        for name in ["not_a_store", MEMORY] {
+            // One bad name refuses the whole search, not just its share.
+            assert_eq!(
+                kind(h.state.search(search_in(&[ACADEMIC, name])).await),
+                ErrorKind::BadRequest,
+                "{name}"
+            );
+        }
 
         assert_eq!(h.store.ops(), [], "nothing may be written or deleted");
         assert!(h.store.state.lock().searches.is_empty());
@@ -804,34 +853,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_deletes_only_the_documents_of_the_named_configured_collection() {
+    async fn a_reference_store_is_read_but_takes_and_loses_no_documents_of_its_own() {
         let h = harness().await;
-        h.store.seed("academic_papers", "a", 3);
-        h.store.seed("paper_abstracts", "a", 1);
-        h.store.seed("paper_abstracts", "b", 2);
-        let (name, deleted) = h
-            .state
-            .reset_collection(Some("paper_abstracts"))
-            .await
-            .unwrap();
-        assert_eq!((name.as_str(), deleted), ("paper_abstracts", 3));
-        assert_eq!(h.store.stored("academic_papers", "a").len(), 3);
-        assert!(h.store.stored("paper_abstracts", "a").is_empty());
+        h.store.seed(REFERENCES, "d", 2);
+        let c = Some(REFERENCES);
+
+        for err in [
+            refusal(h.state.prepare_index(index_req(Some("d.md"), Some("x"), c))),
+            refusal(h.state.delete_doc("d", c).await),
+            refusal(h.state.reset_store(c).await),
+        ] {
+            assert_eq!(err.kind, ErrorKind::BadRequest, "{err}");
+            assert!(err.message.contains("no documents of its own"), "{err}");
+        }
+        assert_eq!(h.store.ops(), [], "nothing may be written or deleted");
+
+        assert_eq!(h.state.doc_exists("d", c).await.unwrap(), (true, 2));
+        assert_eq!(h.state.list_docs(None, c).await.unwrap().doc_ids, ["d"]);
+        let status = h.state.status(c).await.unwrap();
+        assert_eq!((status.points_count, status.documents_count), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn reset_deletes_the_documents_of_the_named_store_and_their_reference_lists() {
+        let h = harness().await;
+        h.store.seed(ACADEMIC, "a", 3);
+        h.store.seed(REFERENCES, "a", 2);
+        h.store.seed(ABSTRACTS, "a", 1);
+        h.store.seed(PERSONAL, "p", 4);
+
+        let (name, deleted) = h.state.reset_store(IN_ACADEMIC).await.unwrap();
+        assert_eq!((name, deleted), (ACADEMIC, 5));
+        assert!(h.store.stored(ACADEMIC, "a").is_empty());
+        assert!(h.store.stored(REFERENCES, "a").is_empty());
+        assert_eq!(h.store.stored(ABSTRACTS, "a").len(), 1);
+        assert_eq!(h.store.stored(PERSONAL, "p").len(), 4);
         assert_eq!(
             h.store.ops(),
             [
                 Op::Forget {
-                    collection: "paper_abstracts".into(),
+                    store: ACADEMIC.into(),
                     doc_id: "a".into(),
                     keep: vec![]
                 },
                 Op::Forget {
-                    collection: "paper_abstracts".into(),
-                    doc_id: "b".into(),
+                    store: REFERENCES.into(),
+                    doc_id: "a".into(),
                     keep: vec![]
                 },
             ]
         );
+
+        let (name, deleted) = h.state.reset_store(Some(ABSTRACTS)).await.unwrap();
+        assert_eq!((name, deleted), (ABSTRACTS, 1));
+        assert_eq!(h.store.stored(PERSONAL, "p").len(), 4);
     }
 
     // ── RA-89: search and listing limits ───────────────────────────────
@@ -911,7 +986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_forwards_the_query_the_collection_and_the_parsed_filters() {
+    async fn search_forwards_the_query_the_stores_and_the_parsed_filters() {
         let h = harness().await;
         let filters = SearchFilters {
             year: Some(">=2020".into()),
@@ -919,21 +994,48 @@ mod tests {
             category: None,
         };
         h.state
-            .search(search_req("find me", Some(5), Some(filters)))
+            .search(SearchRequest {
+                stores: vec![PERSONAL.into()],
+                ..search_req("find me", Some(5), Some(filters))
+            })
             .await
             .unwrap();
         let st = h.store.state.lock();
-        let (collection, query, limit, filter) = &st.searches[0];
-        assert_eq!(
-            (collection.as_str(), query.as_str(), *limit),
-            ("academic_papers", "find me", 5)
-        );
+        let (stores, query, limit, filter) = &st.searches[0];
+        assert_eq!(*stores, [PERSONAL]);
+        assert_eq!((query.as_str(), *limit), ("find me", 5));
         assert_eq!(filter.year, Some(crate::store::YearFilter::Gte(2020)));
         assert_eq!(filter.topic.as_deref(), Some("autism"));
     }
 
+    #[tokio::test]
+    async fn a_search_that_names_no_store_reads_the_default_ones() {
+        // The papers are read by default. Their reference lists are kept
+        // in a store of their own so that a default search does NOT read
+        // them.
+        let h = harness().await;
+        h.state.search(search_req("q", None, None)).await.unwrap();
+        let st = h.store.state.lock();
+        let stores = &st.searches[0].0;
+        assert!(stores.iter().any(|s| s == ACADEMIC), "{stores:?}");
+        for never in [REFERENCES, MEMORY] {
+            assert!(!stores.iter().any(|s| s == never), "{stores:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_search_reads_each_named_store_once_in_the_order_named() {
+        let h = harness().await;
+        h.state
+            .search(search_in(&[REFERENCES, ACADEMIC, REFERENCES]))
+            .await
+            .unwrap();
+        assert_eq!(h.store.state.lock().searches[0].0, [REFERENCES, ACADEMIC]);
+    }
+
     fn hit(doc_id: &str, text: &str) -> SearchHit {
         SearchHit {
+            store: ACADEMIC.into(),
             doc_id: doc_id.into(),
             title: None,
             authors: vec![],
@@ -941,7 +1043,6 @@ mod tests {
             doi: None,
             chunk_text: text.into(),
             score: 0.0,
-            pdf_path: None,
             line_start: 0,
             line_end: 0,
             page: None,
@@ -949,256 +1050,45 @@ mod tests {
         }
     }
 
-    async fn search_ids(h: &Harness, hits: Vec<SearchHit>, limit: u64) -> Vec<String> {
-        h.store.state.lock().canned_hits = hits;
-        h.state
-            .search(search_req("q", Some(limit), None))
+    #[tokio::test]
+    async fn hits_are_returned_in_the_order_the_store_ranked_them() {
+        // Ranking is the store's: the server adds no ordering of its own,
+        // whatever a hit's text looks like.
+        let h = harness().await;
+        h.store.state.lock().canned_hits = vec![
+            hit("references", BIBLIOGRAPHY),
+            hit("prose", "The hippocampus generates new neurons."),
+        ];
+        let ids: Vec<String> = h
+            .state
+            .search(search_req("q", Some(10), None))
             .await
             .unwrap()
             .into_iter()
             .map(|x| x.doc_id)
-            .collect()
-    }
-
-    // ── reference-list demotion ────────────────────────────────────
-
-    /// A chunk that is a list of citations.
-    fn bibliography_chunk(doc_id: &str) -> SearchHit {
-        hit(
-            doc_id,
-            "Berkenbosch F, van Vant J, Aubert A, et al. (2001) Neurotrophins and the brain. \
-             Nature Reviews Neuroscience.\n\
-             van Vant J, Jonkman T, Caligor L (2004) Neurobiology of learning and memory. \
-             Journal of Neurochemistry, vol. 104, pp. 12-19.",
-        )
-    }
-
-    #[tokio::test]
-    async fn a_reference_list_is_demoted_below_prose_that_outranks_it() {
-        // A bibliography entry matches a topic query because a citation to
-        // work about the topic *is* about the topic. When prose outranks
-        // it, the passage that discusses the topic must come first.
-        let h = harness().await;
-        let ids = search_ids(
-            &h,
-            vec![
-                hit(
-                    "prose",
-                    "The hippocampus generates new neurons throughout adulthood.",
-                ),
-                bibliography_chunk("references"),
-            ],
-            10,
-        )
-        .await;
-        assert_eq!(ids, ["prose", "references"]);
-    }
-
-    #[tokio::test]
-    async fn a_demoted_reference_list_is_still_returned_with_its_score() {
-        // A user asking for a paper's bibliography wants it: the chunk is
-        // demoted, not dropped.
-        let h = harness().await;
-        let mut references = bibliography_chunk("references");
-        references.score = 0.42;
-        h.store.state.lock().canned_hits = vec![
-            references,
-            hit(
-                "prose",
-                "The hippocampus generates new neurons throughout adulthood.",
-            ),
-        ];
-        let hits = h
-            .state
-            .search(search_req("hippocampus neurogenesis", Some(10), None))
-            .await
-            .unwrap();
-        assert_eq!(hits.len(), 2, "the reference list was dropped, not demoted");
-        assert_eq!(hits[1].doc_id, "references");
-        assert!(
-            (hits[1].score - 0.42).abs() < 1e-6,
-            "the demoted hit lost its score"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_mixed_chunk_is_not_demoted() {
-        // A chunk that cites a work and then discusses it is useful, and
-        // must not be treated as a reference list.
-        let h = harness().await;
-        let ids =
-            search_ids(
-                &h,
-                vec![
-                hit(
-                    "mixed",
-                    "Neurogenesis was first reported by Altman (1962) in rodents, and the rate of \
-                     new neuron production in the adult hippocampus remains contested to this day.",
-                ),
-                hit("other", "Something else entirely about a different subject."),
-            ],
-                10,
-            )
-            .await;
-        assert_eq!(ids[0], "mixed", "a mixed chunk was demoted");
-    }
-
-    #[tokio::test]
-    async fn the_demotion_does_not_change_the_number_of_results() {
-        let h = harness().await;
-        let ids = search_ids(
-            &h,
-            (0..4)
-                .map(|i| bibliography_chunk(&format!("refs{i}")))
-                .collect(),
-            10,
-        )
-        .await;
-        assert_eq!(ids.len(), 4, "results were dropped");
-    }
-
-    #[tokio::test]
-    async fn a_small_limit_still_demotes_a_reference_list() {
-        let h = harness().await;
-        let ids = search_ids(
-            &h,
-            vec![
-                bibliography_chunk("references"),
-                hit(
-                    "prose-1",
-                    "The split brain was studied by Sperry and Gazzaniga.",
-                ),
-                hit(
-                    "prose-2",
-                    "A second prose passage about hemispheric specialization.",
-                ),
-            ],
-            3,
-        )
-        .await;
-        assert_eq!(ids[0], "prose-1", "the prose did not come first: {ids:?}");
-        assert!(
-            ids.contains(&"references".to_string()),
-            "the reference list was dropped, not demoted: {ids:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_reference_list_leads_only_when_there_is_no_prose() {
-        // Sometimes the only chunk in the corpus that mentions the term
-        // IS a reference list; with nothing else to show, it is the answer
-        // and keeps its place.
-        let h = harness().await;
-        let ids = search_ids(&h, vec![bibliography_chunk("references")], 3).await;
-        assert_eq!(ids[0], "references");
-    }
-
-    #[tokio::test]
-    async fn prose_leads_even_when_a_reference_list_outranks_it() {
-        let h = harness().await;
-        let ids = search_ids(
-            &h,
-            vec![
-                bibliography_chunk("references"),
-                hit("prose", "Something about the subject matter."),
-            ],
-            3,
-        )
-        .await;
-        assert_eq!(ids[0], "prose");
-    }
-
-    #[tokio::test]
-    async fn a_bibliography_in_a_bare_year_style_is_demoted_below_prose() {
-        // The year is not in parentheses. Measured 2026-10-21, this shape
-        // was the first hit for 6 of the 25 fixed queries.
-        let h = harness().await;
-        let ids = search_ids(
-            &h,
-            vec![
-                hit(
-                    "bibliography",
-                    "Sundralingham, P. 1983 Responses of potted seedlings of Dryobalanops \
-                     aromatica to shading. Malaysian Forester.\n\
-                     Tanner, E. V. J., Vitousek, P. M. & Cuevas, E. 1998 Experimental \
-                     investigation of nutrient limitation. Ecology 79:744-52.\n\
-                     Trenberth, K. E. 1997 The definition of El Nino. Bull. Am. Meteorol. Soc.",
-                ),
-                hit("prose", "Something about the subject matter."),
-            ],
-            3,
-        )
-        .await;
-        assert_eq!(ids[0], "prose");
-    }
-
-    #[tokio::test]
-    async fn a_bibliography_in_a_numbered_style_is_demoted_below_prose() {
-        let h = harness().await;
-        let ids = search_ids(
-            &h,
-            vec![
-                hit(
-                    "bibliography",
-                    "59. Ferguson JN, Aldag JM, Insel TR, Young LJ. Oxytocin in the medial \
-                     amygdala is essential for social recognition. J Neurosci 2009.\n\
-                     71. Melis MR, Succu S, Mascia MS, Cortis L, Argiolas A. Extra-cellular \
-                     dopamine increases in the paraventricular nucleus. Neurosci Lett 2003.\n\
-                     72. Waldherr M, Neumann ID. Centrally released oxytocin mediates mating-induced \
-                     anxiolysis in male rats. Proc Natl Acad Sci 2007.",
-                ),
-                hit("prose", "Something about the subject matter."),
-            ],
-            3,
-        )
-        .await;
-        assert_eq!(ids[0], "prose");
-    }
-
-    #[tokio::test]
-    async fn a_numbered_prose_paragraph_is_not_demoted() {
-        // "22. The idea of the series is, in itself, important …" is a
-        // numbered footnote, not a bibliography.
-        let h = harness().await;
-        let ids = search_ids(
-            &h,
-            vec![hit(
-                "prose",
-                "22. The idea of the series is, in itself, important to Eisenman's early \
-                 development. Sandra Kaji-O'Gorman explores the relationship in detail.\n\
-                 19. Eisenman is in an interesting tension with Bergson here, as he often was \
-                 in his writings about the nature of form.",
-            )],
-            3,
-        )
-        .await;
-        assert_eq!(ids[0], "prose");
+            .collect();
+        assert_eq!(ids, ["references", "prose"]);
     }
 
     #[tokio::test]
     async fn list_docs_limit_is_bounded_and_never_silently_truncated() {
         let h = harness().await;
         for d in ["a", "b", "c"] {
-            h.store.seed("academic_papers", d, 1);
+            h.store.seed(ACADEMIC, d, 1);
         }
-        assert_eq!(
-            kind(h.state.list_docs(Some(MAX_DOC_LIST_LIMIT + 1), None).await),
-            ErrorKind::BadRequest
-        );
-        assert_eq!(
-            kind(h.state.list_docs(Some(u64::MAX), None).await),
-            ErrorKind::BadRequest
-        );
-        assert_eq!(
-            kind(h.state.list_docs(Some(0), None).await),
-            ErrorKind::BadRequest
-        );
+        for refused in [MAX_DOC_LIST_LIMIT + 1, u64::MAX, 0] {
+            assert_eq!(
+                kind(h.state.list_docs(Some(refused), IN_ACADEMIC).await),
+                ErrorKind::BadRequest,
+                "{refused}"
+            );
+        }
 
-        let all = h.state.list_docs(None, None).await.unwrap();
+        let all = h.state.list_docs(None, IN_ACADEMIC).await.unwrap();
         assert_eq!(all.doc_ids, ["a", "b", "c"]);
         assert!(!all.truncated);
 
-        let some = h.state.list_docs(Some(2), None).await.unwrap();
+        let some = h.state.list_docs(Some(2), IN_ACADEMIC).await.unwrap();
         assert_eq!(some.doc_ids.len(), 2);
         assert!(
             some.truncated,
@@ -1211,22 +1101,59 @@ mod tests {
     #[tokio::test]
     async fn status_counts_chunks_and_documents() {
         let h = harness().await;
-        h.store.seed("academic_papers", "a", 3);
-        h.store.seed("academic_papers", "b", 2);
-        h.store.seed("paper_abstracts", "c", 7);
-        let s = h.state.status(None).await.unwrap();
+        h.store.seed(ACADEMIC, "a", 3);
+        h.store.seed(ACADEMIC, "b", 2);
+        h.store.seed(ABSTRACTS, "c", 7);
+        let s = h.state.status(IN_ACADEMIC).await.unwrap();
         assert_eq!((s.points_count, s.documents_count), (5, 2));
         assert!(!s.documents_count_truncated);
         assert_eq!(s.embed_model, "bge-m3:latest");
         assert_eq!(s.compute_device, "cuda");
-        assert_eq!(s.collection, "academic_papers");
+        assert_eq!(s.store, ACADEMIC);
+    }
+
+    #[tokio::test]
+    async fn a_documents_chunks_are_counted_with_its_reference_lists() {
+        // A caller that compares a document's chunk count with what an
+        // index reported must see the same number, wherever the chunks
+        // were filed.
+        let h = harness().await;
+        h.store.seed(ACADEMIC, "a", 3);
+        h.store.seed(REFERENCES, "a", 2);
+        h.store.seed(REFERENCES, "only_references", 1);
+        h.store.seed(ABSTRACTS, "a", 1);
+
+        let s = h.state.status(IN_ACADEMIC).await.unwrap();
+        assert_eq!((s.points_count, s.documents_count), (6, 2));
+        assert_eq!(
+            h.state.doc_exists("a", IN_ACADEMIC).await.unwrap(),
+            (true, 5)
+        );
+        assert_eq!(
+            h.state
+                .doc_exists("only_references", IN_ACADEMIC)
+                .await
+                .unwrap(),
+            (true, 1)
+        );
+        assert_eq!(
+            h.state.list_docs(None, IN_ACADEMIC).await.unwrap().doc_ids,
+            ["a", "only_references"]
+        );
+
+        // A store with no reference store counts only itself.
+        let s = h.state.status(Some(ABSTRACTS)).await.unwrap();
+        assert_eq!((s.points_count, s.documents_count), (1, 1));
     }
 
     #[tokio::test]
     async fn status_reports_a_cpu_embedder_rather_than_hiding_it() {
         let h = harness().await;
         *h.ollama.mode.lock() = OllamaMode::Cpu;
-        assert_eq!(h.state.status(None).await.unwrap().compute_device, "cpu");
+        assert_eq!(
+            h.state.status(IN_ACADEMIC).await.unwrap().compute_device,
+            "cpu"
+        );
     }
 
     #[tokio::test]
@@ -1309,7 +1236,7 @@ mod tests {
         assert!(!err.contains("refused"), "{err}");
         h.store.state.lock().down = false;
 
-        let status = h.state.status(None).await.unwrap();
+        let status = h.state.status(IN_ACADEMIC).await.unwrap();
         assert_eq!(status.myelin_url, h.state.config.myelin_url);
     }
 
@@ -1347,7 +1274,7 @@ mod tests {
         h.store.state.lock().fail_write_from_call = Some(0);
         let job = h
             .state
-            .prepare_index(index_req(Some("d.md"), Some(&prose(6)), None))
+            .prepare_index(index_req(Some("d.md"), Some(&prose(6)), IN_ACADEMIC))
             .unwrap();
         assert_eq!(
             kind(h.state.run_index(job, |_| {}).await),
@@ -1362,7 +1289,7 @@ mod tests {
             *h.ollama.mode.lock() = mode;
             let job = h
                 .state
-                .prepare_index(index_req(Some("d.md"), Some(&prose(6)), None))
+                .prepare_index(index_req(Some("d.md"), Some(&prose(6)), IN_ACADEMIC))
                 .unwrap();
             assert_eq!(
                 kind(h.state.run_index(job, |_| {}).await),
@@ -1374,24 +1301,91 @@ mod tests {
         assert_eq!(h.state.in_flight.load(Ordering::Relaxed), 0);
     }
 
+    // ── reference lists ────────────────────────────────────────────────
+
+    /// Three pages, one chunk each: prose, a reference list, prose.
+    fn paper_with_a_reference_list() -> String {
+        let page = prose(3);
+        format!("{page}{PAGE_SEPARATOR}{BIBLIOGRAPHY}{PAGE_SEPARATOR}{page}")
+    }
+
+    async fn index_paper_into(h: &Harness, store: &str) -> u32 {
+        let job = h
+            .state
+            .prepare_index(index_req(
+                Some("d.md"),
+                Some(&paper_with_a_reference_list()),
+                Some(store),
+            ))
+            .unwrap();
+        h.state.run_index(job, |_| {}).await.unwrap().chunks_indexed
+    }
+
+    #[tokio::test]
+    async fn a_papers_reference_list_is_filed_in_the_reference_store() {
+        let h = harness().await;
+        assert_eq!(index_paper_into(&h, ACADEMIC).await, 3);
+        assert_eq!(h.store.stored(ACADEMIC, "d"), [0, 2]);
+        assert_eq!(h.store.stored(REFERENCES, "d"), [1]);
+        assert_eq!(
+            h.state.doc_exists("d", IN_ACADEMIC).await.unwrap(),
+            (true, 3),
+            "the document's chunk count must match what indexing reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_without_a_reference_store_keeps_every_chunk() {
+        let h = harness().await;
+        assert_eq!(index_paper_into(&h, PERSONAL).await, 3);
+        assert_eq!(h.store.stored(PERSONAL, "d"), [0, 1, 2]);
+        assert!(h.store.stored(REFERENCES, "d").is_empty());
+    }
+
     // ── per-document operations ────────────────────────────────────────
 
     #[tokio::test]
     async fn delete_reports_how_many_chunks_existed_and_removes_them() {
         let h = harness().await;
-        h.store.seed("academic_papers", "d", 4);
-        assert_eq!(h.state.delete_doc("d", None).await.unwrap(), 4);
-        assert!(h.store.stored("academic_papers", "d").is_empty());
-        assert_eq!(h.state.delete_doc("d", None).await.unwrap(), 0);
-        assert_eq!(h.state.doc_exists("d", None).await.unwrap(), (false, 0));
+        h.store.seed(ACADEMIC, "d", 4);
+        assert_eq!(h.state.delete_doc("d", IN_ACADEMIC).await.unwrap(), 4);
+        assert!(h.store.stored(ACADEMIC, "d").is_empty());
+        assert_eq!(h.state.delete_doc("d", IN_ACADEMIC).await.unwrap(), 0);
+        assert_eq!(
+            h.state.doc_exists("d", IN_ACADEMIC).await.unwrap(),
+            (false, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_document_deletes_its_reference_lists_and_leaves_its_abstract() {
+        // The abstract is written from the catalog and stamped there; it
+        // is deleted by the caller that deletes the catalog row.
+        let h = harness().await;
+        h.store.seed(ACADEMIC, "d", 4);
+        h.store.seed(REFERENCES, "d", 2);
+        h.store.seed(ABSTRACTS, "d", 1);
+        h.store.seed(REFERENCES, "other", 3);
+
+        assert_eq!(h.state.delete_doc("d", IN_ACADEMIC).await.unwrap(), 6);
+        assert!(h.store.stored(ACADEMIC, "d").is_empty());
+        assert!(h.store.stored(REFERENCES, "d").is_empty());
+        assert_eq!(h.store.stored(ABSTRACTS, "d").len(), 1);
+        assert_eq!(h.store.stored(REFERENCES, "other").len(), 3);
+
+        assert_eq!(h.state.delete_doc("d", Some(ABSTRACTS)).await.unwrap(), 1);
+        assert!(h.store.stored(ABSTRACTS, "d").is_empty());
     }
 
     #[tokio::test]
     async fn doc_exists_counts_the_documents_own_chunks() {
         let h = harness().await;
-        h.store.seed("academic_papers", "d", 4);
-        h.store.seed("academic_papers", "other", 9);
-        assert_eq!(h.state.doc_exists("d", None).await.unwrap(), (true, 4));
+        h.store.seed(ACADEMIC, "d", 4);
+        h.store.seed(ACADEMIC, "other", 9);
+        assert_eq!(
+            h.state.doc_exists("d", IN_ACADEMIC).await.unwrap(),
+            (true, 4)
+        );
     }
 
     #[tokio::test]
@@ -1399,12 +1393,12 @@ mod tests {
         let h = harness().await;
         for bad in ["..", ".", "a/b", "a\\b"] {
             assert_eq!(
-                kind(h.state.doc_exists(bad, None).await),
+                kind(h.state.doc_exists(bad, IN_ACADEMIC).await),
                 ErrorKind::BadRequest,
                 "{bad:?}"
             );
             assert_eq!(
-                kind(h.state.delete_doc(bad, None).await),
+                kind(h.state.delete_doc(bad, IN_ACADEMIC).await),
                 ErrorKind::BadRequest,
                 "{bad:?}"
             );
@@ -1418,7 +1412,7 @@ mod tests {
         h.store.state.lock().panic_on_write = true;
         let job = h
             .state
-            .prepare_index(index_req(Some("d.md"), Some(&prose(6)), None))
+            .prepare_index(index_req(Some("d.md"), Some(&prose(6)), IN_ACADEMIC))
             .unwrap();
         let err = h.state.run_index(job, |_| {}).await.expect_err("must fail");
         assert_eq!(err.kind, ErrorKind::Panicked);

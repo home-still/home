@@ -133,8 +133,20 @@ pub async fn dispatch(
             limit,
             year,
             topic,
+            stores,
             server,
-        } => cmd_search(&query, limit, year, topic, server.as_deref(), global).await,
+        } => {
+            cmd_search(
+                &query,
+                limit,
+                year,
+                topic,
+                &stores,
+                server.as_deref(),
+                global,
+            )
+            .await
+        }
         DistillCmd::Status { server } => cmd_status(server.as_deref(), reporter).await,
         DistillCmd::WatchEvents { server } => cmd_watch_events(server, reporter).await,
         DistillCmd::Diagnose { stem, verbose } => cmd_diagnose(&stem, verbose, reporter).await,
@@ -163,11 +175,24 @@ async fn cmd_purge(doc_id: &str, server: Option<&str>, reporter: &Arc<dyn Report
     let client = make_distill_client(&servers[0]).await?;
     reporter.status("Purging", doc_id);
     let deleted = client
-        .delete_doc(doc_id)
+        .delete_doc(hs_common::stores::ACADEMIC, doc_id)
         .await
         .with_context(|| format!("delete_doc({doc_id})"))?;
     reporter.finish(&format!("Deleted {deleted} chunk(s) for {doc_id}"));
     Ok(())
+}
+
+/// Delete a paper from every store that holds part of it: its chunks (the
+/// server deletes its reference lists with them) and its abstract. For
+/// callers that delete the paper's catalog row as well: the row carries the
+/// abstract's stamp, so an abstract left behind would be a search hit that
+/// nothing accounts for. Returns the number of records deleted.
+pub(crate) async fn delete_paper_everywhere(client: &DistillClient, stem: &str) -> Result<u64> {
+    let chunks = client.delete_doc(hs_common::stores::ACADEMIC, stem).await?;
+    let abstracts = client
+        .delete_doc(hs_common::stores::ABSTRACTS, stem)
+        .await?;
+    Ok(chunks + abstracts)
 }
 
 /// Open the local OpenAlex DuckDB read-only using the path from
@@ -241,7 +266,6 @@ async fn build_abstract_row(
 ) -> Result<AbstractRow> {
     use hs_distill::abstracts::{build_embed_input, coalesce_abstract};
 
-    const COLLECTION: &str = "paper_abstracts";
     const CATALOG_PREFIX: &str = "catalog";
 
     // 1. OpenAlex DOI lookup. The catalog only has metadata that was
@@ -310,7 +334,12 @@ async fn build_abstract_row(
     //    so the doc_id resolves to the catalog stem.
     let path_hint = format!("{stem}.md");
     let result = client
-        .index_content_in(&path_hint, &embed_input, Some(entry), Some(COLLECTION))
+        .index_content(
+            hs_common::stores::ABSTRACTS,
+            &path_hint,
+            &embed_input,
+            Some(entry),
+        )
         .await
         .context("embed abstract")?;
     if result.chunks_indexed == 0 {
@@ -332,11 +361,11 @@ async fn build_abstract_row(
     Ok(AbstractRow::Indexed(coalesced.source))
 }
 
-/// Build the `paper_abstracts` collection from every catalog entry.
+/// Build the `abstracts` store from every catalog entry.
 ///
 /// Per the abstracts plan: coalesce (OpenAlex DuckDB, then the catalog's
 /// provider abstract, then markdown `## Abstract`), embed `title + abstract` via the
-/// existing /distill route targeting `collection_name="paper_abstracts"`,
+/// existing /distill route naming the `abstracts` store,
 /// then stamp the catalog so reconcile runs are idempotent. Rows that fail
 /// are counted and listed, the run continues, and the command exits non-zero.
 async fn cmd_abstracts_build(
@@ -418,7 +447,7 @@ async fn cmd_abstracts_build(
     Ok(())
 }
 
-/// Report `paper_abstracts` coverage from catalog stamps. Does not touch
+/// Report `abstracts` coverage from catalog stamps. Does not touch
 /// the store — pure catalog-walk so it's safe to run while distill is busy.
 async fn cmd_abstracts_status(reporter: &Arc<dyn Reporter>) -> Result<()> {
     const CATALOG_PREFIX: &str = "catalog";
@@ -741,16 +770,16 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
         }
     }
 
-    // Collection info (if server is reachable)
-    match client.status().await {
+    // Store info (if server is reachable)
+    match client.status(hs_common::stores::ACADEMIC).await {
         Ok(status) => {
-            reporter.status("Collection", &status.collection);
+            reporter.status("Store", &status.store);
             reporter.status("Chunks", &status.points_count.to_string());
             reporter.status("Device", &status.compute_device);
         }
         Err(e) => {
             reporter.status(
-                "Collection",
+                "Store",
                 &format!(
                     "unavailable (server at {} not reachable: {e:#})",
                     servers[0]
@@ -1108,7 +1137,7 @@ async fn cmd_index_daemon(
         // Skip if already indexed (unless --force). A failed probe is a
         // failure of this file, not "not indexed".
         if !force {
-            match client.doc_exists(stem).await {
+            match client.doc_exists(hs_common::stores::ACADEMIC, stem).await {
                 Ok(true) => {
                     status.indexed += 1;
                     write_index_status(&status);
@@ -1124,7 +1153,10 @@ async fn cmd_index_daemon(
             }
         }
 
-        match client.index_file_with_progress(&path_str, |_| {}).await {
+        match client
+            .index_file_with_progress(hs_common::stores::ACADEMIC, &path_str, |_| {})
+            .await
+        {
             Ok(result) => {
                 status.total_chunks += result.chunks_indexed;
                 // Indexed only once the stamp is written: a vector without
@@ -1177,6 +1209,7 @@ async fn cmd_search(
     limit: u64,
     year: Option<String>,
     topic: Option<String>,
+    stores: &[String],
     server: Option<&str>,
     global: &GlobalArgs,
 ) -> Result<()> {
@@ -1192,8 +1225,10 @@ async fn cmd_search(
         topic,
         category: None,
     };
+    // No store named: the server searches its default stores.
+    let stores: Vec<&str> = stores.iter().map(String::as_str).collect();
     let hits = client
-        .search(query, limit, filters)
+        .search(&stores, query, limit, filters)
         .await
         .context(format!("Is hs-distill-server running at {}?", servers[0]))?;
 
@@ -1226,8 +1261,6 @@ async fn cmd_search(
                     .page
                     .map(|p| format!(" (page {})", p))
                     .unwrap_or_default();
-                let pdf = hit.pdf_path.as_deref().unwrap_or("?");
-
                 println!(
                     "\n{}. {}{} [score: {:.3}]{}",
                     i + 1,
@@ -1237,10 +1270,9 @@ async fn cmd_search(
                     year_str
                 );
                 println!(
-                    "   {}:{}-{}{}",
-                    hit.doc_id, hit.line_start, hit.line_end, page_info
+                    "   {} {}:{}-{}{}",
+                    hit.store, hit.doc_id, hit.line_start, hit.line_end, page_info
                 );
-                println!("   PDF: {pdf}");
 
                 let preview: String = hit.chunk_text.chars().take(200).collect();
                 println!("   {preview}...");
@@ -1296,7 +1328,6 @@ async fn cmd_diagnose(stem: &str, verbose: bool, reporter: &Arc<dyn Reporter>) -
     let doc_meta = DocumentMeta {
         doc_id: stem.to_string(),
         title: Some(title),
-        markdown_path: format!("markdown/{stem}.md"),
         ..Default::default()
     };
     let chunker_config = ChunkerConfig {
@@ -1426,9 +1457,9 @@ async fn cmd_reconcile(
     reporter.status("Markdown", &format!("{} stems", markdown_stems.len()));
 
     reporter.status("Scan", "fetching indexed doc_ids from the store");
-    // `list_docs` returns every distinct doc_id of the collection. 500k is well above our expected corpus size for years.
+    // `list_docs` returns every distinct doc_id of the store. 500k is well above our expected corpus size for years.
     let indexed: HashSet<String> = distill
-        .list_docs(500_000)
+        .list_docs(hs_common::stores::ACADEMIC, 500_000)
         .await
         .context("listing indexed doc_ids")?
         .into_iter()
@@ -1523,7 +1554,7 @@ async fn cmd_reconcile(
             if i.is_multiple_of(25) && i > 0 {
                 reporter.status("Progress", &format!("{i}/{} stamped", stamp_missing.len()));
             }
-            let chunks = match distill.doc_chunks(stem).await {
+            let chunks = match distill.doc_chunks(hs_common::stores::ACADEMIC, stem).await {
                 Ok((true, n)) => n as u32,
                 Ok((false, _)) => {
                     // Doc vanished between list_docs and doc_chunks — rare
@@ -1601,7 +1632,12 @@ async fn cmd_reconcile(
                 .and_then(|e| e.markdown_path.clone())
                 .unwrap_or_else(|| format!("markdown/{}", hs_common::sharded_key(stem, "md")));
             match distill
-                .index_from_storage_with_catalog(&*storage, &md_key, catalog_entry.as_ref())
+                .index_from_storage_with_catalog(
+                    hs_common::stores::ACADEMIC,
+                    &*storage,
+                    &md_key,
+                    catalog_entry.as_ref(),
+                )
                 .await
             {
                 Ok(result) => {
@@ -1999,7 +2035,7 @@ mod status_tests {
     }
 
     /// A server that answers `/health` with the given body and `/status`
-    /// with the collection's numbers.
+    /// with the academic store's numbers.
     async fn live_server(pid: u32) -> FakeServer {
         FakeServer::start(move |req| match req.path.as_str() {
             "/health" => Response::json(
@@ -2007,17 +2043,16 @@ mod status_tests {
                 &serde_json::json!({
                     "status": "ok",
                     "compute_device": "Cuda",
-                    "collection": "academic_papers",
                     "version": "0.0.1-rc.374",
                     "backend_version": "myelin-mcp 0.1.0",
                     "embed_model": "bge-m3",
                     "pid": pid,
                 }),
             ),
-            "/status" => Response::json(
+            "/status?store=academic" => Response::json(
                 200,
                 &serde_json::json!({
-                    "collection": "academic_papers",
+                    "store": "academic",
                     "points_count": 445451,
                     "compute_device": "Cuda",
                     "myelin_url": "http://127.0.0.1:7462/mcp",

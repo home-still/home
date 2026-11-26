@@ -27,7 +27,7 @@ indexed.
    The metadata comes from the document's catalog entry, never from guessing
    at the text: the first DOI or year in a paper is usually a citation. A
    document indexed without a catalog entry carries no title until
-   `hs distill backfill-titles --apply` copies one in.
+   it is indexed again with one.
 
 ## Two channels, one ranking
 
@@ -56,21 +56,21 @@ specific first: the two rarest terms of the query; the query's first term
 (usually what the question is about) with the rarest other term; the rarest
 term alone; and the first term alone.
 
-**Reference lists are pushed down.** To a dense model, a bibliography entry
+**Reference lists are kept apart.** To a dense model, a bibliography entry
 about hippocampal neurogenesis *is* about hippocampal neurogenesis, so a
 chunk of citations can outrank the passage that discusses the topic. Chunks
 that are recognisably reference lists (lines with `doi:`, author names
 followed by a year, `et al.`, page ranges, volumes, numbered entries) are
-ranked below the passages that discuss the topic. They are not removed: a
-search for a bibliography still finds it, and a term that appears only in a
-citation still leads to it. A chunk that mixes citations with prose counts as
-prose.
+filed in a store of their own, `references`, when a paper is indexed, so a
+search of the `academic` store returns only the passages that discuss the
+topic. They are not thrown away: `hs distill search --store references`
+searches them. A chunk that mixes citations with prose counts as prose.
 
-## Searching whole papers: the abstracts collection
+## Searching whole papers: the abstracts store
 
 Passage search answers "where is this said". To ask "which papers are about
-this", a second collection, `paper_abstracts`, holds one point per paper,
-embedded from its title and abstract. The abstract comes from the local
+this", a second store, `abstracts`, holds one record per paper: its title
+and abstract. The abstract comes from the local
 OpenAlex catalog when it has the paper, else from the provider's record in
 the catalog, else from the markdown's `## Abstract` section; a paper with
 none is skipped. `hs distill abstracts build` fills it, and the MCP

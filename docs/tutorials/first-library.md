@@ -182,15 +182,15 @@ stores them under `~/home-still/boxes/`. Leave it running.
 ## 7. Index and search
 
 ```sh
-hs distill init
 hs serve distill start
 hs distill index
 ```
 
-`hs distill init` writes `~/.home-still/docker-compose-distill.yml` and
-starts Qdrant in a container; `hs serve distill start` starts the search
-server on the GPU; `hs distill index` cuts your markdown into passages,
-embeds them and stores them, showing a progress bar. Now ask a question:
+`hs serve distill start` starts the search server, which keeps passages in a
+myelin server and needs that server and Ollama running first (see
+[`distill_server`](../reference/configuration.md#distill_server));
+`hs distill index` cuts your markdown into passages, embeds them and stores
+them, showing a progress bar. Now ask a question:
 
 ```sh
 hs distill search "why does self-attention replace recurrence"

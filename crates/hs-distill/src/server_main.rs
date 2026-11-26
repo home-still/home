@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use hs_common::stores::Stores;
 use hs_distill::api::DistillServerState;
 use hs_distill::config::DistillServerConfig;
 use hs_distill::embed_device::{ollama_embed_device, DEVICE_CUDA, OLLAMA_EMBED_MODEL};
@@ -48,6 +49,9 @@ async fn async_main() -> Result<()> {
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid distill_server config: {e}"))?;
+    // The registry of stores: which tenant holds each one, and the personal
+    // prefix from the config. A malformed registry stops the start.
+    let stores = Stores::load().context("loading the store registry")?;
     // Every route but /health and /readiness requires this secret; there is
     // no unauthenticated mode.
     let token = server::backend_token(|name| std::env::var(name))?;
@@ -80,7 +84,23 @@ async fn async_main() -> Result<()> {
 
     let host = args.host.unwrap_or_else(|| config.host.clone());
     let port = args.port.unwrap_or(config.port);
-    let state = Arc::new(DistillServerState::new(Arc::new(store), ollama, config));
+    let myelin_url = config.myelin_url.clone();
+    let state = Arc::new(DistillServerState::new(
+        Arc::new(store),
+        ollama,
+        config,
+        stores,
+    ));
+    // Myelin must hold every store under the tenant the registry names
+    // before a request can file a document in one.
+    state
+        .define_stores()
+        .await
+        .map_err(|e| anyhow::anyhow!("myelin at {myelin_url} refused the store registry: {e}"))?;
+    tracing::info!(
+        stores = state.stores.iter().count(),
+        "stores defined in myelin"
+    );
 
     let addr = format!("{host}:{port}");
     tracing::info!("Listening on {addr}");

@@ -37,6 +37,8 @@ pub struct IndexResult {
 /// A single search hit returned to the client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
+    /// The store the hit came from, by name.
+    pub store: String,
     pub doc_id: String,
     pub title: Option<String>,
     #[serde(default)]
@@ -47,12 +49,10 @@ pub struct SearchHit {
     pub doi: Option<String>,
     pub chunk_text: String,
     pub score: f32,
-    pub pdf_path: Option<String>,
     pub line_start: usize,
     pub line_end: usize,
     pub page: Option<usize>,
-    /// Personal-store category. Always `None` for academic-papers hits;
-    /// populated only on hits originating from the personal pipeline.
+    /// Personal-store category: `None` on a hit from any other store.
     #[serde(default)]
     pub category: Option<String>,
 }
@@ -72,7 +72,6 @@ pub struct SearchFilters {
 pub struct HealthResponse {
     pub status: String,
     pub compute_device: String,
-    pub collection: String,
     #[serde(default)]
     pub version: String,
     /// The myelin server behind this distill server, as `<name> <version>`.
@@ -126,7 +125,8 @@ impl ReadinessInfo for ReadinessResponse {
 /// Status response from the distill server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
-    pub collection: String,
+    /// The store these counts describe, by name.
+    pub store: String,
     pub points_count: u64,
     #[serde(default)]
     pub documents_count: u64,
@@ -306,41 +306,32 @@ impl DistillClient {
         resp.json().await.context("Invalid readiness response")
     }
 
-    /// Index a markdown file (non-streaming). Reads the file locally and sends content to server.
-    pub async fn index_file(&self, markdown_path: &str) -> Result<IndexResult> {
+    /// Index a markdown file into `store` (non-streaming). Reads the file
+    /// locally and sends its content to the server.
+    pub async fn index_file(&self, store: &str, markdown_path: &str) -> Result<IndexResult> {
         let content = std::fs::read_to_string(markdown_path)
             .context(format!("Failed to read {markdown_path}"))?;
-        self.index_content(markdown_path, &content, None).await
-    }
-
-    /// Index markdown already held in memory. `path_hint` names the document
-    /// (its file stem becomes the doc id) but the server never reads it from
-    /// disk. Pass `catalog` when the caller already has the catalog entry:
-    /// the server has no catalog of its own, so without one the stored
-    /// chunks carry no title, authors, DOI or year.
-    pub async fn index_content(
-        &self,
-        path_hint: &str,
-        content: &str,
-        catalog: Option<&hs_common::catalog::CatalogEntry>,
-    ) -> Result<IndexResult> {
-        self.index_content_in(path_hint, content, catalog, None)
+        self.index_content(store, markdown_path, &content, None)
             .await
     }
 
-    /// Same as `index_content` but routes the write to a non-default
-    /// collection. The collection must be one the server is configured to
-    /// serve (`distill_server.collections`); an unknown name is a 400. The
-    /// request is bounded by the client's index timeout.
-    pub async fn index_content_in(
+    /// Index markdown already held in memory into `store`, which must be a
+    /// store the server serves and documents are sent to; any other name
+    /// is a 400. `path_hint` names the document (its file stem becomes the
+    /// doc id) but the server never reads it from disk. Pass `catalog`
+    /// when the caller already has the catalog entry: the server has no
+    /// catalog of its own, so without one the stored chunks carry no
+    /// title, authors, DOI or year. The request is bounded by the client's
+    /// index timeout.
+    pub async fn index_content(
         &self,
+        store: &str,
         path_hint: &str,
         content: &str,
         catalog: Option<&hs_common::catalog::CatalogEntry>,
-        collection: Option<&str>,
     ) -> Result<IndexResult> {
         let url = format!("{}/distill", self.server_url);
-        let body = index_body(path_hint, content, catalog, collection)?;
+        let body = index_body(store, path_hint, content, catalog)?;
         let resp = self
             .http
             .post(&url)
@@ -356,10 +347,11 @@ impl DistillClient {
     /// Index a markdown object pulled from a `Storage` backend (local or S3).
     pub async fn index_from_storage(
         &self,
+        store: &str,
         storage: &dyn Storage,
         key: &str,
     ) -> Result<IndexResult> {
-        self.index_from_storage_with_catalog(storage, key, None)
+        self.index_from_storage_with_catalog(store, storage, key, None)
             .await
     }
 
@@ -367,6 +359,7 @@ impl DistillClient {
     /// the caller (the server cannot look one up itself).
     pub async fn index_from_storage_with_catalog(
         &self,
+        store: &str,
         storage: &dyn Storage,
         key: &str,
         catalog: Option<&hs_common::catalog::CatalogEntry>,
@@ -377,7 +370,7 @@ impl DistillClient {
             .with_context(|| format!("Failed to read {key} from storage"))?;
         let content = String::from_utf8(bytes)
             .with_context(|| format!("Markdown at {key} is not valid UTF-8"))?;
-        self.index_content(key, &content, catalog).await
+        self.index_content(store, key, &content, catalog).await
     }
 
     /// Index a markdown file with streaming progress via NDJSON.
@@ -385,6 +378,7 @@ impl DistillClient {
     /// the client's index timeout (the whole stream, not each line).
     pub async fn index_file_with_progress(
         &self,
+        store: &str,
         markdown_path: &str,
         on_progress: impl Fn(DistillProgress),
     ) -> Result<IndexResult> {
@@ -394,7 +388,7 @@ impl DistillClient {
         let resp = self
             .http
             .post(&url)
-            .json(&index_body(markdown_path, &content, None, None)?)
+            .json(&index_body(store, markdown_path, &content, None)?)
             .timeout(self.index_timeout)
             .send()
             .await
@@ -407,35 +401,24 @@ impl DistillClient {
             .map_err(type_stream_error)
     }
 
-    /// Search indexed documents.
+    /// Search the named stores in one ranked pass; every hit says which
+    /// store it came from. With no store named, the server reads every
+    /// store a read covers by default. A name the server does not serve is
+    /// a 400. The server clamps `limit` to [`MAX_SEARCH_LIMIT`].
     pub async fn search(
         &self,
+        stores: &[&str],
         query: &str,
         limit: u64,
         filters: SearchFilters,
-    ) -> Result<Vec<SearchHit>> {
-        self.search_in(query, limit, filters, None).await
-    }
-
-    /// Same as `search` but targets a non-default collection (e.g.
-    /// `personal_docs`), which must be one the server is configured to serve.
-    /// The server clamps `limit` to [`MAX_SEARCH_LIMIT`].
-    pub async fn search_in(
-        &self,
-        query: &str,
-        limit: u64,
-        filters: SearchFilters,
-        collection: Option<&str>,
     ) -> Result<Vec<SearchHit>> {
         let url = format!("{}/search", self.server_url);
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "query": query,
             "limit": limit,
             "filters": filters,
+            "stores": stores,
         });
-        if let Some(c) = collection {
-            body["collection"] = serde_json::Value::String(c.to_string());
-        }
         let resp = self
             .http
             .post(&url)
@@ -448,12 +431,12 @@ impl DistillClient {
         json_or_server_error(resp, "search").await
     }
 
-    /// Get collection status.
-    pub async fn status(&self) -> Result<StatusResponse> {
-        let url = format!("{}/status", self.server_url);
+    /// What `store` holds.
+    pub async fn status(&self, store: &str) -> Result<StatusResponse> {
+        let url = self.endpoint(&["status"], &[(STORE_PARAM, store)])?;
         let resp = self
             .http
-            .get(&url)
+            .get(url)
             .timeout(Duration::from_secs(5))
             .send()
             .await
@@ -461,20 +444,20 @@ impl DistillClient {
         json_or_server_error(resp, "status").await
     }
 
-    /// Check if a document is already indexed.
-    pub async fn doc_exists(&self, doc_id: &str) -> Result<bool> {
-        Ok(self.doc_chunks(doc_id).await?.0)
+    /// Check if a document is already indexed in `store`.
+    pub async fn doc_exists(&self, store: &str, doc_id: &str) -> Result<bool> {
+        Ok(self.doc_chunks(store, doc_id).await?.0)
     }
 
     /// Return `(exists, chunk_count)` for a doc. Chunk count is needed by the
     /// reconciler to backfill catalog stamps that were lost on earlier writes.
-    pub async fn doc_chunks(&self, doc_id: &str) -> Result<(bool, u64)> {
+    pub async fn doc_chunks(&self, store: &str, doc_id: &str) -> Result<(bool, u64)> {
         #[derive(Deserialize)]
         struct Exists {
             exists: bool,
             chunks: u64,
         }
-        let url = self.endpoint(&["exists", doc_id], &[])?;
+        let url = self.endpoint(&["exists", doc_id], &[(STORE_PARAM, store)])?;
         let resp = self
             .http
             .get(url)
@@ -486,19 +469,15 @@ impl DistillClient {
         Ok((data.exists, data.chunks))
     }
 
-    /// Delete every chunk whose `doc_id` matches. Returns the number of
-    /// chunks that were deleted.
-    pub async fn delete_doc(&self, doc_id: &str) -> Result<u64> {
-        self.delete_doc_in(doc_id, None).await
-    }
-
-    /// Same as `delete_doc` but targets a non-default collection.
-    pub async fn delete_doc_in(&self, doc_id: &str, collection: Option<&str>) -> Result<u64> {
+    /// Delete every chunk of `doc_id` in `store`, the reference lists the
+    /// server filed beside them included. Returns the number of chunks
+    /// that were deleted.
+    pub async fn delete_doc(&self, store: &str, doc_id: &str) -> Result<u64> {
         #[derive(Deserialize)]
         struct Deleted {
             deleted: u64,
         }
-        let url = self.endpoint(&["doc", doc_id], &collection_query(collection))?;
+        let url = self.endpoint(&["doc", doc_id], &[(STORE_PARAM, store)])?;
         let resp = self
             .http
             .delete(url)
@@ -510,33 +489,33 @@ impl DistillClient {
         Ok(data.deleted)
     }
 
-    /// Delete every document of the collection. Returns the number of
-    /// chunks that were deleted.
-    pub async fn reset_collection(&self) -> Result<u64> {
+    /// Delete every document of `store`. Returns the number of chunks that
+    /// were deleted.
+    pub async fn reset_store(&self, store: &str) -> Result<u64> {
         #[derive(Deserialize)]
         struct Reset {
-            deleted_points: u64,
+            deleted: u64,
         }
-        let url = format!("{}/collection/reset", self.server_url);
+        let url = self.endpoint(&["store", "reset"], &[(STORE_PARAM, store)])?;
         let resp = self
             .http
-            .post(&url)
+            .post(url)
             // One delete per document: minutes on a large corpus.
             .timeout(DEFAULT_INDEX_TIMEOUT)
             .send()
             .await
             .context("Failed to reach distill server")?;
-        let data: Reset = json_or_server_error(resp, "reset_collection").await?;
-        Ok(data.deleted_points)
+        let data: Reset = json_or_server_error(resp, "reset_store").await?;
+        Ok(data.deleted)
     }
 
-    /// List every distinct `doc_id` present in the collection. `limit` is a
-    /// safety cap, not a page size: a collection with more documents than
+    /// List every distinct `doc_id` present in `store`. `limit` is a
+    /// safety cap, not a page size: a store with more documents than
     /// `limit` (or than the server maximum, [`MAX_DOC_LIST_LIMIT`]) is an
     /// error, never a silently partial list — callers diff this list against
     /// storage, and a missing id looks like a document that was never
     /// indexed.
-    pub async fn list_docs(&self, limit: u64) -> Result<Vec<String>> {
+    pub async fn list_docs(&self, store: &str, limit: u64) -> Result<Vec<String>> {
         #[derive(Deserialize)]
         struct Docs {
             doc_ids: Vec<String>,
@@ -544,10 +523,13 @@ impl DistillClient {
             truncated: bool,
         }
         let limit = limit.min(MAX_DOC_LIST_LIMIT);
-        let url = format!("{}/docs?limit={}", self.server_url, limit);
+        let url = self.endpoint(
+            &["docs"],
+            &[(STORE_PARAM, store), ("limit", &limit.to_string())],
+        )?;
         let resp = self
             .http
-            .get(&url)
+            .get(url)
             .timeout(Duration::from_secs(60))
             .send()
             .await
@@ -555,33 +537,28 @@ impl DistillClient {
         let data: Docs = json_or_server_error(resp, "list_docs").await?;
         if data.truncated {
             anyhow::bail!(
-                "the collection holds more than {limit} documents (server maximum {MAX_DOC_LIST_LIMIT}); \
-                 the list would be incomplete"
+                "the store {store:?} holds more than {limit} documents (server maximum \
+                 {MAX_DOC_LIST_LIMIT}); the list would be incomplete"
             );
         }
         Ok(data.doc_ids)
     }
 }
 
-/// The `collection` query pair, when a collection is named.
-fn collection_query(collection: Option<&str>) -> Vec<(&'static str, &str)> {
-    collection.map(|c| ("collection", c)).into_iter().collect()
-}
+/// Query parameter that names the store a request is about.
+pub const STORE_PARAM: &str = "store";
 
 /// Body of an index request.
 fn index_body(
+    store: &str,
     path_hint: &str,
     content: &str,
     catalog: Option<&hs_common::catalog::CatalogEntry>,
-    collection: Option<&str>,
 ) -> Result<serde_json::Value> {
-    let mut body = serde_json::json!({ "path": path_hint, "content": content });
+    let mut body = serde_json::json!({ "store": store, "path": path_hint, "content": content });
     if let Some(cat) = catalog {
         body["catalog"] =
             serde_json::to_value(cat).context("Failed to serialize the catalog entry")?;
-    }
-    if let Some(c) = collection {
-        body["collection"] = serde_json::Value::String(c.to_string());
     }
     Ok(body)
 }
@@ -665,6 +642,7 @@ impl ServiceClient for DistillClient {
 mod tests {
     use super::*;
     use crate::testutil::{serve, Reply};
+    use hs_common::stores::{ACADEMIC, PERSONAL};
     use std::time::Instant;
 
     fn client(fake: &crate::testutil::FakeHttp) -> DistillClient {
@@ -684,7 +662,10 @@ mod tests {
         let fake = serve(|_| Reply::Hang).await;
         let c = client(&fake).with_index_timeout(Duration::from_millis(300));
         let started = Instant::now();
-        let err = c.index_content("doc.md", "text", None).await.unwrap_err();
+        let err = c
+            .index_content(ACADEMIC, "doc.md", "text", None)
+            .await
+            .unwrap_err();
         assert!(is_timeout(&err), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(10));
     }
@@ -697,7 +678,7 @@ mod tests {
         std::fs::write(&file, "some markdown").unwrap();
         let c = client(&fake).with_index_timeout(Duration::from_millis(300));
         let err = c
-            .index_file_with_progress(file.to_str().unwrap(), |_| {})
+            .index_file_with_progress(ACADEMIC, file.to_str().unwrap(), |_| {})
             .await
             .unwrap_err();
         assert!(is_timeout(&err), "{err:#}");
@@ -716,14 +697,11 @@ mod tests {
     fn a_stem_with_url_metacharacters_stays_one_path_segment() {
         let c = DistillClient::new("http://example.local:7434/").unwrap();
         let url = c
-            .endpoint(
-                &["doc", "10.1002_a?b#c%41 d"],
-                &collection_query(Some("a&b")),
-            )
+            .endpoint(&["doc", "10.1002_a?b#c%41 d"], &[(STORE_PARAM, "a&b")])
             .unwrap();
         assert_eq!(
             url.as_str(),
-            "http://example.local:7434/doc/10.1002_a%3Fb%23c%2541%20d?collection=a%26b"
+            "http://example.local:7434/doc/10.1002_a%3Fb%23c%2541%20d?store=a%26b"
         );
         let gw = DistillClient::new("https://gw.example.local/distill").unwrap();
         assert_eq!(
@@ -733,7 +711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_request_always_carries_content_and_the_catalog() {
+    async fn index_request_always_carries_the_store_the_content_and_the_catalog() {
         let fake = serve(|_| {
             Reply::Json(
                 200,
@@ -746,12 +724,7 @@ mod tests {
             ..Default::default()
         };
         let got = client(&fake)
-            .index_content_in(
-                "markdown/ab/doc.md",
-                "# body",
-                Some(&catalog),
-                Some("personal_docs"),
-            )
+            .index_content(PERSONAL, "markdown/ab/doc.md", "# body", Some(&catalog))
             .await
             .unwrap();
         assert_eq!(got.chunks_indexed, 3);
@@ -761,15 +734,65 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
         assert_eq!(body["content"], "# body");
         assert_eq!(body["path"], "markdown/ab/doc.md");
-        assert_eq!(body["collection"], "personal_docs");
+        assert_eq!(body["store"], PERSONAL);
         assert_eq!(body["catalog"]["title"], "T");
+    }
+
+    #[tokio::test]
+    async fn a_search_names_its_stores_and_an_empty_list_is_sent_as_one() {
+        let fake = serve(|_| Reply::Json(200, "[]".into())).await;
+        let c = client(&fake);
+        c.search(&[ACADEMIC, PERSONAL], "q", 5, SearchFilters::default())
+            .await
+            .unwrap();
+        c.search(&[], "q", 5, SearchFilters::default())
+            .await
+            .unwrap();
+        let bodies: Vec<serde_json::Value> = fake
+            .recorded()
+            .iter()
+            .map(|r| serde_json::from_str(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies[0]["stores"], serde_json::json!([ACADEMIC, PERSONAL]));
+        assert_eq!(bodies[1]["stores"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn every_per_store_request_names_the_store_in_the_query() {
+        // Each reply is refused as malformed; only the request matters.
+        let fake = serve(|_| Reply::Json(200, "{}".into())).await;
+        let c = client(&fake);
+        let _ = c.status(PERSONAL).await;
+        let _ = c.doc_chunks(PERSONAL, "d").await;
+        let _ = c.delete_doc(PERSONAL, "d").await;
+        let _ = c.reset_store(PERSONAL).await;
+        let _ = c.list_docs(PERSONAL, 7).await;
+        let lines: Vec<String> = fake
+            .recorded()
+            .into_iter()
+            .map(|r| {
+                r.request_line
+                    .rsplit_once(' ')
+                    .map_or(r.request_line.clone(), |(line, _version)| line.to_string())
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "GET /status?store=personal",
+                "GET /exists/d?store=personal",
+                "DELETE /doc/d?store=personal",
+                "POST /store/reset?store=personal",
+                "GET /docs?store=personal&limit=7",
+            ]
+        );
     }
 
     #[tokio::test]
     async fn server_errors_surface_the_status_and_message() {
         let fake = serve(|_| Reply::Json(400, "`content` is required".into())).await;
         let err = client(&fake)
-            .index_content("doc.md", "x", None)
+            .index_content(ACADEMIC, "doc.md", "x", None)
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -793,7 +816,7 @@ mod tests {
         ] {
             let fake = serve(move |_| Reply::Json(status, "no".into())).await;
             let err = client(&fake)
-                .index_content("d.md", "x", None)
+                .index_content(ACADEMIC, "d.md", "x", None)
                 .await
                 .unwrap_err();
             let typed = err
@@ -812,7 +835,7 @@ mod tests {
         let file = dir.path().join("doc.md");
         std::fs::write(&file, "some markdown").unwrap();
         let err = client(&fake)
-            .index_file_with_progress(file.to_str().unwrap(), |_| {})
+            .index_file_with_progress(ACADEMIC, file.to_str().unwrap(), |_| {})
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("404"));
@@ -825,17 +848,20 @@ mod tests {
     async fn list_docs_refuses_a_partial_list() {
         let fake =
             serve(|_| Reply::Json(200, r#"{"doc_ids":["a","b"],"truncated":true}"#.into())).await;
-        let err = client(&fake).list_docs(2).await.unwrap_err();
+        let err = client(&fake).list_docs(ACADEMIC, 2).await.unwrap_err();
         assert!(format!("{err:#}").contains("more than 2"), "{err:#}");
 
         let fake = serve(|_| Reply::Json(200, r#"{"doc_ids":["a","b"]}"#.into())).await;
-        assert_eq!(client(&fake).list_docs(10).await.unwrap(), ["a", "b"]);
+        assert_eq!(
+            client(&fake).list_docs(ACADEMIC, 10).await.unwrap(),
+            ["a", "b"]
+        );
     }
 
     #[tokio::test]
     async fn list_docs_never_asks_for_more_than_the_server_maximum() {
         let fake = serve(|_| Reply::Json(200, r#"{"doc_ids":[]}"#.into())).await;
-        client(&fake).list_docs(u64::MAX).await.unwrap();
+        client(&fake).list_docs(ACADEMIC, u64::MAX).await.unwrap();
         let line = &fake.recorded()[0].request_line;
         assert!(
             line.contains(&format!("limit={MAX_DOC_LIST_LIMIT}")),
@@ -847,15 +873,15 @@ mod tests {
     async fn malformed_or_error_replies_are_errors_not_defaults() {
         // `doc_chunks` used to read a missing `exists` as false.
         let fake = serve(|_| Reply::Json(200, "{}".into())).await;
-        assert!(client(&fake).doc_chunks("d").await.is_err());
+        assert!(client(&fake).doc_chunks(ACADEMIC, "d").await.is_err());
         let fake = serve(|_| Reply::Json(503, "embedder unusable".into())).await;
-        let err = client(&fake).doc_chunks("d").await.unwrap_err();
+        let err = client(&fake).doc_chunks(ACADEMIC, "d").await.unwrap_err();
         assert!(format!("{err:#}").contains("503"));
         let err = client(&fake).health().await.unwrap_err();
         assert!(format!("{err:#}").contains("embedder unusable"), "{err:#}");
         let fake = serve(|_| Reply::Json(200, "{}".into())).await;
-        assert!(client(&fake).delete_doc("d").await.is_err());
-        assert!(client(&fake).reset_collection().await.is_err());
+        assert!(client(&fake).delete_doc(ACADEMIC, "d").await.is_err());
+        assert!(client(&fake).reset_store(ACADEMIC).await.is_err());
     }
 
     #[tokio::test]
@@ -887,9 +913,11 @@ mod tests {
         .await;
         let c = client(&fake);
         for err in [
-            c.index_content("d.md", "x", None).await.unwrap_err(),
-            c.status().await.unwrap_err(),
-            c.delete_doc("d").await.unwrap_err(),
+            c.index_content(ACADEMIC, "d.md", "x", None)
+                .await
+                .unwrap_err(),
+            c.status(ACADEMIC).await.unwrap_err(),
+            c.delete_doc(ACADEMIC, "d").await.unwrap_err(),
         ] {
             let u = err
                 .downcast_ref::<Unauthorized>()
@@ -916,7 +944,7 @@ mod tests {
                 Reply::Hang => Reply::Hang,
             })
             .await;
-            let err = client(&fake).status().await.unwrap_err();
+            let err = client(&fake).status(ACADEMIC).await.unwrap_err();
             assert!(err.downcast_ref::<Unauthorized>().is_none(), "{err:#}");
             let typed = err.downcast_ref::<ServerError>().expect("ordinary error");
             assert!(!typed.is_permanent_rejection());

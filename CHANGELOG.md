@@ -2,6 +2,42 @@
 
 Changes that need action when upgrading. Binaries and full notes: GitHub Releases.
 
+## Unreleased
+
+- The distill server keeps its documents in a myelin server, in named
+  stores: `academic`, `references`, `abstracts`, `personal`, `web`,
+  `syntheses` and `memory`. **A distill host needs a myelin server (its full
+  surface) at `distill_server.myelin_url`, default
+  `http://127.0.0.1:7462/mcp`, and Ollama with the embedding model on the
+  GPU, before the upgraded server starts**: it defines every store in myelin
+  at start-up and stops when myelin does not answer or refuses one.
+- Every distill request names its store. **Upgrade the distill server and
+  every client of it (`hs`, `hs-mcp`, the watchers) together**: an older
+  client names no store and is answered `400`, and a newer client's requests
+  are not understood by an older server. `POST /collection/reset` became
+  `POST /store/reset?store=<name>`. The routes `/collection/hnsw`,
+  `/scrub-interstitials`, `/embedder/release`, `/docs/titles`,
+  `/docs/markdown-paths` and `/doc/{doc_id}/title` are gone; **a GPU broker
+  that called `/embedder/release` must stop calling it** (Ollama holds the
+  embedding model now, not the distill server).
+- These `distill_server` keys no longer exist and only draw a warning when
+  set: `qdrant_url`, `collection_name`, `collections`, and every
+  `embedding.*` and `hnsw.*` key. `personal.collection_name` likewise.
+  **`HOME_STILL_PERSONAL_COLLECTION_NAME` in the environment is now an
+  error**: remove it from the unit or shell that sets it.
+- The commands `hs distill init`, `hs distill hnsw enable`,
+  `hs distill backfill-titles` and `hs pipeline purge-poisoned-chunks` are
+  gone. A script that runs one fails on the unknown subcommand.
+- Reference lists are filed in the `references` store when a paper is
+  indexed, so a search of `academic` no longer returns them.
+  `hs distill search --store <NAME>` (repeatable) picks the stores to search;
+  without it the search covers `academic`. A search hit carries `store` and
+  no longer carries `pdf_path`.
+- `hs distill purge` and the reconversion of a paper delete its chunks from
+  `academic` and its reference lists; `hs pipeline purge-poisoned` and
+  `hs migrate` also delete its record from `abstracts`, because they delete
+  its catalog entry. `hs pipeline rebuild` empties both stores.
+
 ## v0.0.1-rc.394
 
 - The scribe server answers `POST /scribe/boxes`: the body is a PDF, the

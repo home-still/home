@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use hs_common::stores::StoreSpec;
 
 use crate::client::{SearchFilters, SearchHit};
 use crate::error::DistillError;
@@ -71,12 +72,17 @@ impl SearchFilter {
 /// The document-store seam. The server talks to myelin only through
 /// [`DocumentStore`]; tests drive the same code with an in-memory fake.
 ///
+/// Every call names a store of [`hs_common::stores::Stores`] by its name.
+/// [`define_store`] tells the backend which tenant holds a store; the
+/// server calls it for every store before it listens.
+///
 /// A document is one generation of records: [`write_document`] stores every
 /// chunk of the document's current text and returns the record ids, and
 /// [`forget_document`] with those ids as `keep` then removes every earlier
 /// generation. The two calls are separate so a failed write never removes the
 /// previous version.
 ///
+/// [`define_store`]: DocumentStore::define_store
 /// [`write_document`]: DocumentStore::write_document
 /// [`forget_document`]: DocumentStore::forget_document
 #[async_trait]
@@ -85,11 +91,15 @@ pub trait DocumentStore: Send + Sync {
     /// initialize result.
     async fn health(&self) -> Result<String, DistillError>;
 
+    /// Bind the store's name to its tenant and state its description and
+    /// flags. Saying the same thing again changes nothing.
+    async fn define_store(&self, spec: &StoreSpec) -> Result<(), DistillError>;
+
     /// Write one generation of a document; returns one record id per chunk,
     /// in chunk order.
     async fn write_document(
         &self,
-        collection: &str,
+        store: &str,
         doc_id: &str,
         chunks: &[Chunk],
     ) -> Result<Vec<String>, DistillError>;
@@ -98,15 +108,16 @@ pub trait DocumentStore: Send + Sync {
     /// were deleted.
     async fn forget_document(
         &self,
-        collection: &str,
+        store: &str,
         doc_id: &str,
         keep: &[String],
     ) -> Result<u64, DistillError>;
 
-    /// Ranked hits, best first, at most `limit`.
+    /// Ranked hits over every store in `stores`, best first, at most
+    /// `limit`. Each hit names the store it came from.
     async fn search(
         &self,
-        collection: &str,
+        stores: &[&str],
         query: &str,
         limit: u64,
         filter: &SearchFilter,
@@ -115,7 +126,7 @@ pub trait DocumentStore: Send + Sync {
     /// doc_id -> live record count (one doc when `doc_id` is `Some`).
     async fn inventory(
         &self,
-        collection: &str,
+        store: &str,
         doc_id: Option<&str>,
     ) -> Result<BTreeMap<String, u64>, DistillError>;
 }

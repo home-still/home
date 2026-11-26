@@ -64,24 +64,20 @@ the gateway) sets the same value in `~/.home-still/secrets.env`.
 
 ## Distill server endpoints
 
+Every route except `/health`, `/readiness` and `/search` names one store: in the `store` field of the body (`/distill`, `/distill/stream`) or in the `store` query parameter (the others). A missing or unknown store is a 400. The stores are listed under [`distill_server`](configuration.md#stores).
+
 | Endpoint | Method | Token | Description |
 |---|---|---|---|
-| `/health` | GET | no | Status, the server's own `pid`, device, collection and versions; 503 if the embedder is unusable or Qdrant is unreachable. |
-| `/readiness` | GET | no | `ready`, `capacity` (embedder slots), `in_flight`, `reason`; 503 when not ready. |
-| `/status` | GET | yes | Collection statistics (points, documents, device). |
-| `/distill` | POST | yes | Index one document. |
-| `/distill/stream` | POST | yes | Index one document, streaming NDJSON progress. |
-| `/search` | POST | yes | Hybrid search with optional filters. `limit` defaults to 10, at most 200; `query` is at most 65,536 bytes. |
-| `/exists/{doc_id}` | GET | yes | The document's chunk count. |
-| `/docs` | GET | yes | Distinct document ids. |
-| `/docs/titles` | GET | yes | The title stored on each document's points. |
-| `/docs/markdown-paths` | GET | yes | The markdown storage key carried on each document's points. |
-| `/doc/{doc_id}/title` | POST | yes | Write a title onto a document's points (payload only; no re-embedding). |
-| `/doc/{doc_id}` | DELETE | yes | Delete a document's points. |
-| `/collection/reset` | POST | yes | Drop and recreate a collection. |
-| `/collection/hnsw?collection=<name>` | POST | yes | Start the background HNSW index build on a collection. |
-| `/scrub-interstitials` | POST | yes | Delete chunks matching publisher interstitial pages. |
-| `/embedder/release` | POST | yes | Drop the model of every idle pool slot now (`{"released": n}`); the next embed reloads it. A host GPU broker calls it before handing the card to another tenant. |
+| `/health` | GET | no | Status, the server's own `pid`, device, embedding model and versions; 503 if the embedding model is not on the GPU or myelin is unreachable. |
+| `/readiness` | GET | no | `ready`, `capacity` (1: writes are serialized), `in_flight`, `reason`; 503 when not ready. |
+| `/status?store=<name>` | GET | yes | The store's statistics (chunks, documents, device). |
+| `/distill` | POST | yes | Index one document into the store its body names. |
+| `/distill/stream` | POST | yes | The same, streaming NDJSON progress. |
+| `/search` | POST | yes | Search the stores listed in `stores`; an empty or absent list searches the default stores. `limit` defaults to 10, at most 200; `query` is at most 65,536 bytes. Each hit names its store. |
+| `/exists/{doc_id}?store=<name>` | GET | yes | The document's chunk count. |
+| `/docs?store=<name>` | GET | yes | Distinct document ids. |
+| `/doc/{doc_id}?store=<name>` | DELETE | yes | Delete a document's chunks, and its reference lists with them. |
+| `/store/reset?store=<name>` | POST | yes | Delete every document of a store; answers `{"store","deleted"}`. |
 
 Bad input is a 400, a missing dependency a 503, anything else a 500.
 

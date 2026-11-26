@@ -295,7 +295,7 @@ Changes state: no.
 
 ### `abstract_search`
 
-Semantic search over paper abstracts: the `paper_abstracts` Qdrant collection, one point per paper. Each point is embedded from the title and abstract; the abstract comes from the local OpenAlex catalog, else the paper's catalog abstract, else the converted markdown's `## Abstract` section. Papers with no usable abstract are not indexed. Body sections are excluded, so it is more precise than `distill_search` for finding the paper that argues a claim. Returns ranked hits with score, title, DOI, year and abstract text.
+Semantic search over paper abstracts: the `abstracts` store, one record per paper. Each record is the paper's title and abstract; the abstract comes from the local OpenAlex catalog, else the paper's catalog abstract, else the converted markdown's `## Abstract` section. Papers with no usable abstract are not indexed. Body sections are excluded, so it is more precise than `distill_search` for finding the paper that argues a claim. Returns ranked hits with score, title, DOI, year and abstract text.
 
 Changes state: no.
 
@@ -308,7 +308,7 @@ Changes state: no.
 
 ### `distill_status`
 
-Distill system status: Qdrant collection info, document and chunk counts, compute device and server version.
+Distill system status: the `academic` store's document and chunk counts, compute device and server version.
 
 Changes state: no. Takes no parameters.
 
@@ -382,7 +382,7 @@ These tools work on the personal-documents store. See [Manage personal documents
 
 ### `personal_search`
 
-Semantic search over the personal-documents collection.
+Semantic search over the personal documents: the `personal` store.
 
 Changes state: no.
 

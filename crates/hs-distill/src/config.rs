@@ -16,12 +16,6 @@ use crate::error::DistillError;
 
 // ── Server Config ──────────────────────────────────────────────
 
-/// Collections requests may name besides `collection_name`, unless the
-/// config says otherwise. `paper_abstracts` is written by
-/// `hs distill abstracts` and read by the MCP `abstract_search` tool;
-/// `personal_docs` is the `hs personal` store (`personal.collection_name`).
-const DEFAULT_EXTRA_COLLECTIONS: [&str; 2] = ["paper_abstracts", "personal_docs"];
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DistillServerConfig {
@@ -31,15 +25,12 @@ pub struct DistillServerConfig {
     /// distill --port` passes it as `HS_DISTILL_PORT`).
     pub port: u16,
     /// MCP endpoint of the myelin server that stores and searches the
-    /// chunks (`myelin-mcp`, streamable HTTP).
+    /// chunks (`myelin-mcp`, streamable HTTP). It must be myelin's full
+    /// surface: the server defines its stores there at startup and writes
+    /// and forgets documents in them, which the agent surface
+    /// (`--serve-agents`) refuses. The stores themselves are not configured
+    /// here: they are the registry in `hs_common::stores`.
     pub myelin_url: String,
-    /// The default collection: requests that name none use it.
-    pub collection_name: String,
-    /// Further collections requests may name. Every configured collection
-    /// is created/verified at startup; a request naming any other
-    /// collection is rejected (HTTP 400), so a caller can never create or
-    /// reset a collection by naming it.
-    pub collections: Vec<String>,
     pub chunk_max_tokens: usize,
     pub chunk_overlap: usize,
     pub llm_metadata: bool,
@@ -114,11 +105,6 @@ impl Default for DistillServerConfig {
             host: "0.0.0.0".into(),
             port: 7434,
             myelin_url: "http://127.0.0.1:7462/mcp".into(),
-            collection_name: "academic_papers".into(),
-            collections: DEFAULT_EXTRA_COLLECTIONS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
             chunk_max_tokens: 1000,
             chunk_overlap: 100,
             llm_metadata: false,
@@ -153,18 +139,6 @@ impl DistillServerConfig {
         }
         if self.port == 0 {
             return Err(DistillError::Config("port must not be 0".into()));
-        }
-
-        validate_collection_name(&self.collection_name)?;
-        let mut seen = vec![self.collection_name.as_str()];
-        for name in &self.collections {
-            validate_collection_name(name)?;
-            if seen.contains(&name.as_str()) {
-                return Err(DistillError::Config(format!(
-                    "collection {name:?} is listed twice (collection_name + collections)"
-                )));
-            }
-            seen.push(name);
         }
 
         ChunkerConfig {
@@ -204,13 +178,6 @@ impl DistillServerConfig {
         }
         Ok(())
     }
-
-    /// Every collection the server serves: the default first, then
-    /// `collections`.
-    pub fn served_collections(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.collection_name.as_str())
-            .chain(self.collections.iter().map(String::as_str))
-    }
 }
 
 /// The myelin MCP endpoint as a URL. An invalid one is an error, never a
@@ -224,24 +191,6 @@ pub fn parse_myelin_url(myelin_url: &str) -> Result<reqwest::Url, DistillError> 
         )));
     }
     Ok(url)
-}
-
-/// A myelin collection (tenant) name this server will accept: 1–64 chars of
-/// `[A-Za-z0-9_-]`, starting with a letter or digit.
-pub fn validate_collection_name(name: &str) -> Result<(), DistillError> {
-    let ok = !name.is_empty()
-        && name.len() <= 64
-        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if ok {
-        Ok(())
-    } else {
-        Err(DistillError::Config(format!(
-            "collection name {name:?} must be 1-64 chars of [A-Za-z0-9_-] starting with a letter or digit"
-        )))
-    }
 }
 
 /// The embedding model's context window (bge-m3 under ollama: 8192 tokens).
@@ -423,44 +372,6 @@ mod tests {
         let mut c = cfg();
         c.chunk_overlap = c.chunk_max_tokens;
         config_error(&c);
-    }
-
-    #[test]
-    fn collection_names_are_restricted() {
-        for bad in ["", "../x", "a b", "-lead", "ünï", &"a".repeat(65), "a/b"] {
-            assert!(
-                validate_collection_name(bad).is_err(),
-                "{bad:?} should be rejected"
-            );
-        }
-        for good in ["academic_papers", "paper_abstracts", "p-1", "A9"] {
-            validate_collection_name(good).unwrap();
-        }
-    }
-
-    #[test]
-    fn configured_collections_must_be_valid_and_unique() {
-        let mut c = cfg();
-        c.collections = vec!["bad name".into()];
-        config_error(&c);
-
-        let mut c = cfg();
-        c.collections = vec![c.collection_name.clone()];
-        assert!(config_error(&c).contains("twice"));
-
-        let mut c = cfg();
-        c.collections = vec!["x".into(), "x".into()];
-        config_error(&c);
-    }
-
-    #[test]
-    fn default_collections_serve_the_workspace_callers() {
-        let c = cfg();
-        let served: Vec<_> = c.served_collections().collect();
-        assert_eq!(
-            served,
-            ["academic_papers", "paper_abstracts", "personal_docs"]
-        );
     }
 
     // ── Loading (RA-6) ─────────────────────────────────────────────────

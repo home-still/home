@@ -300,7 +300,7 @@ struct DistillReconcileParams {
     #[serde(default = "default_true")]
     dry_run: bool,
     #[schemars(
-        description = "Maximum number of doc_ids to check for missing markdown. Default: every doc_id in the collection."
+        description = "Maximum number of doc_ids to check for missing markdown. Default: every doc_id in the academic store."
     )]
     #[serde(default)]
     limit: Option<u64>,
@@ -2546,7 +2546,12 @@ impl HomeStillMcp {
         };
 
         match client
-            .search(&p.query, p.limit.unwrap_or(10), filters)
+            .search(
+                &[hs_common::stores::ACADEMIC],
+                &p.query,
+                p.limit.unwrap_or(10),
+                filters,
+            )
             .await
         {
             Ok(hits) => {
@@ -2559,7 +2564,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Semantic search over downloaded papers' abstracts. Targets the `paper_abstracts` collection of the myelin store — one record per paper (not per chunk), embedded from `{title}\\n\\n{abstract}` where the abstract is sourced from the local OpenAlex catalog (preferred), the paper's catalog abstract, or the converted markdown's `## Abstract` section; papers with no usable abstract are not indexed. Higher-precision than `distill_search` for 'find me the paper that argues X' queries because body-section noise (methods, references, citations) is excluded. Returns ranked hits with score, title, doi, year, and the embedded abstract text.",
+        description = "Semantic search over downloaded papers' abstracts. Targets the `abstracts` store — one record per paper (not per chunk), embedded from `{title}\\n\\n{abstract}` where the abstract is sourced from the local OpenAlex catalog (preferred), the paper's catalog abstract, or the converted markdown's `## Abstract` section; papers with no usable abstract are not indexed. Higher-precision than `distill_search` for 'find me the paper that argues X' queries because body-section noise (methods, references, citations) is excluded. Returns ranked hits with score, title, doi, year, and the embedded abstract text.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2583,11 +2588,11 @@ impl HomeStillMcp {
         };
 
         match client
-            .search_in(
+            .search(
+                &[hs_common::stores::ABSTRACTS],
                 &p.query,
                 p.limit.unwrap_or(10),
                 filters,
-                Some("paper_abstracts"),
             )
             .await
         {
@@ -2601,7 +2606,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Get distill system status: myelin store collection info, document/chunk counts, compute device (where the embedding model runs), server version.",
+        description = "Get distill system status: the `academic` store's document/chunk counts, compute device (where the embedding model runs), server version.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2616,7 +2621,7 @@ impl HomeStillMcp {
             .ok_or("No distill server configured")?;
 
         let (health, health_error) = split_result(client.health().await);
-        let (status, status_error) = split_result(client.status().await);
+        let (status, status_error) = split_result(client.status(hs_common::stores::ACADEMIC).await);
 
         to_json(&serde_json::json!({
             "health": health,
@@ -2644,7 +2649,10 @@ impl HomeStillMcp {
             .map_err(|e| format!("{e:#}"))?
             .ok_or("No distill server configured")?;
 
-        match client.doc_exists(&p.stem).await {
+        match client
+            .doc_exists(hs_common::stores::ACADEMIC, &p.stem)
+            .await
+        {
             Ok(exists) => to_json(&serde_json::json!({
                 "stem": p.stem,
                 "indexed": exists,
@@ -2674,7 +2682,12 @@ impl HomeStillMcp {
         let (key, catalog_entry) = self.existing_markdown(&p.stem).await?;
 
         let result = client
-            .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
+            .index_from_storage_with_catalog(
+                hs_common::stores::ACADEMIC,
+                &*self.storage,
+                &key,
+                catalog_entry.as_ref(),
+            )
             .await
             .map_err(|e| format!("Indexing failed for '{}': {e:#}", p.stem))?;
         self.stamp_embedding(&p.stem, &result).await?;
@@ -2724,7 +2737,10 @@ impl HomeStillMcp {
         // document that was never indexed), so ask for everything the server
         // can return; `limit` only caps how many of those ids are checked.
         let doc_ids = client
-            .list_docs(hs_distill::client::MAX_DOC_LIST_LIMIT)
+            .list_docs(
+                hs_common::stores::ACADEMIC,
+                hs_distill::client::MAX_DOC_LIST_LIMIT,
+            )
             .await
             .map_err(|e| format!("list_docs failed: {e:#}"))?;
         let scan_cap = p.limit.map_or(usize::MAX, |l| l as usize);
@@ -2866,7 +2882,12 @@ impl HomeStillMcp {
         // to the vector store. Every failure on the way is returned as is.
         let (key, catalog_entry) = self.existing_markdown(&p.stem).await?;
         let result = client
-            .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
+            .index_from_storage_with_catalog(
+                hs_common::stores::ACADEMIC,
+                &*self.storage,
+                &key,
+                catalog_entry.as_ref(),
+            )
             .await
             .map_err(|e| format!("Re-index failed for '{}': {e:#}", p.stem))?;
         self.stamp_embedding(&p.stem, &result).await?;
@@ -2955,7 +2976,12 @@ impl HomeStillMcp {
                 }
             };
             match client
-                .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
+                .index_from_storage_with_catalog(
+                    hs_common::stores::ACADEMIC,
+                    &*self.storage,
+                    &key,
+                    catalog_entry.as_ref(),
+                )
                 .await
             {
                 Ok(result) => {
@@ -3475,7 +3501,8 @@ impl HomeStillMcp {
             };
             let (health, health_err) = split_result(client.health().await);
             let (readiness, readiness_err) = split_result(client.readiness().await);
-            let (status, status_err) = split_result(client.status().await);
+            let (status, status_err) =
+                split_result(client.status(hs_common::stores::ACADEMIC).await);
             let error = join_call_errors(&[
                 ("health", &health_err),
                 ("readiness", &readiness_err),
@@ -3497,11 +3524,13 @@ impl HomeStillMcp {
                 .map(|s| s.embed_model.clone())
                 .or_else(|| health.as_ref().map(|h| h.embed_model.clone()))
                 .unwrap_or_default();
-            let collection = status
-                .as_ref()
-                .map(|s| s.collection.clone())
-                .or_else(|| health.as_ref().map(|h| h.collection.clone()))
-                .unwrap_or_default();
+            // The store these numbers are about: the one `status` was asked
+            // for. A server that answered neither call reports none.
+            let collection = if healthy || status.is_some() {
+                hs_common::stores::ACADEMIC.to_string()
+            } else {
+                String::new()
+            };
             let in_flight = readiness.as_ref().map(|r| r.in_flight as u64).unwrap_or(0);
             let activity = if !healthy {
                 format!("unhealthy: {}", health_err.as_deref().unwrap_or("unknown"))
@@ -4601,7 +4630,7 @@ mod distill_search_mapping_tests {
             doi: Some("10.1234/test".to_string()),
             chunk_text: "lorem ipsum dolor sit amet".to_string(),
             score: 0.87,
-            pdf_path: Some("papers/10/10.1234_test.pdf".to_string()),
+            store: hs_common::stores::ACADEMIC.to_string(),
             line_start: 12,
             line_end: 16,
             page: Some(3),
@@ -4641,9 +4670,9 @@ mod distill_search_mapping_tests {
 
     #[test]
     fn a_hit_carries_the_links_a_user_can_open() {
-        // The `pdf_path` on a hit is a storage key on this host. The
+        // A hit names its document, never a storage key on this host. The
         // links are what a caller can open, and they are what the tool
-        // returns instead.
+        // returns.
         let out = map_distill_search_hits(fixture(), true, Some(&minter()));
         let json = serde_json::to_string(&out).unwrap();
         assert!(json.contains("\"links\""), "json: {json}");

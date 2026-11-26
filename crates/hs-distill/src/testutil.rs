@@ -122,6 +122,7 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<Recorded> {
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use hs_common::stores::{StoreSpec, Stores, PERSONAL_PREFIX_DEFAULT};
 
 use crate::client::SearchHit;
 use crate::config::DistillServerConfig;
@@ -133,13 +134,13 @@ use crate::types::{Chunk, ChunkSpan, DocumentMeta};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Op {
     Write {
-        collection: String,
+        store: String,
         doc_id: String,
         /// Chunk indexes, in the order written.
         indexes: Vec<u32>,
     },
     Forget {
-        collection: String,
+        store: String,
         doc_id: String,
         keep: Vec<String>,
     },
@@ -147,11 +148,15 @@ pub(crate) enum Op {
 
 #[derive(Default)]
 pub(crate) struct StoreState {
-    /// (collection, doc_id) -> every stored record, whatever its generation.
+    /// (store, doc_id) -> every stored record, whatever its generation.
     pub docs: BTreeMap<(String, String), Vec<(String, Chunk)>>,
     pub ops: Vec<Op>,
-    /// (collection, query, limit, filter) of every search.
-    pub searches: Vec<(String, String, u64, SearchFilter)>,
+    /// Every store that was defined, in order.
+    pub defined: Vec<StoreSpec>,
+    /// Refuse every `define_store` call.
+    pub fail_define: bool,
+    /// (stores, query, limit, filter) of every search.
+    pub searches: Vec<(Vec<String>, String, u64, SearchFilter)>,
     /// Fail the n-th (0-based) `write_document` call and every later one.
     pub fail_write_from_call: Option<usize>,
     pub write_calls: usize,
@@ -201,11 +206,11 @@ impl StoreState {
 
 impl FakeStore {
     /// Chunk indexes of the records stored for `doc_id`, in storage order.
-    pub fn stored(&self, collection: &str, doc_id: &str) -> Vec<u32> {
+    pub fn stored(&self, store: &str, doc_id: &str) -> Vec<u32> {
         self.state
             .lock()
             .docs
-            .get(&(collection.to_string(), doc_id.to_string()))
+            .get(&(store.to_string(), doc_id.to_string()))
             .map(|records| records.iter().map(|(_, c)| c.chunk_index).collect())
             .unwrap_or_default()
     }
@@ -214,12 +219,12 @@ impl FakeStore {
         self.state.lock().ops.clone()
     }
 
-    pub fn seed(&self, collection: &str, doc_id: &str, chunks: u32) {
+    pub fn seed(&self, store: &str, doc_id: &str, chunks: u32) {
         let mut st = self.state.lock();
         let records = (0..chunks)
             .map(|i| (st.new_record(), blank_chunk(doc_id, i)))
             .collect();
-        st.docs.insert((collection.into(), doc_id.into()), records);
+        st.docs.insert((store.into(), doc_id.into()), records);
     }
 }
 
@@ -232,9 +237,18 @@ impl DocumentStore for FakeStore {
         Ok("fake-myelin 1.0.0".into())
     }
 
+    async fn define_store(&self, spec: &StoreSpec) -> Result<(), DistillError> {
+        let mut st = self.state.lock();
+        if st.fail_define {
+            return Err(DistillError::Backend("define refused".into()));
+        }
+        st.defined.push(spec.clone());
+        Ok(())
+    }
+
     async fn write_document(
         &self,
-        collection: &str,
+        store: &str,
         doc_id: &str,
         chunks: &[Chunk],
     ) -> Result<Vec<String>, DistillError> {
@@ -252,13 +266,13 @@ impl DocumentStore for FakeStore {
             let id = st.new_record();
             ids.push(id.clone());
             st.docs
-                .entry((collection.to_string(), doc_id.to_string()))
+                .entry((store.to_string(), doc_id.to_string()))
                 .or_default()
                 .push((id, chunk.clone()));
         }
         st.written.extend(chunks.iter().cloned());
         st.ops.push(Op::Write {
-            collection: collection.into(),
+            store: store.into(),
             doc_id: doc_id.into(),
             indexes: chunks.iter().map(|c| c.chunk_index).collect(),
         });
@@ -267,7 +281,7 @@ impl DocumentStore for FakeStore {
 
     async fn forget_document(
         &self,
-        collection: &str,
+        store: &str,
         doc_id: &str,
         keep: &[String],
     ) -> Result<u64, DistillError> {
@@ -276,11 +290,11 @@ impl DocumentStore for FakeStore {
             return Err(DistillError::Backend("forget failed".into()));
         }
         st.ops.push(Op::Forget {
-            collection: collection.into(),
+            store: store.into(),
             doc_id: doc_id.into(),
             keep: keep.to_vec(),
         });
-        let key = (collection.to_string(), doc_id.to_string());
+        let key = (store.to_string(), doc_id.to_string());
         let Some(records) = st.docs.get_mut(&key) else {
             return Ok(0);
         };
@@ -295,14 +309,18 @@ impl DocumentStore for FakeStore {
 
     async fn search(
         &self,
-        collection: &str,
+        stores: &[&str],
         query: &str,
         limit: u64,
         filter: &SearchFilter,
     ) -> Result<Vec<SearchHit>, DistillError> {
         let mut st = self.state.lock();
-        st.searches
-            .push((collection.into(), query.into(), limit, filter.clone()));
+        st.searches.push((
+            stores.iter().map(|s| s.to_string()).collect(),
+            query.into(),
+            limit,
+            filter.clone(),
+        ));
         Ok(st
             .canned_hits
             .iter()
@@ -313,15 +331,15 @@ impl DocumentStore for FakeStore {
 
     async fn inventory(
         &self,
-        collection: &str,
+        store: &str,
         doc_id: Option<&str>,
     ) -> Result<BTreeMap<String, u64>, DistillError> {
         let st = self.state.lock();
         Ok(st
             .docs
             .iter()
-            .filter(|((c, d), records)| {
-                c == collection && doc_id.is_none_or(|want| want == d) && !records.is_empty()
+            .filter(|((s, d), records)| {
+                s == store && doc_id.is_none_or(|want| want == d) && !records.is_empty()
             })
             .map(|((_, d), records)| (d.clone(), records.len() as u64))
             .collect())
@@ -376,7 +394,10 @@ pub(crate) async fn fake_state() -> (crate::api::DistillServerState, Arc<FakeSto
         ollama_url: ollama.http.url(),
         ..small_chunk_config()
     };
-    let state = crate::api::DistillServerState::new(store.clone(), reqwest::Client::new(), config);
+    let stores = Stores::with_personal_prefix(PERSONAL_PREFIX_DEFAULT)
+        .expect("the default personal prefix is a valid one");
+    let state =
+        crate::api::DistillServerState::new(store.clone(), reqwest::Client::new(), config, stores);
     (state, store, ollama)
 }
 
@@ -402,3 +423,11 @@ pub(crate) fn prose(sentences: usize) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// A page that is a reference list: every line is a citation. Short enough
+/// to be one chunk under [`small_chunk_config`].
+pub(crate) const BIBLIOGRAPHY: &str =
+    "Berkenbosch F, van Vant J, Aubert A, et al. (2001) Neurotrophins and the brain. \
+     Nature Reviews Neuroscience.\n\
+     van Vant J, Jonkman T, Caligor L (2004) Neurobiology of learning and memory. \
+     Journal of Neurochemistry.";

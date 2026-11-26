@@ -798,9 +798,7 @@ mod tests {
     fn health_route(device: &str) -> HashMap<String, Route> {
         HashMap::from([(
             "/health".to_string(),
-            Route::ok(format!(
-                r#"{{"status":"ok","compute_device":"{device}","collection":"c"}}"#
-            )),
+            Route::ok(format!(r#"{{"status":"ok","compute_device":"{device}"}}"#)),
         )])
     }
 

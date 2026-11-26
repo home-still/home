@@ -54,11 +54,6 @@ GPU stops and says why. The usual reasons:
    nvidia-smi --query-compute-apps=pid,used_gpu_memory,process_name --format=csv
    ```
 
-   To let the distill server hand its memory back when it is idle, set
-   `embedding.idle_release_secs` under `distill_server` in
-   `~/.home-still/config.yaml`, and restart it. See
-   [Sharing one GPU](../explanation/architecture.md#sharing-one-gpu).
-
 2. Check which libraries the provider cannot find:
 
    ```sh

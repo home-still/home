@@ -12,12 +12,10 @@ use crate::types::DocumentMeta;
 pub fn extract_rule_based(
     markdown: &str,
     stem: &str,
-    markdown_path: &str,
     catalog: Option<&CatalogEntry>,
 ) -> DocumentMeta {
     let mut meta = DocumentMeta {
         doc_id: stem.to_string(),
-        markdown_path: markdown_path.to_string(),
         ..Default::default()
     };
 
@@ -33,15 +31,8 @@ pub fn extract_rule_based(
         meta.category = cat.category.clone();
         meta.original_format = cat.original_format.clone();
         meta.ingested_at = cat.downloaded_at.clone();
+        meta.source_url = cat.source_url.clone();
     }
-
-    // Always derive pdf_path from the sharded storage key rather than the
-    // catalog's `pdf_path` field — that field is a host-local filesystem
-    // path (e.g. `/Users/.../papers/10/DOI.pdf`) written by whichever
-    // machine ran the downloader, and leaking it through search results
-    // exposes the downloader's home directory. The storage key is the
-    // canonical location and is identical across hosts.
-    meta.pdf_path = Some(format!("papers/{}", hs_common::sharded_key(stem, "pdf")));
 
     // A document with no catalog row still gets a title, taken from its
     // own first heading. A title-less point is not merely a display
@@ -400,7 +391,7 @@ mod tests {
         // None rather than pick one of them.
         let markdown = "Frontiers in Psychology\n\nCopyright 2008 the authors\n\n\
                         See Smith et al. 1998 for background.\n\nAbstract";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        let meta = extract_rule_based(markdown, "stem", None);
         assert_eq!(meta.publication_date, None);
     }
 
@@ -410,7 +401,7 @@ mod tests {
         // cannot name the document it found a passage in.
         let markdown = "# On the Run for Hippocampal Plasticity\n\nSome body text.\n\n\
                         ## A section\n\nMore text.";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        let meta = extract_rule_based(markdown, "stem", None);
         assert_eq!(
             meta.title.as_deref(),
             Some("On the Run for Hippocampal Plasticity")
@@ -423,7 +414,7 @@ mod tests {
         // with the title as a plain line.
         let markdown = "Real-Time Stress Detection by Means of Physiological Signals\n\n\
                         Authors et al.\n\nSome body text.";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        let meta = extract_rule_based(markdown, "stem", None);
         assert_eq!(
             meta.title.as_deref(),
             Some("Real-Time Stress Detection by Means of Physiological Signals")
@@ -437,7 +428,7 @@ mod tests {
         let markdown =
             "In Shanghai, nitrogen pollution has become an increasingly serious problem.\n\n\
                         More body text.";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        let meta = extract_rule_based(markdown, "stem", None);
         assert_eq!(meta.title, None);
     }
 
@@ -448,7 +439,7 @@ mod tests {
         // user verbatim, so it must not become the title.
         let markdown = "<table><tr><br>Some Heading Here</table>\n\n\
                         More body text.";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        let meta = extract_rule_based(markdown, "stem", None);
         assert_eq!(meta.title, None);
     }
 
@@ -458,7 +449,7 @@ mod tests {
         // line repeats itself. That is an artifact, not a title.
         let markdown = "The rapidity, and, and finally, and finally, and finally, and finally, \
                         finally, finally, finally, finally\n\nMore body text.";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        let meta = extract_rule_based(markdown, "stem", None);
         assert_eq!(meta.title, None);
     }
 
@@ -470,7 +461,7 @@ mod tests {
         let markdown =
             "Computational authorship verification of a major 2nd century <scp>A</scp>\n\n\
                         More body text.";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        let meta = extract_rule_based(markdown, "stem", None);
         assert_eq!(
             meta.title.as_deref(),
             Some("Computational authorship verification of a major 2nd century A")
@@ -499,7 +490,7 @@ mod tests {
         let markdown =
             "<i>Juniperus communis</i> populations exhibit low variability in hydraulic safety\n\n\
                         More body text.";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        let meta = extract_rule_based(markdown, "stem", None);
         assert_eq!(
             meta.title.as_deref(),
             Some("Juniperus communis populations exhibit low variability in hydraulic safety")
@@ -559,7 +550,7 @@ mod tests {
             ..Default::default()
         };
         let markdown = "# The Heading Title\n\nBody.";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", Some(&cat));
+        let meta = extract_rule_based(markdown, "stem", Some(&cat));
         assert_eq!(meta.title.as_deref(), Some("The Catalog Title"));
     }
 
@@ -569,7 +560,7 @@ mod tests {
         // document; a page number is not a title.
         for heading in ["# References", "# Abstract", "# 42", "# 7.1"] {
             let markdown = format!("{heading}\n\nBody text that is long enough.");
-            let meta = extract_rule_based(&markdown, "stem", "path/stem.md", None);
+            let meta = extract_rule_based(&markdown, "stem", None);
             assert_eq!(meta.title, None, "heading {heading:?} was used as a title");
         }
     }
@@ -577,7 +568,7 @@ mod tests {
     #[test]
     fn a_document_with_no_heading_has_no_title() {
         let markdown = "Just some body text, no heading at all.";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        let meta = extract_rule_based(markdown, "stem", None);
         assert_eq!(meta.title, None);
     }
 
@@ -588,7 +579,7 @@ mod tests {
             ..Default::default()
         };
         let markdown = "# A Real Heading\n\nBody.";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", Some(&cat));
+        let meta = extract_rule_based(markdown, "stem", Some(&cat));
         assert_eq!(meta.title.as_deref(), Some("A Real Heading"));
     }
 
@@ -598,7 +589,7 @@ mod tests {
             publication_date: Some("2021-03-04".into()),
             ..Default::default()
         };
-        let meta = extract_rule_based("Copyright 2008", "stem", "path/stem.md", Some(&cat));
+        let meta = extract_rule_based("Copyright 2008", "stem", Some(&cat));
         assert_eq!(meta.publication_date.as_deref(), Some("2021-03-04"));
     }
 
@@ -606,7 +597,7 @@ mod tests {
     fn doi_comes_only_from_catalog_not_body_text() {
         // Body text mentions another paper's DOI in a citation — must be ignored.
         let markdown = "... see 10.1002/aur.2049 for background ...";
-        let meta = extract_rule_based(markdown, "stem", "path/stem.md", None);
+        let meta = extract_rule_based(markdown, "stem", None);
         assert_eq!(meta.doi, None);
     }
 

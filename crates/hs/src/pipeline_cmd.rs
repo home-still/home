@@ -631,10 +631,17 @@ async fn execute_rebuild(
     }
 
     reporter.status("Store", "delete every document");
-    let store_deleted = client.reset_collection().await.context(
-        "distill reset_collection (markdown and catalog are already deleted: fix distill, then \
-         run `hs pipeline catch-up`)",
-    )?;
+    // The papers' chunks and reference lists, then their abstracts: the
+    // catalog rows that stamped the abstracts are already gone.
+    let mut store_deleted = 0u64;
+    for store in [hs_common::stores::ACADEMIC, hs_common::stores::ABSTRACTS] {
+        store_deleted += client.reset_store(store).await.with_context(|| {
+            format!(
+                "distill reset of the {store} store (markdown and catalog are already deleted: \
+                 fix distill, then run `hs pipeline catch-up`)"
+            )
+        })?;
+    }
 
     let publish =
         publish_papers_ingested(bus, &inv.paper_keys, "hs pipeline rebuild", stop, reporter).await;
@@ -682,14 +689,14 @@ async fn inventory(storage: &Arc<dyn Storage>, client: &DistillClient) -> Result
 
     // A distill server that does not answer is an error here, not "0 docs":
     // the inventory is what the operator confirms against, and `rebuild`
-    // cannot reset the collection without distill anyway.
+    // cannot reset the store without distill anyway.
     let store_ids = client
-        .list_docs(u64::MAX)
+        .list_docs(hs_common::stores::ACADEMIC, u64::MAX)
         .await
         .context("list indexed documents via the distill server")?;
     let store_docs = store_ids.len() as u64;
     let store_points = client
-        .status()
+        .status(hs_common::stores::ACADEMIC)
         .await
         .context("read the distill server status")?
         .points_count;
@@ -968,8 +975,9 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
         // The store first — if this fails, leaving the markdown/source/catalog
         // in place lets a retry hit the same victim again. The reverse
         // (delete files first, fail the store) leaves a phantom 1-chunk doc
-        // that the reconciler can never reach.
-        match client.delete_doc(&v.stem).await {
+        // that the reconciler can never reach. The abstract goes with the
+        // chunks: the catalog row that stamps it is deleted below.
+        match crate::distill_cmd::delete_paper_everywhere(&client, &v.stem).await {
             Ok(_) => store_deleted += 1,
             Err(e) => {
                 // Leave this victim's markdown/source/catalog in place so a
@@ -1406,25 +1414,39 @@ mod tests {
         Arc::new(SilentReporter)
     }
 
-    /// A distill server that answers the inventory calls and logs `reset`.
+    /// Records the fake server says each store held when it is reset.
+    const ACADEMIC_RECORDS: u64 = 42;
+    const ABSTRACT_RECORDS: u64 = 3;
+
+    /// A distill server that answers the inventory calls and logs each
+    /// store's reset as `reset:<store>`.
     async fn distill(log: &Log, reset_status: u16) -> FakeServer {
         let log = Arc::clone(log);
         FakeServer::start(move |req| match (req.method.as_str(), req.path.as_str()) {
-            ("GET", p) if p.starts_with("/docs") => Response::json(
+            ("GET", p) if p.starts_with("/docs?store=academic") => Response::json(
                 200,
                 &serde_json::json!({"doc_ids": ["10.1_a", "10.1_b"], "truncated": false}),
             ),
-            ("GET", "/status") => Response::json(
+            ("GET", "/status?store=academic") => Response::json(
                 200,
                 &serde_json::json!({
-                    "collection": "academic_papers", "points_count": 42,
+                    "store": "academic", "points_count": ACADEMIC_RECORDS,
                     "documents_count": 2, "compute_device": "cuda"
                 }),
             ),
-            ("POST", "/collection/reset") => {
-                log.lock().push("reset".into());
+            ("POST", p) if p.starts_with("/store/reset?store=") => {
+                let store = p.trim_start_matches("/store/reset?store=");
+                log.lock().push(format!("reset:{store}"));
                 if reset_status == 200 {
-                    Response::json(200, &serde_json::json!({"deleted_points": 42}))
+                    let deleted = if store == hs_common::stores::ACADEMIC {
+                        ACADEMIC_RECORDS
+                    } else {
+                        ABSTRACT_RECORDS
+                    };
+                    Response::json(
+                        200,
+                        &serde_json::json!({"store": store, "deleted": deleted}),
+                    )
                 } else {
                     Response::json(reset_status, &serde_json::json!({"error": "boom"}))
                 }
@@ -1509,20 +1531,24 @@ mod tests {
             .min(index_of(&events, "delete:catalog/cd/cdefgh.yaml"));
         let cat_last = index_of(&events, "delete:catalog/ab/abcdef.yaml")
             .max(index_of(&events, "delete:catalog/cd/cdefgh.yaml"));
-        let reset = index_of(&events, "reset");
+        let reset = index_of(&events, "reset:academic");
+        let reset_abstracts = index_of(&events, "reset:abstracts");
         let first_publish = events
             .iter()
             .position(|e| e.starts_with("publish:"))
             .unwrap();
         assert!(md < cat_first, "markdown before catalog: {events:?}");
         assert!(
-            cat_last < reset,
-            "catalog before the store is emptied: {events:?}"
+            cat_last < reset.min(reset_abstracts),
+            "catalog before the stores are emptied: {events:?}"
         );
-        assert!(reset < first_publish, "drop before republish: {events:?}");
+        assert!(
+            reset.max(reset_abstracts) < first_publish,
+            "drop before republish: {events:?}"
+        );
         assert_eq!(summary.markdown_deleted, 1);
         assert_eq!(summary.catalog_deleted, 2);
-        assert_eq!(summary.store_deleted, 42);
+        assert_eq!(summary.store_deleted, ACADEMIC_RECORDS + ABSTRACT_RECORDS);
         assert_eq!(summary.publish.published, 2);
         assert!(summary.publish.errors.is_empty());
     }
@@ -1558,7 +1584,7 @@ mod tests {
 
             let events = log.lock().clone();
             assert!(
-                !events.contains(&"reset".to_string()),
+                !events.iter().any(|e| e.starts_with("reset:")),
                 "{failing}: {events:?}"
             );
             assert!(
@@ -1570,8 +1596,8 @@ mod tests {
                 server
                     .requests()
                     .iter()
-                    .all(|r| r.path != "/collection/reset"),
-                "{failing}: the collection must not have been reset"
+                    .all(|r| !r.path.starts_with("/store/reset")),
+                "{failing}: no store may have been reset"
             );
         }
     }

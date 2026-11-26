@@ -37,7 +37,7 @@ pub fn app(state: Arc<DistillServerState>, token: BackendToken) -> Router {
         .route("/exists/{doc_id}", get(handle_exists))
         .route("/doc/{doc_id}", axum::routing::delete(handle_delete_doc))
         .route("/docs", get(handle_list_docs))
-        .route("/collection/reset", post(handle_reset_collection))
+        .route("/store/reset", post(handle_reset_store))
         .route_layer(middleware::from_fn_with_state(token, require_token));
     Router::new()
         .route("/health", get(handle_health))
@@ -112,15 +112,17 @@ fn reply<T: serde::Serialize>(result: Result<T, ApiError>) -> Response {
     }
 }
 
+/// `?store=<name>`. The name is optional here so that a request without it
+/// gets the API's own refusal, which lists the stores this server serves.
 #[derive(Deserialize)]
-struct CollectionQuery {
-    collection: Option<String>,
+struct StoreQuery {
+    store: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ListDocsQuery {
     limit: Option<u64>,
-    collection: Option<String>,
+    store: Option<String>,
 }
 
 async fn handle_health(State(state): State<Arc<DistillServerState>>) -> Response {
@@ -140,19 +142,19 @@ async fn handle_readiness(State(state): State<Arc<DistillServerState>>) -> Respo
 
 async fn handle_status(
     State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<CollectionQuery>,
+    Query(q): Query<StoreQuery>,
 ) -> Response {
-    reply(state.status(q.collection.as_deref()).await)
+    reply(state.status(q.store.as_deref()).await)
 }
 
 async fn handle_delete_doc(
     State(state): State<Arc<DistillServerState>>,
     Path(doc_id): Path<String>,
-    Query(q): Query<CollectionQuery>,
+    Query(q): Query<StoreQuery>,
 ) -> Response {
     reply(
         state
-            .delete_doc(&doc_id, q.collection.as_deref())
+            .delete_doc(&doc_id, q.store.as_deref())
             .await
             .map(|deleted| serde_json::json!({"doc_id": doc_id, "deleted": deleted})),
     )
@@ -164,34 +166,32 @@ async fn handle_list_docs(
 ) -> Response {
     reply(
         state
-            .list_docs(q.limit, q.collection.as_deref())
+            .list_docs(q.limit, q.store.as_deref())
             .await
             .map(|docs| serde_json::json!({"doc_ids": docs.doc_ids, "truncated": docs.truncated})),
     )
 }
 
-async fn handle_reset_collection(
+async fn handle_reset_store(
     State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<CollectionQuery>,
+    Query(q): Query<StoreQuery>,
 ) -> Response {
     reply(
         state
-            .reset_collection(q.collection.as_deref())
+            .reset_store(q.store.as_deref())
             .await
-            .map(|(collection, deleted)| {
-                serde_json::json!({"collection": collection, "deleted_points": deleted})
-            }),
+            .map(|(store, deleted)| serde_json::json!({"store": store, "deleted": deleted})),
     )
 }
 
 async fn handle_exists(
     State(state): State<Arc<DistillServerState>>,
     Path(doc_id): Path<String>,
-    Query(q): Query<CollectionQuery>,
+    Query(q): Query<StoreQuery>,
 ) -> Response {
     reply(
         state
-            .doc_exists(&doc_id, q.collection.as_deref())
+            .doc_exists(&doc_id, q.store.as_deref())
             .await
             .map(|(exists, chunks)| serde_json::json!({"exists": exists, "chunks": chunks})),
     )
@@ -261,6 +261,7 @@ mod tests {
     use crate::client::{DistillStreamLine, ReadinessResponse};
     use crate::testutil::{fake_state, prose, FakeOllama, FakeStore, OllamaMode};
     use hs_common::service::protocol::StreamLine;
+    use hs_common::stores::{ACADEMIC, PERSONAL};
 
     /// A real axum server on an ephemeral loopback port, over fakes.
     const TOKEN: &str = "test-backend-token-0123456789abcdef";
@@ -357,14 +358,16 @@ mod tests {
         let resp = h
             .post(
                 "/distill",
-                serde_json::json!({ "path": "markdown/ab/doc.md", "content": prose(6) }),
+                serde_json::json!({
+                    "path": "markdown/ab/doc.md", "content": prose(6), "store": ACADEMIC
+                }),
             )
             .await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["doc_id"], "doc");
         assert!(body["chunks_indexed"].as_u64().unwrap() > 0);
-        assert!(!h.store.stored("academic_papers", "doc").is_empty());
+        assert!(!h.store.stored(ACADEMIC, "doc").is_empty());
     }
 
     #[tokio::test]
@@ -373,7 +376,7 @@ mod tests {
         let text = h
             .post(
                 "/distill/stream",
-                serde_json::json!({ "path": "doc.md", "content": prose(6) }),
+                serde_json::json!({ "path": "doc.md", "content": prose(6), "store": ACADEMIC }),
             )
             .await
             .text()
@@ -398,7 +401,7 @@ mod tests {
         let text = h
             .post(
                 "/distill/stream",
-                serde_json::json!({ "path": "doc.md", "content": prose(6) }),
+                serde_json::json!({ "path": "doc.md", "content": prose(6), "store": ACADEMIC }),
             )
             .await
             .text()
@@ -409,23 +412,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_collection_is_400_on_every_route_and_creates_nothing() {
+    async fn an_unknown_store_is_400_on_every_route_and_touches_nothing() {
         let h = start().await;
-        let q = "collection=made_up";
+        let q = "store=made_up";
         let responses = vec![
             h.post(
                 "/distill",
-                serde_json::json!({"path":"a.md","content":"x","collection":"made_up"}),
+                serde_json::json!({"path":"a.md","content":"x","store":"made_up"}),
             )
             .await,
             h.post(
                 "/distill/stream",
-                serde_json::json!({"path":"a.md","content":"x","collection":"made_up"}),
+                serde_json::json!({"path":"a.md","content":"x","store":"made_up"}),
             )
             .await,
             h.post(
                 "/search",
-                serde_json::json!({"query":"q","collection":"made_up"}),
+                serde_json::json!({"query":"q","stores":["made_up"]}),
             )
             .await,
             h.http
@@ -449,7 +452,7 @@ mod tests {
                 .await
                 .unwrap(),
             h.http
-                .post(h.url(&format!("/collection/reset?{q}")))
+                .post(h.url(&format!("/store/reset?{q}")))
                 .send()
                 .await
                 .unwrap(),
@@ -457,23 +460,56 @@ mod tests {
         for resp in responses {
             let url = resp.url().path().to_string();
             assert_eq!(resp.status(), 400, "{url}");
+            let text = resp.text().await.unwrap();
+            assert!(text.contains("unknown store"), "{url}: {text}");
         }
         assert_eq!(h.store.ops(), []);
         assert!(h.ollama.http.recorded().is_empty());
     }
 
     #[tokio::test]
-    async fn configured_extra_collection_is_served() {
+    async fn only_a_search_may_leave_the_store_unnamed() {
+        let h = start().await;
+        let responses = vec![
+            h.post("/distill", serde_json::json!({"path":"a.md","content":"x"}))
+                .await,
+            h.post(
+                "/distill/stream",
+                serde_json::json!({"path":"a.md","content":"x"}),
+            )
+            .await,
+            h.http.get(h.url("/status")).send().await.unwrap(),
+            h.http.get(h.url("/exists/d")).send().await.unwrap(),
+            h.http.get(h.url("/docs")).send().await.unwrap(),
+            h.http.delete(h.url("/doc/d")).send().await.unwrap(),
+            h.http.post(h.url("/store/reset")).send().await.unwrap(),
+        ];
+        for resp in responses {
+            let url = resp.url().path().to_string();
+            assert_eq!(resp.status(), 400, "{url}");
+            let text = resp.text().await.unwrap();
+            assert!(text.contains("`store` is required"), "{url}: {text}");
+        }
+        assert_eq!(h.store.ops(), []);
+        assert!(h.ollama.http.recorded().is_empty());
+
+        // A search that names none reads the default stores.
+        let resp = h.post("/search", serde_json::json!({"query":"q"})).await;
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn a_document_is_filed_in_the_store_the_request_names() {
         let h = start().await;
         let resp = h
             .post(
                 "/distill",
-                serde_json::json!({"path":"a.md","content":prose(4),"collection":"personal_docs"}),
+                serde_json::json!({"path":"a.md","content":prose(4),"store":PERSONAL}),
             )
             .await;
         assert_eq!(resp.status(), 200);
-        assert!(!h.store.stored("personal_docs", "a").is_empty());
-        assert!(h.store.stored("academic_papers", "a").is_empty());
+        assert!(!h.store.stored(PERSONAL, "a").is_empty());
+        assert!(h.store.stored(ACADEMIC, "a").is_empty());
     }
 
     #[tokio::test]
@@ -496,14 +532,17 @@ mod tests {
             400
         );
         assert_eq!(
-            h.post("/distill", serde_json::json!({"path":"..","content":"x"}))
-                .await
-                .status(),
+            h.post(
+                "/distill",
+                serde_json::json!({"path":"..","content":"x","store":ACADEMIC})
+            )
+            .await
+            .status(),
             400
         );
         assert_eq!(
             h.http
-                .get(h.url("/docs?limit=99999999"))
+                .get(h.url("/docs?store=academic&limit=99999999"))
                 .send()
                 .await
                 .unwrap()
@@ -515,7 +554,7 @@ mod tests {
         assert_eq!(
             h.post(
                 "/distill",
-                serde_json::json!({"path":"a.md","content":prose(6)})
+                serde_json::json!({"path":"a.md","content":prose(6),"store":ACADEMIC})
             )
             .await
             .status(),
@@ -527,11 +566,11 @@ mod tests {
     async fn docs_lists_ids_with_a_truncation_flag() {
         let h = start().await;
         for d in ["a", "b", "c"] {
-            h.store.seed("academic_papers", d, 1);
+            h.store.seed(ACADEMIC, d, 1);
         }
         let all: serde_json::Value = h
             .http
-            .get(h.url("/docs"))
+            .get(h.url("/docs?store=academic"))
             .send()
             .await
             .unwrap()
@@ -542,7 +581,7 @@ mod tests {
         assert_eq!(all["truncated"], false);
         let some: serde_json::Value = h
             .http
-            .get(h.url("/docs?limit=2"))
+            .get(h.url("/docs?store=academic&limit=2"))
             .send()
             .await
             .unwrap()
@@ -598,10 +637,10 @@ mod tests {
     #[tokio::test]
     async fn delete_and_exists_round_trip() {
         let h = start().await;
-        h.store.seed("academic_papers", "d", 3);
+        h.store.seed(ACADEMIC, "d", 3);
         let exists: serde_json::Value = h
             .http
-            .get(h.url("/exists/d"))
+            .get(h.url("/exists/d?store=academic"))
             .send()
             .await
             .unwrap()
@@ -614,7 +653,7 @@ mod tests {
         );
         let deleted: serde_json::Value = h
             .http
-            .delete(h.url("/doc/d"))
+            .delete(h.url("/doc/d?store=academic"))
             .send()
             .await
             .unwrap()
@@ -624,7 +663,7 @@ mod tests {
         assert_eq!(deleted["deleted"], 3);
         let exists: serde_json::Value = h
             .http
-            .get(h.url("/exists/d"))
+            .get(h.url("/exists/d?store=academic"))
             .send()
             .await
             .unwrap()
@@ -650,18 +689,24 @@ mod tests {
         );
 
         let indexed = client
-            .index_content("markdown/ab/doc.md", &prose(8), None)
+            .index_content(ACADEMIC, "markdown/ab/doc.md", &prose(8), None)
             .await
             .unwrap();
         assert_eq!(indexed.doc_id, "doc");
         assert!(indexed.chunks_indexed > 0);
         assert_eq!(
-            client.doc_chunks("doc").await.unwrap(),
+            client.doc_chunks(ACADEMIC, "doc").await.unwrap(),
             (true, u64::from(indexed.chunks_indexed))
         );
-        assert_eq!(client.list_docs(10).await.unwrap(), ["doc"]);
+        assert_eq!(client.list_docs(ACADEMIC, 10).await.unwrap(), ["doc"]);
+        assert_eq!(
+            client.doc_chunks(PERSONAL, "doc").await.unwrap(),
+            (false, 0),
+            "another store does not hold it"
+        );
 
-        let status = client.status().await.unwrap();
+        let status = client.status(ACADEMIC).await.unwrap();
+        assert_eq!(status.store, ACADEMIC);
         assert_eq!(status.documents_count, 1);
         assert_eq!(status.points_count, u64::from(indexed.chunks_indexed));
         assert!(!status.documents_count_truncated);
@@ -676,6 +721,7 @@ mod tests {
 
         client
             .search(
+                &[ACADEMIC],
                 "query",
                 5,
                 SearchFilters {
@@ -687,6 +733,7 @@ mod tests {
             .unwrap();
         let err = client
             .search(
+                &[],
                 "query",
                 5,
                 SearchFilters {
@@ -699,19 +746,19 @@ mod tests {
         assert!(format!("{err:#}").contains("400"), "{err:#}");
 
         let unknown = client
-            .index_content_in("a.md", "text", None, Some("made_up"))
+            .index_content("made_up", "a.md", "text", None)
             .await
             .unwrap_err();
         assert!(
-            format!("{unknown:#}").contains("unknown collection"),
+            format!("{unknown:#}").contains("unknown store"),
             "{unknown:#}"
         );
 
         assert_eq!(
-            client.delete_doc("doc").await.unwrap(),
+            client.delete_doc(ACADEMIC, "doc").await.unwrap(),
             u64::from(indexed.chunks_indexed)
         );
-        assert_eq!(client.reset_collection().await.unwrap(), 0);
+        assert_eq!(client.reset_store(ACADEMIC).await.unwrap(), 0);
     }
 
     // ── RA-26: backend bearer token ────────────────────────────────────
@@ -726,7 +773,7 @@ mod tests {
             ("GET", "/exists/d"),
             ("DELETE", "/doc/d"),
             ("GET", "/docs"),
-            ("POST", "/collection/reset"),
+            ("POST", "/store/reset"),
         ]
     }
 
@@ -793,7 +840,7 @@ mod tests {
         let resp = h
             .post(
                 "/distill",
-                serde_json::json!({"path":"boom.md","content":prose(6)}),
+                serde_json::json!({"path":"boom.md","content":prose(6),"store":ACADEMIC}),
             )
             .await;
         assert_eq!(resp.status(), 500);
@@ -802,7 +849,7 @@ mod tests {
         let text = h
             .post(
                 "/distill/stream",
-                serde_json::json!({"path":"boom.md","content":prose(6)}),
+                serde_json::json!({"path":"boom.md","content":prose(6),"store":ACADEMIC}),
             )
             .await
             .text()
@@ -823,7 +870,7 @@ mod tests {
             ),
         );
         let err = client
-            .index_content("boom.md", &prose(6), None)
+            .index_content(ACADEMIC, "boom.md", &prose(6), None)
             .await
             .unwrap_err();
         let typed = err
@@ -836,7 +883,7 @@ mod tests {
         assert_eq!(
             h.post(
                 "/distill",
-                serde_json::json!({"path":"ok.md","content":prose(6)})
+                serde_json::json!({"path":"ok.md","content":prose(6),"store":ACADEMIC})
             )
             .await
             .status(),
@@ -845,15 +892,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_title_hnsw_and_scrub_routes_are_gone() {
-        // Titles are derived at index time, there is no HNSW to enable and no
-        // per-chunk scrub: these routes have no handler, token or not.
+    async fn the_title_hnsw_scrub_and_collection_routes_are_gone() {
+        // Titles are derived at index time, there is no HNSW to enable, no
+        // per-chunk scrub and no collection: these routes have no handler,
+        // token or not.
         let h = start().await;
         for (method, path) in [
             ("POST", "/doc/d/title"),
             ("GET", "/docs/titles"),
             ("GET", "/docs/markdown-paths"),
             ("POST", "/collection/hnsw"),
+            ("POST", "/collection/reset"),
             ("POST", "/scrub-interstitials"),
         ] {
             let resp = send(&h.http, method, h.url(path)).await;

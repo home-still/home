@@ -32,7 +32,7 @@ Every command accepts these flags, before or after the subcommand.
 | `--verbose` | off | Show debug-level output. |
 | `-y`, `--yes` | off | Skip interactive prompts and assume yes. |
 
-A few commands define their own flag with the same name, and the local flag replaces the global one on that command: `--yes` on `hs pipeline rebuild`, `hs pipeline purge-skipped`, `hs pipeline purge-poisoned`, `hs pipeline reap-phantoms`, `hs pipeline purge-poisoned-chunks`, `hs pipeline reconvert-failed` and `hs distill hnsw enable` (long form only, no `-y`), and `--verbose` on `hs distill diagnose`.
+A few commands define their own flag with the same name, and the local flag replaces the global one on that command: `--yes` on `hs pipeline rebuild`, `hs pipeline purge-skipped`, `hs pipeline purge-poisoned`, `hs pipeline reap-phantoms` and `hs pipeline reconvert-failed` (long form only, no `-y`), and `--verbose` on `hs distill diagnose`.
 
 Secrets in `~/.home-still/secrets.env` are exported into the environment before any command runs; a secrets file that cannot be read stops the command with exit code 2.
 
@@ -727,17 +727,14 @@ hs distill [OPTIONS] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `hs distill init` | Set up Qdrant and distill server environment. |
-| `hs distill index` | Index markdown files into Qdrant through the distill server. |
+| `hs distill index` | Index markdown files into the `academic` store through the distill server. |
 | `hs distill search` | Semantic search across indexed documents. |
-| `hs distill hnsw` | Manage HNSW indexing of the Qdrant collections. |
-| `hs distill status` | Show distill system status (Qdrant, server, collection). |
+| `hs distill status` | Show distill system status (server, backend, the `academic` store). |
 | `hs distill watch-events` | Consume `scribe.completed` events from the event bus and index each markdown object through the distill server. |
 | `hs distill diagnose` | Explain why a stem produces or does not produce chunks: fetch its markdown, run the chunker and quality filter, and print the accept or reject reason for each chunk. |
-| `hs distill reconcile` | Compare the markdown objects, the Qdrant index and the catalog, and optionally repair the differences. |
-| `hs distill backfill-titles` | Write the catalog's title onto the Qdrant points of documents that were indexed without one. |
-| `hs distill purge` | Delete every Qdrant chunk for a `doc_id`. |
-| `hs distill abstracts` | Manage the `paper_abstracts` collection, which holds one embedding per paper built from its title and abstract. |
+| `hs distill reconcile` | Compare the markdown objects, the `academic` store and the catalog, and optionally repair the differences. |
+| `hs distill purge` | Delete every stored chunk for a `doc_id`. |
+| `hs distill abstracts` | Manage the `abstracts` store, which holds one record per paper built from its title and abstract. |
 
 The distill commands talk to the distill server named by `distill.servers` and read `storage:`; the watcher also needs `events:`. See [configuration](configuration.md).
 
@@ -747,29 +744,9 @@ Example:
 hs distill --help
 ```
 
-### `hs distill init`
-
-Set up Qdrant and distill server environment.
-
-```text
-hs distill init [OPTIONS]
-```
-
-| Name | Default | Meaning |
-|---|---|---|
-| `--force` | off | Re-create compose config even if it exists. |
-
-Checks whether Qdrant answers at the address in `distill_server.qdrant_url`. When it does and `--force` is absent, nothing is created. Otherwise the command needs Docker or Podman, writes `~/.home-still/docker-compose-distill.yml` for Qdrant, starts it, and waits for its health endpoint. It then reports whether the `hs-distill-server` binary is installed.
-
-Example:
-
-```bash
-hs distill init
-```
-
 ### `hs distill index`
 
-Index markdown files into Qdrant through the distill server.
+Index markdown files into the `academic` store through the distill server.
 
 ```text
 hs distill index [OPTIONS]
@@ -803,61 +780,21 @@ hs distill search [OPTIONS] <QUERY>
 | `-l`, `--limit <LIMIT>` | `10` | Number of results. |
 | `--year <YEAR>` | none | Filter by year (e.g., ">2020"). |
 | `--topic <TOPIC>` | none | Filter by topic. |
+| `--store <NAME>` | none | Store to search: `academic`, `abstracts`, `references`, `personal`, `web` or `syntheses`. Repeat the flag to search several. Without it the server searches its default stores, which is `academic`. |
 | `--server <SERVER>` | none | Override server URL. |
 
-Prints ranked chunks with title, authors, year, page and a text preview. `--output json` prints the hits as one JSON array; `--output ndjson` prints one hit per line. An empty query is an error.
+Prints ranked chunks with title, authors, year, the store and document each one is from, its lines and page, and a text preview. `--output json` prints the hits as one JSON array; `--output ndjson` prints one hit per line. An empty query is an error, and so is a store the server does not have.
 
 Example:
 
 ```bash
 hs distill search "attention mechanisms" --year ">2020" --limit 5
-```
-
-### `hs distill hnsw`
-
-Manage HNSW indexing of the Qdrant collections.
-
-```text
-hs distill hnsw [OPTIONS] <COMMAND>
-```
-
-| Command | Description |
-|---|---|
-| `hs distill hnsw enable` | Enable HNSW on a configured collection. Starts a background whole-collection index build on the Qdrant host: requires --yes. |
-
-HNSW indexing builds a graph over a whole collection on the Qdrant host.
-
-Example:
-
-```bash
-hs distill hnsw --help
-```
-
-### `hs distill hnsw enable`
-
-Enable HNSW on a configured collection. Starts a background whole-collection index build on the Qdrant host: requires --yes.
-
-```text
-hs distill hnsw enable [OPTIONS] --collection <COLLECTION>
-```
-
-| Name | Default | Meaning |
-|---|---|---|
-| `--collection <COLLECTION>` | required | Collection name (the server accepts only configured collections). |
-| `--yes` | off | Confirm starting the background index build. Without it the command prints what it would do and exits non-zero. Long form only: `-y` is not accepted here. |
-| `--server <SERVER>` | none | Override server URL. |
-
-The server accepts only collections named in its configuration. Without `--yes` the command describes the build and exits non-zero without submitting it. When HNSW is already enabled on the collection, nothing is submitted. The server rejects requests without the right `HS_BACKEND_TOKEN` with a 401.
-
-Example:
-
-```bash
-hs distill hnsw enable --collection academic_papers --yes
+hs distill search "transformer architectures survey" --store abstracts
 ```
 
 ### `hs distill status`
 
-Show distill system status (Qdrant, server, collection).
+Show distill system status (server, backend, the `academic` store).
 
 ```text
 hs distill status [OPTIONS]
@@ -867,7 +804,7 @@ hs distill status [OPTIONS]
 |---|---|---|
 | `--server <SERVER>` | none | Override server URL. |
 
-Prints Qdrant, server and collection state.
+Prints the server's state, then the `academic` store's chunk count and the device the embedding model runs on.
 
 Example:
 
@@ -918,7 +855,7 @@ hs distill diagnose 10.48550_arxiv.2312.10997 --verbose
 
 ### `hs distill reconcile`
 
-Compare the markdown objects, the Qdrant index and the catalog, and optionally repair the differences.
+Compare the markdown objects, the `academic` store and the catalog, and optionally repair the differences.
 
 ```text
 hs distill reconcile [OPTIONS]
@@ -926,11 +863,11 @@ hs distill reconcile [OPTIONS]
 
 | Name | Default | Meaning |
 |---|---|---|
-| `--fix-stamps` | off | Backfill missing `embedding` stamps for docs already in Qdrant. |
-| `--reembed` | off | Re-index markdown that never reached Qdrant. |
+| `--fix-stamps` | off | Backfill missing `embedding` stamps for docs already in the store. |
+| `--reembed` | off | Re-index markdown that never reached the store. |
 | `--server <SERVER>` | none | Override server URL. |
 
-Without flags the command only reports counts and examples: the documents that are `ok`, those missing their `embedding` stamp (embedded but unstamped), and those whose markdown never reached Qdrant. `--fix-stamps` writes the missing stamps. `--reembed` re-indexes the markdown that never reached Qdrant. The command lists every markdown object, every indexed `doc_id` and every catalog entry, so it takes time on a large corpus.
+Without flags the command only reports counts and examples: the documents that are `ok`, those missing their `embedding` stamp (embedded but unstamped), and those whose markdown never reached the store. `--fix-stamps` writes the missing stamps. `--reembed` re-indexes the markdown that never reached the store. The command lists every markdown object, every indexed `doc_id` and every catalog entry, so it takes time on a large corpus.
 
 Example:
 
@@ -938,30 +875,9 @@ Example:
 hs distill reconcile --fix-stamps
 ```
 
-### `hs distill backfill-titles`
-
-Write the catalog's title onto the Qdrant points of documents that were indexed without one.
-
-```text
-hs distill backfill-titles [OPTIONS]
-```
-
-| Name | Default | Meaning |
-|---|---|---|
-| `--apply` | off | Write the titles. Without this, report what would change. |
-| `--server <SERVER>` | none | Override server URL. |
-
-A document's title is copied from its catalog entry into the Qdrant payload when it is indexed, so a document indexed before its catalog entry existed has no title there. This command is a payload update: the vectors are untouched and no GPU or embedding model is needed. Documents the catalog does not know are reported as untitled and never given a placeholder. Without `--apply` it reports what would change.
-
-Example:
-
-```bash
-hs distill backfill-titles --apply
-```
-
 ### `hs distill purge`
 
-Delete every Qdrant chunk for a `doc_id`.
+Delete every stored chunk for a `doc_id`.
 
 ```text
 hs distill purge [OPTIONS] <DOC_ID>
@@ -969,10 +885,10 @@ hs distill purge [OPTIONS] <DOC_ID>
 
 | Name | Default | Meaning |
 |---|---|---|
-| `<DOC_ID>` | required | doc_id whose chunks should be deleted from Qdrant. |
+| `<DOC_ID>` | required | doc_id whose chunks should be deleted. |
 | `--server <SERVER>` | none | Override server URL. |
 
-The command is CLI-only because it is a destructive write. It has no dry run and no confirmation prompt: it asks the distill server to delete the chunks and prints how many were deleted. The markdown, the source and the catalog entry are not touched.
+The command is CLI-only because it is a destructive write. It has no dry run and no confirmation prompt: it asks the distill server to delete the document's chunks from the `academic` store, and its reference lists with them, and prints how many were deleted. The markdown, the source, the catalog entry and the paper's record in the `abstracts` store are not touched.
 
 Example:
 
@@ -982,7 +898,7 @@ hs distill purge 10.48550_arxiv.2312.10997
 
 ### `hs distill abstracts`
 
-Manage the `paper_abstracts` collection, which holds one embedding per paper built from its title and abstract.
+Manage the `abstracts` store, which holds one record per paper built from its title and abstract.
 
 ```text
 hs distill abstracts [OPTIONS] <COMMAND>
@@ -990,7 +906,7 @@ hs distill abstracts [OPTIONS] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `hs distill abstracts build` | Embed the title and abstract of every catalog entry into `paper_abstracts` and stamp the catalog. |
+| `hs distill abstracts build` | Embed the title and abstract of every catalog entry into the `abstracts` store and stamp the catalog. |
 | `hs distill abstracts reconcile` | Embed only the catalog entries that have no `abstract_embed` stamp. |
 | `hs distill abstracts status` | Report abstract coverage from the catalog stamps, broken down by source. |
 
@@ -1002,7 +918,7 @@ hs distill abstracts --help
 
 ### `hs distill abstracts build`
 
-Embed the title and abstract of every catalog entry into `paper_abstracts` and stamp the catalog.
+Embed the title and abstract of every catalog entry into the `abstracts` store and stamp the catalog.
 
 ```text
 hs distill abstracts build [OPTIONS]
@@ -1051,7 +967,7 @@ hs distill abstracts status [OPTIONS]
 
 The command takes no arguments or flags of its own.
 
-Reads only the catalog, never Qdrant, so it is safe to run while the indexer is busy. It prints the catalog size, the number of stamped entries by source (`openalex`, `catalog`, `markdown`, `title_only`) and the number of unstamped entries.
+Reads only the catalog, never the store, so it is safe to run while the indexer is busy. It prints the catalog size, the number of stamped entries by source (`openalex`, `catalog`, `markdown`, `title_only`) and the number of unstamped entries.
 
 Example:
 
@@ -1248,7 +1164,7 @@ hs serve distill [OPTIONS] [ACTION]
 | `--install` | off | Install as a system service and start it. |
 | `--uninstall` | off | Stop and remove the system service. |
 
-In the foreground the command first checks the prerequisites (Qdrant reachable or started, as `hs distill init` does), then runs the `hs-distill-server` binary on the given port. The distill server requires CUDA; a build without the `cuda` feature does not compile.
+In the foreground the command runs the `hs-distill-server` binary on the given port. The server needs a myelin server at `distill_server.myelin_url` and Ollama at `distill_server.ollama_url`; it stops at start-up when myelin refuses one of its [stores](configuration.md#stores), and answers 503 on `/health` until the embedding model is on the GPU.
 
 `--install` writes the system unit `hs-serve-distill.service` (Linux, using `sudo`) or the LaunchAgent `com.home-still.distill` (macOS), enables it and starts it. `--uninstall` removes it.
 
@@ -1790,13 +1706,12 @@ hs pipeline [OPTIONS] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `hs pipeline rebuild` | Delete the derived state (markdown, catalog entries, Qdrant vectors) and republish `papers.ingested` for every source under `papers/`. |
+| `hs pipeline rebuild` | Delete the derived state (markdown, catalog entries, stored chunks and abstracts) and republish `papers.ingested` for every source under `papers/`. |
 | `hs pipeline catch-up` | Republish `papers.ingested` for every source under `papers/` that has no markdown and no failure stamp. |
 | `hs pipeline events-reset` | Delete the JetStream streams `PAPERS`, `SCRIBE` and `DISTILL` and recreate them from the `events` configuration. |
 | `hs pipeline purge-skipped` | Delete HTML paywall and loading-stub artifacts that the indexer skipped as empty. |
-| `hs pipeline purge-poisoned` | Delete documents that reached Qdrant but whose text is an anti-bot or cookie-wall page. |
+| `hs pipeline purge-poisoned` | Delete documents that reached the store but whose text is an anti-bot or cookie-wall page. |
 | `hs pipeline reap-phantoms` | Delete catalog entries that have no downloaded paper, no markdown and no embedding record. |
-| `hs pipeline purge-poisoned-chunks` | Delete the individual Qdrant chunks whose text matches a known interstitial or cookie-banner signature. |
 | `hs pipeline reconvert-failed` | Re-queue documents whose conversion was given up on. |
 
 Pipeline operations read `storage:`, `events:` and `distill.servers`. The destructive ones (`rebuild`, `purge-*`, `reap-phantoms`) have `--dry-run` and ask for confirmation unless `--yes` is given. `--yes` on these commands is a local, long-form flag: `-y` is not accepted.
@@ -1809,7 +1724,7 @@ hs pipeline --help
 
 ### `hs pipeline rebuild`
 
-Delete the derived state (markdown, catalog entries, Qdrant vectors) and republish `papers.ingested` for every source under `papers/`.
+Delete the derived state (markdown, catalog entries, stored chunks and abstracts) and republish `papers.ingested` for every source under `papers/`.
 
 ```text
 hs pipeline rebuild [OPTIONS]
@@ -1821,7 +1736,7 @@ hs pipeline rebuild [OPTIONS]
 | `--yes` | off | Skip the interactive prompts. Requires `--confirm rebuild-from-papers`. Long form only: `-y` is not accepted here. |
 | `--confirm <CONFIRM>` | none | Confirmation token. Must equal `rebuild-from-papers` when `--yes` is set; otherwise the interactive prompt asks for it. |
 
-Prints an inventory of what it would delete and republish, and refuses to continue when there are no sources under `papers/` or the first source cannot be read. `--dry-run` stops there. Otherwise it asks `Proceed?` (default no) and then asks you to type `rebuild-from-papers`; a different answer aborts with no change. In a script, pass both `--yes` and `--confirm rebuild-from-papers`; `--yes` without the matching token is an error. The papers themselves are never touched. Rebuilding takes hours of scribe work; `hs status` shows the progress. The Qdrant collection is dropped.
+Prints an inventory of what it would delete and republish, and refuses to continue when there are no sources under `papers/` or the first source cannot be read. `--dry-run` stops there. Otherwise it asks `Proceed?` (default no) and then asks you to type `rebuild-from-papers`; a different answer aborts with no change. In a script, pass both `--yes` and `--confirm rebuild-from-papers`; `--yes` without the matching token is an error. The papers themselves are never touched. Rebuilding takes hours of scribe work; `hs status` shows the progress. Every document is deleted from the `academic` store, with its reference lists, and from the `abstracts` store.
 
 Example:
 
@@ -1890,7 +1805,7 @@ hs pipeline purge-skipped --dry-run
 
 ### `hs pipeline purge-poisoned`
 
-Delete documents that reached Qdrant but whose text is an anti-bot or cookie-wall page.
+Delete documents that reached the store but whose text is an anti-bot or cookie-wall page.
 
 ```text
 hs pipeline purge-poisoned [OPTIONS]
@@ -1901,7 +1816,7 @@ hs pipeline purge-poisoned [OPTIONS]
 | `--dry-run` | off | Report what would be deleted without touching anything. |
 | `--yes` | off | Skip the interactive confirmation prompt. |
 
-Finds markdown stubs that passed the chunk-quality floor and reached Qdrant as one-chunk vectors, but whose text matches a known anti-bot or cookie-wall signature. For each it deletes the Qdrant points, the markdown, the source PDF or HTML, and the catalog `.yaml`. `--dry-run` lists the selection and stops. Without `--yes` the command asks before deleting (default no).
+Finds markdown stubs that passed the chunk-quality floor and reached the store as one-chunk documents, but whose text matches a known anti-bot or cookie-wall signature. For each it deletes the stored chunks and the abstract, the markdown, the source PDF or HTML, and the catalog `.yaml`. `--dry-run` lists the selection and stops. Without `--yes` the command asks before deleting (default no).
 
 Example:
 
@@ -1928,27 +1843,6 @@ Example:
 
 ```bash
 hs pipeline reap-phantoms --dry-run
-```
-
-### `hs pipeline purge-poisoned-chunks`
-
-Delete the individual Qdrant chunks whose text matches a known interstitial or cookie-banner signature.
-
-```text
-hs pipeline purge-poisoned-chunks [OPTIONS]
-```
-
-| Name | Default | Meaning |
-|---|---|---|
-| `--dry-run` | off | Report what would be deleted without touching anything. |
-| `--yes` | off | Skip the interactive confirmation prompt. |
-
-Scans every Qdrant point and deletes only the chunks whose text matches a known interstitial or cookie-banner signature; the markdown, source and catalog are untouched. It is for a real paper that a trailing cookie banner contaminated. `--dry-run` reports the match count and stops. Without `--yes` the command asks before deleting (default no).
-
-Example:
-
-```bash
-hs pipeline purge-poisoned-chunks --dry-run
 ```
 
 ### `hs pipeline reconvert-failed`

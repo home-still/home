@@ -40,16 +40,11 @@ fn home_with(yaml: Option<&str>) -> (tempfile::TempDir, ConfigFile) {
 }
 
 #[test]
-fn yaml_collections_replace_the_default_list_and_host_port_are_read() {
-    let (_home, file) = home_with(Some(
-        "distill_server:\n  host: 127.0.0.1\n  port: 7444\n  collections: [only_this]\n",
-    ));
+fn the_file_sets_the_host_and_port() {
+    let (_home, file) = home_with(Some("distill_server:\n  host: 127.0.0.1\n  port: 7444\n"));
     let loaded = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();
-    assert_eq!(loaded.collections, ["only_this"]);
     assert_eq!((loaded.host.as_str(), loaded.port), ("127.0.0.1", 7444));
     loaded.validate().unwrap();
-    let served: Vec<_> = loaded.served_collections().collect();
-    assert_eq!(served, ["academic_papers", "only_this"]);
 }
 
 #[test]
@@ -77,7 +72,7 @@ fn env_overrides_the_file() {
 fn a_malformed_section_or_env_value_is_an_error_never_the_defaults() {
     for yaml in [
         "distill_server:\n  port: not-a-port\n",
-        "distill_server:\n  collections: not-a-list\n",
+        "distill_server:\n  chunk_max_tokens: many\n",
         "distill_server: [1, 2]\n",
     ] {
         let (_home, file) = home_with(Some(yaml));
@@ -100,7 +95,7 @@ fn a_malformed_section_or_env_value_is_an_error_never_the_defaults() {
 
 #[test]
 fn removed_keys_still_load() {
-    let yaml = "distill_server:\n  qdrant_url: http://localhost:6334\n  qdrant_data_dir: /x\n  embedding:\n    model: bge-m3\n    compute_device: cuda\n  hnsw:\n    m: 16\n  qdrant_upsert_batch: 10\n";
+    let yaml = "distill_server:\n  qdrant_url: http://localhost:6334\n  qdrant_data_dir: /x\n  collection_name: academic_papers\n  collections: [paper_abstracts]\n  embedding:\n    model: bge-m3\n    compute_device: cuda\n  hnsw:\n    m: 16\n  qdrant_upsert_batch: 10\n";
     let (_home, file) = home_with(Some(yaml));
     // The keys are inert; they are reported by name, never fatal.
     let loaded = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();

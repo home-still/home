@@ -615,6 +615,25 @@ impl Stores {
         })
     }
 
+    /// The store that holds `text` of the documents of the store named
+    /// `of`, when the registry has one.
+    pub fn derived(&self, of: &str, text: DerivedText) -> Option<&StoreSpec> {
+        self.0.iter().find(|spec| {
+            matches!(
+                &spec.kind,
+                StoreKind::Derived { of: parent, text: held } if *parent == of && *held == text
+            )
+        })
+    }
+
+    /// Every store whose records are taken from the documents of the
+    /// store named `of`.
+    pub fn derived_from<'a>(&'a self, of: &'a str) -> impl Iterator<Item = &'a StoreSpec> + 'a {
+        self.0.iter().filter(move |spec| {
+            matches!(&spec.kind, StoreKind::Derived { of: parent, .. } if *parent == of)
+        })
+    }
+
     /// Every store, in the order an agent is shown them.
     pub fn iter(&self) -> impl Iterator<Item = &StoreSpec> {
         self.0.iter()

@@ -24,8 +24,9 @@ pub struct DocumentMeta {
     pub abstract_text: Option<String>,
     pub cited_by_count: Option<u64>,
     pub source: Option<String>,
-    pub pdf_path: Option<String>,
-    pub markdown_path: String,
+    /// Where the document came from, when its catalog entry says: the
+    /// address a captured web page was captured from.
+    pub source_url: Option<String>,
     pub keywords: Vec<String>,
     pub topics: Vec<String>,
     /// Personal-store category (`medical`, `financial`, …). Always `None` for
