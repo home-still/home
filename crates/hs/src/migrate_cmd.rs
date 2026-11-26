@@ -1471,7 +1471,7 @@ async fn move_object(
 ///   next fetch of that DOI would land on the canonical key and manufacture
 ///   a fresh collision. Canonicalizing now closes that door.
 ///
-/// Vectors for every dropped `doc_id` are purged from Qdrant, and any stem
+/// Records for every dropped `doc_id` are purged from the store, and any stem
 /// whose canonical markdown changed is re-indexed, so storage and the index
 /// stay in agreement. Without the purge the duplicate stays searchable —
 /// which is the whole defect.

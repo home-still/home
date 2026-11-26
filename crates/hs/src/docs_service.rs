@@ -1049,7 +1049,7 @@ pub(crate) mod tests {
     /// A personal document is served by the same service, with the same
     /// signed links.
     ///
-    /// Measured 2026-10-21: `personal_search` returned **0 of 5** hits
+    /// Measured 2026-10-21: a search of the personal documents returned **0 of 5** hits
     /// with a link, because the personal store was outside the
     /// `Storage` the docs service reads.
     #[tokio::test]

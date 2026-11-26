@@ -818,7 +818,7 @@ async fn cmd_status(server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Resul
     match client.status(hs_common::stores::ACADEMIC).await {
         Ok(status) => {
             reporter.status("Store", &status.store);
-            reporter.status("Chunks", &status.points_count.to_string());
+            reporter.status("Chunks", &status.records_count.to_string());
             reporter.status("Device", &status.compute_device);
         }
         Err(e) => {
@@ -2097,7 +2097,7 @@ mod status_tests {
                 200,
                 &serde_json::json!({
                     "store": "academic",
-                    "points_count": 445451,
+                    "records_count": 445451,
                     "compute_device": "Cuda",
                     "myelin_url": "http://127.0.0.1:7462/mcp",
                 }),

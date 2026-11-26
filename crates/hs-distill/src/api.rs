@@ -491,7 +491,7 @@ impl DistillServerState {
         let counts = self.chunk_counts(spec, None).await?;
         Ok(StatusResponse {
             store: spec.name.to_string(),
-            points_count: counts.values().sum(),
+            records_count: counts.values().sum(),
             documents_count: counts.len() as u64,
             documents_count_truncated: false,
             compute_device: self.embedder_device().await?,
@@ -871,7 +871,7 @@ mod tests {
         assert_eq!(h.state.doc_exists("d", c).await.unwrap(), (true, 2));
         assert_eq!(h.state.list_docs(None, c).await.unwrap().doc_ids, ["d"]);
         let status = h.state.status(c).await.unwrap();
-        assert_eq!((status.points_count, status.documents_count), (2, 1));
+        assert_eq!((status.records_count, status.documents_count), (2, 1));
     }
 
     #[tokio::test]
@@ -1105,7 +1105,7 @@ mod tests {
         h.store.seed(ACADEMIC, "b", 2);
         h.store.seed(ABSTRACTS, "c", 7);
         let s = h.state.status(IN_ACADEMIC).await.unwrap();
-        assert_eq!((s.points_count, s.documents_count), (5, 2));
+        assert_eq!((s.records_count, s.documents_count), (5, 2));
         assert!(!s.documents_count_truncated);
         assert_eq!(s.embed_model, "bge-m3:latest");
         assert_eq!(s.compute_device, "cuda");
@@ -1124,7 +1124,7 @@ mod tests {
         h.store.seed(ABSTRACTS, "a", 1);
 
         let s = h.state.status(IN_ACADEMIC).await.unwrap();
-        assert_eq!((s.points_count, s.documents_count), (6, 2));
+        assert_eq!((s.records_count, s.documents_count), (6, 2));
         assert_eq!(
             h.state.doc_exists("a", IN_ACADEMIC).await.unwrap(),
             (true, 5)
@@ -1143,7 +1143,7 @@ mod tests {
 
         // A store with no reference store counts only itself.
         let s = h.state.status(Some(ABSTRACTS)).await.unwrap();
-        assert_eq!((s.points_count, s.documents_count), (1, 1));
+        assert_eq!((s.records_count, s.documents_count), (1, 1));
     }
 
     #[tokio::test]

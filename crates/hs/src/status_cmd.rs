@@ -48,9 +48,11 @@ struct DashboardData {
 
     scribe_servers: Vec<ServiceStatus>,
     distill_servers: Vec<ServiceStatus>,
-    qdrant_healthy: bool,
-    qdrant_url: String,
-    qdrant_version: String,
+    store_healthy: bool,
+    /// The myelin endpoint the distill server uses; empty when unknown.
+    store_url: String,
+    store_name: String,
+    store_version: String,
 
     watcher: WatcherInfo,
     indexer: IndexerInfo,
@@ -97,9 +99,10 @@ impl DashboardData {
         // Always update network-sourced fields
         self.scribe_servers = new.scribe_servers;
         self.distill_servers = new.distill_servers;
-        self.qdrant_healthy = new.qdrant_healthy;
-        self.qdrant_url = new.qdrant_url;
-        self.qdrant_version = new.qdrant_version;
+        self.store_healthy = new.store_healthy;
+        self.store_url = new.store_url;
+        self.store_name = new.store_name;
+        self.store_version = new.store_version;
         self.embedded_docs = new.embedded_docs;
         self.embedded_chunks = new.embedded_chunks;
         self.embedding_skipped = new.embedding_skipped;
@@ -129,9 +132,10 @@ impl DashboardData {
             snapshot_received: false,
             scribe_servers: vec![],
             distill_servers: vec![],
-            qdrant_healthy: false,
-            qdrant_url: String::new(),
-            qdrant_version: String::new(),
+            store_healthy: false,
+            store_url: String::new(),
+            store_name: String::new(),
+            store_version: String::new(),
             watcher: WatcherInfo::Stopped,
             indexer: IndexerInfo::Stopped,
             history: vec![],
@@ -263,27 +267,9 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         .map(instance_to_status)
         .collect();
 
-    let qdrant_healthy = snap.qdrant.is_some();
-    let qdrant_url = snap
-        .qdrant
-        .as_ref()
-        .map(|q| {
-            // Prefer the real myelin endpoint reported by distill's /status;
-            // fall back to "gateway" only for older distill servers that
-            // don't yet surface the store URL (backward-compat via serde default).
-            let url_part = if q.qdrant_url.is_empty() {
-                "gateway".to_string()
-            } else {
-                q.qdrant_url.clone()
-            };
-            format!("{url_part} → {}", q.collection)
-        })
-        .unwrap_or_default();
-    let qdrant_version = snap
-        .qdrant
-        .as_ref()
-        .map(|q| q.qdrant_version.clone())
-        .unwrap_or_default();
+    let store_healthy = snap.store.is_some();
+    let store = snap.store.unwrap_or_default();
+    let (store_url, store_name, store_version) = (store.url, store.store, store.version);
 
     let history = snap
         .history
@@ -332,9 +318,10 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         snapshot_received: true,
         scribe_servers,
         distill_servers,
-        qdrant_healthy,
-        qdrant_url,
-        qdrant_version,
+        store_healthy,
+        store_url,
+        store_name,
+        store_version,
         watcher: WatcherInfo::from(snap.inbox_heartbeat),
         indexer: IndexerInfo::Stopped,
         history,
@@ -443,11 +430,11 @@ fn render(frame: &mut Frame, data: &DashboardData) {
     // line, and it wraps — so the Services block must be tall enough to
     // show all of it. The height is one line per service, plus the
     // extra lines the longest status needs, plus the block's two border
-    // rows and the Qdrant row.
+    // rows and the Store row.
     let width = frame.area().width.saturating_sub(4);
     let diagnosis_lines =
         services_diagnosis_lines(&data.scribe_servers, &data.distill_servers, width);
-    // service rows + the Qdrant row + the header row + the diagnosis block
+    // service rows + the Store row + the header row + the diagnosis block
     // + the block's two border rows. Getting this one line short is exactly
     // how the Indexer row vanished in rc.380 and how the diagnosis block
     // went missing here: ratatui clips silently.
@@ -956,28 +943,28 @@ fn render_services(frame: &mut Frame, area: Rect, data: &DashboardData) {
         ]));
     }
 
-    let (q_indicator, q_style) = if data.qdrant_healthy {
+    let (s_indicator, s_style) = if data.store_healthy {
         ("●", Style::default().fg(Color::Green))
     } else {
         ("○", Style::default().fg(Color::Red))
     };
-    let q_status = if data.qdrant_healthy {
+    let s_status = if data.store_healthy {
         "healthy"
     } else {
         "stopped"
     };
-    // Split qdrant_url "http://…:7434 → collection" into url and detail
-    let (q_url, q_detail) = match data.qdrant_url.split_once(" → ") {
-        Some((u, c)) => (u.to_string(), format!("→ {c}")),
-        None => (data.qdrant_url.clone(), String::new()),
+    let s_detail = if data.store_name.is_empty() {
+        String::new()
+    } else {
+        format!("→ {}", data.store_name)
     };
     rows.push(Row::new(vec![
         Cell::from("Store"),
-        Cell::from(q_indicator).style(q_style),
-        Cell::from(q_status.to_string()),
-        Cell::from(q_url),
-        Cell::from(q_detail).style(Style::default().fg(Color::DarkGray)),
-        Cell::from(data.qdrant_version.clone()).style(Style::default().fg(Color::DarkGray)),
+        Cell::from(s_indicator).style(s_style),
+        Cell::from(s_status.to_string()),
+        Cell::from(data.store_url.clone()),
+        Cell::from(s_detail).style(Style::default().fg(Color::DarkGray)),
+        Cell::from(data.store_version.clone()).style(Style::default().fg(Color::DarkGray)),
     ]));
 
     let table = Table::new(
@@ -1358,10 +1345,15 @@ async fn run_oneshot_text() -> Result<()> {
             println!("      ! {e}");
         }
     }
-    let qdot = if data.qdrant_healthy { "●" } else { "○" };
+    let sdot = if data.store_healthy { "●" } else { "○" };
+    let store_target = match (data.store_url.is_empty(), data.store_name.is_empty()) {
+        (_, true) => data.store_url.clone(),
+        (true, false) => data.store_name.clone(),
+        (false, false) => format!("{} → {}", data.store_url, data.store_name),
+    };
     println!(
-        "  {qdot} store    {:<35}  {}",
-        data.qdrant_url, data.qdrant_version
+        "  {sdot} store    {:<35}  {}",
+        store_target, data.store_version
     );
     println!();
 

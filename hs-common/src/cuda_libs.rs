@@ -18,13 +18,8 @@
 //! (`~/.cache/ort.pyke.io/dfbin`), and that directory has to be on the
 //! path too, or the provider is not found at all.
 //!
-//! **One path, for every service.** The distill server and the scribe
-//! server both load the CUDA provider, so they both get their loader
-//! path from this module. When one of them had it and the other did
-//! not, the scribe server crash-looped on a host whose CUDA toolkit
-//! had been upgraded, while the distill server was fine: the same
-//! library, the same host, one working and one not, because the path
-//! was set in one place and not the other.
+//! **One path.** The scribe server loads the CUDA provider for its layout,
+//! table and OCR models, and gets its loader path from this module.
 //!
 //! The path is only extended, never replaced: whatever the caller
 //! already had keeps its entries, so a caller that needs something

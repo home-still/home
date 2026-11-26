@@ -99,7 +99,7 @@ impl FakeDistill {
                 if path == "/status" {
                     return Json(serde_json::json!({
                         "store": store,
-                        "points_count": doc_ids.len() as u64 * FAKE_RECORDS_PER_DOC,
+                        "records_count": doc_ids.len() as u64 * FAKE_RECORDS_PER_DOC,
                         "documents_count": doc_ids.len(),
                         "documents_count_truncated": false,
                         "compute_device": "cuda",

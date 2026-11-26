@@ -138,14 +138,14 @@ impl HomeStillMcp {
         include_repaired: bool,
     ) -> hs_common::status::StatusSnapshot {
         use hs_common::status::{
-            build_history, collect_pipeline_counts, QdrantInfo, ServiceInstance, StatusSnapshot,
+            build_history, collect_pipeline_counts, ServiceInstance, StatusSnapshot, StoreInfo,
         };
 
         // Per-distill health fanout (also yields embedded doc/chunk counts).
         let mut distill_instances: Vec<ServiceInstance> = Vec::new();
         let mut embedded_documents: Option<u64> = None;
         let mut embedded_chunks: Option<u64> = None;
-        let mut qdrant: Option<QdrantInfo> = None;
+        let mut store_info: Option<StoreInfo> = None;
         for url in &self.distill_servers {
             let client = match hs_distill::client::DistillClient::new(url) {
                 Ok(c) => c,
@@ -198,20 +198,20 @@ impl HomeStillMcp {
             if let Some(s) = status.as_ref() {
                 if embedded_documents.is_none() {
                     embedded_documents = Some(s.documents_count);
-                    embedded_chunks = Some(s.points_count);
+                    embedded_chunks = Some(s.records_count);
                 }
             }
-            if qdrant.is_none() && !collection.is_empty() {
-                qdrant = Some(QdrantInfo {
-                    collection: collection.clone(),
+            if store_info.is_none() && !collection.is_empty() {
+                store_info = Some(StoreInfo {
+                    store: collection.clone(),
                     compute_device: compute_device.clone(),
                     embed_model: embed_model.clone(),
-                    qdrant_version: health
+                    version: health
                         .as_ref()
                         .map(|h| h.backend_version.clone())
                         .unwrap_or_default(),
                     // Served only by the token-protected /status.
-                    qdrant_url: status
+                    url: status
                         .as_ref()
                         .map(|s| s.myelin_url.clone())
                         .unwrap_or_default(),
@@ -483,7 +483,7 @@ impl HomeStillMcp {
             pipeline,
             scribe_instances,
             distill_instances,
-            qdrant,
+            store: store_info,
             history,
             inbox_heartbeat,
             generated_at: Some(chrono::Utc::now().to_rfc3339()),

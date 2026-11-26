@@ -127,7 +127,8 @@ impl ReadinessInfo for ReadinessResponse {
 pub struct StatusResponse {
     /// The store these counts describe, by name.
     pub store: String,
-    pub points_count: u64,
+    /// Records (chunks) the store holds.
+    pub records_count: u64,
     #[serde(default)]
     pub documents_count: u64,
     /// `documents_count` stopped at [`MAX_DOC_LIST_LIMIT`]; more exist.

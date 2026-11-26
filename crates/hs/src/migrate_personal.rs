@@ -5,7 +5,7 @@
 //! `big` on 2026-10-21:
 //!
 //! * the docs service cannot serve a personal document, so an agent's
-//!   `personal_search` hit comes back with **no link** — the user
+//!   hit in a personal document comes back with **no link** — the user
 //!   cannot open what the agent found;
 //! * the store is not in the bucket, so it is on **one** host
 //!   (`two`, `bmb` and `mac_air` have nothing) and not in the backup;

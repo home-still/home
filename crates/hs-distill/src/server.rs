@@ -708,7 +708,7 @@ mod tests {
         let status = client.status(ACADEMIC).await.unwrap();
         assert_eq!(status.store, ACADEMIC);
         assert_eq!(status.documents_count, 1);
-        assert_eq!(status.points_count, u64::from(indexed.chunks_indexed));
+        assert_eq!(status.records_count, u64::from(indexed.chunks_indexed));
         assert!(!status.documents_count_truncated);
 
         let ready = client.readiness().await.unwrap();

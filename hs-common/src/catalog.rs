@@ -80,8 +80,9 @@ pub struct CatalogEntry {
 
     /// Personal-store category, set at ingest by the `personal` crate. Always
     /// `None` for academic papers; `Some` only for documents that came in
-    /// through `hs personal add`. Indexed in Qdrant so personal_search can
-    /// filter by category without a sidecar walk.
+    /// through `hs personal add`. Indexed with the document's records, so a
+    /// search of the `personal` store can filter by category without a
+    /// sidecar walk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
 
@@ -594,7 +595,7 @@ pub async fn update_conversion_failed_via(
 }
 
 /// Record the outcome of an indexing attempt: stamp `embedding` when
-/// Qdrant got points, otherwise stamp `embedding_skip`. Use this at the
+/// the store got records, otherwise stamp `embedding_skip`. Use this at the
 /// integration seam (MCP, event_watch) so a 0-chunks return value is
 /// always visible in the catalog rather than indistinguishable from
 /// "never tried."

@@ -1,7 +1,7 @@
 //! The one definition of a downloaded paper's storage identity (its "stem").
 //!
 //! Every artifact the pipeline stores for a paper — `papers/XX/<stem>.pdf`,
-//! `markdown/…`, `catalog/<stem>.yaml`, the Qdrant `doc_id` — is keyed by this
+//! `markdown/…`, `catalog/<stem>.yaml`, the index's `doc_id` — is keyed by this
 //! string, so two spellings of one paper are two documents: converted twice,
 //! indexed twice, returned twice by one query.
 //!

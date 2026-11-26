@@ -29,7 +29,7 @@ use crate::parser::{parse_work_id_u64, strip_openalex_id};
 
 /// Minimal work-row projection used by the abstracts pipeline and other
 /// per-DOI lookups. Field names match the underlying `works` columns so
-/// downstream code can stuff this straight into a Qdrant payload.
+/// downstream code can stuff this straight into a record's metadata.
 #[derive(Debug, Clone)]
 pub struct WorkAbstract {
     pub openalex_id: String,

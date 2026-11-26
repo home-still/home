@@ -508,7 +508,7 @@ async fn cmd_rebuild(
             eprintln!(
                 "This will delete {} markdown objects, {} catalog YAMLs, \
                  and delete every indexed document ({} chunks across {} docs).",
-                inv.markdown_count, inv.catalog_count, inv.store_points, inv.store_docs
+                inv.markdown_count, inv.catalog_count, inv.store_records, inv.store_docs
             );
             eprintln!(
                 "{} papers under `papers/` will be republished for re-ingestion.",
@@ -688,7 +688,7 @@ struct Inventory {
     catalog_objs: Vec<hs_common::storage::ObjectMeta>,
     catalog_count: u64,
     store_docs: u64,
-    store_points: u64,
+    store_records: u64,
 }
 
 async fn inventory(storage: &Arc<dyn Storage>, client: &DistillClient) -> Result<Inventory> {
@@ -722,11 +722,11 @@ async fn inventory(storage: &Arc<dyn Storage>, client: &DistillClient) -> Result
         .await
         .context("list indexed documents via the distill server")?;
     let store_docs = store_ids.len() as u64;
-    let store_points = client
+    let store_records = client
         .status(hs_common::stores::ACADEMIC)
         .await
         .context("read the distill server status")?
-        .points_count;
+        .records_count;
 
     Ok(Inventory {
         paper_keys,
@@ -735,7 +735,7 @@ async fn inventory(storage: &Arc<dyn Storage>, client: &DistillClient) -> Result
         catalog_objs,
         catalog_count,
         store_docs,
-        store_points,
+        store_records,
     })
 }
 
@@ -745,7 +745,7 @@ fn print_summary(inv: &Inventory, reporter: &Arc<dyn Reporter>) {
     reporter.status("Catalog to delete", &format!("{}", inv.catalog_count));
     reporter.status(
         "Store to purge",
-        &format!("{} chunks / {} docs", inv.store_points, inv.store_docs),
+        &format!("{} chunks / {} docs", inv.store_records, inv.store_docs),
     );
     reporter.status("Papers to republish", &format!("{}", inv.paper_keys.len()));
 }
@@ -1457,7 +1457,7 @@ mod tests {
             ("GET", "/status?store=academic") => Response::json(
                 200,
                 &serde_json::json!({
-                    "store": "academic", "points_count": ACADEMIC_RECORDS,
+                    "store": "academic", "records_count": ACADEMIC_RECORDS,
                     "documents_count": 2, "compute_device": "cuda"
                 }),
             ),
@@ -1680,7 +1680,7 @@ mod tests {
         assert!(log.lock().is_empty(), "no delete and no reset");
     }
 
-    /// `list_docs(..).unwrap_or_default()` showed 0 docs / 0 points while
+    /// `list_docs(..).unwrap_or_default()` showed 0 docs / 0 records while
     /// distill was down, and the operator confirmed against that.
     #[tokio::test]
     async fn inventory_fails_loudly_when_distill_is_unreachable() {

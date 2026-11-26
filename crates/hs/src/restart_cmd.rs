@@ -955,19 +955,17 @@ fn classify_compose_restart(
 }
 
 /// The compose stacks `hs` manages on this host, in restart/upgrade order:
-/// the scribe stack only when `scribe.local_server` is on, the distill
-/// (Qdrant) stack always — and only files that exist.
+/// the scribe stack, when `scribe.local_server` is on and its file exists.
 pub(crate) fn managed_compose_files(
     hidden: &Path,
     scribe_local_server: bool,
 ) -> Vec<(&'static str, PathBuf)> {
-    let mut stacks: Vec<(&'static str, PathBuf)> = Vec::new();
-    if scribe_local_server {
-        stacks.push(("scribe", hidden.join("docker-compose.yml")));
+    let scribe = hidden.join("docker-compose.yml");
+    if scribe_local_server && scribe.exists() {
+        vec![("scribe", scribe)]
+    } else {
+        Vec::new()
     }
-    stacks.push(("distill", hidden.join("docker-compose-distill.yml")));
-    stacks.retain(|(_, p)| p.exists());
-    stacks
 }
 
 /// The compose runtime for `files`. None installed is an error naming the
@@ -1699,16 +1697,16 @@ mod tests {
 
     #[test]
     fn compose_nonzero_with_empty_stderr_is_a_failure() {
-        assert!(classify_compose_restart("distill", true, Some(0), "").is_ok());
+        assert!(classify_compose_restart("scribe", true, Some(0), "").is_ok());
 
-        let err = classify_compose_restart("distill", false, Some(1), "").unwrap_err();
-        assert!(err.contains("distill"), "{err}");
+        let err = classify_compose_restart("scribe", false, Some(1), "").unwrap_err();
+        assert!(err.contains("scribe"), "{err}");
 
         // Stderr that is pure podman banner noise filters to nothing: still a failure.
         let noise = ">>>> Executing external compose provider \"podman-compose\"\n";
-        assert!(classify_compose_restart("distill", false, Some(1), noise).is_err());
+        assert!(classify_compose_restart("scribe", false, Some(1), noise).is_err());
 
-        let err = classify_compose_restart("distill", false, Some(1), "Error: no such service")
+        let err = classify_compose_restart("scribe", false, Some(1), "Error: no such service")
             .unwrap_err();
         assert!(err.contains("no such service"), "{err}");
     }
@@ -1721,18 +1719,14 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let scribe = dir.path().join("docker-compose.yml");
-        let distill = dir.path().join("docker-compose-distill.yml");
+        // The file `hs` once managed for a Qdrant of its own: still on disk
+        // on an upgraded host, and no longer ours to restart.
+        let retired = dir.path().join("docker-compose-distill.yml");
         std::fs::write(&scribe, "services: {}\n").unwrap();
-        std::fs::write(&distill, "services: {}\n").unwrap();
+        std::fs::write(&retired, "services: {}\n").unwrap();
 
         // A scribe file on a host with `local_server: false` is stale, not ours.
-        assert_eq!(names(managed_compose_files(dir.path(), false)), ["distill"]);
-        assert_eq!(
-            names(managed_compose_files(dir.path(), true)),
-            ["scribe", "distill"]
-        );
-
-        std::fs::remove_file(&distill).unwrap();
+        assert!(managed_compose_files(dir.path(), false).is_empty());
         assert_eq!(names(managed_compose_files(dir.path(), true)), ["scribe"]);
 
         std::fs::remove_file(&scribe).unwrap();

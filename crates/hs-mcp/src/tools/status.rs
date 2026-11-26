@@ -82,7 +82,7 @@ impl HomeStillMcp {
                     "store": status.store,
                     "documents": status.documents_count,
                     "documents_is_a_floor": status.documents_count_truncated,
-                    "records": status.points_count,
+                    "records": status.records_count,
                     "embed_model": status.embed_model,
                 }),
                 Err(e) => unavailable(format!("{e:#}")),

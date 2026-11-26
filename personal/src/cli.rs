@@ -38,7 +38,7 @@ pub enum PersonalCmd {
         limit: usize,
     },
 
-    /// Semantic search across the personal collection.
+    /// Semantic search across the personal store.
     Search {
         /// Query string.
         query: String,
@@ -58,13 +58,13 @@ pub enum PersonalCmd {
         stem: String,
     },
 
-    /// Remove a document from Qdrant and disk.
+    /// Remove a document from the personal store and disk.
     Delete {
         /// Document stem.
         stem: String,
     },
 
-    /// Re-chunk and re-embed a document. Useful after chunker/embedder changes.
+    /// Re-chunk and re-embed a document. Useful after the chunker changes, or to fill an empty index.
     Reindex {
         /// Document stem.
         stem: String,

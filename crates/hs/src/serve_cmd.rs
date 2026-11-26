@@ -70,7 +70,7 @@ pub enum ServeCmd {
         uninstall: bool,
     },
     /// NATS event-watch daemon that indexes `scribe.completed` events into
-    /// Qdrant via the distill server. Runs as a user-level service.
+    /// the myelin store via the distill server. Runs as a user-level service.
     DistillWatch {
         /// Install as a user service and start it
         #[arg(long, conflicts_with = "uninstall")]

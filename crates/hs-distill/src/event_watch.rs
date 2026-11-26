@@ -840,7 +840,7 @@ mod tests {
         let ok = serve(|_| {
             Reply::Json(
                 200,
-                r#"{"store":"academic","points_count":0,"compute_device":"Cuda"}"#.into(),
+                r#"{"store":"academic","records_count":0,"compute_device":"Cuda"}"#.into(),
             )
         })
         .await;

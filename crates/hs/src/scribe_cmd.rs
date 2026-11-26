@@ -179,9 +179,7 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
 /// Reset every derived artifact for a stem and republish `papers.ingested`
 /// so the watcher reconverts it from the source bytes:
 ///
-/// 1. purge the stem's chunks from Qdrant (re-indexing upserts by
-///    `(doc_id, chunk_index)`, so a shorter new conversion would leave
-///    orphaned tail chunks from the old one),
+/// 1. purge the stem's records from its store,
 /// 2. delete the stale markdown object (the watcher's idempotency guard
 ///    — "markdown already present; skipping" — would otherwise skip the
 ///    reconvert entirely),
@@ -1140,10 +1138,8 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
     // `libcublasLt.so.12` and friends — cannot find them and the server
     // dies with "the execution provider could not be registered".
     //
-    // The distill server has had this path since rc.267; the scribe
-    // server did not, which is why one worked and the other crash-looped
-    // on the same host. Both get it from `hs_common::cuda_libs` now, so
-    // there is one implementation of the path.
+    // The path comes from `hs_common::cuda_libs`, the one implementation
+    // of it.
     let ld_path = hs_common::cuda_libs::cuda_ld_library_path(
         &std::env::var("LD_LIBRARY_PATH").unwrap_or_default(),
     );

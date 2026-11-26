@@ -25,7 +25,7 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub distill_instances: Vec<ServiceInstance>,
     #[serde(default)]
-    pub qdrant: Option<QdrantInfo>,
+    pub store: Option<StoreInfo>,
     #[serde(default)]
     pub history: Vec<HistoryEvent>,
     /// Cluster-wide inbox-sweeper health. Populated from the heartbeat key
@@ -333,19 +333,22 @@ pub struct ServiceInstance {
     pub error: Option<String>,
 }
 
-/// Convenience rollup of the first healthy distill instance.
+/// The myelin server behind the first distill instance that answered, and
+/// the store its numbers are about.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct QdrantInfo {
-    pub collection: String,
+pub struct StoreInfo {
+    /// The store's name.
+    pub store: String,
     pub compute_device: String,
     #[serde(default)]
     pub embed_model: String,
+    /// The myelin server's version, from the distill server's `/health`.
     #[serde(default)]
-    pub qdrant_version: String,
-    /// Qdrant endpoint URL reported by distill, e.g. `http://host:6334`.
-    /// Empty when an older distill server doesn't yet expose it.
+    pub version: String,
+    /// The myelin endpoint, from the distill server's token-protected
+    /// `/status`. Empty when that call failed.
     #[serde(default)]
-    pub qdrant_url: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,7 +454,7 @@ pub fn build_history(
         }
         if let Some(ref emb) = entry.embedding {
             // Zero-chunk "embeddings" were stamped by an older pipeline when
-            // nothing reached Qdrant; they only pollute history.
+            // nothing reached the store; they only pollute history.
             if emb.chunks_indexed > 0 {
                 events.push(HistoryEvent {
                     activity: "Embed".into(),
@@ -1073,7 +1076,7 @@ pub fn list_catalog_flag_drift_resync_candidates(
 /// drift-gate failure mode: docs that went through convert → markdown →
 /// embed, had their markdown deleted, and whose catalog flags were
 /// cleared by `catalog_no_markdown` repair without the corresponding
-/// Qdrant purge. After the rc.260 purge-also-on-clear fix the catalog
+/// store purge. After the rc.260 purge-also-on-clear fix the catalog
 /// is consistent, but the source remains and needs re-conversion.
 #[cfg(all(feature = "storage", feature = "catalog"))]
 #[derive(Debug, Clone)]

@@ -70,9 +70,8 @@ image = { version = "0.25", optional = true }
 ort = { version = "=2.0.0-rc.11", features = ["ndarray"], optional = true }
 # The words of a page that has no text layer (`word_ocr`): PP-OCRv5
 # detection and recognition on ONNX Runtime. Pinned to the last release
-# that builds on the `ort` above: `ort-sys` links one onnxruntime for the
-# whole workspace, fastembed 5 (hs-distill) fixes it at 2.0.0-rc.11, and
-# oar-ocr 0.6.2 onwards needs rc.12 or later.
+# that builds on the `ort` above (`ort-sys` links one onnxruntime for the
+# whole workspace): oar-ocr 0.6.2 onwards needs rc.12 or later.
 oar-ocr = { version = "=0.6.1", default-features = false, optional = true }
 ndarray = { version = "0.17", optional = true }
 ollama-rs = { version = "0.3", features = ["stream"], optional = true }
