@@ -65,7 +65,7 @@ have.
    The `myelin-mcp` service is active (the unit name is the one you gave it in
    [set up myelin](../tutorials/home-cloud-cluster.md#8-set-up-myelin-on-the-gpu-host);
    `myelin-mcp` has no `/health` route, so the distill server's health call
-   below is the check that it answers). `ollama ps` lists `bge-m3:latest`
+   below is the check that it answers). `ollama ps` lists `bge-m3-8k:latest`
    with its processor as `100% GPU`.
 
 4. On `<gpu-host>`, check the card and the servers:

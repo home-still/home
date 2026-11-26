@@ -715,7 +715,7 @@ mod tests {
         assert!(ready.is_ready());
         assert_eq!(ready.available_slots(), 1);
         let health = client.health().await.unwrap();
-        assert_eq!(health.embed_model, "bge-m3:latest");
+        assert_eq!(health.embed_model, crate::embed_device::OLLAMA_EMBED_MODEL);
         assert_eq!(health.compute_device, "cuda");
         assert_eq!(health.backend_version, "fake-myelin 1.0.0");
 

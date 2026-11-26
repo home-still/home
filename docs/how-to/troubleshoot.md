@@ -21,15 +21,16 @@ ends with one of:
 
 - `myelin is not usable at <url>: …` from the distill server;
 - `myelin at <url> refused the store registry: …` from the distill server;
-- `cannot verify where bge-m3:latest runs: …` from the distill server;
-- `ollama runs bge-m3:latest on `cpu`, not fully on the GPU. …` from the
+- `cannot verify where bge-m3-8k:latest runs: …` from the distill server;
+- `ollama runs bge-m3-8k:latest on `cpu`, not fully on the GPU. …` from the
   distill server (the device can also be `partial`);
+- `bge-m3-8k:latest cannot embed a long chunk: …` from the distill server;
 - `the execution provider could not be registered` from the scribe server;
 - `libpdfium could not be loaded (searched …)` from the scribe server;
 - an error that names `HS_BACKEND_TOKEN`.
 
 **Cause.** The distill server does no embedding itself. It writes to a myelin
-server, which asks Ollama for `bge-m3:latest` vectors, and it refuses to start,
+server, which asks Ollama for `bge-m3-8k:latest` vectors, and it refuses to start,
 and reports itself not ready, unless Ollama holds that model entirely on the
 GPU. It never accepts the CPU. The scribe server runs its layout and table
 models on CUDA on Linux and does not fall back either. The usual reasons:
@@ -40,10 +41,12 @@ models on CUDA on Linux and does not fall back either. The usual reasons:
    agent surface (port 7463), which refuses the writes the distill server
    needs. `myelin-mcp` has no `/health` route; its own service log says why it
    is down, for example that its Qdrant or Ollama is not reachable.
-2. **Ollama cannot be reached or has no `bge-m3`.** The distill server asks
+2. **Ollama cannot be reached or has no `bge-m3-8k`.** The distill server asks
    `distill_server.ollama_url` where the model is loaded, and loads it with one
    embedding request when it is not. An unreachable Ollama, or one that does not
-   have the model, stops the start.
+   have the model, stops the start. So does a `bge-m3-8k` that was made
+   without `num_batch 8192`: the server sends one long input at start-up and
+   stops when Ollama reads only part of it.
 3. **Ollama holds the model on the CPU, or split between CPU and GPU.** The
    card is full (another program holds its memory) or Ollama's CUDA is broken.
 4. **libpdfium is missing.** The scribe server binds it from `~/.local/lib`,
@@ -65,11 +68,12 @@ models on CUDA on Linux and does not fall back either. The usual reasons:
    nvidia-smi --query-compute-apps=pid,used_gpu_memory,process_name --format=csv
    ```
 
-   `ollama ps` must list `bge-m3:latest` with `100% GPU`. When it says `CPU` or
-   a split, stop or move the program that holds the card's memory, or fix
-   Ollama's CUDA, then unload the model (`ollama stop bge-m3:latest`) so the
-   next request loads it again. When the model is missing, pull it
-   (`ollama pull bge-m3`).
+   `ollama ps` must list `bge-m3-8k:latest` with `100% GPU`. When it says `CPU`
+   or a split, stop or move the program that holds the card's memory, or fix
+   Ollama's CUDA, then unload the model (`ollama stop bge-m3-8k:latest`) so the
+   next request loads it again. When the model is missing, or the log says it
+   cannot embed a long chunk, make it as in
+   [set up myelin](../tutorials/home-cloud-cluster.md#8-set-up-myelin-on-the-gpu-host).
 
 2. Check myelin and the settings that point at it:
 
@@ -147,7 +151,7 @@ fail with the first two.
 
 **Cause.** The server checks its dependencies on every health probe and before
 every index. `embedder unavailable` means Ollama did not answer or does not
-have the model; `embedder not on GPU` means Ollama holds `bge-m3:latest` on the
+have the model; `embedder not on GPU` means Ollama holds `bge-m3-8k:latest` on the
 CPU or split between the card and system memory (typically because another
 program took the card's memory after the model was unloaded); `myelin
 unavailable` means the myelin server did not answer. The response does not give

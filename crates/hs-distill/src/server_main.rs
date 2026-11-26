@@ -5,7 +5,10 @@ use clap::Parser;
 use hs_common::stores::Stores;
 use hs_distill::api::DistillServerState;
 use hs_distill::config::DistillServerConfig;
-use hs_distill::embed_device::{ollama_embed_device, DEVICE_CUDA, OLLAMA_EMBED_MODEL};
+use hs_distill::embed_device::{
+    ollama_embed_device, verify_embed_capacity, DEVICE_CUDA, OLLAMA_EMBED_MODEL,
+    OLLAMA_EMBED_MODEL_SETUP,
+};
 use hs_distill::myelin::MyelinStore;
 use hs_distill::server;
 use hs_distill::store::DocumentStore;
@@ -73,13 +76,21 @@ async fn async_main() -> Result<()> {
         .context("building the ollama HTTP client")?;
     let device = ollama_embed_device(&ollama, &config.ollama_url)
         .await
-        .map_err(|e| anyhow::anyhow!("cannot verify where {OLLAMA_EMBED_MODEL} runs: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot verify where {OLLAMA_EMBED_MODEL} runs: {e}. An ollama without the \
+                 model needs: {OLLAMA_EMBED_MODEL_SETUP}"
+            )
+        })?;
     if device != DEVICE_CUDA {
         anyhow::bail!(
             "ollama runs {OLLAMA_EMBED_MODEL} on `{device}`, not fully on the GPU. Distill \
              embedding never runs on the CPU: fix ollama's CUDA (driver, libraries, free VRAM)"
         );
     }
+    verify_embed_capacity(&ollama, &config.ollama_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("{OLLAMA_EMBED_MODEL} cannot embed a long chunk: {e}"))?;
     tracing::info!(model = OLLAMA_EMBED_MODEL, %device, "embedding model on the GPU");
 
     let host = args.host.unwrap_or_else(|| config.host.clone());

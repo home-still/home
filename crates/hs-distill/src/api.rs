@@ -1105,7 +1105,7 @@ mod tests {
         let s = h.state.status(IN_ACADEMIC).await.unwrap();
         assert_eq!((s.records_count, s.documents_count), (5, 2));
         assert!(!s.documents_count_truncated);
-        assert_eq!(s.embed_model, "bge-m3:latest");
+        assert_eq!(s.embed_model, OLLAMA_EMBED_MODEL);
         assert_eq!(s.compute_device, "cuda");
         assert_eq!(s.store, ACADEMIC);
     }
@@ -1198,7 +1198,7 @@ mod tests {
         let ok = h.state.health().await.unwrap();
         assert_eq!(ok.status, "ok");
         assert_eq!(ok.compute_device, "cuda");
-        assert_eq!(ok.embed_model, "bge-m3:latest");
+        assert_eq!(ok.embed_model, OLLAMA_EMBED_MODEL);
         assert_eq!(ok.backend_version, "fake-myelin 1.0.0");
 
         for mode in [OllamaMode::Cpu, OllamaMode::Partial, OllamaMode::Down] {

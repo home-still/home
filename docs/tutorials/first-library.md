@@ -193,8 +193,9 @@ hs distill index
 ```
 
 `hs serve distill start` starts the search server, which keeps passages in a
-myelin server and needs that server and Ollama, with `bge-m3` pulled
-(`ollama pull bge-m3`), running first (see
+myelin server and needs that server and Ollama, with the embedding model
+`bge-m3-8k` made
+([how](home-cloud-cluster.md#8-set-up-myelin-on-the-gpu-host)), running first (see
 [`distill_server`](../reference/configuration.md#distill_server)). It exits
 when myelin does not answer or Ollama does not hold the model on the GPU.
 `hs distill index` cuts your markdown into passages, embeds them and stores

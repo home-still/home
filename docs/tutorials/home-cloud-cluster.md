@@ -320,16 +320,23 @@ Qdrant; you run it with the tools below. On `<gpu-host>`, install
 
 The pieces are:
 
-1. **Ollama with the embedding model.** Pull the model:
+1. **Ollama with the embedding model.** Pull `bge-m3`, then make the model
+   the servers ask for, `bge-m3-8k`, from it:
 
    ```sh
-   ollama pull bge-m3:latest
+   ollama pull bge-m3
+   printf 'FROM bge-m3\nPARAMETER num_batch 8192\n' > bge-m3-8k.Modelfile
+   ollama create bge-m3-8k -f bge-m3-8k.Modelfile
    ```
+
+   `bge-m3-8k` is the same model with a batch as large as its context. With
+   the model as pulled, Ollama reads only the first 2,048 tokens of a passage
+   or refuses the passage, so the distill server does not start with it.
 
    The distill server loads the model with its first embedding request and
    refuses to start while Ollama holds it on the CPU or split between the CPU
-   and the GPU. Once it is loaded, `ollama ps` lists `bge-m3:latest` with its
-   processor as `100% GPU`.
+   and the GPU. Once it is loaded, `ollama ps` lists `bge-m3-8k:latest` with
+   its processor as `100% GPU`.
 
 2. **myelin's Qdrant.** Run it on the same host, with its data on a fast disk,
    and publish its ports to the host's loopback only. myelin is developed
@@ -376,7 +383,8 @@ umask 077
 cat > ~/.config/myelin-mcp.env <<'ENV'
 MYELIN_QDRANT__URL=http://127.0.0.1:6334
 MYELIN_EMBED__URL=http://127.0.0.1:11434/v1
-MYELIN_EMBED__MODEL=bge-m3:latest
+MYELIN_EMBED__MODEL=bge-m3-8k:latest
+MYELIN_EMBED__MAX_CHARS=4500
 MYELIN_EMBED__DIM=1024
 MYELIN_RERANK__URL=<rerank-url>
 MYELIN_RERANK__MODEL=bge-reranker-v2-m3
@@ -390,6 +398,12 @@ ENV
 requires. Give it the same value as `HS_BACKEND_TOKEN` (step 2): the gateway
 sends that secret to every backend, including the memory server. Listeners on
 the loopback need no token.
+
+`MYELIN_EMBED__MAX_CHARS` is the longest text myelin embeds in one piece.
+home-still's passages are up to about 4,400 characters, and 4500 keeps each
+one whole; with myelin's default of 4000 the longest are cut in two and their
+vectors averaged. Do not set it much higher: Ollama keeps about 1 MiB of
+system memory per token of the longest text it has embedded.
 
 Write the user service `~/.config/systemd/user/myelin-mcp.service`. It has two
 listeners for agents: one on the loopback, for the agents on this host, and one

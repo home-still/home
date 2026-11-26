@@ -11,6 +11,15 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
   `http://127.0.0.1:7462/mcp`, and Ollama with the embedding model on the
   GPU, before the upgraded server starts**: it defines every store in myelin
   at start-up and stops when myelin does not answer or refuses one.
+- The distill server asks Ollama for the embedding model `bge-m3-8k:latest`,
+  not `bge-m3:latest`. **Make it on the distill host before upgrading**
+  (`ollama pull bge-m3`, then `ollama create bge-m3-8k` from a Modelfile
+  holding `FROM bge-m3` and `PARAMETER num_batch 8192`), **and give the myelin
+  server `MYELIN_EMBED__MODEL=bge-m3-8k:latest` and
+  `MYELIN_EMBED__MAX_CHARS=4500`**. The server stops at start-up without the
+  model, or with one that reads only part of a long input. With the model as
+  pulled, Ollama embedded a passage over 2,048 tokens from its beginning
+  only, or refused it.
 - Every distill request names its store. **Upgrade the distill server and
   every client of it (`hs`, `hs-mcp`, the watchers) together**: an older
   client names no store and is answered `400`, and a newer client's requests
