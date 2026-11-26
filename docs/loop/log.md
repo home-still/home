@@ -3068,3 +3068,71 @@ written.
    chosen and scored on the same 25.
 5. **Production's 137 indexed documents without markdown**: purge or
    explain.
+
+## 2026-11-26-02 — gate rework: default depth restored, two store defects fixed, held-out queries approved; nothing scored yet
+
+**Evidence.** The owner did not accept entry 2026-11-26-01's pass and set
+the bar: pass at myelin's default rerank depth; confirm on queries no
+setting was chosen with, approved before scoring; fix the embedder limit
+and index the affected documents again; fix the refused-write defect
+first. Equal document counts are replaced by the document-by-document
+account in that entry. Latency is not a rule.
+
+**Before / after.** Measured on the GPU host unless marked.
+
+| What | Before | After |
+|---|---|---|
+| Tokens the embedder reads per input | 2,048 | 8,192 (`bge-m3-8k`; the distill server probes it at start-up) |
+| Documents the store refuses | 2 | 0 (58 and 53 chunks; ledger rows equal index points) |
+| A refused write leaves ledger rows | yes | no (`home-still/myelin#217`) |
+| `academic` records stored as the plain average of two pieces | 70,444 of 378,829 (18.6 %), in 15,230 of 19,263 documents | none once every document is indexed again (`home-still/myelin#218`, split cap 4,500 characters) |
+| One such record: cosine of the stored vector to its whole text's | 0.903 | 1.000 |
+| Rerank depth of the store | 50, chosen on the gate's queries | 25, the default |
+| Gate at depth 25 | 23/25 (entry 01, row 2) | not run yet |
+| Held-out queries | none | 50, approved, not scored |
+
+The second defect was found while fixing the first. myelin embedded an
+input over 4,000 characters in two pieces and gave them equal weight; a
+home-still record is a header line and a chunk of up to 4,000 characters,
+so the second piece was usually the chunk's last lines (median 260
+characters in a sample of 285). The count given to the owner for the first
+defect, 3,120 documents holding a record over 2,048 tokens, was taken on
+whole records and is too high for that reason. Not shown: that either
+defect is why q09 and q11 miss at depth 25. BACKLOG P1-40, P1-41, P1-43.
+
+Every document is being indexed again: 19,331 stems, started 16:04 UTC.
+Sixteen documents took 17 to 20 s on an idle host (19 chunks/s) and the
+run's first 125 took 265 s with a CI job on the same cores (9 chunks/s),
+so 7 to 14 hours. `--concurrency 3` was not faster than 1 (16.9 s and
+34.0 s against 17.1 s and 20.1 s).
+
+**Held-out queries.** `docs/loop/queries_heldout.yaml`: 50 queries, each
+anchored to one document, which must be in the top 10. The documents are
+a seeded sample of those both indexes hold; each query was written from
+800 characters of a seeded inner chunk, with no search run. A first draft
+written from titles and first chunks was rejected by the owner as too
+easy. Pass rule, fixed before scoring: at default settings the candidate
+finds at least as many expected documents as the baseline in the same
+session; every query they disagree on is reported. The 25-query rule of
+entry 01 stands unchanged.
+
+**Gates.** `cargo clippy -p hs-distill --features hs-distill/server
+--all-targets --locked -- -D warnings` clean; `cargo nextest run -p
+hs-distill --features hs-distill/server`: 275 passed. myelin: `cargo
+nextest run -p myelin-core -p myelin-mcp --lib`: 315 passed; clippy clean.
+
+**Version.** Branch `myelin-cutover` at `06ade86` before this entry,
+untagged. myelin `main` at `7625783`.
+
+### Top 5 remaining items
+
+1. **Finish indexing every document again**, then check that none failed
+   and that ledger rows equal index points.
+2. **Run the gate at depth 25** on both query files against both servers,
+   and report every query the two disagree on.
+3. **Measure the approximate dense search's recall again** on the
+   re-indexed store (BACKLOG P1-44); two queries showed 17 and 22 of the
+   exact top 25.
+4. **Owner: release or not**, once item 2 is in. Qdrant stays until then.
+5. **Production's 137 indexed documents without markdown**: purge or
+   explain.

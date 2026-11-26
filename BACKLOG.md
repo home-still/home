@@ -1507,6 +1507,10 @@ repeats, but one query sits at rank 8 and recall is not monotone in depth. All a
 judged by it.
 **Fix.** A second, held-out query set that no setting is tuned on; a retrieval setting is accepted
 on that set. Until then the 2026-11-26 result is "passes at a fitted depth", not "passes".
+**Query set written 2026-11-26.** `docs/loop/queries_heldout.yaml`: 50 queries, each anchored to
+one document and written from an inner passage of it, approved by the owner before any scoring.
+Rule: at default settings the candidate finds at least as many expected documents in the top 10
+as the baseline. Not scored yet: the store is being indexed again (P1-43).
 
 ### P1-43. myelin gave the two pieces of a record over 4,000 characters equal weight, so a fifth of the records had a vector that was half their last lines (found 2026-11-26)
 **Symptom.** Measured on the candidate store. A record is a header line and a chunk of up to
