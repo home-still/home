@@ -18,12 +18,14 @@ Enroll a device with your cloud gateway so `hs` and Claude can reach your librar
 
    The command prints a one-time code, the scopes it grants and when it expires: five minutes after creation, and good for one enrollment.
 
-2. Grant fewer scopes when the device needs less. `--scope` takes `scribe`, `distill` or `mcp`, and repeats; without it the code grants all three. A viewer that only uses Claude needs `mcp`:
+2. Grant fewer scopes when the device needs less. `--scope` takes `scribe`, `distill`, `mcp` or `memory`, and repeats; without it the code grants all four. `mcp` opens the tools server and `memory` opens the memory server, where an agent searches the library. A viewer that only uses Claude needs those two:
 
    ```sh
-   hs cloud invite --name viewer --scope mcp
+   hs cloud invite --name viewer --scope mcp --scope memory
    hs cloud invite --name worker --scope scribe --scope distill
    ```
+
+   A device enrolled before the gateway had a `memory` route holds tokens without that scope, and `/memory/mcp` answers it `403`. Enroll it again with a new code.
 
    The name and scopes are fixed by the invite. The enrolling device cannot choose its own.
 

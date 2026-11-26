@@ -84,8 +84,8 @@ fn validate_device_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Only the three service scopes are grantable — never `*`, never anything
-/// the proxy does not route.
+/// Only the service scopes are grantable — never `*`, never anything the
+/// proxy does not route.
 fn validate_scopes(scopes: Vec<String>) -> Result<Vec<String>, String> {
     if scopes.is_empty() {
         return Err("scopes must not be empty".into());

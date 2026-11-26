@@ -73,7 +73,7 @@ pub async fn proxy_handler(State(state): State<Arc<GatewayState>>, req: Request<
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or_else(|| req.uri().path());
-    let backend_url = format!("{backend_base}{path_and_query}");
+    let backend_url = format!("{backend_base}{}", backend_path(service, path_and_query));
 
     forward_request(&state, service, pick.index, req, backend_url, permit).await
 }
@@ -163,10 +163,11 @@ fn check_path(path: &str) -> Result<(), RouteError> {
 
 /// Map a gateway path to the service that owns it, by path-segment equality:
 ///
-/// * `/mcp[/…]`, `/scribe[/…]`, `/distill[/…]` → that service
+/// * `/mcp[/…]`, `/scribe[/…]`, `/distill[/…]`, `/memory[/…]` → that service
 /// * `/search` and `/exists/<id>` → distill
 ///
-/// `/mcpfoo` is not `/mcp`. The path is forwarded to the backend unchanged.
+/// `/mcpfoo` is not `/mcp`. What the backend is asked for is
+/// [`backend_path`]'s to say.
 pub fn resolve_service(path: &str) -> Result<&'static str, RouteError> {
     check_path(path)?;
     let mut segments = path[1..].split('/');
@@ -176,9 +177,35 @@ pub fn resolve_service(path: &str) -> Result<&'static str, RouteError> {
         "mcp" => Ok("mcp"),
         "scribe" => Ok("scribe"),
         "distill" => Ok("distill"),
+        auth::MEMORY_SERVICE => Ok(auth::MEMORY_SERVICE),
         "search" if second.is_none() => Ok("distill"),
         "exists" if second.is_some_and(|s| !s.is_empty()) => Ok("distill"),
         _ => Err(RouteError::NoSuchService),
+    }
+}
+
+/// The path and query a backend is asked for.
+///
+/// Every service but `memory` serves the paths the gateway routes to it by
+/// (hs-mcp serves `/mcp`, a scribe server `/scribe/…`), so its path is
+/// forwarded unchanged. The memory server also serves `/mcp`, which on the
+/// gateway is hs-mcp's. The gateway therefore mounts it under `/memory` and
+/// takes that segment off: `/memory/mcp` reaches it as `/mcp`.
+fn backend_path<'a>(service: &str, path_and_query: &'a str) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
+
+    if service != auth::MEMORY_SERVICE {
+        return Cow::Borrowed(path_and_query);
+    }
+    let below_mount = path_and_query
+        .strip_prefix('/')
+        .and_then(|rest| rest.strip_prefix(auth::MEMORY_SERVICE));
+    match below_mount {
+        // `/memory/mcp?x=1` is `/mcp?x=1` to the backend.
+        Some(rest) if rest.starts_with('/') => Cow::Borrowed(rest),
+        // `/memory` and `/memory?x=1` are the backend's root.
+        Some(rest) => Cow::Owned(format!("/{rest}")),
+        None => Cow::Borrowed(path_and_query),
     }
 }
 
@@ -357,7 +384,7 @@ fn unauthorized_response(gateway_url: &str) -> Response {
 mod tests {
     use super::*;
     use crate::testutil::{
-        body_json, call, spawn_backend, test_state, test_state_with, unused_local_url,
+        body_json, body_string, call, spawn_backend, test_state, test_state_with, unused_local_url,
     };
     use axum::http::Method;
     use axum::routing::{any, get, post};
@@ -378,6 +405,9 @@ mod tests {
             ("/mcp", "mcp"),
             ("/mcp/", "mcp"),
             ("/mcp/sse", "mcp"),
+            ("/memory", "memory"),
+            ("/memory/", "memory"),
+            ("/memory/mcp", "memory"),
             ("/scribe/a%20b", "scribe"),
         ] {
             assert_eq!(resolve_service(path), Ok(want), "{path}");
@@ -392,6 +422,8 @@ mod tests {
             "/scribefoo",
             "/scribes/x",
             "/distillery",
+            "/memoryfoo",
+            "/memories/mcp",
             "/distill2/x",
             "/search/x",
             "/search/",
@@ -490,6 +522,72 @@ mod tests {
         let seen = body_json(resp).await;
         assert_eq!(seen["uri"], "/exists/doc-1?limit=5&q=two%20words&flag");
         assert_eq!(seen["method"], "GET");
+    }
+
+    /// The memory server serves `/mcp`, as hs-mcp does, so the gateway
+    /// mounts it under `/memory`. What reaches it must be its own path: a
+    /// `/memory/mcp` forwarded unchanged would be a 404 on every call.
+    #[tokio::test]
+    async fn the_memory_mount_is_taken_off_before_the_backend_sees_the_path() {
+        let backend = spawn_backend(echo_router()).await;
+        let state = test_state(&[("memory", &backend)]).await;
+        let token = access(&state, &["memory"]);
+
+        for (asked, wanted) in [
+            ("/memory/mcp", "/mcp"),
+            ("/memory/mcp?session=a%20b&flag", "/mcp?session=a%20b&flag"),
+            ("/memory/mcp/sse", "/mcp/sse"),
+            ("/memory/", "/"),
+            ("/memory", "/"),
+            ("/memory?x=1", "/?x=1"),
+            // Only the mount is removed; a later `memory` segment is the
+            // backend's own.
+            ("/memory/memory/mcp", "/memory/mcp"),
+        ] {
+            let resp = call(
+                &state,
+                bearer_req(Method::POST, asked, &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{asked}");
+            assert_eq!(body_json(resp).await["uri"], wanted, "{asked}");
+        }
+    }
+
+    /// `/mcp` and `/memory/mcp` are two servers with two scopes. A token for
+    /// one must not open the other, in either direction.
+    #[tokio::test]
+    async fn the_mcp_and_memory_scopes_do_not_open_each_other() {
+        let tools = spawn_backend(named_backend("the tools server")).await;
+        let memory = spawn_backend(named_backend("the memory server")).await;
+        let state = test_state(&[("mcp", &tools), ("memory", &memory)]).await;
+
+        for (scope, allowed, answered_by, refused) in [
+            ("mcp", "/mcp", "the tools server", "/memory/mcp"),
+            ("memory", "/memory/mcp", "the memory server", "/mcp"),
+        ] {
+            let token = access(&state, &[scope]);
+            let resp = call(
+                &state,
+                bearer_req(Method::POST, allowed, &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{scope} on {allowed}");
+            assert_eq!(body_string(resp).await, answered_by, "{scope} on {allowed}");
+
+            let resp = call(
+                &state,
+                bearer_req(Method::POST, refused, &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{scope} on {refused}");
+        }
     }
 
     #[tokio::test]
