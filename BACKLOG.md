@@ -1432,3 +1432,38 @@ shape P0-25 had: a maintenance path that exists only in a README. An expired cod
 service answers it `404`), so this is clutter rather than a fault, but it is unbounded.
 **Fix.** Schedule it: a weekly timer on the host that owns the corpus storage. Until then the
 how-to says a cron entry is enough, which puts the burden on the operator.
+
+### P1-40. The embedder takes 2,048 tokens per input, so long chunks are embedded from a prefix and two documents cannot be indexed (found 2026-11-26, cutover re-index)
+**Symptom.** Measured on the myelin store's embedder: an input over 2,048 tokens is cut to 2,048
+with no error (30 of 1,500 randomly sampled academic chunks, 2.0%, report exactly 2,048 prompt
+tokens; replacing the last 300 characters of one leaves its vector unchanged), and some inputs are
+refused with HTTP 413. Two documents (`10.48550_arxiv.2604.26509`, `W3212386989`) fail every
+indexing attempt for that reason; the Qdrant-era index holds both.
+**Cause.** A chunk is at most 4,000 characters, which table and formula markup turns into more
+than 2,048 tokens. The model's own limit is 8,192. Why this server stops at 2,048 is assumed, not
+verified: 8,192 shared across 4 parallel slots would give that number.
+**Fix.** Give the embedder the full context per input (one slot on the Ollama service, which needs
+root on the GPU host, or an embedder of its own), then index again every document holding a chunk
+over 2,048 tokens. Not a chunk-size cut: that changes retrieval for the whole corpus.
+
+### P1-41. A refused myelin `observe` leaves ledger records with no index points, and the document then counts as indexed (found 2026-11-26)
+**Symptom.** The two documents of P1-40 were listed by `/docs`, `/exists` and the status counts
+with 90 and 111 chunks while the index held no point for either, so nothing could find them.
+Reconcile classed both as `ok`, so `--reembed` never retried them. The 201 records were purged by
+hand; counts and index then agreed (475,786).
+**Cause.** Assumed from the counts, not read in the code: myelin writes a batch's ledger rows
+before it embeds them and keeps them when the embedding is refused, and hs-distill cannot remove
+them because a refused batch returns no ids. Read both write paths before fixing.
+**Fix.** In myelin, a refused `observe` leaves nothing behind. In hs-distill, a failed write
+removes every record of the document that was not there before the attempt, and reconcile counts
+a document as indexed only when the index can return it.
+
+### P1-42. The cutover gate picks and scores retrieval settings on the same 25 queries (found 2026-11-26)
+**Symptom.** At myelin's default rerank depth the gate fails (23/25). Seven depths were then tried
+on the gate's own queries; 50 and 75 give 25/25, 30, 35, 40 and 100 give 24/25. The pass at 50
+repeats, but one query sits at rank 8 and recall is not monotone in depth. All arms:
+`docs/loop/log.md`, 2026-11-26-01.
+**Cause.** `docs/loop/queries.yaml` is the only query set, so a setting chosen with it is also
+judged by it.
+**Fix.** A second, held-out query set that no setting is tuned on; a retrieval setting is accepted
+on that set. Until then the 2026-11-26 result is "passes at a fitted depth", not "passes".

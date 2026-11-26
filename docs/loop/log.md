@@ -3026,8 +3026,9 @@ without markdown. That was inferred, not measured, and is wrong: it is 137.
 
 Found while indexing, both open:
 
-- The embedder accepts 2,048 tokens per input here, not the model's 8,192
-  (Ollama splits the context across 4 slots). Longer inputs are cut without
+- The embedder accepts 2,048 tokens per input here, not the model's 8,192.
+  The limit is measured; its cause is inferred, not read from the server
+  (8,192 over 4 parallel slots would give it). Longer inputs are cut without
   an error: 30 of 1,500 randomly sampled academic chunks (2.0%) report
   exactly 2,048 prompt tokens, and replacing such a chunk's last 300
   characters leaves its vector unchanged (cosine 1.0). Two documents are
