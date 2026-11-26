@@ -3027,8 +3027,9 @@ without markdown. That was inferred, not measured, and is wrong: it is 137.
 Found while indexing, both open:
 
 - The embedder accepts 2,048 tokens per input here, not the model's 8,192.
-  The limit is measured; its cause is inferred, not read from the server
-  (8,192 over 4 parallel slots would give it). Longer inputs are cut without
+  Ollama starts the model with `-c 8192 -np 1 -b 2048 -ub 2048`, and an
+  embedding input has to fit one batch. (This entry first guessed 4
+  parallel slots; the process arguments show one.) Longer inputs are cut without
   an error: 30 of 1,500 randomly sampled academic chunks (2.0%) report
   exactly 2,048 prompt tokens, and replacing such a chunk's last 300
   characters leaves its vector unchanged (cosine 1.0). Two documents are
@@ -3050,9 +3051,9 @@ written.
 
 1. **Owner: decide whether a depth fitted to the gate queries counts as
    the gate passing.** Rows 2 and 11 are both true.
-2. **Give the embedder its full context** (one slot, or a dedicated
-   embedder), then index again the documents that hold a chunk over 2,048
-   tokens. Needs root on the GPU host for the Ollama setting.
+2. **Give the embedder a batch as large as its context** (8,192), then
+   index again the documents that hold a chunk over 2,048 tokens. Untested:
+   whether Ollama's `num_batch` does it, or it takes a separate embedder.
 3. **myelin: a refused `observe` must leave no ledger records**, and
    reconcile must not count a document with records but no index points
    as indexed.

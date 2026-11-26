@@ -1440,23 +1440,31 @@ tokens; replacing the last 300 characters of one leaves its vector unchanged), a
 refused with HTTP 413. Two documents (`10.48550_arxiv.2604.26509`, `W3212386989`) fail every
 indexing attempt for that reason; the Qdrant-era index holds both.
 **Cause.** A chunk is at most 4,000 characters, which table and formula markup turns into more
-than 2,048 tokens. The model's own limit is 8,192. Why this server stops at 2,048 is assumed, not
-verified: 8,192 shared across 4 parallel slots would give that number.
-**Fix.** Give the embedder the full context per input (one slot on the Ollama service, which needs
-root on the GPU host, or an embedder of its own), then index again every document holding a chunk
-over 2,048 tokens. Not a chunk-size cut: that changes retrieval for the whole corpus.
+than 2,048 tokens. The model's own limit is 8,192, but Ollama starts it with a 2,048-token batch
+(measured from the process arguments: `-c 8192 -np 1 -b 2048 -ub 2048`), and an embedding input
+must fit one batch. An earlier version of this entry blamed 4 parallel slots; that was a guess
+and it was wrong.
+**Fix.** Run the embedder with a batch equal to its context, then index again every document
+holding a chunk over 2,048 tokens. Untested: whether Ollama's `num_batch` (request option or
+Modelfile parameter) raises it, or the store needs an embedder of its own. Not a chunk-size cut:
+that changes retrieval for the whole corpus.
 
 ### P1-41. A refused myelin `observe` leaves ledger records with no index points, and the document then counts as indexed (found 2026-11-26)
 **Symptom.** The two documents of P1-40 were listed by `/docs`, `/exists` and the status counts
 with 90 and 111 chunks while the index held no point for either, so nothing could find them.
 Reconcile classed both as `ok`, so `--reembed` never retried them. The 201 records were purged by
 hand; counts and index then agreed (475,786).
-**Cause.** Assumed from the counts, not read in the code: myelin writes a batch's ledger rows
-before it embeds them and keeps them when the embedding is refused, and hs-distill cannot remove
-them because a refused batch returns no ids. Read both write paths before fixing.
-**Fix.** In myelin, a refused `observe` leaves nothing behind. In hs-distill, a failed write
-removes every record of the document that was not there before the attempt, and reconcile counts
-a document as indexed only when the index can return it.
+**Cause.** Read in both write paths. myelin's `WritePath::insert`
+(`crates/myelin-core/src/pipeline/write.rs`) stores the episodes in the ledger, then indexes them,
+and returns the indexing error without removing what it stored. hs-distill sends a document's
+chunks in one `observe` call per store and, on an error, returns before it deletes anything: a
+refused call gives it no record ids to delete.
+**Fix.** In myelin: a write whose index leg fails leaves no ledger rows (filed as
+`home-still/myelin#216`). hs-distill cannot do this from its side today: `forget_scope` takes only
+a list of ids to keep, nothing lists a document's ids past 200, and an unchanged document gets the
+same ids again, so "delete what this attempt wrote" would delete the live records. The same gap
+leaves a duplicate generation when the first store's write succeeds and the second's fails; that
+needs a way to list a document's record ids.
 
 ### P1-42. The cutover gate picks and scores retrieval settings on the same 25 queries (found 2026-11-26)
 **Symptom.** At myelin's default rerank depth the gate fails (23/25). Seven depths were then tried
