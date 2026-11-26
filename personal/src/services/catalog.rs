@@ -108,6 +108,24 @@ pub async fn list_entries(
         .collect())
 }
 
+/// Every document's stem and catalog card, in stem-key order.
+///
+/// The personal store keeps each card beside its document, so the cards
+/// are found by walking `prefix`, the store's source prefix. A card that
+/// cannot be read or parsed fails the listing: a list that silently left a
+/// document out would read as "that document is not here".
+pub async fn list_cards(
+    storage: &dyn Storage,
+    prefix: &str,
+) -> Result<Vec<(String, CatalogEntry)>> {
+    let mut cards = Vec::new();
+    for key in sidecar_keys(storage, prefix).await? {
+        let entry = read_sidecar(storage, &key).await?;
+        cards.push((sidecar_stem(&key), entry));
+    }
+    Ok(cards)
+}
+
 /// Every catalog sidecar's key, under `prefix`.
 async fn sidecar_keys(storage: &dyn Storage, prefix: &str) -> Result<Vec<String>> {
     let root = prefix.trim_end_matches('/');

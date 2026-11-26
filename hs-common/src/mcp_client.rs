@@ -341,6 +341,54 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    async fn the_status_snapshot_is_read_beside_the_mcp_endpoint_without_a_session() {
+        let server = FakeServer::start(|req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/mcp/status") => {
+                Response::raw(200, "application/json", "{\"generated_at\":\"now\"}")
+            }
+            _ => Response::raw(404, "text/plain", "no such route"),
+        })
+        .await;
+        let http = AuthedHttp::plain(reqwest::Client::new());
+
+        // A trailing slash on the configured endpoint does not double up.
+        for endpoint in [
+            format!("{}/mcp", server.base),
+            format!("{}/mcp/", server.base),
+        ] {
+            let snapshot = fetch_status(&http, &endpoint).await.unwrap();
+            assert_eq!(snapshot["generated_at"], "now");
+        }
+        assert!(
+            server.requests().iter().all(|r| r.method == "GET"),
+            "no MCP session is opened for the snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_status_answer_that_is_not_a_snapshot_is_an_error() {
+        // An older server has no such route and answers the MCP service's
+        // refusal; a proxy answers an error page.
+        let refused =
+            FakeServer::start(|_| Response::raw(406, "text/plain", "Not Acceptable")).await;
+        let http = AuthedHttp::plain(reqwest::Client::new());
+        let err = fetch_status(&http, &format!("{}/mcp", refused.base))
+            .await
+            .expect_err("a 406 is a failure");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("406") && msg.contains("/mcp/status"), "{msg}");
+
+        let page = FakeServer::start(|_| Response::raw(200, "text/html", "<html>hi</html>")).await;
+        let err = fetch_status(&http, &format!("{}/mcp", page.base))
+            .await
+            .expect_err("a page is not a snapshot");
+        assert!(
+            format!("{err:#}").contains("did not answer JSON"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn parses_sse_result_json_text() {
         let body = "data: \n\nid: 0\nretry: 3000\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"catalog_entries\\\":2855}\"}],\"isError\":false}}\n";
