@@ -1622,6 +1622,16 @@ deleted. Documents reach the store through the distill watcher, which reads stor
 `hs distill reconcile --reembed` and `hs distill reindex` cover what the watcher missed. The 27
 ids are kept with the release's records on the host, not in this repository, and are removed
 with `hs distill purge` once rc.396 runs there.
+**FIXED (rc.396, 2026-11-27).** Measured on the GPU host. The distill server started twice under
+rc.396 and the ledger holds no `add` event after either start. The 27 ids were removed with
+`hs distill purge`: 1,688 records deleted, the number added. The ledger and the index agree
+(378,948 passages, 96,985 reference lists) and the four lower-case originals kept their records.
+The store is the judged store plus 2 papers the watcher indexed in between: 475,933 records and
+19,270 documents. Both query files then gave the judged ranks: 25/25, 47/50, 0 of 75 differ.
+**Wrong in the symptom above.** "The gate rows did not move … each rank equal to the judged run"
+was measured at 13:15:52Z, while the daemon was still adding. With all 27 in the store one rank
+differed (q09: 3, judged 6), and an injected id was in the first ten of 2 of the 25 gate queries
+(q01, q09) and of none of the 50 held-out.
 
 ### P1-47. `hs distill reconcile` does not report a document that is in the store and not in storage (found 2026-11-27)
 **Symptom.** With the 27 documents of P0-32 in the store, `hs distill reconcile --fix-stamps
@@ -1650,6 +1660,36 @@ under two ids, so a search can return it twice and a purge by one id leaves the 
 writer produced the mixed-case ids is not established; the DOI lower-casing migration is the
 first place to look.
 
+### P1-51. On `mac_air` the inbox LaunchAgent could not reach the LAN for six minutes after `hs upgrade` replaced its binary, and the upgrade reported it restarted (found 2026-11-27, rc.396 rollout)
+**Symptom.** After the upgrade from rc.393 to rc.396, `io.home-still.scribe-inbox` exited on
+`connecting to NATS at nats://<host>:4222: IO error: No route to host (os error 65)`. launchd
+started it again every 10 seconds. 34 starts failed over 5 minutes 50 seconds; the 35th connected
+and the agent has run since. Before the upgrade the same agent was connected.
+**Measured while it failed.** On the same host: `nc` from an ssh shell reached that port, and
+`hs scribe inbox sweep` run from the ssh shell with the new binary answered `found=161 …
+errors=0`. The host runs macOS 26.6.2. The binary is ad-hoc signed by the linker, with an
+identifier that ends in a hash of the build.
+**Cause: not established.** P1-25 saw the same error on the first start after the rc.360
+upgrade; there the next start connected. Here it took 35.
+**Wrong at first.** I took it for a macOS local-network permission that stays refused until the
+owner allows the new binary. The agent connected with no action from me. Someone was using that
+Mac in the same minute, so a person allowing it is not ruled out; the system log could not be
+read over ssh.
+**The upgrade said `OK: io.home-still.scribe-inbox restarted`.** The launchd restart
+(`crates/hs/src/restart_cmd.rs`) waits for a pid that runs the installed binary. A job that
+exits a second after it starts has one each time it is started.
+**Not affected.** The GPU host runs the same watcher on the same storage prefix, so the inbox was
+swept. `bmb`'s scribe agent was restarted by the same upgrade and its `/health` answers.
+**Change.** (a) The restart check requires the pid to still be the same one after a few seconds,
+and reports the agent's last error when it is not. (b) At the next upgrade of a Mac, watch the
+agent and the screen together, to learn whether macOS asks for permission.
+
+### P2-16. The gateway does not listen until its backend checks finish (found 2026-11-27)
+On the gateway host under rc.396 the unit started at 17:19:05Z and logged `Gateway listening` at
+17:19:11Z. In between it waited for `/health` of each backend, and the `memory` backend timed out
+(its port is dropped by a firewall). A restart is 6 seconds without the remote route for each
+backend that does not answer. Listen first and run the checks beside it.
+
 ### Owner-only items after the rc.395 cutover (2026-11-27)
 - The GPU host's firewall does not admit the gateway host on TCP 7463, so the remote memory route
   answers nothing.
@@ -1658,3 +1698,14 @@ first place to look.
   read by anything in rc.396. It is the owner's to delete.
 - The abstracts store: 33 of 2,860 entries hold a vector from before the pooling fix until
   `hs distill abstracts build --force` is run (at least 5 GB of GPU memory).
+
+### Owner-only items after the rc.396 rollout (2026-11-27)
+- `bmb` and `big_mac`: `hs status` fails with `gateway rejected the refresh token (401)`. Their
+  enrolments expired (P0-23). Enrolling again also gives them the `memory` scope.
+- `mac_air`: if macOS showed a local-network prompt for `hs` at the upgrade, say so on P1-51; it
+  is the one fact that item lacks.
+- `five` did not answer (`No route to host`) and runs whatever it ran before.
+- `~/.home-still/distill-index-status.json` and `distill-index.log` on the GPU host are no longer
+  read or written.
+- The gateway host's config was edited to add the `memory` route; the copy from before is beside
+  it as `config.yaml.bak-rc396-<time>`.
