@@ -1660,28 +1660,29 @@ under two ids, so a search can return it twice and a purge by one id leaves the 
 writer produced the mixed-case ids is not established; the DOI lower-casing migration is the
 first place to look.
 
-### P1-51. On `mac_air` the inbox LaunchAgent cannot reach the LAN after `hs upgrade` replaces its binary, and the upgrade reports it restarted (found 2026-11-27, rc.396 rollout)
-**Symptom.** After the upgrade from rc.393 to rc.396, `io.home-still.scribe-inbox` exits on
+### P1-51. On `mac_air` the inbox LaunchAgent could not reach the LAN for six minutes after `hs upgrade` replaced its binary, and the upgrade reported it restarted (found 2026-11-27, rc.396 rollout)
+**Symptom.** After the upgrade from rc.393 to rc.396, `io.home-still.scribe-inbox` exited on
 `connecting to NATS at nats://<host>:4222: IO error: No route to host (os error 65)`. launchd
-starts it again every 10 seconds; 34 starts failed in the first 6 minutes and its log grew by
-about 1 KB each time. Before the upgrade the same agent was connected.
-**Measured.** In the same minute, on the same host: `nc` from an ssh shell reaches that port, and
-`hs scribe inbox sweep` run from the ssh shell with the new binary answers `found=161 …
+started it again every 10 seconds. 34 starts failed over 5 minutes 50 seconds; the 35th connected
+and the agent has run since. Before the upgrade the same agent was connected.
+**Measured while it failed.** On the same host: `nc` from an ssh shell reached that port, and
+`hs scribe inbox sweep` run from the ssh shell with the new binary answered `found=161 …
 errors=0`. The host runs macOS 26.6.2. The binary is ad-hoc signed by the linker, with an
 identifier that ends in a hash of the build.
-**Inferred, not measured.** macOS withholds local-network access from a launchd agent whose
-binary it has not seen, until someone allows it under Privacy & Security → Local Network. Every
-release is a new binary to it. P1-25 saw the same error on the first start after the rc.360
-upgrade; there the next start connected.
+**Cause: not established.** P1-25 saw the same error on the first start after the rc.360
+upgrade; there the next start connected. Here it took 35.
+**Wrong at first.** I took it for a macOS local-network permission that stays refused until the
+owner allows the new binary. The agent connected with no action from me. Someone was using that
+Mac in the same minute, so a person allowing it is not ruled out; the system log could not be
+read over ssh.
 **The upgrade said `OK: io.home-still.scribe-inbox restarted`.** The launchd restart
 (`crates/hs/src/restart_cmd.rs`) waits for a pid that runs the installed binary. A job that
 exits a second after it starts has one each time it is started.
-**Not affected.** The GPU host runs the same watcher on the same storage prefix, so the inbox is
+**Not affected.** The GPU host runs the same watcher on the same storage prefix, so the inbox was
 swept. `bmb`'s scribe agent was restarted by the same upgrade and its `/health` answers.
-**Change.** (a) The owner allows `hs` on that Mac. (b) The restart check requires the pid to still
-be the same one after a few seconds, and reports the agent's last error when it is not. (c) Find
-whether a signature with a fixed identity keeps the permission across releases, before choosing
-one.
+**Change.** (a) The restart check requires the pid to still be the same one after a few seconds,
+and reports the agent's last error when it is not. (b) At the next upgrade of a Mac, watch the
+agent and the screen together, to learn whether macOS asks for permission.
 
 ### P2-16. The gateway does not listen until its backend checks finish (found 2026-11-27)
 On the gateway host under rc.396 the unit started at 17:19:05Z and logged `Gateway listening` at
@@ -1701,8 +1702,8 @@ backend that does not answer. Listen first and run the checks beside it.
 ### Owner-only items after the rc.396 rollout (2026-11-27)
 - `bmb` and `big_mac`: `hs status` fails with `gateway rejected the refresh token (401)`. Their
   enrolments expired (P0-23). Enrolling again also gives them the `memory` scope.
-- `mac_air`: allow local-network access for `hs` (P1-51). Until then its inbox agent restarts
-  every 10 seconds.
+- `mac_air`: if macOS showed a local-network prompt for `hs` at the upgrade, say so on P1-51; it
+  is the one fact that item lacks.
 - `five` did not answer (`No route to host`) and runs whatever it ran before.
 - `~/.home-still/distill-index-status.json` and `distill-index.log` on the GPU host are no longer
   read or written.

@@ -3459,23 +3459,26 @@ answered (viewer 200, page 200, source 206, markdown 206).
 | `bmb` | rc.394 | rc.396 | scribe agent restarted; its `/health` reports rc.396 |
 | `mac_air` | rc.393 | rc.396 | `hs status` through the gateway shows 19,270 documents and 475,933 chunks |
 | `big_mac` | rc.394 | rc.396 | binaries; it runs no agent |
-| `two` | rc.394 | rc.396 | gateway active, five routes, local `/health` 200 |
+| `two` | rc.394 | rc.396 | gateway active, five routes, local `/health` 200; the four remote links of a `cite` answer through it (206, 200, 206, 200) |
 | `one`, `three`, `four` | rc.394 | rc.396 | binaries; they run no home-still service |
 | `five` | | | unreachable (`No route to host`) |
 
 `hs distill index` is an unknown command on all eight.
 
-**What does not work after the rollout.**
+**What did not work, or does not, after the rollout.**
 
-- **`mac_air`: the inbox LaunchAgent has not connected since its binary was
-  replaced** (BACKLOG P1-51). It exits on `connecting to NATS … No route to
-  host (os error 65)` and launchd starts it again every 10 seconds: 34
-  times in the first 6 minutes. The same binary run once from an ssh shell
-  on that host swept the inbox without an error. `hs upgrade` reported the
-  agent restarted. Inferred, not measured: macOS withholds local-network
-  access from the new binary until someone allows it on that Mac. The GPU
-  host runs the same watcher on the same storage prefix, so the inbox is
-  still swept.
+- **`mac_air`: the inbox LaunchAgent could not reach the LAN for 5 minutes
+  50 seconds after its binary was replaced** (BACKLOG P1-51). It exited on
+  `connecting to NATS … No route to host (os error 65)` and launchd started
+  it again every 10 seconds: 34 failed starts. The 35th connected and the
+  agent has run since. In those minutes the same binary, run once from an
+  ssh shell on that host, swept the inbox without an error. `hs upgrade`
+  had reported the agent restarted. The cause is not established: I first
+  took it for a macOS local-network permission that only the owner could
+  give, and the agent then connected with no action from me. Someone was
+  using that Mac in the same minute, so a person allowing it is not ruled
+  out. The GPU host runs the same watcher on the same storage prefix, so
+  the inbox was swept throughout.
 - **`bmb` and `big_mac`: `hs status` fails** with `gateway rejected the
   refresh token (401)`. Their enrolments expired (BACKLOG P0-23); the
   token files are 29 and 28 days old.
@@ -3506,8 +3509,8 @@ reachable host.
 1. **Owner: open TCP 7463 on the GPU host to the gateway host, and enrol
    each device again** (the `memory` scope; `bmb` and `big_mac` have
    expired).
-2. **Owner: allow local-network access for `hs` on `mac_air`** (BACKLOG
-   P1-51).
+2. **`hs upgrade` reports a LaunchAgent restarted while it is failing**
+   (BACKLOG P1-51).
 3. **`hs distill reconcile` is blind to a document the store holds and
    storage does not** (BACKLOG P1-47).
 4. **`hs scribe catalog-backfill` reads and writes folders on its own
