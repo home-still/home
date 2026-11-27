@@ -3390,3 +3390,126 @@ branch `retire-local-index`.
 4. **`hs scribe catalog-backfill` reads and writes folders on its own
    host** (BACKLOG P1-49): the same fault in another command.
 5. **Rare-word queries** (BACKLOG P1-46), unchanged.
+
+## 2026-11-27-03 — rc.396 on every reachable host: a server start adds nothing, the 27 documents are gone, the judged ranking holds
+
+**Evidence.** `v0.0.1-rc.396` was tagged on `main` at `5b25f67`. The
+release run's first attempt built nothing: GitHub never gave the macOS
+check a runner and cancelled it after 15 minutes (`The job was not acquired
+by Runner of type hosted even after multiple attempts`). The failed leg was
+rerun on the same run and the same tag; every job then passed. The release
+holds 33 assets, the same names as rc.395. The Linux x86_64 `hs` asset
+matches its sha256 and prints `hs 0.0.1-rc.396`.
+
+**The fix, measured on the GPU host.** `hs upgrade --pre --yes` exited 0
+and restarted 8 services. The five binaries carry the rc.396 marker;
+`hs distill index` answers `unrecognized subcommand`. The distill server
+started twice under rc.396 (the upgrade, then one restart by hand). The
+ledger holds no `add` event after either start. No indexing process ran and
+the old status file was not rewritten.
+
+**The 27 documents.** Each was removed with `hs distill purge -- <id>`; all
+27 exited 0.
+
+| | With the 27 | After the purge | Judged store plus the watcher's 2 papers |
+|---|---|---|---|
+| `academic` records | 477,621 | 475,933 | 475,933 |
+| `academic` documents | 19,297 | 19,270 | 19,270 |
+| `references` records | 97,259 | 96,985 | 96,985 |
+| `references` documents | 16,793 | 16,773 | 16,773 |
+
+1,688 records were deleted (1,414 passages, 274 reference lists), the
+number that was added. The ledger and the index agree: 378,948 passages and
+96,985 reference lists in each. The four stored documents whose ids differ
+from an injected one only in letter case kept their records.
+`hs distill reconcile` answers `ok=19333 stamp_missing=0 embed_missing=0`.
+The watcher indexed 2 new papers at 14:29Z and 14:30Z (36 records); they
+came from conversion events and stay.
+
+**The ranking.**
+
+| What | Judged run | rc.396, 27 still in | rc.396, after the purge |
+|---|---|---|---|
+| Gate `RECALL@10` | 25/25 | 25/25 | 25/25 |
+| Held-out: expected document in the top 10 | 47/50 | 47/50 | 47/50 |
+| Ranks that differ from the judged run | | 1 of 75 | 0 of 75 |
+| Queries with an injected id in the top 10 | | 2 of 75 | 0 of 75 |
+
+`hs-mcp` lists ten tools. A `cite` call on a stored paper located its quote
+on the PDF page from the text layer, and the four links it returned
+answered (viewer 200, page 200, source 206, markdown 206).
+
+**Corrections to entry 2026-11-27-02.**
+
+- "Whether one is in the first ten of a judged query was not measured." It
+  is now: with all 27 in the store an injected id was in the first ten of 2
+  of the 25 gate queries (q01, q09) and of none of the 50 held-out.
+- "Ranks that differ from the judged run: 0 of 75." That run was written at
+  13:15:52Z, while the daemon was still adding (13:14:44Z to 13:19:52Z), so
+  it did not measure the store with all 27 in it. With all 27, one rank
+  differed: q09 answered at rank 3 where the judged run has 6, because an
+  injected document matched. After the purge it is 6 again.
+
+**The fleet.** One host at a time, each with `hs upgrade --pre --yes`, exit
+0 on every one.
+
+| Host | Before | After | Checked |
+|---|---|---|---|
+| `big` | rc.395 | rc.396 | everything above |
+| `bmb` | rc.394 | rc.396 | scribe agent restarted; its `/health` reports rc.396 |
+| `mac_air` | rc.393 | rc.396 | `hs status` through the gateway shows 19,270 documents and 475,933 chunks |
+| `big_mac` | rc.394 | rc.396 | binaries; it runs no agent |
+| `two` | rc.394 | rc.396 | gateway active, five routes, local `/health` 200 |
+| `one`, `three`, `four` | rc.394 | rc.396 | binaries; they run no home-still service |
+| `five` | | | unreachable (`No route to host`) |
+
+`hs distill index` is an unknown command on all eight.
+
+**What does not work after the rollout.**
+
+- **`mac_air`: the inbox LaunchAgent has not connected since its binary was
+  replaced** (BACKLOG P1-51). It exits on `connecting to NATS … No route to
+  host (os error 65)` and launchd starts it again every 10 seconds: 34
+  times in the first 6 minutes. The same binary run once from an ssh shell
+  on that host swept the inbox without an error. `hs upgrade` reported the
+  agent restarted. Inferred, not measured: macOS withholds local-network
+  access from the new binary until someone allows it on that Mac. The GPU
+  host runs the same watcher on the same storage prefix, so the inbox is
+  still swept.
+- **`bmb` and `big_mac`: `hs status` fails** with `gateway rejected the
+  refresh token (401)`. Their enrolments expired (BACKLOG P0-23); the
+  token files are 29 and 28 days old.
+- **The remote `memory` route answers nothing.** The gateway logs `memory
+  backend … is not reachable (timed out …)`: the GPU host's firewall drops
+  the port. The other four backends answered.
+- **The gateway did not listen for 6 seconds after it started**: it waits
+  for its backend checks, and one timed out (BACKLOG P2-16).
+
+**Mistakes in this pass.**
+
+- The count that was to confirm each purge was called with its two
+  arguments in the wrong order and returned 0 for every id. Two documents
+  were purged before the store's totals showed it. Both were then counted
+  directly in the ledger and the index, with their lower-case originals,
+  before the other 25 were removed.
+
+**Noted, not acted on.** `W2007223677`, the one injected id that storage
+holds, is in storage as 15 lines that repeat one word, with no catalog
+title. The store did not hold it before and does not now; reconcile does
+not count it as missing.
+
+**Version.** `main` at `5b25f67`, tagged `v0.0.1-rc.396`, on every
+reachable host.
+
+### Top 5 remaining items
+
+1. **Owner: open TCP 7463 on the GPU host to the gateway host, and enrol
+   each device again** (the `memory` scope; `bmb` and `big_mac` have
+   expired).
+2. **Owner: allow local-network access for `hs` on `mac_air`** (BACKLOG
+   P1-51).
+3. **`hs distill reconcile` is blind to a document the store holds and
+   storage does not** (BACKLOG P1-47).
+4. **`hs scribe catalog-backfill` reads and writes folders on its own
+   host** (BACKLOG P1-49).
+5. **Rare-word queries** (BACKLOG P1-46), unchanged.
