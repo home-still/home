@@ -748,7 +748,6 @@ hs distill [OPTIONS] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `hs distill index` | Index markdown files into the `academic` store through the distill server. |
 | `hs distill search` | Semantic search across indexed documents. |
 | `hs distill status` | Show distill system status (server, backend, the `academic` store). |
 | `hs distill watch-events` | Consume `scribe.completed` events from the event bus and index each markdown object through the distill server. |
@@ -766,28 +765,6 @@ Example:
 
 ```bash
 hs distill --help
-```
-
-### `hs distill index`
-
-Index markdown files into the `academic` store through the distill server.
-
-```text
-hs distill index [OPTIONS]
-```
-
-| Name | Default | Meaning |
-|---|---|---|
-| `--force` | off | Re-index all documents (ignore cache). |
-| `--file <FILE>` | none | Index only this file. Repeat the flag for several files. |
-| `--server <SERVER>` | none | Override server URL. |
-
-Starts a background indexing daemon and attaches to its progress display; press `q` to detach and leave the daemon running. When a daemon is already running the command attaches to it. The command checks the distill server's health before starting, and exits non-zero when any file failed to index.
-
-Example:
-
-```bash
-hs distill index --server http://<gpu-host>:7434
 ```
 
 ### `hs distill search`
@@ -1161,7 +1138,7 @@ hs restart [OPTIONS]
 
 The command takes no arguments or flags of its own.
 
-Discovers the units that run this host's home-still binaries (systemd system units, systemd user units and launchd agents), matches them by the executable they run, and restarts them. It also restarts the distill index daemon and the scribe compose containers (`~/.home-still/docker-compose.yml`, when `scribe.local_server` is on), and exits non-zero when any restart failed. One-shot timer jobs are left alone.
+Discovers the units that run this host's home-still binaries (systemd system units, systemd user units and launchd agents), matches them by the executable they run, and restarts them. It also restarts the scribe compose containers (`~/.home-still/docker-compose.yml`, when `scribe.local_server` is on), and exits non-zero when any restart failed. One-shot timer jobs are left alone.
 
 Example:
 
@@ -1264,7 +1241,7 @@ In the foreground the command runs the `hs-distill-server` binary on the given p
 
 `--install` writes the system unit `hs-serve-distill.service` (Linux, using `sudo`) or the LaunchAgent `com.home-still.distill` (macOS), enables it and starts it. `--uninstall` removes it.
 
-`start` stops any distill server recorded in the PID file, starts `hs-distill-server` in the background with its output in `distill-server.log` under the log directory, waits up to 300 seconds for `/health`, and starts the indexing daemon. It starts no database: myelin and Ollama must already be running. `stop` stops the server process.
+`start` stops any distill server recorded in the PID file, starts `hs-distill-server` in the background with its output in `distill-server.log` under the log directory, and waits up to 300 seconds for `/health`. It starts no database: myelin and Ollama must already be running. `stop` stops the server process.
 
 Example:
 

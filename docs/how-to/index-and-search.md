@@ -36,26 +36,30 @@ index consistent with your library. How search ranks passages is explained in
 
 ## Index
 
-1. Index every markdown file under the markdown directory:
+Documents are indexed from the library's storage, never from a folder on the
+host you run a command on.
 
-   ```sh
-   hs distill index
-   ```
-
-   Documents already indexed are skipped; `--force` indexes everything again.
-   `--file` indexes only the named files:
-
-   ```sh
-   hs distill index --file ~/home-still/markdown/10/10.48550_arxiv.1706.03762.md
-   ```
-
-2. To index every conversion as it is stored, install the distill watcher:
+1. To index every conversion as it is stored, install the distill watcher:
 
    ```sh
    hs serve distill-watch --install
    ```
 
    Or run it in the foreground with `hs distill watch-events`.
+
+2. To index the documents that were converted while no watcher was running:
+
+   ```sh
+   hs distill reconcile --reembed
+   ```
+
+   Without `--reembed` it reports them and changes nothing.
+
+3. To index one document again, replacing its passages in place:
+
+   ```sh
+   hs distill reindex 10.48550_arxiv.1706.03762
+   ```
 
 ## Search
 

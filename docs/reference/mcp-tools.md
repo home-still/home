@@ -320,7 +320,7 @@ Earlier releases exposed about forty tools. The ones below are gone; this table 
 | `system_status` | `hs status`, which reads `GET /mcp/status`; an agent asks [`status`](#status). |
 | `scribe_convert` | `hs scribe convert` |
 | `scribe_queue` | `hs scribe queue <STEM>` |
-| `distill_index` | `hs distill index` |
+| `distill_index` | `hs distill reindex <STEM>`; `hs distill reconcile --reembed` for documents that were never indexed |
 | `distill_reconcile` | `hs distill reconcile` |
 | `distill_reindex` | `hs distill reindex` |
 | `distill_backfill` | `hs distill backfill` |

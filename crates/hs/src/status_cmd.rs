@@ -55,7 +55,6 @@ struct DashboardData {
     store_version: String,
 
     watcher: WatcherInfo,
-    indexer: IndexerInfo,
 
     history: Vec<HistoryEvent>,
 
@@ -107,7 +106,6 @@ impl DashboardData {
         self.embedded_chunks = new.embedded_chunks;
         self.embedding_skipped = new.embedding_skipped;
         self.watcher = new.watcher;
-        self.indexer = new.indexer;
         self.history = new.history;
         self.counts_error = new.counts_error;
         self.loading = false;
@@ -137,7 +135,6 @@ impl DashboardData {
             store_name: String::new(),
             store_version: String::new(),
             watcher: WatcherInfo::Stopped,
-            indexer: IndexerInfo::Stopped,
             history: vec![],
             loading,
             counts_error,
@@ -180,21 +177,6 @@ impl From<Option<hs_common::status::InboxHeartbeatSnapshot>> for WatcherInfo {
     }
 }
 
-enum IndexerInfo {
-    /// Indexer daemon is actively running
-    Running {
-        indexed: u64,
-        total: u64,
-        failed: u64,
-        chunks: u64,
-        current_file: String,
-    },
-    /// Indexer finished all files
-    Finished { indexed: u64, chunks: u64 },
-    /// Not running
-    Stopped,
-}
-
 struct ServiceStatus {
     url: String,
     healthy: bool,
@@ -222,39 +204,20 @@ async fn collect_data() -> DashboardData {
     // cause is never discarded.
     match collect_data_via_mcp().await {
         Ok(data) => data,
-        Err(e) => {
-            let (indexer, note) = match read_indexer_status() {
-                Ok(indexer) => (indexer, String::new()),
-                Err(ie) => (
-                    IndexerInfo::Stopped,
-                    format!("; indexer status unavailable: {ie:#}"),
-                ),
-            };
-            DashboardData {
-                indexer,
-                ..DashboardData::blank(false, Some(format!("status unavailable: {e:#}{note}")))
-            }
-        }
+        Err(e) => DashboardData::blank(false, Some(format!("status unavailable: {e:#}"))),
     }
 }
 
 /// Populate the dashboard from the MCP server's status snapshot — the single
 /// source of truth for pipeline counts and service health. Byte counts stay
-/// at 0 (the snapshot reports object counts, not sizes). The `indexer` row
-/// reflects the distill-index daemon on the CLI host, not the remote gateway.
+/// at 0 (the snapshot reports object counts, not sizes).
 async fn collect_data_via_mcp() -> anyhow::Result<DashboardData> {
     let snapshot = hs_common::mcp_client::status_snapshot().await?;
     let snap: hs_common::status::StatusSnapshot = serde_json::from_value(snapshot)?;
-
-    let mut data = snapshot_to_dashboard(snap);
-    data.indexer = read_indexer_status()?;
-    Ok(data)
+    Ok(snapshot_to_dashboard(snap))
 }
 
 /// Map the shared StatusSnapshot into the CLI's TUI-local DashboardData.
-/// The caller is responsible for overlaying local-daemon fields
-/// (`watcher`, `indexer`) since those reflect the CLI host, not the remote
-/// gateway.
 fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardData {
     let scribe_servers = snap
         .scribe_instances
@@ -323,7 +286,6 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         store_name,
         store_version,
         watcher: WatcherInfo::from(snap.inbox_heartbeat),
-        indexer: IndexerInfo::Stopped,
         history,
         loading: false,
     }
@@ -343,56 +305,6 @@ fn instance_to_status(inst: &hs_common::status::ServiceInstance) -> ServiceStatu
         version: inst.version.clone(),
         error: inst.error.clone(),
     }
-}
-
-fn read_indexer_status() -> anyhow::Result<IndexerInfo> {
-    let status = match crate::distill_cmd::read_index_status()? {
-        Some(s) => s,
-        None => return Ok(IndexerInfo::Stopped),
-    };
-
-    // Cross-host liveness: trust the status file's mtime over local PID check.
-    // The indexer updates the status file frequently while running.
-    let status_path = crate::distill_cmd::index_status_path()?;
-    let status_is_fresh = std::fs::metadata(&status_path)
-        .and_then(|m| m.modified())
-        .map(|t| {
-            std::time::SystemTime::now()
-                .duration_since(t)
-                .map(|d| d.as_secs() < 30)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-
-    // A bare "is this PID alive" names whatever process recycled the PID of a
-    // crashed indexer; only the real index daemon counts.
-    let is_alive =
-        status_is_fresh || (status.pid > 0 && crate::distill_cmd::is_index_daemon(status.pid)?);
-
-    if !is_alive {
-        if status.done {
-            return Ok(IndexerInfo::Finished {
-                indexed: status.indexed as u64,
-                chunks: status.total_chunks as u64,
-            });
-        }
-        return Ok(IndexerInfo::Stopped);
-    }
-
-    if status.done {
-        return Ok(IndexerInfo::Finished {
-            indexed: status.indexed as u64,
-            chunks: status.total_chunks as u64,
-        });
-    }
-
-    Ok(IndexerInfo::Running {
-        indexed: status.indexed as u64,
-        total: status.total_files as u64,
-        failed: status.failed as u64,
-        chunks: status.total_chunks as u64,
-        current_file: status.current_file,
-    })
 }
 
 // ── Formatting helpers ──────────────────────────────────────────
@@ -436,14 +348,14 @@ fn render(frame: &mut Frame, data: &DashboardData) {
         services_diagnosis_lines(&data.scribe_servers, &data.distill_servers, width);
     // service rows + the Store row + the header row + the diagnosis block
     // + the block's two border rows. Getting this one line short is exactly
-    // how the Indexer row vanished in rc.380 and how the diagnosis block
-    // went missing here: ratatui clips silently.
+    // how the last Pipeline row vanished in rc.380 and how the diagnosis
+    // block went missing here: ratatui clips silently.
     let services_height =
         (data.scribe_servers.len() + data.distill_servers.len()) as u16 + 2 + diagnosis_lines + 2;
 
     let outer = Layout::vertical([
         Constraint::Length(1),               // title
-        Constraint::Length(14), // pipeline: header + Documents/Markdown/Cataloged/Embedded/In-flight/Queued/Stalled/Inbox/Failed/Watcher/Indexer rows + 2 border rows
+        Constraint::Length(13), // pipeline: header + Documents/Markdown/Cataloged/Embedded/In-flight/Queued/Stalled/Inbox/Failed/Watcher rows + 2 border rows
         Constraint::Length(1),  // spacer
         Constraint::Length(services_height), // services
         Constraint::Length(1),  // spacer
@@ -811,49 +723,6 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                     }),
                 ])
             }
-        },
-        match &data.indexer {
-            IndexerInfo::Running {
-                indexed,
-                total,
-                failed,
-                chunks,
-                current_file,
-            } => {
-                let color = Color::Green;
-                let pct = if *total > 0 {
-                    (*indexed as f64 / *total as f64 * 100.0) as u64
-                } else {
-                    0
-                };
-                let file_short = ellipsize(current_file, 30);
-                let fail_str = if *failed > 0 {
-                    format!(" · {failed} failed")
-                } else {
-                    String::new()
-                };
-                let detail = format!(
-                    "{indexed}/{total} ({pct}%) · {chunks} chunks{fail_str} · {file_short}"
-                );
-                Row::new(vec![
-                    Cell::from("Indexer").style(Style::default().fg(color)),
-                    Cell::from("●".to_string()).style(Style::default().fg(color)),
-                    Cell::from("indexing"),
-                    Cell::from(detail),
-                ])
-            }
-            IndexerInfo::Finished { indexed, chunks } => Row::new(vec![
-                Cell::from("Indexer").style(Style::default().fg(Color::Green)),
-                Cell::from("●".to_string()).style(Style::default().fg(Color::Green)),
-                Cell::from("done"),
-                Cell::from(format!("{indexed} indexed · {chunks} chunks")),
-            ]),
-            IndexerInfo::Stopped => Row::new(vec![
-                Cell::from("Indexer").style(Style::default().fg(Color::DarkGray)),
-                Cell::from("○".to_string()).style(Style::default().fg(Color::DarkGray)),
-                Cell::from("stopped"),
-                Cell::from(""),
-            ]),
         },
     ];
 
@@ -1545,39 +1414,6 @@ mod tests {
         assert!(cut.ends_with("..."));
     }
 
-    /// The indexer row sliced `current_file` at byte 27: a multi-byte
-    /// character straddling it panicked the render (and, in release builds,
-    /// aborted the process with the terminal in raw mode). The row is built
-    /// eagerly even when the panel clips it, so a completed draw is the proof.
-    #[test]
-    fn the_dashboard_renders_a_non_ascii_file_name_longer_than_the_column() {
-        for name in [
-            format!("{}é{}", "a".repeat(26), "b".repeat(20)),
-            format!("{}日本語{}", "a".repeat(25), "b".repeat(20)),
-        ] {
-            let mut data = DashboardData::blank(false, None);
-            data.indexer = IndexerInfo::Running {
-                indexed: 1,
-                total: 2,
-                failed: 0,
-                chunks: 3,
-                current_file: name,
-            };
-            let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
-
-            terminal.draw(|frame| render(frame, &data)).unwrap();
-
-            let screen: String = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect();
-            assert!(screen.contains("Pipeline"), "the dashboard drew");
-        }
-    }
-
     fn draw(data: &DashboardData) -> String {
         draw_at(data, 160)
     }
@@ -1594,11 +1430,11 @@ mod tests {
             .collect()
     }
 
-    /// The Pipeline panel was one row short of its content, so the last row
-    /// (Indexer) never drew; and the Services status cell was narrower than
-    /// the "backend unavailable" label it exists to show.
+    /// The Pipeline panel was one row short of its content, so its last row
+    /// never drew; and the Services status cell was narrower than the
+    /// "backend unavailable" label it exists to show.
     #[test]
-    fn the_dashboard_shows_the_indexer_row_and_the_whole_unhealthy_label() {
+    fn the_dashboard_shows_the_last_pipeline_row_and_the_whole_unhealthy_label() {
         let mut data = DashboardData::blank(false, None);
         data.scribe_servers.push(ServiceStatus {
             url: "http://scribe.example.local:7435".into(),
@@ -1609,7 +1445,7 @@ mod tests {
             error: None,
         });
         let screen = draw(&data);
-        assert!(screen.contains("Indexer"), "Indexer row clipped");
+        assert!(screen.contains("Watcher"), "last Pipeline row clipped");
         assert!(screen.contains("backend unavailable"), "label truncated");
     }
 

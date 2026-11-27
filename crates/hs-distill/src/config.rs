@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use figment::{
@@ -75,10 +74,8 @@ where
 {
     let invalid = |e: serde_json::Error| ConfigError::section(file.path(), section, e);
     let own = serde_json::to_value(defaults).map_err(invalid)?;
-    let project = file.project_dir()?;
     let server = serde_json::to_value(DistillServerConfig::default()).map_err(invalid)?;
-    let client =
-        serde_json::to_value(DistillClientConfig::with_project_dir(&project)).map_err(invalid)?;
+    let client = serde_json::to_value(DistillClientConfig::default()).map_err(invalid)?;
     hs_common::config_file::warn_unknown_prefixed_env(
         "HS_DISTILL_",
         &[&server, &client],
@@ -208,8 +205,6 @@ pub struct DistillClientConfig {
     /// Distill servers. Empty by default: there is no server to guess at;
     /// commands that need one call [`Self::require_servers`].
     pub servers: Vec<String>,
-    pub markdown_dir: PathBuf,
-    pub catalog_dir: PathBuf,
     /// Event-watch worker concurrency — how many markdown documents the
     /// local `hs distill watch-events` loop will index in parallel.
     /// `None` means "use the HardwareProfile default for this host"
@@ -231,28 +226,18 @@ pub struct DistillClientConfig {
 }
 
 impl Default for DistillClientConfig {
-    /// The documented built-in defaults, rooted at `~/home-still`. Loading
-    /// ([`DistillClientConfig::load`]) roots them at `home.project_dir` and
-    /// never falls back to this value.
     fn default() -> Self {
-        Self::with_project_dir(&hs_common::default_project_dir())
-    }
-}
-
-impl DistillClientConfig {
-    /// Defaults with the directories under `project` (`home.project_dir`).
-    pub fn with_project_dir(project: &std::path::Path) -> Self {
         Self {
             servers: Vec::new(),
-            markdown_dir: project.join("markdown"),
-            catalog_dir: project.join("catalog"),
             concurrency: None,
             index_timeout_secs: crate::client::DEFAULT_INDEX_TIMEOUT.as_secs(),
             storage: StorageConfig::default(),
             events: None,
         }
     }
+}
 
+impl DistillClientConfig {
     /// The configured distill servers, or an error telling the operator how
     /// to configure one. Commands that talk to a distill server call this
     /// instead of guessing a `localhost` address.
@@ -278,20 +263,19 @@ impl DistillClientConfig {
         })
     }
 
-    /// The client's effective settings: the documented defaults (rooted at
-    /// `home.project_dir`), then the `distill:` section of
-    /// `~/.home-still/config.yaml`, then `HS_DISTILL_*` environment
-    /// variables. `storage:` and `events:` are read from their own sections.
-    /// A missing file is a valid, empty config; a file or section that is
-    /// present but malformed is an `Err` naming it.
+    /// The client's effective settings: the documented defaults, then the
+    /// `distill:` section of `~/.home-still/config.yaml`, then
+    /// `HS_DISTILL_*` environment variables. `storage:` and `events:` are
+    /// read from their own sections. A missing file is a valid, empty
+    /// config; a file or section that is present but malformed is an `Err`
+    /// naming it.
     pub fn load() -> anyhow::Result<Self> {
         Ok(Self::from_file(&ConfigFile::load()?)?)
     }
 
     /// [`Self::load`] against an already-read config file.
     pub fn from_file(file: &ConfigFile) -> Result<Self, ConfigError> {
-        let defaults = Self::with_project_dir(&file.project_dir()?);
-        let mut cfg: Self = extract_section(file, CLIENT_SECTION, &defaults)?;
+        let mut cfg: Self = extract_section(file, CLIENT_SECTION, &Self::default())?;
         cfg.storage = file.storage()?;
         cfg.events = EventBusConfig::from_file(file)?;
         cfg.validate()
@@ -491,9 +475,8 @@ mod tests {
                 include_str!("../../../docs/tutorials/home-cloud-cluster.md"),
             ),
         ];
-        let project = hs_common::default_project_dir();
         let server = serde_json::to_value(DistillServerConfig::default()).unwrap();
-        let client = serde_json::to_value(DistillClientConfig::with_project_dir(&project)).unwrap();
+        let client = serde_json::to_value(DistillClientConfig::default()).unwrap();
         let mut checked = 0;
         for (name, text) in documents {
             for var in hs_common::config_file::env_names_in_text(text, "HS_DISTILL_") {

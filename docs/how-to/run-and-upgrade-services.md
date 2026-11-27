@@ -52,7 +52,7 @@ hs serve distill start
 hs serve distill stop
 ```
 
-`start` replaces any distill server it started before, waits for `/health`, and starts the indexing daemon. It starts no database: myelin and Ollama must already be running. The server's log is `distill-server.log` in the log directory.
+`start` replaces any distill server it started before and waits for `/health`. It starts no database: myelin and Ollama must already be running. The server's log is `distill-server.log` in the log directory.
 
 ## Install a service
 
@@ -117,7 +117,7 @@ After you change `~/.home-still/config.yaml` or `secrets.env`, restart the servi
 hs restart
 ```
 
-The command finds every systemd unit and LaunchAgent that runs one of this host's home-still binaries, restarts the ones that are active, then restarts the distill indexing daemon and the scribe compose stack (`~/.home-still/docker-compose.yml`, when `scribe.local_server` is on). It does not restart myelin, Ollama or Qdrant. A unit that is enabled but stopped is left stopped, with a warning. The command exits non-zero when any restart failed.
+The command finds every systemd unit and LaunchAgent that runs one of this host's home-still binaries, restarts the ones that are active, then restarts the scribe compose stack (`~/.home-still/docker-compose.yml`, when `scribe.local_server` is on). It does not restart myelin, Ollama or Qdrant. A unit that is enabled but stopped is left stopped, with a warning. The command exits non-zero when any restart failed.
 
 ## Upgrade a host
 

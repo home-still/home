@@ -38,17 +38,11 @@ struct ServiceUnit {
     oneshot: bool,
 }
 
-/// Restart every home-still unit running a local binary, the distill index
-/// daemon, and the compose containers. Called by `hs restart`.
+/// Restart every home-still unit running a local binary and the compose
+/// containers. Called by `hs restart`.
 pub async fn run(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let binaries = installed_binaries();
     let (mut restarted, mut failures) = restart_units(&binaries, reporter).await;
-
-    match restart_index_daemon(reporter).await {
-        Ok(true) => restarted += 1,
-        Ok(false) => {}
-        Err(e) => failures.push(format!("distill indexer: {e:#}")),
-    }
 
     let (compose_restarted, compose_failures) = restart_compose_services(reporter).await?;
     restarted += compose_restarted;
@@ -60,21 +54,7 @@ pub async fn run(reporter: &Arc<dyn Reporter>) -> Result<()> {
 /// Restart only the units running one of `replaced`. Called by `hs upgrade`
 /// once the new binaries are on disk.
 pub async fn after_upgrade(replaced: &[PathBuf], reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let (mut restarted, mut failures) = restart_units(replaced, reporter).await;
-
-    // The index daemon is started as a child of `hs`, so only a replaced `hs`
-    // changes what it would exec.
-    if std::env::current_exe()
-        .ok()
-        .is_some_and(|exe| is_replaced(&exe, replaced))
-    {
-        match restart_index_daemon(reporter).await {
-            Ok(true) => restarted += 1,
-            Ok(false) => {}
-            Err(e) => failures.push(format!("distill indexer: {e:#}")),
-        }
-    }
-
+    let (restarted, failures) = restart_units(replaced, reporter).await;
     finish(restarted, failures, reporter)
 }
 
@@ -894,39 +874,6 @@ fn parse_launchd_print_pid(stdout: &str) -> Option<u32> {
         .lines()
         .find_map(|line| line.trim().strip_prefix("pid = "))
         .and_then(|pid| pid.trim().parse().ok())
-}
-
-// ── Distill index daemon ───────────────────────────────────────
-
-/// Outcome of the index-daemon restart: `Ok(true)` restarted. A daemon that
-/// was running and could not be brought back is an error — the old one was
-/// already killed, so "nothing to do" would hide an outage.
-async fn restart_index_daemon(reporter: &Arc<dyn Reporter>) -> Result<bool> {
-    use crate::daemon::StopOutcome;
-
-    // Only a PID that is really the index daemon is signaled; a PID file
-    // naming anything else is stale and is removed.
-    match crate::distill_cmd::stop_index_daemon().await? {
-        StopOutcome::Stopped(pid) => {
-            reporter.status("Restart", &format!("distill indexer (PID {pid})"));
-            if !crate::distill_cmd::ensure_index_running().await? {
-                bail!(
-                    "the old indexer (PID {pid}) was stopped but a new one was not started: \
-                     distill server binary missing or server unreachable"
-                );
-            }
-            reporter.status("OK", "distill indexer restarted");
-            Ok(true)
-        }
-        StopOutcome::Foreign(pid) => {
-            reporter.warn(&format!(
-                "distill-index.pid named PID {pid}, which is not the index daemon; \
-                 removed the stale PID file and left that process alone"
-            ));
-            Ok(false)
-        }
-        StopOutcome::Dead(_) | StopOutcome::NoPidFile => Ok(false),
-    }
 }
 
 // ── Docker compose containers ──────────────────────────────────
