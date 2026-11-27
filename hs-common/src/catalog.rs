@@ -304,8 +304,10 @@ pub fn resolve_page_accounting(md_pages: u64, source_pages: Option<u32>) -> Page
 // local backend rooted at the project dir, or "" for a dedicated `catalog`
 // bucket).
 
+/// The storage key of a stem's catalog entry under the catalog `prefix`:
+/// `<prefix>/<shard>/<stem>.yaml`. An invalid stem is an error.
 #[cfg(feature = "storage")]
-fn catalog_key(prefix: &str, stem: &str) -> anyhow::Result<String> {
+pub fn catalog_key(prefix: &str, stem: &str) -> anyhow::Result<String> {
     crate::validate_stem(stem).map_err(|e| anyhow::anyhow!("catalog stem {stem:?}: {e}"))?;
     let key = crate::sharded_key(stem, "yaml");
     Ok(if prefix.is_empty() {

@@ -2,6 +2,35 @@
 
 Changes that need action when upgrading. Binaries and full notes: GitHub Releases.
 
+## v0.0.1-rc.397
+
+- **rc releases are GitHub pre-releases from this one on.** `hs upgrade
+  --pre` installs them as before; `hs upgrade` without `--pre` installs only
+  a release whose tag has no `-rc.` in it.
+- `hs distill purge` needs `--store <store>` and removes the document from
+  storage as well: its records in that store (for `academic` also its
+  abstract), then its source, markdown, catalog entry and word boxes. It
+  asks first unless `-y`. It refuses `memory`, `references` and `abstracts`
+  and a document that has neither records nor objects.
+- `hs distill reconcile` lists every document the `academic` store holds
+  and storage does not, and exits non-zero while there are any. Remove each
+  with `hs distill purge --store academic <doc_id>`.
+- `hs scribe catalog-backfill` is gone: it read a folder on its own host,
+  not the library. The scribe watcher writes catalog entries as documents
+  convert.
+- `POST /distill/stream` is gone from the distill server and the gateway.
+- `hs restart` and `hs upgrade` wait 5 s after a service or LaunchAgent
+  comes back and fail if its process is not the same one, naming its last
+  exit status (and, for a LaunchAgent, the end of its error log). An agent
+  that dies right after it starts no longer reports `restarted`.
+- `hs status` prints `unknown (<reason>)` for a count it could not read
+  (Embedded, In-flight), not 0.
+- `hs scribe boxes status` and `catch-up` print their result. Every
+  command's progress and error lines now reach stderr when stderr is not a
+  terminal that can draw (a pipe, a file, `TERM=dumb`).
+- The gateway listens as soon as it starts and checks its backends beside
+  it.
+
 ## v0.0.1-rc.396
 
 - `hs distill index` is gone, and the distill server no longer starts an

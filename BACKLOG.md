@@ -1647,17 +1647,26 @@ walks the other way, from the store's ids to storage.
 compare ids exactly (letter case included). Removing them stays a separate, explicit command.
 **Acceptance.** A store holding one document that storage does not hold makes
 `hs distill reconcile` name it and exit non-zero.
+**FIXED rc.397.** Reconcile compares the `academic` store's document ids with the markdown stems
+in storage, exactly (`store_only_docs` in `crates/hs-distill/src/reconcile.rs`), prints each
+store-only id, adds `store_only=N` to its summary and fails naming
+`hs distill purge --store academic <doc_id>`. It deletes nothing. Only `academic` is walked, the
+one store reconcile covers.
 
 ### P1-48. The distill server keeps a route no client calls, and the client a method nothing calls (found 2026-11-27)
 `POST /distill/stream` was called only by `hs distill index`, deleted in rc.396; the gateway still
 routes it and `docs/reference/services-and-ports.md` still lists it. `DistillClient::doc_exists`
 has no caller in the workspace. Delete both or name their user.
+**FIXED rc.397.** Both deleted, with the stream's progress callback, its NDJSON types, its gateway
+route and its doc row; `tokio-stream` left `hs-distill`.
 
 ### P1-49. `hs scribe catalog-backfill` reads a markdown folder and writes a catalog folder on its own host (found 2026-11-27)
 `cmd_catalog_backfill` (`crates/hs/src/scribe_cmd.rs`) walks `scribe.output_dir` and writes rows
 through `LocalFsStorage`, whatever `storage.backend` is. On a host whose storage is S3 it builds
 catalog rows nothing reads, from files that are not the library: the fault of P0-32 in another
 command. Not run during this release. Make it read and write storage, or delete it.
+**FIXED rc.397: deleted.** The scribe watcher writes catalog entries as documents convert;
+`hs pipeline repair-catalog` is the command for a missing one.
 
 ### P1-50. 20 groups of document ids in the `academic` store differ only in letter case (found 2026-11-27)
 Measured on the judged store, before P0-32 added 4 more groups. Each group is one paper indexed
@@ -1688,12 +1697,18 @@ swept. `bmb`'s scribe agent was restarted by the same upgrade and its `/health` 
 **Change.** (a) The restart check requires the pid to still be the same one after a few seconds,
 and reports the agent's last error when it is not. (b) At the next upgrade of a Mac, watch the
 agent and the screen together, to learn whether macOS asks for permission.
+**(a) FIXED rc.397.** After the pid appears, the restart check waits 5 s (below launchd's 10 s
+throttle) and requires the same pid; otherwise it fails with the job's last exit status and the
+end of its `StandardErrorPath`. The systemd path follows the same rule (`MainPID` unchanged,
+unit `active`). (b) is still open: the owner does not know whether macOS asked on 2026-11-27.
 
 ### P2-16. The gateway does not listen until its backend checks finish (found 2026-11-27)
 On the gateway host under rc.396 the unit started at 17:19:05Z and logged `Gateway listening` at
 17:19:11Z. In between it waited for `/health` of each backend, and the `memory` backend timed out
 (its port is dropped by a firewall). A restart is 6 seconds without the remote route for each
 backend that does not answer. Listen first and run the checks beside it.
+**FIXED rc.397.** The gateway logs `Gateway listening` first and runs the backend checks in a
+task beside the server; they still only report.
 
 ### P1-52. Nothing removes a captured page or a saved synthesis (found 2026-11-27)
 `hs distill purge` deletes records only in `academic` (`cmd_purge` in `crates/hs/src/distill_cmd.rs`
@@ -1702,6 +1717,11 @@ test page from `web` and one synthesis from `syntheses` took a `DELETE /doc/<id>
 the distill server and a signed S3 `DELETE` for each of the six objects (source, markdown, catalog
 entry). An agent's wrong capture cannot be taken back with a command. Give purge a `--store` and
 make it remove the document's objects as well, or add one command that does both.
+**FIXED rc.397.** `hs distill purge --store <store> <doc_id>` (`crates/hs/src/maintain/purge.rs`)
+deletes the records in that store (for `academic` with the abstract) and then each object
+storage holds for the document: source of any extension, markdown, catalog entry, word boxes.
+It asks unless `-y`, refuses `memory` and the derived stores, and fails on a document with
+neither records nor objects.
 
 ### P1-53. `hs mcp install` reaches the servers one way and every working client another (found 2026-11-27)
 `--remote` writes URL entries (`"type": "http"` for Claude Code), so the client signs in through
@@ -1717,6 +1737,10 @@ Both exit 0 with no output, through a pipe, to a file, with `--output json`, and
 pseudo-terminal. `catch-up` did publish its event: the watcher's journal shows it received. Both
 report only through `reporter.status`/`reporter.finish`. Only `catch-up --dry-run`, which uses
 `println!`, prints.
+**FIXED rc.397.** The cause was not in these commands: `TtyReporter` printed through indicatif,
+which drops every line when stderr cannot draw (a pipe, a file, `TERM=dumb`), so every
+command's status, warning and error lines vanished there. It now writes them to stderr in that
+case. The two commands print their result on stdout, as text, JSON or NDJSON.
 
 ### P2-18. `hs status` shows `Embedded : 0 docs, 0 chunks` when it could not ask the distill server (found 2026-11-27)
 On the GPU host and on two Macs between 20:54Z and 20:57Z, while the host's one-minute load average
@@ -1724,6 +1748,8 @@ was 89 (other agents' builds),
 `/status?store=academic` timed out and the dashboard printed 0 documents and 0 chunks, with the
 timeout only further down, under Services. The store held 19,270 documents throughout. A count
 that was not read must not print as zero.
+**FIXED rc.397.** An unread count is an error value, not 0: `Embedded : unknown (<reason>)`, a
+blank percentage, and the same for In-flight, which counted a scribe that did not answer as 0.
 
 ### P2-19. One stored PDF is truncated, so its word boxes cannot be built (found 2026-11-27)
 `papers/10/10.1073_pnas.0903616106.pdf` holds 710,463 bytes; its linearization dictionary

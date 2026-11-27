@@ -162,10 +162,10 @@ The scribe client: `hs scribe`, the scribe watcher, the inbox and `hs-mcp`. Envi
 | Key | Default | Meaning |
 |---|---|---|
 | `servers` | empty list | The scribe servers, in dispatch order. See [Server entries](#server-entries). Commands that talk to a scribe server stop when it is empty. |
-| `output_dir` | `<project_dir>/markdown` | Local markdown directory used by `hs scribe convert` for its default output path and by local migration and backfill commands. |
-| `watch_dir` | `<project_dir>/papers` | Local papers directory used by `hs scribe catalog-backfill`. |
+| `output_dir` | `<project_dir>/markdown` | Local markdown directory used by `hs scribe convert` for its default output path and by local migration commands. |
+| `watch_dir` | `<project_dir>/papers` | Local papers directory. The only reader is `hs scribe inbox run`, which prints it in its start-up line; the inbox itself sweeps `papers/manually_downloaded/` on the configured storage. |
 | `corrupted_dir` | `<project_dir>/corrupted` | Accepted but not read by any command. The inbox moves rejected files to the `corrupted/` storage prefix. |
-| `catalog_dir` | `<project_dir>/catalog` | Local catalog directory used by local migration and backfill commands. |
+| `catalog_dir` | `<project_dir>/catalog` | Local catalog directory used by local migration commands. |
 | `local_server` | `true` | When `false`, skip local scribe server start-up: a machine that only forwards to remote scribe servers. |
 | `inbox_poll_interval_secs` | `30` | How often `hs scribe inbox run` polls `papers/manually_downloaded/` on the configured storage; at least 1. |
 | `convert_timeout_secs` | `900` | Baseline request timeout for a conversion when the page count is unknown; at least 1. |

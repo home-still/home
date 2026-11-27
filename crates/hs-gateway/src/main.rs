@@ -79,22 +79,7 @@ async fn async_main() -> anyhow::Result<()> {
     tracing::info!("Starting gateway on {listen} (public URL {gateway_url})");
     tracing::info!("Routes: {:?}", config.routes.keys().collect::<Vec<_>>());
 
-    // Are the backends actually reachable? The gateway proxies to other
-    // hosts, and a backend it cannot reach makes every request to that
-    // service fail — with a `502` or a `504` in a browser and nothing
-    // anywhere saying why. The gateway's own host is the only vantage
-    // point from which "can a client reach the backend?" is the same
-    // question: a backend that answers its own `/health` on its own
-    // host proves nothing, because a firewall that drops the port
-    // leaves the service perfectly healthy in place and unreachable
-    // from everywhere else.
-    //
-    // A backend that is down is **not** fatal: the gateway's job is to
-    // proxy, and one host rebooting must not take the other services
-    // down with it. So this reports, loudly, and the gateway starts.
-    for line in backend_health::report(&config.routes).await {
-        tracing::warn!("{line}");
-    }
+    let routes = config.routes.clone();
 
     let state = Arc::new(GatewayState::new(
         config,
@@ -109,11 +94,53 @@ async fn async_main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
-    tracing::info!("Gateway listening on {listen}");
 
-    let result = serve(listener, app).await;
+    let result = serve_and_report(listener, app, &listen, async move {
+        backend_health::report(&routes).await
+    })
+    .await;
 
     let _ = logging_handle.shutdown().await;
+    result
+}
+
+/// Log that the gateway is listening, start `backend_report` in the
+/// background, and serve until SIGINT/SIGTERM.
+///
+/// Are the backends actually reachable? The gateway proxies to other hosts,
+/// and a backend it cannot reach makes every request to that service fail —
+/// with a `502` or a `504` in a browser and nothing anywhere saying why. The
+/// gateway's own host is the only vantage point from which "can a client
+/// reach the backend?" is the same question: a backend that answers its own
+/// `/health` on its own host proves nothing, because a firewall that drops
+/// the port leaves the service perfectly healthy in place and unreachable
+/// from everywhere else.
+///
+/// A backend that is down is **not** fatal: the gateway's job is to proxy,
+/// and one host rebooting must not take the other services down with it. So
+/// the probes only report, loudly. They also must not delay the gateway: a
+/// backend that drops packets costs the probe's whole timeout, and the
+/// gateway used to sit unbound for that long (BACKLOG P2-16: `Gateway
+/// listening` logged six seconds after the unit started). The socket is
+/// already bound, so the probes run in a task beside the server and their
+/// results are logged after `Gateway listening`.
+async fn serve_and_report<R>(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    listen: &str,
+    backend_report: R,
+) -> anyhow::Result<()>
+where
+    R: Future<Output = Vec<String>> + Send + 'static,
+{
+    tracing::info!("Gateway listening on {listen}");
+    let probes = tokio::spawn(async move {
+        for line in backend_report.await {
+            tracing::warn!("{line}");
+        }
+    });
+    let result = serve(listener, app).await;
+    probes.abort();
     result
 }
 
@@ -187,6 +214,50 @@ async fn install_logging() -> hs_common::logging::LoggingHandle {
 #[cfg(test)]
 mod tests {
     use hs_common::auth::backend::{BackendToken, ENV_VAR};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// One `GET /ping` over a raw connection; the status line of the answer.
+    async fn ping(addr: std::net::SocketAddr) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /ping HTTP/1.1\r\nHost: gateway\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        answer.lines().next().unwrap_or_default().to_string()
+    }
+
+    /// A backend probe that takes as long as a dropped packet does must not
+    /// keep the gateway from answering: the report is still pending (its
+    /// gate is never opened) while a request is served.
+    #[tokio::test]
+    async fn the_gateway_serves_while_its_backend_check_is_still_running() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
+        let (never_opened, gate) = tokio::sync::oneshot::channel::<()>();
+        let (probe_started, started) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            super::serve_and_report(listener, app, "test", async move {
+                let _ = probe_started.send(());
+                let _ = gate.await;
+                vec!["distill backend is not reachable".to_string()]
+            })
+            .await
+        });
+
+        started.await.expect("the backend check starts");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), ping(addr))
+            .await
+            .expect("the gateway answers while the check is pending");
+        assert!(status.contains("200"), "{status}");
+        assert!(!server.is_finished());
+
+        drop(never_opened);
+        server.abort();
+    }
 
     fn lookup(value: Option<&'static str>) -> impl Fn(&str) -> Result<String, std::env::VarError> {
         move |name| {

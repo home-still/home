@@ -21,9 +21,9 @@ of two ways:
 |---|---|---|---|---|
 | Documents | Source documents (PDF, HTML, EPUB) under `papers/`. | Total size. | | |
 | Markdown | Markdown documents under `markdown/`. | Total size. | Markdown ÷ (Documents − bad sources), capped at 100 %. A document that failed for a retryable reason stays in the denominator. | `hs pipeline catch-up` |
-| Cataloged | Catalog entries. | | | `hs scribe catalog-backfill` |
-| Embedded | Documents with records in the store. | Chunk count, and how many documents are stamped `embedding_skip` (markdown that yields no chunk). | Embedded ÷ (Markdown − skipped). | `hs distill reconcile --reembed` |
-| In-flight | Conversions running now, summed over every scribe server's `/readiness`. | `converting across N scribes`, or `idle`. | | |
+| Cataloged | Catalog entries, written by `hs scribe watch-events` as each document converts. | | | `hs pipeline repair-catalog` |
+| Embedded | Documents with records in the store, as the distill server's `/status` reports them. | Chunk count, and how many documents are stamped `embedding_skip` (markdown that yields no chunk). When the distill server could not be asked (a timeout, a refusal), the count reads `unknown` and the detail column names the server and the reason; the text output prints `Embedded  : unknown (<reason>)`. It is never `0`. | Embedded ÷ (Markdown − skipped); blank while the count is unknown. | `hs distill reconcile --reembed` |
+| In-flight | Conversions running now, summed over every scribe server's `/readiness`. | `converting across N scribes`, or `idle`. `?` when a scribe did not answer `/readiness`: that scribe's work is unknown, not zero. | | |
 | Queued | Messages outstanding on the `scribe-workers` consumer: waiting in the stream plus delivered and not yet acknowledged. | `waiting for or held by a scribe`, `queue empty`, or `unavailable: <reason>` when the broker cannot say. `?` means unknown, never zero. | | |
 | Stalled | Sources with no markdown and no failure stamp, minus Queued. These were never queued, or their message was lost. | `no markdown and not queued — run hs pipeline catch-up`, or `none`. | | `hs pipeline catch-up --dry-run` |
 | Inbox | Files waiting in `papers/manually_downloaded/`. | `pending in manually_downloaded/ (N)` or `manually_downloaded/ empty`. | | `hs scribe inbox sweep` |

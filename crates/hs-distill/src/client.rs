@@ -9,16 +9,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 // ── Protocol types ─────────────────────────────────────────────
 
-/// Progress update emitted during indexing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DistillProgress {
-    pub stage: String,
-    pub doc: String,
-    pub chunks_done: u64,
-    pub chunks_total: u64,
-    pub message: String,
-}
-
 /// Most hits one search request may ask for; larger `limit`s are clamped.
 pub const MAX_SEARCH_LIMIT: u64 = 200;
 
@@ -144,8 +134,6 @@ pub struct StatusResponse {
     pub myelin_url: String,
 }
 
-pub type DistillStreamLine = hs_common::service::protocol::StreamLine<DistillProgress, IndexResult>;
-
 // ── Client ─────────────────────────────────────────────────────
 
 /// A non-2xx answer from the distill server. Typed so callers can tell a
@@ -207,7 +195,7 @@ impl std::fmt::Display for ServerError {
 
 impl std::error::Error for ServerError {}
 
-/// Upper bound on one indexing request (`/distill`, `/distill/stream`) unless
+/// Upper bound on one indexing request (`/distill`) unless
 /// the caller sets another with [`DistillClient::with_index_timeout`].
 ///
 /// Indexing a book-length markdown is chunk -> GPU embed -> store on a card
@@ -406,11 +394,6 @@ impl DistillClient {
             .await
             .context("Failed to reach distill server")?;
         json_or_server_error(resp, "status").await
-    }
-
-    /// Check if a document is already indexed in `store`.
-    pub async fn doc_exists(&self, store: &str, doc_id: &str) -> Result<bool> {
-        Ok(self.doc_chunks(store, doc_id).await?.0)
     }
 
     /// Return `(exists, chunk_count)` for a doc. Chunk count is needed by the

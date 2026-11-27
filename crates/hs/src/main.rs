@@ -173,7 +173,9 @@ fn main() -> ExitCode {
                     .map_err(|e| anyhow::anyhow!(e)),
                 TopCmd::Config { action } => handle_config(action, &cli.global, &reporter).await,
                 TopCmd::Serve { command } => serve_cmd::dispatch(command, &reporter).await,
-                TopCmd::Scribe { command } => scribe_cmd::dispatch(command, &reporter).await,
+                TopCmd::Scribe { command } => {
+                    scribe_cmd::dispatch(command, &cli.global, &reporter).await
+                }
                 TopCmd::Distill { command } => {
                     distill_cmd::dispatch(command, &cli.global, &reporter).await
                 }

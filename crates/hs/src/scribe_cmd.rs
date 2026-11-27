@@ -2,6 +2,7 @@ use crate::scribe_pool::ScribePool;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use hs_common::auth::client::is_cloud_url;
+use hs_common::global_args::GlobalArgs;
 use hs_common::reporter::Reporter;
 use hs_scribe::config::ScribeConfig;
 use std::path::PathBuf;
@@ -103,9 +104,6 @@ pub enum ScribeCmd {
         #[command(subcommand)]
         action: Option<InboxAction>,
     },
-    /// Backfill catalog entries for markdown files that were converted
-    /// before the catalog feature.
-    CatalogBackfill,
     /// Clear a stem's `conversion` / `conversion_failed` stamps and
     /// republish `papers.ingested` so the watcher reconverts it. The
     /// only supported escape hatch for rows that the QC gate terminally
@@ -158,7 +156,11 @@ pub enum ServerAction {
     Stop,
 }
 
-pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
+pub async fn dispatch(
+    cmd: ScribeCmd,
+    global: &GlobalArgs,
+    reporter: &Arc<dyn Reporter>,
+) -> Result<()> {
     match cmd {
         ScribeCmd::Convert {
             input,
@@ -169,9 +171,10 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         ScribeCmd::Inbox { action } => {
             crate::scribe_inbox::dispatch(action.unwrap_or(InboxAction::Run), reporter).await
         }
-        ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
         ScribeCmd::Reconvert { stem } => cmd_reconvert(&stem, reporter).await,
-        ScribeCmd::Boxes { action } => crate::scribe_boxes::dispatch(action, reporter).await,
+        ScribeCmd::Boxes { action } => {
+            crate::scribe_boxes::dispatch(action, global, reporter).await
+        }
         ScribeCmd::Queue { stem } => crate::maintain::scribe_queue::cmd(&stem).await,
     }
 }
@@ -1171,126 +1174,6 @@ async fn wait_for_health(server_url: &str, timeout_secs: u64) -> Result<()> {
     let url = format!("{server_url}/health");
     hs_common::compose::wait_for_url(&url, timeout_secs, "scribe server").await
 }
-
-async fn cmd_catalog_backfill(reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let scribe_cfg = ScribeConfig::load()?;
-    let markdown_dir = &scribe_cfg.output_dir;
-    let catalog_dir = &scribe_cfg.catalog_dir;
-    let catalog_store = hs_common::storage::LocalFsStorage::new(catalog_dir);
-    let papers_dir = &scribe_cfg.watch_dir;
-
-    let entries = hs_common::collect_files_recursive(markdown_dir, "md")
-        .context("walking the markdown directory")?;
-
-    let mut created = 0u32;
-    let mut skipped = 0u32;
-    let mut unreadable = 0u32;
-
-    for md_path in &entries {
-        let stem = md_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{} has a non-UTF-8 file name; no catalog stem",
-                    md_path.display()
-                )
-            })?;
-
-        // Skip if catalog entry already exists
-        if hs_common::catalog::read_catalog_entry_via(&catalog_store, "", stem)
-            .await
-            .with_context(|| format!("read catalog {stem}.yaml"))?
-            .is_some()
-        {
-            skipped += 1;
-            continue;
-        }
-
-        // Read markdown to extract metadata
-        let content = match std::fs::read_to_string(md_path) {
-            Ok(c) => c,
-            Err(e) => {
-                reporter.warn(&format!("cannot read {}: {e}", md_path.display()));
-                unreadable += 1;
-                continue;
-            }
-        };
-
-        // Extract title from first line if it looks like a heading
-        let title = content
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .map(|l| l.trim_start_matches('#').trim().to_string())
-            .filter(|t| !t.is_empty());
-
-        // Look for matching PDF
-        let pdf_path = papers_dir.join(format!("{stem}.pdf"));
-        let pdf_exists = pdf_path.exists();
-
-        // Prefer the PDF's real page count when the source is still on
-        // disk. Markdown separators only track pages for backends that
-        // emit them, so olmocr-converted markdown would otherwise backfill
-        // as `total_pages: 1` regardless of length.
-        let source_pages = if pdf_exists {
-            match hs_scribe::pdf_meta::count_pages_in_file(&pdf_path).await {
-                Ok(pages) => Some(pages),
-                Err(e) => {
-                    tracing::warn!(
-                        pdf = %pdf_path.display(),
-                        error = %e,
-                        "cannot count the source PDF's pages; backfilling from the markdown alone"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let page_offsets = hs_common::catalog::compute_page_offsets(&content);
-        let accounting =
-            hs_common::catalog::resolve_page_accounting(page_offsets.len() as u64, source_pages);
-
-        let entry = hs_common::catalog::CatalogEntry {
-            title,
-            pdf_path: if pdf_exists {
-                Some(pdf_path.to_string_lossy().to_string())
-            } else {
-                None
-            },
-            markdown_path: Some(md_path.to_string_lossy().to_string()),
-            conversion: Some(hs_common::catalog::ConversionMeta {
-                server: "backfill".to_string(),
-                duration_secs: 0.0,
-                total_pages: accounting.total_pages,
-                converted_at: chrono::Utc::now().to_rfc3339(),
-                pages: if accounting.offsets_trustworthy {
-                    page_offsets
-                } else {
-                    Vec::new()
-                },
-                converted_by: None,
-                attempts_log: Vec::new(),
-            }),
-            ..Default::default()
-        };
-
-        hs_common::catalog::write_catalog_entry_via(&catalog_store, "", stem, &entry)
-            .await
-            .with_context(|| format!("write catalog {stem}.yaml"))?;
-        created += 1;
-    }
-
-    reporter.finish(&format!(
-        "Backfill complete: {created} created, {skipped} already existed, {unreadable} unreadable"
-    ));
-    if unreadable > 0 {
-        anyhow::bail!("{unreadable} markdown file(s) could not be read and were not backfilled");
-    }
-    Ok(())
-}
-
-// ── Clean junk HTML papers ────────────────────────────────────
 
 #[cfg(test)]
 mod backend_tier_tests {

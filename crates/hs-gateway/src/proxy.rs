@@ -420,7 +420,6 @@ mod tests {
             ("/scribe", "scribe"),
             ("/scribe/", "scribe"),
             ("/scribe/stream", "scribe"),
-            ("/distill/stream", "distill"),
             ("/distill", "distill"),
             ("/search", "distill"),
             ("/exists/abc123", "distill"),
