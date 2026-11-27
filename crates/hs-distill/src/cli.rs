@@ -1,27 +1,7 @@
-use std::path::PathBuf;
-
 use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
 pub enum DistillCmd {
-    /// Index markdown files into the myelin store via distill server
-    Index {
-        /// Re-index all documents (ignore cache)
-        #[arg(long)]
-        force: bool,
-
-        /// Only index specific files
-        #[arg(long)]
-        file: Option<Vec<PathBuf>>,
-
-        /// Override server URL
-        #[arg(long)]
-        server: Option<String>,
-
-        /// Internal: run as daemon child process
-        #[arg(long, hide = true)]
-        daemon_child: bool,
-    },
     /// Semantic search across indexed documents
     Search {
         /// Search query text
@@ -56,8 +36,7 @@ pub enum DistillCmd {
         server: Option<String>,
     },
     /// Subscribe to `scribe.completed` on the configured event bus and index
-    /// each markdown object via the distill server. Event-driven replacement
-    /// for the directory-walk indexer.
+    /// each markdown object via the distill server.
     WatchEvents {
         /// Override server URL
         #[arg(long)]

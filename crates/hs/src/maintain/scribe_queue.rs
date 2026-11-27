@@ -23,8 +23,8 @@ pub(crate) struct QueueReport {
 }
 
 /// What to do once the event is published.
-const NEXT: &str = "run `hs status` until the document is converted; `hs distill index` embeds \
-                    it once it is";
+const NEXT: &str = "run `hs status` until the document is converted; the distill watcher \
+                    embeds it once it is";
 
 /// The key of the source of `stem`, probing each extension the store allows,
 /// in order. A storage error other than "not found" stops the probe.

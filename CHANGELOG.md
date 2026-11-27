@@ -2,6 +2,30 @@
 
 Changes that need action when upgrading. Binaries and full notes: GitHub Releases.
 
+## v0.0.1-rc.396
+
+- `hs distill index` is gone, and the distill server no longer starts an
+  indexing run when it starts (`hs serve distill`, `hs serve distill start`).
+  Both read markdown from the folder `<project_dir>/markdown` on the host
+  they ran on, not from the library's storage. Where storage is S3 that
+  folder is not the library: on the first host upgraded to rc.395, the server
+  start added 26 documents to the `academic` store from a leftover folder, 25
+  of which the library does not hold, so search returned documents that
+  `read` and `cite` refuse. **Documents reach the store one way: the distill
+  watcher (`hs serve distill-watch --install`) indexes each conversion from
+  storage.** Use `hs distill reconcile --reembed` for documents converted
+  while no watcher ran, and `hs distill reindex <STEM>` to index one again.
+- **A host that ran the rc.395 distill server with S3 storage and a markdown
+  folder under `home.project_dir` holds such documents in its store. Remove
+  each one with `hs distill purge <doc_id>` after upgrading**, so that a
+  restart cannot add them again.
+- `hs status` has no Indexer row, and `hs restart` and `hs upgrade` restart
+  no indexing daemon. `~/.home-still/distill-index-status.json`,
+  `~/.home-still/distill-index.pid` and `distill-index.log` in the log
+  directory are no longer read or written and can be deleted.
+- `distill.markdown_dir` and `distill.catalog_dir` no longer exist and only
+  draw a warning when set.
+
 ## v0.0.1-rc.395
 
 - The distill server keeps its documents in a myelin server, in named

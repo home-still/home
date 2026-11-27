@@ -1,4 +1,3 @@
-use anyhow::{Context, Result};
 use std::path::Path;
 
 /// Read PID from a PID file. Returns None if file doesn't exist or is corrupt.
@@ -38,25 +37,12 @@ struct ProcessInfo {
 /// File name of an executable path as the OS reports it; `/proc/<pid>/exe`
 /// of a binary replaced on disk (an upgrade renames the new file over the
 /// old one) reads `<path> (deleted)`.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn exe_file_name(exe: &str) -> String {
     crate::restart_cmd::on_disk_path(Path::new(exe))
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
-}
-
-/// The running `hs`'s path on disk. Linux reports a replaced image as
-/// `<path> (deleted)`, which is not a path that can be spawned; after
-/// `hs upgrade` swapped the binary, the file at `<path>` is the new `hs`.
-pub fn current_exe_on_disk() -> Result<std::path::PathBuf> {
-    let exe = std::env::current_exe().context("cannot find the running hs executable")?;
-    Ok(crate::restart_cmd::on_disk_path(&exe))
-}
-
-/// File name of the running `hs`, which is what a daemon it spawned (via
-/// [`current_exe_on_disk`]) runs as.
-pub fn current_exe_name() -> Result<String> {
-    Ok(exe_file_name(&current_exe_on_disk()?.to_string_lossy()))
 }
 
 /// Whether `info` is `exe_name` run with `args` as a contiguous run of its
@@ -205,8 +191,8 @@ mod tests {
     #[test]
     fn cmdline_args_skip_argv0_and_empty_fields() {
         assert_eq!(
-            args_from_cmdline(b"/bin/hs\0distill\0index\0--daemon-child\0"),
-            ["distill", "index", "--daemon-child"]
+            args_from_cmdline(b"/bin/hs\0scribe\0inbox\0run\0"),
+            ["scribe", "inbox", "run"]
         );
         assert!(args_from_cmdline(b"").is_empty());
     }
@@ -215,18 +201,14 @@ mod tests {
     fn matcher_needs_the_name_and_the_contiguous_args() {
         let info = ProcessInfo {
             exe_name: "hs".into(),
-            args: ["distill", "index", "--daemon-child", "--force"]
+            args: ["scribe", "inbox", "run", "--quiet"]
                 .map(String::from)
                 .into(),
         };
         assert!(info_matches(&info, "hs", &[]));
-        assert!(info_matches(
-            &info,
-            "hs",
-            &["distill", "index", "--daemon-child"]
-        ));
-        assert!(!info_matches(&info, "hs", &["index", "distill"]));
-        assert!(!info_matches(&info, "hs", &["distill", "--daemon-child"]));
+        assert!(info_matches(&info, "hs", &["scribe", "inbox", "run"]));
+        assert!(!info_matches(&info, "hs", &["inbox", "scribe"]));
+        assert!(!info_matches(&info, "hs", &["scribe", "run"]));
         assert!(!info_matches(&info, "other", &[]));
     }
 
@@ -252,14 +234,6 @@ mod tests {
             StopOutcome::NoPidFile
         );
     }
-}
-
-/// Write PID to file.
-pub fn write_pid_file(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, std::process::id().to_string()).context("Failed to write PID file")
 }
 
 /// Remove PID file.

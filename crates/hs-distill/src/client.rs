@@ -307,15 +307,6 @@ impl DistillClient {
         resp.json().await.context("Invalid readiness response")
     }
 
-    /// Index a markdown file into `store` (non-streaming). Reads the file
-    /// locally and sends its content to the server.
-    pub async fn index_file(&self, store: &str, markdown_path: &str) -> Result<IndexResult> {
-        let content = std::fs::read_to_string(markdown_path)
-            .context(format!("Failed to read {markdown_path}"))?;
-        self.index_content(store, markdown_path, &content, None)
-            .await
-    }
-
     /// Index markdown already held in memory into `store`, which must be a
     /// store the server serves and documents are sent to; any other name
     /// is a 400. `path_hint` names the document (its file stem becomes the
@@ -372,34 +363,6 @@ impl DistillClient {
         let content = String::from_utf8(bytes)
             .with_context(|| format!("Markdown at {key} is not valid UTF-8"))?;
         self.index_content(store, key, &content, catalog).await
-    }
-
-    /// Index a markdown file with streaming progress via NDJSON.
-    /// Reads the file locally and sends content to the server. Bounded by
-    /// the client's index timeout (the whole stream, not each line).
-    pub async fn index_file_with_progress(
-        &self,
-        store: &str,
-        markdown_path: &str,
-        on_progress: impl Fn(DistillProgress),
-    ) -> Result<IndexResult> {
-        let content = std::fs::read_to_string(markdown_path)
-            .context(format!("Failed to read {markdown_path}"))?;
-        let url = format!("{}/distill/stream", self.server_url);
-        let resp = self
-            .http
-            .post(&url)
-            .json(&index_body(store, markdown_path, &content, None)?)
-            .timeout(self.index_timeout)
-            .send()
-            .await
-            .context("Failed to send index request")?;
-
-        let resp = ensure_success(resp).await?;
-
-        hs_common::service::protocol::read_ndjson_stream(resp, on_progress)
-            .await
-            .map_err(type_stream_error)
     }
 
     /// Search the named stores in one ranked pass; every hit says which
@@ -564,22 +527,6 @@ fn index_body(
     Ok(body)
 }
 
-/// The stream route reports a server-side panic as an error *line* (the
-/// status is already 200). Give it the same typed, permanent error the
-/// non-stream route's 500 + `x-hs-error-code` produces.
-fn type_stream_error(e: anyhow::Error) -> anyhow::Error {
-    let msg = e.to_string();
-    match msg.strip_prefix("Server error: ") {
-        Some(rest) if rest.starts_with(crate::api::PANIC_CODE) => ServerError {
-            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            body: rest.to_string(),
-            code: Some(crate::api::PANIC_CODE.to_string()),
-        }
-        .into(),
-        _ => e,
-    }
-}
-
 fn names_distill_realm(www_authenticate: Option<&str>) -> bool {
     www_authenticate.is_some_and(|v| v.contains(&format!("realm=\"{AUTH_REALM}\"")))
 }
@@ -669,20 +616,6 @@ mod tests {
             .unwrap_err();
         assert!(is_timeout(&err), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(10));
-    }
-
-    #[tokio::test]
-    async fn the_streaming_index_request_is_bounded_too() {
-        let fake = serve(|_| Reply::Hang).await;
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("doc.md");
-        std::fs::write(&file, "some markdown").unwrap();
-        let c = client(&fake).with_index_timeout(Duration::from_millis(300));
-        let err = c
-            .index_file_with_progress(ACADEMIC, file.to_str().unwrap(), |_| {})
-            .await
-            .unwrap_err();
-        assert!(is_timeout(&err), "{err:#}");
     }
 
     #[tokio::test]
@@ -829,23 +762,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_404_from_the_stream_endpoint_is_an_error_not_a_second_request() {
-        // The old client answered a 404 by silently re-posting to /distill.
-        let fake = serve(|_| Reply::Json(404, "not found".into())).await;
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("doc.md");
-        std::fs::write(&file, "some markdown").unwrap();
-        let err = client(&fake)
-            .index_file_with_progress(ACADEMIC, file.to_str().unwrap(), |_| {})
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("404"));
-        let seen = fake.recorded();
-        assert_eq!(seen.len(), 1, "no fallback request: {seen:?}");
-        assert!(seen[0].request_line.contains("/distill/stream"));
-    }
-
-    #[tokio::test]
     async fn list_docs_refuses_a_partial_list() {
         let fake =
             serve(|_| Reply::Json(200, r#"{"doc_ids":["a","b"],"truncated":true}"#.into())).await;
@@ -950,17 +866,5 @@ mod tests {
             let typed = err.downcast_ref::<ServerError>().expect("ordinary error");
             assert!(!typed.is_permanent_rejection());
         }
-    }
-
-    #[test]
-    fn a_panic_error_line_on_the_stream_is_the_typed_permanent_error() {
-        let typed = type_stream_error(anyhow::anyhow!(
-            "Server error: index_panicked: indexing d panicked"
-        ));
-        let s = typed.downcast_ref::<ServerError>().expect("typed");
-        assert!(s.is_permanent_rejection());
-        assert_eq!(s.code.as_deref(), Some(crate::api::PANIC_CODE));
-        let other = type_stream_error(anyhow::anyhow!("Server error: myelin down"));
-        assert!(other.downcast_ref::<ServerError>().is_none());
     }
 }

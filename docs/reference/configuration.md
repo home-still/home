@@ -293,8 +293,6 @@ The distill client: `hs distill`, the distill watcher, `hs pipeline` and `hs-mcp
 | Key | Default | Meaning |
 |---|---|---|
 | `servers` | empty list | Distill server URLs, for example `http://<gpu-host>:7434`. Commands that talk to a distill server stop when it is empty. |
-| `markdown_dir` | `<project_dir>/markdown` | Local markdown directory for local indexing. |
-| `catalog_dir` | `<project_dir>/catalog` | Local catalog directory for local indexing. |
 | `concurrency` | host class | Documents the distill watcher indexes in parallel; at least 1. See [Host classes](#host-classes). |
 | `index_timeout_secs` | `1800` | Deadline for one indexing request; at least 1. |
 

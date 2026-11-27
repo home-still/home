@@ -29,7 +29,6 @@ of two ways:
 | Inbox | Files waiting in `papers/manually_downloaded/`. | `pending in manually_downloaded/ (N)` or `manually_downloaded/ empty`. | | `hs scribe inbox sweep` |
 | Failed, retry | Documents stamped `conversion_failed` with a retryable reason. | `hs pipeline reconvert-failed --dry-run` when the count is above zero, else `none`. | The largest retryable reason and its count, then `N bad source` and `N unclassified` when present. | `hs pipeline reconvert-failed --dry-run` |
 | Watcher | The inbox daemon (`hs scribe inbox run`), from the heartbeat it writes on every tick. | `running · <host>`, plus `swept <moved> / <found>` after its first sweep; or `stopped`. | `last tick Ns ago`, plus `K err` when the last sweep had errors. | `hs scribe inbox status` |
-| Indexer | A local `hs distill index` run, from its status file. | `indexing` with `indexed/total (pct) · chunks · failed · current file`, `done` with totals, or `stopped`. | | `hs distill index` |
 
 The text output prints the failed conversions in full:
 

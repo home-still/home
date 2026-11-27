@@ -189,17 +189,22 @@ stores them under `~/home-still/boxes/`. Leave it running.
 
 ```sh
 hs serve distill start
-hs distill index
 ```
 
-`hs serve distill start` starts the search server, which keeps passages in a
-myelin server and needs that server and Ollama, with the embedding model
-`bge-m3-8k` made
+This starts the search server, which keeps passages in a myelin server and
+needs that server and Ollama, with the embedding model `bge-m3-8k` made
 ([how](home-cloud-cluster.md#8-set-up-myelin-on-the-gpu-host)), running first (see
 [`distill_server`](../reference/configuration.md#distill_server)). It exits
 when myelin does not answer or Ollama does not hold the model on the GPU.
-`hs distill index` cuts your markdown into passages, embeds them and stores
-them, showing a progress bar. Now ask a question:
+
+Then run the indexer that listens on the bus. In a fourth terminal:
+
+```sh
+hs distill watch-events
+```
+
+It picks up the event the conversion left in step 6, cuts the markdown into
+passages, embeds them and stores them. Leave it running. Now ask a question:
 
 ```sh
 hs distill search "why does self-attention replace recurrence"
@@ -228,10 +233,11 @@ see [connect Claude and agents](../how-to/connect-claude-and-agents.md).
 
 ## 9. Make it automatic
 
-Stop the scribe server from step 5 and the converter from step 6 with
-Ctrl+C in their terminals. Then install the scribe server as a system service
-(it asks for your `sudo` password), and the converter and indexer as user
-services that start with your session and restart on failure:
+Stop the scribe server from step 5, the converter from step 6 and the
+indexer from step 7 with Ctrl+C in their terminals. Then install the scribe
+server as a system service (it asks for your `sudo` password), and the
+converter and indexer as user services that start with your session and
+restart on failure:
 
 ```sh
 hs serve scribe --install

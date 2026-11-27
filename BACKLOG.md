@@ -1594,3 +1594,67 @@ the same file's 40 document queries the order is the other way: candidate 40, ba
 returns for the whole query, or the reranker puts ten other chunks above them.
 **Fix.** None yet. Find which of the two it is for the three queries before changing anything,
 and choose any change on the development file, not on the gate or the held-out file.
+
+### P0-32. The distill server started an indexer that read a folder on its own host, and on rc.395 it put 27 documents in the store that the library's storage does not hold (found 2026-11-27, first host upgraded to rc.395)
+**Symptom.** After `hs upgrade` to rc.395 on the GPU host the `academic` store went from 475,897
+records and 19,268 documents to 477,585 and 19,295: 1,688 records and 27 document ids more than
+the store that was judged. The ledger holds 1,688 `add` events between 13:14:44Z and 13:19:52Z, the
+five minutes after the distill server started. 26 of the 27 have passages (1,414 records); 20
+have a reference list (274 records); one has a reference list and no passage. 26 of the 27 have no
+markdown object and no catalog row in storage. 4 of those are copies of a stored document under
+an id that differs in letter case (`10.48550_arXiv.1706.03762` beside
+`10.48550_arxiv.1706.03762`). The 27th (`W2007223677`) is in storage with other content. `read` and
+`cite` refuse a document that storage does not hold, so search returned hits that could not be
+opened. The gate rows did not move (25/25 and 47/50, each rank equal to the judged run).
+**Cause.** `hs serve distill` and `hs serve distill start` started `hs distill index` as a daemon
+once the server answered `/health`. That command walked `distill.markdown_dir`, a folder on the
+host (default `<project_dir>/markdown`), and sent every file whose id the store did not hold. On a
+host whose storage is S3 the folder is not the library: here it was a leftover tree of 2,845 files
+from before the move to S3. The code predates the cutover. The rebuilt store was filled from
+storage, so the first server start under rc.395 found 27 local files it did not know. It would
+have run again on every restart. Inferred, not measured: the old index held those ids, which is
+why the daemon had added nothing before.
+**Wrong before this was found.** The report to the owner said 26 documents. The 27th has only a
+reference list, and the count was taken from the passages.
+**Fix (rc.396).** One way in. `hs distill index`, the automatic start, the daemon, its status file,
+the dashboard's Indexer row and the `distill.markdown_dir` and `distill.catalog_dir` keys are
+deleted. Documents reach the store through the distill watcher, which reads storage;
+`hs distill reconcile --reembed` and `hs distill reindex` cover what the watcher missed. The 27
+ids are kept with the release's records on the host, not in this repository, and are removed
+with `hs distill purge` once rc.396 runs there.
+
+### P1-47. `hs distill reconcile` does not report a document that is in the store and not in storage (found 2026-11-27)
+**Symptom.** With the 27 documents of P0-32 in the store, `hs distill reconcile --fix-stamps
+--reembed` printed `ok=19331 stamps_fixed=0 embeds_done=0` and exited 0.
+**Cause.** `partition` classifies each markdown stem against the store and the catalog. Nothing
+walks the other way, from the store's ids to storage.
+**Change.** Report the ids the store holds and storage does not, as a count and a list, and
+compare ids exactly (letter case included). Removing them stays a separate, explicit command.
+**Acceptance.** A store holding one document that storage does not hold makes
+`hs distill reconcile` name it and exit non-zero.
+
+### P1-48. The distill server keeps a route no client calls, and the client a method nothing calls (found 2026-11-27)
+`POST /distill/stream` was called only by `hs distill index`, deleted in rc.396; the gateway still
+routes it and `docs/reference/services-and-ports.md` still lists it. `DistillClient::doc_exists`
+has no caller in the workspace. Delete both or name their user.
+
+### P1-49. `hs scribe catalog-backfill` reads a markdown folder and writes a catalog folder on its own host (found 2026-11-27)
+`cmd_catalog_backfill` (`crates/hs/src/scribe_cmd.rs`) walks `scribe.output_dir` and writes rows
+through `LocalFsStorage`, whatever `storage.backend` is. On a host whose storage is S3 it builds
+catalog rows nothing reads, from files that are not the library: the fault of P0-32 in another
+command. Not run during this release. Make it read and write storage, or delete it.
+
+### P1-50. 20 groups of document ids in the `academic` store differ only in letter case (found 2026-11-27)
+Measured on the judged store, before P0-32 added 4 more groups. Each group is one paper indexed
+under two ids, so a search can return it twice and a purge by one id leaves the other. Which
+writer produced the mixed-case ids is not established; the DOI lower-casing migration is the
+first place to look.
+
+### Owner-only items after the rc.395 cutover (2026-11-27)
+- The GPU host's firewall does not admit the gateway host on TCP 7463, so the remote memory route
+  answers nothing.
+- Device tokens issued before rc.395 lack the `memory` scope; each device enrols again.
+- The old markdown tree under `<project_dir>/markdown` on the GPU host (2,845 files) is no longer
+  read by anything in rc.396. It is the owner's to delete.
+- The abstracts store: 33 of 2,860 entries hold a vector from before the pooling fix until
+  `hs distill abstracts build --force` is run (at least 5 GB of GPU memory).

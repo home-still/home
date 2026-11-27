@@ -3306,3 +3306,87 @@ untagged. myelin `main` at `18f0dbf`.
 4. **Search time**: a median of 3 s at depth 50 against 0.3 to 1.3 s
    before. Not a rule; measure what the reranker costs per record.
 5. **myelin: the rerank head cuts a tie on record id** (BACKLOG P1-45).
+
+## 2026-11-27-02 — rc.395 on the first host: the judged ranking holds, and a server start put 27 documents in the store that storage does not hold
+
+**Evidence.** The owner said release. `v0.0.1-rc.395` was tagged on `main`
+at `33bc8eb`; the release run was green on every target. `hs upgrade --pre
+--yes` on the GPU host exited 0. No other host was upgraded.
+
+**What held (measured on the upgraded host).**
+
+| What | Judged run (entry 2026-11-27-01) | Production after the upgrade |
+|---|---|---|
+| Gate `RECALL@10` | 25/25 | 25/25 |
+| Held-out: expected document in the top 10 | 47/50 | 47/50 |
+| Ranks that differ from the judged run | | 0 of 75 |
+| Tools `hs-mcp` lists | | 10 |
+
+The five binaries carry the rc.395 marker and the units are active. The
+old Qdrant container is stopped and its data kept.
+
+**What did not hold.** The `academic` store's counts moved without any
+document being converted:
+
+| | Before the upgrade | After |
+|---|---|---|
+| `academic` records | 475,897 | 477,585 |
+| `academic` documents | 19,268 | 19,295 |
+| `references` records | 96,978 | 97,252 |
+| `references` documents | 16,771 | 16,791 |
+
+The ledger holds 1,688 `add` events between 13:14:44Z and 13:19:52Z, right
+after the distill server started. 27 document ids are new: 26 with
+passages (1,414 records), 20 with a reference list (274 records). 26 of the
+27 have no markdown and no catalog row in storage; 4 of them copy a stored
+document under an id that differs in letter case. `read` and `cite` refuse
+them; search can return them. Whether one is in the first ten of a judged
+query was not measured: the harness keeps ranks, not ids.
+
+**Cause.** `hs serve distill` started `hs distill index` as a daemon. It
+walked a folder on the host, not storage: a leftover tree of 2,845 markdown
+files from before the move to S3. The rebuilt store was filled from storage
+(19,331 markdown objects) and did not hold 27 of the folder's ids. The
+daemon would run again on every server start (BACKLOG P0-32). Inferred,
+not measured: the old index held those ids, which is why the daemon had
+added nothing before.
+
+**Why the gate did not catch it.** The gate asks whether the right passage
+is in the first ten. It does not compare the store's ids with storage, and
+neither does `hs distill reconcile`, which answered `ok=19331` with the 27
+in the store (BACKLOG P1-47). The daemon had not written to the judged
+store: none of the 27 ids was in it before 13:14Z. Inferred, not measured:
+the judged server was started from the `hs-distill-server` binary, which
+starts no daemon, while the unit runs `hs serve distill`, which did.
+
+**Mistakes in this pass.**
+
+- The first report to the owner said 26 documents. The count was taken
+  from the passages; a 27th id has a reference list and no passage.
+- One `systemctl stop` naming three units stopped none of them, because one
+  was not loaded. They were then stopped one at a time.
+
+**Decision (owner).** Fix it before any other host is upgraded: delete the
+automatic start and `hs distill index` whole, as rc.396, then remove the
+injected documents. The fleet upgrades once, to rc.396.
+
+**Change.** `hs distill index`, the daemon, its status file, the
+dashboard's Indexer row, `DistillClient::index_file` and
+`index_file_with_progress`, and the `distill.markdown_dir` and
+`distill.catalog_dir` keys are deleted. Documents reach the store through
+the distill watcher; `hs distill reconcile --reembed` and `hs distill
+reindex` repair.
+
+**Version.** `main` at `33bc8eb`, tagged `v0.0.1-rc.395`. The change is on
+branch `retire-local-index`.
+
+### Top 5 remaining items
+
+1. **Release rc.396, upgrade the first host, remove the 27 documents**,
+   then rerun both query files against production.
+2. **The rest of the fleet**, in series, to rc.396.
+3. **`hs distill reconcile` is blind to a document the store holds and
+   storage does not** (BACKLOG P1-47).
+4. **`hs scribe catalog-backfill` reads and writes folders on its own
+   host** (BACKLOG P1-49): the same fault in another command.
+5. **Rare-word queries** (BACKLOG P1-46), unchanged.
