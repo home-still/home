@@ -3,6 +3,9 @@
 #
 # Written 2026-11-26. Approved by the owner on 2026-11-27, with the choice
 # rule below, before any of them was scored.
+# Scored once on 2026-11-27: depth 50 was chosen (docs/loop/log.md, entry
+# 2026-11-27-01). A later choice made with this file is no longer blind
+# to it.
 #
 # What is chosen with it: the store's rerank depth, the number of fused
 # records per store that the reranker scores. Three arms: 25 (myelin's

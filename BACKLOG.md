@@ -1520,6 +1520,15 @@ and h24 (candidate first, baseline misses), h30 (baseline second, candidate miss
 lexical list and outside the dense top 50, so the reranker scores none of them; scoring the 13th
 too gives it -4.43 against the tenth result's -3.62. No store defect was found behind it. The
 owner's bar (a pass at the default depth) is not met. `docs/loop/log.md`, 2026-11-26-03.
+**Depth chosen on a third set, 2026-11-27.** The owner had the depth picked on
+`docs/loop/queries_dev.yaml` (78 queries, approved before scoring; rule: most passes, ties to the
+smaller depth, no loss on its 40 document queries). Candidate at depth 25, 50, 100: 74, 75, 75
+of 78; the baseline 74. Depth 50 was chosen, on one query (t16) and the tie-break. At depth 50,
+each file run once: gate 25/25 against 25/25, first hit a reference list 2/25 against 2/25,
+reference share 21/250 against 28/250; held-out 47/50 against 46/50. Both rules hold. What
+weakens it: depth 50 was already known to pass the gate before the fixes (entry 2026-11-26-01),
+and the development set does not show 50 to be better than 25 (sign test p = 0.5).
+`docs/loop/log.md`, 2026-11-27-01.
 
 ### P1-43. myelin gave the two pieces of a record over 4,000 characters equal weight, so a fifth of the records had a vector that was half their last lines (found 2026-11-26)
 **Symptom.** Measured on the candidate store. A record is a header line and a chunk of up to
@@ -1573,3 +1582,15 @@ lost that way.
 **Fix.** Not made. Taking every record tied with the last would be the plain repair. It does not
 change q09: the reranker scores that chunk -4.43 and the tenth result -3.62 (measured outside
 the store with the same reranker). Filed as `home-still/myelin#220`.
+
+### P1-46. On a short query holding a rare word, the myelin store shows the word less often than Qdrant did (found 2026-11-27)
+**Symptom.** 38 queries of `docs/loop/queries_dev.yaml` (t01 to t38) each hold one word the store
+has in 3 to 30 chunks and pass when a top-10 hit holds it. The baseline passes 38; the candidate
+34 at rerank depth 25 and 35 at depth 50 and at depth 100. t09 (`polycarbonate`), t17
+(`callipers`) and t24 (`nanosystems`) miss at every depth, depth 100 included, where the
+reranker scores every candidate the two searches return. Gate query q09 was of this kind. On
+the same file's 40 document queries the order is the other way: candidate 40, baseline 36.
+**Cause.** Not established. Either the chunks holding the word are beyond the 50 the word search
+returns for the whole query, or the reranker puts ten other chunks above them.
+**Fix.** None yet. Find which of the two it is for the three queries before changing anything,
+and choose any change on the development file, not on the gate or the held-out file.

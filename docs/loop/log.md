@@ -3228,3 +3228,81 @@ untagged. myelin `main` at `18f0dbf`.
 5. **myelin: the gaps left by the refused-write fix** (BACKLOG P1-41): the
    derived-record leg is not atomic, and a second store's failure leaves
    the first store's write.
+
+## 2026-11-27-01 — rerank depth chosen on a third query set (50); the gate and the held-out file then both hold
+
+**Evidence.** The owner chose to hold and have the ranking changed by a
+fixed procedure: a third query set, approved before scoring; one setting
+picked on it by a rule fixed beforehand; then `queries.yaml` and
+`queries_heldout.yaml` each run once at that setting. The set is
+`docs/loop/queries_dev.yaml` (78 queries: 40 anchored to a document, 38
+short queries holding a word the store has in 3 to 30 chunks). The owner
+approved it and picked the rule (most queries passed; ties to the smaller
+depth; no loss on the 40 document queries). It was committed before the
+first run (`740df36`).
+
+**The choice.** One session, the baseline once, the candidate at each
+depth. No query errored.
+
+| | Document queries | Rare-word queries | Total | First hit a reference list | Median |
+|---|---|---|---|---|---|
+| Baseline (Qdrant) | 36/40 | 38/38 | 74/78 | 6/78 | 1,344 ms |
+| Candidate, depth 25 | 40/40 | 34/38 | 74/78 | 5/78 | 2,410 ms |
+| Candidate, depth 50 | 40/40 | 35/38 | 75/78 | 5/78 | 3,432 ms |
+| Candidate, depth 100 | 40/40 | 35/38 | 75/78 | 5/78 | 3,595 ms |
+
+By the rule the depth is **50**: it ties with 100 on passes and is the
+smaller. Against depth 25 it wins one query (t16) and loses none; the
+exact sign test on that is p = 0.5, so the set does not show that 50 is
+better than 25, only that it is not worse. t09, t17 and t24 miss at every
+depth; the baseline passes them (BACKLOG P1-46).
+
+**Before / after.** Both files, once, at depth 50, baseline first. The
+baseline's rows equal those of entry 2026-11-26-03.
+
+| What | Depth 25 (entry 2026-11-26-03) | Depth 50 |
+|---|---|---|
+| Gate `RECALL@10`, baseline / candidate | 25/25 / 24/25 | 25/25 / 25/25 |
+| First hit is a reference list, baseline / candidate | 2/25 / 2/25 | 2/25 / 2/25 |
+| Reference-list share of the page, baseline / candidate | 28/250 / 24/250 | 28/250 / 21/250 |
+| Held-out: expected document in the top 10, baseline / candidate | 46/50 / 47/50 | 46/50 / 47/50 |
+| Held-out: expected document first, baseline / candidate | 35/50 / 43/50 | 35/50 / 43/50 |
+| Median, gate, baseline / candidate | 286 ms / 1,147 ms | 350 ms / 3,053 ms |
+| Median, held-out, baseline / candidate | 1,579 ms / 765 ms | 635 ms / 3,238 ms |
+
+**Rules.** The 25-query rule holds (25 against 25; 2/25 against 2/25;
+21/250 against 28/250). The held-out rule holds (47 against 46). On the
+gate two candidate ranks moved: q09 from a miss to 6th, q10 from 8th to
+9th. No held-out rank moved; the disagreements are those of the entry
+before (h23, h24, h30; h13 and h35 miss on both).
+
+**What weakens this pass.** Each was known when the procedure was agreed
+or is measured above.
+
+- Entry 2026-11-26-01 had already shown depth 50 passing the gate and
+  depth 100 failing it, before the store fixes. The arms and the
+  tie-break were written by someone who knew that, and the tie-break is
+  what separated 50 from 100.
+- The development set gives one query of evidence for 50 over 25.
+- The rare-word half was modelled on q09's kind of query.
+- Depth 100 was not run on the gate or the held-out file.
+- The longest candidate answer in the judging run took 7.1 s. Latency
+  is not a rule.
+
+**Gates.** No code changed. The store runs with `--rerank-depth 50` from
+a drop-in on the `myelin-mcp` unit; the running process's arguments were
+read to confirm it.
+
+**Version.** Branch `myelin-cutover` at `740df36` before this entry,
+untagged. myelin `main` at `18f0dbf`.
+
+### Top 5 remaining items
+
+1. **Owner: release or hold**, on the result above and its weaknesses.
+2. **Rare-word queries** (BACKLOG P1-46): the store shows the word for 35
+   of 38 where Qdrant shows it for 38 of 38, at any depth.
+3. **Abstracts store**: build it with `--force` after the cutover; 33 of
+   its 2,860 entries still hold a vector from before the pooling fix.
+4. **Search time**: a median of 3 s at depth 50 against 0.3 to 1.3 s
+   before. Not a rule; measure what the reranker costs per record.
+5. **myelin: the rerank head cuts a tie on record id** (BACKLOG P1-45).
