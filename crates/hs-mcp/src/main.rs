@@ -10,19 +10,18 @@ use rmcp::{
     },
     model::{
         CallToolResult, ErrorData, GetPromptRequestParams, GetPromptResult, ListPromptsResult,
-        ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-        ProgressNotificationParam, PromptMessage, PromptMessageRole, RawResource,
-        RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
+        PaginatedRequestParams, ProgressNotificationParam, PromptMessage, PromptMessageRole,
         ServerCapabilities, ServerInfo,
     },
     prompt, prompt_handler, prompt_router, schemars,
     service::RequestContext,
     tool, tool_router, RoleServer, ServerHandler,
 };
-use stem::Stem;
 
 mod http_app;
 mod links;
+mod openalex;
+mod snapshot;
 mod stem;
 #[cfg(test)]
 mod testkit;
@@ -30,772 +29,30 @@ mod testkit;
 mod tool_tests;
 mod tools;
 
-// ── Tool parameter types ────────────────────────────────────────
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct PaperSearchParams {
-    #[schemars(description = "Search query for academic papers")]
-    query: String,
-    #[schemars(description = "Maximum results to return (default 10)")]
-    max_results: Option<u16>,
-    #[schemars(
-        description = "Search type: keywords, title, author, doi, subject (default: keywords)"
-    )]
-    search_type: Option<String>,
-    #[schemars(description = "Date filter, e.g. '>=2023' or '2020-2024'")]
-    date: Option<String>,
-    #[schemars(
-        description = "Result offset for pagination (default 0). OpenAlex needs a multiple of the page size (max_results); Europe PMC cannot page by offset (an error when requested alone, left out of `all` when offset > 0)."
-    )]
-    offset: Option<usize>,
-    #[schemars(
-        description = "Provider: all, arxiv, openalex, semantic_scholar (s2), europmc (pmc), crossref, core (default: all). Unknown values return an error."
-    )]
-    provider: Option<String>,
-    #[schemars(
-        description = "Minimum citation count filter. Papers with fewer citations are excluded. Provider support varies (OpenAlex, Semantic Scholar, CORE honor this; arXiv does not)."
-    )]
-    min_citations: Option<u32>,
-    #[schemars(
-        description = "Sort order: relevance, citations, date (default: relevance). Unknown values are an error."
-    )]
-    sort: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct PaperGetParams {
-    #[schemars(description = "DOI to look up")]
-    doi: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct PaperReferencesParams {
-    #[schemars(description = "DOI of the paper whose reference list to return")]
-    doi: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct PaperCitationsParams {
-    #[schemars(description = "DOI of the paper to find citing works for")]
-    doi: String,
-    #[schemars(description = "Maximum citations to return (default 100, max 1000)")]
-    limit: Option<u32>,
-    #[schemars(
-        description = "Optional minimum publication year; applied while paging, so `limit` counts only citing papers from this year on"
-    )]
-    year_from: Option<u16>,
-    #[schemars(description = "Sort order: 'year' (default) or 'citations'")]
-    sort: Option<String>,
-}
-
-// ── OpenAlex (local DuckDB) parameter types ─────────────────────
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct OpenAlexSearchParams {
-    #[schemars(description = "Free-text search over works title + abstract (BM25)")]
-    query: String,
-    #[schemars(description = "Maximum results (default 10, max 200)")]
-    max_results: Option<u16>,
-    #[schemars(description = "Minimum publication year filter")]
-    year_from: Option<u16>,
-    #[schemars(description = "Maximum publication year filter")]
-    year_to: Option<u16>,
-    #[schemars(description = "Minimum cited_by_count filter")]
-    min_citations: Option<u32>,
-    #[schemars(description = "Sort: 'relevance' (default), 'citations', 'year'")]
-    sort: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct OpenAlexGetParams {
-    #[schemars(description = "OpenAlex work ID (e.g. W2741809807) or DOI (e.g. 10.1234/x)")]
-    id_or_doi: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct OpenAlexReferencesParams {
-    #[schemars(description = "OpenAlex work ID whose outbound references to list")]
-    openalex_id: String,
-    #[schemars(description = "Maximum results (default 100, max 1000)")]
-    limit: Option<u32>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct OpenAlexCitationsParams {
-    #[schemars(description = "OpenAlex work ID to find citing works for")]
-    openalex_id: String,
-    #[schemars(description = "Maximum results (default 100, max 1000)")]
-    limit: Option<u32>,
-    #[schemars(description = "Optional minimum publication year filter")]
-    year_from: Option<u16>,
-    #[schemars(description = "Sort: 'citations' (default) or 'year'")]
-    sort: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct OpenAlexAuthorsByTopicParams {
-    #[schemars(
-        description = "OpenAlex topic ID (e.g. T13975) — get from `openalex_search` or `topics` table"
-    )]
-    topic_id: String,
-    #[schemars(description = "Maximum authors (default 25, max 200)")]
-    limit: Option<u16>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct CatalogReadParams {
-    #[schemars(description = "Paper stem name (filename without extension)")]
-    stem: Stem,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct ListParams {
-    #[schemars(description = "Maximum items to return (default: all)")]
-    limit: Option<usize>,
-    #[schemars(description = "Number of items to skip (default: 0)")]
-    offset: Option<usize>,
-    #[schemars(
-        description = "catalog_list only: filter by embedded-in-Qdrant state. true=only embedded, false=only not-yet-embedded, omit=all."
-    )]
-    embedded: Option<bool>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct CatalogRecentParams {
-    #[schemars(description = "Maximum items to return (default: 30)")]
-    limit: Option<usize>,
-    #[schemars(
-        description = "When false (default), suppress rows whose timestamp came from a catalog_repair backfill (`downloaded_at == repair.repaired_at`, or synthetic Convert whose `converted_at == repair.repaired_at`). Set true for forensic mode — repair rows reappear with `\"repair\": true`."
-    )]
-    include_repaired: Option<bool>,
-}
-
-#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
-struct SystemStatusParams {
-    #[schemars(
-        description = "When false (default), the `history` pane mirrors `catalog_recent` and suppresses `catalog_repair` backfill rows. Set true for forensic mode — repair rows reappear with `\"repair\": true`."
-    )]
-    include_repaired: Option<bool>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct MarkdownReadParams {
-    #[schemars(description = "Paper stem name (filename without extension)")]
-    stem: Stem,
-    #[schemars(description = "Specific page number (1-based). Omit for full document.")]
-    page: Option<usize>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DistillSearchParams {
-    #[schemars(description = "Search query for semantic search across indexed documents")]
-    query: String,
-    #[schemars(description = "Maximum results (default 10)")]
-    limit: Option<u64>,
-    #[schemars(description = "Year filter, e.g. '>2020', '2023', '>=2021'")]
-    year: Option<String>,
-    #[schemars(
-        description = "When true (default), include the matched chunk_text in each hit. Set false for a metadata-only response — useful when an agent is ranking/deduping large result sets (e.g. building a DOI catalog) and the passages would overflow its context window. Score and ranking are unaffected."
-    )]
-    include_text: Option<bool>,
-}
-
-#[derive(serde::Serialize)]
-struct DistillSearchHitOut {
-    doc_id: String,
-    title: Option<String>,
-    authors: Vec<String>,
-    year: Option<u64>,
-    doi: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    chunk_text: Option<String>,
-    score: f32,
-    /// The links a user can open: the original document and the
-    /// markdown, on the LAN and away from home.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    links: Option<crate::links::DocumentLinks>,
-    line_start: usize,
-    line_end: usize,
-    page: Option<usize>,
-    category: Option<String>,
-}
-
-fn map_distill_search_hits(
-    hits: Vec<hs_distill::client::SearchHit>,
-    include_text: bool,
-    minter: Option<&Arc<crate::links::LinkMinter>>,
-) -> Vec<DistillSearchHitOut> {
-    hits.into_iter()
-        .map(|h| {
-            // The passage's first line is what a text fragment quotes,
-            // so the browser can select the passage the agent found.
-            let passage = h.chunk_text.lines().next().map(str::trim).map(String::from);
-            let links = minter.and_then(|m| {
-                m.mint(
-                    &h.doc_id,
-                    hs_common::stores::ACADEMIC,
-                    h.page.map(|p| p as u32),
-                    passage.as_deref(),
-                )
-            });
-            DistillSearchHitOut {
-                doc_id: h.doc_id.clone(),
-                title: h.title,
-                authors: h.authors,
-                year: h.year,
-                doi: h.doi,
-                chunk_text: include_text.then_some(h.chunk_text),
-                score: h.score,
-                links,
-                line_start: h.line_start,
-                line_end: h.line_end,
-                page: h.page,
-                category: h.category,
-            }
-        })
-        .collect()
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DistillExistsParams {
-    #[schemars(
-        description = "Paper stem name (filename without extension) of the indexed document to check"
-    )]
-    stem: Stem,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct PaperDownloadParams {
-    #[schemars(description = "DOI of the paper to download")]
-    doi: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct ScribeQueueParams {
-    #[schemars(
-        description = "Paper stem name (filename without extension) of a PDF, HTML or EPUB source already stored in the papers directory"
-    )]
-    stem: Stem,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct ScribeConvertParams {
-    #[schemars(
-        description = "Paper stem name (filename without extension) of a PDF, HTML or EPUB source stored in the papers directory"
-    )]
-    stem: Stem,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DistillIndexParams {
-    #[schemars(
-        description = "Paper stem name (filename without extension) of a markdown document to index"
-    )]
-    stem: Stem,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DistillReconcileParams {
-    #[schemars(description = "If true, report orphans without deleting. Default: true.")]
-    #[serde(default = "default_true")]
-    dry_run: bool,
-    #[schemars(
-        description = "Maximum number of doc_ids to check for missing markdown. Default: every doc_id in the collection."
-    )]
-    #[serde(default)]
-    limit: Option<u64>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DistillReindexParams {
-    #[schemars(description = "Paper stem name (filename without extension) to re-index")]
-    stem: Stem,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DistillScanRepetitionsParams {
-    #[schemars(
-        description = "Maximum number of markdown objects to scan. Default: 100000 (effectively unbounded)."
-    )]
-    #[serde(default)]
-    limit: Option<u64>,
-    #[schemars(
-        description = "Flag documents whose repetition truncation count exceeds this value. Default: 20. Lower is more aggressive; tune against a hand-labeled sample."
-    )]
-    #[serde(default)]
-    threshold: Option<usize>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct CatalogRepairParams {
-    #[schemars(
-        description = "If true, report what would be repaired without writing. Default: true."
-    )]
-    #[serde(default = "default_true")]
-    dry_run: bool,
-    #[schemars(description = "Maximum number of orphans to repair in this call.")]
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DedupeUrlEncodedParams {
-    // rc.306 P0-6: field accepted for schema compatibility but ignored
-    // server-side; MCP only reports. No command applies the report yet.
-    #[schemars(
-        description = "Ignored: this tool only reports. No command applies the dedupe yet."
-    )]
-    #[serde(default = "default_true")]
-    #[allow(dead_code)]
-    dry_run: bool,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct CatalogBackfillTitleParams {
-    #[schemars(
-        description = "If true, report what would be backfilled without writing. Default: true."
-    )]
-    #[serde(default = "default_true")]
-    dry_run: bool,
-    #[schemars(
-        description = "Maximum number of catalog rows to process in this call. Each row triggers one provider aggregate lookup — keep this bounded."
-    )]
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct DistillBackfillParams {
-    #[schemars(
-        description = "If true, report what would be re-indexed without writing. Default: true."
-    )]
-    #[serde(default = "default_true")]
-    dry_run: bool,
-    #[schemars(description = "Maximum number of documents to attempt this call.")]
-    #[serde(default)]
-    limit: Option<usize>,
-    #[schemars(
-        description = "If true, also retry documents previously stamped with an embedding_skip reason. Default: false."
-    )]
-    #[serde(default)]
-    retry_skipped: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-// ── Personal Tools params ─────────────────────────────────────
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct PersonalSearchParams {
-    #[schemars(description = "Search query for the personal-documents collection")]
-    query: String,
-    #[schemars(description = "Maximum results (default 10)")]
-    limit: Option<usize>,
-    #[schemars(
-        description = "Restrict to a single category (medical, financial, education, legal, employment, tax, insurance, correspondence, other). Omit to search across all categories."
-    )]
-    category: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct PersonalListParams {
-    #[schemars(description = "Maximum entries to return (default 50)")]
-    limit: Option<usize>,
-    #[schemars(description = "Restrict to a single category. Omit to list all categories.")]
-    category: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct PersonalReadParams {
-    #[schemars(description = "Document stem (filename without extension)")]
-    stem: Stem,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct PersonalAddParams {
-    #[schemars(
-        description = "Filename inside the personal-store inbox (no path separators, no leading dot, no absolute paths). Drop the file under cfg.inbox_dir() yourself before calling."
-    )]
-    filename: String,
-    #[schemars(
-        description = "Override the LLM-picked category. Must be one of the configured categories."
-    )]
-    category: Option<String>,
-    #[schemars(description = "Override the LLM-picked title.")]
-    title: Option<String>,
-    #[schemars(
-        description = "If true, replace an existing document with the same stem or the same file content."
-    )]
-    #[serde(default)]
-    force: bool,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct PersonalReindexParams {
-    #[schemars(description = "Document stem to re-chunk and re-embed.")]
-    stem: Stem,
-}
-
-// ── OpenAlex DuckDB helpers ─────────────────────────────────────
-
-fn openalex_unavailable_error() -> String {
-    "OpenAlex DB not configured. Add an `openalex:` section to ~/.home-still/config.yaml \
-     with `db_path` and `snapshot_dir`, then run `hs openalex load <entity>`."
-        .to_string()
-}
-
-/// The `openalex:` section of `~/.home-still/config.yaml` as hs-mcp reads it.
-/// `snapshot_dir` belongs to `hs openalex load`; it is accepted here so the
-/// shared section is not rejected, and not used. hs-mcp does not own this
-/// section, and deployed configs carry stale keys in it, so an unknown key is
-/// a warning (the convention for such sections), not a startup error.
-#[derive(Debug, serde::Deserialize)]
-struct OpenAlexSection {
-    db_path: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    snapshot_dir: Option<String>,
-}
-
-/// Open the local OpenAlex DuckDB read-only, using `openalex.db_path` from
-/// the already-loaded config file. `Ok(None)` is the two legitimate
-/// "OpenAlex is not set up on this host" states: no `openalex:` section, or
-/// a database file that `hs openalex load` has not created yet. A section
-/// that is present but malformed (a typo, a missing `db_path`) is an error
-/// that stops the server: it must not read as "not configured".
-fn open_openalex_readonly(
-    file: &hs_common::config_file::ConfigFile,
-) -> anyhow::Result<Option<duckdb::Connection>> {
-    if let Some(raw) = file.section_json("openalex")? {
-        hs_common::config_file::warn_unknown_keys(
-            file.path(),
-            "openalex",
-            &raw,
-            &serde_json::json!({ "db_path": "", "snapshot_dir": "" }),
-            &[],
-        );
-    }
-    let Some(section) = file.section::<OpenAlexSection>("openalex")? else {
-        tracing::info!("no `openalex:` section in the config; openalex_* tools are not offered");
-        return Ok(None);
-    };
-    let home = hs_common::config_file::home_dir()?;
-    let db_path_str = section.db_path.trim();
-    if db_path_str.is_empty() {
-        anyhow::bail!(
-            "{}: invalid `openalex` section: `db_path` is empty",
-            file.path().display()
-        );
-    }
-    let db_path = if let Some(rest) = db_path_str.strip_prefix("~/") {
-        home.join(rest)
-    } else {
-        std::path::PathBuf::from(db_path_str)
-    };
-    if !db_path.exists() {
-        tracing::warn!(
-            "openalex db not found at {} — run `hs openalex load <entity>` first; \
-             openalex_* tools are not offered",
-            db_path.display()
-        );
-        return Ok(None);
-    }
-    let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
-    let conn = match duckdb::Connection::open_with_flags(&db_path, cfg) {
-        Ok(conn) => conn,
-        // The database is configured and present but cannot be opened: most
-        // often `hs openalex load` holds the write lock. Not a config error,
-        // so the server still starts, without the openalex_* tools.
-        Err(e) => {
-            tracing::warn!(
-                "openalex db at {} cannot be opened: {e}; openalex_* tools are not offered",
-                db_path.display()
-            );
-            return Ok(None);
-        }
-    };
-    // Cap query memory so a single bad FTS call can't OOM-kill the entire
-    // mcp process and trigger a systemd restart loop. `match_bm25` on
-    // multi-term queries with common terms builds an ~11M-row intermediate
-    // CTE; under the default unlimited budget DuckDB tries to materialize
-    // it and the kernel OOM-killer fires. With a cap, DuckDB plans
-    // conservatively and either completes or raises a recoverable
-    // "Out of Memory" that surfaces cleanly to the MCP client.
-    conn.execute_batch("SET memory_limit='4GB';")?;
-    Ok(Some(conn))
-}
-
-/// Probe whether the OpenAlex corpus has finished its end-to-end build
-/// (load, indexes, FTS). The signal is a single row in `_corpus_state`
-/// keyed `openalex_works`, written by `OpenAlexDb::build_fts` only after
-/// the FTS index is persisted. Returns `false` if the table doesn't exist
-/// (older DB from before the gate landed) or has no row — both mean
-/// "not ready, don't expose the openalex_* tools yet."
-fn is_openalex_corpus_ready(conn: &duckdb::Connection) -> bool {
-    let result: Result<i64, _> = conn.query_row(
-        "SELECT COUNT(*) FROM _corpus_state WHERE component = 'openalex_works'",
-        [],
-        |row| row.get(0),
-    );
-    match result {
-        Ok(n) => n > 0,
-        // A missing table is the expected "older DB" answer; say so rather
-        // than hiding whichever error this really was.
-        Err(e) => {
-            tracing::warn!("openalex readiness probe failed: {e}");
-            false
-        }
-    }
-}
-
-/// Split a service answer into the value and the reason it is missing, so a
-/// status tool reports why a service is down instead of a bare `null`.
-fn split_result<T, E: std::fmt::Display>(r: Result<T, E>) -> (Option<T>, Option<String>) {
-    match r {
-        Ok(v) => (Some(v), None),
-        Err(e) => (None, Some(format!("{e:#}"))),
-    }
-}
-
-/// `"health: <why>; readiness: <why>"` for the calls that failed; `None`
-/// when none did. Carried into the system snapshot so an unhealthy instance
-/// says why.
-fn join_call_errors(calls: &[(&str, &Option<String>)]) -> Option<String> {
-    let parts: Vec<String> = calls
-        .iter()
-        .filter_map(|(name, err)| err.as_ref().map(|e| format!("{name}: {e}")))
-        .collect();
-    (!parts.is_empty()).then(|| parts.join("; "))
-}
-
-/// Why a scribe tier is refusing work, in one line.
-///
-/// "backend unavailable" is a symptom: it is what a crashed server, a
-/// missing model, a wrong URL and a broken converter all look like.
-/// The tier's admission gate is a *measurement*, and the measurement is
-/// already in the health payload — the free VRAM, the headroom it
-/// wants, and who is holding the card. This turns the symptom into a
-/// diagnosis, and a diagnosis into an action.
-fn backend_unavailable_reason(health: Option<&hs_scribe::client::HealthResponse>) -> String {
-    let Some(h) = health else {
-        return "backend unavailable".to_string();
-    };
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(holder) = h.backend_yielding_to.as_deref() {
-        parts.push(format!("GPU yielded to {holder}"));
-    }
-    if h.backend_reachable == Some(false) {
-        parts.push("the VLM backend is unreachable".to_string());
-    }
-    if let Some(free) = h.backend_vram_free_mb {
-        match h.backend_vram_headroom_mb {
-            Some(headroom) if free < headroom => parts.push(format!(
-                "{:.1} GiB free, needs {:.1} GiB",
-                free as f64 / 1024.0,
-                headroom as f64 / 1024.0
-            )),
-            Some(headroom) => parts.push(format!(
-                "{:.1} GiB free, {:.1} GiB needed",
-                free as f64 / 1024.0,
-                headroom as f64 / 1024.0
-            )),
-            None => parts.push(format!("{:.1} GiB free", free as f64 / 1024.0)),
-        }
-    }
-    if let Some(holders) = h.backend_vram_holders.as_deref() {
-        let card = holders_summary(holders);
-        if !card.is_empty() {
-            parts.push(format!("card held by {card}"));
-        }
-    }
-    if parts.is_empty() {
-        "backend unavailable".to_string()
-    } else {
-        // "·" separates clauses: the diagnosis is read, not parsed.
-        format!("backend unavailable: {}", parts.join(" · "))
-    }
-}
-
-/// Who is on the card, folded into something a person can read.
-///
-/// The health payload carries one `pid=… NNNMB name` entry per process,
-/// which is `nvidia-smi`'s shape, not a sentence. Three problems with
-/// printing it verbatim in a status row: the pid answers no question an
-/// operator of *this* tool has (the action is "wait for the tenant to
-/// idle", not "kill 220903"), MB is the only MB among GiB neighbours, and
-/// the length is what forces the row to wrap mid-token.
-///
-/// So: same process name folds into one entry, sizes report in GiB, pids
-/// drop. Two `llama-server`s are two processes but one tenant — summing
-/// them is the honest answer to "how much of my card is llama-server".
-fn holders_summary(holders: &str) -> String {
-    // Largest first, so the tenant that actually took the card leads.
-    let mut by_name: Vec<(String, u64)> = Vec::new();
-    for entry in holders.split(';') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        // `pid=<n> <mb>MB <name>` — keep the name and the size, skip the pid.
-        // An entry with no size is not a holder report (a truncated or
-        // garbled string), so it is dropped rather than printed raw.
-        let mut mb: Option<u64> = None;
-        let mut name = String::new();
-        for token in entry.split_whitespace() {
-            if token.starts_with("pid=") {
-                continue;
-            }
-            if let Some(size) = token.strip_suffix("MB").and_then(|n| n.parse::<u64>().ok()) {
-                mb = Some(size);
-                continue;
-            }
-            if name.is_empty() {
-                name = token.to_string();
-            }
-        }
-        let (Some(mb), false) = (mb, name.is_empty()) else {
-            continue;
-        };
-        match by_name.iter_mut().find(|(existing, _)| *existing == name) {
-            Some((_, total)) => *total += mb,
-            None => by_name.push((name, mb)),
-        }
-    }
-    by_name.sort_by_key(|(_, mb)| std::cmp::Reverse(*mb));
-    by_name
-        .iter()
-        .map(|(name, mb)| format!("{name} {:.1} GiB", *mb as f64 / 1024.0))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// A private read-only handle for one request. The shared connection is
-/// locked only long enough to clone it, so a slow query (a BM25 search) never
-/// blocks the others; a poisoned lock or a failed clone is an error that
-/// names its cause.
-fn openalex_request_conn(
-    shared: &std::sync::Mutex<duckdb::Connection>,
-) -> Result<duckdb::Connection, String> {
-    let guard = shared
-        .lock()
-        .map_err(|_| "the openalex DB handle is poisoned by an earlier panic".to_string())?;
-    guard
-        .try_clone()
-        .map_err(|e| format!("opening a request handle on the openalex DB failed: {e}"))
-}
-
-/// Run an OpenAlex SQL query inside spawn_blocking, return rows serialized as
-/// a JSON array (pretty-printed). Single entry point for all 4 simple
-/// SELECT-driven openalex_* tools.
-async fn run_openalex_query_json(
-    server: &HomeStillMcp,
-    sql: &str,
-    params: Vec<duckdb::types::Value>,
-) -> Result<String, String> {
-    let shared = server
-        .openalex_db
-        .as_ref()
-        .ok_or_else(openalex_unavailable_error)?;
-    let conn = openalex_request_conn(shared)?;
-    let sql = sql.to_string();
-    tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let rows_json = collect_rows_json(&conn, &sql, duckdb::params_from_iter(params.iter()))?;
-        to_json(&rows_json)
-    })
-    .await
-    .map_err(|e| format!("join: {e}"))?
-}
-
-/// Build a `duckdb::types::Value` from a typed Option, mapping None → Null.
-/// Used by tool handlers to construct the params Vec inline.
-fn opt_value<T: Into<duckdb::types::Value>>(v: Option<T>) -> duckdb::types::Value {
-    v.map(Into::into).unwrap_or(duckdb::types::Value::Null)
-}
-
-/// Run a query and return the result rows as a Vec<serde_json::Value>.
-fn collect_rows_json(
-    conn: &duckdb::Connection,
-    sql: &str,
-    params: impl duckdb::Params,
-) -> Result<Vec<serde_json::Value>, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
-    let mut rows = stmt.query(params).map_err(|e| format!("query: {e}"))?;
-    let cols: Vec<String> = rows
-        .as_ref()
-        .map(|s| s.column_names().into_iter().collect())
-        .unwrap_or_default();
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| format!("next: {e}"))? {
-        out.push(row_to_json(row, &cols)?);
-    }
-    Ok(out)
-}
-
-fn row_to_json(row: &duckdb::Row, cols: &[String]) -> Result<serde_json::Value, String> {
-    let mut m = serde_json::Map::with_capacity(cols.len());
-    for (i, name) in cols.iter().enumerate() {
-        let v: duckdb::types::Value = row.get(i).map_err(|e| format!("col {i}: {e}"))?;
-        m.insert(name.clone(), duckdb_value_to_json(v));
-    }
-    Ok(serde_json::Value::Object(m))
-}
-
-fn duckdb_value_to_json(v: duckdb::types::Value) -> serde_json::Value {
-    use duckdb::types::Value as V;
-    use serde_json::Value as J;
-    match v {
-        V::Null => J::Null,
-        V::Boolean(b) => J::Bool(b),
-        V::TinyInt(n) => J::from(n),
-        V::SmallInt(n) => J::from(n),
-        V::Int(n) => J::from(n),
-        V::BigInt(n) => J::from(n),
-        V::HugeInt(n) => J::from(n.to_string()),
-        V::UTinyInt(n) => J::from(n),
-        V::USmallInt(n) => J::from(n),
-        V::UInt(n) => J::from(n),
-        V::UBigInt(n) => J::from(n),
-        V::Float(f) => serde_json::Number::from_f64(f as f64)
-            .map(J::Number)
-            .unwrap_or(J::Null),
-        V::Double(f) => serde_json::Number::from_f64(f)
-            .map(J::Number)
-            .unwrap_or(J::Null),
-        V::Text(s) => J::String(s),
-        V::Blob(b) => J::String(format!("<{} bytes>", b.len())),
-        other => J::String(format!("{:?}", other)),
-    }
-}
-
 // ── MCP Server ──────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct HomeStillMcp {
     // Primary read-path handle: Storage trait (local fs or Garage/S3).
     storage: Arc<dyn Storage>,
-    // Event bus for cross-service notifications (scribe.completed,
-    // papers.ingested, …). Required: `HomeStillMcp::new` fails if the config
-    // has no usable `events:` section or the broker is unreachable.
+    // Event bus for cross-service notifications (`papers.ingested`).
+    // Required: `HomeStillMcp::new` fails if the config has no usable
+    // `events:` section.
     events: Arc<dyn EventBus>,
-    catalog_prefix: String,
-    markdown_prefix: String,
-    papers_prefix: String,
+    /// Where the `academic` store keeps its objects: what `acquire` writes
+    /// to and the dashboard snapshot counts.
+    academic: hs_common::stores::DocumentLayout,
+    /// The scribe servers `status` asks for their readiness.
     scribe_servers: Vec<String>,
-    scribe_convert_timeout: std::time::Duration,
-    scribe_timeout_policy: hs_scribe::config::TimeoutPolicy,
-    epub_limits: hs_scribe::epub::EpubLimits,
     /// Every paper provider, with its rate limiters and circuit breakers,
     /// built once so all requests share them.
     providers: Arc<paper::providers::set::ProviderSet>,
     /// The downloader over the shared providers, storage and event bus.
     downloader: Arc<paper::providers::downloader::PaperDownloader>,
+    /// The distill servers `status` asks what the index holds.
     distill_servers: Vec<String>,
-    /// Read-only handle to the local OpenAlex DuckDB (when `openalex:` section
-    /// is present in config and the file exists). `None` when the section is
-    /// absent — `openalex_*` tools then return a configuration error.
-    openalex_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
+    /// The local OpenAlex corpus, or why it cannot be read.
+    openalex: openalex::OpenAlexCorpus,
     /// Mints the signed, expiring links that let a user open what an
     /// agent found.
     link_minter: Option<Arc<crate::links::LinkMinter>>,
@@ -815,39 +72,17 @@ struct Deps {
     storage: Arc<dyn Storage>,
     events: Arc<dyn EventBus>,
     scribe_servers: Vec<String>,
-    scribe_convert_timeout: std::time::Duration,
-    scribe_timeout_policy: hs_scribe::config::TimeoutPolicy,
-    epub_limits: hs_scribe::epub::EpubLimits,
     paper_config: paper::config::Config,
     distill_servers: Vec<String>,
-    openalex_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
+    openalex: openalex::OpenAlexCorpus,
     link_minter: Option<Arc<crate::links::LinkMinter>>,
     stores: hs_common::stores::Stores,
-}
-
-/// See [`HomeStillMcp::probe_markdown`].
-struct MarkdownProbe {
-    key: String,
-    present: bool,
-    catalog: Option<hs_common::catalog::CatalogEntry>,
 }
 
 /// Serialize a tool result. A serialization failure is a tool error, never
 /// an empty "success".
 fn to_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, String> {
     serde_json::to_string_pretty(value).map_err(|e| format!("serializing the result failed: {e}"))
-}
-
-/// A catalog row, with the links a caller can open.
-///
-/// The row's own `pdf_path` is a storage key on this host. The links
-/// are what a caller can actually open.
-#[derive(serde::Serialize)]
-struct CatalogEntryWithLinks {
-    #[serde(flatten)]
-    entry: hs_common::catalog::CatalogEntry,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    links: Option<crate::links::DocumentLinks>,
 }
 
 /// Sends `notifications/progress` about every 20 s while it is alive, so a
@@ -930,14 +165,14 @@ impl HomeStillMcp {
             .await
             .map_err(|e| anyhow::anyhow!("storage ensure_ready failed: {e:#}"))?;
 
-        // Event bus: `paper_download` and `scribe_convert` publish
-        // `papers.ingested` / `scribe.completed`, so this server cannot run
+        // Event bus: `acquire`, `capture` and `synthesis_save` announce what
+        // they store on `papers.ingested`, so this server cannot run
         // without a valid `events:` section: a missing section, an invalid
         // key, an unset auth variable or a build without NATS stops the
         // start, and a bus that silently drops every publish is never
         // substituted. The broker connection itself is made on first
-        // publish: only those two tools need it, and a broker outage must
-        // not take the dozen read-only tools (and a restart loop) with it.
+        // use: only those tools and `status` need it, and a broker outage
+        // must not take the read-only tools (and a restart loop) with it.
         let events: Arc<dyn EventBus> =
             hs_common::event_bus::EventBusConfig::build_lazy(scribe_cfg.events.as_ref())
                 .await
@@ -948,25 +183,22 @@ impl HomeStillMcp {
         // Config is the sole source of server URLs. To route through the
         // gateway, set the gateway URL explicitly in config (e.g.
         // `servers: [https://gateway.example/gateway/scribe]`).
-        // hs-mcp only needs URLs (health fanout + ScribeClient::new). The
-        // per-server backend metadata in `ScribeServerEntry` is consumed
-        // by the scribe-chain dispatcher in `cmd_watch_events`, not here.
-        // No server configured is a valid state for the server as a whole
-        // (paper search needs none); the tools that need one say so.
+        // hs-mcp only needs the URLs: `status` asks each server how it is.
+        // No server configured is a valid state for the server as a whole;
+        // `status` says so in the part of its answer that needed one.
         let scribe_servers: Vec<String> =
             scribe_cfg.servers.iter().map(|e| e.url.clone()).collect();
         let distill_servers = distill_cfg.servers.clone();
 
-        // Local OpenAlex DuckDB. No `openalex:` section or a database file
-        // that is not there yet = `None` (tools hidden; `hs openalex` owns
-        // the DB lifecycle); a malformed `openalex:` section stops the start.
-        let openalex_db =
-            open_openalex_readonly(&file)?.map(|conn| Arc::new(std::sync::Mutex::new(conn)));
+        // Local OpenAlex corpus. Not configured, not built or not openable
+        // are states `discover` and `graph` report when asked for it; a
+        // malformed `openalex:` section stops the start.
+        let openalex = openalex::OpenAlexCorpus::open(&file)?;
 
         let paper_config = paper::config::Config::load()
             .map_err(|e| anyhow::anyhow!("paper config invalid: {e:#}"))?;
 
-        let link_minter = Arc::new(crate::links::LinkMinter::from_config(&file));
+        let link_minter = Arc::new(crate::links::LinkMinter::from_config(&file)?);
         if link_minter.is_enabled() {
             tracing::info!("document links are enabled");
         } else {
@@ -982,11 +214,8 @@ impl HomeStillMcp {
             storage,
             events,
             scribe_servers,
-            scribe_convert_timeout: std::time::Duration::from_secs(scribe_cfg.convert_timeout_secs),
-            scribe_timeout_policy: scribe_cfg.timeout_policy.clone(),
-            epub_limits: scribe_cfg.epub.clone(),
             distill_servers,
-            openalex_db,
+            openalex,
             paper_config,
             link_minter: Some(link_minter),
             stores: hs_common::stores::Stores::from_config(&file.load_system()?, &file)?,
@@ -998,12 +227,9 @@ impl HomeStillMcp {
             storage,
             events,
             scribe_servers,
-            scribe_convert_timeout,
-            scribe_timeout_policy,
-            epub_limits,
             paper_config,
             distill_servers,
-            openalex_db,
+            openalex,
             link_minter,
             stores,
         } = deps;
@@ -1012,11 +238,7 @@ impl HomeStillMcp {
         let (_, academic) = stores
             .documents(hs_common::stores::ACADEMIC)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (catalog_prefix, markdown_prefix, papers_prefix) = (
-            academic.catalog_prefix.clone(),
-            academic.markdown_prefix.clone(),
-            academic.source_prefix.clone(),
-        );
+        let academic = academic.clone();
 
         // One provider set for the life of the process: every request goes
         // through the same rate limiters and circuit breakers, and a bad
@@ -1035,186 +257,36 @@ impl HomeStillMcp {
             .map_err(|e| anyhow::anyhow!("paper downloader: {e:#}"))?,
         );
 
-        // Gate: check the readiness sentinel BEFORE building the tool
-        // router. If the openalex corpus isn't fully loaded + indexed + FTS'd,
-        // strip the 5 `openalex_*` tools from the router so they don't show
-        // up in tools/list — preventing downstream agents from calling them
-        // and getting empty/partial results during a migration window. The
-        // gate evaluates once at server startup; Phase 6 of the migration
-        // restarts hs-serve-mcp, which re-evaluates against the now-set
-        // sentinel and re-exposes the tools.
-        let openalex_corpus_ready = match openalex_db.as_ref() {
-            Some(shared) => {
-                let conn = openalex_request_conn(shared).map_err(|e| anyhow::anyhow!(e))?;
-                is_openalex_corpus_ready(&conn)
-            }
-            None => false,
-        };
-
-        let mut tool_router = Self::tool_router();
-        if !openalex_corpus_ready {
-            for name in [
-                "openalex_search",
-                "openalex_get",
-                "openalex_references",
-                "openalex_citations",
-                "openalex_authors_by_topic",
-            ] {
-                tool_router.remove_route(name);
-            }
-            tracing::info!(
-                "openalex corpus not ready (no _corpus_state sentinel); 5 openalex_* tools hidden \
-                 from tools/list — restart hs-serve-mcp after `hs openalex build-fts` to expose them"
-            );
-        } else {
-            tracing::info!("openalex corpus ready; openalex_* tools enabled");
-        }
-
         Ok(Self {
             short_links: hs_common::docs::ShortLinks::new(storage.clone()),
             storage,
             events,
-            catalog_prefix,
-            markdown_prefix,
-            papers_prefix,
+            academic,
             scribe_servers,
-            scribe_convert_timeout,
-            scribe_timeout_policy,
-            epub_limits,
             providers,
             downloader,
             distill_servers,
-            openalex_db,
+            openalex,
             link_minter,
             stores,
-            tool_router,
+            tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         })
     }
 
-    fn scribe_client(&self) -> anyhow::Result<Option<hs_scribe::client::ScribeClient>> {
-        match self.scribe_servers.first() {
-            Some(url) => Ok(Some(hs_scribe::client::ScribeClient::new_with_timeout(
-                url,
-                self.scribe_convert_timeout,
-            )?)),
-            None => Ok(None),
-        }
-    }
-
-    fn distill_client(&self) -> anyhow::Result<Option<hs_distill::client::DistillClient>> {
-        match self.distill_servers.first() {
-            Some(url) => Ok(Some(hs_distill::client::DistillClient::new(url)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// What storage says about a document's markdown: the key the object
-    /// lives (or would live) at, whether it is there, and the catalog row
-    /// read on the way. Every storage error is returned; "absent" only ever
-    /// means the backend answered "not found".
-    async fn probe_markdown(&self, stem: &str) -> Result<MarkdownProbe, String> {
-        // The catalog row first: its `markdown_path` is the exact key scribe
-        // wrote, which re-deriving via `sharded_key` can miss (stems with
-        // apostrophes or percent-encoded bytes, pre-rc.241 unsharded rows).
-        let catalog =
-            hs_common::catalog::read_catalog_entry_via(&*self.storage, &self.catalog_prefix, stem)
-                .await
-                .map_err(|e| format!("catalog read for '{stem}' failed: {e:#}"))?;
-        let key = hs_common::markdown::resolve_markdown_key_verified(
-            &*self.storage,
-            &self.markdown_prefix,
-            stem,
-            catalog.as_ref().and_then(|e| e.markdown_path.as_deref()),
-        )
-        .await
-        .map_err(|e| format!("resolving the markdown key for '{stem}' failed: {e:#}"))?;
-        let present = self
-            .storage
-            .exists(&key)
-            .await
-            .map_err(|e| format!("checking markdown '{key}' for '{stem}' failed: {e:#}"))?;
-        Ok(MarkdownProbe {
-            key,
-            present,
-            catalog,
-        })
-    }
-
-    /// [`Self::probe_markdown`] for callers that need the document: absent
-    /// markdown is an error.
-    async fn existing_markdown(
-        &self,
-        stem: &str,
-    ) -> Result<(String, Option<hs_common::catalog::CatalogEntry>), String> {
-        let probe = self.probe_markdown(stem).await?;
-        if !probe.present {
-            return Err(format!(
-                "Markdown not found for '{stem}' at storage key '{}'. Convert the PDF first.",
-                probe.key
-            ));
-        }
-        Ok((probe.key, probe.catalog))
-    }
-
-    /// Stamp the catalog with the outcome of an index call (`embedding` on
-    /// chunks, `embedding_skip` on zero), so the catalog tells "indexed" from
-    /// "tried and skipped" from "never tried". The vectors are already in
-    /// Qdrant when this runs; a failed stamp is an error so the caller knows
-    /// the row is stale (the index call is idempotent, so a retry repairs it).
-    async fn stamp_embedding(
-        &self,
-        stem: &str,
-        result: &hs_distill::client::IndexResult,
-    ) -> Result<(), String> {
-        hs_common::catalog::record_embedding_outcome_via(
-            &*self.storage,
-            &self.catalog_prefix,
-            stem,
-            self.distill_servers
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or(""),
-            result.chunks_indexed,
-            &result.embedding_device,
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "'{stem}' was indexed ({} chunks) but the catalog embedding stamp failed: {e:#}",
-                result.chunks_indexed
-            )
-        })
-    }
-
-    /// The stored source for `stem`: the PDF if there is one, else HTML, else
-    /// EPUB. A missing object moves on to the next type; any other storage
-    /// error is returned — "storage is down" must never read as "no PDF" and
-    /// send the stem down another converter.
-    async fn find_source_key(&self, stem: &str) -> Result<String, String> {
-        let mut tried = Vec::new();
-        for ext in ["pdf", "html", "epub"] {
-            let key = format!(
-                "{}/{}",
-                self.papers_prefix.trim_end_matches('/'),
-                hs_common::sharded_key(stem, ext),
-            );
-            match self.storage.head(&key).await {
-                Ok(Some(_)) => return Ok(key),
-                Ok(None) => tried.push(key),
-                Err(e) if hs_common::storage::is_not_found(&e) => tried.push(key),
-                Err(e) => return Err(format!("checking for source {key} failed: {e:#}")),
-            }
-        }
-        Err(format!(
-            "No PDF, HTML, or EPUB found for '{stem}' (tried {})",
-            tried.join(", ")
-        ))
+    /// A client for the distill server this host is configured to ask, or
+    /// why there is none.
+    fn distill_client(&self) -> Result<hs_distill::client::DistillClient, String> {
+        let url = self.distill_servers.first().ok_or(
+            "no distill server is configured: set `distill.servers` in \
+             ~/.home-still/config.yaml",
+        )?;
+        hs_distill::client::DistillClient::new(url).map_err(|e| format!("{e:#}"))
     }
 
     /// A tool that announces its result on the event bus checks, before it
-    /// does any work, that the bus can be reached: a download or conversion
-    /// whose announcement nobody receives is worse than a refusal.
+    /// does any work, that the bus can be reached: a document whose
+    /// announcement nobody receives is worse than a refusal.
     async fn require_event_bus(&self, tool: &str) -> Result<(), String> {
         self.events.ensure_ready().await.map_err(|e| {
             format!(
@@ -1223,608 +295,16 @@ impl HomeStillMcp {
             )
         })
     }
-
-    /// Convert the stored source of `stem` through the scribe watcher's own
-    /// functions (`prepare_source` + `convert_and_upload`).
-    async fn convert_source(&self, stem: &Stem) -> Result<String, String> {
-        use hs_scribe::event_watch::{
-            announce_already_converted, convert_and_upload, prepare_source, IngestedEvent,
-            SourcePrep,
-        };
-
-        self.require_event_bus("scribe_convert").await?;
-
-        let source_key = self.find_source_key(stem).await?;
-        let event = IngestedEvent {
-            key: source_key.clone(),
-            sha256: None,
-            size_bytes: None,
-            source: Some("mcp:scribe_convert".to_string()),
-        };
-
-        let source = match prepare_source(&*self.storage, &event)
-            .await
-            .map_err(|e| format!("{source_key}: {e}"))?
-        {
-            SourcePrep::AlreadyConverted(md_key) => {
-                announce_already_converted(
-                    &*self.events,
-                    &*self.storage,
-                    &self.stores,
-                    &md_key,
-                    &source_key,
-                )
-                .await
-                .map_err(|e| format!("{md_key} exists but announcing it failed: {e}"))?;
-                return to_json(&serde_json::json!({
-                    "stem": stem,
-                    "markdown_key": md_key,
-                    "source_key": source_key,
-                    "already_converted": true,
-                }));
-            }
-            SourcePrep::Fetched(source) => source,
-        };
-
-        let client = self
-            .scribe_client()
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or("No scribe server configured")?;
-
-        let md_key = convert_and_upload(
-            &*self.storage,
-            &client,
-            &*self.events,
-            &event,
-            &self.scribe_timeout_policy,
-            &self.epub_limits,
-            &source,
-            None,
-            Vec::new(),
-        )
-        .await
-        .map_err(|e| format!("Conversion of {source_key} failed: {e}"))?;
-
-        // `convert_and_upload` completes the event even when the conversion
-        // stamp could not be written (it cannot be retried through the event).
-        // This caller can say so, instead of reporting a document the
-        // catalog does not know about.
-        let conversion =
-            hs_common::catalog::read_catalog_entry_via(&*self.storage, &self.catalog_prefix, stem)
-                .await
-                .map_err(|e| {
-                    format!("{md_key} was written but reading its catalog row failed: {e:#}")
-                })?
-                .and_then(|entry| entry.conversion)
-                .ok_or_else(|| {
-                    format!(
-                "{md_key} was written but the catalog has no conversion stamp for '{stem}'; \
-                 run `catalog_repair` to see it as disk_no_catalog"
-            )
-                })?;
-
-        to_json(&serde_json::json!({
-            "stem": stem,
-            "markdown_key": md_key,
-            "source_key": source_key,
-            "already_converted": false,
-            "total_pages": conversion.total_pages,
-            "duration_secs": conversion.duration_secs,
-            "server": conversion.server,
-        }))
-    }
 }
+
+// ── Tools ───────────────────────────────────────────────────────
+//
+// Ten tools. Each one's arguments and logic are in its own file under
+// `tools/`; this is the one place that names and describes them. Search is
+// not here: it is the `myelin` server's `recall`.
 
 #[tool_router]
 impl HomeStillMcp {
-    // ── Paper Tools ────────────────────────────────────────────
-
-    #[tool(
-        description = "Search academic papers across arXiv, OpenAlex, Semantic Scholar, Europe PMC, CrossRef and (with an API key) CORE. Returns a JSON object {\"papers\": [...], \"provider_failures\": [...]}: papers with title, authors, abstract, DOI, citations; provider_failures names each provider that failed (empty when all answered). If every provider fails the call is an error.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn paper_search(
-        &self,
-        Parameters(p): Parameters<PaperSearchParams>,
-    ) -> Result<String, String> {
-        let provider_arg = resolve_provider_arg(p.provider.as_deref())?;
-        let provider = self.providers.provider(&provider_arg);
-
-        let search_type = match p.search_type.as_deref() {
-            None | Some("keywords") => paper::models::SearchType::Keywords,
-            Some("title") => paper::models::SearchType::Title,
-            Some("author") => paper::models::SearchType::Author,
-            Some("doi") => paper::models::SearchType::DOI,
-            Some("subject") => paper::models::SearchType::Subject,
-            Some(other) => {
-                return Err(format!(
-                    "Unknown search_type {other:?}. Accepted: keywords, title, author, doi, subject."
-                ));
-            }
-        };
-
-        // A date filter that does not parse is an error: dropping it would
-        // answer a different question than the one asked.
-        let date_filter = p
-            .date
-            .as_deref()
-            .map(|d| {
-                paper::models::DateFilter::parse(d)
-                    .map_err(|e| format!("invalid date filter {d:?}: {e}"))
-            })
-            .transpose()?;
-
-        let sort_by = match p.sort.as_deref() {
-            None | Some("relevance") => paper::models::SortBy::Relevance,
-            Some("citations") => paper::models::SortBy::Citations,
-            Some("date") => paper::models::SortBy::Date,
-            Some(other) => {
-                return Err(format!(
-                    "Unknown sort {other:?}. Accepted: relevance, citations, date."
-                ));
-            }
-        };
-
-        let query = paper::models::SearchQuery {
-            query: p.query,
-            search_type,
-            max_results: p.max_results.unwrap_or(10) as usize,
-            offset: p.offset.unwrap_or(0),
-            date_filter,
-            sort_by,
-            min_citations: p.min_citations.map(u64::from),
-        };
-
-        // One shape, always: `papers` plus the providers that failed (empty
-        // when every provider answered). A search where every provider
-        // failed is an error, so a partial result is never mistaken for a
-        // complete one.
-        let result = provider
-            .search_by_query(&query)
-            .await
-            .map_err(|e| format!("Search failed: {e}"))?;
-        to_json(&serde_json::json!({
-            "papers": result.papers,
-            "provider_failures": result.provider_failures,
-        }))
-    }
-
-    #[tool(
-        description = "Look up a single paper by DOI. Returns JSON with full metadata.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn paper_get(&self, Parameters(p): Parameters<PaperGetParams>) -> Result<String, String> {
-        let paper = self
-            .providers
-            .provider(&paper::cli::ProviderArg::All)
-            .get_by_doi(&p.doi)
-            .await
-            .map_err(|e| format!("Lookup failed: {e}"))?
-            .ok_or_else(|| format!("No paper found for DOI: {}", p.doi))?;
-        to_json(&paper)
-    }
-
-    #[tool(
-        description = "Return the structured reference list of a paper by DOI. Returns JSON with each reference's DOI, title, year, authors, venue, and citation count. Source: Semantic Scholar Graph API.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn paper_references(
-        &self,
-        Parameters(p): Parameters<PaperReferencesParams>,
-    ) -> Result<String, String> {
-        let resp = self
-            .providers
-            .references(&p.doi)
-            .await
-            .map_err(|e| format!("References lookup failed: {e}"))?;
-        to_json(&resp)
-    }
-
-    #[tool(
-        description = "Return the list of papers that cite a given paper by DOI (forward citation chaining). Supports limit (default 100, max 1000) and optional year_from / sort filters. Returns JSON with each citing paper's DOI, title, year, authors, venue, and citation count. Source: Semantic Scholar Graph API.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn paper_citations(
-        &self,
-        Parameters(p): Parameters<PaperCitationsParams>,
-    ) -> Result<String, String> {
-        if let Some(sort) = p.sort.as_deref() {
-            if !matches!(sort, "year" | "citations") {
-                return Err(format!("Unknown sort {sort:?}. Accepted: year, citations."));
-            }
-        }
-        let opts = paper::providers::semantic_scholar::CitationsOpts {
-            limit: p.limit,
-            year_from: p.year_from,
-            sort: p.sort,
-        };
-
-        let resp = self
-            .providers
-            .citations(&p.doi, opts)
-            .await
-            .map_err(|e| format!("Citations lookup failed: {e}"))?;
-        to_json(&resp)
-    }
-
-    #[tool(
-        description = "Download a paper PDF by DOI into the papers directory. Tries arXiv, MDPI and the shared provider resolvers (Semantic Scholar, Europe PMC, CORE with a key, OpenAlex, CrossRef). Creates a catalog entry with metadata; fails if the provider lookup or the catalog write fails (the PDF stays stored and a retry repairs the row). Returns JSON with file path, size, and sha256.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn paper_download(
-        &self,
-        Parameters(p): Parameters<PaperDownloadParams>,
-    ) -> Result<String, String> {
-        use paper::ports::download_service::DownloadService;
-
-        let doi = paper::stem::normalize_doi(&p.doi).map_err(|e| format!("invalid DOI: {e}"))?;
-        let stem = paper::stem::doi_stem(&doi).map_err(|e| format!("invalid DOI: {e}"))?;
-        self.require_event_bus("paper_download").await?;
-
-        let result = self
-            .downloader
-            .download_by_doi(&doi)
-            .await
-            .map_err(|e| format!("Download failed: {e}"))?;
-
-        // A PDF that was already stored is only "done" when its catalog row
-        // exists too: a retry after a failed catalog write must repair the
-        // row, not report success over a missing one.
-        if result.skipped {
-            let has_row = hs_common::catalog::read_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &stem,
-            )
-            .await
-            .map_err(|e| format!("reading the catalog row for '{stem}' failed: {e:#}"))?
-            .is_some();
-            if has_row {
-                return to_json(&serde_json::json!({
-                    "doi": doi,
-                    "skipped": true,
-                    "path": result.file_path.display().to_string(),
-                    "message": "File already exists",
-                }));
-            }
-        }
-
-        // A provider that errors is an error, not "no metadata": the PDF is
-        // stored, but the row must not be written as if nothing was known.
-        let paper_meta = self
-            .providers
-            .provider(&paper::cli::ProviderArg::All)
-            .get_by_doi(&doi)
-            .await
-            .map_err(|e| {
-                format!(
-                    "{doi} is stored at {} but looking up its metadata failed, so no catalog \
-                     row was written (run paper_download again once providers answer): {e}",
-                    result.file_path.display()
-                )
-            })?;
-
-        let entry = hs_common::catalog::CatalogEntry {
-            title: paper_meta.as_ref().map(|p| p.title.clone()),
-            authors: paper_meta
-                .as_ref()
-                .map(|p| {
-                    p.authors
-                        .iter()
-                        .map(|a| hs_common::catalog::AuthorEntry {
-                            name: a.name.clone(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            doi: Some(doi.clone()),
-            publication_date: paper_meta
-                .as_ref()
-                .and_then(|p| p.publication_date.map(|d| d.to_string())),
-            abstract_text: paper_meta.as_ref().and_then(|p| p.abstract_text.clone()),
-            cited_by_count: paper_meta.as_ref().and_then(|p| p.cited_by_count),
-            source: paper_meta.as_ref().map(|p| p.source.clone()),
-            download_urls: paper_meta
-                .as_ref()
-                .map(|p| p.download_urls.clone())
-                .unwrap_or_default(),
-            source_url: None,
-            pdf_path: Some(result.file_path.display().to_string()),
-            markdown_path: None,
-            downloaded_at: Some(chrono::Utc::now().to_rfc3339()),
-            file_size_bytes: Some(result.size_bytes),
-            sha256: Some(result.sha256.clone()),
-            conversion: None,
-            conversion_failed: None,
-            embedding: None,
-            embedding_skip: None,
-            abstract_embed: None,
-            repair: None,
-            category: None,
-            original_format: None,
-        };
-        hs_common::catalog::write_catalog_entry_via(
-            &*self.storage,
-            &self.catalog_prefix,
-            &stem,
-            &entry,
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "{doi} is stored at {} but writing its catalog row failed (run paper_download \
-                 again to retry): {e:#}",
-                result.file_path.display()
-            )
-        })?;
-
-        to_json(&serde_json::json!({
-            "doi": doi,
-            "path": result.file_path.display().to_string(),
-            "size_bytes": result.size_bytes,
-            "sha256": result.sha256,
-        }))
-    }
-
-    // ── Catalog Tools ──────────────────────────────────────────
-
-    #[tool(
-        description = "List all papers in the catalog with titles, conversion status, and embedded-in-Qdrant status. Returns JSON array. Supports pagination via limit/offset and filtering via `embedded=true|false` (omit for all). Use `embedded=false` to find papers stuck between convert and embed. Flag semantics: `converted` is true iff markdown exists. `conversion_failed` is null, or `{reason, kind}` when the conversion was given up on: `kind` is `retryable` (a backend failed on the document; `hs pipeline reconvert-failed` re-queues it), `bad_source` (the source can never convert) or `unclassified`. `embedded` is true only when Qdrant actually received chunks (`chunks_indexed > 0`).",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn catalog_list(&self, Parameters(p): Parameters<ListParams>) -> Result<String, String> {
-        let mut triples = hs_common::catalog::list_catalog_entries_parallel(
-            &*self.storage,
-            &self.catalog_prefix,
-            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
-            |_, _| {},
-        )
-        .await
-        .map_err(|e| format!("catalog list failed: {e:#}"))?;
-        // Stable ordering by stem for deterministic pagination.
-        triples.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Apply embedded filter before pagination so counts make sense. An entry
-        // only counts as "embedded" if Qdrant actually got chunks — mirrors the
-        // chunks_indexed > 0 predicate used by catalog_recent.
-        if let Some(want) = p.embedded {
-            triples.retain(|(_, _, cat)| {
-                let is_embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
-                is_embedded == want
-            });
-        }
-
-        let offset = p.offset.unwrap_or(0);
-        let slice: Vec<_> = match p.limit {
-            Some(limit) => triples.into_iter().skip(offset).take(limit).collect(),
-            None => triples.into_iter().skip(offset).collect(),
-        };
-
-        let entries: Vec<_> = slice
-            .into_iter()
-            .map(|(stem, _meta, cat)| {
-                let title = cat.title.unwrap_or_default();
-                let downloaded = cat.downloaded_at.is_some();
-                // `converted` means markdown exists (the success stamp).
-                let converted = cat.conversion.is_some();
-                let embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
-                let embedding_skipped = cat.embedding_skip.is_some();
-                let repaired = cat.repair.is_some();
-                // The reason a conversion was given up on, and what a retry
-                // can do about it (the same kinds `system_status` counts).
-                let conversion_failed = cat.conversion_failed.as_ref().map(|f| {
-                    serde_json::json!({
-                        "reason": f.reason,
-                        "kind": hs_scribe::classify::stamp_kind(&f.reason),
-                    })
-                });
-                let doi = cat.doi.clone().unwrap_or_default();
-                serde_json::json!({
-                    "stem": stem,
-                    "title": title,
-                    "doi": doi,
-                    "downloaded": downloaded,
-                    "converted": converted,
-                    "embedded": embedded,
-                    "embedding_skipped": embedding_skipped,
-                    "repaired": repaired,
-                    "conversion_failed": conversion_failed,
-                })
-            })
-            .collect();
-
-        to_json(&entries)
-    }
-
-    #[tool(
-        description = "Most recent catalog activity (download/convert/embed/embed-skip events). One row per event, sorted newest-first by event timestamp; ties broken by stem so output is deterministic. By default excludes rows whose timestamp is a `catalog_repair` backfill stamp (fingerprint: `downloaded_at == repair.repaired_at`, or synthetic Convert whose `converted_at == repair.repaired_at`) so the feed reflects organic activity. Pass `include_repaired=true` for forensic inspection — repair rows reappear annotated `\"repair\": true`. Used by the status dashboard's History pane.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn catalog_recent(
-        &self,
-        Parameters(p): Parameters<CatalogRecentParams>,
-    ) -> Result<String, String> {
-        let triples = hs_common::catalog::list_catalog_entries_parallel(
-            &*self.storage,
-            &self.catalog_prefix,
-            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
-            |_, _| {},
-        )
-        .await
-        .map_err(|e| format!("catalog list failed: {e:#}"))?;
-
-        let include_repaired = p.include_repaired.unwrap_or(false);
-
-        let mut events: Vec<serde_json::Value> = Vec::new();
-        for (stem, _meta, entry) in triples {
-            let name = entry.title.clone().unwrap_or_else(|| stem.clone());
-            let repair_at: Option<&str> = entry.repair.as_ref().map(|r| r.repaired_at.as_str());
-
-            if let Some(ref dl_at) = entry.downloaded_at {
-                // Fingerprint: this `downloaded_at` was stamped by a prior
-                // catalog_repair flag_drift pass. Skip by default so the feed
-                // shows organic activity instead of hundreds of batch-stamped
-                // rows collapsed onto one nanosecond.
-                let is_repair = repair_at == Some(dl_at.as_str());
-                if is_repair && !include_repaired {
-                    // skip
-                } else {
-                    let size = entry
-                        .file_size_bytes
-                        .map(|b| b.to_string())
-                        .unwrap_or_default();
-                    let mut row = serde_json::json!({
-                        "activity": "Download",
-                        "stem": stem,
-                        "name": name,
-                        "detail_bytes": entry.file_size_bytes,
-                        "detail": size,
-                        "at": dl_at,
-                    });
-                    if is_repair {
-                        row["repair"] = serde_json::Value::Bool(true);
-                    }
-                    events.push(row);
-                }
-            }
-            if let Some(ref conv) = entry.conversion {
-                // Synthetic Convert fingerprint: the flag_drift backfill
-                // stamps `server = "catalog_repair:flag_drift"` and shares the
-                // batch `now()` with `repair.repaired_at`. Matching on both
-                // guards against a real conversion that happened to finish at
-                // the same moment as an unrelated repair on another row.
-                let is_repair = conv.server == "catalog_repair:flag_drift"
-                    && repair_at == Some(conv.converted_at.as_str());
-                if is_repair && !include_repaired {
-                    // skip
-                } else {
-                    let mut row = serde_json::json!({
-                        "activity": "Convert",
-                        "stem": stem,
-                        "name": name,
-                        "pages": conv.total_pages,
-                        "duration_secs": conv.duration_secs,
-                        "server": conv.server,
-                        "at": conv.converted_at,
-                    });
-                    if is_repair {
-                        row["repair"] = serde_json::Value::Bool(true);
-                    }
-                    events.push(row);
-                }
-            }
-            if let Some(ref emb) = entry.embedding {
-                // TODO: Legacy, deal with it.
-                // Skip zero-chunk "embeddings" — they were stamped by an older
-                // pipeline when nothing actually made it into Qdrant, and only
-                // pollute the history pane.
-                if emb.chunks_indexed > 0 {
-                    events.push(serde_json::json!({
-                        "activity": "Embed",
-                        "stem": stem,
-                        "name": name,
-                        "chunks": emb.chunks_indexed,
-                        "at": emb.embedded_at,
-                    }));
-                }
-            }
-            if let Some(ref skip) = entry.embedding_skip {
-                events.push(serde_json::json!({
-                    "activity": "EmbedSkip",
-                    "stem": stem,
-                    "name": name,
-                    "reason": skip.reason,
-                    "at": skip.at,
-                }));
-            }
-        }
-
-        // Primary sort: RFC3339 lexicographic DESC. Secondary: stem ASC so
-        // ties (common after batch backfills) produce a stable, readable
-        // order instead of whatever the storage `list` happened to return.
-        events.sort_by(|a, b| {
-            let a_at = a.get("at").and_then(|v| v.as_str()).unwrap_or("");
-            let b_at = b.get("at").and_then(|v| v.as_str()).unwrap_or("");
-            let a_stem = a.get("stem").and_then(|v| v.as_str()).unwrap_or("");
-            let b_stem = b.get("stem").and_then(|v| v.as_str()).unwrap_or("");
-            b_at.cmp(a_at).then_with(|| a_stem.cmp(b_stem))
-        });
-        let limit = p.limit.unwrap_or(30);
-        events.truncate(limit);
-
-        to_json(&events)
-    }
-
-    #[tool(
-        description = "Read full catalog entry for a paper. Returns JSON with metadata, conversion info, page offsets, download URLs.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn catalog_read(
-        &self,
-        Parameters(p): Parameters<CatalogReadParams>,
-    ) -> Result<String, String> {
-        match hs_common::catalog::read_catalog_entry_via(
-            &*self.storage,
-            &self.catalog_prefix,
-            &p.stem,
-        )
-        .await
-        .map_err(|e| format!("{e:#}"))?
-        {
-            Some(entry) => {
-                // The catalog row's `pdf_path` is a storage key on this
-                // host, not something the caller can open. The links are
-                // what a caller can open.
-                let links = self
-                    .link_minter
-                    .as_ref()
-                    .and_then(|m| m.mint(&p.stem, hs_common::stores::ACADEMIC, None, None));
-                to_json(&CatalogEntryWithLinks { entry, links })
-            }
-            None => Err(format!("No catalog entry found for '{}'", p.stem)),
-        }
-    }
-
     #[tool(
         description = "Check a quote against the document it is from, and return a citation a reader can verify. Call it for every passage you present as a quotation from the corpus, before you present it. The quote is matched against the document's own text: markup, line breaks, spacing, hyphenation, case and typography may differ, the words may not. When the document does not contain the quote the call FAILS and names the closest passage: quote that passage, or do not quote. On success it returns the passage as the document has it; the document's title, authors, year and DOI; where the passage is (its lines, and for a PDF whose word boxes are built its page and the rectangles around its words: `boxes.status` is `located`, `not_located`, `pending` or `not_applicable`); and signed, expiring links, each for the LAN and for away from home: `links.source` (the original document), `links.markdown` (the converted text, the passage selected) and, for a located passage, `links.viewer` (the PDF opened on the boxed passage) and `links.page` (that page as a picture, the passage boxed). `not_located` means the converted text has the passage and the words read from the PDF's pages do not, so the conversion may be wrong there: tell the reader the quote is not confirmed on the page. `image: true` also returns that picture in the result. `short` also stores a 12-character code that redirects to one of the links. Call it again for fresh links when earlier ones have expired.",
         annotations(
@@ -1847,7 +327,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Reports catalog ↔ storage reconciliation in seven directions (forward disk orphans, catalog_no_markdown, catalog_no_source phantoms, flag-drift, flag-drift-resync, md-path-drift, stuck-convert). REPORT ONLY from MCP: the apply path was removed in rc.306 and no CLI command replaces it yet (`hs distill reconcile --fix-stamps --reembed` backfills embedding stamps; `hs pipeline catch-up` re-queues unconverted papers). Any `dry_run=false` argument is ignored with a notice in the response.",
+        description = "Read a document: its catalog card and a slice of its text. `store` and `doc_id` are a search hit's `store` and `meta.doc_id` (the `myelin` server's `recall`), or a row of `documents`. Returns two parts: a JSON answer with the card (title, authors, year, DOI, abstract, when it was added), `converted`, the `slice` returned (`line_start`, `line_end`, `page`, `total_lines`, `total_pages`, `next_line`) and signed links that open the document; then the text, every line behind its number (`12: ...`). Select with `page` (one page of the source) or `lines: [first, last]`, not both; with neither, reading starts at line 1. At most `max_chars` characters come back (12,000 by default), in whole lines: when the selection did not fit, `slice.next_line` is the line to call again from. A document that is stored and not yet converted answers `converted: false` with its card and no text: ask `status` with its `doc_id`. The line numbers are the ones `cite` reports and takes as `near_line`. Reading is for context: anything you quote goes through `cite`.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1855,246 +335,15 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    async fn catalog_repair(
+    async fn read(
         &self,
-        Parameters(p): Parameters<CatalogRepairParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<String, String> {
-        // rc.306 P0-6: MCP is a read-only surface. This handler is
-        // dry-run ONLY — the apply path lives in the CLI. A client-
-        // supplied `dry_run=false` is acknowledged in the response so
-        // the caller knows no writes happened.
-        let client_wanted_apply = !p.dry_run;
-        // One shared pass over all three prefixes — 3 concurrent LISTs and
-        // bounded-concurrency parallel GETs of every catalog YAML. Replaces
-        // the pre-fix "7 serial scans × (1 LIST + N serial GETs)" shape
-        // whose cost at 3k+ rows exceeded the MCP 4-minute client budget
-        // even under dry_run.
-        let progress_token = context.meta.get_progress_token();
-        let peer = context.peer.clone();
-
-        let progress_token_for_fetch = progress_token.clone();
-        let peer_for_fetch = peer.clone();
-        let on_fetch_progress = move |done: usize, total: usize| {
-            let Some(token) = progress_token_for_fetch.clone() else {
-                return;
-            };
-            let peer = peer_for_fetch.clone();
-            tokio::spawn(async move {
-                let params = ProgressNotificationParam::new(token, done as f64)
-                    .with_message(format!("catalog snapshot: {done}/{total}"))
-                    .with_total(total as f64);
-                if let Err(e) = peer.notify_progress(params).await {
-                    tracing::warn!(error = %e, "catalog_repair snapshot notify_progress failed");
-                }
-            });
-        };
-
-        let snapshot = hs_common::status::build_repair_snapshot(
-            &*self.storage,
-            &self.papers_prefix,
-            &self.catalog_prefix,
-            &self.markdown_prefix,
-            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
-            on_fetch_progress,
-        )
-        .await
-        .map_err(|e| format!("snapshot build failed: {e:#}"))?;
-
-        // Per-phase progress ping so the client timer resets between scans
-        // and the operator can see which phase is running. The scans
-        // themselves are pure in-memory filters over the snapshot — this
-        // is heartbeat + visibility, not pacing.
-        let emit_scan_phase = |phase: u64, name: &str| {
-            let Some(token) = progress_token.clone() else {
-                return;
-            };
-            let peer = peer.clone();
-            let name = name.to_string();
-            tokio::spawn(async move {
-                let params = ProgressNotificationParam::new(token, phase as f64)
-                    .with_message(format!("scan {phase}/7: {name}"))
-                    .with_total(7.0);
-                if let Err(e) = peer.notify_progress(params).await {
-                    tracing::warn!(error = %e, "catalog_repair scan-phase notify_progress failed");
-                }
-            });
-        };
-
-        // Forward direction: files on disk with no catalog row.
-        emit_scan_phase(1, "disk orphans");
-        let disk_orphans =
-            hs_common::status::list_orphan_document_stems(&snapshot.papers, &snapshot.catalog);
-
-        // Reverse direction: catalog claims converted but markdown is gone.
-        emit_scan_phase(2, "catalog rows without markdown");
-        let md_orphans = hs_common::status::list_catalog_rows_without_markdown(
-            &snapshot.catalog,
-            &snapshot.markdown,
-        );
-
-        // Phantom direction: catalog row with neither a paper file nor a
-        // markdown file. These inflate `catalog_entries` above `documents`
-        // in the pipeline rollup and have no reachable payload anywhere —
-        // safe to delete once confirmed via dry-run.
-        emit_scan_phase(3, "phantom orphans");
-        let phantom_orphans = hs_common::status::list_catalog_rows_without_source(
-            &snapshot.papers,
-            &snapshot.catalog,
-            &snapshot.markdown,
-        );
-
-        // Flag-drift direction: catalog row where a stage flag is missing but
-        // the storage evidence for that stage exists. Backfills without
-        // deleting — unlike the three directions above, which clear or synth.
-        emit_scan_phase(4, "flag drift");
-        let drift_rows = hs_common::status::list_catalog_flag_drift(
-            &snapshot.papers,
-            &snapshot.catalog,
-            &snapshot.markdown,
-        );
-
-        // Flag-drift-resync direction: rows still wearing the fingerprint of a
-        // prior flag_drift batch stamp (`downloaded_at == repair.repaired_at` or
-        // synthetic Convert whose `converted_at == repair.repaired_at`). Rewrite
-        // to the storage object's `last_modified` so the activity feed stops
-        // showing hundreds of rows collapsed onto one nanosecond.
-        emit_scan_phase(5, "flag drift resync");
-        let resync_rows = hs_common::status::list_catalog_flag_drift_resync_candidates(
-            &snapshot.papers,
-            &snapshot.catalog,
-            &snapshot.markdown,
-        );
-
-        // Md-path-drift direction: catalog `markdown_path` disagrees with
-        // where the markdown actually lives. Post-`bc2b6fb` the physical
-        // layout moved from `markdown/<stem>.md` to `markdown/{XX}/<stem>.md`,
-        // but pre-existing catalog rows weren't rewritten — so every
-        // resolver that trusts `markdown_path` probes a stale key and
-        // reports a ghost orphan. Rewrites the catalog field to the real
-        // storage key (non-destructive; does not touch markdown or Qdrant).
-        emit_scan_phase(6, "md_path drift");
-        let md_path_drift_rows = hs_common::status::list_catalog_rows_with_md_path_drift(
-            &snapshot.catalog,
-            &snapshot.markdown,
-        );
-
-        // Stuck-convert direction: catalog has a PDF/HTML source on disk but
-        // no `conversion` stamp. Re-queues via the event bus rather than an
-        // inline scribe call — publishes `papers.ingested`, which the
-        // `hs scribe watch-events` daemon converts and `hs distill
-        // watch-events` then embeds. Type A rows (ghost Qdrant chunks from a
-        // prior cycle whose markdown was later deleted) also get purged
-        // here so the re-index writes fresh points instead of mixing with
-        // stale ones.
-        emit_scan_phase(7, "stuck convert");
-        let stuck_rows =
-            hs_common::status::list_catalog_stuck_convert(&snapshot.papers, &snapshot.catalog);
-
-        let disk_total = disk_orphans.len();
-        let md_total = md_orphans.len();
-        let phantom_total = phantom_orphans.len();
-        let drift_total = drift_rows.len();
-        let md_path_drift_total = md_path_drift_rows.len();
-        let stuck_total = stuck_rows.len();
-        let stuck_pdf = stuck_rows.iter().filter(|r| r.source_ext == "pdf").count();
-        let stuck_html = stuck_rows.iter().filter(|r| r.source_ext == "html").count();
-        let drift_conversion_total = drift_rows
-            .iter()
-            .filter(|r| r.conversion_missing_with_markdown)
-            .count();
-        let drift_download_total = drift_rows
-            .iter()
-            .filter(|r| r.download_stamp_missing_with_source)
-            .count();
-        let resync_total = resync_rows.len();
-        let resync_download_total = resync_rows
-            .iter()
-            .filter(|r| r.resync_download.is_some())
-            .count();
-        let resync_conversion_total = resync_rows
-            .iter()
-            .filter(|r| r.resync_conversion.is_some())
-            .count();
-        let limit = p.limit.unwrap_or(usize::MAX);
-        let disk_samples: Vec<String> = disk_orphans
-            .iter()
-            .take(10)
-            .map(|(s, _)| s.clone())
-            .collect();
-        let md_samples: Vec<String> = md_orphans.iter().take(10).cloned().collect();
-        let phantom_samples: Vec<String> = phantom_orphans.iter().take(10).cloned().collect();
-        let drift_samples: Vec<String> =
-            drift_rows.iter().take(10).map(|r| r.stem.clone()).collect();
-        let resync_samples: Vec<String> = resync_rows
-            .iter()
-            .take(10)
-            .map(|r| r.stem.clone())
-            .collect();
-        let md_path_drift_samples: Vec<serde_json::Value> = md_path_drift_rows
-            .iter()
-            .take(10)
-            .map(|r| {
-                serde_json::json!({
-                    "stem": r.stem,
-                    "stale_path": r.stale_path,
-                    "resolved_path": r.resolved_path,
-                })
-            })
-            .collect();
-        let stuck_samples: Vec<serde_json::Value> = stuck_rows
-            .iter()
-            .take(10)
-            .map(|r| serde_json::json!({ "stem": r.stem, "source_ext": r.source_ext }))
-            .collect();
-
-        to_json(&serde_json::json!({
-            "dry_run": true,
-            "requested_apply_ignored": client_wanted_apply,
-            "disk_no_catalog": {
-                "orphans_found": disk_total,
-                "would_repair": disk_orphans.iter().take(limit).count(),
-                "samples": disk_samples,
-            },
-            "catalog_no_markdown": {
-                "orphans_found": md_total,
-                "would_clear_conversion": md_orphans.iter().take(limit).count(),
-                "samples": md_samples,
-            },
-            "catalog_no_source": {
-                "orphans_found": phantom_total,
-                "would_delete": phantom_orphans.iter().take(limit).count(),
-                "samples": phantom_samples,
-            },
-            "flag_drift": {
-                "drift_found": drift_total,
-                "would_backfill_conversion": drift_conversion_total.min(limit),
-                "would_backfill_downloaded_at": drift_download_total.min(limit),
-                "samples": drift_samples,
-            },
-            "flag_drift_resync": {
-                "candidates_found": resync_total,
-                "would_resync_downloaded_at": resync_download_total.min(limit),
-                "would_resync_conversion": resync_conversion_total.min(limit),
-                "samples": resync_samples,
-            },
-            "md_path_drift": {
-                "drift_found": md_path_drift_total,
-                "would_rewrite": md_path_drift_rows.iter().take(limit).count(),
-                "samples": md_path_drift_samples,
-            },
-            "stuck_convert": {
-                "stuck_found": stuck_total,
-                "would_emit": stuck_rows.iter().take(limit).count(),
-                "pdf_candidates": stuck_pdf,
-                "html_candidates": stuck_html,
-                "samples": stuck_samples,
-            },
-        }))
+        Parameters(p): Parameters<tools::read::ReadParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(tools::read::tool_result(self.read_document(p).await))
     }
 
     #[tool(
-        description = "Reports URL-encoded duplicate stems (encoded-form + decoded-form pairs where the decoded twin is the one actually indexed). REPORT ONLY: the apply path was removed in rc.306 and no CLI command replaces it yet. Any `dry_run=false` argument is ignored.",
+        description = "List the documents of one store, newest first: `academic` (papers; the default), `personal` (the user's own records), `web` (captured pages) or `syntheses` (saved answers). Each row has the `doc_id` that `read`, `cite` and `status` take, with the title, authors, year, DOI, when it was added, and whether it is converted to text and indexed for search. Narrow with `title_contains` and `added_after`. A page holds `limit` rows (20 by default, 200 at most); `next_cursor`, when present, is the `cursor` of the next page with the same filters. This lists what the corpus holds; to find documents by what they say, search with the `myelin` server's `recall`.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2102,167 +351,47 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    async fn dedupe_url_encoded(
+    async fn documents(
         &self,
-        Parameters(_p): Parameters<DedupeUrlEncodedParams>,
+        Parameters(p): Parameters<tools::documents::DocumentsParams>,
     ) -> Result<String, String> {
-        // rc.306 P0-6: MCP is a read-only surface. The caller's dry_run
-        // argument is intentionally ignored — this handler always reports
-        // without writing, and no command applies the report yet.
-        // Enumerate all markdown stems.
-        let markdown = self
-            .storage
-            .list(&self.markdown_prefix)
-            .await
-            .map_err(|e| format!("markdown list failed: {e:#}"))?;
-
-        use std::collections::HashSet;
-        let stems: HashSet<String> = markdown
-            .iter()
-            .filter_map(|o| {
-                if !o.key.ends_with(".md") {
-                    return None;
-                }
-                let filename = o.key.rsplit('/').next()?;
-                if filename.starts_with("._") {
-                    return None;
-                }
-                Some(filename.strip_suffix(".md").unwrap_or(filename).to_string())
-            })
-            .collect();
-
-        // Find encoded-form stems whose decoded twin also exists.
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        for s in &stems {
-            if !s.contains('%') {
-                continue;
-            }
-            let decoded = percent_encoding::percent_decode_str(s)
-                .decode_utf8_lossy()
-                .into_owned();
-            if decoded != *s && stems.contains(&decoded) {
-                pairs.push((s.clone(), decoded));
-            }
-        }
-        pairs.sort();
-
-        let total = pairs.len();
-        let samples: Vec<serde_json::Value> = pairs
-            .iter()
-            .take(10)
-            .map(|(e, d)| serde_json::json!({"encoded": e, "decoded": d}))
-            .collect();
-
-        to_json(&serde_json::json!({
-            "dry_run": true,
-            "mcp_forced_dry_run": true,
-            "pairs_found": total,
-            "would_delete_encoded_rows": total,
-            "samples": samples,
-        }))
+        self.list_documents(p).await
     }
 
-    // ── Markdown Tools ─────────────────────────────────────────
-
     #[tool(
-        description = "List all converted markdown documents with file sizes and page counts. Supports pagination via limit/offset.",
+        description = "Look outside the corpus for works worth adding to it. `source` is required: `providers` asks the online paper providers (arXiv, OpenAlex, Semantic Scholar, Europe PMC, CrossRef and, with an API key, CORE); `openalex` reads the local OpenAlex corpus without the network. Give exactly one of `query` (a search; `year_from`, `year_to` and `limit` narrow it, 10 results by default and 200 at most) or `doi` (one work's full metadata; with `openalex`, its authors and topics too). A provider search answers `{works, provider_failures}`: `provider_failures` names each provider that did not answer, and the call fails only when none did. `kind: \"authors\"` (with `source: \"openalex\"` and a `query` naming a topic by id or exact name) returns that topic's most cited authors. A combination a source cannot answer is refused, never answered in part; `source: \"openalex\"` on a host whose corpus is not built is an error that says how to build it. To bring a work found here into the corpus, call `acquire` with its DOI.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
-    async fn markdown_list(
+    async fn discover(
         &self,
-        Parameters(p): Parameters<ListParams>,
-        context: RequestContext<RoleServer>,
+        Parameters(p): Parameters<tools::discover::DiscoverParams>,
     ) -> Result<String, String> {
-        // One catalog read per listed document: an unpaginated call runs
-        // longer than the session idle timeout can tolerate without a
-        // progress signal; see `ProgressHeartbeat`.
-        let _heartbeat = ProgressHeartbeat::start(&context, "markdown_list".to_string());
-        self.list_markdown(p).await
-    }
-
-    async fn list_markdown(&self, p: ListParams) -> Result<String, String> {
-        let mut metas =
-            hs_common::markdown::list_markdown_meta_via(&*self.storage, &self.markdown_prefix)
-                .await
-                .map_err(|e| format!("markdown list failed: {e:#}"))?;
-        metas.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let offset = p.offset.unwrap_or(0);
-        let slice: Vec<_> = match p.limit {
-            Some(limit) => metas.into_iter().skip(offset).take(limit).collect(),
-            None => metas.into_iter().skip(offset).collect(),
-        };
-
-        let mut entries = Vec::with_capacity(slice.len());
-        for (stem, obj) in slice {
-            let pages = hs_common::catalog::read_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &stem,
-            )
-            .await
-            .map_err(|e| format!("{e:#}"))?
-            .and_then(|c| c.conversion)
-            .map(|cv| cv.total_pages)
-            .unwrap_or(0);
-            entries.push(serde_json::json!({
-                "stem": stem,
-                "size_bytes": obj.size,
-                "pages": pages,
-            }));
-        }
-
-        to_json(&entries)
+        self.discover_works(p).await
     }
 
     #[tool(
-        description = "Read a converted markdown document. Optionally specify a page number (1-based) to read just one page.",
+        description = "Step along the citation graph from a paper's DOI. `direction` is `references` (the works the paper cites) or `citations` (the works that cite it). `source` is `semantic_scholar` (the Graph API, online) or `openalex` (the local OpenAlex corpus, no network; an error that says how to build it when the corpus is not built). Returns `{doi, direction, source, works, returned, truncated}`: `truncated` says more works matched than were returned. `limit` is 1 to 1000 (100 by default), `year_from` keeps works from that year on, and `sort` is `year` (newest first, the default) or `citations` (most cited first). The works carry their source's fields: Semantic Scholar gives DOI, title, year, authors, venue and citation count; OpenAlex gives its id, DOI, title, year and citation count. To bring a work found here into the corpus, call `acquire` with its DOI.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
-    async fn markdown_read(
+    async fn graph(
         &self,
-        Parameters(p): Parameters<MarkdownReadParams>,
+        Parameters(p): Parameters<tools::graph::GraphParams>,
     ) -> Result<String, String> {
-        match hs_common::markdown::read_markdown_via(&*self.storage, &self.markdown_prefix, &p.stem)
-            .await
-            .map_err(|e| format!("{e:#}"))?
-        {
-            Some(content) => {
-                if let Some(page) = p.page {
-                    let pages: Vec<&str> =
-                        content.split(hs_common::markdown::PAGE_SEPARATOR).collect();
-                    if page == 0 || page > pages.len() {
-                        Err(format!(
-                            "Page {} not found. Document has {} pages.",
-                            page,
-                            pages.len()
-                        ))
-                    } else {
-                        Ok(pages[page - 1].to_string())
-                    }
-                } else {
-                    Ok(content)
-                }
-            }
-            None => Err(format!(
-                "Markdown not found for '{}'. Check if it has been converted.",
-                p.stem
-            )),
-        }
+        self.graph_neighbours(p).await
     }
 
     #[tool(
-        description = "Backfill empty/missing `title` fields on catalog rows that have a DOI. Rows synthesized by `catalog_repair`'s `disk_no_catalog` direction, by the inbox watcher, or by server-event conversions have no title until a metadata fan-in happens. This tool calls the aggregate paper provider (`paper::get_by_doi`) for each eligible row and stamps `title` (plus `authors`, `publication_date`, `abstract_text`, `cited_by_count` when we're already on the wire). Defaults to dry-run.",
+        description = "Download a paper by DOI into the `academic` store. Tries arXiv, MDPI and the providers' open-access locations, stores the file, writes its catalog entry and announces it; conversion to text, indexing and word boxes then run in the background. Returns `{store, doc_id, doi, state, converted}`: `state` is `queued` (stored by this call; the answer carries its size and SHA-256) or `present` (the store already held it; nothing was downloaded). When `converted` is false, ask `status` with the `doc_id` until it is, then `read` and `cite`. Fails when no open copy can be downloaded, when the metadata lookup fails or when the catalog entry cannot be written; calling again repairs a half-finished acquisition.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2270,831 +399,32 @@ impl HomeStillMcp {
             open_world_hint = true
         )
     )]
-    async fn catalog_backfill_title(
+    async fn acquire(
         &self,
-        Parameters(p): Parameters<CatalogBackfillTitleParams>,
-        context: RequestContext<RoleServer>,
+        Parameters(p): Parameters<tools::acquire::AcquireParams>,
     ) -> Result<String, String> {
-        // Runs longer than the session idle timeout can tolerate without a
-        // progress signal; see `ProgressHeartbeat`.
-        let _heartbeat = ProgressHeartbeat::start(&context, "catalog_backfill_title".to_string());
-        let triples = hs_common::catalog::list_catalog_entries_parallel(
-            &*self.storage,
-            &self.catalog_prefix,
-            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
-            |_, _| {},
-        )
-        .await
-        .map_err(|e| format!("catalog list failed: {e:#}"))?;
-
-        // Candidates: row has a DOI and title is missing/empty.
-        let candidates: Vec<(String, hs_common::catalog::CatalogEntry)> = triples
-            .into_iter()
-            .filter_map(|(stem, _meta, entry)| {
-                let has_doi = entry.doi.as_ref().is_some_and(|d| !d.trim().is_empty());
-                let missing_title = entry
-                    .title
-                    .as_ref()
-                    .map(|t| t.trim().is_empty())
-                    .unwrap_or(true);
-                if has_doi && missing_title {
-                    Some((stem, entry))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let total = candidates.len();
-        let limit = p.limit.unwrap_or(usize::MAX);
-        let take: Vec<(String, hs_common::catalog::CatalogEntry)> =
-            candidates.into_iter().take(limit).collect();
-        let samples: Vec<String> = take.iter().take(10).map(|(s, _)| s.clone()).collect();
-
-        if p.dry_run {
-            return to_json(&serde_json::json!({
-                "dry_run": true,
-                "candidates": total,
-                "would_backfill": take.len(),
-                "samples": samples,
-            }));
-        }
-
-        // Metadata fan-in through the same shared providers every tool uses.
-        let provider = self.providers.provider(&paper::cli::ProviderArg::All);
-
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut backfilled = 0u64;
-        let mut no_metadata = 0u64;
-        let mut errors: Vec<String> = Vec::new();
-
-        for (stem, listed) in take {
-            let doi = match listed.doi.as_deref() {
-                Some(d) => d,
-                None => continue,
-            };
-            let meta = match provider.get_by_doi(doi).await {
-                Ok(Some(p)) => p,
-                Ok(None) => {
-                    no_metadata += 1;
-                    continue;
-                }
-                Err(e) => {
-                    errors.push(format!("{stem}: provider error: {e}"));
-                    continue;
-                }
-            };
-
-            if meta.title.trim().is_empty() {
-                no_metadata += 1;
-                continue;
-            }
-
-            // The listing is minutes old by now (one provider round trip per
-            // row): write onto the row as it is, not as it was, or a
-            // conversion/embedding stamp landed in between is erased.
-            let mut entry = match hs_common::catalog::read_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &stem,
-            )
-            .await
-            {
-                Ok(Some(entry)) => entry,
-                Ok(None) => {
-                    errors.push(format!("{stem}: catalog row vanished before the write"));
-                    continue;
-                }
-                Err(e) => {
-                    errors.push(format!("{stem}: catalog re-read failed: {e:#}"));
-                    continue;
-                }
-            };
-            if entry.title.as_ref().is_some_and(|t| !t.trim().is_empty()) {
-                continue;
-            }
-
-            entry.title = Some(meta.title.clone());
-            if entry.authors.is_empty() && !meta.authors.is_empty() {
-                entry.authors = meta
-                    .authors
-                    .iter()
-                    .map(|a| hs_common::catalog::AuthorEntry {
-                        name: a.name.clone(),
-                    })
-                    .collect();
-            }
-            if entry.publication_date.is_none() {
-                entry.publication_date = meta.publication_date.map(|d| d.to_string());
-            }
-            if entry.abstract_text.is_none() {
-                entry.abstract_text = meta.abstract_text.clone();
-            }
-            if entry.cited_by_count.is_none() {
-                entry.cited_by_count = meta.cited_by_count;
-            }
-            entry.repair = Some(hs_common::catalog::RepairMeta {
-                repaired_at: now.clone(),
-                reason: "title backfilled via paper aggregate".to_string(),
-            });
-
-            match hs_common::catalog::write_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &stem,
-                &entry,
-            )
-            .await
-            {
-                Ok(()) => backfilled += 1,
-                Err(e) => errors.push(format!("{stem}: write failed: {e:#}")),
-            }
-        }
-
-        to_json(&serde_json::json!({
-            "dry_run": false,
-            "candidates": total,
-            "backfilled": backfilled,
-            "no_metadata": no_metadata,
-            "samples": samples,
-            "errors": errors,
-        }))
-    }
-
-    // ── Scribe Tools ───────────────────────────────────────────
-
-    #[tool(
-        description = "Check scribe server health: model status, version, in-flight conversions, available VLM slots.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn scribe_health(&self) -> Result<String, String> {
-        let client = self
-            .scribe_client()
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or("No scribe server configured")?;
-
-        let (health, health_error) = split_result(client.health().await);
-        let (readiness, readiness_error) = split_result(client.readiness().await);
-
-        to_json(&serde_json::json!({
-            "health": health,
-            "health_error": health_error,
-            "readiness": readiness,
-            "readiness_error": readiness_error,
-        }))
+        self.acquire_paper(p).await
     }
 
     #[tool(
-        description = "Queue a stored source document (PDF, HTML or EPUB) for conversion and return immediately — do NOT use this to wait. Publishes `papers.ingested`, which the `hs scribe watch-events` daemon picks up: typical documents finish in seconds to a few minutes, and the timeout ceiling for one document is 1 hour, so the conversion far outlives a tool call. Poll `catalog_list` (it reports `converted` and `conversion_failed` per stem) or `distill_index` until the markdown exists, then read it with `markdown_read`. Use `scribe_convert` ONLY when you want to block this call until the document is ready. An `already_converted` reply means the source no longer needs queueing.",
+        description = "Keep a web page you have read, in the `web` store, so it can be searched, read and cited like a paper. You fetch the page; pass its `url` (http or https), its whole `content` (2 MiB at most: citations are checked against this text, so not a summary) and the `content_type` the content is written in (`html`, `markdown` or `text`), with a `title` when you know it. The page's `doc_id` is made from its address, so capturing the same address again REPLACES the page captured before. Refused: content over the limit, an address that is not http(s), and HTML that is a paywall or login page rather than the article. Returns `{store, doc_id, source_url, size_bytes, replaced, next}`; conversion and indexing run in the background, and `status` with the `doc_id` says when the page can be read and cited.",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
+            // Capturing an address again replaces the earlier capture.
+            destructive_hint = true,
             idempotent_hint = true,
             open_world_hint = false
         )
     )]
-    async fn scribe_queue(
+    async fn capture(
         &self,
-        Parameters(p): Parameters<ScribeQueueParams>,
+        Parameters(p): Parameters<tools::capture::CaptureParams>,
     ) -> Result<String, String> {
-        self.require_event_bus("scribe_queue").await?;
-
-        // Queueing is only honest if the source exists: `find_source_key`
-        // probes the collection's extensions and errors when there is none,
-        // so a caller cannot queue a stem that will fail in the watcher with
-        // no one listening.
-        let source_key = self.find_source_key(&p.stem).await?;
-
-        // `IngestedEvent` declares every field but `key` as `#[serde(default)]`
-        // — a minimal publisher may only know the object key, so the optional
-        // fields are omitted rather than filled with guesses.
-        let payload = serde_json::json!({
-            "key": source_key,
-            "source": "mcp:scribe_queue",
-        });
-        let bytes = serde_json::to_vec(&payload)
-            .map_err(|e| format!("serializing papers.ingested for {source_key}: {e}"))?;
-        self.events
-            .publish(hs_common::event_bus::specs::PAPERS_INGESTED.subject, &bytes)
-            .await
-            .map_err(|e| {
-                format!(
-                    "queueing {source_key} failed (nothing was queued; the source is stored and \
-                     the conversion did not start): {e:#}"
-                )
-            })?;
-
-        to_json(&serde_json::json!({
-            "stem": p.stem,
-            "source_key": source_key,
-            "queued": true,
-            "next": "poll catalog_list for this stem until `converted` is true, or \
-                     distill_index to embed it once it is",
-        }))
+        self.capture_page(p).await
     }
 
     #[tool(
-        description = "BLOCKS until the conversion finishes — use `scribe_queue` instead unless you need the markdown in this call; conversion is bounded by the scribe timeout ceiling of 3600 s. Converts a stored source document (PDF, HTML or EPUB; PDF preferred when several exist) to markdown through the same code path the scribe event watcher uses: PDFs go to the scribe VLM server, HTML and EPUB are parsed by the shared parsers. Takes a stem name (filename without extension). Writes markdown to storage, stamps the catalog and announces `scribe.completed`. Markdown that already exists is not converted again (it is re-announced; `hs scribe reconvert` forces a fresh conversion). Fails, naming the cause, when storage is unreachable, the source is missing, the document is refused (not a PDF, paywall page, empty or looping output) or the catalog stamp did not land. While a conversion runs, the tool sends a progress notification about every 20 seconds. Use `markdown_read` to fetch content.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn scribe_convert(
-        &self,
-        Parameters(p): Parameters<ScribeConvertParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<String, String> {
-        // A long PDF converts for minutes with no per-page signal from this
-        // path; a periodic notification keeps the client's tool-call timer
-        // (Claude Desktop: 4 min) and the session idle timer from firing.
-        let _heartbeat = ProgressHeartbeat::start(&context, p.stem.to_string());
-        self.convert_source(&p.stem).await
-    }
-
-    // ── Distill Tools ──────────────────────────────────────────
-
-    #[tool(
-        description = "Semantic search across indexed academic documents. Returns ranked results with text snippets, metadata, and relevance scores. Pass include_text=false to omit chunk_text from each hit — a metadata-only response that lets an agent rank/dedupe large result sets (e.g. build a DOI catalog) without the passages overflowing its context window. Score and ranking are unaffected.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn distill_search(
-        &self,
-        Parameters(p): Parameters<DistillSearchParams>,
-    ) -> Result<String, String> {
-        let client = self
-            .distill_client()
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or("No distill server configured")?;
-
-        let filters = hs_distill::client::SearchFilters {
-            year: p.year,
-            topic: None,
-            category: None,
-        };
-
-        match client
-            .search(&p.query, p.limit.unwrap_or(10), filters)
-            .await
-        {
-            Ok(hits) => {
-                let include_text = p.include_text.unwrap_or(true);
-                let out = map_distill_search_hits(hits, include_text, self.link_minter.as_ref());
-                to_json(&out)
-            }
-            Err(e) => Err(format!("Search failed: {e:#}")),
-        }
-    }
-
-    #[tool(
-        description = "Semantic search over downloaded papers' abstracts. Targets the `paper_abstracts` Qdrant collection — one point per paper (not per chunk), embedded from `{title}\\n\\n{abstract}` where the abstract is sourced from the local OpenAlex catalog (preferred), the paper's catalog abstract, or the converted markdown's `## Abstract` section; papers with no usable abstract are not indexed. Higher-precision than `distill_search` for 'find me the paper that argues X' queries because body-section noise (methods, references, citations) is excluded. Returns ranked hits with score, title, doi, year, and the embedded abstract text.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn abstract_search(
-        &self,
-        Parameters(p): Parameters<DistillSearchParams>,
-    ) -> Result<String, String> {
-        let client = self
-            .distill_client()
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or("No distill server configured")?;
-
-        let filters = hs_distill::client::SearchFilters {
-            year: p.year,
-            topic: None,
-            category: None,
-        };
-
-        match client
-            .search_in(
-                &p.query,
-                p.limit.unwrap_or(10),
-                filters,
-                Some("paper_abstracts"),
-            )
-            .await
-        {
-            Ok(hits) => {
-                let include_text = p.include_text.unwrap_or(true);
-                let out = map_distill_search_hits(hits, include_text, self.link_minter.as_ref());
-                to_json(&out)
-            }
-            Err(e) => Err(format!("abstract_search failed: {e:#}")),
-        }
-    }
-
-    #[tool(
-        description = "Get distill system status: Qdrant collection info, document/chunk counts, compute device, server version.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn distill_status(&self) -> Result<String, String> {
-        let client = self
-            .distill_client()
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or("No distill server configured")?;
-
-        let (health, health_error) = split_result(client.health().await);
-        let (status, status_error) = split_result(client.status().await);
-
-        to_json(&serde_json::json!({
-            "health": health,
-            "health_error": health_error,
-            "status": status,
-            "status_error": status_error,
-        }))
-    }
-
-    #[tool(
-        description = "Check if a specific document has been indexed in the vector database.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn distill_exists(
-        &self,
-        Parameters(p): Parameters<DistillExistsParams>,
-    ) -> Result<String, String> {
-        let client = self
-            .distill_client()
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or("No distill server configured")?;
-
-        match client.doc_exists(&p.stem).await {
-            Ok(exists) => to_json(&serde_json::json!({
-                "stem": p.stem,
-                "indexed": exists,
-            })),
-            Err(e) => Err(format!("Check failed: {e:#}")),
-        }
-    }
-
-    #[tool(
-        description = "Index a converted markdown document into the vector database for semantic search. Takes a stem name.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn distill_index(
-        &self,
-        Parameters(p): Parameters<DistillIndexParams>,
-    ) -> Result<String, String> {
-        let client = self
-            .distill_client()
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or("No distill server configured")?;
-
-        let (key, catalog_entry) = self.existing_markdown(&p.stem).await?;
-
-        let result = client
-            .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
-            .await
-            .map_err(|e| format!("Indexing failed for '{}': {e:#}", p.stem))?;
-        self.stamp_embedding(&p.stem, &result).await?;
-        to_json(&serde_json::json!({
-            "stem": p.stem,
-            "chunks_indexed": result.chunks_indexed,
-            "embedding_device": result.embedding_device,
-        }))
-    }
-
-    // distill_purge: removed in rc.306. Bulk-delete is CLI-only via
-    // `hs distill purge <doc_id>`. Agents can no longer reach the
-    // write path through MCP.
-
-    #[tool(
-        description = "Reports Qdrant doc_ids whose markdown object is missing. DRY-RUN ONLY from MCP: the delete path was removed in rc.306 — use `hs distill reconcile --reembed` or `hs distill purge <doc_id>` for the write path. Any `dry_run=false` argument is ignored with a notice in the response.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn distill_reconcile(
-        &self,
-        Parameters(p): Parameters<DistillReconcileParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<String, String> {
-        // One markdown probe per indexed document: a scan of the whole
-        // collection runs longer than the session idle timeout can tolerate
-        // without a progress signal; see `ProgressHeartbeat`.
-        let _heartbeat = ProgressHeartbeat::start(&context, "distill_reconcile".to_string());
-        self.reconcile_orphans(p).await
-    }
-
-    async fn reconcile_orphans(&self, p: DistillReconcileParams) -> Result<String, String> {
-        // rc.306 P0-6: MCP is read-only. The caller's dry_run argument is
-        // ignored; the delete path lives in `hs distill reconcile` (existing
-        // CLI) and `hs distill purge <doc_id>`. The response says so, because
-        // a caller that asked to apply must not read a report as a success.
-        let client_wanted_apply = !p.dry_run;
-        let client = self
-            .distill_client()
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or("No distill server configured")?;
-        // The client refuses a partial list (a missing id would read as a
-        // document that was never indexed), so ask for everything the server
-        // can return; `limit` only caps how many of those ids are checked.
-        let doc_ids = client
-            .list_docs(hs_distill::client::MAX_DOC_LIST_LIMIT)
-            .await
-            .map_err(|e| format!("list_docs failed: {e:#}"))?;
-        let scan_cap = p.limit.map_or(usize::MAX, |l| l as usize);
-
-        let mut orphans: Vec<String> = Vec::new();
-        let mut scanned = 0usize;
-        for doc_id in doc_ids.iter().take(scan_cap) {
-            // A storage error here is an error: reporting it as "markdown
-            // missing" would hand the operator a false orphan to purge.
-            let probe = self.probe_markdown(doc_id).await?;
-            if !probe.present {
-                orphans.push(doc_id.clone());
-            }
-            scanned += 1;
-        }
-
-        to_json(&serde_json::json!({
-            "dry_run": true,
-            "mcp_forced_dry_run": true,
-            "requested_apply_ignored": client_wanted_apply,
-            "apply_hint": "use `hs distill reconcile --reembed` or `hs distill purge <doc_id>` (CLI-only) for the delete path",
-            "total_doc_ids": doc_ids.len(),
-            "scanned_doc_ids": scanned,
-            "orphan_count": orphans.len(),
-            "orphans": orphans,
-            "points_deleted": 0,
-        }))
-    }
-
-    #[tool(
-        description = "Scan every markdown object for VLM repetition artifacts and report doc_ids whose cleanup truncation count exceeds `threshold` (default 20). Read-only — reports only, does not purge or delete; remediate flagged documents with the CLI (`hs distill purge <doc_id>` or a re-index). An unreadable or non-UTF-8 object is an error, never skipped.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn distill_scan_repetitions(
-        &self,
-        Parameters(p): Parameters<DistillScanRepetitionsParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<String, String> {
-        // Runs longer than the session idle timeout can tolerate without a
-        // progress signal; see `ProgressHeartbeat`.
-        let _heartbeat = ProgressHeartbeat::start(&context, "distill_scan_repetitions".to_string());
-        let limit = p.limit.unwrap_or(100_000) as usize;
-        let threshold = p.threshold.unwrap_or(20);
-
-        let objects = self
-            .storage
-            .list(&self.markdown_prefix)
-            .await
-            .map_err(|e| format!("list({}) failed: {e:#}", self.markdown_prefix))?;
-
-        let mut scanned: usize = 0;
-        let mut flagged: Vec<serde_json::Value> = Vec::new();
-
-        for obj in objects.iter().take(limit) {
-            if !obj.key.ends_with(".md") {
-                continue;
-            }
-            scanned += 1;
-
-            let bytes = match self.storage.get(&obj.key).await {
-                Ok(b) => b,
-                Err(e) => {
-                    return Err(format!("reading {} failed: {e:#}", obj.key));
-                }
-            };
-            let original = match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Err(format!("{} is not valid UTF-8: {e}", obj.key));
-                }
-            };
-            // CPU-bound over a whole document: off the async worker threads,
-            // so a large scan cannot starve every other session. Cleaned per
-            // page, exactly as the scribe QC gate does: a page whose longest
-            // repeated run is below the loop floor is benign structure and
-            // contributes no truncations.
-            let (original, cleaned, breakdown) = tokio::task::spawn_blocking(move || {
-                let (cleaned, per_page) =
-                    hs_scribe::postprocess::clean_repetitions_per_page(&original);
-                let breakdown: hs_scribe::diag::TruncationCounts = per_page.iter().copied().sum();
-                (original, cleaned, breakdown)
-            })
-            .await
-            .map_err(|e| format!("repetition scan of {} failed: {e}", obj.key))?;
-            let truncations = breakdown.total();
-            if truncations <= threshold {
-                continue;
-            }
-            let stem = obj
-                .key
-                .rsplit('/')
-                .next()
-                .and_then(|f| f.strip_suffix(".md"))
-                .unwrap_or(obj.key.as_str())
-                .to_string();
-            let snippet = hs_scribe::postprocess::divergence_snippet(&original, &cleaned, 120)
-                .unwrap_or_default();
-            flagged.push(serde_json::json!({
-                "stem": stem,
-                "key": obj.key,
-                "truncations": truncations,
-                "truncations_by_pass": breakdown,
-                "offending_snippet": snippet,
-            }));
-        }
-
-        to_json(&serde_json::json!({
-            "scanned": scanned,
-            "threshold": threshold,
-            "flagged_count": flagged.len(),
-            "flagged": flagged,
-        }))
-    }
-
-    #[tool(
-        description = "Re-index a document from storage with fresh catalog metadata, replacing its vectors in place: the new chunks are upserted and stale tail chunks are removed only after the index succeeded, so a failure leaves the previous vectors untouched. Use to fix documents with null/wrong metadata or stale embeddings. Nothing is deleted up front; there is no purge step.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn distill_reindex(
-        &self,
-        Parameters(p): Parameters<DistillReindexParams>,
-    ) -> Result<String, String> {
-        let client = self
-            .distill_client()
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or("No distill server configured")?;
-
-        // Verify the markdown and read the fresh catalog row BEFORE talking
-        // to the vector store. Every failure on the way is returned as is.
-        let (key, catalog_entry) = self.existing_markdown(&p.stem).await?;
-        let result = client
-            .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
-            .await
-            .map_err(|e| format!("Re-index failed for '{}': {e:#}", p.stem))?;
-        self.stamp_embedding(&p.stem, &result).await?;
-
-        to_json(&serde_json::json!({
-            "stem": p.stem,
-            "chunks_indexed": result.chunks_indexed,
-            "embedding_device": result.embedding_device,
-            "has_catalog": catalog_entry.is_some(),
-        }))
-    }
-
-    #[tool(
-        description = "Find catalog entries that are converted but not embedded and re-attempt indexing for each. Use `dry_run=true` to preview the candidate count. By default, documents previously stamped with an embedding_skip reason are excluded; pass `retry_skipped=true` to retry those too. Pairs with the per-document `distill_reindex` tool for batch recovery.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn distill_backfill(
-        &self,
-        Parameters(p): Parameters<DistillBackfillParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<String, String> {
-        // Runs longer than the session idle timeout can tolerate without a
-        // progress signal; see `ProgressHeartbeat`.
-        let _heartbeat = ProgressHeartbeat::start(&context, "distill_backfill".to_string());
-        let triples = hs_common::catalog::list_catalog_entries_parallel(
-            &*self.storage,
-            &self.catalog_prefix,
-            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
-            |_, _| {},
-        )
-        .await
-        .map_err(|e| format!("catalog list failed: {e:#}"))?;
-
-        let candidates: Vec<String> = triples
-            .into_iter()
-            .filter_map(|(stem, _meta, cat)| {
-                let converted = cat.conversion.is_some();
-                let already_embedded = cat.embedding.as_ref().is_some_and(|e| e.chunks_indexed > 0);
-                let was_skipped = cat.embedding_skip.is_some();
-                if !converted || already_embedded {
-                    return None;
-                }
-                if was_skipped && !p.retry_skipped {
-                    return None;
-                }
-                Some(stem)
-            })
-            .collect();
-
-        let total = candidates.len();
-        let limit = p.limit.unwrap_or(usize::MAX);
-        let take: Vec<&String> = candidates.iter().take(limit).collect();
-        let sample: Vec<String> = take.iter().take(10).map(|s| (*s).clone()).collect();
-
-        if p.dry_run {
-            return to_json(&serde_json::json!({
-                "candidates": total,
-                "would_index": take.len(),
-                "samples": sample,
-                "dry_run": true,
-            }));
-        }
-
-        let client = self
-            .distill_client()
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or("No distill server configured")?;
-
-        let mut indexed = 0u64;
-        let mut still_skipped = 0u64;
-        let mut errors: Vec<String> = Vec::new();
-
-        for stem in take {
-            // Every per-document failure is reported in `errors` with its
-            // cause; a storage error is never turned into "markdown missing".
-            let (key, catalog_entry) = match self.existing_markdown(stem).await {
-                Ok(found) => found,
-                Err(e) => {
-                    errors.push(format!("{stem}: {e}"));
-                    continue;
-                }
-            };
-            match client
-                .index_from_storage_with_catalog(&*self.storage, &key, catalog_entry.as_ref())
-                .await
-            {
-                Ok(result) => {
-                    if let Err(e) = self.stamp_embedding(stem, &result).await {
-                        errors.push(format!("{stem}: {e}"));
-                    }
-                    if result.chunks_indexed > 0 {
-                        indexed += 1;
-                    } else {
-                        still_skipped += 1;
-                    }
-                }
-                Err(e) => errors.push(format!("{stem}: {e:#}")),
-            }
-        }
-
-        to_json(&serde_json::json!({
-            "candidates": total,
-            "indexed": indexed,
-            "still_skipped": still_skipped,
-            "errors": errors,
-            "samples": sample,
-            "dry_run": false,
-        }))
-    }
-
-    // ── Personal Tools ─────────────────────────────────────────
-    //
-    // Read tools (search/list/read) are unconstrained. Write tools
-    // (add/reindex) are scoped: `personal_add` accepts a filename and
-    // resolves it under the configured inbox (cfg.inbox_dir()), refusing
-    // any path separator, leading dot, or symlink-escape — see
-    // `personal::services::inbox::resolve_inbox_path` for the constraints.
-    // Delete is intentionally still CLI-only (`hs personal delete <stem>`).
-
-    #[tool(
-        description = "Semantic search over the personal-documents collection. Use category to scope to medical, financial, etc. Read-only — for ingest, run `hs personal add` from the CLI.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn personal_search(
-        &self,
-        Parameters(p): Parameters<PersonalSearchParams>,
-    ) -> Result<String, String> {
-        let cfg = personal::config::Config::load().map_err(|e| format!("{e:#}"))?;
-        let hits = personal::services::search::search(
-            &cfg,
-            &p.query,
-            p.category.as_deref(),
-            p.limit.unwrap_or(10),
-        )
-        .await
-        .map_err(|e| format!("{e:#}"))?;
-        let json: Vec<serde_json::Value> = hits
-            .into_iter()
-            .map(|h| {
-                // The personal documents are served by the same docs
-                // service as the academic ones, under their own store:
-                // the store is part of the link's signature, so the
-                // link is a capability for this document and not for
-                // another store's.
-                let passage = h.snippet.lines().next().map(str::trim);
-                let links = self
-                    .link_minter
-                    .as_ref()
-                    .and_then(|m| m.mint(&h.stem, hs_common::stores::PERSONAL, None, passage));
-                serde_json::json!({
-                    "stem": h.stem,
-                    "title": h.title,
-                    "category": h.category,
-                    "snippet": h.snippet,
-                    "score": h.score,
-                    "links": links,
-                })
-            })
-            .collect();
-        to_json(&json)
-    }
-
-    #[tool(
-        description = "List ingested personal documents (most recent first), optionally filtered by category. Read-only — for ingest, run `hs personal add` from the CLI.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn personal_list(
-        &self,
-        Parameters(p): Parameters<PersonalListParams>,
-    ) -> Result<String, String> {
-        let cfg = personal::config::Config::load().map_err(|e| format!("{e:#}"))?;
-        let entries = personal::services::catalog::list_entries(
-            &cfg,
-            p.category.as_deref(),
-            p.limit.unwrap_or(50),
-        )
-        .await
-        .map_err(|e| format!("{e:#}"))?;
-        let json: Vec<serde_json::Value> = entries
-            .into_iter()
-            .map(|e| {
-                serde_json::json!({
-                    "stem": e.stem,
-                    "title": e.title,
-                    "category": e.category,
-                    "original_format": e.original_format,
-                })
-            })
-            .collect();
-        to_json(&json)
-    }
-
-    #[tool(
-        description = "Read the converted markdown of a single personal document by stem. Read-only.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn personal_read(
-        &self,
-        Parameters(p): Parameters<PersonalReadParams>,
-    ) -> Result<String, String> {
-        let cfg = personal::config::Config::load().map_err(|e| format!("{e:#}"))?;
-        personal::services::catalog::read_markdown(&cfg, &p.stem)
-            .await
-            .map_err(|e| format!("{e:#}"))
-    }
-
-    #[tool(
-        description = "Ingest a file already staged in the personal inbox. Provide just the FILENAME (e.g. 'medical-record.pdf') — absolute paths and path separators are rejected. The user drops the file under the configured inbox directory; this tool resolves the name, runs the same ingest pipeline as `hs personal add`, and reports the assigned stem/title/category. PDF conversion of long documents can take many minutes; the tool blocks until indexing finishes.",
+        description = "Ingest a file already staged in the personal inbox. Provide just the FILENAME (e.g. 'medical-record.pdf') — absolute paths and path separators are rejected. The user drops the file under the configured inbox directory; this tool resolves the name, runs the same ingest pipeline as `hs personal add`, and reports the assigned doc_id/title/category. PDF conversion of long documents can take many minutes; the tool blocks until indexing finishes.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3104,59 +434,33 @@ impl HomeStillMcp {
     )]
     async fn personal_add(
         &self,
-        Parameters(p): Parameters<PersonalAddParams>,
+        Parameters(p): Parameters<tools::personal_add::PersonalAddParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         // Runs longer than the session idle timeout can tolerate without a
         // progress signal; see `ProgressHeartbeat`.
         let _heartbeat = ProgressHeartbeat::start(&context, "personal_add".to_string());
-        let cfg = personal::config::Config::load().map_err(|e| format!("{e:#}"))?;
-        let path = personal::services::inbox::resolve_inbox_path(&cfg, &p.filename)
-            .map_err(|e| format!("{e:#}"))?;
-        let opts = personal::services::ingest::IngestOptions {
-            category_override: p.category,
-            title_override: p.title,
-            force: p.force,
-        };
-        let outcome = personal::services::ingest::ingest(&cfg, &path, opts)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
-        to_json(&serde_json::json!({
-            "stem": outcome.stem,
-            "title": outcome.title,
-            "category": outcome.category,
-            "chunks_indexed": outcome.chunk_count,
-            "source_file": p.filename,
-        }))
+        self.add_personal_document(p).await
     }
 
     #[tool(
-        description = "Re-chunk and re-embed an already-ingested personal document by stem. Useful after chunker/embedder changes. Replaces the document's vectors in place from the stored markdown: nothing is deleted first, so a failed re-embed leaves the previous vectors untouched.",
+        description = "Save an answer you wrote as a document in the `syntheses` store, so it can be found, read and cited later. Pass its `title`, its `body` (markdown, 1 MiB at most), the `citations` it stands on and optional `tags`. Every citation is `{store, doc_id, quote}` and is checked exactly as `cite` checks it: when a document does not contain its quote, NOTHING is saved and the refusal names the citation, so call `cite` on each quote first. At least one citation is required. The saved document starts with front matter listing the title, the creation time, the tags and each verified citation (store, doc_id, page, lines, quote). Returns `{store, doc_id, citations_verified, next}`; indexing runs in the background. Each call saves a new document.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
+            idempotent_hint = false,
+            open_world_hint = false
         )
     )]
-    async fn personal_reindex(
+    async fn synthesis_save(
         &self,
-        Parameters(p): Parameters<PersonalReindexParams>,
+        Parameters(p): Parameters<tools::synthesis_save::SynthesisSaveParams>,
     ) -> Result<String, String> {
-        let cfg = personal::config::Config::load().map_err(|e| format!("{e:#}"))?;
-        let chunks = personal::services::catalog::reindex(&cfg, &p.stem)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
-        to_json(&serde_json::json!({
-            "stem": p.stem,
-            "chunks_indexed": chunks,
-        }))
+        self.save_synthesis(p).await
     }
 
-    // ── System Tools ───────────────────────────────────────────
-
     #[tool(
-        description = "Full pipeline status: PDF count, markdown count, catalog count, embedded document count, server health for all services. The `history` pane matches `catalog_recent`'s defaults — rows stamped by a `catalog_repair` backfill (`downloaded_at == repair.repaired_at`, or synthetic Convert whose `converted_at == repair.repaired_at`) are suppressed. Pass `include_repaired=true` for forensic mode; repair rows reappear annotated `\"repair\": true`.",
+        description = "How the pipeline is, or how one document is. Without `doc_id`: the queues (sources waiting to be converted, converted documents waiting to be indexed, PDFs waiting for their word boxes; each with `waiting` and `in_progress`), what the index holds for `store` (`academic` by default), and each converter's readiness. It reads only sources that answer at once and never lists the storage. With `doc_id`: whether the document's source is stored and in what format, whether it is converted, how many records each index holds for it, whether its word boxes are `built`, `pending` or `not_applicable`, and the failure recorded for it, if any. A part whose source could not answer carries `error` in place of its value; the rest of the answer stands. Use it after `acquire` or `capture` to learn when a document can be read and cited.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -3164,723 +468,108 @@ impl HomeStillMcp {
             open_world_hint = false
         )
     )]
-    async fn system_status(
+    async fn status(
         &self,
-        Parameters(p): Parameters<SystemStatusParams>,
+        Parameters(p): Parameters<tools::status::StatusParams>,
     ) -> Result<String, String> {
-        let include_repaired = p.include_repaired.unwrap_or(false);
-        let snap = self.build_status_snapshot(20, include_repaired).await;
-        to_json(&snap)
-    }
-
-    // ── OpenAlex (local DuckDB) Tools ────────────────────────────
-
-    #[tool(
-        description = "Search the local OpenAlex catalog by free text (BM25 over title+abstract). Returns JSON array of works with openalex_id, doi, title, year, citations, and bm25 score. Local DB — no external API calls. Requires `hs openalex build-fts` to have been run.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn openalex_search(
-        &self,
-        Parameters(p): Parameters<OpenAlexSearchParams>,
-    ) -> Result<String, String> {
-        let limit = p.max_results.unwrap_or(10).min(200) as i64;
-        let order_by = match p.sort.as_deref() {
-            None | Some("relevance") => "ORDER BY bm25 DESC",
-            Some("citations") => "ORDER BY cited_by_count DESC NULLS LAST, bm25 DESC",
-            Some("year") => "ORDER BY publication_year DESC NULLS LAST, bm25 DESC",
-            Some(other) => {
-                return Err(format!(
-                    "Unknown sort {other:?}. Accepted: relevance, citations, year."
-                ));
-            }
-        };
-        // `conjunctive := 1` requires every query term to appear in the doc.
-        // Without it (default disjunctive), a multi-term query against a
-        // 56M-row corpus matches millions of docs and DuckDB's BM25
-        // implementation OOMs trying to score them all. Conjunctive matches
-        // are also the semantics users actually want for multi-word search.
-        let sql = format!(
-            r#"
-            WITH ranked AS (
-              SELECT
-                openalex_id, doi, title, publication_year, cited_by_count,
-                fts_main_works.match_bm25(openalex_id, ?, conjunctive := 1) AS bm25
-              FROM works
-            )
-            SELECT openalex_id, doi, title, publication_year, cited_by_count, bm25
-            FROM ranked
-            WHERE bm25 IS NOT NULL
-              AND (CAST(? AS BIGINT) IS NULL OR publication_year >= CAST(? AS BIGINT))
-              AND (CAST(? AS BIGINT) IS NULL OR publication_year <= CAST(? AS BIGINT))
-              AND (CAST(? AS BIGINT) IS NULL OR cited_by_count >= CAST(? AS BIGINT))
-            {order_by}
-            LIMIT ?;
-            "#
-        );
-        run_openalex_query_json(
-            self,
-            &sql,
-            vec![
-                duckdb::types::Value::Text(p.query),
-                opt_value(p.year_from.map(i64::from)),
-                opt_value(p.year_from.map(i64::from)),
-                opt_value(p.year_to.map(i64::from)),
-                opt_value(p.year_to.map(i64::from)),
-                opt_value(p.min_citations.map(i64::from)),
-                opt_value(p.min_citations.map(i64::from)),
-                duckdb::types::Value::BigInt(limit),
-            ],
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Look up a single work in the local OpenAlex catalog by OpenAlex ID (e.g. W2741809807) or DOI (e.g. 10.1234/x). Returns JSON with the work + its denormalized authors and topics.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn openalex_get(
-        &self,
-        Parameters(p): Parameters<OpenAlexGetParams>,
-    ) -> Result<String, String> {
-        let conn = openalex_request_conn(
-            self.openalex_db
-                .as_ref()
-                .ok_or_else(openalex_unavailable_error)?,
-        )?;
-        let id = p.id_or_doi.clone();
-        // An OpenAlex id and a DOI can never be confused, so each goes to the
-        // one indexed column that holds it (the shared classification also
-        // normalizes the DOI on the query side).
-        let (column, key) = match openalex_ingest::lookup::classify(&p.id_or_doi) {
-            openalex_ingest::lookup::Key::OpenAlexId(k) => ("openalex_id", k),
-            openalex_ingest::lookup::Key::Doi(k) => ("doi", k),
-        };
-        let result: Result<serde_json::Value, String> = tokio::task::spawn_blocking(move || {
-            // Work row
-            let work = {
-                let mut stmt = conn
-                    .prepare(&format!(
-                        "SELECT openalex_id, doi, title, abstract_text, publication_year,
-                                publication_date, language, type, cited_by_count, is_retracted,
-                                is_oa, oa_url, primary_source_id
-                         FROM works
-                         WHERE {column} = ?
-                         LIMIT 1"
-                    ))
-                    .map_err(|e| format!("prepare: {e}"))?;
-                let mut rows = stmt
-                    .query(duckdb::params![key])
-                    .map_err(|e| format!("query: {e}"))?;
-                let cols: Vec<String> = rows
-                    .as_ref()
-                    .map(|s| s.column_names().into_iter().collect())
-                    .unwrap_or_default();
-                if let Some(row) = rows.next().map_err(|e| format!("next: {e}"))? {
-                    Some(row_to_json(row, &cols)?)
-                } else {
-                    None
-                }
-            };
-            let work = match work {
-                Some(w) => w,
-                None => {
-                    return Ok(serde_json::json!({"error": "not_found", "id_or_doi": id}));
-                }
-            };
-            let work_id = work
-                .get("openalex_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let authors = collect_rows_json(
-                &conn,
-                "SELECT a.openalex_id, a.display_name, wa.author_position,
-                        wa.raw_affiliation_string, wa.institution_id
-                 FROM work_authorships wa
-                 LEFT JOIN authors a ON a.openalex_id = wa.author_id
-                 WHERE wa.work_id = ?
-                 ORDER BY wa.author_position",
-                duckdb::params![work_id],
-            )?;
-            let topics = collect_rows_json(
-                &conn,
-                "SELECT t.openalex_id, t.display_name, wt.score
-                 FROM work_topics wt
-                 LEFT JOIN topics t ON t.openalex_id = wt.topic_id
-                 WHERE wt.work_id = ?
-                 ORDER BY wt.score DESC NULLS LAST",
-                duckdb::params![work_id],
-            )?;
-
-            let mut out = work;
-            if let serde_json::Value::Object(ref mut m) = out {
-                m.insert("authors".into(), serde_json::Value::Array(authors));
-                m.insert("topics".into(), serde_json::Value::Array(topics));
-            }
-            Ok::<serde_json::Value, String>(out)
-        })
-        .await
-        .map_err(|e| format!("join: {e}"))?;
-
-        let v = result?;
-        to_json(&v)
-    }
-
-    #[tool(
-        description = "List works that the given OpenAlex work cites (outbound references). Returns JSON array of cited works with openalex_id, doi, title, year, cited_by_count.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn openalex_references(
-        &self,
-        Parameters(p): Parameters<OpenAlexReferencesParams>,
-    ) -> Result<String, String> {
-        let limit = p.limit.unwrap_or(100).min(1000) as i64;
-        let sql = "SELECT w.openalex_id, w.doi, w.title, w.publication_year, w.cited_by_count
-                   FROM work_references wr
-                   LEFT JOIN works w ON w.openalex_id = wr.referenced_work_id
-                   WHERE wr.work_id = ?
-                   ORDER BY w.cited_by_count DESC NULLS LAST
-                   LIMIT ?";
-        run_openalex_query_json(
-            self,
-            sql,
-            vec![
-                duckdb::types::Value::Text(p.openalex_id),
-                duckdb::types::Value::BigInt(limit),
-            ],
-        )
-        .await
-    }
-
-    #[tool(
-        description = "List works that cite the given OpenAlex work (forward citation chaining). Returns JSON array of citing works.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn openalex_citations(
-        &self,
-        Parameters(p): Parameters<OpenAlexCitationsParams>,
-    ) -> Result<String, String> {
-        let limit = p.limit.unwrap_or(100).min(1000) as i64;
-        let order_by = match p.sort.as_deref() {
-            None | Some("citations") => "ORDER BY w.cited_by_count DESC NULLS LAST",
-            Some("year") => "ORDER BY w.publication_year DESC NULLS LAST",
-            Some(other) => {
-                return Err(format!(
-                    "Unknown sort {other:?}. Accepted: citations, year."
-                ));
-            }
-        };
-        let sql = format!(
-            "SELECT w.openalex_id, w.doi, w.title, w.publication_year, w.cited_by_count
-             FROM work_references wr
-             LEFT JOIN works w ON w.openalex_id = wr.work_id
-             WHERE wr.referenced_work_id = ?
-               AND (CAST(? AS BIGINT) IS NULL OR w.publication_year >= CAST(? AS BIGINT))
-             {order_by}
-             LIMIT ?"
-        );
-        run_openalex_query_json(
-            self,
-            &sql,
-            vec![
-                duckdb::types::Value::Text(p.openalex_id),
-                opt_value(p.year_from.map(i64::from)),
-                opt_value(p.year_from.map(i64::from)),
-                duckdb::types::Value::BigInt(limit),
-            ],
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Top authors for an OpenAlex topic, ranked by total cited_by_count. Joins work_topics → work_authorships → authors. Returns JSON array of (openalex_id, display_name, cited_by_count, papers_in_topic).",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn openalex_authors_by_topic(
-        &self,
-        Parameters(p): Parameters<OpenAlexAuthorsByTopicParams>,
-    ) -> Result<String, String> {
-        let limit = p.limit.unwrap_or(25).min(200) as i64;
-        let sql = "SELECT a.openalex_id, a.display_name, a.cited_by_count,
-                          COUNT(*) AS papers_in_topic
-                   FROM work_topics wt
-                   JOIN work_authorships wa ON wa.work_id = wt.work_id
-                   JOIN authors a ON a.openalex_id = wa.author_id
-                   WHERE wt.topic_id = ?
-                   GROUP BY a.openalex_id, a.display_name, a.cited_by_count
-                   ORDER BY a.cited_by_count DESC NULLS LAST
-                   LIMIT ?";
-        run_openalex_query_json(
-            self,
-            sql,
-            vec![
-                duckdb::types::Value::Text(p.topic_id),
-                duckdb::types::Value::BigInt(limit),
-            ],
-        )
-        .await
+        self.report_status(p).await
     }
 }
 
-impl HomeStillMcp {
-    /// Build the unified StatusSnapshot used by both `system_status` (MCP) and
-    /// `hs status` (CLI cloud-client mode). Truth source for pipeline state.
-    pub(crate) async fn build_status_snapshot(
-        &self,
-        history_limit: usize,
-        include_repaired: bool,
-    ) -> hs_common::status::StatusSnapshot {
-        use hs_common::status::{
-            build_history, collect_pipeline_counts, QdrantInfo, ServiceInstance, StatusSnapshot,
-        };
-
-        // Per-distill health fanout (also yields embedded doc/chunk counts).
-        let mut distill_instances: Vec<ServiceInstance> = Vec::new();
-        let mut embedded_documents: Option<u64> = None;
-        let mut embedded_chunks: Option<u64> = None;
-        let mut qdrant: Option<QdrantInfo> = None;
-        for url in &self.distill_servers {
-            let client = match hs_distill::client::DistillClient::new(url) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("distill client build for {url} failed: {e}");
-                    continue;
-                }
-            };
-            let (health, health_err) = split_result(client.health().await);
-            let (readiness, readiness_err) = split_result(client.readiness().await);
-            let (status, status_err) = split_result(client.status().await);
-            let error = join_call_errors(&[
-                ("health", &health_err),
-                ("readiness", &readiness_err),
-                ("status", &status_err),
-            ]);
-
-            let healthy = health.is_some();
-            let version = health
-                .as_ref()
-                .map(|h| h.version.clone())
-                .unwrap_or_default();
-            let compute_device = status
-                .as_ref()
-                .map(|s| s.compute_device.clone())
-                .or_else(|| health.as_ref().map(|h| h.compute_device.clone()))
-                .unwrap_or_default();
-            let embed_model = status
-                .as_ref()
-                .map(|s| s.embed_model.clone())
-                .or_else(|| health.as_ref().map(|h| h.embed_model.clone()))
-                .unwrap_or_default();
-            let collection = status
-                .as_ref()
-                .map(|s| s.collection.clone())
-                .or_else(|| health.as_ref().map(|h| h.collection.clone()))
-                .unwrap_or_default();
-            let in_flight = readiness.as_ref().map(|r| r.in_flight as u64).unwrap_or(0);
-            let activity = if !healthy {
-                format!("unhealthy: {}", health_err.as_deref().unwrap_or("unknown"))
-            } else if in_flight > 0 {
-                format!("{in_flight} embedding")
-            } else {
-                "idle".to_string()
-            };
-
-            if let Some(s) = status.as_ref() {
-                if embedded_documents.is_none() {
-                    embedded_documents = Some(s.documents_count);
-                    embedded_chunks = Some(s.points_count);
-                }
-            }
-            if qdrant.is_none() && !collection.is_empty() {
-                qdrant = Some(QdrantInfo {
-                    collection: collection.clone(),
-                    compute_device: compute_device.clone(),
-                    embed_model: embed_model.clone(),
-                    qdrant_version: health
-                        .as_ref()
-                        .map(|h| h.qdrant_version.clone())
-                        .unwrap_or_default(),
-                    // Served only by the token-protected /status.
-                    qdrant_url: status
-                        .as_ref()
-                        .map(|s| s.qdrant_url.clone())
-                        .unwrap_or_default(),
-                });
-            }
-
-            distill_instances.push(ServiceInstance {
-                url: url.clone(),
-                healthy,
-                version,
-                compute_device,
-                embed_model,
-                collection,
-                activity,
-                in_flight,
-                slots_total: None,
-                slots_available: None,
-                error,
-            });
-        }
-
-        // Per-scribe health fanout.
-        let mut scribe_instances: Vec<ServiceInstance> = Vec::new();
-        for url in &self.scribe_servers {
-            let client = match hs_scribe::client::ScribeClient::new(url) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("scribe client build for {url} failed: {e}");
-                    continue;
-                }
-            };
-            let (health, health_err) = split_result(client.health().await);
-            let (readiness, readiness_err) = split_result(client.readiness().await);
-            let error = join_call_errors(&[("health", &health_err), ("readiness", &readiness_err)]);
-
-            // A scribe whose VLM backend can't take work answers 503
-            // with `status: "backend_unavailable"`. The body still
-            // parses, so "reachable" is not "usable" — key off status.
-            let status = health.as_ref().map(|h| h.status.as_str());
-            let backend_unavailable = status == Some(hs_scribe::client::BACKEND_UNAVAILABLE);
-            let healthy = status == Some("ok");
-            let version = health
-                .as_ref()
-                .map(|h| h.version.clone())
-                .unwrap_or_default();
-            let (in_flight, slots_total, slots_available) = match readiness.as_ref() {
-                Some(r) => (
-                    r.in_flight_conversions as u64,
-                    Some(r.vlm_slots_total as u64),
-                    Some(r.vlm_slots_available as u64),
-                ),
-                None => (0, None, None),
-            };
-            let activity = if backend_unavailable {
-                // A diagnosis, not a symptom. "backend unavailable"
-                // is indistinguishable from a crashed server, a missing
-                // model, a wrong URL or a broken converter — and the
-                // operator's next step is to read a journal on another
-                // host. The gate's own numbers turn it into an action.
-                backend_unavailable_reason(health.as_ref())
-            } else if !healthy {
-                format!(
-                    "unhealthy: {}",
-                    health_err.as_deref().unwrap_or("status not ok")
-                )
-            } else if in_flight > 0 {
-                format!("{in_flight} converting")
-            } else {
-                "idle".to_string()
-            };
-
-            scribe_instances.push(ServiceInstance {
-                url: url.clone(),
-                healthy,
-                version,
-                compute_device: String::new(),
-                embed_model: String::new(),
-                collection: String::new(),
-                activity,
-                in_flight,
-                slots_total,
-                slots_available,
-                error,
-            });
-        }
-
-        // Scan the catalog once; reuse for both the pipeline failed-count
-        // and the history panel so we don't pay to deserialize every YAML twice.
-        let (catalog_triples, catalog_error) =
-            match hs_common::catalog::list_catalog_entries_parallel(
-                &*self.storage,
-                &self.catalog_prefix,
-                hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
-                |_, _| {},
-            )
-            .await
-            {
-                Ok(triples) => (Some(triples), None),
-                Err(e) => (None, Some(format!("listing the catalog failed: {e:#}"))),
-            };
-
-        // Count entries stamped `embedding_skip` so progress percentages
-        // can exclude intentionally-skipped docs from the denominator.
-        let embedding_skipped: Option<u64> = catalog_triples.as_ref().map(|triples| {
-            triples
-                .iter()
-                .filter(|(_, _, entry)| entry.embedding_skip.is_some())
-                .count() as u64
-        });
-
-        // Same pass — catalog rows stamped `conversion_failed`, by what a
-        // retry can do (`hs status` renders them as the Failed row).
-        let failed_conversions = catalog_triples.as_ref().map(|triples| {
-            hs_common::status::FailedConversions::tally(
-                triples
-                    .iter()
-                    .filter_map(|(_, _, entry)| entry.conversion_failed.as_ref())
-                    .map(|f| f.reason.as_str()),
-                hs_scribe::classify::stamp_kind,
-            )
-        });
-
-        // Inbox queue — files waiting in `papers/manually_downloaded/` for
-        // the next sweep tick. Filtered by the same whitelist the sweeper
-        // applies, so the dashboard number tracks what the daemon will
-        // actually relocate. A listing failure is logged with its cause and
-        // leaves the count unknown (`Inbox ···`) rather than failing the
-        // whole `system_status`.
-        let inbox_prefix = format!(
-            "{}/manually_downloaded/",
-            self.papers_prefix.trim_end_matches('/')
-        );
-        let inbox_pending: Option<u64> = match self.storage.list(&inbox_prefix).await {
-            Ok(objs) => Some(
-                objs.iter()
-                    .filter(|o| {
-                        let fn_ = o.key.rsplit('/').next().unwrap_or("");
-                        hs_common::inbox::is_inbox_candidate_filename(fn_)
-                    })
-                    .count() as u64,
-            ),
-            Err(e) => {
-                tracing::warn!(prefix = %inbox_prefix, error = %e, "inbox listing failed; the inbox count is unknown");
-                None
-            }
-        };
-
-        // A failed listing must not read as a fully converted, empty corpus:
-        // mark the counts unavailable so `hs status` renders "unknown".
-        let mut pipeline = match collect_pipeline_counts(
-            &*self.storage,
-            &self.papers_prefix,
-            &self.markdown_prefix,
-            &self.catalog_prefix,
-            embedded_documents,
-            embedded_chunks,
-            embedding_skipped,
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                let mut p = hs_common::status::PipelineCounts {
-                    embedded_documents,
-                    embedded_chunks,
-                    embedding_skipped,
-                    ..Default::default()
-                };
-                p.mark_unavailable(&e);
-                p
-            }
-        };
-        if let Some(reason) = &catalog_error {
-            pipeline.mark_unavailable(reason);
-        }
-
-        // Pipeline drift: distinct source stems that haven't produced
-        // markdown yet, less whatever is converting right now. Saturating
-        // subtraction so stage lag never yields a negative.
-        //
-        // Counted per *stem*, not per object: a paper stored as both `.pdf`
-        // and `.html` yields one markdown, and markdown whose source was
-        // removed by the DOI-stem lowercasing migration has no source at
-        // all. The old `documents - markdown` object arithmetic charged the
-        // former as backlog and credited the latter against it, holding the
-        // metric at 71 against a threshold of 3 no matter how much the
-        // pipeline converted. See `count_unconverted_stems`.
-        //
-        // By design, catalog rows stamped `conversion_failed` that still
-        // sit in the live papers tree (surfaced separately as
-        // `failed_conversions`) are NOT subtracted — drift is meant to surface
-        // them too, since failed converts represent stuck pipeline state
-        // the operator should see. Values above `pipeline_drift_threshold`
-        // indicate either stamped failures or stems that errored without a
-        // stamp; check scribe/event-watch logs for the latter.
-        //
-        // Stalled, unlike drift, leaves stamped stems out: it is what `hs
-        // pipeline catch-up` would queue, and catch-up skips them. Without
-        // the catalog the stamped stems are unknown, and so is Stalled.
-        let total_in_flight: u64 = scribe_instances.iter().map(|s| s.in_flight).sum();
-        let stamped: Option<std::collections::HashSet<&str>> =
-            catalog_triples.as_ref().map(|triples| {
-                triples
-                    .iter()
-                    .filter(|(_, _, entry)| entry.conversion_failed.is_some())
-                    .map(|(stem, _, _)| stem.as_str())
-                    .collect()
-            });
-        let unstamped_unconverted = match hs_common::status::count_unconverted_stems(
-            &*self.storage,
-            &self.papers_prefix,
-            &self.markdown_prefix,
-            stamped.as_ref().unwrap_or(&Default::default()),
-        )
-        .await
-        {
-            Ok(unconverted) => {
-                pipeline.pipeline_drift = unconverted.all.saturating_sub(total_in_flight);
-                stamped.as_ref().map(|_| unconverted.unstamped)
-            }
-            Err(e) => {
-                pipeline.mark_unavailable(&e);
-                None
-            }
-        };
-        // Bounded: an unreachable broker must not stall the whole snapshot.
-        let depth = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.events
-                .queue_depth(&hs_common::event_bus::specs::PAPERS_INGESTED),
-        )
-        .await
-        {
-            Ok(Ok(depth)) => Ok(depth.outstanding()),
-            Ok(Err(e)) => Err(format!("{e:#}")),
-            Err(_) => Err("timed out asking the broker for queue depth".to_string()),
-        };
-        pipeline.record_queue(unstamped_unconverted, depth);
-        pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
-        pipeline.failed_conversions = failed_conversions;
-        pipeline.inbox_pending = inbox_pending;
-        pipeline.in_flight_conversions = Some(total_in_flight);
-
-        // History from the catalog — same source and same default filter as
-        // `catalog_recent` so the two activity feeds can never disagree.
-        let history = match catalog_triples {
-            Some(triples) => {
-                let pairs: Vec<(String, hs_common::catalog::CatalogEntry)> =
-                    triples.into_iter().map(|(s, _m, e)| (s, e)).collect();
-                build_history(&pairs, history_limit, include_repaired)
-            }
-            None => Vec::new(),
-        };
-
-        // Inbox-sweeper heartbeat. Populated server-side so every client
-        // (mac_air, big, laptop) renders the same verdict. `None` = no
-        // heartbeat key in storage; `Some(.running=false)` = stale.
-        // A storage/parse error is surfaced via `counts_error`, not folded
-        // into `None` (which means "no heartbeat key").
-        let inbox_heartbeat = match hs_common::status::read_inbox_heartbeat(&*self.storage).await {
-            Ok(hb) => hb,
-            Err(e) => {
-                pipeline.mark_unavailable(&e);
-                None
-            }
-        };
-
-        StatusSnapshot {
-            pipeline,
-            scribe_instances,
-            distill_instances,
-            qdrant,
-            history,
-            inbox_heartbeat,
-            generated_at: Some(chrono::Utc::now().to_rfc3339()),
-        }
-    }
-}
-
-// ── Prompt parameter types ───────────────────────────────────────
+// ── Prompts ─────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct ResearchPromptParams {
-    #[schemars(description = "Research topic to investigate")]
+struct GuidancePromptParams {
+    #[schemars(description = "The question to answer from the corpus")]
+    question: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct VerifyPromptParams {
+    #[schemars(description = "The claim to check against the corpus")]
+    claim: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct BriefPromptParams {
+    #[schemars(description = "The topic to write a brief on")]
     topic: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct SummarizePromptParams {
-    #[schemars(description = "Paper stem name to summarize")]
-    stem: Stem,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct ComparePromptParams {
-    #[schemars(description = "First paper stem name")]
-    stem_a: Stem,
-    #[schemars(description = "Second paper stem name")]
-    stem_b: Stem,
 }
 
 #[prompt_router]
 impl HomeStillMcp {
-    #[prompt(description = "Research a topic: search papers, read documents, synthesize findings")]
-    fn research_paper(
-        &self,
-        Parameters(p): Parameters<ResearchPromptParams>,
-    ) -> Vec<PromptMessage> {
+    #[prompt(
+        description = "Answer a question from the corpus: profile, recall, cite each claim, answer with links"
+    )]
+    fn guidance(&self, Parameters(p): Parameters<GuidancePromptParams>) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
             PromptMessageRole::User,
             format!(
-                "Research the topic: \"{}\"\n\n\
-                 Use the home-still tools in this order:\n\
-                 1. paper_search to find relevant papers\n\
-                 2. catalog_read to check which papers are in our collection\n\
-                 3. markdown_read to read the full text of converted papers\n\
-                 4. distill_search for semantic search across the indexed corpus\n\
-                 5. Synthesize the findings into a comprehensive summary with citations",
+                "Answer this question from the user's corpus: \"{}\"\n\n\
+                 1. `profile` (myelin): read what the user is known to prefer, and let it shape \
+                 the form of the answer.\n\
+                 2. `stores` (myelin), then `recall` over the stores the question needs: \
+                 `academic` for papers, `abstracts` for a broad first pass, `web` for captured \
+                 pages, `syntheses` for earlier answers, `memory` for what was said before, and \
+                 `personal` only when the question is about the user's own records. Use \
+                 `investigate` when one search is not enough.\n\
+                 3. `read` (home-still) a hit's document when the passage needs its context.\n\
+                 4. `cite` (home-still) every passage you intend to quote, with the hit's \
+                 `store`, its `meta.doc_id` and the exact words. A quote that `cite` refuses is \
+                 not in the document: quote the passage it names instead, or drop the claim.\n\
+                 5. Answer. Give each quotation with its citation's link (`links.viewer` for a \
+                 located passage, otherwise `links.markdown`), say so when `boxes.status` is \
+                 `not_located`, and keep what the corpus says apart from what you infer. When \
+                 the corpus does not answer the question, say that instead of answering from \
+                 memory.",
+                p.question
+            ),
+        )]
+    }
+
+    #[prompt(
+        description = "Check a claim against the corpus: find support and contradiction, cite both, give a verdict"
+    )]
+    fn verify(&self, Parameters(p): Parameters<VerifyPromptParams>) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Check this claim against the user's corpus: \"{}\"\n\n\
+                 1. `recall` (myelin) twice: once for passages that support the claim, once \
+                 for passages that contradict or qualify it.\n\
+                 2. `read` (home-still) around the strongest passages, so none is taken out \
+                 of its context.\n\
+                 3. `cite` (home-still) each passage you rely on. Only a passage `cite` \
+                 accepts counts as evidence.\n\
+                 4. Give a verdict: supported, contradicted, mixed, or not in the corpus. \
+                 List the cited passages for and against, each with its link. \"Not in the \
+                 corpus\" is an answer: do not fill the gap from memory. `discover` can find \
+                 works that would settle it, and `acquire` brings one in.",
+                p.claim
+            ),
+        )]
+    }
+
+    #[prompt(
+        description = "Write a cited brief on a topic from the corpus, widen the corpus if it is thin, and save the brief"
+    )]
+    fn brief(&self, Parameters(p): Parameters<BriefPromptParams>) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Write a brief on \"{}\" from the user's corpus.\n\n\
+                 1. `recall` (myelin) over `abstracts` to find the documents that matter, \
+                 then over `academic`, `web` and `syntheses` for their passages.\n\
+                 2. `read` (home-still) the central documents where the passages are.\n\
+                 3. If the corpus is thin: `discover` and `graph` to find the central works, \
+                 `acquire` them (or `capture` a page you have read), and ask `status` until \
+                 they are converted.\n\
+                 4. `cite` every quotation.\n\
+                 5. Write the brief: the question, what the sources agree on, where they \
+                 differ, what is not known. Each claim carries its citation's link.\n\
+                 6. `synthesis_save` the brief with the citations it stands on, so it can be \
+                 recalled later.",
                 p.topic
-            ),
-        )]
-    }
-
-    #[prompt(description = "Summarize a specific document from the collection")]
-    fn summarize_document(
-        &self,
-        Parameters(p): Parameters<SummarizePromptParams>,
-    ) -> Vec<PromptMessage> {
-        vec![PromptMessage::new_text(
-            PromptMessageRole::User,
-            format!(
-                "Read and summarize the paper with stem \"{}\".\n\n\
-                 1. Use catalog_read to get the metadata\n\
-                 2. Use markdown_read to get the full text\n\
-                 3. Provide a structured summary: objective, methods, key findings, limitations, and relevance",
-                p.stem
-            ),
-        )]
-    }
-
-    #[prompt(description = "Compare two papers from the collection")]
-    fn compare_papers(&self, Parameters(p): Parameters<ComparePromptParams>) -> Vec<PromptMessage> {
-        vec![PromptMessage::new_text(
-            PromptMessageRole::User,
-            format!(
-                "Compare these two papers:\n\
-                 - Paper A: \"{}\"\n\
-                 - Paper B: \"{}\"\n\n\
-                 1. Use catalog_read for metadata on both\n\
-                 2. Use markdown_read for full text of both\n\
-                 3. Compare: research questions, methodology, findings, and conclusions\n\
-                 4. Note agreements, contradictions, and complementary insights",
-                p.stem_a, p.stem_b
             ),
         )]
     }
@@ -3935,210 +624,33 @@ impl ServerHandler for HomeStillMcp {
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
-                .enable_resources()
                 .enable_prompts()
                 .build(),
         )
         .with_instructions(
-            "home-still: Academic research pipeline server.\n\n\
-             Full pipeline workflow:\n\
-             1. DISCOVER: paper_search (by query) or paper_get (by DOI) — metadata lookup\n\
-             2. DOWNLOAD: paper_download (by DOI) — downloads the actual PDF/HTML into the papers directory. This is REQUIRED before conversion.\n\
-             3. CONVERT: scribe_queue (PDF/HTML/EPUB stem → queued) then poll; scribe_convert BLOCKS for the whole conversion (timeout ceiling 3600 s), so use it only when you need the markdown in this call\n\
-             4. READ: catalog_read, markdown_read, or use resources (catalog:///{stem}, markdown:///{stem})\n\
-             5. INDEX: distill_index (markdown → vector DB)\n\
-             6. SEARCH: distill_search (semantic search across all indexed papers)\n\
-             7. MONITOR: system_status, scribe_health, distill_status\n\n\
-             To add a new paper to the pipeline: paper_search → paper_download → scribe_queue → (poll catalog_list) → distill_index\n\n\
-             Personal documents: personal_search, personal_list, personal_read are read-only \
-             over the user's private medical/financial/school records. Writes are scoped: \
-             personal_add takes a FILENAME (not a path) and resolves it under the configured \
-             inbox directory (default ~/home-still/personal/inbox/); the user drops the file \
-             there, the tool ingests it. personal_reindex re-chunks an existing stem. Delete \
-             is intentionally CLI-only — run `hs personal delete <stem>`.\n\n\
-             Prompts: research_paper, summarize_document, compare_papers",
+            "home-still: the user's document corpus, with citations a reader can check.\n\n\
+             Search and memory are the `myelin` server's, not this one's: `recall` (or \
+             `investigate`) searches the stores, `remember` keeps what the user tells you, \
+             `profile` says what they prefer. A hit names its `store` and its `meta.doc_id`; \
+             every tool here takes those two.\n\n\
+             - `cite` every passage you quote from the corpus BEFORE you present it. A quote \
+             it refuses is not in the document.\n\
+             - `read` a document for the context around a hit; `documents` lists what a \
+             store holds.\n\
+             - Widen the corpus: `discover` finds works, `graph` follows citations, \
+             `acquire` downloads a paper by DOI, `capture` keeps a web page you have read; \
+             `status` says when a new document can be read and cited.\n\
+             - `synthesis_save` keeps an answer, with the citations it stands on, so it can \
+             be recalled later.\n\
+             - `personal_add` ingests a file the user staged in the personal inbox: it takes \
+             a FILENAME, never a path. Deleting a personal document is `hs personal delete` \
+             on the command line, on purpose.\n\n\
+             Stores: `academic` (papers), `references` and `abstracts` (derived from the \
+             papers), `personal` (the user's own records), `web` (captured pages), \
+             `syntheses` (saved answers) and `memory`.\n\n\
+             Prompts: guidance (answer a question), verify (check a claim), brief (write a \
+             cited brief).",
         )
-    }
-
-    async fn list_resources(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        use rmcp::model::AnnotateAble;
-
-        let mut resources = Vec::new();
-
-        // Catalog entries via Storage
-        let triples = hs_common::catalog::list_catalog_entries_parallel(
-            &*self.storage,
-            &self.catalog_prefix,
-            hs_common::catalog::CATALOG_FETCH_CONCURRENCY,
-            |_, _| {},
-        )
-        .await
-        .map_err(|e| ErrorData::internal_error(format!("catalog list failed: {e:#}"), None))?;
-        for (stem, _meta, cat) in triples {
-            let title = cat.title.unwrap_or_else(|| stem.clone());
-            resources.push(
-                RawResource {
-                    uri: format!("catalog:///{stem}"),
-                    name: title,
-                    title: None,
-                    description: Some("Catalog entry with paper metadata".into()),
-                    mime_type: Some("application/yaml".into()),
-                    size: None,
-                    icons: None,
-                    meta: None,
-                }
-                .no_annotation(),
-            );
-        }
-
-        // Markdown documents via Storage
-        let metas =
-            hs_common::markdown::list_markdown_meta_via(&*self.storage, &self.markdown_prefix)
-                .await
-                .map_err(|e| {
-                    ErrorData::internal_error(format!("markdown list failed: {e:#}"), None)
-                })?;
-        for (stem, obj) in metas {
-            resources.push(
-                RawResource {
-                    uri: format!("markdown:///{stem}"),
-                    name: stem.clone(),
-                    title: None,
-                    description: Some("Converted markdown document".into()),
-                    mime_type: Some("text/markdown".into()),
-                    size: Some(obj.size as u32),
-                    icons: None,
-                    meta: None,
-                }
-                .no_annotation(),
-            );
-        }
-
-        Ok(ListResourcesResult::with_all_items(resources))
-    }
-
-    async fn list_resource_templates(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        use rmcp::model::AnnotateAble;
-
-        Ok(ListResourceTemplatesResult::with_all_items(vec![
-            RawResourceTemplate {
-                uri_template: "catalog:///{stem}".into(),
-                name: "Catalog Entry".into(),
-                title: None,
-                description: Some(
-                    "Paper catalog entry with metadata, conversion info, and page offsets".into(),
-                ),
-                mime_type: Some("application/yaml".into()),
-                icons: None,
-            }
-            .no_annotation(),
-            RawResourceTemplate {
-                uri_template: "markdown:///{stem}".into(),
-                name: "Markdown Document".into(),
-                title: None,
-                description: Some("Full converted markdown of an academic paper".into()),
-                mime_type: Some("text/markdown".into()),
-                icons: None,
-            }
-            .no_annotation(),
-            RawResourceTemplate {
-                uri_template: "markdown:///{stem}/page/{page}".into(),
-                name: "Markdown Page".into(),
-                title: None,
-                description: Some(
-                    "Single page from a converted markdown document (1-based)".into(),
-                ),
-                mime_type: Some("text/markdown".into()),
-                icons: None,
-            }
-            .no_annotation(),
-        ]))
-    }
-
-    async fn read_resource(
-        &self,
-        request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
-        let uri = &request.uri;
-
-        if let Some(stem) = uri.strip_prefix("catalog:///") {
-            let stem = Stem::parse(stem).map_err(Stem::invalid_params)?;
-            // Catalog resource via Storage
-            let entry = hs_common::catalog::read_catalog_entry_via(
-                &*self.storage,
-                &self.catalog_prefix,
-                &stem,
-            )
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("catalog read: {e:#}"), None))?
-            .ok_or_else(|| ErrorData::resource_not_found("catalog entry not found", None))?;
-            let yaml = serde_json::to_string_pretty(&entry)
-                .map_err(|e| ErrorData::internal_error(format!("serialize error: {e}"), None))?;
-            Ok(ReadResourceResult::new(vec![
-                ResourceContents::TextResourceContents {
-                    uri: uri.clone(),
-                    mime_type: Some("application/yaml".into()),
-                    text: yaml,
-                    meta: None,
-                },
-            ]))
-        } else if let Some(rest) = uri.strip_prefix("markdown:///") {
-            // Markdown resource — check for page number
-            let (stem, page) = if let Some((s, p)) = rest.rsplit_once("/page/") {
-                let page: usize = p.parse().map_err(|_| {
-                    ErrorData::invalid_params(format!("invalid page number: {p}"), None)
-                })?;
-                (s, Some(page))
-            } else {
-                (rest, None)
-            };
-
-            let stem = Stem::parse(stem).map_err(Stem::invalid_params)?;
-            let content = hs_common::markdown::read_markdown_via(
-                &*self.storage,
-                &self.markdown_prefix,
-                &stem,
-            )
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))?
-            .ok_or_else(|| ErrorData::resource_not_found("markdown not found", None))?;
-
-            let text = if let Some(page) = page {
-                let pages: Vec<&str> = content.split(hs_common::markdown::PAGE_SEPARATOR).collect();
-                if page == 0 || page > pages.len() {
-                    return Err(ErrorData::invalid_params(
-                        format!("page {page} not found, document has {} pages", pages.len()),
-                        None,
-                    ));
-                }
-                pages[page - 1].to_string()
-            } else {
-                content
-            };
-
-            Ok(ReadResourceResult::new(vec![
-                ResourceContents::TextResourceContents {
-                    uri: uri.clone(),
-                    mime_type: Some("text/markdown".into()),
-                    text,
-                    meta: None,
-                },
-            ]))
-        } else {
-            Err(ErrorData::resource_not_found(
-                "unknown resource URI scheme",
-                None,
-            ))
-        }
     }
 }
 
@@ -4242,25 +754,6 @@ async fn async_main() -> anyhow::Result<()> {
     result
 }
 
-fn resolve_provider_arg(s: Option<&str>) -> Result<paper::cli::ProviderArg, String> {
-    use paper::cli::ProviderArg;
-    let Some(name) = s else {
-        return Ok(ProviderArg::All);
-    };
-    match name {
-        "all" => Ok(ProviderArg::All),
-        "arxiv" => Ok(ProviderArg::Arxiv),
-        "openalex" => Ok(ProviderArg::OpenAlex),
-        "semantic_scholar" | "s2" => Ok(ProviderArg::SemanticScholar),
-        "europmc" | "pmc" => Ok(ProviderArg::EuropePmc),
-        "crossref" => Ok(ProviderArg::CrossRef),
-        "core" => Ok(ProviderArg::Core),
-        other => Err(format!(
-            "Unknown provider {other:?}. Accepted: all, arxiv, openalex, semantic_scholar (s2), europmc (pmc), crossref, core."
-        )),
-    }
-}
-
 async fn install_logging(is_sse: bool) -> hs_common::logging::LoggingHandle {
     use hs_common::logging::{self, StderrOutput};
     let (service, stderr) = if is_sse {
@@ -4281,182 +774,8 @@ async fn install_logging(is_sse: bool) -> hs_common::logging::LoggingHandle {
 }
 
 #[cfg(test)]
-mod backend_reason_tests {
-    use super::*;
-
-    fn health(
-        free: Option<u64>,
-        headroom: Option<u64>,
-        holders: Option<&str>,
-        resident: Option<bool>,
-    ) -> hs_scribe::client::HealthResponse {
-        hs_scribe::client::HealthResponse {
-            status: "backend_unavailable".into(),
-            layout_model: false,
-            table_model: false,
-            layout_model_reason: None,
-            table_model_reason: None,
-            version: "0.0.1-rc.374".into(),
-            gpu_name: None,
-            gpu_utilization_pct: None,
-            gpu_memory_used_mb: None,
-            last_conversion_at: None,
-            total_conversions: 0,
-            backend_reachable: Some(true),
-            backend_model_resident: resident,
-            backend_vram_free_mb: free,
-            backend_vram_headroom_mb: headroom,
-            backend_vram_holders: holders.map(str::to_string),
-            backend_yielding_to: None,
-            backend_checked_at: None,
-        }
-    }
-
-    /// The report must name the shortfall: a free-VRAM number on its
-    /// own says nothing, and "backend unavailable" says even less.
-    #[test]
-    fn a_shortfall_is_reported_with_both_numbers() {
-        let h = health(Some(13251), Some(13500), None, Some(false));
-        let reason = backend_unavailable_reason(Some(&h));
-        assert!(reason.contains("12.9 GiB free"), "{reason}");
-        assert!(reason.contains("13.2 GiB"), "{reason}");
-    }
-
-    /// The holders are the question an operator actually has: who is
-    /// holding the card. The answer names the tenants in GiB, not raw
-    /// pids and MB — a pid is not actionable from a status row.
-    #[test]
-    fn the_holders_are_named_in_gib_without_pids() {
-        let h = health(
-            Some(13251),
-            Some(13500),
-            Some("pid=2227527 7534MB hs-distill-server; pid=1737565 2596MB hs-scribe-server"),
-            Some(false),
-        );
-        let reason = backend_unavailable_reason(Some(&h));
-        assert!(reason.contains("hs-distill-server 7.4 GiB"), "{reason}");
-        assert!(reason.contains("hs-scribe-server 2.5 GiB"), "{reason}");
-        assert!(!reason.contains("pid="), "a pid is noise here: {reason}");
-        assert!(!reason.contains("MB"), "sizes are GiB beside GiB: {reason}");
-    }
-
-    /// LARGEST FIRST, so the tenant that actually took the card leads.
-    #[test]
-    fn the_biggest_tenant_leads() {
-        let h = health(
-            Some(1051),
-            Some(13500),
-            Some("pid=1 500MB ollama; pid=2 15960MB llama-server"),
-            Some(false),
-        );
-        let reason = backend_unavailable_reason(Some(&h));
-        let llama = reason.find("llama-server").expect("llama-server named");
-        let ollama = reason.find("ollama").expect("ollama named");
-        assert!(llama < ollama, "the card's owner leads: {reason}");
-    }
-
-    /// Two processes, one tenant: summing them answers "how much of my
-    /// card is llama-server", which is the question worth answering.
-    #[test]
-    fn a_tenant_running_two_processes_is_folded_into_one_entry() {
-        let h = health(
-            Some(1051),
-            Some(13500),
-            Some("pid=1 15960MB llama-server; pid=2 920MB llama-server; pid=3 500MB ollama"),
-            Some(false),
-        );
-        let reason = backend_unavailable_reason(Some(&h));
-        assert_eq!(
-            reason.matches("llama-server").count(),
-            1,
-            "one entry per tenant: {reason}"
-        );
-        assert!(reason.contains("llama-server 16.5 GiB"), "{reason}");
-    }
-
-    /// A name that is not the last token on the line is still read whole,
-    /// and a malformed entry is dropped rather than printed raw.
-    #[test]
-    fn malformed_holder_entries_are_dropped_not_printed() {
-        assert_eq!(holders_summary(""), "");
-        assert_eq!(holders_summary("pid=1 500MB"), "");
-        assert_eq!(holders_summary("garbage; ; pid=2 100MB ok"), "ok 0.1 GiB");
-    }
-
-    /// A model that is already resident needs no room to start, so no
-    /// headroom is reported against it.
-    #[test]
-    fn a_resident_model_reports_no_headroom_requirement() {
-        let h = health(Some(6000), None, None, Some(true));
-        let reason = backend_unavailable_reason(Some(&h));
-        assert!(!reason.contains("needs"), "{reason}");
-        assert!(reason.contains("5.9 GiB free"), "{reason}");
-    }
-
-    /// A health body with no numbers at all still says something true.
-    #[test]
-    fn a_body_with_no_numbers_falls_back_to_the_symptom() {
-        let h = health(None, None, None, None);
-        assert_eq!(backend_unavailable_reason(Some(&h)), "backend unavailable");
-        assert_eq!(backend_unavailable_reason(None), "backend unavailable");
-    }
-}
-
-#[cfg(test)]
-mod provider_arg_tests {
-    use super::resolve_provider_arg;
-    use paper::cli::ProviderArg;
-
-    #[test]
-    fn none_routes_to_all() {
-        assert!(matches!(resolve_provider_arg(None), Ok(ProviderArg::All)));
-    }
-
-    #[test]
-    fn pmc_aliases_to_europe_pmc() {
-        assert!(matches!(
-            resolve_provider_arg(Some("pmc")),
-            Ok(ProviderArg::EuropePmc)
-        ));
-    }
-
-    #[test]
-    fn s2_aliases_to_semantic_scholar() {
-        assert!(matches!(
-            resolve_provider_arg(Some("s2")),
-            Ok(ProviderArg::SemanticScholar)
-        ));
-    }
-
-    #[test]
-    fn canonical_names_resolve() {
-        assert!(matches!(
-            resolve_provider_arg(Some("crossref")),
-            Ok(ProviderArg::CrossRef)
-        ));
-        assert!(matches!(
-            resolve_provider_arg(Some("europmc")),
-            Ok(ProviderArg::EuropePmc)
-        ));
-        assert!(matches!(
-            resolve_provider_arg(Some("semantic_scholar")),
-            Ok(ProviderArg::SemanticScholar)
-        ));
-    }
-
-    #[test]
-    fn unknown_returns_error_naming_value_and_aliases() {
-        let err = resolve_provider_arg(Some("bogus")).unwrap_err();
-        assert!(
-            err.contains("bogus"),
-            "error should name the bad value: {err}"
-        );
-        assert!(err.contains("pmc"), "error should hint at pmc alias: {err}");
-    }
-}
-
-#[cfg(test)]
 mod startup_tests {
+    use super::openalex::OpenAlexCorpus;
     use super::HomeStillMcp;
 
     /// Regression for P0-4: when `~/.home-still/config.yaml` has no
@@ -4486,6 +805,14 @@ mod startup_tests {
         (tmp, file)
     }
 
+    /// Why the corpus is unavailable; panics when it is ready.
+    fn unavailable(corpus: OpenAlexCorpus) -> String {
+        match corpus {
+            OpenAlexCorpus::Unavailable(reason) => reason,
+            OpenAlexCorpus::Ready(_) => panic!("the corpus must not be ready"),
+        }
+    }
+
     /// RA-121: a malformed `openalex:` section stops the server; it is not
     /// read as "OpenAlex is not configured".
     #[test]
@@ -4497,7 +824,7 @@ mod startup_tests {
             "openalex:\n  db_path: \"  \"\n",
         ] {
             let (_tmp, file) = config_with(yaml);
-            let err = super::open_openalex_readonly(&file)
+            let err = OpenAlexCorpus::open(&file)
                 .err()
                 .unwrap_or_else(|| panic!("must refuse: {yaml}"));
             assert!(format!("{err:#}").contains("openalex"), "{err:#}");
@@ -4505,18 +832,21 @@ mod startup_tests {
     }
 
     #[test]
-    fn an_absent_section_or_database_leaves_openalex_unconfigured() {
+    fn an_absent_section_or_database_says_what_to_do() {
         let (_tmp, file) = config_with("storage:\n  backend: local\n");
-        assert!(super::open_openalex_readonly(&file).unwrap().is_none());
+        let reason = unavailable(OpenAlexCorpus::open(&file).unwrap());
+        assert!(reason.contains("not configured"), "{reason}");
+        assert!(reason.contains("`openalex:` section"), "{reason}");
 
         // A stale key another tool once read (live configs carry
         // `ingest_workers`) is warned about, never fatal.
-        let (tmp, file) = config_with(&format!(
+        let (_tmp, file) = config_with(&format!(
             "openalex:\n  db_path: {}\n  ingest_workers: 8\n",
             "/definitely/not/there/openalex.db"
         ));
-        assert!(super::open_openalex_readonly(&file).unwrap().is_none());
-        drop(tmp);
+        let reason = unavailable(OpenAlexCorpus::open(&file).unwrap());
+        assert!(reason.contains("has not been built"), "{reason}");
+        assert!(reason.contains("hs openalex load-works"), "{reason}");
     }
 }
 
@@ -4587,104 +917,27 @@ mod transport_tests {
 }
 
 #[cfg(test)]
-mod distill_search_mapping_tests {
-    use super::map_distill_search_hits;
-    use hs_common::docs::LinkKey;
-    use hs_distill::client::SearchHit;
-
-    fn fixture() -> Vec<SearchHit> {
-        vec![SearchHit {
-            doc_id: "10.1234_test".to_string(),
-            title: Some("Test paper".to_string()),
-            authors: vec!["Doe".to_string()],
-            year: Some(2024),
-            doi: Some("10.1234/test".to_string()),
-            chunk_text: "lorem ipsum dolor sit amet".to_string(),
-            score: 0.87,
-            pdf_path: Some("papers/10/10.1234_test.pdf".to_string()),
-            line_start: 12,
-            line_end: 16,
-            page: Some(3),
-            category: None,
-        }]
-    }
-
-    fn minter() -> std::sync::Arc<crate::links::LinkMinter> {
-        let key = LinkKey::from_bytes(vec![5u8; 32]).unwrap();
-        crate::links::LinkMinter::for_test(key, "http://host:7446", "https://public.example")
-    }
-
-    #[test]
-    fn include_text_true_preserves_chunk_text() {
-        let out = map_distill_search_hits(fixture(), true, None);
-        let json = serde_json::to_string(&out).unwrap();
-        assert!(json.contains("\"chunk_text\""), "json: {json}");
-        assert!(json.contains("lorem ipsum"), "json: {json}");
-    }
-
-    #[test]
-    fn include_text_false_omits_chunk_text_key() {
-        let out = map_distill_search_hits(fixture(), false, None);
-        let json = serde_json::to_string(&out).unwrap();
-        assert!(
-            !json.contains("\"chunk_text\""),
-            "chunk_text key should be absent; got: {json}"
-        );
-        assert!(
-            !json.contains("lorem ipsum"),
-            "passage text should not leak; got: {json}"
-        );
-        assert!(json.contains("\"doc_id\":\"10.1234_test\""));
-        assert!(json.contains("\"doi\":\"10.1234/test\""));
-        assert!(json.contains("\"score\":0.87"));
-    }
-
-    #[test]
-    fn a_hit_carries_the_links_a_user_can_open() {
-        // The `pdf_path` on a hit is a storage key on this host. The
-        // links are what a caller can open, and they are what the tool
-        // returns instead.
-        let out = map_distill_search_hits(fixture(), true, Some(&minter()));
-        let json = serde_json::to_string(&out).unwrap();
-        assert!(json.contains("\"links\""), "json: {json}");
-        assert!(
-            json.contains("http://host:7446/docs/v1/10.1234_test/source?"),
-            "json: {json}"
-        );
-        assert!(
-            json.contains("https://public.example/docs/v1/10.1234_test/source?"),
-            "json: {json}"
-        );
-        assert!(
-            !json.contains("pdf_path"),
-            "the storage key should not be handed to a caller; got: {json}"
-        );
-    }
-
-    #[test]
-    fn a_hit_without_a_configured_minter_carries_no_links() {
-        let out = map_distill_search_hits(fixture(), true, None);
-        let json = serde_json::to_string(&out).unwrap();
-        assert!(!json.contains("\"links\""), "json: {json}");
-    }
-
-    #[test]
-    fn empty_input_round_trips() {
-        let full = serde_json::to_string(&map_distill_search_hits(vec![], true, None)).unwrap();
-        let lite = serde_json::to_string(&map_distill_search_hits(vec![], false, None)).unwrap();
-        assert_eq!(full, "[]");
-        assert_eq!(lite, "[]");
-    }
-}
-
-/// The MCP tool reference lists every tool the server defines, and only those.
-#[cfg(test)]
 mod docs_tests {
     use std::collections::BTreeSet;
 
     use super::HomeStillMcp;
 
     const REFERENCE: &str = include_str!("../../../docs/reference/mcp-tools.md");
+
+    /// The whole surface. A tool is added or removed here on purpose, with
+    /// its reference entry.
+    const TOOLS: [&str; 10] = [
+        "acquire",
+        "capture",
+        "cite",
+        "discover",
+        "documents",
+        "graph",
+        "personal_add",
+        "read",
+        "status",
+        "synthesis_save",
+    ];
 
     /// Names in headings of the form ``### `tool_name` ``.
     fn documented_tools(markdown: &str) -> BTreeSet<String> {
@@ -4698,15 +951,23 @@ mod docs_tests {
             .collect()
     }
 
-    #[test]
-    fn every_tool_has_a_reference_entry_and_every_entry_is_a_tool() {
-        // The unfiltered router: the `openalex_*` tools are removed from a
-        // running server's router only when the corpus is not ready.
-        let defined: BTreeSet<String> = HomeStillMcp::tool_router()
+    fn defined_tools() -> BTreeSet<String> {
+        HomeStillMcp::tool_router()
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn the_server_offers_exactly_the_ten_tools() {
+        let expected: BTreeSet<String> = TOOLS.iter().map(|name| name.to_string()).collect();
+        assert_eq!(defined_tools(), expected);
+    }
+
+    #[test]
+    fn every_tool_has_a_reference_entry_and_every_entry_is_a_tool() {
+        let defined = defined_tools();
         let documented = documented_tools(REFERENCE);
 
         let missing: Vec<&String> = defined.difference(&documented).collect();

@@ -1,27 +1,23 @@
-// rc.306 P0-8 / P3-11: the distill server binary MUST be built with the
-// `cuda` feature. Without it, ort wouldn't link the CUDA provider and we
-// would silently run on CPU — directly violating the project's
-// "no CPU fallback" non-negotiable. Refuse to compile.
-#[cfg(not(feature = "cuda"))]
-compile_error!(
-    "hs-distill-server requires --features cuda. Rebuild with:\n\
-     cargo build --release -p hs-distill --features server,cuda --bin hs-distill-server"
-);
-
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use hs_common::stores::Stores;
 use hs_distill::api::DistillServerState;
-use hs_distill::collection::CollectionSpec;
 use hs_distill::config::DistillServerConfig;
-use hs_distill::embed::onnx::OnnxEmbedder;
-use hs_distill::embed::Embedder;
-use hs_distill::qdrant::{ensure_collection, QdrantStore};
+use hs_distill::embed_device::{
+    ollama_embed_device, verify_embed_capacity, DEVICE_CUDA, OLLAMA_EMBED_MODEL,
+    OLLAMA_EMBED_MODEL_SETUP,
+};
+use hs_distill::myelin::MyelinStore;
 use hs_distill::server;
+use hs_distill::store::DocumentStore;
 
 #[derive(Parser, Debug)]
-#[command(name = "hs-distill-server", about = "Distill embedding server")]
+#[command(
+    name = "hs-distill-server",
+    about = "Distill server: chunks documents into the myelin store and searches them"
+)]
 struct Args {
     /// Bind address (default: `distill_server.host` from the config, else 0.0.0.0)
     #[arg(long)]
@@ -35,10 +31,6 @@ include!("../../../build-support/version_marker.rs");
 
 fn main() -> Result<()> {
     keep_version_marker();
-    // Must run before ANY dlopen or tokio init — re-execs self with the
-    // platform's dynamic-lib search path augmented so ort's CUDA provider
-    // (Linux) loads from our bundled directories.
-    hs_common::service::lib_bootstrap::ensure_lib_paths_or_reexec();
     // Secrets are exported into the environment, which is only sound while
     // this is the only thread: load them before the runtime (and its worker
     // threads) exist, and refuse to start if they cannot be read. The
@@ -60,48 +52,66 @@ async fn async_main() -> Result<()> {
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid distill_server config: {e}"))?;
+    // The registry of stores: which tenant holds each one, and the personal
+    // prefix from the config. A malformed registry stops the start.
+    let stores = Stores::load().context("loading the store registry")?;
     // Every route but /health and /readiness requires this secret; there is
     // no unauthenticated mode.
     let token = server::backend_token(|name| std::env::var(name))?;
 
-    // Build the embedder on the configured device. There is no fallback:
-    // if CUDA is unavailable or the model does not land on the GPU,
-    // startup fails.
-    let embedder = OnnxEmbedder::new(&config.embedding, config.embedding.compute_device.clone())
-        .map_err(|e| anyhow::anyhow!("Failed to initialize embedder: {e}"))?;
+    // The store and the embedder behind it must both answer before the
+    // server listens. There is no fallback: a store that is down, or an
+    // embedding model that is not fully on the GPU, stops the start.
+    let store = MyelinStore::new(&config.myelin_url)?;
+    let backend = store
+        .health()
+        .await
+        .map_err(|e| anyhow::anyhow!("myelin is not usable at {}: {e}", config.myelin_url))?;
+    tracing::info!(%backend, url = %config.myelin_url, "myelin reachable");
 
-    tracing::info!("Embedder device: {}", embedder.device());
-
-    // Connect to Qdrant
-    let qdrant = qdrant_client::Qdrant::from_url(&config.qdrant_url)
-        .timeout(std::time::Duration::from_secs(30))
+    let ollama = hs_common::http::client_builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(config.ollama_timeout_secs))
         .build()
-        .map_err(|e| anyhow::anyhow!("Failed to connect to Qdrant: {e}"))?;
-
-    // Create or verify every collection the server will serve. Requests can
-    // only name these; none is ever created on demand.
-    let spec = CollectionSpec::new(embedder.dimension(), &config.hnsw);
-    for name in config.served_collections() {
-        let outcome = ensure_collection(&qdrant, name, &spec)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to ensure collection '{name}': {e}"))?;
-        tracing::info!(
-            collection = name,
-            created = outcome.created,
-            indexes_created = ?outcome.indexes_created,
-            hnsw_disabled = outcome.hnsw_disabled,
-            "collection ready"
+        .context("building the ollama HTTP client")?;
+    let device = ollama_embed_device(&ollama, &config.ollama_url)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot verify where {OLLAMA_EMBED_MODEL} runs: {e}. An ollama without the \
+                 model needs: {OLLAMA_EMBED_MODEL_SETUP}"
+            )
+        })?;
+    if device != DEVICE_CUDA {
+        anyhow::bail!(
+            "ollama runs {OLLAMA_EMBED_MODEL} on `{device}`, not fully on the GPU. Distill \
+             embedding never runs on the CPU: fix ollama's CUDA (driver, libraries, free VRAM)"
         );
     }
+    verify_embed_capacity(&ollama, &config.ollama_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("{OLLAMA_EMBED_MODEL} cannot embed a long chunk: {e}"))?;
+    tracing::info!(model = OLLAMA_EMBED_MODEL, %device, "embedding model on the GPU");
 
     let host = args.host.unwrap_or_else(|| config.host.clone());
     let port = args.port.unwrap_or(config.port);
-    let store = QdrantStore::new(qdrant, config.hnsw.search_ef);
+    let myelin_url = config.myelin_url.clone();
     let state = Arc::new(DistillServerState::new(
-        Arc::new(embedder),
         Arc::new(store),
+        ollama,
         config,
+        stores,
     ));
+    // Myelin must hold every store under the tenant the registry names
+    // before a request can file a document in one.
+    state
+        .define_stores()
+        .await
+        .map_err(|e| anyhow::anyhow!("myelin at {myelin_url} refused the store registry: {e}"))?;
+    tracing::info!(
+        stores = state.stores.iter().count(),
+        "stores defined in myelin"
+    );
 
     let addr = format!("{host}:{port}");
     tracing::info!("Listening on {addr}");

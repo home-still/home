@@ -19,55 +19,84 @@ symptom, read its cause, and follow its steps.
 **Symptom.** The unit restarts in a loop, or `/health` never answers. The log
 ends with one of:
 
-- `gpu busy: <N> MB free < <M> MB required to load bge-m3; holders: …` from the
-  distill server;
-- `CUDA requested but model is not on GPU …` or `Failed to load model: …` from
-  the distill server;
+- `myelin is not usable at <url>: …` from the distill server;
+- `myelin at <url> refused the store registry: …` from the distill server;
+- `cannot verify where bge-m3-8k:latest runs: …` from the distill server;
+- `ollama runs bge-m3-8k:latest on `cpu`, not fully on the GPU. …` from the
+  distill server (the device can also be `partial`);
+- `bge-m3-8k:latest cannot embed a long chunk: …` from the distill server;
 - `the execution provider could not be registered` from the scribe server;
 - `libpdfium could not be loaded (searched …)` from the scribe server;
 - an error that names `HS_BACKEND_TOKEN`.
 
-**Cause.** The distill server embeds on CUDA, and the scribe server runs its
-layout and table models on CUDA on Linux. Neither falls back to the CPU, and
-`embedding.compute_device` accepts only `cuda`. A server that cannot use the
-GPU stops and says why. The usual reasons:
+**Cause.** The distill server does no embedding itself. It writes to a myelin
+server, which asks Ollama for `bge-m3-8k:latest` vectors, and it refuses to start,
+and reports itself not ready, unless Ollama holds that model entirely on the
+GPU. It never accepts the CPU. The scribe server runs its layout and table
+models on CUDA on Linux and does not fall back either. The usual reasons:
 
-1. **Another program holds the GPU's memory.** The distill server needs
-   `embedding.vram_floor_mb` of free memory (5000 MB by default) before it loads
-   its model, and the message lists the holders.
-2. **The ONNX Runtime CUDA provider cannot load its libraries.** The provider is
-   built against CUDA 12 (`libcublas.so.12`, `libcudart.so.12`,
-   `libcufft.so.11`), and a host that has only CUDA 13 does not have them.
-3. **More than one provider bundle is cached.** `~/.cache/ort.pyke.io/dfbin/`
-   gains a directory each time the provider changes, and the oldest is used.
+1. **myelin does not answer.** The distill server connects to
+   `distill_server.myelin_url` (default `http://127.0.0.1:7462/mcp`) before it
+   listens. The service is stopped, listens on another address, or is the
+   agent surface (port 7463), which refuses the writes the distill server
+   needs. `myelin-mcp` has no `/health` route; its own service log says why it
+   is down, for example that its Qdrant or Ollama is not reachable.
+2. **Ollama cannot be reached or has no `bge-m3-8k`.** The distill server asks
+   `distill_server.ollama_url` where the model is loaded, and loads it with one
+   embedding request when it is not. An unreachable Ollama, or one that does not
+   have the model, stops the start. So does a `bge-m3-8k` that was made
+   without `num_batch 8192`: the server sends one long input at start-up and
+   stops when Ollama reads only part of it.
+3. **Ollama holds the model on the CPU, or split between CPU and GPU.** The
+   card is full (another program holds its memory) or Ollama's CUDA is broken.
 4. **libpdfium is missing.** The scribe server binds it from `~/.local/lib`,
    `~/.home-still/dyld-libs` or the system library path, and stops when it
    cannot.
-5. **The shared secret is missing.** The servers refuse to start without
+5. **The scribe server's ONNX Runtime CUDA provider cannot load its
+   libraries.** The provider is built against CUDA 12 (`libcublas.so.12`,
+   `libcudart.so.12`, `libcufft.so.11`), and a host that has only CUDA 13 does
+   not have them.
+6. **The shared secret is missing.** The servers refuse to start without
    `HS_BACKEND_TOKEN`.
 
 **Fix.**
 
-1. Find what holds the GPU, and stop or move it:
+1. Check where Ollama holds the embedding model, and what holds the GPU:
 
    ```sh
+   ollama ps
    nvidia-smi --query-compute-apps=pid,used_gpu_memory,process_name --format=csv
    ```
 
-   To let the distill server hand its memory back when it is idle, set
-   `embedding.idle_release_secs` under `distill_server` in
-   `~/.home-still/config.yaml`, and restart it. See
-   [Sharing one GPU](../explanation/architecture.md#sharing-one-gpu).
+   `ollama ps` must list `bge-m3-8k:latest` with `100% GPU`. When it says `CPU`
+   or a split, stop or move the program that holds the card's memory, or fix
+   Ollama's CUDA, then unload the model (`ollama stop bge-m3-8k:latest`) so the
+   next request loads it again. When the model is missing, or the log says it
+   cannot embed a long chunk, make it as in
+   [set up myelin](../tutorials/home-cloud-cluster.md#8-set-up-myelin-on-the-gpu-host).
 
-2. Check which libraries the provider cannot find:
+2. Check myelin and the settings that point at it:
+
+   ```sh
+   systemctl --user status myelin-mcp
+   journalctl --user -u myelin-mcp -n 100
+   hs config show
+   ```
+
+   `distill_server.myelin_url` must name myelin's full surface, and
+   `distill_server.ollama_url` the Ollama that myelin embeds with. How myelin
+   is installed is in
+   [set up myelin](../tutorials/home-cloud-cluster.md#8-set-up-myelin-on-the-gpu-host).
+
+3. For the scribe server, check which libraries the provider cannot find:
 
    ```sh
    ldd ~/.cache/ort.pyke.io/dfbin/*/*/libonnxruntime_providers_cuda.so | grep "not found"
    ```
 
    If it prints `libcublas.so.12`, `libcudart.so.12` or `libcufft.so.11`, put the
-   CUDA 12 runtime libraries in `~/.home-still/cuda12-libs/`. Both servers add
-   that directory to their library path when they start:
+   CUDA 12 runtime libraries in `~/.home-still/cuda12-libs/`. `hs serve scribe`
+   adds that directory to the server's library path when it starts:
 
    ```sh
    mkdir -p ~/.home-still/cuda12-libs
@@ -90,21 +119,18 @@ GPU stops and says why. The usual reasons:
 
    Run the `ldd` line again: nothing reads `not found` any more.
 
-3. If `~/.cache/ort.pyke.io/dfbin/` holds several bundles, the server logs a
-   warning that lists them. Remove the ones that no installed binary uses.
-
 4. If CUDA lives outside `/opt/cuda` and `/usr/local/lib`, add its library
-   directory to the unit's `LD_LIBRARY_PATH`:
+   directory to the scribe unit's `LD_LIBRARY_PATH`:
 
    ```sh
-   sudo systemctl edit hs-serve-distill
+   sudo systemctl edit hs-serve-scribe
    ```
 
    In the editor, add `[Service]` and `Environment=LD_LIBRARY_PATH=<cuda-lib-dir>`,
    then save.
 
 5. If the scribe server cannot find pdfium, install it as in
-   [step 8 of the cluster tutorial](../tutorials/home-cloud-cluster.md#8-set-up-conversion-on-the-gpu-host).
+   [step 7 of the cluster tutorial](../tutorials/home-cloud-cluster.md#7-set-up-conversion-on-the-gpu-host).
    `ldconfig -p | grep pdfium` lists a system-wide copy.
 
 6. If the log names `HS_BACKEND_TOKEN`, add the shared secret to
@@ -113,7 +139,31 @@ GPU stops and says why. The usual reasons:
 
 **Check it worked.** `curl -fsS http://localhost:7434/health` and
 `curl -fsS http://localhost:7433/health` answer with HTTP 200, and the distill
-server's log says that CUDA is verified with the model on the GPU.
+server's log says that myelin is reachable and that the embedding model is on
+the GPU.
+
+## The distill server answers 503
+
+**Symptom.** The distill server runs, but `/health` or `/readiness` answers
+503, and the `reason` (or the error) is `embedder unavailable`, `embedder not
+on GPU`, `myelin unavailable`, or a check that timed out. An index request can
+fail with the first two.
+
+**Cause.** The server checks its dependencies on every health probe and before
+every index. `embedder unavailable` means Ollama did not answer or does not
+have the model; `embedder not on GPU` means Ollama holds `bge-m3-8k:latest` on the
+CPU or split between the card and system memory (typically because another
+program took the card's memory after the model was unloaded); `myelin
+unavailable` means the myelin server did not answer. The response does not give
+the cause; the distill server's log does.
+
+**Fix.** Read the log (`journalctl -u hs-serve-distill -n 100`), then follow
+steps 1 and 2 of [the previous section](#a-scribe-or-distill-server-does-not-start).
+Documents that arrived meanwhile wait on the queue; the watcher indexes them
+when the server is ready again.
+
+**Check it worked.** `curl -fsS http://localhost:7434/readiness` reports
+`ready`.
 
 ## The dashboard says "backend unavailable: …"
 
@@ -139,9 +189,9 @@ rest. The gate is correct; the card is full.
    nvidia-smi --query-compute-apps=pid,used_gpu_memory,process_name --format=csv
    ```
 
-2. Stop or move the program that holds the most memory. If it is the distill
-   server, set `embedding.idle_release_secs` so that it releases the card when
-   idle.
+2. Stop or move the program that holds the most memory. Ollama keeps the
+   embedding model loaded, so it holds part of the card for as long as the
+   distill server is in use; stop or move whichever tenant you can spare.
 
 **Check it worked.** The row changes to `running` or `idle`, and `curl -fsS
 http://localhost:7433/readiness` reports free slots. How the gate works is in
@@ -282,10 +332,11 @@ an error.
 
 **Cause.** The gateway checks its configuration before it listens. It stops
 when `cloud.gateway.routes` has no backend for one of `scribe`, `distill`,
-`mcp` or `docs` (the error names the key to add), when a key in
+`mcp`, `memory` or `docs` (the error names the line to add), when a key in
 `cloud.gateway` does not exist, when `--gateway-url` is missing or does not
 start with `https://`, and when `HS_BACKEND_TOKEN` is unset or shorter than 32
-bytes.
+bytes. A gateway upgraded from a release that had no `memory` route stops on
+its first start for that reason: add `memory: http://<memory-host>:7463`.
 
 **Fix.**
 

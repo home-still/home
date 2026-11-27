@@ -24,8 +24,9 @@ pub struct DocumentMeta {
     pub abstract_text: Option<String>,
     pub cited_by_count: Option<u64>,
     pub source: Option<String>,
-    pub pdf_path: Option<String>,
-    pub markdown_path: String,
+    /// Where the document came from, when its catalog entry says: the
+    /// address a captured web page was captured from.
+    pub source_url: Option<String>,
     pub keywords: Vec<String>,
     pub topics: Vec<String>,
     /// Personal-store category (`medical`, `financial`, …). Always `None` for
@@ -53,37 +54,4 @@ pub struct Chunk {
     pub span: ChunkSpan,
     pub page: Option<usize>,
     pub meta: DocumentMeta,
-}
-
-/// Dense embedding of one text.
-#[derive(Debug, Clone)]
-pub struct EmbeddingOutput {
-    pub dense: Vec<f32>,
-}
-
-/// A chunk with its computed embedding, ready for Qdrant upsert.
-#[derive(Debug, Clone)]
-pub struct EmbeddedChunk {
-    pub chunk: Chunk,
-    pub embedding: EmbeddingOutput,
-}
-
-/// One match found by the per-chunk interstitial scrub — a poisoned point
-/// with enough context (doc_id + excerpt) for the operator to verify.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScrubbedChunk {
-    pub doc_id: String,
-    pub excerpt: String,
-}
-
-/// Outcome of a per-chunk interstitial scrub pass. `total_scanned` is every
-/// point seen during the scroll; `matched` is points whose `chunk_text`
-/// matched a known interstitial signature; `deleted` equals `matched` when
-/// not in dry-run mode, otherwise 0.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScrubReport {
-    pub total_scanned: u64,
-    pub matched: u64,
-    pub deleted: u64,
-    pub samples: Vec<ScrubbedChunk>,
 }

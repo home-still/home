@@ -1,9 +1,10 @@
 # hs-distill
 
-Chunking, embedding and search. The library is the distill client used by
-`hs` and `hs-mcp`; the `server` feature builds `hs-distill-server`, which
-embeds passages with BGE-M3 on a CUDA GPU, stores them in Qdrant, and answers
-hybrid (dense + lexical) searches.
+Chunking, document stores and search. The library is the distill client used
+by `hs` and `hs-mcp`; the `server` feature builds `hs-distill-server`, which
+cuts markdown into passages, files them in named stores of a myelin server
+(which embeds them with BGE-M3 through Ollama, on a CUDA GPU), and answers
+searches over those stores.
 
 ## User documentation
 
@@ -20,33 +21,30 @@ client.rs, cli.rs         DistillClient and the hs distill argument types (featu
 config.rs                 distill / distill_server sections, HS_DISTILL_* overrides, validation
 chunker.rs, text.rs       sentence- and page-aware chunking
 quality.rs                the chunk-quality floor
-metadata.rs               payload metadata from the catalog entry sent with a request
-embed/                    the BGE-M3 ONNX embedder, its slot pool, VRAM floor and idle release
-adaptive_batch.rs         batch sizing against throughput and the card's free memory
-store.rs                  the VectorStore seam the server uses (tests use an in-memory fake)
-qdrant.rs, collection.rs  collections, indexes, upserts, the dense and lexical channels
-pipeline.rs               chunk → embed → upsert for one document
-fusion.rs                 reciprocal rank fusion
-reference_list.rs         reference-list detection for demotion
-abstracts.rs              the paper_abstracts collection and abstract extraction
-reconcile.rs, backfill.rs markdown / Qdrant / catalog reconciliation and title backfill
+metadata.rs               record metadata from the catalog entry sent with a request
+reference_list.rs         reference-list detection: those chunks go to the references store
+store.rs                  the DocumentStore seam the server uses (tests use an in-memory fake)
+myelin.rs                 DocumentStore over a myelin MCP server: stores, records, search
+embed_device.rs           where Ollama runs the embedding model; the server refuses work off the GPU
+pipeline.rs               chunk → file by store → write for one document
+abstracts.rs              abstract selection and extraction for the abstracts store
+reconcile.rs              markdown / store / catalog reconciliation
 event_watch.rs            the scribe.completed consumer behind hs distill watch-events
-api.rs                    transport-independent request handling: validation, routing, limits
+api.rs                    transport-independent request handling: validation, stores, limits
 server.rs                 the axum adapter (feature server)
-server_main.rs            hs-distill-server; refuses to compile without the cuda feature
+server_main.rs            hs-distill-server
 ```
 
 ## Build and test
 
 ```sh
-cargo test -p hs-distill                         # client
-cargo test -p hs-distill --features server --lib # server modules
-cargo clippy -p hs-distill --features cuda --all-targets -- -D warnings
+cargo nextest run -p hs-distill                   # client
+cargo nextest run -p hs-distill --features server # server modules
+cargo clippy -p hs-distill --features server --all-targets -- -D warnings
 ```
 
-The server binary needs the `cuda` feature (which implies `server`) and
-downloads the ONNX Runtime CUDA bundle on first build:
+The server binary needs the `server` feature:
 
 ```sh
-cargo build -p hs-distill --features cuda --bin hs-distill-server
+cargo build -p hs-distill --features server --bin hs-distill-server
 ```

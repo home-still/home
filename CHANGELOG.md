@@ -2,6 +2,158 @@
 
 Changes that need action when upgrading. Binaries and full notes: GitHub Releases.
 
+## v0.0.1-rc.395
+
+- The distill server keeps its documents in a myelin server, in named
+  stores: `academic`, `references`, `abstracts`, `personal`, `web`,
+  `syntheses` and `memory`. **A distill host needs a myelin server (its full
+  surface) at `distill_server.myelin_url`, default
+  `http://127.0.0.1:7462/mcp`, and Ollama with the embedding model on the
+  GPU, before the upgraded server starts**: it defines every store in myelin
+  at start-up and stops when myelin does not answer or refuses one.
+- The distill server asks Ollama for the embedding model `bge-m3-8k:latest`,
+  not `bge-m3:latest`. **Make it on the distill host before upgrading**
+  (`ollama pull bge-m3`, then `ollama create bge-m3-8k` from a Modelfile
+  holding `FROM bge-m3` and `PARAMETER num_batch 8192`), **and give the myelin
+  server `MYELIN_EMBED__MODEL=bge-m3-8k:latest` and
+  `MYELIN_EMBED__MAX_CHARS=4500`**. The server stops at start-up without the
+  model, or with one that reads only part of a long input. With the model as
+  pulled, Ollama embedded a passage over 2,048 tokens from its beginning
+  only, or refused it.
+- **Start the myelin server with `--rerank-depth 50`**, and build it from
+  myelin's `main` at `18f0dbf` or later. Search results were judged at that
+  depth: myelin's reranker reads the first 50 passages of each store, not
+  its default 25, and at 25 one of the 25 gate queries no longer finds its
+  term. A search takes about 3 seconds at depth 50. The older build searches
+  the vector index with a narrow beam and misses near neighbours.
+- Every distill request names its store. **Upgrade the distill server and
+  every client of it (`hs`, `hs-mcp`, the watchers) together**: an older
+  client names no store and is answered `400`, and a newer client's requests
+  are not understood by an older server. `POST /collection/reset` became
+  `POST /store/reset?store=<name>`. The routes `/collection/hnsw`,
+  `/scrub-interstitials`, `/embedder/release`, `/docs/titles`,
+  `/docs/markdown-paths` and `/doc/{doc_id}/title` are gone; **a GPU broker
+  that called `/embedder/release` must stop calling it** (Ollama holds the
+  embedding model now, not the distill server).
+- These `distill_server` keys no longer exist and only draw a warning when
+  set: `qdrant_url`, `collection_name`, `collections`, and every
+  `embedding.*` and `hnsw.*` key. `personal.collection_name` likewise.
+  **`HOME_STILL_PERSONAL_COLLECTION_NAME` in the environment is now an
+  error**: remove it from the unit or shell that sets it.
+- The commands `hs distill init`, `hs distill hnsw enable`,
+  `hs distill backfill-titles` and `hs pipeline purge-poisoned-chunks` are
+  gone. A script that runs one fails on the unknown subcommand.
+- Reference lists are filed in the `references` store when a paper is
+  indexed, so a search of `academic` no longer returns them.
+  `hs distill search --store <NAME>` (repeatable) picks the stores to search;
+  without it the search covers `academic`. A search hit carries `store` and
+  no longer carries `pdf_path`.
+- `hs distill purge` and the reconversion of a paper delete its chunks from
+  `academic` and its reference lists; `hs pipeline purge-poisoned` and
+  `hs migrate` also delete its record from `abstracts`, because they delete
+  its catalog entry. `hs pipeline rebuild` empties both stores.
+- A `scribe.completed` event names the store its document belongs to, and
+  `hs distill watch-events` indexes the document into that store. **Upgrade
+  the scribe and distill watchers together, then run `hs distill
+  reconcile`**: the new distill watcher drops an event published by an older
+  scribe watcher, because it names no store, and does not take it again.
+- `hs scribe watch-events` works out a source's store from its key. It
+  refuses a file type the store does not take (`unsupported_extension`) and
+  a key under no store's prefix (`invalid_key`). It takes `.md` and `.txt`
+  sources in the stores that hold them and stores their text as the
+  markdown; one that is not UTF-8 fails as `text_not_utf8`, and one over
+  16 MiB as `text_too_large`.
+- `hs distill reindex <STEM>...` indexes documents again from their stored
+  markdown and catalog entry; `--all` covers every document, and
+  `--older-than <TIME>` continues a run that stopped. Each document keeps
+  its earlier records until the new ones are written. **A store that an
+  earlier myelin-backed distill server filled needs `hs distill reindex
+  --all` once after the upgrade**: until a paper is indexed again, its
+  reference lists stay in `academic` and its records lack `store`. A store
+  that is empty needs `hs distill reconcile --reembed` instead, which
+  indexes every document it does not hold.
+- **`hs-mcp` has ten tools: `cite`, `read`, `documents`, `discover`,
+  `graph`, `acquire`, `capture`, `personal_add`, `synthesis_save` and
+  `status`.** Every other tool is gone, and so are the `catalog:///` and
+  `markdown:///` resources; a client that calls a removed tool is answered
+  "tool not found". Searching is `recall` on the myelin server, which a
+  client connects beside `hs-mcp`. `docs/reference/mcp-tools.md` says where
+  each removed tool went.
+- New tools: `capture` keeps a web page the agent has read in the `web`
+  store (capturing the same address again replaces the page);
+  `synthesis_save` saves an answer in `syntheses` and refuses it unless
+  every citation is in its document; `status` reports the queues, the index
+  and the converters, or one document stage by stage; `discover` and
+  `graph` take `source` to choose between the online providers and the
+  local OpenAlex corpus, and no longer disappear from the tool list when
+  the corpus is not built (they refuse and say how to build it).
+- The prompts are `guidance`, `verify` and `brief`; `research_paper`,
+  `summarize_document` and `compare_papers` are gone.
+- `hs status` reads `GET /mcp/status` on the MCP server instead of calling
+  the `system_status` tool. **Upgrade `hs` and `hs-mcp` together**: a new
+  `hs status` against an older `hs-mcp` is answered `404`, and an older
+  `hs status` finds no `system_status` tool on a new one.
+- The maintenance tools became commands: `hs pipeline repair-catalog`,
+  `hs pipeline backfill-titles`, `hs migrate dedupe-url-encoded`,
+  `hs scribe queue <STEM>`, `hs distill scan-repetitions` and
+  `hs distill backfill`. A command that writes does so by default and takes
+  `--dry-run`.
+- The gateway has a fifth route, `memory`, mounted at `/memory`: it forwards
+  `/memory/mcp` to the myelin server's agent listener as `/mcp` and admits
+  only a token with the new `memory` scope. **Add
+  `memory: http://<memory-host>:7463` to `cloud.gateway.routes` immediately
+  before upgrading the gateway binary**: the new gateway does not start
+  without it and names the line to add, and the old one does not start with
+  it. The memory host must listen for agents on an address the gateway
+  reaches (`myelin-mcp --serve-agents <address>:7463`), with
+  `MYELIN_MCP_TOKEN` set to the value of `HS_BACKEND_TOKEN`, and its
+  firewall must admit that port from the gateway host.
+- `hs cloud invite --scope` takes `memory`, and a code without `--scope`
+  grants all four scopes. **A device or OAuth client enrolled before this
+  release holds tokens without `memory`, and `/memory/mcp` answers it
+  `403`: enroll it again.** Claude Desktop adds `<gateway>/mcp` and
+  `<gateway>/memory/mcp` as two servers, each with its own code.
+- `hs mcp install` writes two servers, `home-still` (the `hs-mcp` command)
+  and `myelin` (`http://127.0.0.1:7463/mcp`); with `--remote` both are the
+  gateway's `/mcp` and `/memory/mcp`. `hs mcp uninstall` removes both.
+  Claude Code's URL entries are written as `"type": "http"`; the earlier
+  `"type": "url"` entry was one Claude Code refuses, so **run
+  `hs mcp install --remote` again on a machine that used it**. Claude
+  Desktop's file takes commands only, so it gets `home-still` alone, and
+  `hs mcp install --client desktop --remote` now writes nothing and says to
+  add the two addresses in the app.
+- The gateway's start-up check counts a backend that answers `401` or `404`
+  on `/health` as reachable. Only no answer, or a `5xx`, is reported.
+- `hs` no longer runs a Qdrant. `hs upgrade`, `hs restart` and
+  `hs distill server start` do not read
+  `~/.home-still/docker-compose-distill.yml`, and an upgrade no longer waits
+  for Qdrant, so it cannot fail while Qdrant loads its collections. **The
+  container that file started keeps running until you stop it**
+  (`docker compose -f ~/.home-still/docker-compose-distill.yml down`);
+  nothing in home-still reads it. myelin's own Qdrant is another container
+  and must stay up.
+- **The index of an earlier release is not carried over.** Fill the stores
+  from what is already stored: `hs distill reconcile --reembed` for
+  `academic` and `references`, `hs distill abstracts build --force` for
+  `abstracts`, and `hs personal reindex <STEM>` for each personal document
+  (`hs personal list` names them).
+- The status snapshot (`GET /mcp/status`) describes the index in `store`
+  (`store`, `compute_device`, `embed_model`, `version`, `url`) where it had
+  `qdrant`, and the distill server's `/status` reports `records_count` where
+  it had `points_count`. `hs status` labels the row `Store`.
+- `hs mcp install --remote` takes the gateway only as a bare https origin
+  (`https://host[:port]`), the same rule as `hs cloud enroll`. A URL with a
+  path, a query or another scheme is refused before anything is written.
+- `hs-mcp` stops at start-up when the `docs:` section of the config cannot
+  be read. It used to start without document links and report them as not
+  configured.
+- The gateway answers `502` (`Backend refused the gateway's credentials`)
+  when a backend refuses the gateway's own token with a `401`. It used to
+  pass the `401` on, which told a signed-in client to sign in again. **On
+  `/memory/mcp` that answer means `MYELIN_MCP_TOKEN` on the memory host is
+  not the gateway's `HS_BACKEND_TOKEN`**; the gateway's log names the
+  service.
+
 ## v0.0.1-rc.394
 
 - The scribe server answers `POST /scribe/boxes`: the body is a PDF, the

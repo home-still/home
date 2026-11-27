@@ -298,11 +298,6 @@ fn compose_health_url(
             "{}/health",
             local_service_url(scribe_cfg.servers.iter().map(|s| s.url.as_str()), "scribe")?
         )),
-        // That compose file (written by `hs distill init`) runs Qdrant only.
-        "distill" => Some(format!(
-            "{}/healthz",
-            crate::distill_cmd::qdrant_rest_url()?
-        )),
         _ => None,
     })
 }
@@ -311,10 +306,8 @@ fn compose_health_url(
 /// `up -d`) only if something changed; any failing step fails the upgrade.
 /// (`down` first avoids podman pod conflicts on recreate.)
 ///
-/// Recreating is not free: `down` stops the service. For Qdrant that is a
-/// search outage until it reloads its collections — 45–67 s measured on a
-/// copy of the corpus, ~7 minutes in production on 2026-10-22, longer than
-/// the post-upgrade health wait. So the containers are left running when
+/// Recreating is not free: `down` stops the service until it has started
+/// again. So the containers are left running when
 /// each already runs the image its service names after the pull and the
 /// service answers its health URL. Anything that cannot be established —
 /// no engine, a probe failing, a service without an `image` — recreates,
@@ -497,15 +490,10 @@ async fn post_upgrade_health_check(reporter: &Arc<dyn Reporter>) -> Result<()> {
     let hidden = hs_common::hidden_dir()?;
     let files = crate::restart_cmd::managed_compose_files(&hidden, scribe_cfg.local_server);
     // The same URLs the compose phase used to decide whether to recreate.
-    // The distill compose file runs Qdrant only; the distill server is
-    // always a native unit, checked below.
-    for (name, label) in [("scribe", "scribe"), ("distill", "Qdrant")] {
-        if !files.iter().any(|(n, _)| *n == name) {
-            continue;
-        }
+    for (name, _) in &files {
         if let Some(url) = compose_health_url(name, &scribe_cfg)? {
-            hs_common::compose::wait_for_url(&url, HEALTH_WAIT_SECS, label).await?;
-            reporter.status("Health", &format!("{label}: OK"));
+            hs_common::compose::wait_for_url(&url, HEALTH_WAIT_SECS, name).await?;
+            reporter.status("Health", &format!("{name}: OK"));
         }
     }
     if find_companion_binary("hs-distill-server").is_some() {
@@ -650,7 +638,7 @@ mod tests {
             let cf = dir.path().join("c.yml");
             std::fs::write(&cf, "").unwrap();
             assert!(
-                upgrade_compose_service(&compose, None, &cf, "distill", None, &reporter())
+                upgrade_compose_service(&compose, None, &cf, "scribe", None, &reporter())
                     .await
                     .is_err()
             );
@@ -659,7 +647,7 @@ mod tests {
         let compose = fake_compose(dir.path(), "none");
         let cf = dir.path().join("c.yml");
         std::fs::write(&cf, "").unwrap();
-        upgrade_compose_service(&compose, None, &cf, "distill", None, &reporter())
+        upgrade_compose_service(&compose, None, &cf, "scribe", None, &reporter())
             .await
             .unwrap();
         let log = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
@@ -694,20 +682,20 @@ mod tests {
 
     #[test]
     fn service_images_come_from_the_resolved_config_and_require_an_image() {
-        // `podman-compose config` output for the distill stack.
-        let config = "services:\n  qdrant:\n    image: docker.io/qdrant/qdrant:latest\n    \
-                      ports:\n    - 6333:6333\n    restart: always\n";
+        // `podman-compose config` output for a one-service stack.
+        let config = "services:\n  scribe:\n    image: registry.example/scribe:latest\n    \
+                      ports:\n    - 7433:7433\n    restart: always\n";
         assert_eq!(
             service_images(config).unwrap(),
-            ["docker.io/qdrant/qdrant:latest"]
+            ["registry.example/scribe:latest"]
         );
         let built = "services:\n  app:\n    build: .\n";
         assert!(format!("{:#}", service_images(built).unwrap_err()).contains("names no image"));
     }
 
     /// Stand-ins for a compose runtime and its engine that describe one
-    /// running Qdrant container; `tag_id` is what the tag names after the
-    /// pull, the container always runs `8a80`.
+    /// running container; `tag_id` is what the tag names after the pull,
+    /// the container always runs `8a80`.
     fn fake_runtime(dir: &Path, tag_id: &str) -> (ComposeCmd, String) {
         let log = dir.join("calls.log");
         let compose = dir.join("fake-compose");
@@ -715,7 +703,7 @@ mod tests {
             &compose,
             &format!(
                 "echo \"$@\" >> {log}\ncase \"$3\" in\n\
-                 config) printf 'services:\\n  qdrant:\\n    image: q:latest\\n' ;;\n\
+                 config) printf 'services:\\n  scribe:\\n    image: s:latest\\n' ;;\n\
                  ps) echo cid1 ;;\nesac\nexit 0\n",
                 log = log.display()
             ),
@@ -753,7 +741,7 @@ mod tests {
             &compose,
             Some(&engine),
             &cf,
-            "distill",
+            "scribe",
             Some(&url),
             &reporter(),
         )
@@ -779,7 +767,7 @@ mod tests {
                 &compose,
                 Some(&engine),
                 &cf,
-                "distill",
+                "scribe",
                 Some(url),
                 &reporter(),
             )
@@ -796,9 +784,7 @@ mod tests {
     fn health_route(device: &str) -> HashMap<String, Route> {
         HashMap::from([(
             "/health".to_string(),
-            Route::ok(format!(
-                r#"{{"status":"ok","compute_device":"{device}","collection":"c"}}"#
-            )),
+            Route::ok(format!(r#"{{"status":"ok","compute_device":"{device}"}}"#)),
         )])
     }
 

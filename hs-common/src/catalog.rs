@@ -65,9 +65,9 @@ pub struct CatalogEntry {
     pub embedding_skip: Option<EmbeddingSkip>,
 
     /// Recorded by the abstracts pipeline when this paper has been
-    /// embedded into the `paper_abstracts` Qdrant collection. Distinct
-    /// from `embedding` — that one tracks full-body chunks in
-    /// `academic_papers`. Used by `hs distill abstracts reconcile` to
+    /// embedded into the `abstracts` store. Distinct
+    /// from `embedding` — that one tracks full-body chunks in the
+    /// `academic` store. Used by `hs distill abstracts reconcile` to
     /// idempotently re-run only entries that haven't been embedded yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abstract_embed: Option<AbstractEmbedStamp>,
@@ -80,8 +80,9 @@ pub struct CatalogEntry {
 
     /// Personal-store category, set at ingest by the `personal` crate. Always
     /// `None` for academic papers; `Some` only for documents that came in
-    /// through `hs personal add`. Indexed in Qdrant so personal_search can
-    /// filter by category without a sidecar walk.
+    /// through `hs personal add`. Indexed with the document's records, so a
+    /// search of the `personal` store can filter by category without a
+    /// sidecar walk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
 
@@ -203,8 +204,8 @@ pub struct EmbeddingMeta {
 }
 
 /// Stamp recorded when a paper's abstract has been embedded into the
-/// `paper_abstracts` Qdrant collection. Distinct from `EmbeddingMeta` —
-/// that one tracks the full-body chunks in `academic_papers`. The two
+/// `abstracts` store. Distinct from `EmbeddingMeta` —
+/// that one tracks the full-body chunks in the `academic` store. The two
 /// pipelines run independently and stamp different fields.
 ///
 /// `source` records which input the embed actually used so `abstracts
@@ -594,7 +595,7 @@ pub async fn update_conversion_failed_via(
 }
 
 /// Record the outcome of an indexing attempt: stamp `embedding` when
-/// Qdrant got points, otherwise stamp `embedding_skip`. Use this at the
+/// the store got records, otherwise stamp `embedding_skip`. Use this at the
 /// integration seam (MCP, event_watch) so a 0-chunks return value is
 /// always visible in the catalog rather than indistinguishable from
 /// "never tried."
@@ -670,8 +671,8 @@ pub async fn update_embedding_catalog_via(
     write_catalog_entry_via(storage, prefix, stem, &entry).await
 }
 
-/// Stamp the `paper_abstracts` embed result onto a catalog entry. Called
-/// by `hs distill abstracts build` after the embed + Qdrant upsert succeed.
+/// Stamp the `abstracts` embed result onto a catalog entry. Called
+/// by `hs distill abstracts build` after the record is written to the store.
 /// `source` is `"openalex"`, `"markdown"`, or `"title_only"` — matches the
 /// `AbstractSource` enum's serialized form in hs-distill.
 #[cfg(feature = "storage")]

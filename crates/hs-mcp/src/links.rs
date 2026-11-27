@@ -67,9 +67,13 @@ impl LinkMinter {
     /// A missing `docs:` section is not an error: the tools still work,
     /// they just do not carry links. That is the difference between
     /// "this deployment has not configured links" and "this deployment
-    /// is broken", and only the second is worth failing over.
-    pub fn from_config(file: &hs_common::config_file::ConfigFile) -> Self {
-        let config: Option<DocsConfig> = file.section::<DocsConfig>("docs").ok().flatten();
+    /// is broken", and only the second is worth failing over. A section
+    /// that is there and cannot be read is the second: taken for a missing
+    /// one, it would send the operator looking for what is in the file.
+    pub fn from_config(
+        file: &hs_common::config_file::ConfigFile,
+    ) -> Result<Self, hs_common::config_file::ConfigError> {
+        let config: Option<DocsConfig> = file.section::<DocsConfig>("docs")?;
         let key = match hs_common::docs::load_or_create_key(&hs_common::docs::default_key_path()) {
             Ok(key) => Some(key),
             Err(e) => {
@@ -77,7 +81,7 @@ impl LinkMinter {
                 None
             }
         };
-        Self {
+        Ok(Self {
             key,
             lan_base_url: config.as_ref().and_then(|c| c.lan_base_url.clone()),
             remote_base_url: config.as_ref().and_then(|c| c.remote_base_url.clone()),
@@ -89,7 +93,7 @@ impl LinkMinter {
                 .as_ref()
                 .and_then(|c| c.default_subject.clone())
                 .unwrap_or_else(default_subject),
-        }
+        })
     }
 
     /// Is this minter able to mint anything?
@@ -294,9 +298,8 @@ fn short_link_urls(lan_base: &str, remote_base: &str, code: &str) -> ShortLinkPa
 
 /// The expiry, as an ISO timestamp.
 pub(crate) fn expires_at_iso(unix_secs: u64) -> String {
-    let dt = chrono::DateTime::from_timestamp(unix_secs as i64, 0).unwrap_or_else(|| {
-        chrono::DateTime::from_timestamp(0, 0).expect("the epoch is a timestamp")
-    });
+    let dt = chrono::DateTime::from_timestamp(unix_secs as i64, 0)
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH);
     dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 

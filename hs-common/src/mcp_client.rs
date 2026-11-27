@@ -1,32 +1,35 @@
-//! Tiny HTTP client for the home-still MCP server behind the cloud gateway.
+//! Tiny HTTP client for MCP servers over streamable HTTP.
 //!
-//! Used by `hs status` (and other read-only CLI commands) on client-role nodes
-//! where the authoritative data lives on a remote server and this node has no
-//! usable local filesystem view. Mirrors what `npx mcp-remote` does for
-//! Claude Desktop, but in-process — no Node, no long-polling, just POST and
-//! parse the SSE-wrapped JSON result.
+//! Used by `hs-distill-server` to talk to the myelin store. Mirrors what
+//! `npx mcp-remote` does for Claude Desktop, but in-process — no Node, no
+//! long-polling, just POST and parse the SSE-wrapped JSON result.
 //!
 //! Wiring:
-//!   1. Load cached cloud creds via `AuthenticatedClient::from_default_path()`.
-//!   2. Open the MCP session: POST initialize (capture `mcp-session-id`), then
+//!   1. Open the MCP session: POST initialize (capture `mcp-session-id`), then
 //!      POST `notifications/initialized`. Both must succeed.
-//!   3. `call_tool(name, args)` POSTs a `tools/call` request and returns the
+//!   2. `call_tool(name, args)` POSTs a `tools/call` request and returns the
 //!      tool's text content parsed as JSON (tools always return JSON strings
 //!      inside a text content frame, at least in this project's server). A
 //!      non-2xx answer, a JSON-RPC error, or a result flagged `isError` is an
 //!      `Err`, never data.
-//!   4. `close()` ends the session with `DELETE` so the server does not keep
-//!      one session per `hs status` invocation.
+//!   3. `close()` ends the session with `DELETE` so the server does not keep
+//!      it until it expires.
+//!
+//! [`status_snapshot`] is the one request here that is not MCP: `hs status`
+//! reads the home-still MCP server's dashboard snapshot over plain HTTP,
+//! from the route beside the MCP endpoint.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
-use hs_common::auth::client::{AuthedHttp, AuthenticatedClient};
+use crate::auth::client::{AuthedHttp, AuthenticatedClient};
 
 pub struct McpClient {
     http: AuthedHttp,
     endpoint: String,
     session_id: Option<String>,
+    /// The `serverInfo` object (`name`, `version`) of the initialize result.
+    server_info: Option<Value>,
 }
 
 /// How much of a response body is quoted in an error message.
@@ -36,37 +39,74 @@ fn excerpt(body: &str) -> String {
     body.chars().take(BODY_EXCERPT_CHARS).collect()
 }
 
-impl McpClient {
-    /// Build a client and complete the MCP handshake. Two endpoint paths:
-    ///
-    /// - `HS_MCP_URL` env var set: use it verbatim, no auth. For same-host
-    ///   and LAN-direct operation where round-tripping through the cloud
-    ///   gateway (and depending on a 7-day refresh token) is unnecessary.
-    ///   Example: `HS_MCP_URL=http://localhost:7445/mcp`.
-    /// - Otherwise: load cached cloud creds and route through the gateway.
-    pub async fn from_default_creds() -> Result<Self> {
-        if let Ok(direct) = std::env::var("HS_MCP_URL") {
-            let http = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .context("build direct-mode http client for MCP")?;
-            return Self::connect(AuthedHttp::plain(http), direct).await;
-        }
+/// What follows the MCP endpoint in the address of the home-still MCP
+/// server's dashboard snapshot: `<endpoint>/status`.
+pub const STATUS_PATH_SUFFIX: &str = "/status";
 
-        let auth = AuthenticatedClient::from_default_path()
-            .context("load cloud credentials (hs cloud enroll --gateway <url>)")?;
-        let endpoint = format!("{}/mcp", auth.gateway_url().trim_end_matches('/'));
-        let http = AuthedHttp::with_auth(auth, std::time::Duration::from_secs(30))
-            .context("build authenticated http client for MCP")?;
-        Self::connect(http, endpoint).await
+/// How long a request to the home-still MCP server may take.
+const HOME_STILL_MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The home-still MCP endpoint this host is configured to use, and a client
+/// for it:
+///
+/// - `HS_MCP_URL` set: that address, verbatim, sending `HS_BACKEND_TOKEN`
+///   when it is set. For same-host and LAN-direct operation, where a round
+///   trip through the cloud gateway (and its 7-day refresh token) is
+///   unnecessary. Example: `HS_MCP_URL=http://localhost:7445/mcp`.
+/// - Otherwise: the gateway's `/mcp`, with the cached cloud credentials.
+fn home_still_endpoint() -> Result<(AuthedHttp, String)> {
+    if let Ok(direct) = std::env::var("HS_MCP_URL") {
+        let http = reqwest::Client::builder()
+            .timeout(HOME_STILL_MCP_TIMEOUT)
+            .build()
+            .context("build direct-mode http client for MCP")?;
+        return Ok((AuthedHttp::plain(http), direct));
     }
 
+    let auth = AuthenticatedClient::from_default_path()
+        .context("load cloud credentials (hs cloud enroll --gateway <url>)")?;
+    let endpoint = format!("{}/mcp", auth.gateway_url().trim_end_matches('/'));
+    let http = AuthedHttp::with_auth(auth, HOME_STILL_MCP_TIMEOUT)
+        .context("build authenticated http client for MCP")?;
+    Ok((http, endpoint))
+}
+
+/// The dashboard snapshot of the home-still MCP server this host is
+/// configured to use (see `hs_common::status::StatusSnapshot`).
+pub async fn status_snapshot() -> Result<Value> {
+    let (http, endpoint) = home_still_endpoint()?;
+    fetch_status(&http, &endpoint).await
+}
+
+/// `GET <endpoint>/status`. Anything but a 2xx answer with a JSON body is an
+/// error that carries the status and the start of the body.
+async fn fetch_status(http: &AuthedHttp, endpoint: &str) -> Result<Value> {
+    let url = format!("{}{STATUS_PATH_SUFFIX}", endpoint.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("read the answer of GET {url}"))?;
+    if !status.is_success() {
+        anyhow::bail!("GET {url} failed ({status}): {}", excerpt(&body));
+    }
+    serde_json::from_str(&body)
+        .with_context(|| format!("GET {url} did not answer JSON: {}", excerpt(&body)))
+}
+
+impl McpClient {
     /// Open a session against `endpoint` with an already-built client.
-    async fn connect(http: AuthedHttp, endpoint: String) -> Result<Self> {
+    pub async fn connect(http: AuthedHttp, endpoint: String) -> Result<Self> {
         let mut client = Self {
             http,
             endpoint,
             session_id: None,
+            server_info: None,
         };
         client.handshake().await?;
         Ok(client)
@@ -101,10 +141,11 @@ impl McpClient {
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        // Drain body, session is ready once we've read the headers.
-        resp.text()
+        let body = resp
+            .text()
             .await
             .context("read MCP initialize response body")?;
+        self.server_info = initialize_server_info(&body);
 
         let notif = json!({
             "jsonrpc": "2.0",
@@ -136,6 +177,12 @@ impl McpClient {
             anyhow::bail!("MCP request failed ({status}): {}", excerpt(&text));
         }
         Ok(text)
+    }
+
+    /// The `serverInfo` (`name`, `version`) the server reported when the
+    /// session was opened; `None` when its initialize result carried none.
+    pub fn server_info(&self) -> Option<&Value> {
+        self.server_info.as_ref()
     }
 
     /// Invoke a tool and return its text content parsed as JSON.
@@ -184,6 +231,24 @@ impl McpClient {
             tracing::warn!(error = %e, "could not end the MCP session; the server keeps it until it expires");
         }
     }
+}
+
+/// `result.serverInfo` of an initialize response, which is either an SSE
+/// stream with a `data:` frame or one plain JSON-RPC body.
+fn initialize_server_info(body: &str) -> Option<Value> {
+    let frames = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .chain(std::iter::once(body));
+    for payload in frames {
+        let Ok(v) = serde_json::from_str::<Value>(payload.trim()) else {
+            continue;
+        };
+        if let Some(info) = v.pointer("/result/serverInfo") {
+            return Some(info.clone());
+        }
+    }
+    None
 }
 
 /// Pull the tool result out of the first SSE `data:` frame that carries a
@@ -256,10 +321,9 @@ mod tests {
         FakeServer::start(move |req| {
             let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
             match (req.method.as_str(), rpc["method"].as_str()) {
-                ("POST", Some("initialize")) => {
-                    sse(json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
-                        .with_header("mcp-session-id", "sess-1")
-                }
+                ("POST", Some("initialize")) => sse(json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "serverInfo": {"name": "stand-in", "version": "1.2.3"}}}))
+                .with_header("mcp-session-id", "sess-1"),
                 ("POST", Some("notifications/initialized")) => Response::raw(202, "text/plain", ""),
                 ("POST", Some("tools/call")) => tool_reply.clone(),
                 ("DELETE", _) => Response::raw(delete_status, "text/plain", ""),
@@ -277,10 +341,58 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    async fn the_status_snapshot_is_read_beside_the_mcp_endpoint_without_a_session() {
+        let server = FakeServer::start(|req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/mcp/status") => {
+                Response::raw(200, "application/json", "{\"generated_at\":\"now\"}")
+            }
+            _ => Response::raw(404, "text/plain", "no such route"),
+        })
+        .await;
+        let http = AuthedHttp::plain(reqwest::Client::new());
+
+        // A trailing slash on the configured endpoint does not double up.
+        for endpoint in [
+            format!("{}/mcp", server.base),
+            format!("{}/mcp/", server.base),
+        ] {
+            let snapshot = fetch_status(&http, &endpoint).await.unwrap();
+            assert_eq!(snapshot["generated_at"], "now");
+        }
+        assert!(
+            server.requests().iter().all(|r| r.method == "GET"),
+            "no MCP session is opened for the snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_status_answer_that_is_not_a_snapshot_is_an_error() {
+        // An older server has no such route and answers the MCP service's
+        // refusal; a proxy answers an error page.
+        let refused =
+            FakeServer::start(|_| Response::raw(406, "text/plain", "Not Acceptable")).await;
+        let http = AuthedHttp::plain(reqwest::Client::new());
+        let err = fetch_status(&http, &format!("{}/mcp", refused.base))
+            .await
+            .expect_err("a 406 is a failure");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("406") && msg.contains("/mcp/status"), "{msg}");
+
+        let page = FakeServer::start(|_| Response::raw(200, "text/html", "<html>hi</html>")).await;
+        let err = fetch_status(&http, &format!("{}/mcp", page.base))
+            .await
+            .expect_err("a page is not a snapshot");
+        assert!(
+            format!("{err:#}").contains("did not answer JSON"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn parses_sse_result_json_text() {
         let body = "data: \n\nid: 0\nretry: 3000\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"catalog_entries\\\":2855}\"}],\"isError\":false}}\n";
-        let parsed = parse_tool_result("system_status", body).unwrap();
+        let parsed = parse_tool_result("recall", body).unwrap();
         assert_eq!(parsed["catalog_entries"], 2855);
     }
 
@@ -307,10 +419,10 @@ mod tests {
                 "content": [{"type": "text", "text": "storage backend unreachable"}],
                 "isError": true}})
         );
-        let err = parse_tool_result("system_status", &body).unwrap_err();
+        let err = parse_tool_result("recall", &body).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("storage backend unreachable"), "{msg}");
-        assert!(msg.contains("system_status"), "{msg}");
+        assert!(msg.contains("recall"), "{msg}");
     }
 
     #[test]
@@ -321,6 +433,38 @@ mod tests {
         );
         let err = parse_tool_result("nope", &body).unwrap_err();
         assert!(format!("{err:#}").contains("unknown tool"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn the_initialize_result_names_the_server() {
+        let server = mcp_server(sse(tool_ok("{}")), 200).await;
+        let opened = client(&server).await.unwrap();
+        let info = opened.server_info().expect("serverInfo");
+        assert_eq!(
+            (info["name"].as_str(), info["version"].as_str()),
+            (Some("stand-in"), Some("1.2.3"))
+        );
+
+        // A server whose initialize result has no serverInfo reports none.
+        let bare = FakeServer::start(|req| {
+            let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            match rpc["method"].as_str() {
+                Some("initialize") => sse(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+                _ => Response::raw(202, "text/plain", ""),
+            }
+        })
+        .await;
+        assert!(client(&bare).await.unwrap().server_info().is_none());
+    }
+
+    #[test]
+    fn server_info_is_read_from_a_plain_json_body_too() {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "result": {"serverInfo": {"name": "n"}}});
+        assert_eq!(
+            initialize_server_info(&body.to_string()).unwrap()["name"],
+            "n"
+        );
+        assert!(initialize_server_info("not json").is_none());
     }
 
     #[tokio::test]
@@ -335,7 +479,7 @@ mod tests {
         let client = client(&server).await.unwrap();
 
         let err = client
-            .call_tool("system_status", json!({}))
+            .call_tool("recall", json!({}))
             .await
             .expect_err("a 503 is a failure");
 
@@ -347,7 +491,7 @@ mod tests {
         let server = mcp_server(sse(tool_ok("{\"catalog_entries\":2855}")), 200).await;
         let client = client(&server).await.unwrap();
 
-        let value = client.call_tool("system_status", json!({})).await.unwrap();
+        let value = client.call_tool("recall", json!({})).await.unwrap();
 
         assert_eq!(value["catalog_entries"], 2855);
         // Every request after initialize carries the session id.

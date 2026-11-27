@@ -13,14 +13,14 @@ can convert it, so it is not retried by default. See
 metadata, its conversion and embedding stamps, and its page offsets.
 
 **Catalog stem.** The name that identifies a document everywhere: in
-storage, in the catalog and in Qdrant. For a paper with a DOI it is the
+storage, in the catalog and in the myelin stores. For a paper with a DOI it is the
 lowercased DOI with `/` replaced by `_` (`10.1038_s41586-024-07487-w`).
 
 **Chunk.** A passage of a converted document, about 1000 tokens, embedded as
-one vector.
+one vector and stored as one record.
 
 **CUDA.** NVIDIA's framework for computing on GPUs. The distill server
-requires it.
+requires the embedding model, which Ollama runs for myelin, to be on the GPU.
 
 **Durable consumer.** A named JetStream consumer the broker keeps between
 connections. Every worker of one kind uses the same durable consumer
@@ -41,7 +41,13 @@ hardware. One of the two storage backends.
 until consumers acknowledge them.
 
 **MCP.** The Model Context Protocol, a standard for letting AI assistants use
-tools. `hs-mcp` exposes home-still as MCP tools.
+tools. `hs-mcp` exposes home-still's research tools; myelin exposes the
+search and memory tools.
+
+**myelin.** A separate memory server (`github.com/home-still/myelin`) that
+holds home-still's search index. It embeds, stores, searches and reranks
+passages, and serves two MCP surfaces: a full one for the distill server and
+an agent one for assistants.
 
 **NATS.** The message broker that carries home-still's events between
 machines.
@@ -51,8 +57,11 @@ your gateway without seeing a password.
 
 **OCR.** Optical character recognition: reading the text in an image of text.
 
-**Qdrant.** The vector database that stores the embeddings and finds the ones
-nearest a query.
+**Qdrant.** The vector database myelin keeps its vectors in. home-still does
+not run one of its own.
+
+**Store.** A named set of indexed documents in myelin: `academic`,
+`references`, `abstracts`, `personal`, `web`, `syntheses` or `memory`.
 
 **Retryable failure.** A conversion failure caused by a backend (the model
 looped, its stream died, it left gaps). A different or later backend may

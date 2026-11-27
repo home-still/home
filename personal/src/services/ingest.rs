@@ -1,7 +1,7 @@
 //! The single ingest path. Format → markdown → name/category → on-disk store
 //! → distill index. There are no fallbacks: every step either succeeds or
 //! aborts the operation. A failure mid-flight does NOT leave a half-written
-//! sidecar, half-indexed Qdrant points, or a "conversion_failed: true" stamp
+//! sidecar, half-indexed records, or a "conversion_failed: true" stamp
 //! on disk — the caller sees a typed error and the personal store stays in
 //! the state it was in before the call.
 
@@ -550,7 +550,7 @@ mod tests {
     async fn a_caller_that_gives_up_mid_index_does_not_strand_a_half_stored_document() {
         // An MCP session closing drops the `personal_add` future. When the
         // write-and-index unit lived in that future, the files stayed on disk
-        // (and any vectors in Qdrant) for a document that was never indexed.
+        // (and any records in the store) for a document that was never indexed.
         let distill_url = failing_distill(std::time::Duration::from_millis(400)).await;
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {

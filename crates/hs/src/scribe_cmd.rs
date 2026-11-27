@@ -122,6 +122,14 @@ pub enum ScribeCmd {
         #[command(subcommand)]
         action: crate::scribe_boxes::BoxesAction,
     },
+    /// Announce that one stored source needs converting: publish
+    /// `papers.ingested` for the stem's PDF, HTML or EPUB so the scribe
+    /// watcher converts it. Fails, and publishes nothing, when the stem has
+    /// no stored source. Converts nothing itself.
+    Queue {
+        /// Catalog stem (no extension), e.g. `10.48550_arxiv.2312.10997`.
+        stem: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -164,15 +172,14 @@ pub async fn dispatch(cmd: ScribeCmd, reporter: &Arc<dyn Reporter>) -> Result<()
         ScribeCmd::CatalogBackfill => cmd_catalog_backfill(reporter).await,
         ScribeCmd::Reconvert { stem } => cmd_reconvert(&stem, reporter).await,
         ScribeCmd::Boxes { action } => crate::scribe_boxes::dispatch(action, reporter).await,
+        ScribeCmd::Queue { stem } => crate::maintain::scribe_queue::cmd(&stem).await,
     }
 }
 
 /// Reset every derived artifact for a stem and republish `papers.ingested`
 /// so the watcher reconverts it from the source bytes:
 ///
-/// 1. purge the stem's chunks from Qdrant (re-indexing upserts by
-///    `(doc_id, chunk_index)`, so a shorter new conversion would leave
-///    orphaned tail chunks from the old one),
+/// 1. purge the stem's records from its store,
 /// 2. delete the stale markdown object (the watcher's idempotency guard
 ///    — "markdown already present; skipping" — would otherwise skip the
 ///    reconvert entirely),
@@ -241,13 +248,16 @@ async fn cmd_reconvert(stem: &str, reporter: &Arc<dyn Reporter>) -> Result<()> {
     if entry.embedding.is_some() || entry.embedding_skip.is_some() {
         let servers = crate::distill_cmd::resolve_servers(None).await?;
         let client = crate::distill_cmd::make_distill_client(&servers[0]).await?;
-        let deleted = client.delete_doc(stem).await.with_context(|| {
-            format!(
-                "purge old Qdrant chunks for {stem} via {} — start the distill \
+        let deleted = client
+            .delete_doc(hs_common::stores::ACADEMIC, stem)
+            .await
+            .with_context(|| {
+                format!(
+                    "purge old chunks for {stem} via {} — start the distill \
                  server (or fix the URL in config) and re-run",
-                servers[0]
-            )
-        })?;
+                    servers[0]
+                )
+            })?;
         reporter.status("Purged", &format!("{deleted} stale chunk(s) for {stem}"));
     }
 
@@ -557,7 +567,9 @@ pub(crate) async fn cmd_watch_events(
                 // its own failure stamping (source_missing) and
                 // classification: Permanent → TERM, Transient → NAK.
                 let source =
-                    match hs_scribe::event_watch::prepare_source(storage.as_ref(), &event).await {
+                    match hs_scribe::event_watch::prepare_source(storage.as_ref(), &stores, &event)
+                        .await
+                    {
                         Ok(hs_scribe::event_watch::SourcePrep::AlreadyConverted(md_key)) => {
                             // An earlier attempt wrote the markdown; it may have
                             // died before telling distill, or before asking for
@@ -669,7 +681,7 @@ pub(crate) async fn cmd_watch_events(
                                         if let Err(stamp_err) =
                                             hs_common::catalog::update_conversion_failed_via(
                                                 storage.as_ref(),
-                                                "catalog",
+                                                &source.catalog_prefix,
                                                 &stem,
                                                 &reason,
                                                 attempts_log.clone(),
@@ -735,7 +747,7 @@ pub(crate) async fn cmd_watch_events(
                             if let Err(stamp_err) =
                                 hs_common::catalog::update_conversion_failed_via(
                                     storage.as_ref(),
-                                    "catalog",
+                                    &source.catalog_prefix,
                                     &stem,
                                     &reason,
                                     attempts_log,
@@ -1126,10 +1138,8 @@ pub async fn start_server_foreground(port: u16, reporter: &Arc<dyn Reporter>) ->
     // `libcublasLt.so.12` and friends — cannot find them and the server
     // dies with "the execution provider could not be registered".
     //
-    // The distill server has had this path since rc.267; the scribe
-    // server did not, which is why one worked and the other crash-looped
-    // on the same host. Both get it from `hs_common::cuda_libs` now, so
-    // there is one implementation of the path.
+    // The path comes from `hs_common::cuda_libs`, the one implementation
+    // of it.
     let ld_path = hs_common::cuda_libs::cuda_ld_library_path(
         &std::env::var("LD_LIBRARY_PATH").unwrap_or_default(),
     );

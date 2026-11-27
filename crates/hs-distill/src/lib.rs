@@ -1,16 +1,12 @@
 pub mod abstracts;
-pub mod adaptive_batch;
 pub mod api;
-pub mod backfill;
 pub mod chunker;
 pub mod cli;
 pub mod client;
-pub mod collection;
 pub mod config;
-pub mod embed;
+pub mod embed_device;
 pub mod error;
 pub mod event_watch;
-pub mod fusion;
 pub mod metadata;
 pub mod pipeline;
 pub mod quality;
@@ -24,6 +20,6 @@ pub mod types;
 pub(crate) mod testutil;
 
 #[cfg(feature = "server")]
-pub mod qdrant;
+pub mod myelin;
 #[cfg(feature = "server")]
 pub mod server;

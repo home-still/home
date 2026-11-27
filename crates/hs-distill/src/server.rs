@@ -36,14 +36,8 @@ pub fn app(state: Arc<DistillServerState>, token: BackendToken) -> Router {
         .route("/status", get(handle_status))
         .route("/exists/{doc_id}", get(handle_exists))
         .route("/doc/{doc_id}", axum::routing::delete(handle_delete_doc))
-        .route("/doc/{doc_id}/title", post(handle_set_title))
         .route("/docs", get(handle_list_docs))
-        .route("/docs/titles", get(handle_payload_titles))
-        .route("/docs/markdown-paths", get(handle_payload_markdown_paths))
-        .route("/collection/reset", post(handle_reset_collection))
-        .route("/collection/hnsw", post(handle_enable_hnsw))
-        .route("/scrub-interstitials", post(handle_scrub_interstitials))
-        .route("/embedder/release", post(handle_release_embedder))
+        .route("/store/reset", post(handle_reset_store))
         .route_layer(middleware::from_fn_with_state(token, require_token));
     Router::new()
         .route("/health", get(handle_health))
@@ -91,17 +85,6 @@ async fn require_token(
     }
 }
 
-async fn handle_enable_hnsw(
-    State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<CollectionQuery>,
-) -> Response {
-    reply(state.enable_hnsw(q.collection.as_deref()).await)
-}
-
-async fn handle_release_embedder(State(state): State<Arc<DistillServerState>>) -> Response {
-    reply(state.release_embedder().await)
-}
-
 fn error_response(e: ApiError) -> Response {
     let status = match e.kind {
         ErrorKind::BadRequest => StatusCode::BAD_REQUEST,
@@ -129,23 +112,17 @@ fn reply<T: serde::Serialize>(result: Result<T, ApiError>) -> Response {
     }
 }
 
+/// `?store=<name>`. The name is optional here so that a request without it
+/// gets the API's own refusal, which lists the stores this server serves.
 #[derive(Deserialize)]
-struct CollectionQuery {
-    collection: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ScrubQuery {
-    /// When true, scan and report only — do not delete. Default false.
-    #[serde(default)]
-    dry_run: bool,
-    collection: Option<String>,
+struct StoreQuery {
+    store: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ListDocsQuery {
     limit: Option<u64>,
-    collection: Option<String>,
+    store: Option<String>,
 }
 
 async fn handle_health(State(state): State<Arc<DistillServerState>>) -> Response {
@@ -165,19 +142,19 @@ async fn handle_readiness(State(state): State<Arc<DistillServerState>>) -> Respo
 
 async fn handle_status(
     State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<CollectionQuery>,
+    Query(q): Query<StoreQuery>,
 ) -> Response {
-    reply(state.status(q.collection.as_deref()).await)
+    reply(state.status(q.store.as_deref()).await)
 }
 
 async fn handle_delete_doc(
     State(state): State<Arc<DistillServerState>>,
     Path(doc_id): Path<String>,
-    Query(q): Query<CollectionQuery>,
+    Query(q): Query<StoreQuery>,
 ) -> Response {
     reply(
         state
-            .delete_doc(&doc_id, q.collection.as_deref())
+            .delete_doc(&doc_id, q.store.as_deref())
             .await
             .map(|deleted| serde_json::json!({"doc_id": doc_id, "deleted": deleted})),
     )
@@ -189,92 +166,32 @@ async fn handle_list_docs(
 ) -> Response {
     reply(
         state
-            .list_docs(q.limit, q.collection.as_deref())
+            .list_docs(q.limit, q.store.as_deref())
             .await
             .map(|docs| serde_json::json!({"doc_ids": docs.doc_ids, "truncated": docs.truncated})),
     )
 }
 
-async fn handle_payload_titles(
+async fn handle_reset_store(
     State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<CollectionQuery>,
+    Query(q): Query<StoreQuery>,
 ) -> Response {
     reply(
         state
-            .payload_titles(q.collection.as_deref())
+            .reset_store(q.store.as_deref())
             .await
-            .map(|titles| serde_json::json!({"titles": titles})),
-    )
-}
-
-async fn handle_payload_markdown_paths(
-    State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<CollectionQuery>,
-) -> Response {
-    reply(
-        state
-            .payload_markdown_paths(q.collection.as_deref())
-            .await
-            .map(|paths| serde_json::json!({"paths": paths})),
-    )
-}
-
-/// The body of `POST /doc/{doc_id}/title`.
-#[derive(Deserialize)]
-struct SetTitleBody {
-    /// The title to write onto the document's points.
-    title: String,
-    /// Target a non-default collection.
-    #[serde(default)]
-    collection: Option<String>,
-}
-
-async fn handle_set_title(
-    State(state): State<Arc<DistillServerState>>,
-    Path(doc_id): Path<String>,
-    Json(body): Json<SetTitleBody>,
-) -> Response {
-    reply(
-        state
-            .set_title(&doc_id, &body.title, body.collection.as_deref())
-            .await
-            .map(|points| serde_json::json!({"doc_id": doc_id, "points_updated": points})),
-    )
-}
-
-async fn handle_reset_collection(
-    State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<CollectionQuery>,
-) -> Response {
-    reply(
-        state
-            .reset_collection(q.collection.as_deref())
-            .await
-            .map(|(collection, deleted)| {
-                serde_json::json!({"collection": collection, "deleted_points": deleted})
-            }),
-    )
-}
-
-async fn handle_scrub_interstitials(
-    State(state): State<Arc<DistillServerState>>,
-    Query(q): Query<ScrubQuery>,
-) -> Response {
-    reply(
-        state
-            .scrub_interstitials(q.dry_run, q.collection.as_deref())
-            .await,
+            .map(|(store, deleted)| serde_json::json!({"store": store, "deleted": deleted})),
     )
 }
 
 async fn handle_exists(
     State(state): State<Arc<DistillServerState>>,
     Path(doc_id): Path<String>,
-    Query(q): Query<CollectionQuery>,
+    Query(q): Query<StoreQuery>,
 ) -> Response {
     reply(
         state
-            .doc_exists(&doc_id, q.collection.as_deref())
+            .doc_exists(&doc_id, q.store.as_deref())
             .await
             .map(|(exists, chunks)| serde_json::json!({"exists": exists, "chunks": chunks})),
     )
@@ -342,9 +259,9 @@ async fn handle_search(
 mod tests {
     use super::*;
     use crate::client::{DistillStreamLine, ReadinessResponse};
-    use crate::embed::EmbedderHealth;
-    use crate::testutil::{prose, small_chunk_config, FakeEmbedder, FakeStore};
+    use crate::testutil::{fake_state, prose, FakeOllama, FakeStore, OllamaMode};
     use hs_common::service::protocol::StreamLine;
+    use hs_common::stores::{ACADEMIC, PERSONAL};
 
     /// A real axum server on an ephemeral loopback port, over fakes.
     const TOKEN: &str = "test-backend-token-0123456789abcdef";
@@ -374,18 +291,13 @@ mod tests {
     struct Harness {
         base: String,
         http: reqwest::Client,
-        embedder: Arc<FakeEmbedder>,
         store: Arc<FakeStore>,
+        ollama: FakeOllama,
     }
 
     async fn start() -> Harness {
-        let embedder = Arc::new(FakeEmbedder::new());
-        let store = Arc::new(FakeStore::default());
-        let state = Arc::new(DistillServerState::new(
-            embedder.clone(),
-            store.clone(),
-            small_chunk_config(),
-        ));
+        let (state, store, ollama) = fake_state().await;
+        let state = Arc::new(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -394,8 +306,8 @@ mod tests {
         Harness {
             base: format!("http://{addr}"),
             http: http_client(Some(TOKEN)),
-            embedder,
             store,
+            ollama,
         }
     }
 
@@ -435,9 +347,9 @@ mod tests {
                 assert!(!text.contains("UNIQUE-SECRET"), "{route}: {text}");
             }
         }
-        assert_eq!(h.embedder.calls(), 0);
+        assert!(h.ollama.http.recorded().is_empty());
         assert_eq!(h.store.ops(), []);
-        assert!(h.store.state.lock().upserted.is_empty());
+        assert!(h.store.state.lock().written.is_empty());
     }
 
     #[tokio::test]
@@ -446,14 +358,16 @@ mod tests {
         let resp = h
             .post(
                 "/distill",
-                serde_json::json!({ "path": "markdown/ab/doc.md", "content": prose(6) }),
+                serde_json::json!({
+                    "path": "markdown/ab/doc.md", "content": prose(6), "store": ACADEMIC
+                }),
             )
             .await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["doc_id"], "doc");
         assert!(body["chunks_indexed"].as_u64().unwrap() > 0);
-        assert!(!h.store.stored("academic_papers", "doc").is_empty());
+        assert!(!h.store.stored(ACADEMIC, "doc").is_empty());
     }
 
     #[tokio::test]
@@ -462,7 +376,7 @@ mod tests {
         let text = h
             .post(
                 "/distill/stream",
-                serde_json::json!({ "path": "doc.md", "content": prose(6) }),
+                serde_json::json!({ "path": "doc.md", "content": prose(6), "store": ACADEMIC }),
             )
             .await
             .text()
@@ -483,11 +397,11 @@ mod tests {
     #[tokio::test]
     async fn a_failure_after_streaming_started_is_an_error_line() {
         let h = start().await;
-        h.store.state.lock().fail_upsert_from_call = Some(0);
+        h.store.state.lock().fail_write_from_call = Some(0);
         let text = h
             .post(
                 "/distill/stream",
-                serde_json::json!({ "path": "doc.md", "content": prose(6) }),
+                serde_json::json!({ "path": "doc.md", "content": prose(6), "store": ACADEMIC }),
             )
             .await
             .text()
@@ -498,23 +412,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_collection_is_400_on_every_route_and_creates_nothing() {
+    async fn an_unknown_store_is_400_on_every_route_and_touches_nothing() {
         let h = start().await;
-        let q = "collection=made_up";
+        let q = "store=made_up";
         let responses = vec![
             h.post(
                 "/distill",
-                serde_json::json!({"path":"a.md","content":"x","collection":"made_up"}),
+                serde_json::json!({"path":"a.md","content":"x","store":"made_up"}),
             )
             .await,
             h.post(
                 "/distill/stream",
-                serde_json::json!({"path":"a.md","content":"x","collection":"made_up"}),
+                serde_json::json!({"path":"a.md","content":"x","store":"made_up"}),
             )
             .await,
             h.post(
                 "/search",
-                serde_json::json!({"query":"q","collection":"made_up"}),
+                serde_json::json!({"query":"q","stores":["made_up"]}),
             )
             .await,
             h.http
@@ -538,12 +452,7 @@ mod tests {
                 .await
                 .unwrap(),
             h.http
-                .post(h.url(&format!("/collection/reset?{q}")))
-                .send()
-                .await
-                .unwrap(),
-            h.http
-                .post(h.url(&format!("/scrub-interstitials?{q}")))
+                .post(h.url(&format!("/store/reset?{q}")))
                 .send()
                 .await
                 .unwrap(),
@@ -551,23 +460,56 @@ mod tests {
         for resp in responses {
             let url = resp.url().path().to_string();
             assert_eq!(resp.status(), 400, "{url}");
+            let text = resp.text().await.unwrap();
+            assert!(text.contains("unknown store"), "{url}: {text}");
         }
         assert_eq!(h.store.ops(), []);
-        assert_eq!(h.embedder.calls(), 0);
+        assert!(h.ollama.http.recorded().is_empty());
     }
 
     #[tokio::test]
-    async fn configured_extra_collection_is_served() {
+    async fn only_a_search_may_leave_the_store_unnamed() {
+        let h = start().await;
+        let responses = vec![
+            h.post("/distill", serde_json::json!({"path":"a.md","content":"x"}))
+                .await,
+            h.post(
+                "/distill/stream",
+                serde_json::json!({"path":"a.md","content":"x"}),
+            )
+            .await,
+            h.http.get(h.url("/status")).send().await.unwrap(),
+            h.http.get(h.url("/exists/d")).send().await.unwrap(),
+            h.http.get(h.url("/docs")).send().await.unwrap(),
+            h.http.delete(h.url("/doc/d")).send().await.unwrap(),
+            h.http.post(h.url("/store/reset")).send().await.unwrap(),
+        ];
+        for resp in responses {
+            let url = resp.url().path().to_string();
+            assert_eq!(resp.status(), 400, "{url}");
+            let text = resp.text().await.unwrap();
+            assert!(text.contains("`store` is required"), "{url}: {text}");
+        }
+        assert_eq!(h.store.ops(), []);
+        assert!(h.ollama.http.recorded().is_empty());
+
+        // A search that names none reads the default stores.
+        let resp = h.post("/search", serde_json::json!({"query":"q"})).await;
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn a_document_is_filed_in_the_store_the_request_names() {
         let h = start().await;
         let resp = h
             .post(
                 "/distill",
-                serde_json::json!({"path":"a.md","content":prose(4),"collection":"personal_docs"}),
+                serde_json::json!({"path":"a.md","content":prose(4),"store":PERSONAL}),
             )
             .await;
         assert_eq!(resp.status(), 200);
-        assert!(!h.store.stored("personal_docs", "a").is_empty());
-        assert!(h.store.stored("academic_papers", "a").is_empty());
+        assert!(!h.store.stored(PERSONAL, "a").is_empty());
+        assert!(h.store.stored(ACADEMIC, "a").is_empty());
     }
 
     #[tokio::test]
@@ -590,30 +532,33 @@ mod tests {
             400
         );
         assert_eq!(
-            h.post("/distill", serde_json::json!({"path":"..","content":"x"}))
-                .await
-                .status(),
+            h.post(
+                "/distill",
+                serde_json::json!({"path":"..","content":"x","store":ACADEMIC})
+            )
+            .await
+            .status(),
             400
         );
         assert_eq!(
             h.http
-                .get(h.url("/docs?limit=99999999"))
+                .get(h.url("/docs?store=academic&limit=99999999"))
                 .send()
                 .await
                 .unwrap()
                 .status(),
             400
         );
-        // 500: the store fails while indexing
-        h.store.state.lock().fail_upsert_from_call = Some(0);
+        // 503: the store fails while indexing
+        h.store.state.lock().fail_write_from_call = Some(0);
         assert_eq!(
             h.post(
                 "/distill",
-                serde_json::json!({"path":"a.md","content":prose(6)})
+                serde_json::json!({"path":"a.md","content":prose(6),"store":ACADEMIC})
             )
             .await
             .status(),
-            500
+            503
         );
     }
 
@@ -621,11 +566,11 @@ mod tests {
     async fn docs_lists_ids_with_a_truncation_flag() {
         let h = start().await;
         for d in ["a", "b", "c"] {
-            h.store.seed("academic_papers", d, 1);
+            h.store.seed(ACADEMIC, d, 1);
         }
         let all: serde_json::Value = h
             .http
-            .get(h.url("/docs"))
+            .get(h.url("/docs?store=academic"))
             .send()
             .await
             .unwrap()
@@ -636,7 +581,7 @@ mod tests {
         assert_eq!(all["truncated"], false);
         let some: serde_json::Value = h
             .http
-            .get(h.url("/docs?limit=2"))
+            .get(h.url("/docs?store=academic&limit=2"))
             .send()
             .await
             .unwrap()
@@ -648,35 +593,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_and_health_follow_the_embedder_and_qdrant() {
+    async fn readiness_and_health_follow_the_embedder_and_myelin() {
         let h = start().await;
         let ready = h.http.get(h.url("/readiness")).send().await.unwrap();
         assert_eq!(ready.status(), 200);
         let body: ReadinessResponse = ready.json().await.unwrap();
         assert!(body.ready);
-        assert_eq!(body.capacity, 2);
+        assert_eq!(body.capacity, 1);
         assert_eq!(
             h.http.get(h.url("/health")).send().await.unwrap().status(),
             200
         );
 
-        *h.embedder.health.lock() = EmbedderHealth::Failed("slot 0 poisoned".into());
+        *h.ollama.mode.lock() = OllamaMode::Cpu;
         let resp = h.http.get(h.url("/readiness")).send().await.unwrap();
         assert_eq!(resp.status(), 503);
         let body: ReadinessResponse = resp.json().await.unwrap();
         assert!(!body.ready);
         let reason = body.reason.unwrap();
-        assert!(reason.contains("embedder unusable"));
-        assert!(
-            !reason.contains("poisoned"),
-            "internal detail leaked: {reason}"
-        );
+        assert_eq!(reason, "embedder not on GPU");
         assert_eq!(
             h.http.get(h.url("/health")).send().await.unwrap().status(),
             503
         );
 
-        *h.embedder.health.lock() = EmbedderHealth::Healthy;
+        *h.ollama.mode.lock() = OllamaMode::Cuda;
         h.store.state.lock().down = true;
         assert_eq!(
             h.http
@@ -696,10 +637,10 @@ mod tests {
     #[tokio::test]
     async fn delete_and_exists_round_trip() {
         let h = start().await;
-        h.store.seed("academic_papers", "d", 3);
+        h.store.seed(ACADEMIC, "d", 3);
         let exists: serde_json::Value = h
             .http
-            .get(h.url("/exists/d"))
+            .get(h.url("/exists/d?store=academic"))
             .send()
             .await
             .unwrap()
@@ -712,7 +653,7 @@ mod tests {
         );
         let deleted: serde_json::Value = h
             .http
-            .delete(h.url("/doc/d"))
+            .delete(h.url("/doc/d?store=academic"))
             .send()
             .await
             .unwrap()
@@ -722,7 +663,7 @@ mod tests {
         assert_eq!(deleted["deleted"], 3);
         let exists: serde_json::Value = h
             .http
-            .get(h.url("/exists/d"))
+            .get(h.url("/exists/d?store=academic"))
             .send()
             .await
             .unwrap()
@@ -748,29 +689,39 @@ mod tests {
         );
 
         let indexed = client
-            .index_content("markdown/ab/doc.md", &prose(8), None)
+            .index_content(ACADEMIC, "markdown/ab/doc.md", &prose(8), None)
             .await
             .unwrap();
         assert_eq!(indexed.doc_id, "doc");
         assert!(indexed.chunks_indexed > 0);
         assert_eq!(
-            client.doc_chunks("doc").await.unwrap(),
+            client.doc_chunks(ACADEMIC, "doc").await.unwrap(),
             (true, u64::from(indexed.chunks_indexed))
         );
-        assert_eq!(client.list_docs(10).await.unwrap(), ["doc"]);
+        assert_eq!(client.list_docs(ACADEMIC, 10).await.unwrap(), ["doc"]);
+        assert_eq!(
+            client.doc_chunks(PERSONAL, "doc").await.unwrap(),
+            (false, 0),
+            "another store does not hold it"
+        );
 
-        let status = client.status().await.unwrap();
+        let status = client.status(ACADEMIC).await.unwrap();
+        assert_eq!(status.store, ACADEMIC);
         assert_eq!(status.documents_count, 1);
-        assert_eq!(status.points_count, u64::from(indexed.chunks_indexed));
+        assert_eq!(status.records_count, u64::from(indexed.chunks_indexed));
         assert!(!status.documents_count_truncated);
 
         let ready = client.readiness().await.unwrap();
         assert!(ready.is_ready());
-        assert_eq!(ready.available_slots(), 2);
-        assert_eq!(client.health().await.unwrap().embed_model, "bge-m3");
+        assert_eq!(ready.available_slots(), 1);
+        let health = client.health().await.unwrap();
+        assert_eq!(health.embed_model, crate::embed_device::OLLAMA_EMBED_MODEL);
+        assert_eq!(health.compute_device, "cuda");
+        assert_eq!(health.backend_version, "fake-myelin 1.0.0");
 
         client
             .search(
+                &[ACADEMIC],
                 "query",
                 5,
                 SearchFilters {
@@ -782,6 +733,7 @@ mod tests {
             .unwrap();
         let err = client
             .search(
+                &[],
                 "query",
                 5,
                 SearchFilters {
@@ -794,21 +746,19 @@ mod tests {
         assert!(format!("{err:#}").contains("400"), "{err:#}");
 
         let unknown = client
-            .index_content_in("a.md", "text", None, Some("made_up"))
+            .index_content("made_up", "a.md", "text", None)
             .await
             .unwrap_err();
         assert!(
-            format!("{unknown:#}").contains("unknown collection"),
+            format!("{unknown:#}").contains("unknown store"),
             "{unknown:#}"
         );
 
         assert_eq!(
-            client.delete_doc("doc").await.unwrap(),
+            client.delete_doc(ACADEMIC, "doc").await.unwrap(),
             u64::from(indexed.chunks_indexed)
         );
-        assert_eq!(client.reset_collection().await.unwrap(), 0);
-        let report = client.scrub_interstitials(true).await.unwrap();
-        assert_eq!(report.matched, 0);
+        assert_eq!(client.reset_store(ACADEMIC).await.unwrap(), 0);
     }
 
     // ── RA-26: backend bearer token ────────────────────────────────────
@@ -823,9 +773,7 @@ mod tests {
             ("GET", "/exists/d"),
             ("DELETE", "/doc/d"),
             ("GET", "/docs"),
-            ("POST", "/collection/reset"),
-            ("POST", "/collection/hnsw"),
-            ("POST", "/scrub-interstitials"),
+            ("POST", "/store/reset"),
         ]
     }
 
@@ -854,7 +802,7 @@ mod tests {
             }
         }
         assert_eq!(h.store.ops(), [], "nothing may run unauthenticated");
-        assert_eq!(h.embedder.calls(), 0);
+        assert!(h.ollama.http.recorded().is_empty());
 
         let open = http_client(None);
         for path in ["/health", "/readiness"] {
@@ -866,69 +814,6 @@ mod tests {
             let r = send(&h.http, method, h.url(path)).await;
             assert_ne!(r.status(), 401, "{method} {path}");
         }
-    }
-
-    #[tokio::test]
-    async fn enable_hnsw_submits_once_then_reports_a_no_op() {
-        let h = start().await;
-        let first: serde_json::Value = h
-            .http
-            .post(h.url("/collection/hnsw?collection=paper_abstracts"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(first["submitted"], true);
-        assert_eq!(first["collection"], "paper_abstracts");
-        assert_eq!(first["max_indexing_threads"], 4);
-        let again: serde_json::Value = h
-            .http
-            .post(h.url("/collection/hnsw?collection=paper_abstracts"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(again["submitted"], false);
-        assert_eq!(
-            h.store.ops(),
-            [crate::testutil::Op::EnableHnsw {
-                collection: "paper_abstracts".into(),
-                threads: 4
-            }]
-        );
-        let unknown = h
-            .http
-            .post(h.url("/collection/hnsw?collection=made_up"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(unknown.status(), 400);
-    }
-
-    #[tokio::test]
-    async fn the_client_enables_hnsw_with_the_token() {
-        let h = start().await;
-        let client = crate::client::DistillClient::new_with_client(
-            &h.base,
-            hs_common::auth::client::AuthedHttp::plain_with_backend_token(
-                http_client(None),
-                Some(token()),
-            ),
-        );
-        let r = client.enable_hnsw(None).await.unwrap();
-        assert!(r.submitted);
-        assert_eq!(r.collection, "academic_papers");
-
-        let anon = crate::client::DistillClient::new_with_client(
-            &h.base,
-            hs_common::auth::client::AuthedHttp::plain_with_backend_token(http_client(None), None),
-        );
-        let err = anon.enable_hnsw(None).await.unwrap_err();
-        assert!(format!("{err:#}").contains("401"), "{err:#}");
     }
 
     #[test]
@@ -950,12 +835,12 @@ mod tests {
     #[tokio::test]
     async fn an_indexing_panic_is_a_typed_500_on_both_routes_and_the_server_survives() {
         let h = start().await;
-        *h.embedder.panic.lock() = true;
+        h.store.state.lock().panic_on_write = true;
 
         let resp = h
             .post(
                 "/distill",
-                serde_json::json!({"path":"boom.md","content":prose(6)}),
+                serde_json::json!({"path":"boom.md","content":prose(6),"store":ACADEMIC}),
             )
             .await;
         assert_eq!(resp.status(), 500);
@@ -964,7 +849,7 @@ mod tests {
         let text = h
             .post(
                 "/distill/stream",
-                serde_json::json!({"path":"boom.md","content":prose(6)}),
+                serde_json::json!({"path":"boom.md","content":prose(6),"store":ACADEMIC}),
             )
             .await
             .text()
@@ -985,7 +870,7 @@ mod tests {
             ),
         );
         let err = client
-            .index_content("boom.md", &prose(6), None)
+            .index_content(ACADEMIC, "boom.md", &prose(6), None)
             .await
             .unwrap_err();
         let typed = err
@@ -994,11 +879,11 @@ mod tests {
         assert!(typed.is_permanent_rejection());
 
         // Still serving.
-        *h.embedder.panic.lock() = false;
+        h.store.state.lock().panic_on_write = false;
         assert_eq!(
             h.post(
                 "/distill",
-                serde_json::json!({"path":"ok.md","content":prose(6)})
+                serde_json::json!({"path":"ok.md","content":prose(6),"store":ACADEMIC})
             )
             .await
             .status(),
@@ -1007,44 +892,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_markdown_paths_route_reports_each_documents_own_key() {
-        // The doc_id is NOT the markdown key: a book ingested from a
-        // download provider has a title-based doc_id while its markdown
-        // is keyed by a shard of the title. The backfill reads the key
-        // from the payload, so the route has to report it verbatim.
+    async fn the_title_hnsw_scrub_and_collection_routes_are_gone() {
+        // Titles are derived at index time, there is no HNSW to enable, no
+        // per-chunk scrub and no collection: these routes have no handler,
+        // token or not.
         let h = start().await;
-        h.post(
-            "/distill",
-            serde_json::json!({"path":"a.md","content": prose(4)}),
-        )
-        .await;
-
-        let resp = h
-            .http
-            .get(h.url("/docs/markdown-paths"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let paths = body["paths"].as_object().expect("paths object");
-        assert!(!paths.is_empty(), "no markdown path was reported");
-        for (doc_id, path) in paths {
-            assert!(
-                path.as_str().unwrap().starts_with("markdown/"),
-                "the key for {doc_id} is not a storage key: {path}"
-            );
+        for (method, path) in [
+            ("POST", "/doc/d/title"),
+            ("GET", "/docs/titles"),
+            ("GET", "/docs/markdown-paths"),
+            ("POST", "/collection/hnsw"),
+            ("POST", "/collection/reset"),
+            ("POST", "/scrub-interstitials"),
+        ] {
+            let resp = send(&h.http, method, h.url(path)).await;
+            assert_eq!(resp.status(), 404, "{method} {path}");
         }
-    }
-
-    #[tokio::test]
-    async fn the_markdown_paths_route_needs_the_backend_token() {
-        let h = start().await;
-        let resp = http_client(None)
-            .get(h.url("/docs/markdown-paths"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
+        assert_eq!(h.store.ops(), []);
     }
 }

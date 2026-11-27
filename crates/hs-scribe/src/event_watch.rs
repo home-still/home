@@ -107,6 +107,12 @@ pub struct SourceObject {
     /// (a PDF whose pages cannot be counted never gets this far), `None`
     /// for every other source type.
     pub pdf_pages: Option<u32>,
+    /// The store whose source prefix holds the event key.
+    pub store: &'static str,
+    /// Where the store keeps this source's markdown.
+    pub md_key: String,
+    /// The prefix of the store's catalog entries.
+    pub catalog_prefix: String,
 }
 
 /// A failure of the event itself that no retry can fix.
@@ -153,6 +159,37 @@ pub(crate) fn parse_event_key(key: &str) -> Result<(String, String), HandlerErro
 /// on what they will parse.
 pub const MAX_SOURCE_BYTES: u64 = crate::pdf_meta::MAX_PDF_BYTES as u64;
 
+/// Largest Markdown or plain-text source stored as its own markdown. No
+/// parser runs on such a source, so nothing else bounds what reaches the
+/// indexer.
+pub const MAX_TEXT_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The `ConversionMeta.server` of a source stored as its own markdown.
+pub const PASSTHROUGH_SERVER: &str = "passthrough";
+
+/// Whether a source with this extension is its own markdown.
+fn is_text_source(ext: &str) -> bool {
+    matches!(ext, "md" | "txt")
+}
+
+/// The extension a store declares for sources of this one's format: `.htm`
+/// is HTML under its other spelling.
+fn declared_extension(ext: &str) -> &str {
+    match ext {
+        "htm" => "html",
+        other => other,
+    }
+}
+
+/// The size limit of a source with this extension, never above `max`.
+fn size_limit(ext: &str, max: u64) -> u64 {
+    if is_text_source(ext) {
+        max.min(MAX_TEXT_SOURCE_BYTES)
+    } else {
+        max
+    }
+}
+
 /// The failure code of an oversize source, by the converter that would have
 /// run on it.
 fn oversize_code(ext: &str) -> FailureCode {
@@ -160,25 +197,56 @@ fn oversize_code(ext: &str) -> FailureCode {
         "pdf" => FailureCode::PdfParseError,
         "epub" => FailureCode::EpubParseError,
         "html" | "htm" => FailureCode::HtmlParseError,
+        text if is_text_source(text) => FailureCode::TextTooLarge,
         _ => FailureCode::UnsupportedExtension,
     }
 }
 
+/// Fetch the source an event names and work out where its store keeps what
+/// is made from it. A key under no store's source prefix, and an extension
+/// the store does not declare, are refused for good before any storage call.
 pub async fn prepare_source(
     storage: &dyn Storage,
+    stores: &Stores,
     event: &IngestedEvent,
 ) -> Result<SourcePrep, HandlerError> {
-    prepare_source_capped(storage, event, MAX_SOURCE_BYTES).await
+    prepare_source_capped(storage, stores, event, MAX_SOURCE_BYTES).await
 }
 
 /// [`prepare_source`] with the size limit as a parameter.
 async fn prepare_source_capped(
     storage: &dyn Storage,
+    stores: &Stores,
     event: &IngestedEvent,
     max_source_bytes: u64,
 ) -> Result<SourcePrep, HandlerError> {
     let (stem, ext) = parse_event_key(&event.key)?;
-    let md_key = hs_common::markdown::markdown_storage_key(&stem);
+    let Some((spec, layout)) = stores.for_source_key(&event.key) else {
+        return Err(permanent(
+            FailureCode::InvalidKey,
+            format!("{} is under no store's source prefix", event.key),
+        ));
+    };
+    let declared = declared_extension(&ext);
+    if !layout.source_extensions.contains(&declared) {
+        let taken: Vec<String> = layout
+            .source_extensions
+            .iter()
+            .map(|e| format!(".{e}"))
+            .collect();
+        return Err(permanent(
+            FailureCode::UnsupportedExtension,
+            format!(
+                "the `{}` store does not take `.{ext}` sources ({}); it takes: {}",
+                spec.name,
+                event.key,
+                taken.join(", ")
+            ),
+        ));
+    }
+    let store = spec.name;
+    let md_key = layout.markdown_key(&stem);
+    let catalog_prefix = layout.catalog_prefix.clone();
 
     let exists = storage
         .exists(&md_key)
@@ -193,13 +261,14 @@ async fn prepare_source_capped(
     // object far past anything convertible (a manual drop of a disk image
     // renamed `.pdf`) would otherwise be loaded entire before any check ran.
     // A missing object is left to `get`, which owns that verdict.
+    let limit = size_limit(&ext, max_source_bytes);
     match storage.head(&event.key).await {
-        Ok(Some(meta)) if meta.size > max_source_bytes => {
+        Ok(Some(meta)) if meta.size > limit => {
             tracing::warn!(key = %event.key, size = meta.size, "source object over the size limit");
             return Err(permanent(
                 oversize_code(&ext),
                 format!(
-                    "{} is {} bytes, over the {max_source_bytes}-byte limit",
+                    "{} is {} bytes, over the {limit}-byte limit",
                     event.key, meta.size
                 ),
             ));
@@ -220,7 +289,7 @@ async fn prepare_source_capped(
             if hs_common::storage::is_not_found(&e) {
                 if let Err(stamp_err) = hs_common::catalog::update_conversion_failed_via(
                     storage,
-                    "catalog",
+                    &catalog_prefix,
                     &stem,
                     FailureCode::SourceMissing.wire(),
                     Vec::new(),
@@ -279,22 +348,27 @@ async fn prepare_source_capped(
         stem,
         ext,
         pdf_pages,
+        store,
+        md_key,
+        catalog_prefix,
     }))
 }
 
-/// Tell distill that the markdown at `md_key` is ready by publishing
-/// `scribe.completed`. A publish that fails is `Transient`: the event is
-/// NAKed, and its redelivery lands on [`SourcePrep::AlreadyConverted`] —
-/// whose caller announces again through [`announce_already_converted`] — so
-/// the announcement is retried until it gets through instead of being lost
-/// behind an ACK. Distill's handler is idempotent, so a repeat announcement
-/// only repeats the index.
+/// Tell distill that the markdown at `md_key` is ready to index into
+/// `store` by publishing `scribe.completed`. A publish that fails is
+/// `Transient`: the event is NAKed, and its redelivery lands on
+/// [`SourcePrep::AlreadyConverted`] — whose caller announces again through
+/// [`announce_already_converted`] — so the announcement is retried until it
+/// gets through instead of being lost behind an ACK. Distill's handler is
+/// idempotent, so a repeat announcement only repeats the index.
 async fn announce_completed(
     bus: &dyn EventBus,
+    store: &str,
     md_key: &str,
     source_key: &str,
 ) -> Result<(), HandlerError> {
     let payload = serde_json::json!({
+        "store": store,
         "key": md_key,
         "source_key": source_key,
     });
@@ -317,7 +391,13 @@ pub async fn announce_already_converted(
     md_key: &str,
     source_key: &str,
 ) -> Result<(), HandlerError> {
-    announce_completed(bus, md_key, source_key).await?;
+    let Some((spec, _)) = stores.for_source_key(source_key) else {
+        return Err(permanent(
+            FailureCode::InvalidKey,
+            format!("{source_key} is under no store's source prefix"),
+        ));
+    };
+    announce_completed(bus, spec.name, md_key, source_key).await?;
     crate::box_watch::request_missing_boxes(bus, storage, stores, source_key).await
 }
 
@@ -438,17 +518,31 @@ async fn blocking_within<T: Send + 'static>(
     }
 }
 
+/// A Markdown or plain-text source as its own markdown: the same text with
+/// every line ending written as `\n`.
+fn passthrough_markdown(bytes: &[u8], key: &str) -> Result<String, ConvertFailure> {
+    let text = std::str::from_utf8(bytes).map_err(|e| {
+        ConvertFailure::new(
+            FailureCode::TextNotUtf8,
+            format!("{key} is not valid UTF-8: {e}"),
+        )
+    })?;
+    Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
 /// Given a prepared source, dispatch to the converter for its file type
-/// (PDF → scribe VLM, HTML → parser, EPUB → parser), and put the
-/// markdown back under `markdown/{shard}/{stem}.md`. Publishes
-/// `scribe.completed` with the markdown key on success and, for a PDF,
+/// (PDF → scribe VLM, HTML → parser, EPUB → parser, Markdown and plain
+/// text → stored as they are), and put the markdown under the markdown
+/// prefix of the store that holds the source. Publishes `scribe.completed`
+/// with the store and the markdown key on success and, for a PDF,
 /// `scribe.boxes` with the source key, so its word-box sidecar is built.
 ///
 /// Error classification (`classify.rs`, from typed [`FailureCode`]s — never
 /// from message text):
 ///
 /// - `Permanent` — content is unconvertable no matter how many times we
-///   retry: unsupported extension, HTML not UTF-8, paywall/loading HTML,
+///   retry: unsupported extension, HTML or text that is not UTF-8,
+///   paywall/loading HTML,
 ///   EPUB parse failure, and scribe-side PDF parse errors. The scribe
 ///   server returns HTTP 415 with a `unsupported_content_type:{html,binary}`
 ///   body for bytes that fail the `%PDF` magic-byte gate; those bubble up
@@ -475,7 +569,8 @@ pub async fn convert_and_upload(
     attempts_log: Vec<hs_common::catalog::AttemptEntry>,
 ) -> Result<String, HandlerError> {
     let stem = source.stem.as_str();
-    let md_key = hs_common::markdown::markdown_storage_key(stem);
+    let md_key = source.md_key.clone();
+    let catalog_prefix = source.catalog_prefix.as_str();
 
     let start = std::time::Instant::now();
     let (markdown, server) = match source.ext.as_str() {
@@ -561,7 +656,7 @@ pub async fn convert_and_upload(
             if let Some(failure) = reject {
                 if let Err(e) = hs_common::catalog::update_conversion_failed_via(
                     storage,
-                    "catalog",
+                    catalog_prefix,
                     stem,
                     failure.code().wire(),
                     Vec::new(),
@@ -645,11 +740,22 @@ pub async fn convert_and_upload(
             })?;
             (md, "epub-parser")
         }
+        text if is_text_source(text) => {
+            let bytes = source.bytes.clone();
+            let key = event.key.clone();
+            let markdown = blocking("text passthrough", &event.key, move || {
+                passthrough_markdown(&bytes, &key)
+            })
+            .await?
+            .map_err(|f| HandlerError::Permanent(anyhow::Error::new(f)))?;
+            (markdown, PASSTHROUGH_SERVER)
+        }
         other => {
             return Err(permanent(
                 FailureCode::UnsupportedExtension,
                 format!(
-                    "unsupported source type `.{other}` for {} — supported: .pdf, .html, .htm, .epub",
+                    "no converter for `.{other}` sources ({}); the watcher converts: \
+                     .pdf, .html, .htm, .epub, .md, .txt",
                     event.key
                 ),
             ));
@@ -677,7 +783,7 @@ pub async fn convert_and_upload(
         };
         if let Err(e) = hs_common::catalog::update_conversion_failed_via(
             storage,
-            "catalog",
+            catalog_prefix,
             stem,
             code.wire(),
             Vec::new(),
@@ -727,7 +833,7 @@ pub async fn convert_and_upload(
     // `catalog_repair` reconciles markdown that has no conversion row.
     if let Err(e) = hs_common::catalog::update_conversion_catalog_via(
         storage,
-        "catalog",
+        catalog_prefix,
         stem,
         server,
         duration_secs,
@@ -748,7 +854,7 @@ pub async fn convert_and_upload(
         );
     }
 
-    announce_completed(bus, &md_key, &event.key).await?;
+    announce_completed(bus, source.store, &md_key, &event.key).await?;
     if source.ext == crate::box_watch::BOXED_SOURCE_EXTENSION {
         crate::box_watch::request_boxes(bus, &event.key).await?;
     }
@@ -1211,7 +1317,10 @@ pub(crate) mod tests {
             ("papers\\ab\\doc.pdf", FailureCode::InvalidKey),
             ("papers/ab/noext", FailureCode::MissingExtension),
         ] {
-            let err = prepare_source(&st, &event(key)).await.err().expect(key);
+            let err = prepare_source(&st, &stores(), &event(key))
+                .await
+                .err()
+                .expect(key);
             assert_eq!(code_of(&err), ("permanent", Some(code)), "{key}");
         }
     }
@@ -1219,7 +1328,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_missing_source_is_permanent_and_stamped() {
         let (_d, st) = storage();
-        let err = prepare_source(&st, &event("papers/ab/absent.pdf"))
+        let err = prepare_source(&st, &stores(), &event("papers/ab/absent.pdf"))
             .await
             .err()
             .unwrap();
@@ -1241,9 +1350,10 @@ pub(crate) mod tests {
             ("papers/ab/huge.pdf", FailureCode::PdfParseError),
             ("papers/ab/huge.epub", FailureCode::EpubParseError),
             ("papers/ab/huge.html", FailureCode::HtmlParseError),
+            ("web/hu/huge.md", FailureCode::TextTooLarge),
         ] {
             st.put(key, vec![b'x'; 2048]).await.unwrap();
-            let err = prepare_source_capped(&st, &event(key), 1024)
+            let err = prepare_source_capped(&st, &stores(), &event(key), 1024)
                 .await
                 .err()
                 .expect(key);
@@ -1258,7 +1368,7 @@ pub(crate) mod tests {
         let mut at_limit = b"<html>".to_vec();
         at_limit.resize(1024, b' ');
         st.put("papers/ab/edge.pdf", at_limit).await.unwrap();
-        let err = prepare_source_capped(&st, &event("papers/ab/edge.pdf"), 1024)
+        let err = prepare_source_capped(&st, &stores(), &event("papers/ab/edge.pdf"), 1024)
             .await
             .err()
             .unwrap();
@@ -1280,7 +1390,7 @@ pub(crate) mod tests {
         st.put("papers/ab/broken.pdf", b"%PDF-1.4\nnot really".to_vec())
             .await
             .unwrap();
-        let html = prepare_source(&st, &event("papers/ab/paywall.pdf"))
+        let html = prepare_source(&st, &stores(), &event("papers/ab/paywall.pdf"))
             .await
             .err()
             .unwrap();
@@ -1290,7 +1400,7 @@ pub(crate) mod tests {
         );
         // The structural verdict below is pdfium's.
         skip_without_pdfium!("html_named_pdf_and_broken_pdfs: broken-PDF half");
-        let broken = prepare_source(&st, &event("papers/ab/broken.pdf"))
+        let broken = prepare_source(&st, &stores(), &event("papers/ab/broken.pdf"))
             .await
             .err()
             .unwrap();
@@ -1305,7 +1415,7 @@ pub(crate) mod tests {
         skip_without_pdfium!("a_valid_pdf_is_fetched_with_its_page_count");
         let (_d, st) = storage();
         st.put("papers/ab/ok.pdf", pdf_with_pages(3)).await.unwrap();
-        match prepare_source(&st, &event("papers/ab/ok.pdf")).await {
+        match prepare_source(&st, &stores(), &event("papers/ab/ok.pdf")).await {
             Ok(SourcePrep::Fetched(src)) => {
                 assert_eq!(src.pdf_pages, Some(3));
                 assert_eq!(src.stem, "ok");
@@ -1320,7 +1430,7 @@ pub(crate) mod tests {
         let stores = stores();
         let md_key = hs_common::markdown::markdown_storage_key("done");
         st.put(&md_key, b"# text".to_vec()).await.unwrap();
-        let prep = prepare_source(&st, &event("papers/do/done.pdf")).await;
+        let prep = prepare_source(&st, &stores, &event("papers/do/done.pdf")).await;
         let Ok(SourcePrep::AlreadyConverted(key)) = prep else {
             panic!("expected AlreadyConverted");
         };
@@ -1337,6 +1447,7 @@ pub(crate) mod tests {
             assert_eq!(published[0].0, "scribe.completed");
             assert_eq!(published[0].1["key"], md_key);
             assert_eq!(published[0].1["source_key"], "papers/do/done.pdf");
+            assert_eq!(published[0].1["store"], hs_common::stores::ACADEMIC);
             assert_eq!(published[1].0, "scribe.boxes");
             assert_eq!(
                 published[1].1,
@@ -1382,12 +1493,12 @@ pub(crate) mod tests {
     async fn a_failed_completed_publish_is_transient_and_the_retry_goes_through() {
         let bus = FakeBus::default();
         bus.fail_next_publishes.store(1, Ordering::SeqCst);
-        let err = announce_completed(&bus, "markdown/ab/x.md", "papers/ab/x.pdf")
+        let err = announce_completed(&bus, "academic", "markdown/ab/x.md", "papers/ab/x.pdf")
             .await
             .unwrap_err();
         assert!(matches!(err, HandlerError::Transient(_)));
         assert!(bus.published.lock().unwrap().is_empty());
-        announce_completed(&bus, "markdown/ab/x.md", "papers/ab/x.pdf")
+        announce_completed(&bus, "academic", "markdown/ab/x.md", "papers/ab/x.pdf")
             .await
             .unwrap();
         assert_eq!(bus.published.lock().unwrap().len(), 1);
@@ -1403,7 +1514,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let Ok(SourcePrep::Fetched(src)) =
-            prepare_source(&st, &event("papers/pa/paywall-economics.pdf")).await
+            prepare_source(&st, &stores(), &event("papers/pa/paywall-economics.pdf")).await
         else {
             panic!("fetch");
         };
@@ -1436,7 +1547,8 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let Ok(SourcePrep::Fetched(src)) = prepare_source(&st, &event("papers/ab/stub.html")).await
+        let Ok(SourcePrep::Fetched(src)) =
+            prepare_source(&st, &stores(), &event("papers/ab/stub.html")).await
         else {
             panic!("fetch");
         };
@@ -1491,7 +1603,8 @@ pub(crate) mod tests {
         st.put("papers/ab/deep.html", deep.into_bytes())
             .await
             .unwrap();
-        let Ok(SourcePrep::Fetched(src)) = prepare_source(&st, &event("papers/ab/deep.html")).await
+        let Ok(SourcePrep::Fetched(src)) =
+            prepare_source(&st, &stores(), &event("papers/ab/deep.html")).await
         else {
             panic!("fetch");
         };
@@ -1520,6 +1633,110 @@ pub(crate) mod tests {
             .exists(&hs_common::markdown::markdown_storage_key("deep"))
             .await
             .unwrap());
+        assert!(bus.published.lock().unwrap().is_empty());
+    }
+
+    /// A scribe client no text source ever calls.
+    fn unreachable_scribe() -> ScribeClient {
+        ScribeClient::new_with_timeout("http://127.0.0.1:1", Duration::from_secs(5)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_text_source_becomes_its_own_markdown_in_the_store_that_holds_it() {
+        let (_d, st) = storage();
+        let stores = stores();
+        let (_, layout) = stores.documents(hs_common::stores::WEB).unwrap();
+        let source_key = layout.source_key("page", "md");
+        let prose = "A captured page with enough prose to be worth indexing. ".repeat(8);
+        st.put(
+            &source_key,
+            format!("# Title\r\n\r\n{prose}\rlast line").into_bytes(),
+        )
+        .await
+        .unwrap();
+        let ev = event(&source_key);
+        let Ok(SourcePrep::Fetched(src)) = prepare_source(&st, &stores, &ev).await else {
+            panic!("fetch");
+        };
+        let bus = FakeBus::default();
+        let md_key = convert_and_upload(
+            &st,
+            &unreachable_scribe(),
+            &bus,
+            &ev,
+            &TimeoutPolicy::default(),
+            &EpubLimits::default(),
+            &src,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(md_key, layout.markdown_key("page"));
+        let stored = String::from_utf8(st.get(&md_key).await.unwrap()).unwrap();
+        assert_eq!(stored, format!("# Title\n\n{prose}\nlast line"));
+        let row = hs_common::catalog::read_catalog_entry_via(&st, &layout.catalog_prefix, "page")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.conversion.unwrap().server, PASSTHROUGH_SERVER);
+        let published = bus.published.lock().unwrap();
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert_eq!(published[0].0, "scribe.completed");
+        assert_eq!(
+            published[0].1,
+            serde_json::json!({ "store": "web", "key": md_key, "source_key": source_key })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_its_store_cannot_take_is_refused_for_good() {
+        let (_d, st) = storage();
+        let stores = stores();
+        for (key, code) in [
+            // Under no store's source prefix.
+            ("elsewhere/ab/doc.pdf", FailureCode::InvalidKey),
+            // The academic store declares no Markdown sources.
+            ("papers/no/notes.md", FailureCode::UnsupportedExtension),
+        ] {
+            st.put(key, b"# notes".to_vec()).await.unwrap();
+            let err = prepare_source(&st, &stores, &event(key))
+                .await
+                .err()
+                .expect(key);
+            assert_eq!(code_of(&err), ("permanent", Some(code)), "{key}");
+        }
+
+        // Text that is not UTF-8 is fetched and then refused, with nothing
+        // stored or announced.
+        let (_, web) = stores.documents(hs_common::stores::WEB).unwrap();
+        let source_key = web.source_key("binary", "txt");
+        st.put(&source_key, vec![0xff, 0xfe, 0x00]).await.unwrap();
+        let ev = event(&source_key);
+        let Ok(SourcePrep::Fetched(src)) = prepare_source(&st, &stores, &ev).await else {
+            panic!("fetch");
+        };
+        let bus = FakeBus::default();
+        let err = convert_and_upload(
+            &st,
+            &unreachable_scribe(),
+            &bus,
+            &ev,
+            &TimeoutPolicy::default(),
+            &EpubLimits::default(),
+            &src,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            code_of(&err),
+            ("permanent", Some(FailureCode::TextNotUtf8)),
+            "{err}"
+        );
+        assert!(!st.exists(&web.markdown_key("binary")).await.unwrap());
         assert!(bus.published.lock().unwrap().is_empty());
     }
 
@@ -2139,7 +2356,7 @@ pub(crate) mod tests {
 
         async fn fetched(st: &LocalFsStorage, key: &str, pages: usize) -> SourceObject {
             st.put(key, pdf_with_pages(pages)).await.unwrap();
-            match prepare_source(st, &event(key)).await {
+            match prepare_source(st, &stores(), &event(key)).await {
                 Ok(SourcePrep::Fetched(s)) => s,
                 _ => panic!("fetch"),
             }
@@ -2188,7 +2405,8 @@ pub(crate) mod tests {
 
             // Redelivery lands on AlreadyConverted, whose caller announces
             // the markdown and asks for the PDF's word boxes.
-            let Ok(SourcePrep::AlreadyConverted(key)) = prepare_source(&st, &ev).await else {
+            let Ok(SourcePrep::AlreadyConverted(key)) = prepare_source(&st, &stores(), &ev).await
+            else {
                 panic!("redelivery must find the stored markdown");
             };
             announce_already_converted(&bus, &st, &stores(), &key, &ev.key)

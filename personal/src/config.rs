@@ -17,7 +17,6 @@ const ENV_PREFIX: &str = "HOME_STILL_";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub collection_name: String,
     pub storage_dir: String,
     /// Subdirectory under `storage_dir` where files are staged for MCP-driven
     /// ingestion. The MCP `personal_add` tool accepts a *filename* and resolves
@@ -68,7 +67,6 @@ impl Default for Config {
     /// back to this value.
     fn default() -> Self {
         Self {
-            collection_name: "personal_docs".to_string(),
             storage_dir: hs_common::stores::PERSONAL_PREFIX_DEFAULT.to_string(),
             ingest_inbox: "inbox".to_string(),
             naming: NamingConfig::default(),
@@ -216,11 +214,6 @@ impl Config {
         };
         cfg.events = EventBusConfig::from_file(user).map_err(config_error)?;
 
-        if cfg.collection_name.trim().is_empty() {
-            return Err(PersonalError::Config(
-                "personal.collection_name must be set; refusing to fall back".into(),
-            ));
-        }
         if cfg.categories.is_empty() {
             return Err(PersonalError::Config(
                 "personal.categories must list at least one category".into(),

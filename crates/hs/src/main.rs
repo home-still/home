@@ -16,7 +16,7 @@ mod docs_shape;
 mod docs_tests;
 mod docs_views;
 mod installer;
-mod mcp_client;
+mod maintain;
 mod mcp_cmd;
 mod migrate_cmd;
 mod migrate_personal;
@@ -211,6 +211,9 @@ fn main() -> ExitCode {
                             server.as_deref(),
                         )
                         .await
+                    }
+                    cli::MigrateAction::DedupeUrlEncoded => {
+                        maintain::dedupe_url_encoded::cmd().await
                     }
                 },
                 TopCmd::Pipeline { command } => pipeline_cmd::dispatch(command, &reporter).await,

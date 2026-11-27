@@ -11,18 +11,6 @@ pub struct Request {
     pub method: String,
     /// Path and query, exactly as sent.
     pub path: String,
-    /// Header names are lower-cased.
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
-
-impl Request {
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -38,24 +26,6 @@ impl Response {
             status,
             headers: vec![("content-type".into(), "application/json".into())],
             body: body.to_string().into_bytes(),
-        }
-    }
-
-    pub fn with_header(mut self, name: &str, value: &str) -> Self {
-        self.headers.push((name.to_string(), value.to_string()));
-        self
-    }
-
-    pub fn with_status(mut self, status: u16) -> Self {
-        self.status = status;
-        self
-    }
-
-    pub fn raw(status: u16, content_type: &str, body: &str) -> Self {
-        Self {
-            status,
-            headers: vec![("content-type".into(), content_type.into())],
-            body: body.as_bytes().to_vec(),
         }
     }
 }
@@ -151,17 +121,12 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<Request> {
         .find(|(k, _)| k == "content-length")
         .and_then(|(_, v)| v.parse::<usize>().ok())
         .unwrap_or(0);
-    let mut body = buf[head_end..].to_vec();
-    while body.len() < wanted {
+    let mut body_len = buf.len() - head_end;
+    while body_len < wanted {
         match sock.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Ok(n) => body_len += n,
         }
     }
-    Some(Request {
-        method,
-        path,
-        headers,
-        body,
-    })
+    Some(Request { method, path })
 }

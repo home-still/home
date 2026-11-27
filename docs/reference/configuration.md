@@ -46,7 +46,7 @@ An environment variable overrides a key of the section it names. The prefix sele
 | Prefix | Sections | Rule |
 |---|---|---|
 | `HS_SCRIBE_` | `scribe`, `scribe_server` | `HS_SCRIBE_<KEY>` sets the top-level key `<key>` (lower case) of the section being loaded. `HS_SCRIBE_CONVERT_TIMEOUT_SECS` sets `scribe.convert_timeout_secs`; `HS_SCRIBE_VLM_CONCURRENCY` sets `scribe_server.vlm_concurrency`. The two sections have disjoint keys, so one prefix serves both. Nested keys (`timeout_policy.*`, `epub.*`) have no variable. |
-| `HS_DISTILL_` | `distill`, `distill_server` | `HS_DISTILL_<KEY>` sets the top-level key `<key>` (lower case) of the section being loaded. `HS_DISTILL_PORT` sets `distill_server.port`. Nested keys (`embedding.*`, `hnsw.*`) have no variable. |
+| `HS_DISTILL_` | `distill`, `distill_server` | `HS_DISTILL_<KEY>` sets the top-level key `<key>` (lower case) of the section being loaded. `HS_DISTILL_PORT` sets `distill_server.port`. Nested keys have no variable. |
 | `HOME_STILL_PAPER_` | `paper` | The words after the prefix name the key path, joined by `_` whether they separate levels or words inside a key: `HOME_STILL_PAPER_DOWNLOAD_PATH` is `paper.download_path`; `HOME_STILL_PAPER_DOWNLOAD_TIMEOUT_SECS` is `paper.download.timeout_secs`. |
 | `HOME_STILL_STORAGE_`, `HOME_STILL_EVENTS_` | `storage`, `events` | Same rule, read by the paper loader. |
 | `HOME_STILL_PERSONAL_` | `personal` | Same rule. `HOME_STILL_PERSONAL_NAMING_MAX_INPUT_TOKENS` is `personal.naming.max_input_tokens`. |
@@ -61,7 +61,7 @@ An unknown key is an error.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `project_dir` | `~/home-still` | The project directory: papers, markdown, catalog, logs and the local Qdrant data directory live under it. Must be a non-empty string; `~/` expands. |
+| `project_dir` | `~/home-still` | The project directory: papers, markdown, catalog and logs live under it. Must be a non-empty string; `~/` expands. |
 | `log_dir` | `<project_dir>/logs` | Where each binary spools its log files. |
 
 Without a `storage:` section the local-filesystem default (`~/home-still`) applies. If `home.project_dir` names a different directory and `storage:` is absent, loading fails until `storage.local.root` is set.
@@ -306,36 +306,29 @@ The distill server (`hs serve distill`, `hs-distill-server`). The server refuses
 |---|---|---|
 | `host` | `0.0.0.0` | Bind address. The `--host` flag wins. |
 | `port` | `7434` | Listen port. The `--port` flag wins; `hs serve distill --port` passes it as `HS_DISTILL_PORT`. Must not be 0. |
-| `qdrant_url` | `http://localhost:6334` | Qdrant gRPC endpoint. |
-| `qdrant_data_dir` | `<project_dir>/data/qdrant` | Qdrant storage directory. |
-| `collection_name` | `academic_papers` | Default collection; a request that names none uses it. |
-| `collections` | `[paper_abstracts, personal_docs]` | Further collections a request may name. Every configured collection is created or verified at start-up; a request naming any other collection gets HTTP 400. |
-| `chunk_max_tokens` | `1000` | Maximum tokens per chunk. |
+| `myelin_url` | `http://127.0.0.1:7462/mcp` | MCP endpoint of the myelin server that stores and searches the chunks. It must be myelin's full surface, not its agent surface: the distill server defines its stores there at start-up, and writes and deletes documents in them. |
+| `chunk_max_tokens` | `1000` | Maximum tokens per chunk. `chunk_max_tokens + 48` must fit the embedding model's 8192-token context. |
 | `chunk_overlap` | `100` | Token overlap between chunks; smaller than `chunk_max_tokens`. |
-| `qdrant_upsert_batch` | `1000` | Chunks per Qdrant upsert request; at least 1. |
-| `qdrant_upsert_parallelism` | `4` | Upsert requests in flight per document; at least 1. |
 | `llm_metadata` | `false` | Extract keywords and topics with Ollama. A failed call fails that document. |
 | `metadata_model` | `llama3.2:latest` | Ollama model for metadata. Must be non-empty when `llm_metadata` is `true`. |
-| `ollama_url` | `http://localhost:11434` | Ollama URL including the port. Used only when `llm_metadata` is `true`. |
-| `ollama_timeout_secs` | `120` | Upper bound on one metadata call; at least 1 when `llm_metadata` is `true`. |
-| `embedding.dimension` | `1024` | Expected vector width. Compared with what the model returns at start-up; a mismatch stops the server. |
-| `embedding.max_length` | `1280` | Tokens the model sees per text; longer input is truncated. `chunk_max_tokens + 48` must fit. At most `8192`. |
-| `embedding.batch_size` | unset (starts at 32) | Rows per forward pass, and the starting point when `adaptive_batch` is on. At least 1 and at most 128 × 512² ÷ `max_length²` rows. |
-| `embedding.pool_size` | unset (1) | Model copies; at least 1. |
-| `embedding.adaptive_batch` | `true` | Tune the batch size in-process against observed throughput. A batch the accelerator cannot allocate also tunes it, downward. |
-| `embedding.compute_device` | `cuda` | Only `cuda` is accepted; any other value fails to load. |
-| `embedding.idle_release_secs` | unset | Drop the model from GPU memory after this many idle seconds; at least 1. The next request reloads it. Unset keeps it resident. |
-| `embedding.vram_floor_mb` | `5000` | Free VRAM required before (re)loading the model. Below it the load fails and names the GPU holders. Hosts without an NVIDIA GPU skip the check. |
-| `embedding.gpu_yield_file` | unset | A host GPU broker's yield file (`{"for","since","expires"}`). While it names an unexpired tenant a (re)load fails with `gpu busy: yielded to <tenant>`, so the event is NAK'd and redelivered. |
-| `embedding.gpu_make_room_cmd` | unset | Argv run once, with `--need-mib <vram_floor_mb>` appended, when a (re)load is blocked; exit 0 means "try again now". |
-| `hnsw.m` | `16` | Edges per node for new collections; 4 to 128. |
-| `hnsw.ef_construct` | `100` | Candidates considered while building the graph; from `m` to 1024. |
-| `hnsw.search_ef` | `128` | Candidates considered per query; 1 to 4096. |
-| `hnsw.max_indexing_threads` | `4` | Threads Qdrant may use when HNSW is enabled on an existing collection; 1 to 64. |
+| `ollama_url` | `http://localhost:11434` | Ollama URL including the port. Ollama runs the embedding model behind myelin: the server asks it where that model is loaded, and calls it for metadata when `llm_metadata` is `true`. |
+| `ollama_timeout_secs` | `120` | Upper bound on one call to Ollama; at least 1. |
 
-Keys `embedding.model` and `embedding.sparse_enabled` have no effect; the server logs a warning when they are set. The HNSW settings apply when a collection is created; an existing collection keeps the graph it was built with.
+A key the server no longer has, such as `collection_name`, `collections`, `qdrant_url` or an `embedding.*` or `hnsw.*` key, has no effect; the server logs a warning when one is set.
 
-Collection names are 1 to 64 characters of `[A-Za-z0-9_-]`, starting with a letter or digit, and must be unique across `collection_name` and `collections`.
+### Stores
+
+The distill server files every document in a named store. The stores are fixed by the program, not by configuration. The server defines all of them in myelin at start-up and stops if myelin refuses one. A request that names any other store gets HTTP 400.
+
+| Store | Holds | Searched when a search names no store |
+|---|---|---|
+| `academic` | The full text of the academic papers, in passages that carry their page and lines. | yes |
+| `references` | The reference lists of the academic papers. The server fills it while it indexes a paper into `academic`; it takes no documents of its own. | no |
+| `abstracts` | One record per academic paper: its title and abstract. `hs distill abstracts build` fills it. | no |
+| `personal` | The personal documents. `hs personal` fills it. | no |
+| `web` | Web pages an agent captured. | no |
+| `syntheses` | Answers an agent saved. | no |
+| `memory` | What agents were asked to remember. Agents write it through myelin; the distill server defines it and indexes nothing into it. | no |
 
 ### `HS_DISTILL_<KEY>` overrides
 
@@ -344,10 +337,10 @@ The variable name is `HS_DISTILL_` followed by the key in upper case. The loader
 | Variable | Effect |
 |---|---|
 | `HS_DISTILL_PORT` | `distill_server.port`. |
-| `HS_DISTILL_QDRANT_URL` | `distill_server.qdrant_url`. |
+| `HS_DISTILL_MYELIN_URL` | `distill_server.myelin_url`. |
 | `HS_DISTILL_CONCURRENCY` | `distill.concurrency`. |
 
-A name that is a top-level key of neither section is a warning. Nested keys such as `embedding.max_length` can only be set in the file.
+A name that is a top-level key of neither section is a warning.
 
 ## `docs`
 
@@ -382,7 +375,7 @@ The gateway (`hs-gateway`). There is no default gateway: a missing `cloud.gatewa
 | `backend_failure_cooldown_secs` | `10` | How long an instance that refused a connection is skipped. |
 | `auth_rate_limit_per_minute` | `30` | POSTs per minute allowed on each of `/cloud/enroll`, `/authorize`, `/token` and `/register`; at least 1. |
 
-`routes` must contain a backend for each of `scribe`, `distill`, `mcp` and `docs`; a missing service stops the gateway and names the key to add. A route is `http://host[:port]` or `https://host[:port]` with no credentials, path, query or fragment, and an instance may be listed once per service.
+`routes` must contain a backend for each of `scribe`, `distill`, `mcp`, `memory` and `docs`; a missing service stops the gateway and names the line to add. A route is `http://host[:port]` or `https://host[:port]` with no credentials, path, query or fragment, and an instance may be listed once per service. `memory` is the agent listener of the memory server (myelin), port 7463.
 
 ```yaml
 cloud:
@@ -392,6 +385,7 @@ cloud:
       scribe: [http://<gpu-host>:7433, http://<scribe-host>:7433]
       distill: http://<gpu-host>:7434
       mcp: http://127.0.0.1:7445
+      memory: http://<memory-host>:7463
       docs: http://<docs-host>:7446
 ```
 
@@ -404,7 +398,7 @@ The local OpenAlex database. See [Use the OpenAlex catalog](../how-to/use-the-op
 | `db_path` | required | Path of the DuckDB file. `~/` expands. Must be non-empty. |
 | `snapshot_dir` | required by `hs openalex` | Directory that holds the OpenAlex snapshot. `hs-mcp` does not read it. |
 
-`hs openalex` stops when the section, `db_path` or `snapshot_dir` is missing. `hs-mcp` offers the `openalex_*` tools only when the database file exists and its build is complete; see [MCP tools](mcp-tools.md#tool-visibility).
+`hs openalex` stops when the section, `db_path` or `snapshot_dir` is missing. In `hs-mcp`, `discover` and `graph` read the database only when the file exists and its build is complete; see [MCP tools](mcp-tools.md#startup-requirements).
 
 ## `personal`
 
@@ -412,7 +406,6 @@ The personal-documents store. See [Manage personal documents](../how-to/manage-p
 
 | Key | Default | Meaning |
 |---|---|---|
-| `collection_name` | `personal_docs` | Qdrant collection for the store. Must be non-empty. |
 | `storage_dir` | `personal` | Prefix of the store's objects in the storage backend, and the store's directory under the project directory. Must be a relative path without `.` or `..` parts, and must not overlap another store's prefix (`papers`, `markdown`, `catalog`, `boxes`, `web`, `syntheses`). |
 | `ingest_inbox` | `inbox` | Directory that `personal_add` resolves file names against. A relative value is joined under `<project_dir>/<storage_dir>`; an absolute value is used as given. |
 | `distill_url` | `http://localhost:7434` | Distill server URL. |

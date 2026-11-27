@@ -1,14 +1,14 @@
-//! Reconcile markdown ↔ Qdrant ↔ catalog.
+//! Reconcile markdown ↔ myelin store ↔ catalog.
 //!
 //! The embed pipeline can diverge in two ways when a stamp write or an
 //! event handler silently fails:
 //!
-//! - **Stamp lost**: the doc is in Qdrant (search works) but the catalog
+//! - **Stamp lost**: the doc is in the store (search works) but the catalog
 //!   YAML never got the `embedding:` block, so the TUI reports the doc
 //!   as "not embedded" even though it is. The `hs status` Markdown →
 //!   Embedded percentage is phantom-low as a result.
 //! - **Embed lost**: the markdown exists on storage but the doc never
-//!   reached Qdrant. Usually because the `scribe.completed` NATS event
+//!   reached the store. Usually because the `scribe.completed` NATS event
 //!   was dropped or the distill server errored and the handler swallowed
 //!   the failure.
 //!
@@ -19,17 +19,17 @@
 use std::collections::HashSet;
 
 /// Classification of a markdown stem after comparing catalog state to
-/// Qdrant.
+/// the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Classification {
-    /// Catalog and Qdrant agree, or the catalog intentionally recorded a
+    /// Catalog and store agree, or the catalog intentionally recorded a
     /// skip/failure. Nothing to do.
     Ok,
-    /// Doc is in Qdrant but catalog has no embedding stamp. Backfill the
+    /// Doc is in the store but catalog has no embedding stamp. Backfill the
     /// stamp so the TUI counts it correctly.
     StampMissing,
     /// Markdown exists, catalog has no prior embed outcome (neither a
-    /// success stamp nor a skip/failure), but Qdrant doesn't have it.
+    /// success stamp nor a skip/failure), but the store doesn't have it.
     /// Re-embed is safe.
     EmbedMissing,
 }
@@ -48,7 +48,7 @@ pub struct CatalogState {
 }
 
 /// Classify every markdown stem. `indexed_docs` is the set of doc_ids
-/// Qdrant currently has at least one chunk for. `catalog` maps stem →
+/// the store currently has at least one chunk for. `catalog` maps stem →
 /// state (absent entries are treated as all-false).
 pub fn partition<'a>(
     markdown_stems: &'a [String],
@@ -59,27 +59,27 @@ pub fn partition<'a>(
         .iter()
         .map(|stem| {
             let state = catalog.get(stem).cloned().unwrap_or_default();
-            let in_qdrant = indexed_docs.contains(stem);
-            let class = classify(in_qdrant, &state);
+            let in_store = indexed_docs.contains(stem);
+            let class = classify(in_store, &state);
             (stem.as_str(), class)
         })
         .collect()
 }
 
-fn classify(in_qdrant: bool, state: &CatalogState) -> Classification {
-    // A recorded embed failure outranks whatever Qdrant holds for the stem:
+fn classify(in_store: bool, state: &CatalogState) -> Classification {
+    // A recorded embed failure outranks whatever the store holds for the stem:
     // indexing upserts batch by batch, so a failed run can leave a document
-    // with only some of its chunks (or a stale tail) in Qdrant. Stamping
+    // with only some of its chunks (or a stale generation) in the store. Stamping
     // those as embedded would record a partial index as a success; only a
     // fresh index (which replaces the document's chunks) settles it.
     if !state.has_embedding_stamp && is_embed_failure(state.embedding_skip_reason.as_deref()) {
         return Classification::EmbedMissing;
     }
-    match (in_qdrant, state.has_embedding_stamp) {
+    match (in_store, state.has_embedding_stamp) {
         (true, true) => Classification::Ok,
         (true, false) => Classification::StampMissing,
         (false, _) => {
-            // Not in Qdrant. Embedding skips are intentional *unless* the
+            // Not in the store. Embedding skips are intentional *unless* the
             // reason is an embed failure we recorded ourselves — those
             // must stay retryable, otherwise a transient error
             // permanently hides the doc from the reconciler.
@@ -92,7 +92,9 @@ fn classify(in_qdrant: bool, state: &CatalogState) -> Classification {
     }
 }
 
-fn is_embed_failure(reason: Option<&str>) -> bool {
+/// Whether an `embedding_skip` reason records an index attempt that failed,
+/// as opposed to a document found to hold nothing to index.
+pub fn is_embed_failure(reason: Option<&str>) -> bool {
     reason.is_some_and(|r| r.starts_with("embed_failed"))
 }
 
@@ -136,11 +138,11 @@ mod tests {
     }
 
     #[test]
-    fn stamp_missing_when_in_qdrant_but_no_stamp() {
-        // The real-world case we observed: markdown exists, Qdrant has the
+    fn stamp_missing_when_in_store_but_no_stamp() {
+        // The real-world case we observed: markdown exists, the store has the
         // doc, catalog just never got stamped.
         let md = stems(&["a", "b"]);
-        let qdrant = s(&["a", "b"]);
+        let indexed = s(&["a", "b"]);
         let mut cat = HashMap::new();
         cat.insert(
             "a".into(),
@@ -150,24 +152,24 @@ mod tests {
             },
         );
         // "b" has no stamp → StampMissing
-        let parts = partition(&md, &qdrant, &cat);
+        let parts = partition(&md, &indexed, &cat);
         assert_eq!(parts[0].1, Classification::Ok);
         assert_eq!(parts[1].1, Classification::StampMissing);
     }
 
     #[test]
-    fn embed_missing_when_not_in_qdrant_and_no_skip() {
+    fn embed_missing_when_not_in_store_and_no_skip() {
         let md = stems(&["a"]);
-        let qdrant = HashSet::new();
+        let indexed = HashSet::new();
         let cat = HashMap::new();
-        let parts = partition(&md, &qdrant, &cat);
+        let parts = partition(&md, &indexed, &cat);
         assert_eq!(parts[0].1, Classification::EmbedMissing);
     }
 
     #[test]
-    fn intentional_embedding_skip_is_ok_even_without_qdrant_entry() {
+    fn intentional_embedding_skip_is_ok_even_without_store_entry() {
         let md = stems(&["a"]);
-        let qdrant = HashSet::new();
+        let indexed = HashSet::new();
         let mut cat = HashMap::new();
         cat.insert(
             "a".into(),
@@ -176,7 +178,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let parts = partition(&md, &qdrant, &cat);
+        let parts = partition(&md, &indexed, &cat);
         assert_eq!(parts[0].1, Classification::Ok);
     }
 
@@ -187,7 +189,7 @@ mod tests {
         // still classify it as EmbedMissing, otherwise a transient storage
         // error or network blip hides the doc forever.
         let md = stems(&["a"]);
-        let qdrant = HashSet::new();
+        let indexed = HashSet::new();
         let mut cat = HashMap::new();
         cat.insert(
             "a".into(),
@@ -196,17 +198,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        let parts = partition(&md, &qdrant, &cat);
+        let parts = partition(&md, &indexed, &cat);
         assert_eq!(parts[0].1, Classification::EmbedMissing);
     }
 
     #[test]
-    fn embed_failed_doc_present_in_qdrant_is_reindexed_not_stamped() {
+    fn embed_failed_doc_present_in_store_is_reindexed_not_stamped() {
         // A failed index can leave some chunks (or a stale tail) behind;
         // backfilling a success stamp from that count would record a
         // partial index as complete.
         let md = stems(&["a", "b"]);
-        let qdrant = s(&["a", "b"]);
+        let indexed = s(&["a", "b"]);
         let mut cat = HashMap::new();
         cat.insert(
             "a".into(),
@@ -223,7 +225,7 @@ mod tests {
                 embedding_skip_reason: Some("embed_failed: upsert".into()),
             },
         );
-        let parts = partition(&md, &qdrant, &cat);
+        let parts = partition(&md, &indexed, &cat);
         assert_eq!(parts[0].1, Classification::EmbedMissing);
         assert_eq!(parts[1].1, Classification::Ok);
     }
@@ -244,20 +246,20 @@ mod tests {
 
     #[test]
     fn mixed_real_world_sample_partitions_correctly() {
-        // Mirrors the observed sample: 8 docs with markdown, Qdrant has
+        // Mirrors the observed sample: 8 docs with markdown, the store has
         // them, catalog never stamped — all should be StampMissing.
         let md = stems(&[
             "10.1016_j.bbi.2020.08.034",
             "10.1016_j.cobeha.2017.07.018",
             "10.1186_s13229-018-0226-4",
         ]);
-        let mut qdrant = HashSet::new();
-        qdrant.insert("10.1016_j.bbi.2020.08.034".into());
-        qdrant.insert("10.1016_j.cobeha.2017.07.018".into());
-        // Third stem (Risk markers) is genuinely missing from Qdrant.
+        let mut indexed = HashSet::new();
+        indexed.insert("10.1016_j.bbi.2020.08.034".into());
+        indexed.insert("10.1016_j.cobeha.2017.07.018".into());
+        // Third stem (Risk markers) is genuinely missing from the store.
         let cat = HashMap::new();
 
-        let parts = partition(&md, &qdrant, &cat);
+        let parts = partition(&md, &indexed, &cat);
         assert_eq!(parts[0].1, Classification::StampMissing);
         assert_eq!(parts[1].1, Classification::StampMissing);
         assert_eq!(parts[2].1, Classification::EmbedMissing);

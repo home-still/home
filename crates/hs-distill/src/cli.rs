@@ -4,13 +4,7 @@ use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
 pub enum DistillCmd {
-    /// Set up Qdrant and distill server environment
-    Init {
-        /// Re-create compose config even if it exists
-        #[arg(long)]
-        force: bool,
-    },
-    /// Index markdown files into Qdrant via distill server
+    /// Index markdown files into the myelin store via distill server
     Index {
         /// Re-index all documents (ignore cache)
         #[arg(long)]
@@ -45,16 +39,17 @@ pub enum DistillCmd {
         #[arg(long)]
         topic: Option<String>,
 
+        /// Store to search, by name (`academic`, `abstracts`, `references`,
+        /// `personal`, `web`, `syntheses`). Repeat it to search several.
+        /// Without it the server searches its default stores.
+        #[arg(long = "store", value_name = "NAME")]
+        stores: Vec<String>,
+
         /// Override server URL
         #[arg(long)]
         server: Option<String>,
     },
-    /// Manage HNSW indexing of the Qdrant collections
-    Hnsw {
-        #[command(subcommand)]
-        action: HnswCmd,
-    },
-    /// Show distill system status (Qdrant, server, collection)
+    /// Show distill system status (server, backend, the `academic` store)
     Status {
         /// Override server URL
         #[arg(long)]
@@ -78,55 +73,86 @@ pub enum DistillCmd {
         #[arg(long)]
         verbose: bool,
     },
-    /// Reconcile markdown ↔ Qdrant ↔ catalog. Finds docs that were
+    /// Reconcile markdown ↔ myelin store ↔ catalog. Finds docs that were
     /// embedded but lost their catalog stamp (`--fix-stamps` backfills)
-    /// and docs whose markdown exists but never reached Qdrant
+    /// and docs whose markdown exists but never reached the store
     /// (`--reembed` re-indexes). Safe to run anytime: default is dry-run.
     Reconcile {
-        /// Backfill missing `embedding` stamps for docs already in Qdrant
+        /// Backfill missing `embedding` stamps for docs already in the store
         #[arg(long)]
         fix_stamps: bool,
-        /// Re-index markdown that never reached Qdrant
+        /// Re-index markdown that never reached the store
         #[arg(long)]
         reembed: bool,
         /// Override server URL
         #[arg(long)]
         server: Option<String>,
     },
-    /// Backfill missing titles onto indexed points from the catalog.
-    ///
-    /// A document's title is copied from its catalog row into the Qdrant
-    /// payload at index time, so a document indexed before its catalog row
-    /// existed was indexed with no title — and it stays that way, because
-    /// the corpus is not re-indexed. This writes the title the catalog now
-    /// holds onto the document's points. The **vector is untouched**: it is
-    /// a payload update, not a re-embed, so it needs no GPU and no
-    /// embedding model.
-    ///
-    /// Dry-run by default; `--apply` writes. Documents the catalog does
-    /// not know are reported as untitled, never given a placeholder.
-    BackfillTitles {
-        /// Write the titles. Without this, report what would change.
+    /// Index documents of the `academic` store again from their stored
+    /// markdown and catalog entry, replacing their records in place. A
+    /// document's new records are written before its earlier ones are
+    /// deleted, so it stays searchable throughout.
+    Reindex {
+        /// Stems of the documents to index again
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        stems: Vec<String>,
+        /// Index every document that has markdown
         #[arg(long)]
-        apply: bool,
+        all: bool,
+        /// With `--all`, leave out the documents indexed at or after this
+        /// time (RFC 3339); name the time a stopped run began to continue it
+        #[arg(long, value_name = "TIME", requires = "all")]
+        older_than: Option<String>,
+        /// How many documents are indexed at once
+        #[arg(long, default_value = "1")]
+        concurrency: std::num::NonZeroUsize,
         /// Override server URL
         #[arg(long)]
         server: Option<String>,
     },
-    /// Delete every Qdrant chunk for a doc_id. CLI-only (no MCP) because
-    /// this is a destructive write — use to clear orphaned vectors after
+    /// Index the converted documents that were never embedded: those whose
+    /// catalog entry has a conversion stamp and no embedding stamp with
+    /// chunks. Without `--dry-run` it indexes them.
+    Backfill {
+        /// Report what would be indexed without sending anything to the
+        /// server or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Index at most this many documents. Default: all.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Also index documents whose last indexing found nothing to index
+        #[arg(long)]
+        retry_skipped: bool,
+        /// Override server URL
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Report stored markdown that the repetition cleaner would cut heavily,
+    /// which is how a looping conversion shows. Reads only; it changes
+    /// nothing and prints a JSON report.
+    ScanRepetitions {
+        /// Scan at most this many documents. Default: 100000.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Report documents cut more than this many times. Default: 20.
+        #[arg(long)]
+        threshold: Option<usize>,
+    },
+    /// Delete every stored chunk for a doc_id. CLI-only (no MCP) because
+    /// this is a destructive write — use to clear orphaned chunks after
     /// markdown has been removed, or to force a clean re-index.
     Purge {
-        /// doc_id whose chunks should be deleted from Qdrant
+        /// doc_id whose chunks should be deleted
         doc_id: String,
         /// Override server URL
         #[arg(long)]
         server: Option<String>,
     },
-    /// Manage the `paper_abstracts` Qdrant collection — a per-paper
+    /// Manage the `abstracts` store — a per-paper
     /// (not per-chunk) embedding of `{title}\n\n{abstract}` for high-
     /// precision semantic search over papers' core arguments. Distinct
-    /// from `academic_papers` (per-chunk body text). Abstract source is
+    /// from the `academic` store (per-chunk body text). Abstract source is
     /// `openalex` (DOI lookup) > `catalog` (provider abstract) > `markdown`
     /// (`## Abstract` extraction); a paper with none of them is skipped.
     #[command(subcommand)]
@@ -136,7 +162,7 @@ pub enum DistillCmd {
 #[derive(Subcommand, Debug)]
 pub enum AbstractsCmd {
     /// Iterate every catalog entry, coalesce title+abstract, embed into
-    /// the `paper_abstracts` collection, and stamp the catalog. Idempotent
+    /// the `abstracts` store, and stamp the catalog. Idempotent
     /// — entries with an `abstract_embed` stamp are skipped unless
     /// `--force`.
     Build {
@@ -158,21 +184,4 @@ pub enum AbstractsCmd {
     /// Report coverage: total catalog entries vs. abstract_embed stamps
     /// broken down by source (openalex / catalog / markdown).
     Status,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum HnswCmd {
-    /// Enable HNSW on a configured collection. Starts a background
-    /// whole-collection index build on the Qdrant host: requires --yes.
-    Enable {
-        /// Collection name (the server accepts only configured collections)
-        #[arg(long)]
-        collection: String,
-        /// Confirm starting the background index build
-        #[arg(long)]
-        yes: bool,
-        /// Override server URL
-        #[arg(long)]
-        server: Option<String>,
-    },
 }

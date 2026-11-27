@@ -21,6 +21,7 @@ use hs_common::word_boxes::{self, WordBoxes, WordOrigin};
 use rmcp::model::{CallToolResult, Content};
 use rmcp::schemars;
 
+use super::{catalog_entry, contents_result, object, publication_year, source_extension};
 use crate::links::{LinkMinter, LinkPair, MintedLink, ShortLinkPair};
 use crate::stem::Stem;
 use crate::HomeStillMcp;
@@ -37,9 +38,6 @@ const MAX_PAGE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 /// The media type of a page image.
 const PAGE_IMAGE_MEDIA_TYPE: &str = "image/png";
-
-/// The digits of the year a publication date starts with (`2021-03-04`).
-const YEAR_DIGITS: usize = 4;
 
 /// Why `cite` cannot run on a host that mints no links: a citation is the
 /// links a reader checks it with.
@@ -274,26 +272,43 @@ impl Cited {
 /// What the tool answers: the citation, or the refusal as a tool error, the
 /// shape every other tool's `Err` takes.
 pub fn tool_result(outcome: Result<Cited, String>) -> CallToolResult {
-    match outcome.and_then(Cited::into_contents) {
-        Ok(content) => CallToolResult::success(content),
-        Err(refusal) => CallToolResult::error(vec![Content::text(refusal)]),
-    }
+    contents_result(outcome.and_then(Cited::into_contents))
+}
+
+/// A quote checked against its document, before any link to it is made.
+pub(crate) struct Checked<'a> {
+    /// The store whose documents the quote was checked in: the store asked
+    /// for, or for a derived store the one it is derived from.
+    pub holder: &'a StoreSpec,
+    /// The document's catalog entry.
+    pub card: Option<CatalogEntry>,
+    /// The passage, as the text it was checked against has it.
+    pub found: QuoteMatch,
+    /// The quote was checked against the abstract in the catalog entry,
+    /// not against the converted text.
+    pub from_abstract: bool,
+    /// Where the passage is on the pages of its source.
+    pub boxes: CitedBoxes,
+    /// The words a link boxes: there for a located passage and for no
+    /// other.
+    pub highlight: Option<Highlight>,
+    /// The page of the source the passage starts on, when that is known.
+    pub page: Option<u32>,
 }
 
 impl HomeStillMcp {
-    /// Check a quote against its document and build the citation.
-    pub(crate) async fn cite_quote(&self, p: CiteParams) -> Result<Cited, String> {
-        let minter = self
-            .link_minter
-            .as_deref()
-            .filter(|minter| minter.is_enabled())
-            .ok_or(LINKS_NOT_CONFIGURED)?;
-        let short = p.short.as_deref().map(ShortKind::parse).transpose()?;
-        let asked = p.store.as_deref().unwrap_or(hs_common::stores::ACADEMIC);
+    /// Check a quote against its document. `cite` and `synthesis_save`
+    /// both stand on this one check.
+    pub(crate) async fn check_quote(
+        &self,
+        asked: &str,
+        stem: &str,
+        quoted: &str,
+        near_line: Option<u32>,
+    ) -> Result<Checked<'_>, String> {
         let spec = self.stores.get(asked).map_err(|e| e.to_string())?;
         // A derived store's documents, and so its links, are its parent's.
         let (holder, layout) = self.stores.documents(asked).map_err(|e| e.to_string())?;
-        let stem: &str = &p.doc_id;
         let storage: &dyn Storage = &*self.storage;
 
         let extension = source_extension(storage, layout, stem)
@@ -315,10 +330,8 @@ impl HomeStillMcp {
                 ..
             }
         );
-        // `highlight` is the words a link boxes: there for a located
-        // passage and for no other.
         let (found, boxes, highlight) = if from_abstract {
-            if p.near_line.is_some() {
+            if near_line.is_some() {
                 return Err(format!(
                     "`near_line` is a line of a document, and the store {asked:?} is checked \
                      against the abstract in the catalog entry: leave it out"
@@ -335,7 +348,7 @@ impl HomeStillMcp {
                         holder.name
                     )
                 })?;
-            let found = quote::locate(abstract_text, &p.quote, None)
+            let found = quote::locate(abstract_text, quoted, None)
                 .map_err(|e| format!("the abstract of {stem:?}: {e}"))?;
             (found, CitedBoxes::NotApplicable, None)
         } else {
@@ -349,7 +362,7 @@ impl HomeStillMcp {
                 })?;
             let markdown = String::from_utf8(markdown)
                 .map_err(|e| format!("the converted text of {stem:?} is not UTF-8: {e}"))?;
-            let found = quote::locate(&markdown, &p.quote, p.near_line)
+            let found = quote::locate(&markdown, quoted, near_line)
                 .map_err(|e| format!("{stem:?}: {e}"))?;
             let (boxes, highlight) = if extension == PDF_EXTENSION {
                 place(storage, layout, stem, &markdown, &found).await?
@@ -369,6 +382,36 @@ impl HomeStillMcp {
             }
             CitedBoxes::NotApplicable => None,
         };
+        Ok(Checked {
+            holder,
+            card,
+            found,
+            from_abstract,
+            boxes,
+            highlight,
+            page,
+        })
+    }
+
+    /// Check a quote against its document and build the citation.
+    pub(crate) async fn cite_quote(&self, p: CiteParams) -> Result<Cited, String> {
+        let minter = self
+            .link_minter
+            .as_deref()
+            .filter(|minter| minter.is_enabled())
+            .ok_or(LINKS_NOT_CONFIGURED)?;
+        let short = p.short.as_deref().map(ShortKind::parse).transpose()?;
+        let asked = p.store.as_deref().unwrap_or(hs_common::stores::ACADEMIC);
+        let stem: &str = &p.doc_id;
+        let Checked {
+            holder,
+            card,
+            found,
+            from_abstract,
+            boxes,
+            highlight,
+            page,
+        } = self.check_quote(asked, stem, &p.quote, p.near_line).await?;
         // An abstract's words were not looked for in the converted text, so
         // the markdown link selects nothing.
         let passage = (!from_abstract).then_some(found.text.as_str());
@@ -587,56 +630,6 @@ fn located(
     )))
 }
 
-/// An object's bytes, or `None` when the storage holds no such object. Any
-/// other failure is an error: an outage must not read as a missing object.
-async fn object(storage: &dyn Storage, key: &str) -> Result<Option<Vec<u8>>, String> {
-    match storage.get(key).await {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if hs_common::storage::is_not_found(&e) => Ok(None),
-        Err(e) => Err(format!("reading {key} failed: {e:#}")),
-    }
-}
-
-/// The extension of a stem's source object, probing the store's extensions
-/// in order. `None` when the store has no such document.
-async fn source_extension(
-    storage: &dyn Storage,
-    layout: &DocumentLayout,
-    stem: &str,
-) -> Result<Option<&'static str>, String> {
-    for extension in layout.source_extensions {
-        let key = layout.source_key(stem, extension);
-        match storage.head(&key).await {
-            Ok(Some(_)) => return Ok(Some(*extension)),
-            Ok(None) => {}
-            Err(e) if hs_common::storage::is_not_found(&e) => {}
-            Err(e) => return Err(format!("checking for the source {key} failed: {e:#}")),
-        }
-    }
-    Ok(None)
-}
-
-/// A document's catalog entry, or `None` when it has none.
-///
-/// The personal store keeps the entry in a sidecar beside the document;
-/// every other store keeps it under its catalog prefix.
-async fn catalog_entry(
-    storage: &dyn Storage,
-    store: &StoreSpec,
-    layout: &DocumentLayout,
-    stem: &str,
-) -> Result<Option<CatalogEntry>, String> {
-    if store.name == hs_common::stores::PERSONAL {
-        personal::services::catalog::read_card(storage, &layout.source_prefix, stem)
-            .await
-            .map_err(|e| e.to_string())
-    } else {
-        hs_common::catalog::read_catalog_entry_via(storage, &layout.catalog_prefix, stem)
-            .await
-            .map_err(|e| format!("reading the catalog entry of {stem:?} failed: {e:#}"))
-    }
-}
-
 /// The page the conversion recorded for the part of the text a passage
 /// starts in.
 fn recorded_page(card: &CatalogEntry, found: &QuoteMatch) -> Option<u32> {
@@ -646,15 +639,6 @@ fn recorded_page(card: &CatalogEntry, found: &QuoteMatch) -> Option<u32> {
         .iter()
         .find(|page| (page.char_start..page.char_end).contains(&found.char_start))
         .and_then(|page| u32::try_from(page.page).ok())
-}
-
-/// The year a publication date (`2021-03-04`, `2021`) starts with.
-fn publication_year(date: &str) -> Option<u16> {
-    let year = date.get(..YEAR_DIGITS)?;
-    if !year.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    year.parse().ok()
 }
 
 /// The address a document was captured from, pointing at a passage: the

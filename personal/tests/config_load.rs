@@ -44,7 +44,6 @@ fn documented_multi_word_env_keys_bind() {
         None,
         &[
             ("HOME_STILL_PERSONAL_STORAGE_DIR", "scans"),
-            ("HOME_STILL_PERSONAL_COLLECTION_NAME", "my_docs"),
             ("HOME_STILL_PERSONAL_NAMING_MAX_INPUT_TOKENS", "512"),
             (
                 "HOME_STILL_PERSONAL_NAMING_OLLAMA_URL",
@@ -55,7 +54,6 @@ fn documented_multi_word_env_keys_bind() {
     )
     .unwrap();
     assert_eq!(c.storage_dir, "scans");
-    assert_eq!(c.collection_name, "my_docs");
     assert_eq!(c.naming.max_input_tokens, 512);
     assert_eq!(c.naming.ollama_url, "http://llm.example:11434");
     assert_eq!(c.ingest_inbox, "drop");
@@ -92,14 +90,14 @@ fn an_env_key_that_names_nothing_is_an_error_not_silence() {
 #[test]
 fn a_malformed_section_is_an_error_not_the_defaults() {
     for yaml in [
-        "personal:\n  collection_name: [a]\n",
+        "personal:\n  storage_dir: [a]\n",
         "personal:\n  categories: not-a-list\n",
         "personal: [1, 2]\n",
         "home:\n  project_dir: [a]\n",
     ] {
         assert!(load_yaml(Some(yaml), &[]).is_err(), "{yaml}");
     }
-    let err = load_yaml(Some("personal:\n  collection_name: [a]\n"), &[])
+    let err = load_yaml(Some("personal:\n  storage_dir: [a]\n"), &[])
         .unwrap_err()
         .to_string();
     assert!(err.contains("personal"), "{err}");

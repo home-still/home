@@ -8,11 +8,10 @@ pub enum DistillError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("Embedding error: {0}")]
-    Embedding(String),
-
-    #[error("Qdrant error: {0}")]
-    Qdrant(String),
+    /// The myelin store or the ollama embedder behind it failed or answered
+    /// something this server cannot use.
+    #[error("Backend error: {0}")]
+    Backend(String),
 
     #[error("Metadata extraction error: {0}")]
     Metadata(String),

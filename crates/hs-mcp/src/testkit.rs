@@ -1,5 +1,6 @@
-//! Fakes for tool-level tests: a storage that fails on demand and records
-//! deletes, and a loopback distill server that records every request.
+//! Fakes for tool-level tests: a storage that fails on demand, a loopback
+//! distill server, an event bus that remembers what was published, and a
+//! synthetic OpenAlex corpus.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,22 +8,17 @@ use std::sync::{Arc, Mutex};
 use hs_common::event_bus::NoOpBus;
 use hs_common::storage::{LocalFsStorage, ObjectMeta, Storage};
 
+use crate::openalex::OpenAlexCorpus;
 use crate::{Deps, HomeStillMcp};
 
 /// A `LocalFsStorage` in a temp dir whose operations can be made to fail like
-/// an S3 outage (an error that is *not* "not found"), and that records every
-/// `delete`.
+/// an S3 outage (an error that is *not* "not found").
 pub struct FaultyStorage {
     inner: LocalFsStorage,
     _dir: tempfile::TempDir,
     pub fail_head: AtomicBool,
     pub fail_get: AtomicBool,
-    pub fail_put: AtomicBool,
     pub fail_list: AtomicBool,
-    /// When set, faults only hit keys containing this text (so a test can
-    /// break the markdown probe and leave catalog reads working).
-    pub only_keys_containing: Mutex<Option<String>>,
-    pub deletes: Mutex<Vec<String>>,
 }
 
 impl FaultyStorage {
@@ -33,10 +29,7 @@ impl FaultyStorage {
             _dir: dir,
             fail_head: AtomicBool::new(false),
             fail_get: AtomicBool::new(false),
-            fail_put: AtomicBool::new(false),
             fail_list: AtomicBool::new(false),
-            only_keys_containing: Mutex::new(None),
-            deletes: Mutex::new(Vec::new()),
         })
     }
 
@@ -45,20 +38,10 @@ impl FaultyStorage {
     }
 
     fn outage(&self, flag: &AtomicBool, op: &str, key: &str) -> anyhow::Result<()> {
-        let in_scope = self
-            .only_keys_containing
-            .lock()
-            .unwrap()
-            .as_deref()
-            .is_none_or(|needle| key.contains(needle));
-        if in_scope && flag.load(Ordering::SeqCst) {
+        if flag.load(Ordering::SeqCst) {
             anyhow::bail!("simulated storage outage during {op}({key})");
         }
         Ok(())
-    }
-
-    pub fn recorded_deletes(&self) -> Vec<String> {
-        self.deletes.lock().unwrap().clone()
     }
 }
 
@@ -69,7 +52,6 @@ impl Storage for FaultyStorage {
         self.inner.get(key).await
     }
     async fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
-        self.outage(&self.fail_put, "put", key)?;
         self.inner.put(key, bytes).await
     }
     async fn head(&self, key: &str) -> anyhow::Result<Option<ObjectMeta>> {
@@ -81,59 +63,58 @@ impl Storage for FaultyStorage {
         self.inner.list(prefix).await
     }
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        self.deletes.lock().unwrap().push(key.to_string());
         self.inner.delete(key).await
     }
 }
 
-/// One request seen by [`FakeDistill`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Seen {
-    pub method: String,
-    pub path: String,
-    pub query: String,
-}
+/// How many records [`FakeDistill`] says each store holds for a document it
+/// knows.
+pub const FAKE_RECORDS_PER_DOC: u64 = 4;
 
-/// A loopback distill server. Answers the routes the client uses with canned
-/// replies and records every request, so a test can assert what was (not)
-/// called.
+/// A loopback distill server that knows the documents it was started with.
+/// It answers the two routes the `status` tool asks, `GET /status` and
+/// `GET /exists/<doc_id>`, for whichever store the request names.
 pub struct FakeDistill {
     pub url: String,
-    pub seen: Arc<Mutex<Vec<Seen>>>,
 }
 
 impl FakeDistill {
-    /// `doc_ids` is what `GET /docs` returns.
+    /// `doc_ids` are the documents every store is said to hold.
     pub async fn start(doc_ids: Vec<String>) -> Self {
         use axum::extract::Request;
         use axum::response::Json;
 
-        let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorder = seen.clone();
         let app = axum::Router::new().fallback(move |req: Request| {
-            let recorder = recorder.clone();
             let doc_ids = doc_ids.clone();
             async move {
-                let method = req.method().to_string();
-                let path = req.uri().path().to_string();
-                let query = req.uri().query().unwrap_or_default().to_string();
-                recorder.lock().unwrap().push(Seen {
-                    method: method.clone(),
-                    path: path.clone(),
-                    query,
-                });
-                match (method.as_str(), path.as_str()) {
-                    ("POST", "/distill") => Json(serde_json::json!({
-                        "doc_id": "doc",
-                        "chunks_indexed": 3,
-                        "embedding_device": "cuda",
-                    })),
-                    ("GET", "/docs") => Json(serde_json::json!({
-                        "doc_ids": doc_ids,
-                        "truncated": false,
-                    })),
-                    ("DELETE", _) => Json(serde_json::json!({ "deleted": 7 })),
-                    _ => Json(serde_json::json!({})),
+                let store = req
+                    .uri()
+                    .query()
+                    .unwrap_or_default()
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("store="))
+                    .unwrap_or_default()
+                    .to_string();
+                let path = req.uri().path();
+                if path == "/status" {
+                    return Json(serde_json::json!({
+                        "store": store,
+                        "records_count": doc_ids.len() as u64 * FAKE_RECORDS_PER_DOC,
+                        "documents_count": doc_ids.len(),
+                        "documents_count_truncated": false,
+                        "compute_device": "cuda",
+                        "embed_model": "bge-m3",
+                    }));
+                }
+                match path.strip_prefix("/exists/") {
+                    Some(doc_id) => {
+                        let known = doc_ids.iter().any(|id| id == doc_id);
+                        Json(serde_json::json!({
+                            "exists": known,
+                            "chunks": if known { FAKE_RECORDS_PER_DOC } else { 0 },
+                        }))
+                    }
+                    None => Json(serde_json::json!({})),
                 }
             }
         });
@@ -142,18 +123,7 @@ impl FakeDistill {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        Self { url, seen }
-    }
-
-    pub fn requests(&self) -> Vec<Seen> {
-        self.seen.lock().unwrap().clone()
-    }
-
-    pub fn count(&self, method: &str) -> usize {
-        self.requests()
-            .iter()
-            .filter(|s| s.method == method)
-            .count()
+        Self { url }
     }
 }
 
@@ -167,12 +137,12 @@ fn deps(
         storage,
         events,
         scribe_servers,
-        scribe_convert_timeout: std::time::Duration::from_secs(5),
-        scribe_timeout_policy: hs_scribe::config::TimeoutPolicy::default(),
-        epub_limits: hs_scribe::epub::EpubLimits::default(),
         paper_config: paper::config::Config::default(),
         distill_servers,
-        openalex_db: None,
+        openalex: OpenAlexCorpus::Unavailable(
+            "the test server has no OpenAlex corpus; build one with `hs openalex load-works`"
+                .to_string(),
+        ),
         // The tests do not configure links, so the tools carry none.
         link_minter: None,
         stores: hs_common::stores::Stores::with_personal_prefix(
@@ -219,8 +189,8 @@ impl hs_common::event_bus::EventBus for RecordingBus {
 }
 
 /// [`server`] with a recording bus and a scribe server that nothing listens
-/// on: enough for the sources that never reach the scribe (HTML, EPUB) and
-/// for proving that a source is refused before any request is made.
+/// on: enough for the tools that store a document and announce it, and for
+/// proving that a source is refused before anything is announced.
 pub fn server_with_bus(storage: Arc<dyn Storage>, bus: Arc<RecordingBus>) -> HomeStillMcp {
     HomeStillMcp::from_deps(deps(
         storage,
@@ -271,8 +241,9 @@ pub fn server_with_event_bus(
 }
 
 /// A server over a synthetic OpenAlex DuckDB (a file in `dir`, never the real
-/// corpus) holding a handful of works. The readiness sentinel is set so the
-/// `openalex_*` tools stay exposed.
+/// corpus) holding a handful of works: W1, W2 and W3 each cite W9. There is
+/// no full-text index, so only the DOI lookups and the citation graph can be
+/// asked of it.
 pub fn server_with_openalex(dir: &std::path::Path) -> HomeStillMcp {
     let conn = duckdb::Connection::open(dir.join("openalex.duckdb")).unwrap();
     conn.execute_batch(
@@ -302,7 +273,7 @@ pub fn server_with_openalex(dir: &std::path::Path) -> HomeStillMcp {
         Vec::new(),
         Vec::new(),
     );
-    d.openalex_db = Some(Arc::new(Mutex::new(conn)));
+    d.openalex = OpenAlexCorpus::Ready(Arc::new(Mutex::new(conn)));
     HomeStillMcp::from_deps(d).unwrap()
 }
 

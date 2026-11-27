@@ -141,7 +141,7 @@ pub enum MigrateAction {
     ///
     /// The personal store writes through the local filesystem, so it is
     /// on one host, not in the bucket, and not in the backup — and the
-    /// docs service cannot serve it, so an agent's `personal_search` hit
+    /// docs service cannot serve it, so a hit in a personal document
     /// comes back with no link the user can open. This moves the objects
     /// into the same store the corpus uses, with their names unchanged.
     /// The local files are left in place.
@@ -197,6 +197,10 @@ pub enum MigrateAction {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Report documents stored under a URL-encoded stem (`10.1%2Fabc`) and
+    /// again under the decoded one. Reads only; it changes nothing and
+    /// prints a JSON report of the pairs.
+    DedupeUrlEncoded,
 }
 
 #[derive(Subcommand, Debug)]

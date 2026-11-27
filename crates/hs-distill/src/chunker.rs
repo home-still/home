@@ -233,7 +233,6 @@ mod tests {
         DocumentMeta {
             doc_id: "test-doc".into(),
             title: Some("Test Document".into()),
-            markdown_path: "markdown/test-doc.md".into(),
             ..Default::default()
         }
     }

@@ -9,7 +9,7 @@ understand the design in an **explanation**.
 | Page | What you build |
 |---|---|
 | [Build your first research library](tutorials/first-library.md) | One Linux machine that downloads, converts, indexes and searches papers by itself, connected to Claude. |
-| [Run home-still across your home machines](tutorials/home-cloud-cluster.md) | A small cluster: shared storage, a GPU node, Qdrant, NATS, and a gateway that makes the library reachable from anywhere. |
+| [Run home-still across your home machines](tutorials/home-cloud-cluster.md) | A small cluster: shared storage, a GPU node with myelin, NATS, and a gateway that makes the library reachable from anywhere. |
 
 ## How-to guides
 
@@ -17,14 +17,14 @@ understand the design in an **explanation**.
 |---|---|
 | [Find and download papers](how-to/find-and-download-papers.md) | Search the academic providers, look papers up by DOI, download them, and add files you downloaded yourself. |
 | [Convert documents](how-to/convert-documents.md) | Run scribe servers, convert files by hand or automatically, and retry failed or stalled conversions. |
-| [Index and search your library](how-to/index-and-search.md) | Run the distill server, index markdown, search, build the abstracts collection, and repair the index. |
+| [Index and search your library](how-to/index-and-search.md) | Run the distill server, index markdown, search, build the abstracts store, and repair the index. |
 | [Open documents at the cited page](how-to/open-documents-with-links.md) | Serve signed links that open a source at the page, or the markdown at the passage, on the LAN and remotely. |
 | [Manage personal documents](how-to/manage-personal-documents.md) | Keep private records (medical, financial and others) in their own searchable store. |
 | [Use the local OpenAlex catalog](how-to/use-the-openalex-catalog.md) | Load an OpenAlex snapshot for offline metadata, full-text search and the citation graph. |
 | [Connect Claude and other agents](how-to/connect-claude-and-agents.md) | Give Claude Desktop, Claude Code or OpenCode the home-still tools, locally or through the gateway. |
 | [Access your library remotely](how-to/access-remotely.md) | Enroll and revoke devices, get tokens, and rotate the gateway's signing secret. |
 | [Run and upgrade services](how-to/run-and-upgrade-services.md) | Start, install and restart the services, upgrade every binary, and watch the dashboard. |
-| [Operate a cluster](how-to/operate-a-cluster.md) | Verify a cluster, roll out upgrades, add or retire nodes, choose and migrate storage, and recover Qdrant. |
+| [Operate a cluster](how-to/operate-a-cluster.md) | Verify a cluster, roll out upgrades, add or retire nodes, choose and migrate storage, and rebuild a damaged search index. |
 | [Troubleshoot](how-to/troubleshoot.md) | Match a symptom to its cause and fix. |
 
 ## Reference

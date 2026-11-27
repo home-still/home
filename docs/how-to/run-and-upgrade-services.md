@@ -22,7 +22,7 @@ hs serve docs
 | Service | Default port | Before the first run |
 |---|---|---|
 | `hs serve scribe` | 7433 | The host has the layout and table models, libpdfium, a VLM backend and `HS_BACKEND_TOKEN`. The command provisions nothing. See [Convert documents](convert-documents.md). |
-| `hs serve distill` | 7434 | An NVIDIA GPU with CUDA. The command sets up Qdrant first, as `hs distill init` does. See [Index and search your library](index-and-search.md). |
+| `hs serve distill` | 7434 | An NVIDIA GPU with CUDA, and a myelin server and Ollama running. The command provisions neither. See [Index and search your library](index-and-search.md). |
 | `hs serve mcp` | 7445 | `storage:` and `events:` in the configuration. See [Connect Claude and agents](connect-claude-and-agents.md). |
 | `hs serve docs` | 7446 | `storage:` in the configuration, and libpdfium on the host. See [Open documents with links](open-documents-with-links.md). |
 
@@ -45,14 +45,14 @@ hs serve distill-watch
 
 ## Run distill in the background
 
-For distill, `start` brings up Qdrant and the server and returns; `stop` takes both down:
+For distill, `start` starts the server and returns; `stop` stops it:
 
 ```sh
 hs serve distill start
 hs serve distill stop
 ```
 
-`start` starts Qdrant from `~/.home-still/docker-compose-distill.yml` when that file exists (otherwise Qdrant must already answer), replaces any distill server it started before, waits for `/health`, and starts the indexing daemon. The server's log is `distill-server.log` in the log directory.
+`start` replaces any distill server it started before, waits for `/health`, and starts the indexing daemon. It starts no database: myelin and Ollama must already be running. The server's log is `distill-server.log` in the log directory.
 
 ## Install a service
 
@@ -101,7 +101,7 @@ journalctl --user -u hs-scribe-watch-events -f
 
 On macOS the services are LaunchAgents named `com.home-still.<service>`, and their logs are under `~/Library/Logs/home-still/`. Every unit name is in [service units](../reference/services-and-ports.md#service-units).
 
-See the whole pipeline at once with the dashboard, which reads the MCP server's `system_status`:
+See the whole pipeline at once with the dashboard, which reads the MCP server's `GET /mcp/status` route:
 
 ```sh
 HS_MCP_URL=http://localhost:7445/mcp hs status
@@ -117,7 +117,7 @@ After you change `~/.home-still/config.yaml` or `secrets.env`, restart the servi
 hs restart
 ```
 
-The command finds every systemd unit and LaunchAgent that runs one of this host's home-still binaries, restarts the ones that are active, then restarts the distill indexing daemon and the compose stacks in `~/.home-still/` (Qdrant's `docker-compose-distill.yml`, and the scribe stack's `docker-compose.yml` when `scribe.local_server` is on). A unit that is enabled but stopped is left stopped, with a warning. The command exits non-zero when any restart failed.
+The command finds every systemd unit and LaunchAgent that runs one of this host's home-still binaries, restarts the ones that are active, then restarts the distill indexing daemon and the scribe compose stack (`~/.home-still/docker-compose.yml`, when `scribe.local_server` is on). It does not restart myelin, Ollama or Qdrant. A unit that is enabled but stopped is left stopped, with a warning. The command exits non-zero when any restart failed.
 
 ## Upgrade a host
 
@@ -135,7 +135,7 @@ Upgrade one host at a time, on the host itself.
    hs upgrade --pre --yes
    ```
 
-   The command resolves every download and checksum before it changes anything. Then it updates the managed containers, replaces the binaries, restarts the services that run them, and waits for health.
+   The command resolves every download and checksum before it changes anything. Then it updates the scribe containers, replaces the binaries, restarts the services that run them, and waits for health.
 
 3. Reinstall the current release over itself, for example after a damaged binary:
 
@@ -145,10 +145,10 @@ Upgrade one host at a time, on the host itself.
 
 What the upgrade does, in order:
 
-- **Containers.** For each compose stack in `~/.home-still/` (Qdrant, and the scribe stack when `scribe.local_server` is on), it pulls the images and recreates the containers only when an image changed or the service does not answer its health URL. An unchanged, healthy service keeps running.
+- **Containers.** For the scribe compose stack (`~/.home-still/docker-compose.yml`, when `scribe.local_server` is on), it pulls the images and recreates the containers only when an image changed or the service does not answer its health URL. An unchanged, healthy service keeps running. myelin and its Qdrant are not managed by `hs`; upgrade them with the tools you installed them with.
 - **Binaries.** It replaces `hs-distill-server`, `hs-gateway`, `hs-mcp` and `hs-scribe-server` that are already installed on the host, and replaces `hs` last. A failed run leaves the old `hs` in place, so running it again retries everything.
 - **Restarts.** It restarts the units whose program is a binary it replaced, in systemd system scope, systemd user scope and launchd.
-- **Health.** It waits for the containers to answer, and for a native distill server to answer on CUDA. A restart or health failure fails the upgrade.
+- **Health.** It waits for the scribe containers to answer, and for a native distill server to answer on CUDA. A restart or health failure fails the upgrade.
 
 A companion binary that is not installed on the host is not installed by an upgrade. For rolling a whole cluster, see [Operate a cluster](operate-a-cluster.md).
 
@@ -163,10 +163,10 @@ A companion binary that is not installed on the host is not installed by an upgr
 
    The second command reports that you are up to date.
 
-2. The services came back. `hs status` shows each scribe and distill server and Qdrant as healthy:
+2. The services came back. `hs status` shows each scribe and distill server and the store (myelin) as healthy:
 
    ```sh
    HS_MCP_URL=http://localhost:7445/mcp hs status
    ```
 
-3. A service that fails to restart or stay up is listed by `hs restart` with the reason, and in its journal. If an upgrade times out waiting for Qdrant on a large library, Qdrant may still be loading its collections after its container was recreated; see [Troubleshoot](troubleshoot.md), then run `hs upgrade --pre --yes` again.
+3. A service that fails to restart or stay up is listed by `hs restart` with the reason, and in its journal. If a distill server does not answer on CUDA after an upgrade, see [Troubleshoot](troubleshoot.md), then run `hs upgrade --pre --yes` again.

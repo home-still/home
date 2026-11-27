@@ -1,0 +1,339 @@
+# Held-out evaluation queries for home-still retrieval.
+#
+# Approved by the owner on 2026-11-26, before any of them was scored.
+# No retrieval setting may be chosen with this file: it is for confirming
+# a setting chosen elsewhere. A query that is changed after it has been
+# scored is no longer held out.
+#
+# Pass rule, fixed before the first scoring: with the store at its default
+# settings, the candidate finds at least as many expected documents in the
+# top 10 as the baseline does in the same session. Every query the two
+# disagree on is listed in the report.
+#
+# Same shape as queries.yaml, but every query is anchored to one document:
+# it passes when `expect_doc` is among the top `limit` results.
+#
+# How the set was made, so it can be made again:
+#   * Frame: documents held by both the Qdrant index and the myelin store,
+#     with a title of at least 15 characters that no other document
+#     shares, and at least 4 chunks. 13440 documents.
+#   * Sample: 70 drawn with Python's random.Random(20261126).sample
+#     over the sorted frame; the first 50 usable ones in draw order were
+#     kept (draws 1 to 51 without draw 36).
+#   * Passage: one chunk per document, chosen by
+#     random.Random("20261126:<doc id>").choice over the chunks that
+#     are not the first two, not the last, hold at least 1200 characters,
+#     are at least 72 % letters and spaces, and are not a reference list
+#     (the harness's own rule). The first 800 characters of that
+#     chunk were read, and the query was written from them alone.
+#     No search was run against either index while writing.
+#   * Passed over: draw 36 (the passage is one phrase repeated, a failed
+#     conversion).
+#   * `expect` is a term checked to occur in the passage read. It is
+#     recorded for the rank column; the pass is by document.
+#   * Ten passages hold table cells (h02, h05, h06, h09, h19, h21, h25,
+#     h37, h41, h48); they were kept, because a document's tables are
+#     part of what a search must find.
+#   * h35's document is in Italian and its query is in English.
+#
+# Groups mean what they mean in queries.yaml.
+
+- id: h01
+  group: concept
+  query: "can a hyperpartisan news classifier act as a prefilter for style-based fake news detection"
+  expect: "prefilter"
+  expect_doc: "10.18653_v1_p18-1022"
+
+- id: h02
+  group: literal
+  query: "plasma tetrahydrocannabinol assays confirming no cannabis use during placebo phases and no diversion of the study drug"
+  expect: "diversion"
+  expect_doc: "10.1503_cmaj.091414"
+
+- id: h03
+  group: named
+  query: "EPS values of ring-width chronologies from Gonder Qusquam church"
+  expect: "Qusquam"
+  expect_doc: "10.1007_s00484-020-01863-7"
+
+- id: h04
+  group: named
+  query: "number of tetrahedra in the Hass, Lagarias and Pippenger triangulation of the trefoil complement"
+  expect: "Pippenger"
+  expect_doc: "10.48550_arXiv.2311.03693"
+
+- id: h05
+  group: concept
+  query: "training data for a small speech recognition model built from subtitle file segments and Whisper pseudo-labels"
+  expect: "pseudo-labeled"
+  expect_doc: "10.48550_arxiv.2410.15608"
+
+- id: h06
+  group: concept
+  query: "infertile men who failed to collect semen by masturbation for a second analysis, psychogenic sexual dysfunction"
+  expect: "masturbation"
+  expect_doc: "10.1007_s40618-021-01581-w"
+
+- id: h07
+  group: literal
+  query: "variance partitioning of trait variation among leaf habit, site, taxonomic family and species identity"
+  expect: "variance partitioning"
+  expect_doc: "10.1111_nph.17584"
+
+- id: h08
+  group: concept
+  query: "how developers' workplaces moved from large hardware rooms to cubicles, remote work and hybrid collaboration"
+  expect: "cubicles"
+  expect_doc: "10.1145_3715111"
+
+- id: h09
+  group: literal
+  query: "exact match on NQ-open when a prediction may match any gold reference or only the first"
+  expect: "NQ-OPEN"
+  expect_doc: "10.48550_arxiv.2004.10645"
+
+- id: h10
+  group: concept
+  query: "does a lateral shift in PIN protein localization explain auxin responses in the outer cortex of determinate nodules"
+  expect: "outer cortex"
+  expect_doc: "10.1093_jxb_erx308"
+
+- id: h11
+  group: concept
+  query: "simulating species extinction and avalanche events in a food chain on a 100 by 100 cellular automaton lattice with 256 species"
+  expect: "avalanche"
+  expect_doc: "10.48550_arxiv.1003.5288"
+
+- id: h12
+  group: named
+  query: "web navigation agent reaching 53.94% on WebArena-Lite"
+  expect: "WebArena-Lite"
+  expect_doc: "10.48550_arXiv.2503.09572"
+
+- id: h13
+  group: literal
+  query: "starch determination by perchloric acid hydrolysis of the pellet left after soluble sugar extraction"
+  expect: "starch"
+  expect_doc: "10.1111_pce.14923"
+
+- id: h14
+  group: concept
+  query: "path coefficients for childhood trauma, emotion regulation and psychotic experiences at baseline, month 4, month 8 and month 12"
+  expect: "psychotic experiences"
+  expect_doc: "10.1016_j.eurpsy.2016.12.010"
+
+- id: h15
+  group: concept
+  query: "counselor asking a betrayed client to notice the sensations in her legs and stomach as he comes through the door"
+  expect: "counselor"
+  expect_doc: "10.1353_jip.2016.0018"
+
+- id: h16
+  group: concept
+  query: "men who learnt to apologise and thank their partners after a group programme on partner abuse and substance use"
+  expect: "apologize"
+  expect_doc: "10.1177_0886260521997436"
+
+- id: h17
+  group: literal
+  query: "parameter settings for option-based Monte Carlo tree search: maximum search depth 70, Crazy Stone K 0.5, 40 millisecond action time"
+  expect: "crazy stone"
+  expect_doc: "10.1109_cig.2016.7860383"
+
+- id: h18
+  group: concept
+  query: "why masters throwing events show no accelerated decline: shot put, discus and javelin implement weights drop with age"
+  expect: "javelin"
+  expect_doc: "10.3389_fphys.2018.01100"
+
+- id: h19
+  group: named
+  query: "From helpless to hero: promoting values-based behavior and family interaction during COVID-19, and the role of parents in their children's confinement"
+  expect: "helpless to hero"
+  expect_doc: "W3093234291"
+
+- id: h20
+  group: literal
+  query: "observer rating of demand and withdraw on a 9-point scale after watching the whole interaction, CIRS reliability"
+  expect: "CIRS"
+  expect_doc: "10.1017_cbo9780511500077.016"
+
+- id: h21
+  group: named
+  query: "Forest Inventory and Analysis plots 2000 to 2018 and PRISM climate for the Umatilla and Wallowa-Whitman national forests"
+  expect: "Wallowa-Whitman"
+  expect_doc: "10.3389_ffgc.2020.594274"
+
+- id: h22
+  group: literal
+  query: "tie-discounted accuracy for agreement between crowd, author and GPT-4 annotators"
+  expect: "tie-discounted"
+  expect_doc: "10.48550_arxiv.2305.11206"
+
+- id: h23
+  group: concept
+  query: "forgiveness as emotion-focused coping to reduce anger and hostility after an interpersonal transgression"
+  expect: "emotion-focused coping"
+  expect_doc: "10.3389_fpsyg.2020.01084"
+
+- id: h24
+  group: concept
+  query: "model of sexual identity in which sexual orientation identity forms last and is not fixed over time"
+  expect: "sex role identity"
+  expect_doc: "10.1300_j070v06n03_03"
+
+- id: h25
+  group: concept
+  query: "adjusted odds ratios for orofacial clefts in Iran, where prevalence is below the global average"
+  expect: "OFCs"
+  expect_doc: "10.1186_s40902-020-00270-7"
+
+- id: h26
+  group: named
+  query: "RolePlayConv synthetic multi-party conversation dataset built from 125 assistant roles"
+  expect: "RolePlayConv"
+  expect_doc: "10.48550_arxiv.2606.13544"
+
+- id: h27
+  group: named
+  query: "glucosidase II alpha subunit EST as internal control for qPCR of poplar trees in the Ein Avdat valley"
+  expect: "Ein Avdat"
+  expect_doc: "10.1186_gb-2005-6-12-r101"
+
+- id: h28
+  group: concept
+  query: "scoping review that found 20 knowledge translation resources: overviews, summaries and policy briefs"
+  expect: "policy briefs"
+  expect_doc: "10.1186_s12874-018-0611-x"
+
+- id: h29
+  group: concept
+  query: "orgasm gap beyond university women and the limits of a quasi-control design for a sexuality class"
+  expect: "orgasm gap"
+  expect_doc: "10.1080_14681811.2019.1598858"
+
+- id: h30
+  group: named
+  query: "caregiver burden in schizophrenia versus bipolar disorder in a Gujarat tertiary-care sample of 210 caregivers"
+  expect: "Gujarat"
+  expect_doc: "10.21275_sr261026183224"
+
+- id: h31
+  group: literal
+  query: "mean sensitivity and first-order autocorrelation of larch ring width across forest stand size classes"
+  expect: "mean sensitivity"
+  expect_doc: "10.1007_s13595-018-0701-2"
+
+- id: h32
+  group: concept
+  query: "under-developed soothe system and over-active drive system after adverse early experiences"
+  expect: "soothe system"
+  expect_doc: "10.3389_fpsyg.2023.1267968"
+
+- id: h33
+  group: literal
+  query: "correlations of a compassionate love scale with Eros, Agape, Ludus and Pragma"
+  expect: "Ludus"
+  expect_doc: "10.5964_ijpr.v6i1.88"
+
+- id: h34
+  group: literal
+  query: "bias-reduced binomial GLMs with probit link for symptomatic seedlings under complete separation"
+  expect: "brglm"
+  expect_doc: "10.1101_2020.12.24.424362"
+
+- id: h35
+  group: concept
+  query: "caregivers as unpaid providers of continuing help with daily activities for chronically ill people at home after hospital discharge"
+  expect: "caregivers"
+  expect_doc: "10.54103_dn_20926"
+
+- id: h36
+  group: literal
+  query: "triangle multiplicative update as a cheaper, more symmetric replacement for attention on the pair representation"
+  expect: "triangle multiplicative update"
+  expect_doc: "W3177828909"
+
+- id: h37
+  group: named
+  query: "biomass calculation for Norway with Marklund aboveground and Petersson and Stahl belowground functions"
+  expect: "Marklund"
+  expect_doc: "10.1016_j.foreco.2015.11.016"
+
+- id: h38
+  group: concept
+  query: "why therapist ratings were not used as outcome measures for adults with ASD, and the limits of self-report"
+  expect: "self-reports"
+  expect_doc: "10.1177_1362361313493681"
+
+- id: h39
+  group: literal
+  query: "K-YSR items selected for internalizing and externalizing problems under Achenbach's classification"
+  expect: "K-YSR"
+  expect_doc: "10.4082_kjfm.2013.34.3.169"
+
+- id: h40
+  group: literal
+  query: "principal component analysis finding five cognitive components in euthymic patients, verbal memory from CVLT and sustained attention from CPT"
+  expect: "CVLT"
+  expect_doc: "10.1192_bjp.bp.117.201335"
+
+- id: h41
+  group: named
+  query: "Tumorcut and spatial decision forests among the segmentation algorithms that took part in the benchmark"
+  expect: "Tumorcut"
+  expect_doc: "10.1109_tmi.2014.2377694"
+
+- id: h42
+  group: concept
+  query: "few interpersonal communication studies about sexual coercion and consent"
+  expect: "sexual coercion"
+  expect_doc: "10.3145_epi.2021.ene.14"
+
+- id: h43
+  group: concept
+  query: "counter anti-inflammatory response syndrome: IL-10, TGF beta, glucocorticoids and cholinergic pathways limiting inflammation"
+  expect: "cholinergic"
+  expect_doc: "10.1186_1741-7015-10-66"
+
+- id: h44
+  group: concept
+  query: "why trees with soft-wooded stems have denser twigs in floodplain forests"
+  expect: "twig"
+  expect_doc: "10.1111_1365-2435.14572"
+
+- id: h45
+  group: named
+  query: "de Martonne aridity index and standardized precipitation evapotranspiration index as monthly and seasonal climate variables for stem growth"
+  expect: "de Martonne"
+  expect_doc: "10.1007_s10342-020-01295-3"
+
+- id: h46
+  group: concept
+  query: "shifting an auxin biosynthesis parameter from 50% to 150% and the predicted organ numbers over 30 simulations"
+  expect: "whorls"
+  expect_doc: "10.1371_journal.pone.0028762"
+
+- id: h47
+  group: concept
+  query: "visualized language to help ASD clients follow the unspoken information in a conversation during modified CBT"
+  expect: "visualized language"
+  expect_doc: "10.1111_sjop.12255"
+
+- id: h48
+  group: named
+  query: "pine chronology positively correlated with May, June and October temperatures at Bansko; pointer years coincide"
+  expect: "Bansko"
+  expect_doc: "10.1007_s00468-010-0416-y"
+
+- id: h49
+  group: concept
+  query: "inclusion criteria: one year of unprotected intercourse, female partners without tubal obstruction, semen analysed by WHO criteria"
+  expect: "tubal obstruction"
+  expect_doc: "10.1038_srep22386"
+
+- id: h50
+  group: literal
+  query: "bigrams as boolean features keeping stop words with SVMs, and the Essays dataset of stream-of-consciousness texts"
+  expect: "stream-of-consciousness"
+  expect_doc: "10.1609_icwsm.v7i2.14467"

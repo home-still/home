@@ -5,9 +5,10 @@ recent activity. In an interactive terminal it is a live dashboard (`q`, Esc or
 Ctrl+C quits); when stdout or stdin is not a terminal it prints the same data
 once as text. `--output json` and `--output ndjson` print it once as JSON.
 
-The data comes from the MCP server's [`system_status`](mcp-tools.md#system_status)
-tool, so the CLI and an agent see the same numbers. `hs status` reaches the MCP
-server in one of two ways:
+The data comes from the MCP server's `GET /mcp/status` route (see
+[HTTP routes](mcp-tools.md#http-routes)). An agent reads the pipeline with the
+[`status`](mcp-tools.md#status) tool. `hs status` reaches the MCP server in one
+of two ways:
 
 | Setting | Route |
 |---|---|
@@ -21,7 +22,7 @@ server in one of two ways:
 | Documents | Source documents (PDF, HTML, EPUB) under `papers/`. | Total size. | | |
 | Markdown | Markdown documents under `markdown/`. | Total size. | Markdown ÷ (Documents − bad sources), capped at 100 %. A document that failed for a retryable reason stays in the denominator. | `hs pipeline catch-up` |
 | Cataloged | Catalog entries. | | | `hs scribe catalog-backfill` |
-| Embedded | Documents with points in Qdrant. | Chunk count, and how many documents are stamped `embedding_skip` (markdown that yields no chunk). | Embedded ÷ (Markdown − skipped). | `hs distill reconcile --reembed` |
+| Embedded | Documents with records in the store. | Chunk count, and how many documents are stamped `embedding_skip` (markdown that yields no chunk). | Embedded ÷ (Markdown − skipped). | `hs distill reconcile --reembed` |
 | In-flight | Conversions running now, summed over every scribe server's `/readiness`. | `converting across N scribes`, or `idle`. | | |
 | Queued | Messages outstanding on the `scribe-workers` consumer: waiting in the stream plus delivered and not yet acknowledged. | `waiting for or held by a scribe`, `queue empty`, or `unavailable: <reason>` when the broker cannot say. `?` means unknown, never zero. | | |
 | Stalled | Sources with no markdown and no failure stamp, minus Queued. These were never queued, or their message was lost. | `no markdown and not queued — run hs pipeline catch-up`, or `none`. | | `hs pipeline catch-up --dry-run` |
@@ -44,14 +45,14 @@ names the cause), and `...` while the first count is in progress.
 ## Services rows
 
 One row per scribe server in `scribe.servers`, one per distill server in
-`distill.servers`, and one for Qdrant.
+`distill.servers`, and a last one, `Store`, for the myelin server the distill server uses.
 
 | Column | Meaning |
 |---|---|
 | Indicator | `●` healthy, `○` not. |
-| Status | `running`, `idle`, `N converting` (scribe), `N embedding` (distill), `healthy`/`stopped` (Qdrant), or the reason the service is unhealthy. |
-| URL | The configured address. Never truncated. |
-| Detail | Model, slots and device as the service reports them. |
+| Status | `running`, `idle`, `N converting` (scribe), `N embedding` (distill), `healthy`/`stopped` (the store), or the reason the service is unhealthy. |
+| URL | The configured address; for the store row, the myelin server's URL. Never truncated. |
+| Detail | Model, slots and device as the service reports them. For the store row: the store's name. |
 | Version | The service's version. |
 
 When a scribe server's VLM backend lacks GPU memory, the status is a
@@ -87,11 +88,13 @@ the catalog. The reason's kind decides what can recover it:
 | `epub_parse_error` | bad source | The EPUB cannot be opened, exceeds the size caps, or has a missing, escaping or non-UTF-8 spine item. |
 | `html_not_utf8` | bad source | The HTML is not UTF-8. |
 | `html_parse_error` | bad source | The HTML nests too deeply, or its conversion did not finish in time. |
-| `unsupported_extension` | bad source | No converter handles the file's extension. |
+| `text_not_utf8` | bad source | The Markdown or plain-text source is not UTF-8. |
+| `text_too_large` | bad source | The Markdown or plain-text source is over 16 MiB. |
+| `unsupported_extension` | bad source | No converter handles the file's extension, or the store that holds the source does not take it. |
 | `source_missing` | bad source | The source object does not exist in storage. |
 | `missing_extension` | bad source | The event's key has no extension. |
-| `invalid_key` | bad source | The event's key cannot name a document (escapes the storage root, or an empty or dot-segment stem). |
-| `empty_conversion` | bad source | The HTML or EPUB parser produced less text than can be indexed. |
+| `invalid_key` | bad source | The event's key cannot name a document (escapes the storage root, an empty or dot-segment stem, or under no store's source prefix). |
+| `empty_conversion` | bad source | The HTML or EPUB parser produced less text than can be indexed, or a Markdown or plain-text source holds less. |
 | `conversion_panicked` | bad source | The server panicked converting this document; the same bytes panic again. |
 | `vlm_request_rejected` | bad source | The VLM backend refused the page's request itself (bad request, payload too large, unsupported media). |
 | `empty_vlm_conversion` | retryable | The VLM produced less text than can be indexed. |

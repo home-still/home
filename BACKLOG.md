@@ -267,6 +267,7 @@ this is a logging concern taking down the entire CLI, including the one command
 **Change:** the Qdrant wait must exceed a collection recovery — or, better, it must distinguish "not answering yet" from "still recovering": poll the container's state and say which. A host whose services are all up must not have its upgrade reported as failed. The upgrade already restarts the container (`down` then `up -d`), so the recovery is **caused by the upgrade**; the wait belongs to the same operation.
 **Acceptance:** `hs upgrade --pre --yes` on a host with a 15,933-document corpus exits 0, and a Qdrant that is genuinely down still fails the upgrade with a message that names Qdrant.
 **Partly fixed in rc.388 (2026-10-23):** the upgrade no longer recreates a compose service whose containers already run the images their tags name after the pull and that answers its health URL — the common case (Qdrant's image unchanged), which removes the outage (44.8–67.0 s measured on a copy of the corpus, ~7 min here) and the false timeout together. **Still open:** when the image really changed, the recreate and the 90 s wait are as before; the wait should still distinguish "recovering" from "down". See `docs/loop/runs/2026-10-23-04/`.
+**Closed (2026-11-25, not yet released):** `hs` no longer manages a Qdrant. The distill server's index is a myelin server the operator runs, so the `distill` compose stack, its recreate and the `/healthz` wait are gone from `hs upgrade` and `hs restart` (`managed_compose_files` returns the scribe stack only). The second half of the acceptance no longer applies: a myelin server that is down fails the distill server's own health wait, which names the distill server.
 
 ### P0-30. A wedged `llama-swap` answers every model-start request with an empty `200` after 240 s and never spawns a backend (found 2026-11-02, rc.389)
 **Symptom:** `big`'s scribe tier converted **nothing** for at least 40 minutes. `GET :8081/running` answered `{"running":[]}` in ~40 µs, but every `POST :8081/v1/chat/completions` — for `olmocr` *and* `glm-ocr` *and* gpu-tenant's own warm-up probe — hung for exactly **240.1 s** and then returned `200` with a **zero-length body**. `gpu-tenant`'s reaper repeated `warm-up of olmocr failed: no answer timed out` every 4 minutes for 40+ minutes. Scribe saw it as `backend_reachable: true, backend_model_resident: false` (the `/health` probe is answered by llama-swap, not by a backend), so it kept dispatching and each conversion died on its own 1800 s deadline.
@@ -1431,3 +1432,165 @@ shape P0-25 had: a maintenance path that exists only in a README. An expired cod
 service answers it `404`), so this is clutter rather than a fault, but it is unbounded.
 **Fix.** Schedule it: a weekly timer on the host that owns the corpus storage. Until then the
 how-to says a cron entry is enough, which puts the burden on the operator.
+
+### P1-40. The embedder takes 2,048 tokens per input, so long chunks are embedded from a prefix and two documents cannot be indexed (found 2026-11-26, cutover re-index)
+**Symptom.** Measured on the myelin store's embedder: an input over 2,048 tokens is cut to 2,048
+with no error (30 of 1,500 randomly sampled academic chunks, 2.0%, report exactly 2,048 prompt
+tokens; replacing the last 300 characters of one leaves its vector unchanged), and some inputs are
+refused with HTTP 413. Two documents (`10.48550_arxiv.2604.26509`, `W3212386989`) fail every
+indexing attempt for that reason; the Qdrant-era index holds both. The Qdrant-era ONNX embedder
+cuts sooner, at `embedding.max_length` = 1,280 tokens (240 of the same 1,500 chunks, 16.0%, are
+over that; derived from these chunk texts, not measured on its inputs), so for truncated chunks
+the myelin path is the better of the two and only the two refused documents are a loss.
+**Cause.** A chunk is at most 4,000 characters, which table and formula markup turns into more
+than 2,048 tokens. The model's own limit is 8,192, but Ollama starts it with a 2,048-token batch
+(measured from the process arguments: `-c 8192 -np 1 -b 2048 -ub 2048`), and an embedding input
+must fit one batch. An earlier version of this entry blamed 4 parallel slots; that was a guess
+and it was wrong.
+**Fix.** Run the embedder with a batch equal to its context, then index again every document
+holding a chunk over 2,048 tokens. Tested 2026-11-26 on the GPU host, nothing kept: Ollama's
+`num_batch` 8,192 does it, as a request option and as a parameter of a derived model reached
+through the OpenAI-compatible endpoint the store uses (identical vectors). Both refused documents
+then embed in full (39 of 39 and 42 of 42 windows of 4,000 characters, longest 2,614 tokens), and
+a formerly truncated window's tail reaches its vector. Cost measured: 268 MiB more VRAM and about
+0.5 GB more resident memory in the runner. Not done: pointing the store at such a model and
+indexing the two documents end to end. Not a chunk-size cut: that changes retrieval for the whole
+corpus.
+**Done 2026-11-26.** The store's embedder is `bge-m3-8k`: `bge-m3` with `num_batch 8192`, made
+with `ollama create`. The distill server names that model and stops at start-up when Ollama reads
+fewer tokens than a 2,100-word probe holds (`verify_embed_capacity`). Both refused documents
+then indexed (58 and 53 chunks; ledger rows equal index points). A chunk of 2,374 tokens is
+stored with the vector of its whole text (cosine 1.0).
+**Corrections to the text above, all measured the same day.**
+- "about 0.5 GB more resident memory" held only for inputs up to 2,614 tokens. The runner keeps
+  host memory for the longest input it has read: 1.4 GiB after 18 tokens, 3.4 after 2,102, 4.6
+  after 3,302, 5.4 after 4,502, 9.0 after 8,002. VRAM moved by under 100 MiB across them. The
+  9.0 GiB reading took the host to 0.7 GiB available. So the start-up probe is just over the stock
+  batch, and myelin's split cap (P1-43) is 4,500 characters, not the model's whole context.
+- Length does not say whether a stock model cuts an input or refuses it: inputs of 2,364, 4,502
+  and 8,002 tokens were cut to 2,048 with HTTP 200, and one of 2,078 was refused with HTTP 413.
+- The count given to the owner, 3,120 documents holding a record over 2,048 tokens (7,981
+  records), was taken on whole records. The store embedded a record over 4,000 characters in
+  two pieces (P1-43), so only a piece over 2,048 tokens was cut and the count is too high. It
+  was not taken again: P1-43 needs every document indexed again anyway.
+
+### P1-41. A refused myelin `observe` leaves ledger records with no index points, and the document then counts as indexed (found 2026-11-26)
+**Symptom.** The two documents of P1-40 were listed by `/docs`, `/exists` and the status counts
+with 90 and 111 chunks while the index held no point for either, so nothing could find them.
+Reconcile classed both as `ok`, so `--reembed` never retried them. The 201 records were purged by
+hand; counts and index then agreed (475,786).
+**Cause.** Read in both write paths. myelin's `WritePath::insert`
+(`crates/myelin-core/src/pipeline/write.rs`) stores the episodes in the ledger, then indexes them,
+and returns the indexing error without removing what it stored. hs-distill sends a document's
+chunks in one `observe` call per store and, on an error, returns before it deletes anything: a
+refused call gives it no record ids to delete.
+**Fix.** In myelin: a write whose index leg fails leaves no ledger rows (filed as
+`home-still/myelin#216`). hs-distill cannot do this from its side today: `forget_scope` takes only
+a list of ids to keep, nothing lists a document's ids past 200, and an unchanged document gets the
+same ids again, so "delete what this attempt wrote" would delete the live records. The same gap
+leaves a duplicate generation when the first store's write succeeds and the second's fails; that
+needs a way to list a document's record ids.
+**Fixed 2026-11-26 in myelin** (`home-still/myelin#217`, closes #216). A call's episodes are
+embedded before any ledger row is written; a failure after that removes the rows and points the
+call added and nothing older. The caller gets the failing step and its cause instead of the word
+`store`. Shown with the two documents of P1-40: after the embedder fix both index, and their
+ledger rows equal their index points. Still open: the write of derived records is not undone
+when it fails (the error says what it left), and the duplicate generation when the first store's
+write succeeds and the second's fails.
+
+### P1-42. The cutover gate picks and scores retrieval settings on the same 25 queries (found 2026-11-26)
+**Symptom.** At myelin's default rerank depth the gate fails (23/25). Seven depths were then tried
+on the gate's own queries; 50 and 75 give 25/25, 30, 35, 40 and 100 give 24/25. The pass at 50
+repeats, but one query sits at rank 8 and recall is not monotone in depth. All arms:
+`docs/loop/log.md`, 2026-11-26-01.
+**Cause.** `docs/loop/queries.yaml` is the only query set, so a setting chosen with it is also
+judged by it.
+**Fix.** A second, held-out query set that no setting is tuned on; a retrieval setting is accepted
+on that set. Until then the 2026-11-26 result is "passes at a fitted depth", not "passes".
+**Query set written 2026-11-26.** `docs/loop/queries_heldout.yaml`: 50 queries, each anchored to
+one document and written from an inner passage of it, approved by the owner before any scoring.
+Rule: at default settings the candidate finds at least as many expected documents in the top 10
+as the baseline. Not scored yet: the store is being indexed again (P1-43).
+**Scored 2026-11-26, depth 25, after the re-index and the beam fix (P1-44).** Gate: candidate
+24/25 against the baseline's 25/25, so the 25-query rule fails on recall; first hit a reference
+list 2/25 against 2/25, reference share 24/250 against 28/250. Held-out: candidate 47/50 against
+46/50, so its rule holds; the expected document is first for 43 against 35. Disagreements: h23
+and h24 (candidate first, baseline misses), h30 (baseline second, candidate misses), h13 and h35
+(both miss). The gate's miss is q09: the chunks holding `epiphyseal` are 13th and lower in the
+lexical list and outside the dense top 50, so the reranker scores none of them; scoring the 13th
+too gives it -4.43 against the tenth result's -3.62. No store defect was found behind it. The
+owner's bar (a pass at the default depth) is not met. `docs/loop/log.md`, 2026-11-26-03.
+**Depth chosen on a third set, 2026-11-27.** The owner had the depth picked on
+`docs/loop/queries_dev.yaml` (78 queries, approved before scoring; rule: most passes, ties to the
+smaller depth, no loss on its 40 document queries). Candidate at depth 25, 50, 100: 74, 75, 75
+of 78; the baseline 74. Depth 50 was chosen, on one query (t16) and the tie-break. At depth 50,
+each file run once: gate 25/25 against 25/25, first hit a reference list 2/25 against 2/25,
+reference share 21/250 against 28/250; held-out 47/50 against 46/50. Both rules hold. What
+weakens it: depth 50 was already known to pass the gate before the fixes (entry 2026-11-26-01),
+and the development set does not show 50 to be better than 25 (sign test p = 0.5).
+`docs/loop/log.md`, 2026-11-27-01.
+
+### P1-43. myelin gave the two pieces of a record over 4,000 characters equal weight, so a fifth of the records had a vector that was half their last lines (found 2026-11-26)
+**Symptom.** Measured on the candidate store. A record is a header line and a chunk of up to
+4,000 characters, so 70,444 of the 378,829 records of `academic` are over 4,000 characters
+(18.6 %, in 15,230 of 19,263 documents), as are 26,162 of 96,957 in `references` (27.0 %), 87 of
+3,834 in `personal` and 36 of 3,462 in `abstracts`. The longest is 4,406. Each of them was
+stored as the plain average of the vectors of two pieces; in a sample of 285 the smaller piece
+had a median of 260 characters. For one document a 4,045-character record's stored vector
+equalled the average of its 3,954- and 91-character pieces (cosine 1.0) and was 0.90 from the
+vector of the whole text. Such vectors score higher against unrelated queries: the top 12 dense
+hits of gate queries q11 and q09 average 0.551 and 0.558 as stored, and 0.481 and 0.506 when the
+same texts are embedded whole; split records are 23 and 17 of their top 25 dense hits, and none
+of those holds the expected term.
+**Cause.** myelin's `RemoteEmbedder` split an input over 4,000 characters on line boundaries and
+returned the unweighted mean of the pieces' vectors.
+**Fix.** Done in myelin (`home-still/myelin#218`): the mean is weighted by piece length, and the
+cap is a setting, `MYELIN_EMBED__MAX_CHARS`. The store runs with 4,500, so every home-still
+record is embedded whole (needs the embedder of P1-40). After indexing one document again its
+records' vectors equal their whole-text vectors (cosine 1.0). Every document was indexed again
+on 2026-11-26 (19,331 stems, 475,897 chunks, 0 failed, 7.4 h); of 120 long records sampled
+afterwards every stored vector equals the whole text's. The 18 `personal` documents were
+indexed again too. Open: 33 `abstracts` entries (36 records) keep the old vector until the
+abstracts store is built with `--force`.
+**Was it why the gate missed q09 and q11? No (measured).** After the re-index the gate at depth
+25 missed the same two queries. q11 was the approximate search (P1-44); q09 is the reranker's
+order (P1-42).
+
+### P1-44. The store's approximate dense search misses records an exact search returns (found 2026-11-26)
+**Symptom.** Measured on the candidate store's Qdrant (483,082 points, HNSW `m` 16,
+`ef_construct` 100, no quantization): the approximate top 25 dense hits share 17 of 25 with the
+exact top 25 for gate query q11, and 22 of 25 for q09. For q11 the approximate search misses the
+exact search's first hit, a chunk about the query's subject.
+**Cause.** The search beam. Qdrant searches with the collection's `ef_construct` (100) when no
+`hnsw_ef` is sent, and myelin sent none. This item first suspected the averaged vectors of
+P1-43; that was wrong: with them gone, recall@50 against exact search was 0.942 on 100 sentences
+from random chunks, and the exact first hit was missing for 5 of them.
+**Fix.** Done in myelin (`home-still/myelin#219`): every dense search sends `hnsw_ef` 512
+(`MYELIN_QDRANT__DENSE_HNSW_EF`), the smallest value measured that returns 99 of every 100
+exact neighbours (0.995; exact first hit 100/100; 10 ms against 3 ms). Chosen on those 100
+sentences, not on a query file. After it q11 passes at depth 25 (its 2nd and 6th exact
+neighbours, both holding `Korsakoff`, come back) and no held-out rank moved (47/50 before and
+after).
+
+### P1-45. myelin's rerank head cuts a tie between the lexical and dense lists on record id (found 2026-11-26)
+**Symptom.** myelin fuses the two lists with reciprocal rank at `k = 1` and reranks the first 25.
+The lists rarely share a record (0 to 2 of 50 for the two gate queries looked at), so the 25th and 26th
+fused records are the two lists' 13th, with equal scores, and the record id decides which one
+the reranker sees. For gate query q09 the lexical 13th, the first chunk holding `epiphyseal`,
+lost that way.
+**Cause.** `rrf` breaks ties on id and `recall` takes a fixed number of fused records.
+**Fix.** Not made. Taking every record tied with the last would be the plain repair. It does not
+change q09: the reranker scores that chunk -4.43 and the tenth result -3.62 (measured outside
+the store with the same reranker). Filed as `home-still/myelin#220`.
+
+### P1-46. On a short query holding a rare word, the myelin store shows the word less often than Qdrant did (found 2026-11-27)
+**Symptom.** 38 queries of `docs/loop/queries_dev.yaml` (t01 to t38) each hold one word the store
+has in 3 to 30 chunks and pass when a top-10 hit holds it. The baseline passes 38; the candidate
+34 at rerank depth 25 and 35 at depth 50 and at depth 100. t09 (`polycarbonate`), t17
+(`callipers`) and t24 (`nanosystems`) miss at every depth, depth 100 included, where the
+reranker scores every candidate the two searches return. Gate query q09 was of this kind. On
+the same file's 40 document queries the order is the other way: candidate 40, baseline 36.
+**Cause.** Not established. Either the chunks holding the word are beyond the 50 the word search
+returns for the whole query, or the reranker puts ten other chunks above them.
+**Fix.** None yet. Find which of the two it is for the three queries before changing anything,
+and choose any change on the development file, not on the gate or the held-out file.

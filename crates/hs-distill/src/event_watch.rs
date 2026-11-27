@@ -5,6 +5,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use hs_common::event_bus::{specs, EventBus};
 use hs_common::storage::Storage;
+use hs_common::stores::Stores;
 use serde::{Deserialize, Serialize};
 
 use crate::client::DistillClient;
@@ -50,9 +51,13 @@ impl std::error::Error for HandlerError {}
 const NAK_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Payload published by scribe (or any other markdown producer) on
-/// `scribe.completed`. `key` is the storage key of the markdown object.
+/// `scribe.completed`. `store` is the store of `hs_common::stores` the
+/// markdown belongs to, and `key` the storage key of the markdown object.
+/// A payload that names no store is malformed: nothing is indexed into a
+/// store the event did not ask for.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompletedEvent {
+    pub store: String,
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_key: Option<String>,
@@ -68,7 +73,7 @@ const STAMP_BACKOFFS: [Duration; 3] = [
 
 /// Retry a storage write up to 3 times with exponential backoff. Stamp
 /// writes are the bookkeeping side of the embedding pipeline — a single S3
-/// blip must not make the catalog and Qdrant diverge.
+/// blip must not make the catalog and the store diverge.
 async fn write_with_retry<F, Fut>(op_name: &str, stem: &str, op: F) -> Result<()>
 where
     F: FnMut() -> Fut,
@@ -139,21 +144,39 @@ fn stem_of(key: &str) -> &str {
 }
 
 /// Pull the markdown at `event.key` from `storage` and ask the distill
-/// server to index it. Loads the catalog entry for the stem so metadata
-/// (title, authors, DOI, year) lands on Qdrant payloads. Publishes
-/// `distill.completed` on success.
+/// server to index it into the store the event names. Loads the store's
+/// catalog entry for the stem so metadata (title, authors, DOI, year) lands
+/// on the stored chunks. Publishes `distill.completed` on success.
 ///
 /// Every step that must happen for the event to be complete is an error
 /// when it fails, so the event is redelivered rather than acknowledged with
 /// work missing: indexing is idempotent (the server replaces the document's
 /// chunks), and the redelivery repeats the stamp and the publish.
-/// A key that is not a legal storage key or document stem is permanent.
+/// An event is permanent when it names a store that keeps no documents of
+/// its own, when its key is not a legal document stem, and when its key is
+/// not where that store keeps the stem's markdown.
 pub async fn index_and_publish(
     storage: &dyn Storage,
+    stores: &Stores,
     distill: &DistillClient,
     bus: &dyn EventBus,
     event: &CompletedEvent,
 ) -> Result<(), HandlerError> {
+    let (spec, layout) = stores.documents(&event.store).map_err(|e| {
+        HandlerError::Permanent(anyhow::anyhow!(
+            "event for {:?} names a store that cannot be indexed into: {e}",
+            event.key
+        ))
+    })?;
+    if spec.name != event.store {
+        return Err(HandlerError::Permanent(anyhow::anyhow!(
+            "event for {:?} names the store `{}`, which keeps no documents of its own \
+             (its text is taken from `{}`)",
+            event.key,
+            event.store,
+            spec.name
+        )));
+    }
     let stem = stem_of(&event.key);
     hs_common::validate_stem(stem).map_err(|e| {
         HandlerError::Permanent(anyhow::anyhow!(
@@ -161,15 +184,25 @@ pub async fn index_and_publish(
             event.key
         ))
     })?;
+    let expected_key = layout.markdown_key(stem);
+    if event.key != expected_key {
+        return Err(HandlerError::Permanent(anyhow::anyhow!(
+            "event key {:?} is not where the `{}` store keeps the markdown of {stem:?} \
+             ({expected_key})",
+            event.key,
+            spec.name
+        )));
+    }
+    let catalog_prefix = layout.catalog_prefix.as_str();
     // Transient read errors propagate; a missing row is Ok(None) — the
     // indexer is happy to proceed without prior metadata. A corrupt row
     // bubbles up as Err here (correctness fix from P0-10).
-    let catalog = hs_common::catalog::read_catalog_entry_via(storage, "catalog", stem)
+    let catalog = hs_common::catalog::read_catalog_entry_via(storage, catalog_prefix, stem)
         .await
         .map_err(|e| classify(e.context(format!("catalog read for {stem}"))))?;
 
     let result = match distill
-        .index_from_storage_with_catalog(storage, &event.key, catalog.as_ref())
+        .index_from_storage_with_catalog(spec.name, storage, &event.key, catalog.as_ref())
         .await
     {
         Ok(r) => r,
@@ -191,13 +224,18 @@ pub async fn index_and_publish(
             // Stamp the failure so the reconciler can find it later.
             let reason = format!("embed_failed: {e}");
             if let Err(stamp_err) = write_with_retry("embed_failed stamp", stem, || {
-                hs_common::catalog::update_embedding_skip_via(storage, "catalog", stem, &reason)
+                hs_common::catalog::update_embedding_skip_via(
+                    storage,
+                    catalog_prefix,
+                    stem,
+                    &reason,
+                )
             })
             .await
             {
                 tracing::error!(stem = %stem, error = %stamp_err, "failed to stamp embed_failed");
             }
-            // Index failures are transient by default — a flaky Qdrant
+            // Index failures are transient by default — a flaky store
             // or a slow VRAM recovery shouldn't throw away the event.
             // JetStream's max_deliver bounds the retry count; a truly
             // broken markdown will eventually TERM on its own.
@@ -208,7 +246,7 @@ pub async fn index_and_publish(
     write_with_retry("embedding stamp", stem, || {
         hs_common::catalog::record_embedding_outcome_via(
             storage,
-            "catalog",
+            catalog_prefix,
             stem,
             "event-watch",
             result.chunks_indexed,
@@ -223,6 +261,7 @@ pub async fn index_and_publish(
     })?;
 
     let payload = serde_json::to_vec(&serde_json::json!({
+        "store": spec.name,
         "key": event.key,
         "doc_id": result.doc_id,
         "chunks_indexed": result.chunks_indexed,
@@ -277,7 +316,7 @@ fn fatal_stop(cause: anyhow::Error) -> anyhow::Error {
 /// consumed. Any other failure (server down, slow) is only warned about: the
 /// per-event handling already copes with an unavailable server.
 pub async fn preflight(distill: &DistillClient) -> Result<()> {
-    match distill.status().await {
+    match distill.status(hs_common::stores::ACADEMIC).await {
         Ok(_) => Ok(()),
         Err(e) if e.chain().any(|c| c.is::<crate::client::Unauthorized>()) => Err(fatal_stop(e)),
         Err(e) => {
@@ -547,10 +586,17 @@ mod tests {
 
     #[test]
     fn parses_payload() {
-        let payload = br#"{"key":"markdown/ab/cdef.md","source_key":"ab/cdef.pdf"}"#;
+        let payload =
+            br#"{"store":"academic","key":"markdown/ab/cdef.md","source_key":"ab/cdef.pdf"}"#;
         let e: CompletedEvent = serde_json::from_slice(payload).unwrap();
+        assert_eq!(e.store, "academic");
         assert_eq!(e.key, "markdown/ab/cdef.md");
         assert_eq!(e.source_key.as_deref(), Some("ab/cdef.pdf"));
+        // A payload from before events named their store is refused, not
+        // indexed into a store somebody guessed.
+        assert!(
+            serde_json::from_slice::<CompletedEvent>(br#"{"key":"markdown/ab/cdef.md"}"#).is_err()
+        );
     }
 
     #[test]
@@ -674,15 +720,31 @@ mod tests {
         }
     }
 
-    fn event(key: &str) -> CompletedEvent {
+    fn stores() -> Stores {
+        Stores::with_personal_prefix(hs_common::stores::PERSONAL_PREFIX_DEFAULT).unwrap()
+    }
+
+    fn event_in(store: &str, key: &str) -> CompletedEvent {
         CompletedEvent {
+            store: store.into(),
             key: key.into(),
             source_key: None,
         }
     }
 
+    async fn run_in(rig: &Rig, store: &str, key: &str) -> Result<(), HandlerError> {
+        index_and_publish(
+            &rig.storage,
+            &stores(),
+            &rig.client,
+            &rig.bus,
+            &event_in(store, key),
+        )
+        .await
+    }
+
     async fn run(rig: &Rig, key: &str) -> Result<(), HandlerError> {
-        index_and_publish(&rig.storage, &rig.client, &rig.bus, &event(key)).await
+        run_in(rig, hs_common::stores::ACADEMIC, key).await
     }
 
     fn kind_of(r: Result<(), HandlerError>) -> &'static str {
@@ -778,7 +840,7 @@ mod tests {
         let ok = serve(|_| {
             Reply::Json(
                 200,
-                r#"{"collection":"c","points_count":0,"compute_device":"Cuda"}"#.into(),
+                r#"{"store":"academic","records_count":0,"compute_device":"Cuda"}"#.into(),
             )
         })
         .await;
@@ -871,8 +933,72 @@ mod tests {
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].0, "distill.completed");
         let body: serde_json::Value = serde_json::from_slice(&published[0].1).unwrap();
+        assert_eq!(body["store"], "academic");
         assert_eq!(body["key"], "markdown/do/doc.md");
         assert_eq!(body["chunks_indexed"], 4);
+    }
+
+    #[tokio::test]
+    async fn an_event_is_indexed_into_the_store_it_names_and_stamped_in_that_stores_catalog() {
+        let rig = rig(|| Reply::Json(200, OK_INDEX.into())).await;
+        let stores = stores();
+        let (_, web) = stores.documents(hs_common::stores::WEB).unwrap();
+        let md_key = web.markdown_key("doc");
+        rig.storage
+            .inner
+            .put(&md_key, b"# Page\n\nSome captured text.".to_vec())
+            .await
+            .unwrap();
+
+        run_in(&rig, hs_common::stores::WEB, &md_key)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let sent = rig.server.recorded();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(
+            sent[0].body.contains(r#""store":"web""#),
+            "{}",
+            sent[0].body
+        );
+        let row =
+            hs_common::catalog::read_catalog_entry_via(&rig.storage, &web.catalog_prefix, "doc")
+                .await
+                .unwrap()
+                .expect("stamped in the web store's catalog");
+        assert_eq!(row.embedding.unwrap().chunks_indexed, 4);
+        assert!(
+            hs_common::catalog::read_catalog_entry_via(&rig.storage, "catalog", "doc")
+                .await
+                .unwrap()
+                .is_none(),
+            "the academic catalog must not be stamped"
+        );
+        let published = rig.bus.published.lock();
+        let body: serde_json::Value = serde_json::from_slice(&published[0].1).unwrap();
+        assert_eq!(body["store"], "web");
+    }
+
+    #[tokio::test]
+    async fn an_event_whose_store_and_key_disagree_is_permanent_and_indexes_nothing() {
+        let rig = rig(|| Reply::Json(200, OK_INDEX.into())).await;
+        for store in [
+            hs_common::stores::WEB,        // the key is the academic store's
+            hs_common::stores::REFERENCES, // keeps no documents of its own
+            hs_common::stores::MEMORY,     // holds no documents
+            "nonesuch",
+        ] {
+            assert_eq!(
+                kind_of(run_in(&rig, store, "markdown/do/doc.md").await),
+                "permanent",
+                "{store}"
+            );
+        }
+        assert!(
+            rig.server.recorded().is_empty(),
+            "nothing may reach the server"
+        );
+        assert!(rig.bus.published.lock().is_empty());
     }
 
     #[tokio::test]
@@ -928,7 +1054,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_server_error_is_transient_and_leaves_a_retryable_marker() {
-        let rig = rig(|| Reply::Json(500, "qdrant down".into())).await;
+        let rig = rig(|| Reply::Json(500, "myelin down".into())).await;
         assert_eq!(kind_of(run(&rig, "markdown/do/doc.md").await), "transient");
         let row = hs_common::catalog::read_catalog_entry_via(&rig.storage, "catalog", "doc")
             .await
@@ -989,7 +1115,7 @@ mod tests {
         // NotFound can be replication lag; only illegal keys are terminal.
         let rig = rig(|| Reply::Json(200, OK_INDEX.into())).await;
         assert_eq!(
-            kind_of(run(&rig, "markdown/zz/absent.md").await),
+            kind_of(run(&rig, "markdown/ab/absent.md").await),
             "transient"
         );
     }
@@ -1019,11 +1145,13 @@ mod tests {
 
     // ── run_subscriber ─────────────────────────────────────────────────
 
+    /// The payload of a `scribe.completed` event for `key`.
+    fn payload(key: &str) -> Vec<u8> {
+        format!(r#"{{"store":"academic","key":"{key}"}}"#).into_bytes()
+    }
+
     fn completed(key: &str) -> Event {
-        Event::inert(
-            "scribe.completed",
-            format!(r#"{{"key":"{key}"}}"#).into_bytes(),
-        )
+        Event::inert("scribe.completed", payload(key))
     }
 
     /// `events.nats.ack_wait_secs` default: heartbeats never fire in tests
@@ -1125,10 +1253,9 @@ mod tests {
     async fn a_panicking_handler_terminates_its_event_and_the_subscriber_keeps_running() {
         use hs_common::event_bus::Settlement;
         let bus = Arc::new(FakeBus::default());
-        let (good_a, a_log) = Event::recording("scribe.completed", br#"{"key":"a"}"#.to_vec());
-        let (poison, poison_log) =
-            Event::recording("scribe.completed", br#"{"key":"poison"}"#.to_vec());
-        let (good_b, b_log) = Event::recording("scribe.completed", br#"{"key":"b"}"#.to_vec());
+        let (good_a, a_log) = Event::recording("scribe.completed", payload("a"));
+        let (poison, poison_log) = Event::recording("scribe.completed", payload("poison"));
+        let (good_b, b_log) = Event::recording("scribe.completed", payload("b"));
         *bus.events.lock() = vec![good_a, poison, good_b];
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in_handler = seen.clone();
@@ -1169,10 +1296,8 @@ mod tests {
     async fn a_handler_that_never_finishes_is_abandoned_after_the_drain_timeout_and_named() {
         use hs_common::event_bus::Settlement;
         let bus = Arc::new(FakeBus::default());
-        let (stuck, stuck_log) =
-            Event::recording("scribe.completed", br#"{"key":"stuck"}"#.to_vec());
-        let (quick, quick_log) =
-            Event::recording("scribe.completed", br#"{"key":"quick"}"#.to_vec());
+        let (stuck, stuck_log) = Event::recording("scribe.completed", payload("stuck"));
+        let (quick, quick_log) = Event::recording("scribe.completed", payload("quick"));
         *bus.events.lock() = vec![stuck, quick];
         *bus.then_fail.lock() = Some("missed idle heartbeat".into());
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
@@ -1211,8 +1336,8 @@ mod tests {
     #[tokio::test]
     async fn a_slow_handler_is_kept_alive_with_heartbeats_and_a_fast_one_sends_none() {
         let bus = Arc::new(FakeBus::default());
-        let (slow, slow_log) = Event::recording("scribe.completed", br#"{"key":"slow"}"#.to_vec());
-        let (fast, fast_log) = Event::recording("scribe.completed", br#"{"key":"fast"}"#.to_vec());
+        let (slow, slow_log) = Event::recording("scribe.completed", payload("slow"));
+        let (fast, fast_log) = Event::recording("scribe.completed", payload("fast"));
         *bus.events.lock() = vec![slow, fast];
         *bus.then_fail.lock() = Some("stream closed".into());
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
@@ -1251,8 +1376,8 @@ mod tests {
     async fn held_event_scenario(fatal_on_a: bool) -> (anyhow::Result<()>, Vec<Settlement>) {
         let bus = Arc::new(FakeBus::default());
         bus.keep_open.store(true, Ordering::SeqCst);
-        let (ea, _la) = Event::recording("scribe.completed", br#"{"key":"a"}"#.to_vec());
-        let (eb, log_b) = Event::recording("scribe.completed", br#"{"key":"b"}"#.to_vec());
+        let (ea, _la) = Event::recording("scribe.completed", payload("a"));
+        let (eb, log_b) = Event::recording("scribe.completed", payload("b"));
         *bus.events.lock() = vec![ea, eb];
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1315,7 +1440,7 @@ mod tests {
     async fn the_fatal_event_itself_is_naked_with_a_delay() {
         let bus = Arc::new(FakeBus::default());
         bus.keep_open.store(true, Ordering::SeqCst);
-        let (ea, log_a) = Event::recording("scribe.completed", br#"{"key":"a"}"#.to_vec());
+        let (ea, log_a) = Event::recording("scribe.completed", payload("a"));
         *bus.events.lock() = vec![ea];
         let storage: Arc<dyn Storage> = Arc::new(LocalFsStorage::new(std::env::temp_dir()));
         let r = run_subscriber(

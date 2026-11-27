@@ -1,434 +1,20 @@
-//! Behavior of the tools against fake storage and a loopback distill server.
+//! Behavior of the tools against fake storage, a recording event bus, a
+//! loopback distill server and a synthetic OpenAlex corpus.
 
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
 
 use crate::testkit::{seed_catalog, seed_markdown, server, FakeDistill, FaultyStorage};
-use crate::{DistillReconcileParams, DistillReindexParams};
 
-mod reindex {
-    use super::*;
-
-    fn reindex(stem: &str) -> Parameters<DistillReindexParams> {
-        Parameters(DistillReindexParams {
-            stem: crate::stem::Stem::parse(stem).unwrap(),
-        })
-    }
-
-    /// RA-9: the old tool deleted the document's vectors before it had read
-    /// the catalog or verified the markdown, so a storage blip left the
-    /// document with no vectors and nothing re-indexed.
-    #[tokio::test]
-    async fn a_storage_outage_is_an_error_and_no_vector_is_deleted() {
-        let storage = FaultyStorage::new();
-        seed_markdown(
-            &*storage,
-            "paper-a",
-            "# A\n\nBody text long enough to index.",
-        )
-        .await;
-        seed_catalog(&*storage, "paper-a").await;
-        let distill = FakeDistill::start(vec![]).await;
-        let mcp = server(storage.clone(), Some(&distill));
-
-        FaultyStorage::set(&storage.fail_head, true);
-        let err = mcp.distill_reindex(reindex("paper-a")).await.unwrap_err();
-
-        assert!(
-            err.contains("simulated storage outage"),
-            "the cause must reach the caller: {err}"
-        );
-        assert_eq!(
-            distill.requests(),
-            vec![],
-            "no request (certainly no DELETE) may reach the vector store"
-        );
-        assert!(storage.recorded_deletes().is_empty());
-    }
-
-    #[tokio::test]
-    async fn missing_markdown_is_an_error_and_the_vectors_stay() {
-        let storage = FaultyStorage::new();
-        let distill = FakeDistill::start(vec![]).await;
-        let mcp = server(storage.clone(), Some(&distill));
-
-        let err = mcp
-            .distill_reindex(reindex("never-converted"))
-            .await
-            .unwrap_err();
-
-        assert!(err.contains("Markdown not found"), "{err}");
-        assert_eq!(distill.count("DELETE"), 0);
-        assert_eq!(distill.count("POST"), 0);
-    }
-
-    #[tokio::test]
-    async fn reindex_replaces_in_place_with_one_index_call_and_no_delete() {
-        let storage = FaultyStorage::new();
-        seed_markdown(
-            &*storage,
-            "paper-a",
-            "# A\n\nBody text long enough to index.",
-        )
-        .await;
-        seed_catalog(&*storage, "paper-a").await;
-        let distill = FakeDistill::start(vec![]).await;
-        let mcp = server(storage.clone(), Some(&distill));
-
-        let out = mcp.distill_reindex(reindex("paper-a")).await.unwrap();
-
-        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(out["chunks_indexed"], 3);
-        assert_eq!(out["has_catalog"], true);
-        assert_eq!(distill.count("POST"), 1);
-        assert_eq!(distill.count("DELETE"), 0);
-        let entry = hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", "paper-a")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            entry.embedding.map(|e| e.chunks_indexed),
-            Some(3),
-            "the catalog must carry the new embedding stamp"
-        );
-    }
+/// A document id, as a tool's arguments carry it.
+fn doc(id: &str) -> crate::stem::Stem {
+    crate::stem::Stem::parse(id).unwrap()
 }
 
-mod reconcile {
-    use super::*;
-
-    fn reconcile() -> DistillReconcileParams {
-        DistillReconcileParams {
-            dry_run: true,
-            limit: None,
-        }
-    }
-
-    /// RA-32: `exists().unwrap_or(false)` reported every document as an
-    /// orphan during a storage outage — a purge list built from a blip.
-    #[tokio::test]
-    async fn a_storage_outage_is_an_error_not_a_list_of_orphans() {
-        let storage = FaultyStorage::new();
-        seed_markdown(
-            &*storage,
-            "present",
-            "# P\n\nBody text long enough to index.",
-        )
-        .await;
-        let distill = FakeDistill::start(vec!["present".into(), "gone".into()]).await;
-        let mcp = server(storage.clone(), Some(&distill));
-
-        // Catalog reads keep working; only the markdown existence probe
-        // fails, as when one S3 prefix times out.
-        *storage.only_keys_containing.lock().unwrap() = Some("markdown/".into());
-        FaultyStorage::set(&storage.fail_head, true);
-        let err = mcp.reconcile_orphans(reconcile()).await.unwrap_err();
-
-        assert!(err.contains("simulated storage outage"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn only_ids_without_markdown_are_orphans() {
-        let storage = FaultyStorage::new();
-        seed_markdown(
-            &*storage,
-            "present",
-            "# P\n\nBody text long enough to index.",
-        )
-        .await;
-        let distill = FakeDistill::start(vec!["present".into(), "gone".into()]).await;
-        let mcp = server(storage, Some(&distill));
-
-        let out = mcp.reconcile_orphans(reconcile()).await.unwrap();
-
-        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(out["orphans"], serde_json::json!(["gone"]));
-        assert_eq!(out["scanned_doc_ids"], 2);
-    }
-
-    /// The description promises a notice when `dry_run=false` is ignored, and
-    /// the tool used to discard the argument silently: an agent that asked to
-    /// apply read a report as a success. The response now says so, and says
-    /// `false` when nobody asked.
-    #[tokio::test]
-    async fn an_apply_request_is_reported_as_ignored() {
-        let storage = FaultyStorage::new();
-        let distill = FakeDistill::start(vec![]).await;
-        let mcp = server(storage, Some(&distill));
-
-        let asked = mcp
-            .reconcile_orphans(DistillReconcileParams {
-                dry_run: false,
-                limit: None,
-            })
-            .await
-            .unwrap();
-        let asked: serde_json::Value = serde_json::from_str(&asked).unwrap();
-        assert_eq!(
-            asked["requested_apply_ignored"], true,
-            "a caller that asked to apply must not read a dry-run report as a success: {asked}"
-        );
-        assert_eq!(
-            asked["dry_run"], true,
-            "the report is still a dry run: {asked}"
-        );
-
-        let not_asked = mcp.reconcile_orphans(reconcile()).await.unwrap();
-        let not_asked: serde_json::Value = serde_json::from_str(&not_asked).unwrap();
-        assert_eq!(
-            not_asked["requested_apply_ignored"], false,
-            "the field reports what the caller asked for, not a constant: {not_asked}"
-        );
-    }
-
-    /// The tool asks the server for the whole list; the old 100 000 default
-    /// made a larger collection fail outright.
-    #[tokio::test]
-    async fn the_whole_collection_is_requested() {
-        let storage: Arc<FaultyStorage> = FaultyStorage::new();
-        let distill = FakeDistill::start(vec![]).await;
-        let mcp = server(storage, Some(&distill));
-
-        mcp.reconcile_orphans(reconcile()).await.unwrap();
-
-        let docs_requests: Vec<_> = distill
-            .requests()
-            .into_iter()
-            .filter(|s| s.path == "/docs")
-            .collect();
-        assert_eq!(docs_requests.len(), 1);
-        assert_eq!(
-            docs_requests[0].query,
-            format!("limit={}", hs_distill::client::MAX_DOC_LIST_LIMIT)
-        );
-    }
-}
-
-mod convert {
-    use super::*;
-    use crate::stem::Stem;
-    use crate::testkit::{server_with_bus, RecordingBus};
-    use hs_common::storage::Storage;
-
-    const ARTICLE: &str = "<html><body><article><h1>A study of things</h1>\
-        <p>This paragraph is long enough to clear the indexable floor of the pipeline.</p>\
-        <p>A second paragraph keeps the converter from producing a stub document.</p>\
-        </article></body></html>";
-
-    fn stem(s: &str) -> Stem {
-        Stem::parse(s).unwrap()
-    }
-
-    async fn put_source(storage: &FaultyStorage, stem: &str, ext: &str, bytes: &[u8]) -> String {
-        use hs_common::storage::Storage;
-        let key = format!("papers/{}", hs_common::sharded_key(stem, ext));
-        storage.put(&key, bytes.to_vec()).await.unwrap();
-        key
-    }
-
-    /// RA-31: `if let Ok(pdf) = storage.get(..)` read an S3 outage as "no
-    /// PDF" and converted the HTML twin instead, stamping the catalog with a
-    /// worse document than the PDF the corpus holds.
-    #[tokio::test]
-    async fn a_storage_outage_never_sends_the_stem_to_another_converter() {
-        let storage = FaultyStorage::new();
-        put_source(&storage, "paper", "pdf", b"%PDF-1.4 stand-in").await;
-        put_source(&storage, "paper", "html", ARTICLE.as_bytes()).await;
-        let bus = Arc::new(RecordingBus::default());
-        let mcp = server_with_bus(storage.clone(), bus.clone());
-
-        *storage.only_keys_containing.lock().unwrap() = Some(".pdf".into());
-        FaultyStorage::set(&storage.fail_head, true);
-        let err = mcp.convert_source(&stem("paper")).await.unwrap_err();
-
-        assert!(err.contains("simulated storage outage"), "{err}");
-        assert!(
-            !storage
-                .exists(&hs_common::markdown::markdown_storage_key("paper"))
-                .await
-                .unwrap(),
-            "nothing may be converted"
-        );
-        assert!(bus.published.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_missing_source_names_every_key_that_was_tried() {
-        let storage = FaultyStorage::new();
-        let mcp = server_with_bus(storage, Arc::new(RecordingBus::default()));
-
-        let err = mcp.convert_source(&stem("ghost")).await.unwrap_err();
-
-        for ext in ["pdf", "html", "epub"] {
-            assert!(err.contains(&format!("ghost.{ext}")), "{err}");
-        }
-    }
-
-    /// HTML goes through the watcher's function: markdown stored, catalog
-    /// stamped by the html parser, `scribe.completed` announced.
-    #[tokio::test]
-    async fn an_html_source_is_converted_by_the_shared_path() {
-        let storage = FaultyStorage::new();
-        let source_key = put_source(&storage, "paper", "html", ARTICLE.as_bytes()).await;
-        let bus = Arc::new(RecordingBus::default());
-        let mcp = server_with_bus(storage.clone(), bus.clone());
-
-        let out = mcp.convert_source(&stem("paper")).await.unwrap();
-
-        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(out["server"], "html-parser");
-        assert_eq!(out["already_converted"], false);
-        let md = hs_common::markdown::read_markdown_via(&*storage, "markdown", "paper")
-            .await
-            .unwrap()
-            .expect("markdown stored");
-        assert!(md.contains("A study of things"), "{md}");
-        let published = bus.published.lock().unwrap().clone();
-        assert_eq!(published.len(), 1);
-        assert_eq!(published[0].0, "scribe.completed");
-        assert_eq!(published[0].1["source_key"], source_key);
-    }
-
-    /// A paywall page is refused, not converted into markdown, and the
-    /// refusal is the same one the watcher records.
-    #[tokio::test]
-    async fn a_paywall_page_is_refused_and_nothing_is_stored() {
-        let storage = FaultyStorage::new();
-        put_source(
-            &storage,
-            "wall",
-            "html",
-            b"<html><body><p>Access denied. Sign in to read this article.</p></body></html>",
-        )
-        .await;
-        let bus = Arc::new(RecordingBus::default());
-        let mcp = server_with_bus(storage.clone(), bus.clone());
-
-        let err = mcp.convert_source(&stem("wall")).await.unwrap_err();
-
-        assert!(err.to_lowercase().contains("paywall"), "{err}");
-        assert!(!storage
-            .exists(&hs_common::markdown::markdown_storage_key("wall"))
-            .await
-            .unwrap());
-        assert!(bus.published.lock().unwrap().is_empty());
-        let entry = hs_common::catalog::read_catalog_entry_via(&*storage, "catalog", "wall")
-            .await
-            .unwrap();
-        assert!(
-            entry.is_none_or(|e| e.conversion.is_none()),
-            "a refused document must not carry a conversion stamp"
-        );
-    }
-
-    #[tokio::test]
-    async fn existing_markdown_is_announced_not_converted_again() {
-        let storage = FaultyStorage::new();
-        put_source(&storage, "paper", "html", ARTICLE.as_bytes()).await;
-        seed_markdown(
-            &*storage,
-            "paper",
-            "# Already here\n\nBody text long enough to index.",
-        )
-        .await;
-        let bus = Arc::new(RecordingBus::default());
-        let mcp = server_with_bus(storage.clone(), bus.clone());
-
-        let out = mcp.convert_source(&stem("paper")).await.unwrap();
-
-        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(out["already_converted"], true);
-        let md = hs_common::markdown::read_markdown_via(&*storage, "markdown", "paper")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            md.contains("Already here"),
-            "the stored markdown must be untouched"
-        );
-        assert_eq!(bus.published.lock().unwrap().len(), 1);
-    }
-
-    /// A PDF that was converted before word boxes existed (or whose request
-    /// was lost) gets its sidecar asked for along with the announcement.
-    #[tokio::test]
-    async fn an_already_converted_pdf_without_word_boxes_has_them_requested() {
-        let storage = FaultyStorage::new();
-        let source_key = put_source(&storage, "scan", "pdf", b"%PDF-1.4").await;
-        seed_markdown(&*storage, "scan", "# Already here\n\nBody text.").await;
-        let bus = Arc::new(RecordingBus::default());
-        let mcp = server_with_bus(storage.clone(), bus.clone());
-
-        mcp.convert_source(&stem("scan")).await.unwrap();
-
-        let published = bus.published.lock().unwrap().clone();
-        let subjects: Vec<&str> = published.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(subjects, ["scribe.completed", "scribe.boxes"]);
-        assert_eq!(published[1].1, serde_json::json!({ "key": source_key }));
-    }
-
-    /// The queue tool's whole point: the conversion is announced, not run.
-    /// A caller that gets `queued: true` back must be able to see the event
-    /// the watcher will consume, with the keys the watcher reads.
-    #[tokio::test]
-    async fn queueing_publishes_the_ingest_event_and_converts_nothing() {
-        let storage = FaultyStorage::new();
-        let source_key = put_source(&storage, "paper", "html", ARTICLE.as_bytes()).await;
-        let bus = Arc::new(RecordingBus::default());
-        let mcp = server_with_bus(storage.clone(), bus.clone());
-
-        let out = mcp
-            .scribe_queue(Parameters(crate::ScribeQueueParams {
-                stem: stem("paper"),
-            }))
-            .await
-            .unwrap();
-
-        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(out["queued"], true);
-        assert_eq!(out["stem"], "paper");
-        assert_eq!(out["source_key"], source_key);
-
-        let published = bus.published.lock().unwrap().clone();
-        assert_eq!(published.len(), 1);
-        assert_eq!(
-            published[0].0,
-            hs_common::event_bus::specs::PAPERS_INGESTED.subject
-        );
-        assert_eq!(published[0].1["key"], source_key);
-        assert_eq!(published[0].1["source"], "mcp:scribe_queue");
-
-        // Queueing is an announcement, not a conversion.
-        assert!(
-            !storage
-                .exists(&hs_common::markdown::markdown_storage_key("paper"))
-                .await
-                .unwrap(),
-            "the tool must not convert anything itself"
-        );
-    }
-
-    /// A queued stem with no stored source would fail in the watcher with no
-    /// one listening, so the tool refuses it at the door.
-    #[tokio::test]
-    async fn queueing_a_stem_with_no_source_publishes_nothing() {
-        let storage = FaultyStorage::new();
-        let bus = Arc::new(RecordingBus::default());
-        let mcp = server_with_bus(storage, bus.clone());
-
-        let err = mcp
-            .scribe_queue(Parameters(crate::ScribeQueueParams {
-                stem: stem("ghost"),
-            }))
-            .await
-            .unwrap_err();
-
-        for ext in ["pdf", "html", "epub"] {
-            assert!(err.contains(&format!("ghost.{ext}")), "{err}");
-        }
-        assert!(bus.published.lock().unwrap().is_empty());
-    }
+/// A tool's JSON answer.
+fn parsed(out: &str) -> serde_json::Value {
+    serde_json::from_str(out).unwrap()
 }
 
 mod cite {
@@ -1176,89 +762,825 @@ mod cite {
     }
 }
 
-mod openalex {
+mod read {
+    use super::*;
+    use crate::tools::read::ReadParams;
+    use hs_common::catalog::CatalogEntry;
+    use hs_common::storage::Storage;
+    use hs_common::stores::{MEMORY, PERSONAL, REFERENCES};
+
+    const DOC: &str = "paper-a";
+    const TEXT: &str = "# A\n\nRivers carry sediment.\nDeltas grow.";
+
+    fn ask(store: Option<&str>) -> ReadParams {
+        ReadParams {
+            store: store.map(str::to_string),
+            doc_id: doc(DOC),
+            page: None,
+            lines: None,
+            max_chars: None,
+        }
+    }
+
+    async fn seeded() -> Arc<FaultyStorage> {
+        let storage = FaultyStorage::new();
+        seed_markdown(&*storage, DOC, TEXT).await;
+        seed_catalog(&*storage, DOC).await;
+        storage
+    }
+
+    #[tokio::test]
+    async fn a_converted_document_comes_with_its_card_and_its_numbered_lines() {
+        let mcp = server(seeded().await, None);
+
+        let read = mcp
+            .read_document(ReadParams {
+                lines: Some([3, 4]),
+                ..ask(None)
+            })
+            .await
+            .unwrap();
+
+        assert!(read.answer.converted);
+        assert_eq!(read.answer.card.title.as_deref(), Some("A title"));
+        assert_eq!(
+            read.text.as_deref(),
+            Some("3: Rivers carry sediment.\n4: Deltas grow.\n")
+        );
+        let slice = read.answer.slice.expect("a converted document has a slice");
+        assert_eq!(
+            (slice.line_start, slice.line_end, slice.total_lines),
+            (3, 4, 4)
+        );
+        // No link signing is configured, so no links are offered.
+        assert!(read.answer.links.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_document_that_is_not_converted_yet_says_so() {
+        let storage = FaultyStorage::new();
+        seed_catalog(&*storage, DOC).await;
+        let mcp = server(storage, None);
+
+        let read = mcp.read_document(ask(None)).await.unwrap();
+
+        assert!(!read.answer.converted);
+        assert!(read.answer.slice.is_none() && read.text.is_none());
+        assert_eq!(read.answer.card.title.as_deref(), Some("A title"));
+    }
+
+    #[tokio::test]
+    async fn a_document_the_store_does_not_hold_is_refused() {
+        let mcp = server(FaultyStorage::new(), None);
+
+        let err = mcp.read_document(ask(None)).await.unwrap_err();
+
+        assert!(err.contains("has no document"), "{err}");
+        assert!(err.contains("`documents`"), "{err}");
+    }
+
+    /// An outage must not read as "no such document": the caller would go
+    /// and acquire a paper the store already holds.
+    #[tokio::test]
+    async fn a_storage_outage_is_an_error_not_a_missing_document() {
+        let storage = seeded().await;
+        let mcp = server(storage.clone(), None);
+        FaultyStorage::set(&storage.fail_get, true);
+
+        let err = mcp.read_document(ask(None)).await.unwrap_err();
+
+        assert!(err.contains("failed"), "{err}");
+        assert!(!err.contains("has no document"), "{err}");
+    }
+
+    /// A hit in `references` names the paper its reference list came from.
+    #[tokio::test]
+    async fn a_hit_in_a_derived_store_reads_the_document_it_belongs_to() {
+        let mcp = server(seeded().await, None);
+
+        let read = mcp.read_document(ask(Some(REFERENCES))).await.unwrap();
+
+        assert_eq!(read.answer.store, REFERENCES);
+        let text = read.text.expect("the paper's text");
+        assert!(text.starts_with("1: # A\n"), "{text}");
+    }
+
+    /// The personal store keeps a document's card beside the document.
+    #[tokio::test]
+    async fn a_personal_document_is_read_with_the_card_beside_it() {
+        let storage = FaultyStorage::new();
+        let mcp = server(storage.clone(), None);
+        let (_, layout) = mcp.stores.documents(PERSONAL).unwrap();
+        let card = CatalogEntry {
+            title: Some("Field notes".into()),
+            category: Some("notes".into()),
+            ..Default::default()
+        };
+        for (key, bytes) in [
+            (layout.markdown_key(DOC), TEXT.as_bytes().to_vec()),
+            (
+                layout.source_key(DOC, "catalog.yaml"),
+                serde_yaml_ng::to_string(&card).unwrap().into_bytes(),
+            ),
+        ] {
+            storage.put(&key, bytes).await.unwrap();
+        }
+
+        let read = mcp.read_document(ask(Some(PERSONAL))).await.unwrap();
+
+        assert!(read.answer.converted);
+        assert_eq!(read.answer.card.title.as_deref(), Some("Field notes"));
+        assert_eq!(read.answer.card.category.as_deref(), Some("notes"));
+    }
+
+    #[tokio::test]
+    async fn a_store_that_holds_no_documents_is_refused() {
+        let mcp = server(seeded().await, None);
+
+        let err = mcp.read_document(ask(Some(MEMORY))).await.unwrap_err();
+
+        assert!(err.contains(MEMORY), "{err}");
+    }
+}
+
+mod documents {
+    use super::*;
+    use crate::tools::documents::DocumentsParams;
+    use crate::HomeStillMcp;
+    use hs_common::catalog::{CatalogEntry, ConversionMeta, EmbeddingMeta};
+    use hs_common::storage::Storage;
+    use hs_common::stores::{ACADEMIC, MEMORY, PERSONAL, WEB};
+
+    fn in_store(store: &str) -> DocumentsParams {
+        DocumentsParams {
+            store: Some(store.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn added(at: &str) -> CatalogEntry {
+        CatalogEntry {
+            title: Some(format!("Added {at}")),
+            downloaded_at: Some(at.to_string()),
+            ..Default::default()
+        }
+    }
+
+    async fn file(
+        mcp: &HomeStillMcp,
+        storage: &dyn Storage,
+        store: &str,
+        doc_id: &str,
+        entry: &CatalogEntry,
+    ) {
+        let (_, layout) = mcp.stores.documents(store).unwrap();
+        hs_common::catalog::write_catalog_entry_via(storage, &layout.catalog_prefix, doc_id, entry)
+            .await
+            .unwrap();
+    }
+
+    fn ids(page: &serde_json::Value) -> Vec<&str> {
+        page["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["doc_id"].as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_store_is_listed_newest_first_with_how_far_each_document_got() {
+        let storage = FaultyStorage::new();
+        let mcp = server(storage.clone(), None);
+        file(
+            &mcp,
+            &*storage,
+            ACADEMIC,
+            "older",
+            &added("2026-01-01T00:00:00Z"),
+        )
+        .await;
+        let indexed = CatalogEntry {
+            conversion: Some(ConversionMeta {
+                server: "test".into(),
+                duration_secs: 0.0,
+                total_pages: 1,
+                converted_at: "2026-02-01T01:00:00Z".into(),
+                pages: Vec::new(),
+                converted_by: None,
+                attempts_log: Vec::new(),
+            }),
+            embedding: Some(EmbeddingMeta {
+                server: "test".into(),
+                chunks_indexed: 5,
+                compute_device: "cuda".into(),
+                embedded_at: "2026-02-01T02:00:00Z".into(),
+            }),
+            ..added("2026-02-01T00:00:00Z")
+        };
+        file(&mcp, &*storage, ACADEMIC, "newer", &indexed).await;
+
+        let page = parsed(
+            &mcp.list_documents(DocumentsParams::default())
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(page["store"], ACADEMIC);
+        assert_eq!(page["matching"], 2);
+        assert_eq!(ids(&page), ["newer", "older"]);
+        let stage = |row: usize| {
+            (
+                page["documents"][row]["converted"].as_bool(),
+                page["documents"][row]["indexed"].as_bool(),
+            )
+        };
+        assert_eq!(stage(0), (Some(true), Some(true)));
+        assert_eq!(stage(1), (Some(false), Some(false)));
+    }
+
+    /// A page captured from the web is not a paper, and a personal document
+    /// is listed from the card beside it.
+    #[tokio::test]
+    async fn each_store_lists_only_its_own_documents() {
+        let storage = FaultyStorage::new();
+        let mcp = server(storage.clone(), None);
+        let at = added("2026-01-01T00:00:00Z");
+        file(&mcp, &*storage, ACADEMIC, "paper", &at).await;
+        file(&mcp, &*storage, WEB, "page", &at).await;
+        let (_, personal) = mcp.stores.documents(PERSONAL).unwrap();
+        storage
+            .put(
+                &personal.source_key("note", "catalog.yaml"),
+                serde_yaml_ng::to_string(&at).unwrap().into_bytes(),
+            )
+            .await
+            .unwrap();
+
+        for (store, holds) in [(ACADEMIC, "paper"), (WEB, "page"), (PERSONAL, "note")] {
+            let page = parsed(&mcp.list_documents(in_store(store)).await.unwrap());
+            assert_eq!(ids(&page), [holds], "the store {store}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_without_documents_and_an_unknown_store_are_refused() {
+        let mcp = server(FaultyStorage::new(), None);
+
+        for store in [MEMORY, "nonesuch"] {
+            let err = mcp.list_documents(in_store(store)).await.unwrap_err();
+            assert!(err.contains(store), "{err}");
+        }
+    }
+
+    /// An outage must not read as an empty store.
+    #[tokio::test]
+    async fn a_listing_that_fails_is_an_error_not_an_empty_store() {
+        let storage = FaultyStorage::new();
+        let mcp = server(storage.clone(), None);
+        file(
+            &mcp,
+            &*storage,
+            ACADEMIC,
+            "paper",
+            &added("2026-01-01T00:00:00Z"),
+        )
+        .await;
+        FaultyStorage::set(&storage.fail_list, true);
+
+        let err = mcp
+            .list_documents(DocumentsParams::default())
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("failed"), "{err}");
+    }
+}
+
+mod capture {
+    use super::*;
+    use crate::testkit::{server_with_bus, RecordingBus};
+    use crate::tools::capture::{CaptureContentType, CaptureParams};
+    use hs_common::event_bus::specs::PAPERS_INGESTED;
+    use hs_common::storage::Storage;
+    use hs_common::stores::WEB;
+
+    const ADDRESS: &str = "https://example.org/rivers";
+    const PAGE: &str = "<html><body><article><h1>Rivers</h1>\
+        <p>Rivers carry sediment from the mountains to the sea.</p></article></body></html>";
+
+    /// A capture of [`ADDRESS`], asked for by a link to a part of the page.
+    fn page(content: &str, content_type: CaptureContentType) -> CaptureParams {
+        CaptureParams {
+            url: format!("{ADDRESS}#delta"),
+            content: content.to_string(),
+            content_type,
+            title: Some("Rivers".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_is_stored_under_its_address_and_announced_for_conversion() {
+        let storage = FaultyStorage::new();
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage.clone(), bus.clone());
+
+        let out = parsed(
+            &mcp.capture_page(page(PAGE, CaptureContentType::Html))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(out["store"], WEB);
+        assert_eq!(out["source_url"], ADDRESS, "the fragment is not the page");
+        assert_eq!(out["replaced"], false);
+        let doc_id = out["doc_id"].as_str().unwrap();
+        let (_, layout) = mcp.stores.documents(WEB).unwrap();
+        let key = layout.source_key(doc_id, "html");
+        assert_eq!(storage.get(&key).await.unwrap(), PAGE.as_bytes());
+        let entry =
+            hs_common::catalog::read_catalog_entry_via(&*storage, &layout.catalog_prefix, doc_id)
+                .await
+                .unwrap()
+                .expect("the page has a catalog entry");
+        assert_eq!(entry.title.as_deref(), Some("Rivers"));
+        assert_eq!(entry.source_url.as_deref(), Some(ADDRESS));
+
+        let published = bus.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, PAPERS_INGESTED.subject);
+        assert_eq!(published[0].1["key"], key);
+        assert_eq!(published[0].1["source"], "mcp:capture");
+    }
+
+    /// The page at an address is one document. Capturing it again replaces
+    /// the earlier capture and the text converted from it, which would
+    /// otherwise stop the new page from being converted.
+    #[tokio::test]
+    async fn capturing_an_address_again_replaces_the_page_and_its_converted_text() {
+        let storage = FaultyStorage::new();
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage.clone(), bus.clone());
+        let first = parsed(
+            &mcp.capture_page(page(PAGE, CaptureContentType::Html))
+                .await
+                .unwrap(),
+        );
+        let doc_id = first["doc_id"].as_str().unwrap();
+        let (_, layout) = mcp.stores.documents(WEB).unwrap();
+        storage
+            .put(&layout.markdown_key(doc_id), b"# Rivers\n".to_vec())
+            .await
+            .unwrap();
+
+        let second = parsed(
+            &mcp.capture_page(page(
+                "# Rivers\n\nThe river moved.",
+                CaptureContentType::Markdown,
+            ))
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(second["doc_id"], first["doc_id"]);
+        assert_eq!(second["replaced"], true);
+        for (key, kept) in [
+            (layout.source_key(doc_id, "html"), false),
+            (layout.markdown_key(doc_id), false),
+            (layout.source_key(doc_id, "md"), true),
+        ] {
+            assert_eq!(storage.exists(&key).await.unwrap(), kept, "{key}");
+        }
+        assert_eq!(bus.published.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_paywall_page_is_refused_with_nothing_stored_or_announced() {
+        let storage = FaultyStorage::new();
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage.clone(), bus.clone());
+        let wall = "<html><body><p>Sign in to read the full text. \
+                    Subscription required.</p></body></html>";
+
+        let err = mcp
+            .capture_page(page(wall, CaptureContentType::Html))
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("paywall"), "{err}");
+        let (_, layout) = mcp.stores.documents(WEB).unwrap();
+        assert!(storage
+            .list(&layout.source_prefix)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(bus.published.lock().unwrap().is_empty());
+    }
+}
+
+mod synthesis_save {
+    use super::*;
+    use crate::testkit::{server_with_bus, RecordingBus};
+    use crate::tools::synthesis_save::{SynthesisCitation, SynthesisSaveParams};
+    use crate::HomeStillMcp;
+    use hs_common::storage::Storage;
+    use hs_common::stores::{ACADEMIC, SYNTHESES};
+
+    const DOC: &str = "paper-a";
+    const TEXT: &str =
+        "# Rivers\n\nThe delta grows where the current slows and the silt settles out.";
+    const QUOTE: &str = "the current slows and the silt settles out";
+    /// [`QUOTE`] with one word the paper does not say.
+    const MISQUOTE: &str = "the current slows and the mud settles out";
+    const BODY: &str = "Deltas grow where rivers slow.";
+
+    /// A server whose academic store holds the paper the quotes are from.
+    async fn with_paper() -> (Arc<FaultyStorage>, Arc<RecordingBus>, HomeStillMcp) {
+        let storage = FaultyStorage::new();
+        let bus = Arc::new(RecordingBus::default());
+        let mcp = server_with_bus(storage.clone(), bus.clone());
+        let (_, layout) = mcp.stores.documents(ACADEMIC).unwrap();
+        for (key, bytes) in [
+            (layout.source_key(DOC, "html"), b"the source".to_vec()),
+            (layout.markdown_key(DOC), TEXT.as_bytes().to_vec()),
+        ] {
+            storage.put(&key, bytes).await.unwrap();
+        }
+        (storage, bus, mcp)
+    }
+
+    fn citing(quotes: &[&str]) -> SynthesisSaveParams {
+        SynthesisSaveParams {
+            title: "How deltas grow".into(),
+            body: BODY.into(),
+            citations: quotes
+                .iter()
+                .map(|quote| SynthesisCitation {
+                    store: ACADEMIC.into(),
+                    doc_id: doc(DOC),
+                    quote: quote.to_string(),
+                })
+                .collect(),
+            tags: Some(vec!["rivers".into()]),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_synthesis_is_saved_with_the_passages_it_stands_on() {
+        let (storage, bus, mcp) = with_paper().await;
+
+        let out = parsed(&mcp.save_synthesis(citing(&[QUOTE])).await.unwrap());
+
+        assert_eq!(out["store"], SYNTHESES);
+        assert_eq!(out["citations_verified"], 1);
+        let doc_id = out["doc_id"].as_str().unwrap();
+        assert!(doc_id.ends_with("-how-deltas-grow"), "{doc_id}");
+        let (_, layout) = mcp.stores.documents(SYNTHESES).unwrap();
+        let key = layout.source_key(doc_id, "md");
+        let saved = String::from_utf8(storage.get(&key).await.unwrap()).unwrap();
+        let (front, body) = saved
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("---\n"))
+            .expect("front matter, then the text");
+        let front: serde_json::Value = serde_yaml_ng::from_str(front).unwrap();
+        assert_eq!(front["title"], "How deltas grow");
+        assert_eq!(front["tags"], serde_json::json!(["rivers"]));
+        assert_eq!(
+            front["citations"],
+            serde_json::json!([{
+                "store": ACADEMIC,
+                "doc_id": DOC,
+                "lines": [3, 3],
+                "quote": QUOTE,
+            }])
+        );
+        assert_eq!(body.trim(), BODY);
+
+        let published = bus.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].1["key"], key);
+        assert_eq!(published[0].1["source"], "mcp:synthesis_save");
+    }
+
+    /// A synthesis is only as good as its weakest citation: one that the
+    /// document does not say stops the whole save.
+    #[tokio::test]
+    async fn one_citation_that_is_not_in_its_document_saves_nothing() {
+        let (storage, bus, mcp) = with_paper().await;
+
+        let err = mcp
+            .save_synthesis(citing(&[QUOTE, MISQUOTE]))
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("citation 2 of 2"), "{err}");
+        assert!(err.contains("nothing was saved"), "{err}");
+        let (_, layout) = mcp.stores.documents(SYNTHESES).unwrap();
+        assert!(storage
+            .list(&layout.source_prefix)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(bus.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_synthesis_that_cites_nothing_is_refused() {
+        let (_, bus, mcp) = with_paper().await;
+
+        let err = mcp.save_synthesis(citing(&[])).await.unwrap_err();
+
+        assert!(err.contains("`citations` is empty"), "{err}");
+        assert!(bus.published.lock().unwrap().is_empty());
+    }
+}
+
+mod status {
+    use super::*;
+    use crate::testkit::FAKE_RECORDS_PER_DOC;
+    use crate::tools::status::StatusParams;
+    use hs_common::storage::Storage;
+    use hs_common::stores::{ABSTRACTS, ACADEMIC};
+
+    const DOC: &str = "paper-a";
+
+    fn of(doc_id: &str) -> StatusParams {
+        StatusParams {
+            store: None,
+            doc_id: Some(doc(doc_id)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_document_is_reported_stage_by_stage() {
+        let storage = FaultyStorage::new();
+        let distill = FakeDistill::start(vec![DOC.to_string()]).await;
+        let mcp = server(storage.clone(), Some(&distill));
+        let (_, layout) = mcp.stores.documents(ACADEMIC).unwrap();
+        storage
+            .put(&layout.source_key(DOC, "pdf"), b"%PDF".to_vec())
+            .await
+            .unwrap();
+        seed_markdown(&*storage, DOC, "# A\n\nBody.").await;
+        seed_catalog(&*storage, DOC).await;
+
+        let out = parsed(&mcp.report_status(of(DOC)).await.unwrap());
+
+        assert_eq!(
+            out["source"],
+            serde_json::json!({ "stored": true, "extension": "pdf" })
+        );
+        assert_eq!(out["catalog_entry"], true);
+        assert_eq!(out["converted"], true);
+        assert_eq!(out["boxes"], "pending", "a PDF whose boxes are not built");
+        assert!(out["failure"].is_null(), "{out}");
+        // The paper's own store first, then the stores made from it. Its
+        // reference lists are counted in its own store's figure.
+        let records = out["records"].as_array().unwrap();
+        assert_eq!(
+            records[0],
+            serde_json::json!({ "store": ACADEMIC, "records": FAKE_RECORDS_PER_DOC })
+        );
+        let stores: Vec<&str> = records
+            .iter()
+            .map(|r| r["store"].as_str().unwrap())
+            .collect();
+        assert_eq!(stores, [ACADEMIC, ABSTRACTS]);
+    }
+
+    /// "Not here yet" is an answer, and an index that cannot be asked says
+    /// so instead of reporting zero records.
+    #[tokio::test]
+    async fn a_document_nothing_is_known_about_is_reported_absent() {
+        let mcp = server(FaultyStorage::new(), None);
+
+        let out = parsed(&mcp.report_status(of("nonesuch")).await.unwrap());
+
+        assert_eq!(out["source"]["stored"], false);
+        assert_eq!(out["catalog_entry"], false);
+        assert_eq!(out["converted"], false);
+        assert_eq!(out["boxes"], "not_applicable");
+        let unknown = out["records"][0]["records"]["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(unknown.contains("no distill server"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_recorded_conversion_failure_is_reported_with_its_reason() {
+        let storage = FaultyStorage::new();
+        let mcp = server(storage.clone(), None);
+        let (_, layout) = mcp.stores.documents(ACADEMIC).unwrap();
+        hs_common::catalog::update_conversion_failed_via(
+            &*storage,
+            &layout.catalog_prefix,
+            DOC,
+            "unsupported_content_type:html",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let out = parsed(&mcp.report_status(of(DOC)).await.unwrap());
+
+        assert_eq!(out["converted"], false);
+        assert_eq!(out["failure"]["stage"], "conversion");
+        assert_eq!(out["failure"]["reason"], "unsupported_content_type:html");
+    }
+
+    /// The catalog keeps a skip for good, and a skip also records a
+    /// document that holds nothing to index.
+    #[tokio::test]
+    async fn only_an_indexing_failure_that_still_stands_is_reported() {
+        let storage = FaultyStorage::new();
+        let mcp = server(storage.clone(), None);
+        let (_, layout) = mcp.stores.documents(ACADEMIC).unwrap();
+        let prefix = &layout.catalog_prefix;
+
+        hs_common::catalog::update_embedding_skip_via(
+            &*storage,
+            prefix,
+            DOC,
+            "zero_chunks_or_empty",
+        )
+        .await
+        .unwrap();
+        let out = parsed(&mcp.report_status(of(DOC)).await.unwrap());
+        assert!(out["failure"].is_null(), "nothing to index: {out}");
+
+        let reason = "embed_failed: the store did not answer";
+        hs_common::catalog::update_embedding_skip_via(&*storage, prefix, DOC, reason)
+            .await
+            .unwrap();
+        let out = parsed(&mcp.report_status(of(DOC)).await.unwrap());
+        assert_eq!(out["failure"]["stage"], "indexing");
+        assert_eq!(out["failure"]["reason"], reason);
+
+        hs_common::catalog::update_embedding_catalog_via(
+            &*storage, prefix, DOC, "distill", 3, "cuda",
+        )
+        .await
+        .unwrap();
+        let out = parsed(&mcp.report_status(of(DOC)).await.unwrap());
+        assert!(out["failure"].is_null(), "indexed since it failed: {out}");
+    }
+
+    /// One part that cannot answer does not cost the others their answer.
+    #[tokio::test]
+    async fn the_pipeline_report_says_which_part_could_not_answer() {
+        let distill = FakeDistill::start(vec![DOC.to_string()]).await;
+        let mcp = server(FaultyStorage::new(), Some(&distill));
+
+        let out = parsed(&mcp.report_status(StatusParams::default()).await.unwrap());
+
+        assert_eq!(out["index"]["store"], ACADEMIC);
+        assert_eq!(out["index"]["documents"], 1);
+        // The test's bus cannot report depths: each queue says so instead
+        // of reporting an empty queue.
+        let queues = out["queues"].as_array().unwrap();
+        assert_eq!(queues.len(), 3);
+        assert!(
+            queues.iter().all(|q| q["depth"]["error"].is_string()),
+            "{out}"
+        );
+        assert_eq!(out["converters"], serde_json::json!([]));
+    }
+}
+
+/// `discover` and `graph` against a synthetic OpenAlex corpus.
+mod corpus {
     use super::*;
     use crate::testkit::server_with_openalex;
-    use crate::{OpenAlexCitationsParams, OpenAlexGetParams};
+    use crate::tools::discover::{DiscoverKind, DiscoverParams, DiscoverSource};
+    use crate::tools::graph::{GraphDirection, GraphParams, GraphSort, GraphSource};
+
+    /// The work W1, W2 and W3 cite.
+    const CITED: &str = "10.1234/cited";
+    /// W1, which cites [`CITED`].
+    const CITING: &str = "10.1234/abc";
+
+    fn neighbours(doi: &str, direction: GraphDirection) -> GraphParams {
+        GraphParams {
+            doi: doi.to_string(),
+            direction,
+            source: GraphSource::Openalex,
+            limit: None,
+            year_from: None,
+            sort: GraphSort::default(),
+        }
+    }
 
     fn ids(out: &str) -> Vec<String> {
-        let rows: Vec<serde_json::Value> = serde_json::from_str(out).unwrap();
-        let mut ids: Vec<String> = rows
+        parsed(out)["works"]
+            .as_array()
+            .unwrap()
             .iter()
-            .map(|r| r["openalex_id"].as_str().unwrap().to_string())
-            .collect();
-        ids.sort();
-        ids
+            .map(|work| work["openalex_id"].as_str().unwrap().to_string())
+            .collect()
     }
 
-    fn citations(year_from: Option<u16>) -> Parameters<OpenAlexCitationsParams> {
-        Parameters(OpenAlexCitationsParams {
-            openalex_id: "W9".into(),
-            limit: None,
-            year_from,
-            sort: None,
-        })
-    }
-
-    /// RA-107: `publication_year >= COALESCE(?, 0)` dropped works with no year
-    /// even when no year filter was given.
     #[tokio::test]
-    async fn no_year_filter_keeps_works_without_a_year() {
+    async fn citations_are_the_works_that_cite_and_references_the_works_cited() {
         let dir = tempfile::tempdir().unwrap();
         let mcp = server_with_openalex(dir.path());
 
-        let all = mcp.openalex_citations(citations(None)).await.unwrap();
-        assert_eq!(ids(&all), ["W1", "W2", "W3"]);
+        let citing = mcp
+            .graph_neighbours(neighbours(CITED, GraphDirection::Citations))
+            .await
+            .unwrap();
+        // Newest first, the undated work last.
+        assert_eq!(ids(&citing), ["W2", "W1", "W3"]);
 
-        let recent = mcp.openalex_citations(citations(Some(2000))).await.unwrap();
-        assert_eq!(ids(&recent), ["W2"], "a real filter still filters");
+        let cited = mcp
+            .graph_neighbours(neighbours(CITING, GraphDirection::References))
+            .await
+            .unwrap();
+        assert_eq!(ids(&cited), ["W9"]);
     }
 
-    /// A sort the tool does not offer is an error; it used to re-sort the
-    /// results by the default key and answer a different question.
     #[tokio::test]
-    async fn an_unknown_sort_is_refused() {
+    async fn a_year_floor_drops_older_and_undated_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = server_with_openalex(dir.path());
+
+        let out = mcp
+            .graph_neighbours(GraphParams {
+                year_from: Some(2000),
+                ..neighbours(CITED, GraphDirection::Citations)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(ids(&out), ["W2"]);
+    }
+
+    #[tokio::test]
+    async fn the_limit_cuts_the_list_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = server_with_openalex(dir.path());
+        let limited = |limit: u32| GraphParams {
+            limit: Some(limit),
+            ..neighbours(CITED, GraphDirection::Citations)
+        };
+
+        let cut = mcp.graph_neighbours(limited(2)).await.unwrap();
+        assert_eq!(ids(&cut), ["W2", "W1"]);
+        assert_eq!(parsed(&cut)["truncated"], true);
+
+        let whole = mcp.graph_neighbours(limited(3)).await.unwrap();
+        assert_eq!(ids(&whole).len(), 3);
+        assert_eq!(parsed(&whole)["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn a_doi_the_corpus_does_not_hold_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let mcp = server_with_openalex(dir.path());
 
         let err = mcp
-            .openalex_citations(Parameters(OpenAlexCitationsParams {
-                openalex_id: "W9".into(),
-                limit: None,
-                year_from: None,
-                sort: Some("citation".into()),
-            }))
+            .graph_neighbours(neighbours("10.9999/nonesuch", GraphDirection::Citations))
             .await
             .unwrap_err();
-        assert!(err.contains("Unknown sort"), "{err}");
+
+        assert!(err.contains("has no work with DOI"), "{err}");
     }
 
     #[tokio::test]
-    async fn get_resolves_ids_and_normalizes_dois_on_the_query_side() {
+    async fn a_work_is_looked_up_in_the_corpus_by_its_doi() {
         let dir = tempfile::tempdir().unwrap();
         let mcp = server_with_openalex(dir.path());
-        for query in [
-            "W1",
-            "https://openalex.org/W1",
-            "10.1234/ABC",
-            "https://doi.org/10.1234/abc",
-        ] {
-            let out = mcp
-                .openalex_get(Parameters(OpenAlexGetParams {
-                    id_or_doi: query.into(),
-                }))
-                .await
-                .unwrap();
-            let out: serde_json::Value = serde_json::from_str(&out).unwrap();
-            assert_eq!(out["openalex_id"], "W1", "{query}");
-        }
-        let missing = mcp
-            .openalex_get(Parameters(OpenAlexGetParams {
-                id_or_doi: "10.9999/none".into(),
-            }))
+
+        let out = parsed(
+            &mcp.discover_works(DiscoverParams {
+                source: DiscoverSource::Openalex,
+                query: None,
+                doi: Some(CITING.to_string()),
+                kind: DiscoverKind::Works,
+                year_from: None,
+                year_to: None,
+                limit: None,
+            })
             .await
-            .unwrap();
-        assert!(missing.contains("not_found"), "{missing}");
+            .unwrap(),
+        );
+
+        assert_eq!(out["work"]["openalex_id"], "W1");
+        assert_eq!(out["work"]["title"], "Old paper");
+        assert_eq!(out["work"]["authors"], serde_json::json!([]));
+    }
+
+    /// A server without the corpus still serves every other tool; the two
+    /// that read it pass on why it is not there.
+    #[tokio::test]
+    async fn without_the_corpus_its_tools_say_how_to_build_it() {
+        let mcp = server(FaultyStorage::new(), None);
+
+        let err = mcp
+            .graph_neighbours(neighbours(CITING, GraphDirection::References))
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("hs openalex load-works"), "{err}");
     }
 
     /// Requests do not share one locked connection: a handle held by a slow
@@ -1267,15 +1589,16 @@ mod openalex {
     async fn a_held_request_handle_does_not_block_other_requests() {
         let dir = tempfile::tempdir().unwrap();
         let mcp = server_with_openalex(dir.path());
-        let shared = mcp.openalex_db.as_ref().unwrap();
-        let _slow = crate::openalex_request_conn(shared).unwrap();
+        let _slow = mcp.openalex.connection().unwrap();
+
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            mcp.openalex_citations(citations(None)),
+            mcp.graph_neighbours(neighbours(CITED, GraphDirection::Citations)),
         )
         .await
         .expect("must not wait for the other handle")
         .unwrap();
+
         assert_eq!(ids(&out).len(), 3);
     }
 }
@@ -1284,9 +1607,17 @@ mod openalex {
 /// announce on it fail, and they fail loudly and before doing any work.
 mod broker_outage {
     use super::*;
+    use crate::tools::acquire::AcquireParams;
+    use crate::tools::capture::{CaptureContentType, CaptureParams};
+    use crate::tools::documents::DocumentsParams;
+    use crate::tools::read::ReadParams;
+    use crate::tools::synthesis_save::{SynthesisCitation, SynthesisSaveParams};
     use hs_common::event_bus::config::NatsYaml;
     use hs_common::event_bus::{EventBusConfig, EventsBackend};
     use hs_common::storage::Storage;
+    use hs_common::stores::{ACADEMIC, SYNTHESES, WEB};
+
+    const DOC: &str = "paper-a";
 
     /// A lazily connected NATS bus whose broker is a closed loopback port.
     async fn unreachable_bus() -> Arc<dyn hs_common::event_bus::EventBus> {
@@ -1302,49 +1633,70 @@ mod broker_outage {
     }
 
     #[tokio::test]
-    async fn read_only_tools_work_and_publishing_tools_error_loudly() {
+    async fn reading_works_and_every_tool_that_announces_refuses_before_doing_anything() {
         let storage = FaultyStorage::new();
-        seed_markdown(
-            &*storage,
-            "paper-a",
-            "# A\n\nBody text long enough to index.",
-        )
-        .await;
+        seed_markdown(&*storage, DOC, "# A\n\nBody text long enough to quote.").await;
+        seed_catalog(&*storage, DOC).await;
         let mcp = crate::testkit::server_with_event_bus(storage.clone(), unreachable_bus().await);
 
         // Read-only: unaffected by the outage.
-        let listed = mcp
-            .list_markdown(crate::ListParams {
-                limit: None,
-                offset: None,
-                embedded: None,
+        let read = mcp
+            .read_document(ReadParams {
+                store: None,
+                doc_id: doc(DOC),
+                page: None,
+                lines: None,
+                max_chars: None,
             })
             .await
-            .expect("read-only tools must not depend on the broker");
-        assert!(listed.contains("paper-a"), "{listed}");
-
-        // scribe_convert refuses before it touches the source.
-        let err = mcp
-            .convert_source(&crate::stem::Stem::parse("paper-a").unwrap())
+            .expect("reading must not depend on the broker");
+        assert!(read.answer.converted);
+        let listed = mcp
+            .list_documents(DocumentsParams::default())
             .await
-            .unwrap_err();
-        assert!(
-            err.contains("scribe_convert") && err.contains("event bus"),
-            "{err}"
-        );
-        assert!(err.contains("nothing was done"), "{err}");
+            .expect("listing must not depend on the broker");
+        assert!(listed.contains(DOC), "{listed}");
 
-        // paper_download refuses before any network request or storage write.
-        let err = mcp
-            .paper_download(Parameters(crate::PaperDownloadParams {
-                doi: "10.1234/abc".into(),
-            }))
-            .await
-            .unwrap_err();
-        assert!(
-            err.contains("paper_download") && err.contains("event bus"),
-            "{err}"
-        );
+        let refusals = [
+            (
+                "acquire",
+                mcp.acquire_paper(AcquireParams {
+                    doi: "10.1234/abc".into(),
+                })
+                .await,
+            ),
+            (
+                "capture",
+                mcp.capture_page(CaptureParams {
+                    url: "https://example.org/rivers".into(),
+                    content: "# Rivers\n\nRivers carry sediment.".into(),
+                    content_type: CaptureContentType::Markdown,
+                    title: None,
+                })
+                .await,
+            ),
+            (
+                "synthesis_save",
+                mcp.save_synthesis(SynthesisSaveParams {
+                    title: "Rivers".into(),
+                    body: "Rivers carry sediment.".into(),
+                    citations: vec![SynthesisCitation {
+                        store: ACADEMIC.into(),
+                        doc_id: doc(DOC),
+                        quote: "Body text long enough to quote".into(),
+                    }],
+                    tags: None,
+                })
+                .await,
+            ),
+        ];
+        for (tool, outcome) in refusals {
+            let err = outcome.unwrap_err();
+            assert!(err.contains(tool) && err.contains("event bus"), "{err}");
+            assert!(err.contains("nothing was done"), "{err}");
+        }
+
+        // No download, no page and no synthesis was stored.
         assert!(
             !storage
                 .exists("papers/10/10.1234_abc.pdf")
@@ -1352,30 +1704,10 @@ mod broker_outage {
                 .unwrap_or(false),
             "nothing may be stored"
         );
-    }
-}
-
-mod paper_search {
-    use super::*;
-    use crate::PaperSearchParams;
-
-    /// An unknown `sort` is refused before any provider is asked.
-    #[tokio::test]
-    async fn an_unknown_sort_is_refused() {
-        let mcp = server(FaultyStorage::new(), None);
-        let err = mcp
-            .paper_search(Parameters(PaperSearchParams {
-                query: "attention".into(),
-                max_results: None,
-                search_type: None,
-                date: None,
-                offset: None,
-                provider: None,
-                min_citations: None,
-                sort: Some("citation".into()),
-            }))
-            .await
-            .unwrap_err();
-        assert!(err.contains("Unknown sort"), "{err}");
+        for store in [WEB, SYNTHESES] {
+            let (_, layout) = mcp.stores.documents(store).unwrap();
+            let stored = storage.list(&layout.source_prefix).await.unwrap();
+            assert!(stored.is_empty(), "the store {store} holds {stored:?}");
+        }
     }
 }

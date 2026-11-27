@@ -4,7 +4,7 @@ Keep medical, financial and other private records in a store that is separate fr
 
 ## Before you start
 
-- A distill server is running and serves the `personal_docs` collection, which it creates by default. See [Index and search your library](index-and-search.md).
+- A distill server is running. It files personal documents in its `personal` store, which it defines when it starts. See [Index and search your library](index-and-search.md).
 - A scribe server is running if you add PDFs. Other formats convert on your machine: `docx`, `epub`, `md`, `markdown` and `txt`. See [Convert documents](convert-documents.md).
 - The `events:` section is set and a NATS broker is running if you add PDFs. The ingest asks the scribe watcher to build the PDF's word boxes, which is what lets a quotation be highlighted on its page. Without the bus a PDF is refused before it is converted.
 - Ollama runs on the machine where you run `hs personal add`, with the naming model pulled (`qwen2.5:7b` by default), unless you pin both the title and the category.
@@ -68,13 +68,13 @@ hs personal search "cholesterol results" --category medical -n 5
 hs personal read lab-results-2024-q1-abcdef01
 ```
 
-`list` shows the most recently ingested documents first, with title, category and stem. `search` is semantic, over the personal collection only. `read` prints the converted markdown of one stem. `--category` accepts any letter case.
+`list` shows the most recently ingested documents first, with title, category and stem. `search` is semantic, over the `personal` store only. `read` prints the converted markdown of one stem. `--category` accepts any letter case.
 
-Agents use the same store through `personal_search`, `personal_list` and `personal_read`. See [Personal tools](../reference/mcp-tools.md#personal-tools).
+Agents search the same store with `recall` on the `myelin` server (`stores: ["personal"]`), list it with [`documents`](../reference/mcp-tools.md#documents) and read from it with [`read`](../reference/mcp-tools.md#read), both with `store: "personal"`.
 
 ## Re-index a document
 
-After the chunker or the embedder changes, rebuild one document's vectors from its stored markdown. The new vectors replace the old ones in place; nothing is deleted first.
+After the chunker changes, or to fill an empty index, rebuild one document's records from its stored markdown. The new records replace the old ones in place; nothing is deleted first. The command takes one stem, so run it once for each document.
 
 ```sh
 hs personal reindex lab-results-2024-q1-abcdef01
@@ -86,7 +86,7 @@ hs personal reindex lab-results-2024-q1-abcdef01
 hs personal delete lab-results-2024-q1-abcdef01
 ```
 
-This removes the document's vectors from Qdrant and its source, markdown and sidecar from storage. It asks for no confirmation and cannot be undone. A stem that names nothing is an error. Agents cannot delete personal documents.
+This removes the document's records from the `personal` store and its source, markdown and sidecar from storage. It asks for no confirmation and cannot be undone. A stem that names nothing is an error. Agents cannot delete personal documents.
 
 ## See where the store is configured
 
@@ -99,7 +99,7 @@ hs personal config path
 
 ## Open a personal document from a search hit
 
-Hits from `personal_search` carry signed links when document links are configured. A link names the personal collection, so you can also mint one by hand:
+`read` and `cite` return signed links for a personal document when document links are configured. A link names the `personal` store, so you can also mint one by hand (the flag keeps the name `--collection`):
 
 ```sh
 hs docs link lab-results-2024-q1-abcdef01 --collection personal

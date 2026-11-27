@@ -1,7 +1,7 @@
 //! Unified pipeline-status snapshot.
 //!
-//! Both `hs status` (CLI TUI) and the MCP `system_status` tool render from the
-//! same `StatusSnapshot` so CLI users and LLM consumers see identical truth.
+//! Both `hs status` (CLI TUI) and the MCP server's `/mcp/status` route render
+//! from the same `StatusSnapshot` so every reader sees identical truth.
 //! The CLI layers on its own TUI-only chrome (byte counts, watcher/indexer
 //! daemon state); everything structural lives here.
 
@@ -25,7 +25,7 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub distill_instances: Vec<ServiceInstance>,
     #[serde(default)]
-    pub qdrant: Option<QdrantInfo>,
+    pub store: Option<StoreInfo>,
     #[serde(default)]
     pub history: Vec<HistoryEvent>,
     /// Cluster-wide inbox-sweeper health. Populated from the heartbeat key
@@ -40,13 +40,14 @@ pub struct StatusSnapshot {
 }
 
 /// Storage key the inbox daemon writes its heartbeat to each sweep tick.
-/// Read by every `hs status` client via MCP `system_status`, so the TUI
-/// can render the `Watcher` row honestly regardless of which host the CLI
-/// is running on. Leading `.` keeps it out of top-level listings.
+/// Read by every `hs status` client through the MCP server's status
+/// snapshot, so the TUI can render the `Watcher` row honestly regardless of
+/// which host the CLI is running on. Leading `.` keeps it out of top-level
+/// listings.
 pub const INBOX_HEARTBEAT_KEY: &str = ".heartbeats/scribe-inbox.yaml";
 
 /// Daemon heartbeat contents. Written by `hs scribe inbox` (cmd_run) at
-/// the top of each sweep tick; consumed by `system_status` / `hs status`.
+/// the top of each sweep tick; consumed by the status snapshot / `hs status`.
 ///
 /// `last_sweep_*` fields are populated by the POST-tick stamp with the
 /// `SweepReport` from `sweep_inbox_once`. They're `Option<u64>` so the
@@ -332,19 +333,22 @@ pub struct ServiceInstance {
     pub error: Option<String>,
 }
 
-/// Convenience rollup of the first healthy distill instance.
+/// The myelin server behind the first distill instance that answered, and
+/// the store its numbers are about.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct QdrantInfo {
-    pub collection: String,
+pub struct StoreInfo {
+    /// The store's name.
+    pub store: String,
     pub compute_device: String,
     #[serde(default)]
     pub embed_model: String,
+    /// The myelin server's version, from the distill server's `/health`.
     #[serde(default)]
-    pub qdrant_version: String,
-    /// Qdrant endpoint URL reported by distill, e.g. `http://host:6334`.
-    /// Empty when an older distill server doesn't yet expose it.
+    pub version: String,
+    /// The myelin endpoint, from the distill server's token-protected
+    /// `/status`. Empty when that call failed.
     #[serde(default)]
-    pub qdrant_url: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,10 +385,10 @@ pub struct HistoryEvent {
 
 /// Build the history event list from catalog entries, newest first.
 ///
-/// When `include_repaired` is `false` (the default for both `system_status`
-/// and `catalog_recent`), rows whose timestamp is a `catalog_repair`
-/// backfill fingerprint are suppressed so the feed shows organic activity.
-/// When `true`, those rows reappear annotated with `repair: true`.
+/// When `include_repaired` is `false` (the default of the status snapshot),
+/// rows whose timestamp is a `catalog_repair` backfill fingerprint are
+/// suppressed so the feed shows organic activity. When `true`, those rows
+/// reappear annotated with `repair: true`.
 #[cfg(feature = "catalog")]
 pub fn build_history(
     entries: &[(String, CatalogEntry)],
@@ -450,7 +454,7 @@ pub fn build_history(
         }
         if let Some(ref emb) = entry.embedding {
             // Zero-chunk "embeddings" were stamped by an older pipeline when
-            // nothing reached Qdrant; they only pollute history.
+            // nothing reached the store; they only pollute history.
             if emb.chunks_indexed > 0 {
                 events.push(HistoryEvent {
                     activity: "Embed".into(),
@@ -1072,7 +1076,7 @@ pub fn list_catalog_flag_drift_resync_candidates(
 /// drift-gate failure mode: docs that went through convert → markdown →
 /// embed, had their markdown deleted, and whose catalog flags were
 /// cleared by `catalog_no_markdown` repair without the corresponding
-/// Qdrant purge. After the rc.260 purge-also-on-clear fix the catalog
+/// store purge. After the rc.260 purge-also-on-clear fix the catalog
 /// is consistent, but the source remains and needs re-conversion.
 #[cfg(all(feature = "storage", feature = "catalog"))]
 #[derive(Debug, Clone)]

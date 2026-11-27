@@ -11,12 +11,18 @@ use hs_common::auth::token::{self, TokenClaims, TokenError, TokenType};
 use crate::config::GatewayConfig;
 use crate::state::GatewayState;
 
+/// The service name of the myelin memory server, as a scope and as a key of
+/// `cloud.gateway.routes`.
+pub const MEMORY_SERVICE: &str = "memory";
+
 /// The scopes a device may be granted.
 ///
-/// A scope is a bearer-token permission. `docs` is **not** one: the
-/// docs route authorizes with a signed link's own signature, so a
-/// device never holds a `docs` scope and the gateway never checks one.
-pub const SERVICES: [&str; 3] = ["scribe", "distill", "mcp"];
+/// A scope is a bearer-token permission. `memory` is the myelin memory
+/// server, where agents search the corpus and keep what they were asked to
+/// remember. `docs` is **not** a scope: the docs route authorizes with a
+/// signed link's own signature, so a device never holds a `docs` scope and
+/// the gateway never checks one.
+pub const SERVICES: [&str; 4] = ["scribe", "distill", "mcp", MEMORY_SERVICE];
 
 /// The services the gateway routes to.
 ///
@@ -24,7 +30,7 @@ pub const SERVICES: [&str; 3] = ["scribe", "distill", "mcp"];
 /// routable but not scope-bearing. The two lists are different on
 /// purpose: a route that authorizes with a signature must not also
 /// accept a bearer token, or the signature would be optional.
-pub const ROUTABLE_SERVICES: [&str; 4] = ["scribe", "distill", "mcp", "docs"];
+pub const ROUTABLE_SERVICES: [&str; 5] = ["scribe", "distill", "mcp", MEMORY_SERVICE, "docs"];
 
 /// A refusal small enough to return by value: status plus a fixed message.
 /// Convert with `.into_response()` at the handler boundary.
@@ -268,7 +274,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let prev = dir.join("cloud-secret.key.prev");
         let yaml = format!(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:0\n    secret_path: {}/cloud-secret.key\n    previous_secret_path: {}\n    routes:\n      mcp: http://127.0.0.1:9\n      scribe: http://127.0.0.1:9\n      distill: http://127.0.0.1:9\n      docs: http://127.0.0.1:9\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:0\n    secret_path: {}/cloud-secret.key\n    previous_secret_path: {}\n    routes:\n      mcp: http://127.0.0.1:9\n      scribe: http://127.0.0.1:9\n      distill: http://127.0.0.1:9\n      docs: http://127.0.0.1:9\n      memory: http://127.0.0.1:9\n",
             dir.display(),
             prev.display()
         );

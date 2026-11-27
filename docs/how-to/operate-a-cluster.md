@@ -2,7 +2,7 @@
 
 This page collects the tasks you repeat on a running home-cloud cluster:
 verify it, upgrade it, add a GPU node or a scribe worker, take a node out,
-recover Qdrant, and manage the storage. Each section is a task with its own
+rebuild the search index, and manage the storage. Each section is a task with its own
 steps and check.
 
 ## Before you start
@@ -10,7 +10,8 @@ steps and check.
 - You built the cluster with
   [Build a home-cloud research cluster](../tutorials/home-cloud-cluster.md), so
   the hosts keep the roles that tutorial gives them: `<gateway-host>`,
-  `<storage-host>`, `<qdrant-host>`, `<gpu-host>` and `<laptop>`.
+  `<storage-host>`, `<gpu-host>` and `<laptop>`. The myelin server runs on
+  `<gpu-host>`.
 - You can sign in to each host over SSH. Commands that must run on one
   particular host say so.
 - Over SSH, user services need `XDG_RUNTIME_DIR` set. Run
@@ -54,16 +55,18 @@ have.
    docker ps --filter name=nats
    ```
 
-3. On `<qdrant-host>`, check Qdrant:
+3. On `<gpu-host>`, check myelin and Ollama:
 
    ```sh
-   docker ps --filter name=qdrant
-   curl -fsS http://localhost:6333/healthz
-   curl -fsS http://localhost:6333/collections
+   systemctl --user status myelin-mcp
+   ollama ps
    ```
 
-   The container is up, and `collections` lists the distill server's
-   collections.
+   The `myelin-mcp` service is active (the unit name is the one you gave it in
+   [set up myelin](../tutorials/home-cloud-cluster.md#8-set-up-myelin-on-the-gpu-host);
+   `myelin-mcp` has no `/health` route, so the distill server's health call
+   below is the check that it answers). `ollama ps` lists `bge-m3-8k:latest`
+   with its processor as `100% GPU`.
 
 4. On `<gpu-host>`, check the card and the servers:
 
@@ -73,12 +76,12 @@ have.
    curl -fsS http://localhost:7434/health
    curl -fsS http://localhost:7446/health
    hs distill status
-   journalctl -u hs-serve-distill | grep -iE 'vram|cuda'
+   journalctl -u hs-serve-distill | grep -i 'myelin reachable\|embedding model on the GPU'
    ```
 
    `nvidia-smi` lists the processes that hold GPU memory, each health call
-   answers with HTTP 200, and the log says CUDA is verified with a non-zero
-   amount of memory held by the server.
+   answers with HTTP 200, and the distill server's log says that myelin is
+   reachable and that the embedding model is on the GPU.
 
 5. From any client, check the whole pipeline:
 
@@ -116,9 +119,10 @@ the gateway restarts.
    (`hs-distill-server`, `hs-gateway`, `hs-mcp`, `hs-scribe-server`), restarts
    the services that run those binaries, and checks their health. It installs
    `hs` last, so a failed run leaves the old `hs` in place and you can run the
-   command again. It also pulls and restarts the containers that a compose file
-   in `~/.home-still/` manages, and leaves an unchanged, healthy container
-   running. The flags are in the [CLI reference](../reference/cli.md#hs-upgrade).
+   command again. It also pulls and restarts the scribe containers that
+   `~/.home-still/docker-compose.yml` manages (when `scribe.local_server` is
+   on), and leaves an unchanged, healthy container running. It does not touch
+   myelin or its Qdrant: update those with the tools you installed them with. The flags are in the [CLI reference](../reference/cli.md#hs-upgrade).
 
 3. On `<gpu-host>`, confirm the servers came back:
 
@@ -172,13 +176,12 @@ A second GPU host adds conversion and indexing capacity.
 1. On the new host, install home-still and save the shared secret as in steps 1
    and 2 of the
    [cluster tutorial](../tutorials/home-cloud-cluster.md#1-install-home-still-on-the-gateway-host-the-gpu-host-and-the-laptop).
-2. Set `distill_server.qdrant_url` in `~/.home-still/config.yaml` to
-   `http://<qdrant-host>:6334`, and prepare the card, the layout models,
+2. Set `distill_server.myelin_url` in `~/.home-still/config.yaml` to the
+   myelin server's MCP endpoint, and prepare the card, the layout models,
    pdfium and the scribe server as in steps 6 and 8 of the tutorial.
 3. Start the servers as services:
 
    ```sh
-   hs distill init
    hs serve scribe --install
    hs serve distill --install
    ```
@@ -277,69 +280,54 @@ It prints the values you set.
 
 `hs status` does not list the node, and requests through the gateway succeed.
 
-## Recover a corrupted Qdrant collection
+## Rebuild a damaged search index
 
-The markdown is the source of truth, so you can rebuild the vectors from it.
+The markdown is the source of truth, so you can rebuild a store's records from
+it. Use this when a store's records are damaged or lost, for example after
+you replaced myelin's Qdrant volume. The conversion is not repeated.
 
-1. On `<qdrant-host>`, delete the collection's files and restart Qdrant:
+1. On `<gpu-host>`, make sure myelin, Ollama and the distill server are
+   running (see [Verify the cluster](#verify-the-cluster)).
 
-   ```sh
-   docker exec qdrant rm -rf /qdrant/storage/collections/academic_papers
-   docker restart qdrant
-   ```
-
-2. On `<gpu-host>`, restart the distill server, which creates its collections
-   when it starts:
-
-   ```sh
-   sudo systemctl restart hs-serve-distill
-   ```
-
-3. Index every markdown document again:
+2. If the store still holds records you want to discard, empty it. The call
+   deletes every document of one store, and the reference lists that belong
+   to it; it asks for no confirmation:
 
    ```sh
-   hs distill index --force
+   curl -fsS -X POST -H "Authorization: Bearer $HS_BACKEND_TOKEN" \
+     "http://localhost:7434/store/reset?store=academic"
    ```
 
-   Indexing replaces a document's vectors in place, so you can stop the command
-   and run it again.
+   The answer names the store and how many chunks were deleted.
+
+3. Index the markdown that has no records:
+
+   ```sh
+   hs distill reconcile --reembed
+   ```
+
+   To index documents that are already indexed again, replacing their records
+   in place, run `hs distill reindex --all` instead; it can be resumed with
+   `--older-than`. See the [CLI reference](../reference/cli.md#hs-distill).
+
+4. Fill the other stores that are built from the catalog and from personal
+   documents:
+
+   ```sh
+   hs distill abstracts build --force
+   hs personal reindex <stem>
+   ```
+
+   Run `hs personal reindex` once for each personal document (`hs personal
+   list` shows the stems).
+
+Indexing a document writes its new records before it deletes the old ones, so
+you can stop any of these commands and run it again.
 
 ### Check it worked
 
-`hs distill status` shows the collection's document and chunk counts
-rising again, and `hs distill search "test query"` returns passages.
-
-## Update Qdrant
-
-`hs upgrade` restarts only the containers that a compose file under
-`~/.home-still/` manages. A container you started with `docker run`, as in the
-tutorial, you update yourself.
-
-1. On `<qdrant-host>`, pull the image and recreate the container with the same
-   volume and ports:
-
-   ```sh
-   docker pull qdrant/qdrant:latest
-   docker stop qdrant && docker rm qdrant
-   docker run -d \
-     --name qdrant \
-     --restart unless-stopped \
-     -p 6333:6333 -p 6334:6334 \
-     -v /mnt/nvme/qdrant:/qdrant/storage \
-     qdrant/qdrant:latest
-   ```
-
-2. Wait until Qdrant has recovered its collections. A large corpus takes
-   minutes:
-
-   ```sh
-   curl -fsS http://localhost:6333/healthz
-   ```
-
-### Check it worked
-
-`curl -fsS http://localhost:6333/collections` lists your collections, and
-`hs distill status` reports their points.
+`hs distill status` shows the store's document and record counts rising
+again, and `hs distill search "test query"` returns passages.
 
 ## Choose a storage backend
 
@@ -490,7 +478,7 @@ Copy the data, then point every host at the bucket. Do the steps in order.
    ```
 
    Stop the inbox watcher on your laptop with `hs scribe inbox uninstall`; you
-   install it again in step 5.
+   install it again in step 16 of the tutorial.
 
 2. On `<storage-host>`, configure an `rclone` remote for Garage in
    `~/.config/rclone/rclone.conf`, using the key from the Garage setup:

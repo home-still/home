@@ -199,12 +199,13 @@ pub struct HealthResponse {
     /// initialized at process start; a restart resets it to `None` until
     /// the first post-restart conversion. This is diagnostic, not
     /// persistent. For the persistent last-activity timestamp across
-    /// restarts, read `system_status.history` — it surfaces the most
-    /// recent `Convert`/`Embed` event straight out of the catalog YAMLs.
+    /// restarts, read `history` in the status snapshot (`hs status`) — it
+    /// surfaces the most recent `Convert`/`Embed` event straight out of the
+    /// catalog YAMLs.
     ///
-    /// A `null` here paired with recent converts in `system_status.history`
-    /// is not a contradiction — it just means scribe was restarted between
-    /// the last activity and the health probe.
+    /// A `null` here paired with recent converts in that history is not a
+    /// contradiction — it just means scribe was restarted between the last
+    /// activity and the health probe.
     #[serde(default)]
     pub last_conversion_at: Option<String>,
     /// Total successful conversions since server startup. Monotonic

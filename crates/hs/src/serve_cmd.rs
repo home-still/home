@@ -70,7 +70,7 @@ pub enum ServeCmd {
         uninstall: bool,
     },
     /// NATS event-watch daemon that indexes `scribe.completed` events into
-    /// Qdrant via the distill server. Runs as a user-level service.
+    /// the myelin store via the distill server. Runs as a user-level service.
     DistillWatch {
         /// Install as a user service and start it
         #[arg(long, conflicts_with = "uninstall")]
@@ -250,10 +250,6 @@ async fn serve_scribe(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
 
 async fn serve_distill(port: u16, reporter: &Arc<dyn Reporter>) -> Result<()> {
     reporter.status("Serve", &format!("distill on port {port}"));
-
-    // Auto-init (idempotent)
-    reporter.status("Init", "checking distill prerequisites");
-    super::distill_cmd::ensure_init(reporter).await?;
 
     // Start server (foreground — blocks until shutdown)
     reporter.status("Start", "starting distill server");
@@ -622,7 +618,6 @@ fn render_system_unit(
     user: &str,
     home: &std::path::Path,
     hs_bin: &std::path::Path,
-    fastembed_cache: &std::path::Path,
     secrets_env: Option<&std::path::Path>,
 ) -> String {
     let env_file_line = secrets_env
@@ -637,8 +632,7 @@ After=network.target
 Type=simple
 User={user}
 WorkingDirectory={home}
-{env_file_line}Environment=FASTEMBED_CACHE_PATH={cache}
-ExecStart={hs_path} serve {service_type} --port {port}
+{env_file_line}ExecStart={hs_path} serve {service_type} --port {port}
 Restart=always
 RestartSec=10
 
@@ -646,7 +640,6 @@ RestartSec=10
 WantedBy=multi-user.target
 "#,
         home = home.display(),
-        cache = fastembed_cache.display(),
         hs_path = hs_bin.display(),
     )
 }
@@ -934,11 +927,6 @@ async fn install_service(
             let unit_path = format!("/etc/systemd/system/{service_name}.service");
 
             let home_dir = dirs::home_dir().context("Cannot find home directory")?;
-            let fastembed_cache = hs_bin
-                .parent()
-                .unwrap_or(home_dir.as_path())
-                .join(".fastembed_cache");
-
             let secrets_path = home_dir.join(".home-still").join("secrets.env");
             let unit = render_system_unit(
                 service_type,
@@ -946,7 +934,6 @@ async fn install_service(
                 &user,
                 &home_dir,
                 &hs_bin,
-                &fastembed_cache,
                 secrets_path.exists().then_some(secrets_path.as_path()),
             );
 
@@ -1231,7 +1218,6 @@ mod tests {
             "alice",
             Path::new("/home/user"),
             Path::new("/home/user/.local/bin/hs"),
-            Path::new("/home/user/.local/bin/.fastembed_cache"),
             Some(Path::new("/home/user/.home-still/secrets.env")),
         );
         assert!(unit.lines().any(|l| l == "User=alice"));

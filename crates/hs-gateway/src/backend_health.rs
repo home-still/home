@@ -25,9 +25,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The result of probing one backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reachability {
-    /// The backend answered its `/health` with a success status.
+    /// The backend answered, and not with a server error.
     Reachable,
-    /// The backend answered, but not with a success status.
+    /// The backend answered `/health` with a server error (5xx).
     Answered(u16),
     /// The backend could not be reached at all.
     Unreachable(String),
@@ -35,10 +35,15 @@ pub enum Reachability {
 
 /// Probe one backend's `/health`.
 ///
-/// The backend's `Authorization` header is not sent: `/health` is the
-/// one route every backend leaves open, and sending a token the probe
-/// does not need would turn a reachability question into a
-/// authentication one.
+/// The question is whether the backend can be reached from here, so any
+/// answer that is not a server error is a yes. Not every backend has an open
+/// `/health`: hs-mcp and the memory server ask for the backend token on
+/// every path and answer this probe with `401`, which proves the host, the
+/// port and the firewall as well as a `200` does. The token is not sent,
+/// because sending it would turn a reachability question into an
+/// authentication one. A `5xx` is the backend saying it cannot serve (a
+/// scribe server whose model is not loaded answers `503`), and that is
+/// reported.
 pub async fn probe(base_url: &str) -> Reachability {
     let url = format!("{}/health", base_url.trim_end_matches('/'));
     let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
@@ -46,14 +51,8 @@ pub async fn probe(base_url: &str) -> Reachability {
         Err(e) => return Reachability::Unreachable(format!("cannot build the client: {e}")),
     };
     match client.get(&url).send().await {
-        Ok(r) => {
-            let status = r.status().as_u16();
-            if r.status().is_success() {
-                Reachability::Reachable
-            } else {
-                Reachability::Answered(status)
-            }
-        }
+        Ok(r) if r.status().is_server_error() => Reachability::Answered(r.status().as_u16()),
+        Ok(_) => Reachability::Reachable,
         Err(e) => Reachability::Unreachable(describe(&e)),
     }
 }
@@ -120,11 +119,8 @@ mod tests {
         }
     }
 
-    /// A backend that answers with a non-success status is reported as
-    /// answering — and named as not healthy. A `401` means the token is
-    /// wrong, which is a different problem from an unreachable host.
-    #[tokio::test]
-    async fn a_backend_that_answers_with_an_error_is_reported_as_unhealthy() {
+    /// A backend that answers `/health` with `status_line`, once.
+    async fn backend_answering(status_line: &'static str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -133,30 +129,45 @@ mod tests {
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf).await;
             let _ = stream
-                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .write_all(
+                    format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                )
                 .await;
         });
-        let verdict = probe(&format!("http://127.0.0.1:{port}")).await;
-        assert_eq!(verdict, Reachability::Answered(401));
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A backend that says it cannot serve is reported as answering, with
+    /// the status it gave: that is a different problem from an unreachable
+    /// host.
+    #[tokio::test]
+    async fn a_backend_that_answers_with_a_server_error_is_reported_as_unhealthy() {
+        let backend = backend_answering("503 Service Unavailable").await;
+        assert_eq!(probe(&backend).await, Reachability::Answered(503));
+    }
+
+    /// hs-mcp and the memory server have no open `/health`: they answer the
+    /// probe with `401`, or `404` behind a listener that needs no token.
+    /// Both prove the backend can be reached, and reporting them as "not
+    /// healthy" put a false warning in the log at every gateway start.
+    #[tokio::test]
+    async fn a_backend_that_asks_for_a_token_or_has_no_health_route_is_reachable() {
+        for status_line in ["401 Unauthorized", "404 Not Found"] {
+            let backend = backend_answering(status_line).await;
+            assert_eq!(
+                probe(&backend).await,
+                Reachability::Reachable,
+                "{status_line}"
+            );
+        }
     }
 
     /// A backend that answers `/health` with a success status is
     /// reachable.
     #[tokio::test]
     async fn a_healthy_backend_is_reachable() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf).await;
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                .await;
-        });
-        let verdict = probe(&format!("http://127.0.0.1:{port}")).await;
-        assert_eq!(verdict, Reachability::Reachable);
+        let backend = backend_answering("200 OK").await;
+        assert_eq!(probe(&backend).await, Reachability::Reachable);
     }
 
     /// The report names the service and the backend, so the operator

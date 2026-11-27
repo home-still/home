@@ -47,7 +47,8 @@ tagged `v0.0.1-rc.N` on
 - **Platforms:** the `hs` command runs on macOS (Intel and Apple Silicon),
   Linux (x86-64 and ARM64) and Windows.
 - **Search** needs an NVIDIA GPU with CUDA for the distill server (Linux,
-  x86-64), plus Docker or Podman for Qdrant.
+  x86-64), and a [myelin](https://github.com/home-still/myelin) server
+  (which keeps its own Qdrant) with Ollama holding `bge-m3` on the GPU.
 - **Conversion** needs a vision-language model backend: Ollama (Metal on
   Apple Silicon, CUDA on NVIDIA) or an OpenAI-compatible server.
 - **Automation** needs a NATS server with JetStream.
@@ -73,7 +74,7 @@ hs paper get --doi 10.48550/arXiv.1706.03762
 ```
 
 Downloading needs the event bus, conversion needs a model and its layout
-files, and search needs the distill server.
+files, and search needs the distill server and a myelin server.
 [Build your first research library](docs/tutorials/first-library.md) sets up
 each, step by step, on one machine, and ends with a library that converts
 and indexes every paper you download by itself.

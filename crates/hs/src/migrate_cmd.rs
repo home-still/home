@@ -1471,7 +1471,7 @@ async fn move_object(
 ///   next fetch of that DOI would land on the canonical key and manufacture
 ///   a fresh collision. Canonicalizing now closes that door.
 ///
-/// Vectors for every dropped `doc_id` are purged from Qdrant, and any stem
+/// Records for every dropped `doc_id` are purged from the store, and any stem
 /// whose canonical markdown changed is re-indexed, so storage and the index
 /// stay in agreement. Without the purge the duplicate stays searchable —
 /// which is the whole defect.
@@ -1793,9 +1793,10 @@ pub async fn run_canonicalize_doi_stems(
             }
         }
 
-        // Drop the variant's vectors. Until this happens the duplicate is
-        // still returned by search, which is the defect being fixed.
-        match distill.delete_doc(&v.stem).await {
+        // Drop the variant's vectors, its abstract included. Until this
+        // happens the duplicate is still returned by search, which is the
+        // defect being fixed.
+        match crate::distill_cmd::delete_paper_everywhere(&distill, &v.stem).await {
             Ok(n) => {
                 if n > 0 {
                     stats.purged_docs += 1;
@@ -1825,7 +1826,12 @@ pub async fn run_canonicalize_doi_stems(
                 }
             };
             if let Err(e) = distill
-                .index_from_storage_with_catalog(&*storage, &to_md, cat.as_ref())
+                .index_from_storage_with_catalog(
+                    hs_common::stores::ACADEMIC,
+                    &*storage,
+                    &to_md,
+                    cat.as_ref(),
+                )
                 .await
             {
                 stats.errors.push(format!("reindex {}: {e}", v.canonical));

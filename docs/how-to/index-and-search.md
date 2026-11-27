@@ -6,38 +6,29 @@ index consistent with your library. How search ranks passages is explained in
 
 ## Before you start
 
-- The distill server host has an NVIDIA GPU with CUDA, Docker or Podman (for
-  Qdrant), `hs-distill-server` in `~/.local/bin/` (the install script puts it
-  there on x86-64 Linux), and `HS_BACKEND_TOKEN` in
+- The distill server host has an NVIDIA GPU with CUDA, a myelin server and
+  Ollama running, `hs-distill-server` in `~/.local/bin/` (the install script
+  puts it there on x86-64 Linux), and `HS_BACKEND_TOKEN` in
   `~/.home-still/secrets.env`.
 - Every host that indexes or searches lists the server in `distill.servers`
   and has the same `HS_BACKEND_TOKEN`. See
   [`distill`](../reference/configuration.md#distill).
-- The server's own settings (Qdrant address, collections, embedding) are in
+- The server's own settings (the myelin address, chunking, metadata) and the
+  stores it files documents in are in
   [`distill_server`](../reference/configuration.md#distill_server).
 
 ## Start the server
 
-1. Set up Qdrant on this host. This writes
-   `~/.home-still/docker-compose-distill.yml` and starts the container:
-
-   ```sh
-   hs distill init
-   ```
-
-   If Qdrant already runs elsewhere, set `distill_server.qdrant_url` instead
-   and skip this step.
-
-2. Start the server in the background:
+1. Start the server in the background:
 
    ```sh
    hs serve distill start
    ```
 
-   When the compose file from step 1 exists, this also starts Qdrant; without
-   it, the server requires Qdrant to be reachable already.
+   It defines its stores in the myelin server at `distill_server.myelin_url`
+   and stops if that server does not answer or refuses one.
 
-3. To run it as a service that starts at boot:
+2. To run it as a service that starts at boot:
 
    ```sh
    hs serve distill --install
@@ -81,9 +72,17 @@ hs distill search "gut microbiome" --topic "Neuroscience"
 
 For scripts, add `--output json`.
 
+A search covers the `academic` store unless you name others with `--store`,
+which you can repeat:
+
+```sh
+hs distill search "hippocampal neurogenesis" --store references
+hs distill search "tax return 2024" --store personal --store academic
+```
+
 ## Search papers by their abstracts
 
-Build the per-paper abstracts collection once, then keep it current:
+Build the per-paper `abstracts` store once, then keep it current:
 
 ```sh
 hs distill abstracts build
@@ -91,12 +90,12 @@ hs distill abstracts reconcile
 hs distill abstracts status
 ```
 
-`build --force` re-embeds papers that are already in it. The MCP tool
-[`abstract_search`](../reference/mcp-tools.md#abstract_search) searches it.
+`build --force` re-embeds papers that are already in it. An agent searches it
+with `recall` on the `myelin` server, naming the store: `stores: ["abstracts"]`.
 
 ## Keep the index consistent
 
-1. Report documents whose markdown never reached Qdrant, or whose catalog
+1. Report documents whose markdown never reached the store, or whose catalog
    entry lost its embedding stamp:
 
    ```sh
@@ -109,38 +108,32 @@ hs distill abstracts status
    hs distill reconcile --reembed --fix-stamps
    ```
 
-3. Copy missing titles from the catalog onto indexed passages (reports first,
-   writes with `--apply`):
-
-   ```sh
-   hs distill backfill-titles
-   hs distill backfill-titles --apply
-   ```
-
-4. Find out why a document produces no passages:
+3. Find out why a document produces no passages:
 
    ```sh
    hs distill diagnose 10.48550_arxiv.1706.03762
    ```
 
-5. Delete every passage of one document from Qdrant, for example after its
-   markdown was removed:
+4. Delete every passage of one document from the `academic` store, for
+   example after its markdown was removed:
 
    ```sh
    hs distill purge 10.48550_arxiv.1706.03762
    ```
 
-## Speed up a large collection
+5. Fill an empty index, after you first set up myelin or after a rebuild,
+   then re-index what is already indexed when you need to:
 
-Qdrant answers from a brute-force scan until an HNSW index is built. Start the
-background build in a quiet period:
+   ```sh
+   hs distill reconcile --reembed
+   hs distill abstracts build --force
+   hs personal reindex <stem>
+   ```
 
-```sh
-hs distill hnsw enable --collection academic_papers
-hs distill hnsw enable --collection academic_papers --yes
-```
-
-Without `--yes` it prints what it would do and exits with status 1.
+   Run `hs personal reindex` once for each personal document. To index the
+   documents of the `academic` store again, replacing their records in place,
+   run `hs distill reindex --all`; pass `--older-than <time>` to resume a run
+   that stopped.
 
 ## Check it worked
 
@@ -148,5 +141,5 @@ Without `--yes` it prints what it would do and exits with status 1.
 hs distill status
 ```
 
-It shows the server, its GPU, and the collection's point and document counts.
+It shows the server, its GPU, and the `academic` store's chunk count.
 On the dashboard, the Embedded row approaches the Markdown row.

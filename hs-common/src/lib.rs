@@ -6,6 +6,8 @@ pub mod hardware_profile;
 pub mod html;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "auth")]
+pub mod mcp_client;
 pub mod mode;
 #[cfg(any(feature = "events", feature = "catch-panic", feature = "logging"))]
 pub mod panic_guard;
@@ -13,6 +15,8 @@ pub mod pipe_reporter;
 pub mod quality;
 pub mod reporter;
 pub mod secrets;
+#[cfg(all(test, feature = "auth"))]
+pub(crate) mod test_http;
 
 /// Relative path from $HOME to the config file.
 pub const CONFIG_REL_PATH: &str = ".home-still/config.yaml";

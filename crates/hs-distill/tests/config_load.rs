@@ -40,46 +40,39 @@ fn home_with(yaml: Option<&str>) -> (tempfile::TempDir, ConfigFile) {
 }
 
 #[test]
-fn yaml_collections_replace_the_default_list_and_host_port_are_read() {
-    let (_home, file) = home_with(Some(
-        "distill_server:\n  host: 127.0.0.1\n  port: 7444\n  collections: [only_this]\n",
-    ));
+fn the_file_sets_the_host_and_port() {
+    let (_home, file) = home_with(Some("distill_server:\n  host: 127.0.0.1\n  port: 7444\n"));
     let loaded = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();
-    assert_eq!(loaded.collections, ["only_this"]);
     assert_eq!((loaded.host.as_str(), loaded.port), ("127.0.0.1", 7444));
     loaded.validate().unwrap();
-    let served: Vec<_> = loaded.served_collections().collect();
-    assert_eq!(served, ["academic_papers", "only_this"]);
 }
 
 #[test]
-fn env_overrides_the_file_and_the_project_dir_moves_the_data_dir() {
-    // `/srv/hs` has no drive on Windows, where a relative project dir is
-    // refused.
-    let project = if cfg!(windows) {
-        "C:/srv/hs"
-    } else {
-        "/srv/hs"
-    };
-    let (_home, file) = home_with(Some(&format!(
-        "home:\n  project_dir: {project}\ndistill_server:\n  port: 7444\n"
-    )));
-    let loaded = with_env(&[("HS_DISTILL_PORT", "7555")], || {
-        DistillServerConfig::from_file(&file)
-    })
+fn env_overrides_the_file() {
+    let (_home, file) = home_with(Some(
+        "distill_server:\n  port: 7444\n  myelin_url: http://127.0.0.1:7000/mcp\n",
+    ));
+    let loaded = with_env(
+        &[
+            ("HS_DISTILL_PORT", "7555"),
+            ("HS_DISTILL_MYELIN_URL", "http://127.0.0.1:7001/mcp"),
+        ],
+        || DistillServerConfig::from_file(&file),
+    )
     .unwrap();
     assert_eq!(loaded.port, 7555);
-    assert_eq!(
-        loaded.qdrant_data_dir,
-        std::path::PathBuf::from(project).join("data/qdrant")
-    );
+    assert_eq!(loaded.myelin_url, "http://127.0.0.1:7001/mcp");
+
+    let from_file = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();
+    assert_eq!(from_file.port, 7444);
+    assert_eq!(from_file.myelin_url, "http://127.0.0.1:7000/mcp");
 }
 
 #[test]
 fn a_malformed_section_or_env_value_is_an_error_never_the_defaults() {
     for yaml in [
         "distill_server:\n  port: not-a-port\n",
-        "distill_server:\n  embedding:\n    compute_device: cpu\n",
+        "distill_server:\n  chunk_max_tokens: many\n",
         "distill_server: [1, 2]\n",
     ] {
         let (_home, file) = home_with(Some(yaml));
@@ -102,11 +95,11 @@ fn a_malformed_section_or_env_value_is_an_error_never_the_defaults() {
 
 #[test]
 fn removed_keys_still_load() {
-    let yaml = "distill_server:\n  embedding:\n    model: bge-m3\n    sparse_enabled: true\n    dimension: 1024\n";
+    let yaml = "distill_server:\n  qdrant_url: http://localhost:6334\n  qdrant_data_dir: /x\n  collection_name: academic_papers\n  collections: [paper_abstracts]\n  embedding:\n    model: bge-m3\n    compute_device: cuda\n  hnsw:\n    m: 16\n  qdrant_upsert_batch: 10\n";
     let (_home, file) = home_with(Some(yaml));
-    // The keys were already inert; they are reported elsewhere, never fatal.
+    // The keys are inert; they are reported by name, never fatal.
     let loaded = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();
-    assert_eq!(loaded.embedding.dimension, 1024);
+    assert_eq!(loaded.myelin_url, DistillServerConfig::default().myelin_url);
 }
 
 #[test]
@@ -154,10 +147,10 @@ fn a_malformed_client_section_is_an_error_naming_it() {
 #[test]
 fn a_stale_or_misspelt_key_does_not_stop_either_config_from_loading() {
     let (_home, file) = home_with(Some(
-        "distill_server:\n  port: 7555\n  qdrant_urll: http://x\n  embedding:\n    model: bge-m3\n    batchsize: 4\ndistill:\n  index_timeout: 5\n",
+        "distill_server:\n  port: 7555\n  myelin_urll: http://x\n  chunk_max_token: 4\ndistill:\n  index_timeout: 5\n",
     ));
     let server = with_env(&[], || DistillServerConfig::from_file(&file)).unwrap();
     assert_eq!(server.port, 7555);
-    assert_eq!(server.qdrant_url, DistillServerConfig::default().qdrant_url);
+    assert_eq!(server.myelin_url, DistillServerConfig::default().myelin_url);
     with_env(&[], || DistillClientConfig::from_file(&file)).unwrap();
 }

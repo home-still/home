@@ -21,7 +21,7 @@ const CONFIRM_TOKEN: &str = "rebuild-from-papers";
 
 #[derive(Subcommand, Debug)]
 pub enum PipelineCmd {
-    /// Wipe derived state (markdown, catalog, Qdrant vectors) and republish
+    /// Wipe derived state (markdown, catalog, indexed chunks) and republish
     /// `papers.ingested` for every PDF/HTML under `papers/` so scribe + distill
     /// rebuild the entire pipeline from source. Papers themselves are never
     /// touched.
@@ -73,13 +73,13 @@ pub enum PipelineCmd {
         yes: bool,
     },
     /// Delete *embedded* poison: markdown stubs that passed the chunk-quality
-    /// floor and reached Qdrant as 1-chunk vectors but whose visible text
+    /// floor and reached the store as 1-chunk documents but whose visible text
     /// matches a known anti-bot / cookie-wall interstitial signature
     /// (PMC "Checking your browser", Wiley "Cookies disabled", PMC
     /// "Preparing to download"). Sister command to `purge-skipped`:
     /// `purge-skipped` handles `embedding_skip = zero_chunks_or_empty`
-    /// stubs that never reached Qdrant; this handles the residue that
-    /// did. For each victim: deletes the Qdrant points by doc_id,
+    /// stubs that never reached the store; this handles the residue that
+    /// did. For each victim: deletes the stored chunks by doc_id,
     /// the markdown, the source PDF/HTML, and the catalog yaml.
     PurgePoisoned {
         /// Report what would be deleted without touching anything.
@@ -97,20 +97,6 @@ pub enum PipelineCmd {
     /// anything. Deletes the orphan catalog yaml only — there's nothing
     /// else to delete.
     ReapPhantoms {
-        /// Report what would be deleted without touching anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Skip the interactive confirmation prompt.
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Per-chunk parallel to `purge-poisoned`: scan every Qdrant point and
-    /// delete only those individual chunks whose `chunk_text` matches a
-    /// known interstitial / cookie-banner signature, leaving the rest of
-    /// each document intact. Use when a real paper has been contaminated
-    /// by a trailing cookie banner the conversion swept up — the doc is
-    /// worth keeping, just not that one chunk.
-    PurgePoisonedChunks {
         /// Report what would be deleted without touching anything.
         #[arg(long)]
         dry_run: bool,
@@ -143,6 +129,27 @@ pub enum PipelineCmd {
         #[arg(long = "reason", value_name = "REASON")]
         reasons: Vec<String>,
     },
+    /// Report where the academic catalog and the storage disagree: sources
+    /// with no catalog entry, entries with no markdown or no source, missing
+    /// stage flags, stale markdown paths and documents never converted.
+    /// Reads only; it changes nothing and prints a JSON report.
+    RepairCatalog {
+        /// Cap what each `would_*` count reports at this many entries.
+        /// Default: no cap.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Look up the title and other metadata of catalog entries that have a
+    /// DOI and no title. Without `--dry-run` it looks them up and writes them.
+    BackfillTitles {
+        /// Report what would be looked up without contacting a provider or
+        /// writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Look up at most this many entries. Default: all.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<()> {
@@ -160,9 +167,6 @@ pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<
         PipelineCmd::PurgePoisoned { dry_run, yes } => {
             cmd_purge_poisoned(dry_run, yes, reporter).await
         }
-        PipelineCmd::PurgePoisonedChunks { dry_run, yes } => {
-            cmd_purge_poisoned_chunks(dry_run, yes, reporter).await
-        }
         PipelineCmd::ReapPhantoms { dry_run, yes } => {
             cmd_reap_phantoms(dry_run, yes, reporter).await
         }
@@ -172,6 +176,12 @@ pub async fn dispatch(cmd: PipelineCmd, reporter: &Arc<dyn Reporter>) -> Result<
             limit,
             reasons,
         } => cmd_reconvert_failed(dry_run, yes, limit, &reasons, reporter).await,
+        PipelineCmd::RepairCatalog { limit } => {
+            crate::maintain::repair_catalog::cmd(limit, reporter.as_ref()).await
+        }
+        PipelineCmd::BackfillTitles { dry_run, limit } => {
+            crate::maintain::backfill_titles::cmd(dry_run, limit, reporter.as_ref()).await
+        }
     }
 }
 
@@ -497,8 +507,8 @@ async fn cmd_rebuild(
             eprintln!();
             eprintln!(
                 "This will delete {} markdown objects, {} catalog YAMLs, \
-                 and drop the Qdrant collection ({} points across {} docs).",
-                inv.markdown_count, inv.catalog_count, inv.qdrant_points, inv.qdrant_docs
+                 and delete every indexed document ({} chunks across {} docs).",
+                inv.markdown_count, inv.catalog_count, inv.store_records, inv.store_docs
             );
             eprintln!(
                 "{} papers under `papers/` will be republished for re-ingestion.",
@@ -538,12 +548,12 @@ async fn cmd_rebuild(
 
     reporter.finish(&format!(
         "Pipeline rebuild queued — markdown_deleted={} \
-         catalog_deleted={} qdrant_deleted={} \
+         catalog_deleted={} store_deleted={} \
          papers_republished={} errors={} \
          (watch `hs status` for scribe + distill catch-up)",
         summary.markdown_deleted,
         summary.catalog_deleted,
-        summary.qdrant_deleted,
+        summary.store_deleted,
         summary.publish.published,
         summary.publish.errors.len()
     ));
@@ -577,7 +587,7 @@ async fn check_rebuild_inputs(storage: &dyn Storage, inv: &Inventory) -> Result<
 struct RebuildSummary {
     markdown_deleted: u64,
     catalog_deleted: u64,
-    qdrant_deleted: u64,
+    store_deleted: u64,
     publish: PublishOutcome,
 }
 
@@ -586,7 +596,7 @@ struct RebuildSummary {
 /// STOPS the run before the next, harder-to-undo step:
 ///
 /// 1. delete markdown, 2. delete catalog rows (derived state; vectors still
-///    searchable), 3. drop + recreate the Qdrant collection, 4. republish
+///    searchable), 3. delete every document from the store, 4. republish
 ///    `papers.ingested` for every source paper.
 ///
 /// A failure in 1-3 returns `Err` without republishing; `hs pipeline
@@ -603,13 +613,13 @@ async fn execute_rebuild(
     for (i, obj) in inv.markdown_objs.iter().enumerate() {
         if stop.requested() {
             anyhow::bail!(
-                "interrupted after deleting {markdown_deleted} markdown object(s); the Qdrant \
+                "interrupted after deleting {markdown_deleted} markdown object(s); the store \
                  collection is untouched. Re-run `hs pipeline rebuild` or `hs pipeline catch-up`"
             );
         }
         storage.delete(&obj.key).await.with_context(|| {
             format!(
-                "delete markdown {} (deleted {markdown_deleted} so far; Qdrant untouched)",
+                "delete markdown {} (deleted {markdown_deleted} so far; the store untouched)",
                 obj.key
             )
         })?;
@@ -627,14 +637,14 @@ async fn execute_rebuild(
         if stop.requested() {
             anyhow::bail!(
                 "interrupted after deleting {markdown_deleted} markdown object(s) and \
-                 {catalog_deleted} catalog row(s); the Qdrant collection is untouched. \
+                 {catalog_deleted} catalog row(s); the store is untouched. \
                  Re-run `hs pipeline rebuild` or `hs pipeline catch-up`"
             );
         }
         storage.delete(&obj.key).await.with_context(|| {
             format!(
                 "delete catalog {} (markdown already deleted; deleted {catalog_deleted} catalog \
-                 row(s) so far; Qdrant untouched)",
+                 row(s) so far; the store untouched)",
                 obj.key
             )
         })?;
@@ -647,11 +657,18 @@ async fn execute_rebuild(
         }
     }
 
-    reporter.status("Qdrant", "drop + recreate collection");
-    let qdrant_deleted = client.reset_collection().await.context(
-        "distill reset_collection (markdown and catalog are already deleted: fix distill, then \
-         run `hs pipeline catch-up`)",
-    )?;
+    reporter.status("Store", "delete every document");
+    // The papers' chunks and reference lists, then their abstracts: the
+    // catalog rows that stamped the abstracts are already gone.
+    let mut store_deleted = 0u64;
+    for store in [hs_common::stores::ACADEMIC, hs_common::stores::ABSTRACTS] {
+        store_deleted += client.reset_store(store).await.with_context(|| {
+            format!(
+                "distill reset of the {store} store (markdown and catalog are already deleted: \
+                 fix distill, then run `hs pipeline catch-up`)"
+            )
+        })?;
+    }
 
     let publish =
         publish_papers_ingested(bus, &inv.paper_keys, "hs pipeline rebuild", stop, reporter).await;
@@ -659,7 +676,7 @@ async fn execute_rebuild(
     Ok(RebuildSummary {
         markdown_deleted,
         catalog_deleted,
-        qdrant_deleted,
+        store_deleted,
         publish,
     })
 }
@@ -670,8 +687,8 @@ struct Inventory {
     markdown_count: u64,
     catalog_objs: Vec<hs_common::storage::ObjectMeta>,
     catalog_count: u64,
-    qdrant_docs: u64,
-    qdrant_points: u64,
+    store_docs: u64,
+    store_records: u64,
 }
 
 async fn inventory(storage: &Arc<dyn Storage>, client: &DistillClient) -> Result<Inventory> {
@@ -699,17 +716,17 @@ async fn inventory(storage: &Arc<dyn Storage>, client: &DistillClient) -> Result
 
     // A distill server that does not answer is an error here, not "0 docs":
     // the inventory is what the operator confirms against, and `rebuild`
-    // cannot reset the collection without distill anyway.
-    let qdrant_ids = client
-        .list_docs(u64::MAX)
+    // cannot reset the store without distill anyway.
+    let store_ids = client
+        .list_docs(hs_common::stores::ACADEMIC, u64::MAX)
         .await
         .context("list indexed documents via the distill server")?;
-    let qdrant_docs = qdrant_ids.len() as u64;
-    let qdrant_points = client
-        .status()
+    let store_docs = store_ids.len() as u64;
+    let store_records = client
+        .status(hs_common::stores::ACADEMIC)
         .await
         .context("read the distill server status")?
-        .points_count;
+        .records_count;
 
     Ok(Inventory {
         paper_keys,
@@ -717,8 +734,8 @@ async fn inventory(storage: &Arc<dyn Storage>, client: &DistillClient) -> Result
         markdown_count,
         catalog_objs,
         catalog_count,
-        qdrant_docs,
-        qdrant_points,
+        store_docs,
+        store_records,
     })
 }
 
@@ -727,8 +744,8 @@ fn print_summary(inv: &Inventory, reporter: &Arc<dyn Reporter>) {
     reporter.status("Markdown to delete", &format!("{}", inv.markdown_count));
     reporter.status("Catalog to delete", &format!("{}", inv.catalog_count));
     reporter.status(
-        "Qdrant to purge",
-        &format!("{} points / {} docs", inv.qdrant_points, inv.qdrant_docs),
+        "Store to purge",
+        &format!("{} chunks / {} docs", inv.store_records, inv.store_docs),
     );
     reporter.status("Papers to republish", &format!("{}", inv.paper_keys.len()));
 }
@@ -959,7 +976,7 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
     if !yes {
         let accept = Confirm::new()
             .with_prompt(format!(
-                "Delete {} interstitials (Qdrant points + markdown + source + catalog)?",
+                "Delete {} interstitials (stored chunks + markdown + source + catalog)?",
                 victims.len()
             ))
             .default(false)
@@ -970,7 +987,7 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
         }
     }
 
-    let mut qdrant_deleted = 0u64;
+    let mut store_deleted = 0u64;
     let mut md_deleted = 0u64;
     let mut cat_deleted = 0u64;
     let mut src_deleted = 0u64;
@@ -982,16 +999,17 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
             interrupted = true;
             break;
         }
-        // Qdrant first — if this fails, leaving the markdown/source/catalog
+        // The store first — if this fails, leaving the markdown/source/catalog
         // in place lets a retry hit the same victim again. The reverse
-        // (delete files first, fail Qdrant) leaves a phantom 1-chunk doc
-        // that the reconciler can never reach.
-        match client.delete_doc(&v.stem).await {
-            Ok(_) => qdrant_deleted += 1,
+        // (delete files first, fail the store) leaves a phantom 1-chunk doc
+        // that the reconciler can never reach. The abstract goes with the
+        // chunks: the catalog row that stamps it is deleted below.
+        match crate::distill_cmd::delete_paper_everywhere(&client, &v.stem).await {
+            Ok(_) => store_deleted += 1,
             Err(e) => {
                 // Leave this victim's markdown/source/catalog in place so a
                 // retry finds it again (see above).
-                errors.push(format!("qdrant/{}: {e}", v.stem));
+                errors.push(format!("store/{}: {e}", v.stem));
                 continue;
             }
         }
@@ -1011,7 +1029,7 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
         // legitimately have BOTH a poisoned HTML (the interstitial scribe
         // captured) AND a real downloaded PDF. The original implementation
         // broke after the first match and left orphan PDFs in S3 with no
-        // catalog/markdown/Qdrant — invisible to the pipeline and only
+        // catalog/markdown/store — invisible to the pipeline and only
         // recoverable via `catch-up`. Delete every matching extension.
         let mut src_hit = false;
         for ext in ["html", "htm", "pdf"] {
@@ -1045,7 +1063,7 @@ async fn cmd_purge_poisoned(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporte
     }
 
     reporter.finish(&format!(
-        "Purged interstitials — qdrant={qdrant_deleted} markdown={md_deleted} catalog={cat_deleted} source={src_deleted} errors={}",
+        "Purged interstitials — store={store_deleted} markdown={md_deleted} catalog={cat_deleted} source={src_deleted} errors={}",
         errors.len()
     ));
     fail_if_errors("pipeline purge-poisoned", &errors, interrupted)
@@ -1146,78 +1164,6 @@ async fn cmd_reap_phantoms(dry_run: bool, yes: bool, reporter: &Arc<dyn Reporter
         errors.len()
     ));
     fail_if_errors("pipeline reap-phantoms", &errors, interrupted)
-}
-
-async fn cmd_purge_poisoned_chunks(
-    dry_run: bool,
-    yes: bool,
-    reporter: &Arc<dyn Reporter>,
-) -> Result<()> {
-    let cfg = DistillClientConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let server_url = cfg.require_servers()?[0].clone();
-    let client = crate::distill_cmd::make_distill_client(&server_url).await?;
-
-    // First pass: dry-run scan so the user can see what would be deleted.
-    reporter.status("Scan", "Qdrant points for interstitial signatures");
-    let preview = client
-        .scrub_interstitials(true)
-        .await
-        .context("scrub-interstitials dry-run failed")?;
-
-    reporter.status(
-        "Scan complete",
-        &format!(
-            "{} points scanned, {} matched",
-            preview.total_scanned, preview.matched
-        ),
-    );
-    for s in preview.samples.iter().take(5) {
-        reporter.status(
-            "Sample",
-            &format!("{}  «{}…»", s.doc_id, s.excerpt.replace('\n', " ")),
-        );
-    }
-    if preview.samples.len() > 5 {
-        reporter.status(
-            "...",
-            &format!("+{} more samples", preview.samples.len() - 5),
-        );
-    }
-
-    if preview.matched == 0 {
-        reporter.finish("Nothing to scrub — no interstitial chunks found in Qdrant.");
-        return Ok(());
-    }
-
-    if dry_run {
-        reporter.finish("Dry-run complete — no Qdrant points deleted.");
-        return Ok(());
-    }
-
-    if !yes {
-        let accept = Confirm::new()
-            .with_prompt(format!(
-                "Delete {} interstitial chunks from Qdrant? (markdown / source / catalog are NOT touched)",
-                preview.matched
-            ))
-            .default(false)
-            .interact()?;
-        if !accept {
-            reporter.finish("Aborted — no state changed.");
-            return Ok(());
-        }
-    }
-
-    let report = client
-        .scrub_interstitials(false)
-        .await
-        .context("scrub-interstitials destructive call failed")?;
-
-    reporter.finish(&format!(
-        "Scrubbed Qdrant — scanned={} matched={} deleted={}",
-        report.total_scanned, report.matched, report.deleted
-    ));
-    Ok(())
 }
 
 /// Catalog rows stamped `conversion_failed`, as `(stem, reason)`.
@@ -1495,25 +1441,39 @@ mod tests {
         Arc::new(SilentReporter)
     }
 
-    /// A distill server that answers the inventory calls and logs `reset`.
+    /// Records the fake server says each store held when it is reset.
+    const ACADEMIC_RECORDS: u64 = 42;
+    const ABSTRACT_RECORDS: u64 = 3;
+
+    /// A distill server that answers the inventory calls and logs each
+    /// store's reset as `reset:<store>`.
     async fn distill(log: &Log, reset_status: u16) -> FakeServer {
         let log = Arc::clone(log);
         FakeServer::start(move |req| match (req.method.as_str(), req.path.as_str()) {
-            ("GET", p) if p.starts_with("/docs") => Response::json(
+            ("GET", p) if p.starts_with("/docs?store=academic") => Response::json(
                 200,
                 &serde_json::json!({"doc_ids": ["10.1_a", "10.1_b"], "truncated": false}),
             ),
-            ("GET", "/status") => Response::json(
+            ("GET", "/status?store=academic") => Response::json(
                 200,
                 &serde_json::json!({
-                    "collection": "academic_papers", "points_count": 42,
+                    "store": "academic", "records_count": ACADEMIC_RECORDS,
                     "documents_count": 2, "compute_device": "cuda"
                 }),
             ),
-            ("POST", "/collection/reset") => {
-                log.lock().push("reset".into());
+            ("POST", p) if p.starts_with("/store/reset?store=") => {
+                let store = p.trim_start_matches("/store/reset?store=");
+                log.lock().push(format!("reset:{store}"));
                 if reset_status == 200 {
-                    Response::json(200, &serde_json::json!({"deleted_points": 42}))
+                    let deleted = if store == hs_common::stores::ACADEMIC {
+                        ACADEMIC_RECORDS
+                    } else {
+                        ABSTRACT_RECORDS
+                    };
+                    Response::json(
+                        200,
+                        &serde_json::json!({"store": store, "deleted": deleted}),
+                    )
                 } else {
                     Response::json(reset_status, &serde_json::json!({"error": "boom"}))
                 }
@@ -1563,7 +1523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_deletes_derived_state_then_drops_qdrant_then_republishes() {
+    async fn rebuild_deletes_derived_state_then_empties_the_store_then_republishes() {
         let tmp = tempfile::tempdir().unwrap();
         seed(tmp.path(), true).await;
         let log = Log::default();
@@ -1598,28 +1558,32 @@ mod tests {
             .min(index_of(&events, "delete:catalog/cd/cdefgh.yaml"));
         let cat_last = index_of(&events, "delete:catalog/ab/abcdef.yaml")
             .max(index_of(&events, "delete:catalog/cd/cdefgh.yaml"));
-        let reset = index_of(&events, "reset");
+        let reset = index_of(&events, "reset:academic");
+        let reset_abstracts = index_of(&events, "reset:abstracts");
         let first_publish = events
             .iter()
             .position(|e| e.starts_with("publish:"))
             .unwrap();
         assert!(md < cat_first, "markdown before catalog: {events:?}");
         assert!(
-            cat_last < reset,
-            "catalog before the Qdrant drop: {events:?}"
+            cat_last < reset.min(reset_abstracts),
+            "catalog before the stores are emptied: {events:?}"
         );
-        assert!(reset < first_publish, "drop before republish: {events:?}");
+        assert!(
+            reset.max(reset_abstracts) < first_publish,
+            "drop before republish: {events:?}"
+        );
         assert_eq!(summary.markdown_deleted, 1);
         assert_eq!(summary.catalog_deleted, 2);
-        assert_eq!(summary.qdrant_deleted, 42);
+        assert_eq!(summary.store_deleted, ACADEMIC_RECORDS + ABSTRACT_RECORDS);
         assert_eq!(summary.publish.published, 2);
         assert!(summary.publish.errors.is_empty());
     }
 
-    /// The old order dropped the Qdrant collection FIRST, so a failing
+    /// The old order emptied the store FIRST, so a failing
     /// markdown/catalog delete left vectors gone and files in place.
     #[tokio::test]
-    async fn a_failed_delete_stops_the_rebuild_before_qdrant_is_touched() {
+    async fn a_failed_delete_stops_the_rebuild_before_the_store_is_touched() {
         for failing in ["markdown/ab/abcdef.md", "catalog/cd/cdefgh.yaml"] {
             let tmp = tempfile::tempdir().unwrap();
             seed(tmp.path(), true).await;
@@ -1647,7 +1611,7 @@ mod tests {
 
             let events = log.lock().clone();
             assert!(
-                !events.contains(&"reset".to_string()),
+                !events.iter().any(|e| e.starts_with("reset:")),
                 "{failing}: {events:?}"
             );
             assert!(
@@ -1659,14 +1623,14 @@ mod tests {
                 server
                     .requests()
                     .iter()
-                    .all(|r| r.path != "/collection/reset"),
-                "{failing}: the collection must not have been reset"
+                    .all(|r| !r.path.starts_with("/store/reset")),
+                "{failing}: no store may have been reset"
             );
         }
     }
 
     #[tokio::test]
-    async fn a_failed_qdrant_reset_fails_the_rebuild_and_publishes_nothing() {
+    async fn a_failed_store_reset_fails_the_rebuild_and_publishes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         seed(tmp.path(), true).await;
         let log = Log::default();
@@ -1716,7 +1680,7 @@ mod tests {
         assert!(log.lock().is_empty(), "no delete and no reset");
     }
 
-    /// `list_docs(..).unwrap_or_default()` showed 0 docs / 0 points while
+    /// `list_docs(..).unwrap_or_default()` showed 0 docs / 0 records while
     /// distill was down, and the operator confirmed against that.
     #[tokio::test]
     async fn inventory_fails_loudly_when_distill_is_unreachable() {

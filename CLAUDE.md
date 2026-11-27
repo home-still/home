@@ -5,7 +5,7 @@ Academic research engine: 211M+ vector search with OpenAlex + PMC OA + Qdrant.
 ## Non-negotiables
 
 - **ONE PATH per feature. No fallbacks. No legacy shims. No stub placeholders. No "backup" modes. No rollover behavior.** Every operation has exactly one execution path. When the primary path can't produce a usable result, **fail loudly** — don't write a degraded substitute to storage, don't emit silent defaults, don't stamp rows `conversion_failed: true` as a substitute for "we shouldn't have ingested this in the first place." Validate at system boundaries; reject bad input at the door. Two paths = magic results that take hours to trace. If you find a legacy/backup branch, delete it and make the primary right. Concrete anti-patterns this project has suffered from: `local-html` event-watch converter, `is_stub_pdf` silent-skip gate, `html_fallbacks` download path. Do not reintroduce any equivalent.
-- **Distill MUST run on CUDA.** Do not "fall back to CPU" for distill / embedding — not as a quick fix, not temporarily, not as a workaround. `compute_device: cuda` stays in `~/.home-still/config.yaml`. If CUDA is broken, fix CUDA (driver, `libonnxruntime_providers_cuda.so`, pyke-ort `~/.cache/ort.pyke.io/dfbin`, `LD_LIBRARY_PATH`) — don't flip the switch. CPU embedding is too slow to be useful at this corpus size and will silently degrade throughput/latency for every downstream consumer.
+- **Distill embedding MUST run 100 % on the GPU.** Embedding is ollama `bge-m3-8k:latest` (`bge-m3` with `num_batch 8192`; the model as pulled reads only 2,048 tokens of an input) behind the myelin store. `hs-distill-server` asks ollama where the model is resident (`/api/ps`: `size_vram` against `size`) and refuses to start, to report healthy or ready, or to index unless it is fully on the GPU. Do not "fall back to CPU" for distill / embedding — not as a quick fix, not temporarily, not as a workaround. If the GPU path is broken, fix ollama/CUDA (driver, free VRAM, ollama's CUDA libraries) — never move the model to CPU. CPU embedding is too slow to be useful at this corpus size and will silently degrade throughput/latency for every downstream consumer.
 
 ## Working Style
 
@@ -52,15 +52,17 @@ cargo check -p pdf-mash            # Check pdf-mash
 
 ## MCP tools — citation graph
 
-- `paper_references(doi)` — return the structured reference list of a paper by DOI.
-- `paper_citations(doi, limit?, year_from?, sort?)` — return the list of papers
-  that cite a given DOI. Default limit 100, max 1000. Sort by `year` (default)
-  or `citations`.
+- `graph(doi, direction, source, limit?, year_from?, sort?)` — step along the
+  citation graph from a DOI. `direction` is `references` or `citations`;
+  `source` is `semantic_scholar` or `openalex` (the local corpus). Default
+  limit 100, max 1000. Sort by `year` (default) or `citations`.
 
-Both tools call the Semantic Scholar Graph API and reuse the same HTTP client,
-auth, and 429-retry path as `paper_search` / `paper_get` (see
-`paper/src/providers/semantic_scholar.rs`). They are forward-chaining
-primitives for the `home-still-bridge` snowballing skill. The live integration
+With `source: "semantic_scholar"` the tool calls the Semantic Scholar Graph API
+and reuses the same HTTP client, auth, and 429-retry path as `discover` (see
+`paper/src/providers/semantic_scholar.rs`). It is the forward-chaining
+primitive for the `home-still-bridge` snowballing skill. The live integration
 test (`citation_graph_live_attention_is_all_you_need`) is `#[ignore]` — run
 with `cargo test -p paper -- --ignored citation_graph_live`.
+
+The whole tool surface (ten tools) is in `docs/reference/mcp-tools.md`.
 

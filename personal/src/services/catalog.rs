@@ -67,9 +67,9 @@ fn word_boxes_key(prefix: &str, stem: &str) -> Result<String> {
     Ok(hs_common::word_boxes::boxes_key(layout, stem))
 }
 
-/// Documents in the store, most recently ingested first (the order the MCP
-/// `personal_list` tool promises), at most `limit` of them. `category` is
-/// checked against the store's taxonomy (see [`Config::resolve_category`]).
+/// Documents in the store, most recently ingested first, at most `limit` of
+/// them. `category` is checked against the store's taxonomy (see
+/// [`Config::resolve_category`]).
 pub async fn list_entries(
     cfg: &Config,
     category: Option<&str>,
@@ -78,9 +78,7 @@ pub async fn list_entries(
     let category = category.map(|c| cfg.resolve_category(c)).transpose()?;
     let storage = cfg.build_storage().map_err(storage_error)?;
     let mut found: Vec<(Option<String>, ListEntry)> = Vec::new();
-    for key in sidecar_keys(&*storage, &cfg.storage_dir).await? {
-        let stem = sidecar_stem(&key);
-        let entry = read_sidecar(&*storage, &key).await?;
+    for (stem, entry) in list_cards(&*storage, &cfg.storage_dir).await? {
         if let Some(cat) = category {
             let matches = entry
                 .category
@@ -108,6 +106,24 @@ pub async fn list_entries(
         .take(limit)
         .map(|(_, entry)| entry)
         .collect())
+}
+
+/// Every document's stem and catalog card, in stem-key order.
+///
+/// The personal store keeps each card beside its document, so the cards
+/// are found by walking `prefix`, the store's source prefix. A card that
+/// cannot be read or parsed fails the listing: a list that silently left a
+/// document out would read as "that document is not here".
+pub async fn list_cards(
+    storage: &dyn Storage,
+    prefix: &str,
+) -> Result<Vec<(String, CatalogEntry)>> {
+    let mut cards = Vec::new();
+    for key in sidecar_keys(storage, prefix).await? {
+        let entry = read_sidecar(storage, &key).await?;
+        cards.push((sidecar_stem(&key), entry));
+    }
+    Ok(cards)
 }
 
 /// Every catalog sidecar's key, under `prefix`.

@@ -32,7 +32,7 @@ Every command accepts these flags, before or after the subcommand.
 | `--verbose` | off | Show debug-level output. |
 | `-y`, `--yes` | off | Skip interactive prompts and assume yes. |
 
-A few commands define their own flag with the same name, and the local flag replaces the global one on that command: `--yes` on `hs pipeline rebuild`, `hs pipeline purge-skipped`, `hs pipeline purge-poisoned`, `hs pipeline reap-phantoms`, `hs pipeline purge-poisoned-chunks`, `hs pipeline reconvert-failed` and `hs distill hnsw enable` (long form only, no `-y`), and `--verbose` on `hs distill diagnose`.
+A few commands define their own flag with the same name, and the local flag replaces the global one on that command: `--yes` on `hs pipeline rebuild`, `hs pipeline purge-skipped`, `hs pipeline purge-poisoned`, `hs pipeline reap-phantoms` and `hs pipeline reconvert-failed` (long form only, no `-y`), and `--verbose` on `hs distill diagnose`.
 
 Secrets in `~/.home-still/secrets.env` are exported into the environment before any command runs; a secrets file that cannot be read stops the command with exit code 2.
 
@@ -74,6 +74,7 @@ hs scribe [OPTIONS] <COMMAND>
 | `hs scribe catalog-backfill` | Create catalog entries for markdown files in `scribe.output_dir` that have none. |
 | `hs scribe reconvert` | Clear a document's conversion stamps and derived artifacts, then republish `papers.ingested` so the watcher converts it again. |
 | `hs scribe boxes` | Word-box sidecars: where every word of a PDF sits on its page, which is what lets a quotation be highlighted in the document it is from. |
+| `hs scribe queue` | Announce that one stored source needs converting: publish `papers.ingested` so the scribe watcher converts it. |
 
 The conversion commands read the `scribe:` section; the watchers and `hs scribe boxes` also need `storage:` and `events:`. See [configuration](configuration.md).
 
@@ -125,7 +126,7 @@ hs scribe watch-events [OPTIONS]
 
 Runs until stopped. It needs `storage:`, `events:` (a NATS backend) and `scribe.servers`, and it refuses to start on a host where libpdfium cannot be bound. It reads two queues side by side.
 
-Conversions (`papers.ingested`): servers are grouped into tiers by `backend`, in `scribe.servers` order; a paper goes to the first tier and falls through to the next when a backend-class failure occurs. Within a tier the least-loaded server takes the paper. A tier converts at most the sum of its servers' `concurrency` at once. When a PDF's markdown is stored, the watcher publishes `scribe.boxes` for it.
+Conversions (`papers.ingested`): the source's key says which store it belongs to (`papers/` is the `academic` store's prefix, and each other store has its own), and the markdown and the catalog entry are stored in that store. A key under no store's prefix, and a file type the store does not take, are refused for good. A `.md` or `.txt` source is not sent to a server: its text is stored as the markdown, with its line endings made `\n`; it must be UTF-8 and at most 16 MiB. For the other types, servers are grouped into tiers by `backend`, in `scribe.servers` order; a paper goes to the first tier and falls through to the next when a backend-class failure occurs. Within a tier the least-loaded server takes the paper. A tier converts at most the sum of its servers' `concurrency` at once. When a PDF's markdown is stored, the watcher publishes `scribe.boxes` for it.
 
 Word boxes (`scribe.boxes`): the watcher reads the PDF from storage, posts it to a scribe server's `/scribe/boxes`, checks that the sidecar it gets back was built from those bytes, and stores it under the store's `boxes/` prefix. The servers in `scribe.servers` take the requests in turn, whatever their tier, and as many requests run at once as there are servers; when a server cannot answer, the next is tried. A request for a key that is not where a store keeps a PDF, or for a PDF no server can read, is dropped with the reason logged. Any other failure is retried until `events.nats.max_deliver` deliveries are used up; `hs scribe boxes status` shows what is still missing and `hs scribe boxes catch-up` queues it again.
 
@@ -286,7 +287,7 @@ hs scribe reconvert [OPTIONS] <STEM>
 Resets one document so the watcher converts it again. The steps, in order:
 
 1. Validate the stem, read its catalog entry, and find its source (`.pdf`, `.html`, `.htm` or `.epub`) under `papers/`.
-2. When the document has an embedding or an embedding-skip stamp, delete its Qdrant chunks through the distill server. A failure here stops the command before anything else changes.
+2. When the document has an embedding or an embedding-skip stamp, delete its records from its store through the distill server. A failure here stops the command before anything else changes.
 3. Delete the markdown object.
 4. Clear the `conversion`, `conversion_failed`, `embedding` and `embedding_skip` stamps.
 5. Publish `papers.ingested` for the source.
@@ -297,6 +298,26 @@ Example:
 
 ```bash
 hs scribe reconvert 10.48550_arxiv.2312.10997
+```
+
+### `hs scribe queue`
+
+Announce that one stored source needs converting.
+
+```text
+hs scribe queue [OPTIONS] <STEM>
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `<STEM>` | required | Catalog stem (no extension), e.g. `10.48550_arxiv.2312.10997`. |
+
+Looks for the stem's source (`.pdf`, `.html` or `.epub`) in the `academic` store and publishes `papers.ingested` for it, so the scribe watcher converts it. It converts nothing itself, and a stem with no stored source is an error that names every key tried and publishes nothing. It needs `storage:` and an `events:` section, and fails when the event bus is not reachable. On success it prints a JSON report with `stem`, `source_key`, `queued` and a hint for what to run next. Unlike `hs scribe reconvert`, it clears nothing: it is for a source that was stored and never announced.
+
+Example:
+
+```bash
+hs scribe queue 10.48550_arxiv.2312.10997
 ```
 
 ### `hs scribe boxes`
@@ -532,13 +553,13 @@ hs personal [OPTIONS] <COMMAND>
 |---|---|
 | `hs personal add` | Ingest a single file into the personal store. |
 | `hs personal list` | List ingested documents, most recently ingested first. |
-| `hs personal search` | Semantic search across the personal collection. |
+| `hs personal search` | Semantic search across the `personal` store. |
 | `hs personal read` | Read a document's converted markdown by stem. |
-| `hs personal delete` | Remove a document from Qdrant and disk. |
-| `hs personal reindex` | Re-chunk and re-embed a document. Useful after chunker/embedder changes. |
+| `hs personal delete` | Remove a document from the `personal` store and disk. |
+| `hs personal reindex` | Re-chunk and re-embed a document. Useful after the chunker changes. |
 | `hs personal config` | View configuration. |
 
-The personal store is a separate collection from the academic corpus; see [configuration](configuration.md) for the `personal:` section.
+The personal documents are a store of their own, `personal`, apart from the `academic` store; see [configuration](configuration.md) for the `personal:` section.
 
 Example:
 
@@ -592,7 +613,7 @@ hs personal list --category medical -n 20
 
 ### `hs personal search`
 
-Semantic search across the personal collection.
+Semantic search across the `personal` store.
 
 ```text
 hs personal search [OPTIONS] <QUERY>
@@ -630,7 +651,7 @@ hs personal read lab-results
 
 ### `hs personal delete`
 
-Remove a document from Qdrant and disk.
+Remove a document from the `personal` store and disk.
 
 ```text
 hs personal delete [OPTIONS] <STEM>
@@ -640,7 +661,7 @@ hs personal delete [OPTIONS] <STEM>
 |---|---|---|
 | `<STEM>` | required | Document stem. |
 
-Removes the document from Qdrant and from disk, with its word boxes. The command has no confirmation prompt and no dry run.
+Removes the document's records from the `personal` store and the document from disk, with its word boxes. The command has no confirmation prompt and no dry run.
 
 Example:
 
@@ -650,7 +671,7 @@ hs personal delete lab-results
 
 ### `hs personal reindex`
 
-Re-chunk and re-embed a document. Useful after chunker/embedder changes.
+Re-chunk and re-embed a document. Useful after the chunker changes, or to fill an empty index.
 
 ```text
 hs personal reindex [OPTIONS] <STEM>
@@ -727,17 +748,17 @@ hs distill [OPTIONS] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `hs distill init` | Set up Qdrant and distill server environment. |
-| `hs distill index` | Index markdown files into Qdrant through the distill server. |
+| `hs distill index` | Index markdown files into the `academic` store through the distill server. |
 | `hs distill search` | Semantic search across indexed documents. |
-| `hs distill hnsw` | Manage HNSW indexing of the Qdrant collections. |
-| `hs distill status` | Show distill system status (Qdrant, server, collection). |
+| `hs distill status` | Show distill system status (server, backend, the `academic` store). |
 | `hs distill watch-events` | Consume `scribe.completed` events from the event bus and index each markdown object through the distill server. |
 | `hs distill diagnose` | Explain why a stem produces or does not produce chunks: fetch its markdown, run the chunker and quality filter, and print the accept or reject reason for each chunk. |
-| `hs distill reconcile` | Compare the markdown objects, the Qdrant index and the catalog, and optionally repair the differences. |
-| `hs distill backfill-titles` | Write the catalog's title onto the Qdrant points of documents that were indexed without one. |
-| `hs distill purge` | Delete every Qdrant chunk for a `doc_id`. |
-| `hs distill abstracts` | Manage the `paper_abstracts` collection, which holds one embedding per paper built from its title and abstract. |
+| `hs distill reconcile` | Compare the markdown objects, the `academic` store and the catalog, and optionally repair the differences. |
+| `hs distill reindex` | Index documents of the `academic` store again from their stored markdown and catalog entry, replacing their records in place. |
+| `hs distill backfill` | Index the converted documents that were never embedded. |
+| `hs distill scan-repetitions` | Report stored markdown that the repetition cleaner would cut heavily. |
+| `hs distill purge` | Delete every stored chunk for a `doc_id`. |
+| `hs distill abstracts` | Manage the `abstracts` store, which holds one record per paper built from its title and abstract. |
 
 The distill commands talk to the distill server named by `distill.servers` and read `storage:`; the watcher also needs `events:`. See [configuration](configuration.md).
 
@@ -747,29 +768,9 @@ Example:
 hs distill --help
 ```
 
-### `hs distill init`
-
-Set up Qdrant and distill server environment.
-
-```text
-hs distill init [OPTIONS]
-```
-
-| Name | Default | Meaning |
-|---|---|---|
-| `--force` | off | Re-create compose config even if it exists. |
-
-Checks whether Qdrant answers at the address in `distill_server.qdrant_url`. When it does and `--force` is absent, nothing is created. Otherwise the command needs Docker or Podman, writes `~/.home-still/docker-compose-distill.yml` for Qdrant, starts it, and waits for its health endpoint. It then reports whether the `hs-distill-server` binary is installed.
-
-Example:
-
-```bash
-hs distill init
-```
-
 ### `hs distill index`
 
-Index markdown files into Qdrant through the distill server.
+Index markdown files into the `academic` store through the distill server.
 
 ```text
 hs distill index [OPTIONS]
@@ -803,61 +804,21 @@ hs distill search [OPTIONS] <QUERY>
 | `-l`, `--limit <LIMIT>` | `10` | Number of results. |
 | `--year <YEAR>` | none | Filter by year (e.g., ">2020"). |
 | `--topic <TOPIC>` | none | Filter by topic. |
+| `--store <NAME>` | none | Store to search: `academic`, `abstracts`, `references`, `personal`, `web` or `syntheses`. Repeat the flag to search several. Without it the server searches its default stores, which is `academic`. |
 | `--server <SERVER>` | none | Override server URL. |
 
-Prints ranked chunks with title, authors, year, page and a text preview. `--output json` prints the hits as one JSON array; `--output ndjson` prints one hit per line. An empty query is an error.
+Prints ranked chunks with title, authors, year, the store and document each one is from, its lines and page, and a text preview. `--output json` prints the hits as one JSON array; `--output ndjson` prints one hit per line. An empty query is an error, and so is a store the server does not have.
 
 Example:
 
 ```bash
 hs distill search "attention mechanisms" --year ">2020" --limit 5
-```
-
-### `hs distill hnsw`
-
-Manage HNSW indexing of the Qdrant collections.
-
-```text
-hs distill hnsw [OPTIONS] <COMMAND>
-```
-
-| Command | Description |
-|---|---|
-| `hs distill hnsw enable` | Enable HNSW on a configured collection. Starts a background whole-collection index build on the Qdrant host: requires --yes. |
-
-HNSW indexing builds a graph over a whole collection on the Qdrant host.
-
-Example:
-
-```bash
-hs distill hnsw --help
-```
-
-### `hs distill hnsw enable`
-
-Enable HNSW on a configured collection. Starts a background whole-collection index build on the Qdrant host: requires --yes.
-
-```text
-hs distill hnsw enable [OPTIONS] --collection <COLLECTION>
-```
-
-| Name | Default | Meaning |
-|---|---|---|
-| `--collection <COLLECTION>` | required | Collection name (the server accepts only configured collections). |
-| `--yes` | off | Confirm starting the background index build. Without it the command prints what it would do and exits non-zero. Long form only: `-y` is not accepted here. |
-| `--server <SERVER>` | none | Override server URL. |
-
-The server accepts only collections named in its configuration. Without `--yes` the command describes the build and exits non-zero without submitting it. When HNSW is already enabled on the collection, nothing is submitted. The server rejects requests without the right `HS_BACKEND_TOKEN` with a 401.
-
-Example:
-
-```bash
-hs distill hnsw enable --collection academic_papers --yes
+hs distill search "transformer architectures survey" --store abstracts
 ```
 
 ### `hs distill status`
 
-Show distill system status (Qdrant, server, collection).
+Show distill system status (server, backend, the `academic` store).
 
 ```text
 hs distill status [OPTIONS]
@@ -867,7 +828,7 @@ hs distill status [OPTIONS]
 |---|---|---|
 | `--server <SERVER>` | none | Override server URL. |
 
-Prints Qdrant, server and collection state.
+Prints the server's state, then the `academic` store's chunk count and the device the embedding model runs on.
 
 Example:
 
@@ -888,6 +849,8 @@ hs distill watch-events [OPTIONS]
 | `--server <SERVER>` | none | Override server URL. |
 
 Runs until stopped. It needs `storage:`, `events:` and `distill.servers`; the first server in `distill.servers` is used unless you pass `--server`. Before it pulls an event, it checks that the server accepts its `HS_BACKEND_TOKEN`. Run it as a service with `hs serve distill-watch --install`.
+
+Each event names its store: the document is indexed into that store and its catalog entry there is stamped. An event that names no store, a store that keeps no documents of its own, or a key that is not that store's markdown key for the document is dropped and is not delivered again.
 
 Example:
 
@@ -918,7 +881,7 @@ hs distill diagnose 10.48550_arxiv.2312.10997 --verbose
 
 ### `hs distill reconcile`
 
-Compare the markdown objects, the Qdrant index and the catalog, and optionally repair the differences.
+Compare the markdown objects, the `academic` store and the catalog, and optionally repair the differences.
 
 ```text
 hs distill reconcile [OPTIONS]
@@ -926,11 +889,11 @@ hs distill reconcile [OPTIONS]
 
 | Name | Default | Meaning |
 |---|---|---|
-| `--fix-stamps` | off | Backfill missing `embedding` stamps for docs already in Qdrant. |
-| `--reembed` | off | Re-index markdown that never reached Qdrant. |
+| `--fix-stamps` | off | Backfill missing `embedding` stamps for docs already in the store. |
+| `--reembed` | off | Re-index markdown that never reached the store. |
 | `--server <SERVER>` | none | Override server URL. |
 
-Without flags the command only reports counts and examples: the documents that are `ok`, those missing their `embedding` stamp (embedded but unstamped), and those whose markdown never reached Qdrant. `--fix-stamps` writes the missing stamps. `--reembed` re-indexes the markdown that never reached Qdrant. The command lists every markdown object, every indexed `doc_id` and every catalog entry, so it takes time on a large corpus.
+Without flags the command only reports counts and examples: the documents that are `ok`, those missing their `embedding` stamp (embedded but unstamped), and those whose markdown never reached the store. `--fix-stamps` writes the missing stamps. `--reembed` re-indexes the markdown that never reached the store. The command lists every markdown object, every indexed `doc_id` and every catalog entry, so it takes time on a large corpus.
 
 Example:
 
@@ -938,30 +901,79 @@ Example:
 hs distill reconcile --fix-stamps
 ```
 
-### `hs distill backfill-titles`
+### `hs distill reindex`
 
-Write the catalog's title onto the Qdrant points of documents that were indexed without one.
+Index documents of the `academic` store again from their stored markdown and catalog entry, replacing their records in place.
 
 ```text
-hs distill backfill-titles [OPTIONS]
+hs distill reindex [OPTIONS] [STEMS]...
 ```
 
 | Name | Default | Meaning |
 |---|---|---|
-| `--apply` | off | Write the titles. Without this, report what would change. |
+| `[STEMS]...` | none | Stems of the documents to index again. Required unless `--all` is given. |
+| `--all` | off | Index every document that has markdown. |
+| `--older-than <TIME>` | none | With `--all`, leave out the documents indexed at or after this time (RFC 3339). |
+| `--concurrency <CONCURRENCY>` | `1` | How many documents are indexed at once. |
 | `--server <SERVER>` | none | Override server URL. |
 
-A document's title is copied from its catalog entry into the Qdrant payload when it is indexed, so a document indexed before its catalog entry existed has no title there. This command is a payload update: the vectors are untouched and no GPU or embedding model is needed. Documents the catalog does not know are reported as untitled and never given a placeholder. Without `--apply` it reports what would change.
+A document's new records are written before its earlier ones are deleted, so it stays searchable throughout. Each document's catalog entry is read again, which picks up corrected metadata, and its `embedding` stamp is written again. A document that fails is reported and counted and keeps the records and the stamp it had; the others still run, and the command exits non-zero.
+
+Use `--all` after an upgrade that changes what a record carries. A run over a large store takes hours: to continue one that stopped, pass the time it began as `--older-than`, and the documents it already indexed are left out. A document the catalog marks with a failed index attempt is never left out.
 
 Example:
 
 ```bash
-hs distill backfill-titles --apply
+hs distill reindex --all --older-than 2026-01-31T00:00:00Z
+```
+
+### `hs distill backfill`
+
+Index the converted documents that were never embedded.
+
+```text
+hs distill backfill [OPTIONS]
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `--dry-run` | off | Report what would be indexed without sending anything to the server or writing anything. |
+| `--limit <LIMIT>` | none | Index at most this many documents. Without it, all of them. |
+| `--retry-skipped` | off | Also index documents whose last indexing found nothing to index. |
+| `--server <SERVER>` | none | Override server URL. |
+
+A document is a candidate when its catalog entry has a conversion stamp, no embedding stamp with chunks, and no record that indexing found nothing to index (unless `--retry-skipped` is given). The command indexes the candidates one at a time into the `academic` store and stamps each catalog entry; the JSON report has `candidates`, `indexed`, `still_skipped` (indexed with no chunks), `errors` (one line for each document that could not be indexed or stamped), up to ten `samples` and `dry_run: false`. With `--dry-run` it sends nothing and writes nothing, and the report has `candidates`, `would_index`, `samples` and `dry_run: true`. The command exits with an error when `errors` is not empty, after printing the report. `hs distill reconcile --reembed` also indexes unembedded documents, and it compares the store as well; `hs distill reindex` indexes documents again whether or not they were embedded.
+
+Example:
+
+```bash
+hs distill backfill --dry-run --limit 100
+```
+
+### `hs distill scan-repetitions`
+
+Report stored markdown that the repetition cleaner would cut heavily.
+
+```text
+hs distill scan-repetitions [OPTIONS]
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `--limit <LIMIT>` | `100000` | Scan at most this many documents. |
+| `--threshold <THRESHOLD>` | `20` | Report documents cut more than this many times. |
+
+A converter that loops writes the same words again and again. The command runs the repetition cleaner over each stored markdown document of the `academic` store in memory and reports the documents it would cut more than `--threshold` times. The JSON report has `scanned`, `threshold`, `flagged_count` and `flagged`; each flagged document has its `stem`, its storage `key`, `truncations`, the count for each cleaning pass in `truncations_by_pass` and an `offending_snippet` where the cleaned text first differs. The command changes nothing. It stops with an error naming the document when one cannot be read or is not UTF-8.
+
+Example:
+
+```bash
+hs distill scan-repetitions --threshold 50
 ```
 
 ### `hs distill purge`
 
-Delete every Qdrant chunk for a `doc_id`.
+Delete every stored chunk for a `doc_id`.
 
 ```text
 hs distill purge [OPTIONS] <DOC_ID>
@@ -969,10 +981,10 @@ hs distill purge [OPTIONS] <DOC_ID>
 
 | Name | Default | Meaning |
 |---|---|---|
-| `<DOC_ID>` | required | doc_id whose chunks should be deleted from Qdrant. |
+| `<DOC_ID>` | required | doc_id whose chunks should be deleted. |
 | `--server <SERVER>` | none | Override server URL. |
 
-The command is CLI-only because it is a destructive write. It has no dry run and no confirmation prompt: it asks the distill server to delete the chunks and prints how many were deleted. The markdown, the source and the catalog entry are not touched.
+The command is CLI-only because it is a destructive write. It has no dry run and no confirmation prompt: it asks the distill server to delete the document's chunks from the `academic` store, and its reference lists with them, and prints how many were deleted. The markdown, the source, the catalog entry and the paper's record in the `abstracts` store are not touched.
 
 Example:
 
@@ -982,7 +994,7 @@ hs distill purge 10.48550_arxiv.2312.10997
 
 ### `hs distill abstracts`
 
-Manage the `paper_abstracts` collection, which holds one embedding per paper built from its title and abstract.
+Manage the `abstracts` store, which holds one record per paper built from its title and abstract.
 
 ```text
 hs distill abstracts [OPTIONS] <COMMAND>
@@ -990,7 +1002,7 @@ hs distill abstracts [OPTIONS] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `hs distill abstracts build` | Embed the title and abstract of every catalog entry into `paper_abstracts` and stamp the catalog. |
+| `hs distill abstracts build` | Embed the title and abstract of every catalog entry into the `abstracts` store and stamp the catalog. |
 | `hs distill abstracts reconcile` | Embed only the catalog entries that have no `abstract_embed` stamp. |
 | `hs distill abstracts status` | Report abstract coverage from the catalog stamps, broken down by source. |
 
@@ -1002,7 +1014,7 @@ hs distill abstracts --help
 
 ### `hs distill abstracts build`
 
-Embed the title and abstract of every catalog entry into `paper_abstracts` and stamp the catalog.
+Embed the title and abstract of every catalog entry into the `abstracts` store and stamp the catalog.
 
 ```text
 hs distill abstracts build [OPTIONS]
@@ -1051,7 +1063,7 @@ hs distill abstracts status [OPTIONS]
 
 The command takes no arguments or flags of its own.
 
-Reads only the catalog, never Qdrant, so it is safe to run while the indexer is busy. It prints the catalog size, the number of stamped entries by source (`openalex`, `catalog`, `markdown`, `title_only`) and the number of unstamped entries.
+Reads only the catalog, never the store, so it is safe to run while the indexer is busy. It prints the catalog size, the number of stamped entries by source (`openalex`, `catalog`, `markdown`, `title_only`) and the number of unstamped entries.
 
 Example:
 
@@ -1092,7 +1104,7 @@ hs docs link [OPTIONS] <STEM>
 |---|---|---|
 | `<STEM>` | required | The document's stem. |
 | `--markdown` | off | Link to the converted markdown instead of the original document. |
-| `--collection <COLLECTION>` | `academic` | Store the document is in: `academic`, `personal`, `web` or `syntheses`. A name that is not a store is refused. The store is part of the link's signature. |
+| `--collection <COLLECTION>` | `academic` | The store the document is in (the flag keeps its name): `academic`, `personal`, `web` or `syntheses`. A name that is not a store is refused. The store is part of the link's signature. |
 | `--page <PAGE>` | none | The page to open, 1-based. The link opens that page and points at it. |
 | `--subject <SUBJECT>` | none | Subject the link is bound to. Default: `docs.default_subject`, else this machine's host name. |
 | `--ttl-secs <TTL_SECS>` | none | Seconds the link works. Default: `docs.link_ttl_secs`, else 3600. |
@@ -1149,7 +1161,7 @@ hs restart [OPTIONS]
 
 The command takes no arguments or flags of its own.
 
-Discovers the units that run this host's home-still binaries (systemd system units, systemd user units and launchd agents), matches them by the executable they run, and restarts them. It also restarts the distill index daemon and the managed compose containers, and exits non-zero when any restart failed. One-shot timer jobs are left alone.
+Discovers the units that run this host's home-still binaries (systemd system units, systemd user units and launchd agents), matches them by the executable they run, and restarts them. It also restarts the distill index daemon and the scribe compose containers (`~/.home-still/docker-compose.yml`, when `scribe.local_server` is on), and exits non-zero when any restart failed. One-shot timer jobs are left alone.
 
 Example:
 
@@ -1171,9 +1183,9 @@ hs upgrade [OPTIONS]
 | `--force` | off | Force reinstall even if already on the latest version. |
 | `--pre` | off | Include pre-release versions (e.g. rc candidates). |
 
-The command fetches the latest release from GitHub, asks for confirmation (skipped by `--yes`), and resolves every download and checksum before it changes anything. It then updates the managed Docker services, replaces the installed binaries with `hs` last, restarts the services that run the replaced binaries, and waits for them to answer their health endpoints.
+The command fetches the latest release from GitHub, asks for confirmation (skipped by `--yes`), and resolves every download and checksum before it changes anything. It then updates the scribe compose stack, replaces the installed binaries with `hs` last, restarts the services that run the replaced binaries, and waits for them to answer their health endpoints.
 
-The companion binaries `hs-distill-server`, `hs-gateway`, `hs-mcp` and `hs-scribe-server` are upgraded only when already installed on the host. For each managed compose file the command pulls the images and recreates the containers only when an image changed or the service does not answer its health URL; an unchanged, healthy service keeps running. Without `--pre`, only stable releases are considered.
+The companion binaries `hs-distill-server`, `hs-gateway`, `hs-mcp` and `hs-scribe-server` are upgraded only when already installed on the host. For the scribe compose stack (`~/.home-still/docker-compose.yml`, when `scribe.local_server` is on) the command pulls the images and recreates the containers only when an image changed or the service does not answer its health URL; an unchanged, healthy service keeps running. It does not manage myelin or its Qdrant, and it waits for no database after the restart. Without `--pre`, only stable releases are considered.
 
 Example:
 
@@ -1195,7 +1207,7 @@ hs serve [OPTIONS] <COMMAND>
 | `hs serve distill` | Run a distill server (auto-init, foreground). |
 | `hs serve mcp` | Run an MCP server (foreground). |
 | `hs serve scribe-watch` | NATS event-watch daemon that converts `papers.ingested` events into markdown via the scribe pool. Runs as a user-level service. |
-| `hs serve distill-watch` | NATS event-watch daemon that indexes `scribe.completed` events into Qdrant via the distill server. Runs as a user-level service. |
+| `hs serve distill-watch` | NATS event-watch daemon that indexes `scribe.completed` events into the myelin store via the distill server. Runs as a user-level service. |
 | `hs serve docs` | Run the docs service: serves the corpus's documents over signed, expiring links. |
 
 `hs serve` runs a service in the foreground, installs it as a service, or starts and stops it in the background. The ports are listed in [services and ports](services-and-ports.md).
@@ -1243,16 +1255,16 @@ hs serve distill [OPTIONS] [ACTION]
 
 | Name | Default | Meaning |
 |---|---|---|
-| `<ACTION>` | none | `start` runs Qdrant and the distill server in the background, `stop` stops them. Without it the server runs in the foreground. |
+| `<ACTION>` | none | `start` runs the distill server in the background, `stop` stops it. Without it the server runs in the foreground. |
 | `--port <PORT>` | `7434` | Port the foreground server and the installed service listen on. `start` and `stop` use `distill_server.port` from the configuration instead. |
 | `--install` | off | Install as a system service and start it. |
 | `--uninstall` | off | Stop and remove the system service. |
 
-In the foreground the command first checks the prerequisites (Qdrant reachable or started, as `hs distill init` does), then runs the `hs-distill-server` binary on the given port. The distill server requires CUDA; a build without the `cuda` feature does not compile.
+In the foreground the command runs the `hs-distill-server` binary on the given port. The server needs a myelin server at `distill_server.myelin_url` and Ollama at `distill_server.ollama_url`; it stops at start-up when myelin refuses one of its [stores](configuration.md#stores), and answers 503 on `/health` until the embedding model is on the GPU.
 
 `--install` writes the system unit `hs-serve-distill.service` (Linux, using `sudo`) or the LaunchAgent `com.home-still.distill` (macOS), enables it and starts it. `--uninstall` removes it.
 
-`start` starts Qdrant through `~/.home-still/docker-compose-distill.yml` when that file exists (otherwise Qdrant must already be reachable), stops any distill server recorded in the PID file, starts `hs-distill-server` in the background with its output in `distill-server.log` under the log directory, waits up to 300 seconds for `/health`, and starts the indexing daemon. `stop` stops the server process and, when the compose file exists, `down`s the Qdrant container.
+`start` stops any distill server recorded in the PID file, starts `hs-distill-server` in the background with its output in `distill-server.log` under the log directory, waits up to 300 seconds for `/health`, and starts the indexing daemon. It starts no database: myelin and Ollama must already be running. `stop` stops the server process.
 
 Example:
 
@@ -1305,7 +1317,7 @@ hs serve scribe-watch --install
 
 ### `hs serve distill-watch`
 
-NATS event-watch daemon that indexes `scribe.completed` events into Qdrant via the distill server. Runs as a user-level service.
+NATS event-watch daemon that indexes `scribe.completed` events into the myelin store via the distill server. Runs as a user-level service.
 
 ```text
 hs serve distill-watch [OPTIONS]
@@ -1339,7 +1351,7 @@ hs serve docs [OPTIONS]
 | `--install-user` | off | Install as a user service and start it. |
 | `--uninstall` | off | Stop and remove the service. |
 
-In the foreground the command serves the corpus's documents on `0.0.0.0:<port>` over signed, expiring links. It requires a `storage:` section, creates the link signing key on first use (mode 0600, never overwritten), and reads the revocation list the gateway also reads, so revoking a device revokes its links. It serves the academic collection and the personal store when its objects are in storage.
+In the foreground the command serves the corpus's documents on `0.0.0.0:<port>` over signed, expiring links. It requires a `storage:` section, creates the link signing key on first use (mode 0600, never overwritten), and reads the revocation list the gateway also reads, so revoking a device revokes its links. It serves the documents of every store (`academic`, `personal`, `web`, `syntheses`) whose objects are in storage.
 
 `--install` writes the system unit `hs-serve-docs.service` (Linux, using `sudo`) or the LaunchAgent `com.home-still.docs` (macOS). `--install-user` writes the user unit `hs-serve-docs.service` (Linux) or the LaunchAgent `com.home-still.serve-docs` (macOS). `--uninstall` removes both kinds. The three flags cannot be combined.
 
@@ -1403,7 +1415,7 @@ hs cloud invite [OPTIONS]
 | Name | Default | Meaning |
 |---|---|---|
 | `--name <NAME>` | `device` | Device name for the enrollment. |
-| `--scope <SCOPE>` | none | Scope to grant: `scribe`, `distill` or `mcp`. Repeat the flag for several. Without it the code grants all three. |
+| `--scope <SCOPE>` | none | Scope to grant: `scribe`, `distill`, `mcp` or `memory`. Repeat the flag for several. Without it the code grants all four. |
 
 Asks the local gateway for a one-time enrollment code and prints the code, its scopes and its lifetime. It reads `cloud.gateway.listen` and the admin key on this host, so it works only on the gateway host, and it fails when `hs-gateway` is not running.
 
@@ -1499,10 +1511,10 @@ hs mcp [OPTIONS] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `hs mcp install` | Install MCP server config into Claude Desktop and/or Claude Code. |
-| `hs mcp uninstall` | Remove MCP server config from Claude Desktop and/or Claude Code. |
+| `hs mcp install` | Write the `home-still` and `myelin` servers into your clients' configuration. |
+| `hs mcp uninstall` | Remove the `home-still` and `myelin` servers from your clients' configuration. |
 
-These commands edit the MCP server entry named `home-still` in each client's configuration file. The tools the server exposes are listed in [MCP tools](mcp-tools.md).
+These commands edit two MCP server entries in each client's configuration file: `home-still`, the tools server (`hs-mcp`), whose tools are listed in [MCP tools](mcp-tools.md), and `myelin`, the memory server, where an agent searches the library and keeps what it is asked to remember.
 
 Example:
 
@@ -1512,7 +1524,7 @@ hs mcp --help
 
 ### `hs mcp install`
 
-Install MCP server config into Claude Desktop and/or Claude Code.
+Write the `home-still` and `myelin` servers into your clients' configuration.
 
 ```text
 hs mcp install [OPTIONS]
@@ -1521,12 +1533,14 @@ hs mcp install [OPTIONS]
 | Name | Default | Meaning |
 |---|---|---|
 | `--client <CLIENT>` | `all` | Target client: `desktop` (Claude Desktop), `code` (Claude Code), `opencode` (OpenCode) or `all`. |
-| `--remote` | off | Configure remote access via cloud gateway instead of local stdio. |
+| `--remote` | off | Reach both servers through the cloud gateway instead of on this machine. |
 | `--gateway-url <GATEWAY_URL>` | none | Gateway URL for remote mode (reads from cloud config if omitted). |
 
-Local mode writes a stdio entry that runs the `hs-mcp` binary and copies the variables from `~/.home-still/secrets.env` into the entry, so the client's file holds those values. When `hs-mcp` is not installed the command downloads it from GitHub. `--remote` writes a URL entry that points at the gateway's `/mcp` path instead; it takes the gateway from `--gateway-url` or from the enrolled credentials.
+Local mode writes two entries. `home-still` runs the `hs-mcp` binary as the client's child process and copies the variables from `~/.home-still/secrets.env` into the entry, so the client's file holds those values; when `hs-mcp` is not installed the command downloads it from GitHub. `myelin` is a URL entry for the memory server on this machine, `http://127.0.0.1:7463/mcp`. `--remote` writes two URL entries that point at the gateway instead, `<gateway>/mcp` and `<gateway>/memory/mcp`; it takes the gateway from `--gateway-url` or from the enrolled credentials.
 
-The entry is written to `claude_desktop_config.json` (Claude Desktop), `~/.claude.json` (Claude Code) and `~/.config/opencode/opencode.json` (OpenCode). Existing content is preserved, and the file is replaced atomically.
+Claude Desktop reads only commands from its file, so a URL entry is never written there: the command prints the URL to add as a connector in the app, and `--client desktop --remote` writes nothing and fails.
+
+The entries are written to `claude_desktop_config.json` (Claude Desktop), `~/.claude.json` (Claude Code) and `~/.config/opencode/opencode.json` (OpenCode). Existing content is preserved, an entry of the same name is replaced, and the file is replaced atomically.
 
 Example:
 
@@ -1536,7 +1550,7 @@ hs mcp install --client desktop
 
 ### `hs mcp uninstall`
 
-Remove MCP server config from Claude Desktop and/or Claude Code.
+Remove the `home-still` and `myelin` servers from your clients' configuration.
 
 ```text
 hs mcp uninstall [OPTIONS]
@@ -1648,8 +1662,9 @@ hs migrate [OPTIONS] <COMMAND>
 | `hs migrate quarantine-bad-content` | Find `papers/**/*.pdf` objects whose bytes are not a PDF, rename HTML to `.html`, and move other content to `papers/.quarantine/`. |
 | `hs migrate drop-local-html` | Delete catalog rows whose `conversion.server` is `local-html`, together with their markdown and source HTML. |
 | `hs migrate canonicalize-doi-stems` | Lowercase DOI-derived stems and merge case-collision duplicates onto one storage key. |
+| `hs migrate dedupe-url-encoded` | Report documents stored under a URL-encoded stem and again under the decoded one. |
 
-Migrations act immediately: none of them asks for confirmation. Every migration except `hs migrate sharding` has `--dry-run`, which prints the plan and changes nothing.
+Migrations act immediately: none of them asks for confirmation. Every migration except `hs migrate sharding` and `hs migrate dedupe-url-encoded` has `--dry-run`, which prints the plan and changes nothing. `hs migrate dedupe-url-encoded` only reports.
 
 Example:
 
@@ -1780,6 +1795,24 @@ Example:
 hs migrate canonicalize-doi-stems --dry-run
 ```
 
+### `hs migrate dedupe-url-encoded`
+
+Report documents stored under a URL-encoded stem and again under the decoded one.
+
+```text
+hs migrate dedupe-url-encoded
+```
+
+This command has no options.
+
+Lists the markdown of the `academic` store and finds each stem that contains a percent-encoded byte, such as `10.1%2Fabc`, whose decoded form is also a stem. It prints a JSON report with `pairs_found`, `would_delete_encoded_rows` and up to ten `samples`, each with the `encoded` and the `decoded` stem. The command changes nothing, so it has no `--dry-run`, and it exits with status 0 whenever it could read the storage.
+
+Example:
+
+```bash
+hs migrate dedupe-url-encoded
+```
+
 ## `hs pipeline`
 
 Cross-service pipeline operations (rebuild from papers, etc.).
@@ -1790,14 +1823,15 @@ hs pipeline [OPTIONS] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `hs pipeline rebuild` | Delete the derived state (markdown, catalog entries, Qdrant vectors) and republish `papers.ingested` for every source under `papers/`. |
+| `hs pipeline rebuild` | Delete the derived state (markdown, catalog entries, stored chunks and abstracts) and republish `papers.ingested` for every source under `papers/`. |
 | `hs pipeline catch-up` | Republish `papers.ingested` for every source under `papers/` that has no markdown and no failure stamp. |
 | `hs pipeline events-reset` | Delete the JetStream streams `PAPERS`, `SCRIBE` and `DISTILL` and recreate them from the `events` configuration. |
 | `hs pipeline purge-skipped` | Delete HTML paywall and loading-stub artifacts that the indexer skipped as empty. |
-| `hs pipeline purge-poisoned` | Delete documents that reached Qdrant but whose text is an anti-bot or cookie-wall page. |
+| `hs pipeline purge-poisoned` | Delete documents that reached the store but whose text is an anti-bot or cookie-wall page. |
 | `hs pipeline reap-phantoms` | Delete catalog entries that have no downloaded paper, no markdown and no embedding record. |
-| `hs pipeline purge-poisoned-chunks` | Delete the individual Qdrant chunks whose text matches a known interstitial or cookie-banner signature. |
 | `hs pipeline reconvert-failed` | Re-queue documents whose conversion was given up on. |
+| `hs pipeline repair-catalog` | Report where the academic catalog and the storage disagree. |
+| `hs pipeline backfill-titles` | Look up the title and other metadata of catalog entries that have a DOI and no title. |
 
 Pipeline operations read `storage:`, `events:` and `distill.servers`. The destructive ones (`rebuild`, `purge-*`, `reap-phantoms`) have `--dry-run` and ask for confirmation unless `--yes` is given. `--yes` on these commands is a local, long-form flag: `-y` is not accepted.
 
@@ -1809,7 +1843,7 @@ hs pipeline --help
 
 ### `hs pipeline rebuild`
 
-Delete the derived state (markdown, catalog entries, Qdrant vectors) and republish `papers.ingested` for every source under `papers/`.
+Delete the derived state (markdown, catalog entries, stored chunks and abstracts) and republish `papers.ingested` for every source under `papers/`.
 
 ```text
 hs pipeline rebuild [OPTIONS]
@@ -1821,7 +1855,7 @@ hs pipeline rebuild [OPTIONS]
 | `--yes` | off | Skip the interactive prompts. Requires `--confirm rebuild-from-papers`. Long form only: `-y` is not accepted here. |
 | `--confirm <CONFIRM>` | none | Confirmation token. Must equal `rebuild-from-papers` when `--yes` is set; otherwise the interactive prompt asks for it. |
 
-Prints an inventory of what it would delete and republish, and refuses to continue when there are no sources under `papers/` or the first source cannot be read. `--dry-run` stops there. Otherwise it asks `Proceed?` (default no) and then asks you to type `rebuild-from-papers`; a different answer aborts with no change. In a script, pass both `--yes` and `--confirm rebuild-from-papers`; `--yes` without the matching token is an error. The papers themselves are never touched. Rebuilding takes hours of scribe work; `hs status` shows the progress. The Qdrant collection is dropped.
+Prints an inventory of what it would delete and republish, and refuses to continue when there are no sources under `papers/` or the first source cannot be read. `--dry-run` stops there. Otherwise it asks `Proceed?` (default no) and then asks you to type `rebuild-from-papers`; a different answer aborts with no change. In a script, pass both `--yes` and `--confirm rebuild-from-papers`; `--yes` without the matching token is an error. The papers themselves are never touched. Rebuilding takes hours of scribe work; `hs status` shows the progress. Every document is deleted from the `academic` store, with its reference lists, and from the `abstracts` store.
 
 Example:
 
@@ -1890,7 +1924,7 @@ hs pipeline purge-skipped --dry-run
 
 ### `hs pipeline purge-poisoned`
 
-Delete documents that reached Qdrant but whose text is an anti-bot or cookie-wall page.
+Delete documents that reached the store but whose text is an anti-bot or cookie-wall page.
 
 ```text
 hs pipeline purge-poisoned [OPTIONS]
@@ -1901,7 +1935,7 @@ hs pipeline purge-poisoned [OPTIONS]
 | `--dry-run` | off | Report what would be deleted without touching anything. |
 | `--yes` | off | Skip the interactive confirmation prompt. |
 
-Finds markdown stubs that passed the chunk-quality floor and reached Qdrant as one-chunk vectors, but whose text matches a known anti-bot or cookie-wall signature. For each it deletes the Qdrant points, the markdown, the source PDF or HTML, and the catalog `.yaml`. `--dry-run` lists the selection and stops. Without `--yes` the command asks before deleting (default no).
+Finds markdown stubs that passed the chunk-quality floor and reached the store as one-chunk documents, but whose text matches a known anti-bot or cookie-wall signature. For each it deletes the stored chunks and the abstract, the markdown, the source PDF or HTML, and the catalog `.yaml`. `--dry-run` lists the selection and stops. Without `--yes` the command asks before deleting (default no).
 
 Example:
 
@@ -1930,27 +1964,6 @@ Example:
 hs pipeline reap-phantoms --dry-run
 ```
 
-### `hs pipeline purge-poisoned-chunks`
-
-Delete the individual Qdrant chunks whose text matches a known interstitial or cookie-banner signature.
-
-```text
-hs pipeline purge-poisoned-chunks [OPTIONS]
-```
-
-| Name | Default | Meaning |
-|---|---|---|
-| `--dry-run` | off | Report what would be deleted without touching anything. |
-| `--yes` | off | Skip the interactive confirmation prompt. |
-
-Scans every Qdrant point and deletes only the chunks whose text matches a known interstitial or cookie-banner signature; the markdown, source and catalog are untouched. It is for a real paper that a trailing cookie banner contaminated. `--dry-run` reports the match count and stops. Without `--yes` the command asks before deleting (default no).
-
-Example:
-
-```bash
-hs pipeline purge-poisoned-chunks --dry-run
-```
-
 ### `hs pipeline reconvert-failed`
 
 Re-queue documents whose conversion was given up on.
@@ -1972,6 +1985,47 @@ Example:
 
 ```bash
 hs pipeline reconvert-failed --dry-run --limit 25
+```
+
+### `hs pipeline repair-catalog`
+
+Report where the academic catalog and the storage disagree.
+
+```text
+hs pipeline repair-catalog [OPTIONS]
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `--limit <LIMIT>` | none | Cap each `would_*` count at this many entries. Without it, no cap. |
+
+Reads every source, every markdown object and every catalog entry of the `academic` store once, then looks for seven kinds of disagreement in that snapshot and prints one JSON report with a count and up to ten example stems for each: `disk_no_catalog` (a source with no catalog entry), `catalog_no_markdown` (an entry that says the document was converted, with no markdown), `catalog_no_source` (an entry with neither a source nor markdown), `flag_drift` (a stage flag is missing but storage shows the stage done), `flag_drift_resync` (timestamps that still carry the stamp of one earlier batch), `md_path_drift` (a recorded markdown path that is not where the markdown is) and `stuck_convert` (a source that was never converted and has no failure stamp). The command changes nothing. It exits with status 0 whenever it could read the storage, whatever it found. `hs pipeline reap-phantoms` deletes the entries that `catalog_no_source` lists.
+
+Example:
+
+```bash
+hs pipeline repair-catalog --limit 100
+```
+
+### `hs pipeline backfill-titles`
+
+Look up the title and other metadata of catalog entries that have a DOI and no title.
+
+```text
+hs pipeline backfill-titles [OPTIONS]
+```
+
+| Name | Default | Meaning |
+|---|---|---|
+| `--dry-run` | off | Report what would be looked up without contacting a provider or writing anything. |
+| `--limit <LIMIT>` | none | Look up at most this many entries. Without it, all of them. |
+
+An entry is a candidate when it has a DOI and its title is missing or blank. The command asks the paper providers for each candidate by DOI. An entry whose lookup returns a title gets the title, plus the authors, publication date, abstract and citation count it lacks; a field it already has is kept. The entry is read again just before it is written, so a stamp written meanwhile is not lost, and it is marked as repaired. The JSON report has `candidates`, `backfilled`, `no_metadata` (the providers know nothing under that DOI), `errors` (one line for each entry whose lookup or write failed), up to ten `samples` and `dry_run: false`. With `--dry-run` it contacts no provider and writes nothing, and the report has `candidates`, `would_backfill`, `samples` and `dry_run: true`. The command exits with an error when `errors` is not empty, after printing the report. Provider settings are read from the paper configuration.
+
+Example:
+
+```bash
+hs pipeline backfill-titles --dry-run --limit 50
 ```
 
 ## `hs openalex`
