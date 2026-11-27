@@ -3456,7 +3456,7 @@ answered (viewer 200, page 200, source 206, markdown 206).
 | Host | Before | After | Checked |
 |---|---|---|---|
 | `big` | rc.395 | rc.396 | everything above |
-| `bmb` | rc.394 | rc.396 | scribe agent restarted; its `/health` reports rc.396 |
+| `bmb` | rc.394 | rc.396 | scribe agent restarted; its `/health` reports rc.396; one PDF page sent to it came back as markdown in 11 s |
 | `mac_air` | rc.393 | rc.396 | `hs status` through the gateway shows 19,270 documents and 475,933 chunks |
 | `big_mac` | rc.394 | rc.396 | binaries; it runs no agent |
 | `two` | rc.394 | rc.396 | gateway active, five routes, local `/health` 200; the four remote links of a `cite` answer through it (206, 200, 206, 200) |
