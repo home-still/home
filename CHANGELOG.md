@@ -2,7 +2,7 @@
 
 Changes that need action when upgrading. Binaries and full notes: GitHub Releases.
 
-## Unreleased
+## v0.0.1-rc.395
 
 - The distill server keeps its documents in a myelin server, in named
   stores: `academic`, `references`, `abstracts`, `personal`, `web`,
@@ -20,6 +20,12 @@ Changes that need action when upgrading. Binaries and full notes: GitHub Release
   model, or with one that reads only part of a long input. With the model as
   pulled, Ollama embedded a passage over 2,048 tokens from its beginning
   only, or refused it.
+- **Start the myelin server with `--rerank-depth 50`**, and build it from
+  myelin's `main` at `18f0dbf` or later. Search results were judged at that
+  depth: myelin's reranker reads the first 50 passages of each store, not
+  its default 25, and at 25 one of the 25 gate queries no longer finds its
+  term. A search takes about 3 seconds at depth 50. The older build searches
+  the vector index with a narrow beam and misses near neighbours.
 - Every distill request names its store. **Upgrade the distill server and
   every client of it (`hs`, `hs-mcp`, the watchers) together**: an older
   client names no store and is answered `400`, and a newer client's requests

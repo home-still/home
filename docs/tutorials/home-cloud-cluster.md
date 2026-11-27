@@ -424,7 +424,8 @@ ExecStart=%h/.local/bin/myelin-mcp \
   --ledger %h/.local/share/myelin/home_still.ledger \
   --meta-index year:integer \
   --meta-index topics:keyword \
-  --meta-index category:keyword
+  --meta-index category:keyword \
+  --rerank-depth 50
 Restart=on-failure
 RestartSec=5
 
@@ -435,8 +436,10 @@ WantedBy=default.target
 Replace `<gpu-host-lan-address>` with the address the gateway uses to reach
 `<gpu-host>`. `--collection` names myelin's Qdrant collection and `--ledger`
 is the path of myelin's own database, in the directory made in item 2; keep
-both between restarts. Start the service and open port 7463 to the gateway
-host only:
+both between restarts. `--rerank-depth 50` is how many passages of each store
+myelin's reranker reads for one search; home-still's search results were
+judged at 50, and myelin's own default is 25. Start the service and open port
+7463 to the gateway host only:
 
 ```sh
 sudo loginctl enable-linger "$USER"
