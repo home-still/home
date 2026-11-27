@@ -3516,3 +3516,115 @@ reachable host.
 4. **`hs scribe catalog-backfill` reads and writes folders on its own
    host** (BACKLOG P1-49).
 5. **Rare-word queries** (BACKLOG P1-46), unchanged.
+
+## 2026-11-27-04 — Agents on four hosts search and cite through the memory route; one write to each empty store, found and removed
+
+**What "agents can search everywhere" was measured as.** On each of the
+GPU host, `bmb`, `mac_air` and `big_mac`, both of the user's clients
+(Claude Code and omp) were started from their own config, exactly as the
+config names each server: `tools/list` on both servers, one `recall` on
+myelin, one `cite` of 12 words from the first hit on home-still, then a GET
+of every link `cite` returned (the LAN link on the GPU host, the remote
+link on the Macs). `claude mcp list` was asked as well.
+
+| Host | Client | `myelin` | `home-still` | `cite` | Links | `claude mcp list` |
+|---|---|---|---|---|---|---|
+| GPU host | Claude Code | loopback URL | bridge (Python) | page 1, exact, boxes located | 200, 200, 206, 206 | both connected |
+| GPU host | omp | loopback URL | bridge (Python) | page 1, exact, boxes located | 200, 200, 206, 206 | |
+| `bmb` | Claude Code | bridge | bridge | page 1, exact, boxes located | 200, 200, 206, 206 | both connected |
+| `bmb` | omp | bridge | bridge | page 1, exact, boxes located | 200, 200, 206, 206 | |
+| `mac_air` | Claude Code | bridge | bridge | page 1, exact, boxes located | 200, 200, 206, 206 | both connected |
+| `mac_air` | omp | bridge | bridge | page 1, exact, boxes located | 200, 200, 206, 206 | |
+| `big_mac` | Claude Code | bridge | bridge | page 1, exact, boxes located | 200, 200, 206, 206 | both connected |
+| `big_mac` | omp | bridge | bridge | page 1, exact, boxes located | 200, 200, 206, 206 | |
+
+"Bridge" is `scripts/home-still-bridge.mjs` (the same file on every Mac
+as in the repo), with `HS_BRIDGE_URL` set to the gateway's `/memory/mcp`
+for `myelin`. Through the gateway the memory surface lists 11 tools and no
+maintenance tool, and `stores` lists all seven stores.
+
+**What it took.**
+
+- **The firewall.** The owner added one rule for TCP 7463 on the GPU
+  host. From the gateway host a request without a token then got `401` in
+  0.014 s, where it had timed out.
+- **Enrolment, done by an agent.** The previous entry put this on the
+  owner; it was not theirs alone. An invite from `hs cloud invite --name
+  <device>` on the gateway host, its code typed into `hs cloud enroll` over
+  `ssh -tt`, enrolled `big_mac` (20:51Z), `bmb` (20:54Z), `mac_air`
+  (20:54Z) and the GPU host (21:02Z), each with `scribe, distill, mcp,
+  memory`. The GPU host's own token had expired too; nothing had listed
+  it. Device names are now the host names. The tokens issued to the old
+  names stay valid until they expire unless revoked.
+- **Clients.** `myelin` was added to every config that lacked it (omp on
+  the three Macs by editing `mcp.json`, Claude Code everywhere with `claude
+  mcp add --scope user`). The first run of the check failed 4 of 8. Three
+  Claude Code entries (the GPU host's, `big_mac`'s, and `bmb`'s, named
+  `home-still-http` there) pointed straight at the GPU host's port 7445
+  with a 23-character static token; the two the check ran answered `401`,
+  and the third holds the same token and address. Those three now run the
+  bridge. The GPU host's omp bridge failed only because the host's own
+  token had expired. The edited files on the Macs have a copy from before
+  beside them (`*.bak-golive`); the GPU host's `~/.claude.json` has none,
+  and its old entry is the one described here. `hs mcp install` was not
+  used: its remote mode would have replaced the working bridge entries
+  with URL entries that need an OAuth sign-in (BACKLOG P1-53).
+
+**Owed check: word boxes.** The one `academic` PDF without word boxes was
+queued with `hs scribe boxes catch-up --store academic` (it printed
+nothing: BACKLOG P2-17). The watcher took the event at 21:04:04Z and
+failed it for good: `PDF cannot be opened (pdfium error 3)`. The stored
+file is 710,463 bytes of a PDF whose header declares 718,582 (BACKLOG
+P2-19).
+
+**Owed check: a write to each empty store, on production, through the
+gateway.** At 21:06Z, one capture of a page on `example.org` to `web`,
+one `synthesis_save` citing one verified passage to `syntheses`, one
+`remember` to `memory`.
+
+| Store | Write | Indexed | `recall` over that store found it |
+|---|---|---|---|
+| `web` | `capture`, 369 bytes of markdown | 1 record, converted | at the first poll |
+| `syntheses` | `synthesis_save`, 1 citation verified | 1 record | at the first poll |
+| `memory` | `remember`, 29 s | 1 episode, 1 extracted statement | yes, the extracted one; `explain` names the episode as its ancestor |
+
+All three were removed. The page and the synthesis: their records with
+the distill server's `DELETE /doc/<id>?store=<store>` (1 each) and their
+six objects with signed S3 deletes (204 each), because no command does it
+(BACKLOG P1-52). `status` for both now says no source, no catalog entry, 0
+records. The memory records were forgotten soft: the agent surface
+refuses `hard`. `web` went from 18 records to 17, `syntheses` from 1 to
+0, `memory` from 2 to 0, and `recall` over `memory` returns nothing.
+
+**Already in use.** Five pages that someone else captured to `web`
+between 20:40Z and 21:06Z (woodworking articles and an eCFR page) are
+there and were not touched.
+
+**Also seen.** Between 20:54Z and 20:57Z `hs status` printed `Embedded :
+0 docs, 0 chunks` on three hosts while the GPU host's one-minute load
+average was 89 from other builds: its `/status` call timed out (BACKLOG
+P2-18). The store held 19,270 documents throughout.
+
+**Mistakes in this pass.**
+
+- I told the owner the enrolment needed them. Asked whether I had tried,
+  I had not; it took one command per device.
+- The check script read the wrong field of a `recall` hit twice before it
+  read the passage from `items`; the first two `cite` failures were the
+  script's, not the server's.
+- The first enrolment of the GPU host never ran: `script(1)` started
+  fish, which refused the command line. Its invite expired unused.
+
+**Version.** `main` at `60abd38`, rc.396 on every reachable host. No code
+changed in this pass.
+
+### Top 5 remaining items
+
+1. **Owner decisions** in the go-live plan: the abstracts rebuild, the old
+   Qdrant data, a backup of the new store, a first non-rc tag.
+2. **One way to install the MCP servers** (BACKLOG P1-53).
+3. **No command removes a captured page or a synthesis** (BACKLOG P1-52).
+4. **`hs upgrade` reports a LaunchAgent restarted while it is failing**
+   (BACKLOG P1-51).
+5. **`hs distill reconcile` is blind to a document the store holds and
+   storage does not** (BACKLOG P1-47).

@@ -218,6 +218,11 @@ Measured on `big` after the rc.356 upgrade, card contended at 4938 MiB free: `cu
 **Symptom:** `gateway rejected the refresh token (401): Refresh token expired — re-enroll with hs cloud enroll` (bmb, big_mac); `MCP initialize failed (401 Unauthorized): missing bearer token` (mac_air). Not caused by rc.360 (unrelated to the binary); found during the Gate 6 `hs status` sweep.
 **Change:** re-enroll each host with `hs cloud enroll` (needs an operator-issued invite).
 **Acceptance:** `hs status` prints the dashboard on all three hosts.
+**FIXED by re-enrolment, no code change (2026-11-27).** An agent enrolled `big_mac`, `bmb`, `mac_air`
+and the GPU host itself (whose own token had also expired), all four scopes each: an invite from
+`hs cloud invite --name <device>` on the gateway host, its code typed into `hs cloud enroll` over
+`ssh -tt`. `hs cloud token` answers on each and `hs status` prints the dashboard on the three Macs.
+"Needs an operator-issued invite" above was read as "only the owner can do it"; that was wrong.
 
 ### P0-24. rc.363's P1-26 fix never took effect: `hs upgrade` still aborts on a masked unit (found rc.363 rollout on big, 2026-10-10)
 **Symptom:** `hs upgrade --pre --yes --force` run by the rc.363 binary on big restarted the four user units, then failed with `discovering system units: hs-serve-olmocr-vllm.service: systemctl show output has no ExecStart property`, the same error rc.362 gave. The `hs-serve-*` system units were not restarted and still run rc.362 binaries.
@@ -1690,10 +1695,50 @@ On the gateway host under rc.396 the unit started at 17:19:05Z and logged `Gatew
 (its port is dropped by a firewall). A restart is 6 seconds without the remote route for each
 backend that does not answer. Listen first and run the checks beside it.
 
+### P1-52. Nothing removes a captured page or a saved synthesis (found 2026-11-27)
+`hs distill purge` deletes records only in `academic` (`cmd_purge` in `crates/hs/src/distill_cmd.rs`
+passes `stores::ACADEMIC`), and no command deletes a document's objects in storage. Removing one
+test page from `web` and one synthesis from `syntheses` took a `DELETE /doc/<id>?store=<store>` on
+the distill server and a signed S3 `DELETE` for each of the six objects (source, markdown, catalog
+entry). An agent's wrong capture cannot be taken back with a command. Give purge a `--store` and
+make it remove the document's objects as well, or add one command that does both.
+
+### P1-53. `hs mcp install` reaches the servers one way and every working client another (found 2026-11-27)
+`--remote` writes URL entries (`"type": "http"` for Claude Code), so the client signs in through
+the gateway's OAuth. Every client that worked on 2026-11-27 runs `scripts/home-still-bridge.mjs`
+instead (or, on the GPU host, a hand-written Python copy outside the repo), which refreshes its
+own token from `~/.home-still/cloud-token`; `myelin` was added the same way, with `HS_BRIDGE_URL`
+set to the gateway's `/memory/mcp`. The local mode copies every key of `secrets.env`, the S3 keys
+among them, into the client's config. Choose one way, make `hs mcp install` write it for omp too,
+and stop copying secrets a server does not need.
+
+### P2-17. `hs scribe boxes status` and `hs scribe boxes catch-up` print nothing (found 2026-11-27)
+Both exit 0 with no output, through a pipe, to a file, with `--output json`, and in a
+pseudo-terminal. `catch-up` did publish its event: the watcher's journal shows it received. Both
+report only through `reporter.status`/`reporter.finish`. Only `catch-up --dry-run`, which uses
+`println!`, prints.
+
+### P2-18. `hs status` shows `Embedded : 0 docs, 0 chunks` when it could not ask the distill server (found 2026-11-27)
+On the GPU host and on two Macs between 20:54Z and 20:57Z, while the host's one-minute load average
+was 89 (other agents' builds),
+`/status?store=academic` timed out and the dashboard printed 0 documents and 0 chunks, with the
+timeout only further down, under Services. The store held 19,270 documents throughout. A count
+that was not read must not print as zero.
+
+### P2-19. One stored PDF is truncated, so its word boxes cannot be built (found 2026-11-27)
+`papers/10/10.1073_pnas.0903616106.pdf` holds 710,463 bytes; its linearization dictionary
+declares 718,582. pdfium refuses it (`PDF cannot be opened (pdfium error 3)`), so
+`hs scribe boxes catch-up` ends in a permanent failure for it, and it is the one `academic` PDF
+without word boxes. It has markdown and records. Download it again and replace it, or move it to
+`corrupted/`.
+
 ### Owner-only items after the rc.395 cutover (2026-11-27)
 - The GPU host's firewall does not admit the gateway host on TCP 7463, so the remote memory route
-  answers nothing.
-- Device tokens issued before rc.395 lack the `memory` scope; each device enrols again.
+  answers nothing. **Done by the owner on 2026-11-27**: one rule for the LAN; the gateway host now
+  gets `401` without a token, `200` with one.
+- Device tokens issued before rc.395 lack the `memory` scope; each device enrols again. **Done by
+  an agent on 2026-11-27** for `big_mac`, `bmb`, `mac_air` and the GPU host (P0-23); this was not
+  owner-only.
 - The old markdown tree under `<project_dir>/markdown` on the GPU host (2,845 files) is no longer
   read by anything in rc.396. It is the owner's to delete.
 - The abstracts store: 33 of 2,860 entries hold a vector from before the pooling fix until
@@ -1701,7 +1746,8 @@ backend that does not answer. Listen first and run the checks beside it.
 
 ### Owner-only items after the rc.396 rollout (2026-11-27)
 - `bmb` and `big_mac`: `hs status` fails with `gateway rejected the refresh token (401)`. Their
-  enrolments expired (P0-23). Enrolling again also gives them the `memory` scope.
+  enrolments expired (P0-23). Enrolling again also gives them the `memory` scope. **Done on
+  2026-11-27** (P0-23).
 - `mac_air`: if macOS showed a local-network prompt for `hs` at the upgrade, say so on P1-51; it
   is the one fact that item lacks.
 - `five` did not answer (`No route to host`) and runs whatever it ran before.
