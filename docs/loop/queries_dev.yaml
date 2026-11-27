@@ -1,0 +1,509 @@
+# Development queries for home-still retrieval: the only file a retrieval
+# setting may be chosen with.
+#
+# Written 2026-11-26. Approved by the owner on 2026-11-27, with the choice
+# rule below, before any of them was scored.
+#
+# What is chosen with it: the store's rerank depth, the number of fused
+# records per store that the reranker scores. Three arms: 25 (myelin's
+# default), 50 and 100. Nothing else differs between the arms.
+#
+# Choice rule, fixed before the first scoring: the arm that passes the
+# most queries of this file wins; on a tie, the smaller depth. An arm that
+# passes fewer of the document-anchored queries (d01 to d40) than depth 25
+# cannot win. Reported with the choice: each arm's passes in each part,
+# the queries it wins and loses against depth 25, and the exact sign test
+# on those. Then queries.yaml and queries_heldout.yaml are each run once
+# at the chosen depth, under their own rules. No second choice is made.
+#
+# Same shape as queries.yaml. Two parts, made differently.
+#
+# Part 1, d01 to d40: anchored to one document, made the way
+# queries_heldout.yaml was. A query passes when `expect_doc` is among the
+# top `limit` results.
+#   * Frame: the held-out file's frame (documents held by both the Qdrant
+#     index and the myelin store, with a title of at least 15 characters
+#     that no other document shares, and at least 4 chunks) without the
+#     70 documents drawn for the held-out file. 13370 documents.
+#   * Sample: 160 drawn with Python's random.Random(20261127).sample
+#     over the sorted frame. Draws 1 to 60 are this part's; the first
+#     40 usable ones in draw order were kept (draws 1 to 41 without
+#     draw 5, which has no eligible chunk). None was passed over.
+#   * Passage: one chunk per document, chosen by
+#     random.Random("20261127:<doc id>").choice over the chunks that
+#     are not the first two, not the last, hold at least 1200 characters,
+#     are at least 72 % letters and spaces, and are not a reference list
+#     (the harness's own rule). The first 760 characters of that
+#     chunk were read, and the query was written from them alone.
+#     No search was run against either index while writing.
+#   * `expect` is a term checked to occur in the passage read. It is
+#     recorded for the rank column; the pass is by document.
+#   * Six passages hold table cells (d01, d02, d06, d14, d28, d31); they
+#     were kept, as in the held-out file.
+#
+# Part 2, t01 to t38: a short query on a subject, holding one word that
+# is rare in the store. A query passes when a top `limit` result holds
+# that word (`expect`), which is how queries.yaml judges its `literal`
+# group. This part exists because of gate query q09, which was studied
+# closely before it was written: it is not blind to that query's kind,
+# only to the queries themselves.
+#   * Documents: draws 61 to 160 of the sample above, then 340 more
+#     drawn with random.Random("20261127:terms").sample over the
+#     sorted frame without the first 160. 440 documents.
+#   * Passage: as in part 1, with the seed string
+#     "20261127:term:<doc id>". 7 documents had no eligible chunk.
+#   * Candidate words: every word of the passage written in at least
+#     8 lower-case letters that the store's word index finds in 3 to 30
+#     chunks of the `academic` store, from at least 3 documents. That
+#     count was read from the store's word index with a one-word query,
+#     the only kind of search run while making this file. 287 documents
+#     had no such word.
+#   * Word kept: the candidates were shuffled with
+#     random.Random("20261127:order:<doc id>").shuffle over the sorted
+#     list, and the first one was kept that is an English noun, or a
+#     chemical name, naming a substance, an organism, a body or cell
+#     structure, a medical condition, a method, an instrument or an
+#     object of a scientific or technical field. That is a judgement.
+#     108 documents had candidates and none that fits (broken or joined
+#     words such as "reatments" and "evidencebased", ordinary words such
+#     as "doughnut" and "aimlessly", adjectives such as "avascular",
+#     names, words of other languages). In six kept documents an earlier
+#     candidate was passed over: deoxygenated, embellished, rootless,
+#     frutescens, sebaceous, and superconvergence with subsubsection.
+#     The kept words are found in 4 to 25 chunks, median 14.
+#   * Query: three to seven words written from the kept word alone, in
+#     the sense it usually has, before its passage was read. So the store
+#     may hold nothing on the query's subject, as with q09. No search was
+#     run against either index while writing.
+#
+# Groups mean what they mean in queries.yaml.
+
+- id: d01
+  group: literal
+  query: "table of P. pinaster pure and mixed plots with stand measurements"
+  expect: "pinaster"
+  expect_doc: "10.1007_s10342-023-01650-0"
+
+- id: d02
+  group: concept
+  query: "distress tolerance skills for self-harm urges triggered by conflicts with a partner in a DBT case"
+  expect: "distress tolerance"
+  expect_doc: "10.36948_ijfmr.2026.v08i01.68783"
+
+- id: d03
+  group: named
+  query: "review of ten studies from the Jyväskylä research project on couple therapy for intimate partner violence"
+  expect: "couple therapy"
+  expect_doc: "10.1111_1467-6427.12170"
+
+- id: d04
+  group: literal
+  query: "rms screen-space error below one pixel for each clipmap level in terrain rendering"
+  expect: "screen-space"
+  expect_doc: "10.1145_1015706.1015799_hhoppe"
+
+- id: d05
+  group: concept
+  query: "does a positive body image predict the partner's perceived relationship quality in actor-partner models"
+  expect: "body image"
+  expect_doc: "10.1037_fam0000407"
+
+- id: d06
+  group: named
+  query: "table ranking Roman cities such as Doclea, Philippopolis and Dyrrachium"
+  expect: "dyrrachium"
+  expect_doc: "10.1038_s41598-017-06961-y"
+
+- id: d07
+  group: literal
+  query: "French version of the SCID-II for personality disorder diagnoses with a third of interviews recoded by a second rater"
+  expect: "scid-ii"
+  expect_doc: "10.1111_j.1752-0606.2009.00151.x"
+
+- id: d08
+  group: concept
+  query: "recommendation that journals and copy editors use LGBTQ+-inclusive language in biology education publications"
+  expect: "copy editor"
+  expect_doc: "10.1187_cbe.20-04-0062"
+
+- id: d09
+  group: named
+  query: "intraspecific trait variation and growth trajectories of Cecropia obtusa in the Guiana shield"
+  expect: "cecropia"
+  expect_doc: "10.1101_351197"
+
+- id: d10
+  group: literal
+  query: "free growth versus lammas growth as forms of indeterminate shoot growth in trees"
+  expect: "lammas"
+  expect_doc: "10.1111_ele.70435"
+
+- id: d11
+  group: concept
+  query: "earlywood and latewood lumen area and cell wall thickness lowest at the driest site of a moisture gradient"
+  expect: "earlywood"
+  expect_doc: "10.1016_j.agrformet.2022.109219"
+
+- id: d12
+  group: literal
+  query: "risk of type III endoleak at five years with AFX endografts compared with non-AFX devices"
+  expect: "endoleak"
+  expect_doc: "a04b9d92326fd157bdfb9bd57bf1de64a17cb06f"
+
+- id: d13
+  group: concept
+  query: "relationship between tree height, topographic wetness index and mortality of larger trees in drought"
+  expect: "topographic wetness index"
+  expect_doc: "10.1038_s41467-023-43083-8"
+
+- id: d14
+  group: named
+  query: "HGN with ALBERT-xxlarge compared with Transformer-XH and Graph Recurrent Retriever on multi-hop question answering"
+  expect: "transformer-xh"
+  expect_doc: "10.18653_v1_2020.emnlp-main.710"
+
+- id: d15
+  group: concept
+  query: "resilience of evergreen gymnosperms in semi-arid forests rests on recovery rather than resistance"
+  expect: "gymnosperms"
+  expect_doc: "10.1007_s10021-022-00782-5"
+
+- id: d16
+  group: literal
+  query: "estimating mangrove canopy height globally from SRTM elevation data and ICESat GLAS lidar"
+  expect: "icesat"
+  expect_doc: "10.1038_s41561-018-0279-1"
+
+- id: d17
+  group: concept
+  query: "how therapists respond to digressive utterances of autistic children and when to refocus"
+  expect: "digressive"
+  expect_doc: "40963736"
+
+- id: d18
+  group: concept
+  query: "choosing not to use a safeword because of trust in a deceptive dominant partner"
+  expect: "safeword"
+  expect_doc: "10.1080_14681994.2015.1102219"
+
+- id: d19
+  group: concept
+  query: "migrant and refugee women's accounts of menarche and being told to fear men"
+  expect: "menarche"
+  expect_doc: "10.1007_s10508-016-0898-9"
+
+- id: d20
+  group: concept
+  query: "families' positive, neutral and negative experiences with a relative with borderline personality disorder during confinement"
+  expect: "confinement"
+  expect_doc: "10.3390_ijerph19010079"
+
+- id: d21
+  group: named
+  query: "Utsureko and Emotionsense smartphone apps for mood monitoring through self-reports"
+  expect: "emotionsense"
+  expect_doc: "17b2539b1ad0a9856a3d175dcb7a575250fd3926"
+
+- id: d22
+  group: literal
+  query: "voice activity detection latency measured as average tail silence duration on Mandarin long speech test sets"
+  expect: "tail silence"
+  expect_doc: "10.48550_arxiv.2305.12450"
+
+- id: d23
+  group: concept
+  query: "perceived social support from family, friends and significant others and WHO-5 well-being after marital dissolution"
+  expect: "marital dissolution"
+  expect_doc: "10.21275_mr261017153208"
+
+- id: d24
+  group: concept
+  query: "allometric equations overestimating the mass of the largest trees and whether that bias inflates growth estimates"
+  expect: "allometric"
+  expect_doc: "10.1038_nature12914"
+
+- id: d25
+  group: concept
+  query: "review of parenting studies in Malaysia lacking samples representative of the major ethnic groups"
+  expect: "malaysia"
+  expect_doc: "10.5772_intechopen.101173"
+
+- id: d26
+  group: literal
+  query: "short telomere length associated with insomnia diagnosis and self-reported sleep duration"
+  expect: "telomere"
+  expect_doc: "10.5664_jcsm.7532"
+
+- id: d27
+  group: literal
+  query: "multi-camera calibration where the RANSAC sample size is one because a single match gives the rotation"
+  expect: "ransac"
+  expect_doc: "eth-cgl-digital_humans-Bee10"
+
+- id: d28
+  group: literal
+  query: "daily bole and petiole sap flux per unit leaf area across palm height"
+  expect: "sap flux"
+  expect_doc: "10.1007_s00468-009-0333-0"
+
+- id: d29
+  group: concept
+  query: "experiential avoidance predicts PTSD and depression scores while the cognitive flexibility scale does not"
+  expect: "experiential avoidance"
+  expect_doc: "10.1007_s10862-010-9201-x"
+
+- id: d30
+  group: concept
+  query: "daily reports of drinking episodes and partner conflicts being more likely after 5 p.m."
+  expect: "conflicts"
+  expect_doc: "10.15288_jsad.2018.79.432"
+
+- id: d31
+  group: literal
+  query: "canonical correlation between brooding, reflection and affective reactions to infidelity"
+  expect: "brooding"
+  expect_doc: "10.30958_ajss.3-1-5"
+
+- id: d32
+  group: concept
+  query: "student money advisors trained to screen for gambling problems and the lack of support services"
+  expect: "money advisors"
+  expect_doc: "10.3389_fpubh.2020.00320"
+
+- id: d33
+  group: literal
+  query: "wilting point and field capacity from pedotransfer functions and water retention curves in tropical forest soils"
+  expect: "pedotransfer"
+  expect_doc: "10.70675_379cf073z39b9z4a7dz83c7zf32729014704"
+
+- id: d34
+  group: literal
+  query: "ablation showing the token-dependency mechanism is needed for joint speech recognition and disfluency removal"
+  expect: "token-dependency"
+  expect_doc: "10.48550_arxiv.2211.08726"
+
+- id: d35
+  group: concept
+  query: "Rise-Fall-Rise emotional arcs show more curvature than monotonic arcs in generated game stories"
+  expect: "monotonic"
+  expect_doc: "10.48550_arxiv.2508.02132"
+
+- id: d36
+  group: named
+  query: "aboveground biomass of T. cacao, G. sepium and L. leucocephala shade trees"
+  expect: "leucocephala"
+  expect_doc: "10.3389_fpls.2015.00191"
+
+- id: d37
+  group: named
+  query: "ABLT-1A rolling bearing dataset with inner and outer ring fault conditions sampled at 12,800 Hz"
+  expect: "ablt-1a"
+  expect_doc: "60d5fc85462fa3612e6b233d00160cce0f7a117b"
+
+- id: d38
+  group: concept
+  query: "salt stress limiting maximum mangrove canopy height by analogy with water stress in terrestrial forests"
+  expect: "salt stress"
+  expect_doc: "10.1111_geb.13720"
+
+- id: d39
+  group: concept
+  query: "minimum reproductive tree size and whether fecundity varies with dbh in shade tolerant species"
+  expect: "fecundity"
+  expect_doc: "10.1890_04-0657"
+
+- id: d40
+  group: concept
+  query: "dominant partners who bottom in long-term BDSM couples"
+  expect: "bottom"
+  expect_doc: "10.51681_1.624"
+
+- id: t01
+  group: literal
+  query: "psychodrama group therapy role play"
+  expect: "psychodrama"
+
+- id: t02
+  group: literal
+  query: "multiquadric radial basis function interpolation"
+  expect: "multiquadric"
+
+- id: t03
+  group: literal
+  query: "phenothiazines antipsychotic drug side effects"
+  expect: "phenothiazines"
+
+- id: t04
+  group: literal
+  query: "thalidomide birth defects limb malformation"
+  expect: "thalidomide"
+
+- id: t05
+  group: literal
+  query: "phanerophyte Raunkiaer plant life forms"
+  expect: "phanerophyte"
+
+- id: t06
+  group: literal
+  query: "protein interactome network mapping"
+  expect: "interactome"
+
+- id: t07
+  group: literal
+  query: "hydroxyindoleacetic acid serotonin metabolite in cerebrospinal fluid"
+  expect: "hydroxyindoleacetic"
+
+- id: t08
+  group: literal
+  query: "HIV serostatus disclosure to partners"
+  expect: "serostatus"
+
+- id: t09
+  group: literal
+  query: "polycarbonate plastic bisphenol A leaching"
+  expect: "polycarbonate"
+
+- id: t10
+  group: literal
+  query: "honeypot network intrusion detection"
+  expect: "honeypot"
+
+- id: t11
+  group: literal
+  query: "soil seedbanks regeneration after disturbance"
+  expect: "seedbanks"
+
+- id: t12
+  group: literal
+  query: "bone lamellae osteon microstructure"
+  expect: "lamellae"
+
+- id: t13
+  group: literal
+  query: "preconditioners for iterative linear solvers"
+  expect: "preconditioners"
+
+- id: t14
+  group: literal
+  query: "syncytia formation by cell fusion"
+  expect: "syncytia"
+
+- id: t15
+  group: literal
+  query: "broomrapes parasitic weeds host germination"
+  expect: "broomrapes"
+
+- id: t16
+  group: literal
+  query: "stigmata of chronic liver disease"
+  expect: "stigmata"
+
+- id: t17
+  group: literal
+  query: "skinfold callipers body fat measurement"
+  expect: "callipers"
+
+- id: t18
+  group: literal
+  query: "tetrapod limb evolution from fins"
+  expect: "tetrapod"
+
+- id: t19
+  group: literal
+  query: "subtribe level phylogeny of orchids"
+  expect: "subtribe"
+
+- id: t20
+  group: literal
+  query: "energy eigenstates of the quantum harmonic oscillator"
+  expect: "eigenstates"
+
+- id: t21
+  group: literal
+  query: "rodent vibrissa whisker barrel cortex"
+  expect: "vibrissa"
+
+- id: t22
+  group: literal
+  query: "oligomenorrhea in polycystic ovary syndrome"
+  expect: "oligomenorrhea"
+
+- id: t23
+  group: literal
+  query: "amoeboid pseudopodia cell migration"
+  expect: "pseudopodia"
+
+- id: t24
+  group: literal
+  query: "nanosystems for targeted drug delivery"
+  expect: "nanosystems"
+
+- id: t25
+  group: literal
+  query: "cytorrhysis cell wall collapse under drought"
+  expect: "cytorrhysis"
+
+- id: t26
+  group: literal
+  query: "coumaryl alcohol lignin monomer biosynthesis"
+  expect: "coumaryl"
+
+- id: t27
+  group: literal
+  query: "ecliptic plane planetary orbit inclination"
+  expect: "ecliptic"
+
+- id: t28
+  group: literal
+  query: "sphingosine phosphate signalling receptors"
+  expect: "sphingosine"
+
+- id: t29
+  group: literal
+  query: "castasterone brassinosteroid biosynthesis pathway"
+  expect: "castasterone"
+
+- id: t30
+  group: literal
+  query: "polyploid genome duplication in plants"
+  expect: "polyploid"
+
+- id: t31
+  group: literal
+  query: "cherrybark oak bottomland hardwood growth"
+  expect: "cherrybark"
+
+- id: t32
+  group: literal
+  query: "phenylcoumaran lignin linkage structure"
+  expect: "phenylcoumaran"
+
+- id: t33
+  group: literal
+  query: "macrofungi diversity in forest ecosystems"
+  expect: "macrofungi"
+
+- id: t34
+  group: literal
+  query: "incretin hormones and glucose dependent insulin secretion"
+  expect: "incretin"
+
+- id: t35
+  group: literal
+  query: "partitioning a mesh into submeshes for parallel computation"
+  expect: "submeshes"
+
+- id: t36
+  group: literal
+  query: "dystrophin deficiency in Duchenne muscular dystrophy"
+  expect: "dystrophin"
+
+- id: t37
+  group: literal
+  query: "sediment porewater dissolved metals"
+  expect: "porewater"
+
+- id: t38
+  group: literal
+  query: "resolving polytomies in phylogenetic trees"
+  expect: "polytomies"
