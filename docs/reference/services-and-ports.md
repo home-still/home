@@ -65,7 +65,7 @@ the gateway) sets the same value in `~/.home-still/secrets.env`.
 
 ## Distill server endpoints
 
-Every route except `/health`, `/readiness` and `/search` names one store: in the `store` field of the body (`/distill`, `/distill/stream`) or in the `store` query parameter (the others). A missing or unknown store is a 400. The stores are listed under [`distill_server`](configuration.md#stores).
+Every route except `/health`, `/readiness` and `/search` names one store: in the `store` field of the body (`/distill`) or in the `store` query parameter (the others). A missing or unknown store is a 400. The stores are listed under [`distill_server`](configuration.md#stores).
 
 | Endpoint | Method | Token | Description |
 |---|---|---|---|
@@ -73,7 +73,6 @@ Every route except `/health`, `/readiness` and `/search` names one store: in the
 | `/readiness` | GET | no | `ready`, `capacity` (1: writes are serialized), `in_flight`, `reason`; 503 when not ready. |
 | `/status?store=<name>` | GET | yes | The store's statistics (`records_count`, documents, device). |
 | `/distill` | POST | yes | Index one document into the store its body names. |
-| `/distill/stream` | POST | yes | The same, streaming NDJSON progress. |
 | `/search` | POST | yes | Search the stores listed in `stores`; an empty or absent list searches the default stores. `limit` defaults to 10, at most 200; `query` is at most 65,536 bytes. Each hit names its store. |
 | `/exists/{doc_id}?store=<name>` | GET | yes | The document's chunk count. |
 | `/docs?store=<name>` | GET | yes | Distinct document ids. |
@@ -149,12 +148,13 @@ At startup the gateway requires `HS_BACKEND_TOKEN`, the signing secret
 (`~/.home-still/cloud-secret.key`) and the admin key
 (`~/.home-still/cloud-admin.key`; both are created by `hs cloud init`, or on
 first start), and a route for each of `scribe`, `distill`, `mcp`, `memory`
-and `docs`. It then probes each backend's `/health` from its own host and
-logs a warning for any that does not answer or that answers with a server
-error; any other answer, including the `401` of a server that wants the
-backend token on every path, shows the backend is reachable. A backend that
-is away does not stop the gateway. On SIGTERM or SIGINT, requests in flight
-get 30 seconds to finish.
+and `docs`. The gateway binds its address and logs `Gateway listening` first;
+it then probes each backend's `/health` from its own host, in the background,
+and logs a warning for any that does not answer or that answers with a server
+error. A slow or dropped probe therefore never delays the listener. Any other
+answer, including the `401` of a server that wants the backend token on every
+path, shows the backend is reachable. A backend that is away does not stop the
+gateway. On SIGTERM or SIGINT, requests in flight get 30 seconds to finish.
 
 ## Gateway endpoints
 

@@ -15,8 +15,8 @@ use hs_common::stores::{DerivedText, StoreKind, StoreSpec, Stores};
 use serde::Deserialize;
 
 use crate::client::{
-    DistillProgress, HealthResponse, IndexResult, ReadinessResponse, SearchFilters, SearchHit,
-    StatusResponse, MAX_DOC_LIST_LIMIT, MAX_SEARCH_LIMIT,
+    HealthResponse, IndexResult, ReadinessResponse, SearchFilters, SearchHit, StatusResponse,
+    MAX_DOC_LIST_LIMIT, MAX_SEARCH_LIMIT,
 };
 use crate::config::DistillServerConfig;
 use crate::embed_device::{ollama_embed_device, DEVICE_CUDA, OLLAMA_EMBED_MODEL};
@@ -38,7 +38,7 @@ const DEFAULT_SEARCH_LIMIT: u64 = 10;
 pub const MAX_SEARCH_QUERY_BYTES: usize = 64 * 1024;
 
 /// Machine-readable code sent with a 500 caused by a panic in the index
-/// task (`x-hs-error-code` header; prefix of the NDJSON error line).
+/// task (`x-hs-error-code` header; prefix of the error message).
 pub const PANIC_CODE: &str = "index_panicked";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +97,7 @@ impl From<DistillError> for ApiError {
     }
 }
 
-/// Body of `POST /distill` and `POST /distill/stream`.
+/// Body of `POST /distill`.
 #[derive(Deserialize)]
 pub struct IndexRequest {
     /// Document name. Only its file stem is used (it becomes the
@@ -329,11 +329,7 @@ impl DistillServerState {
     }
 
     /// Chunk and store a prepared document.
-    pub async fn run_index(
-        &self,
-        job: PreparedIndex,
-        on_progress: impl Fn(DistillProgress),
-    ) -> Result<IndexResult, ApiError> {
+    pub async fn run_index(&self, job: PreparedIndex) -> Result<IndexResult, ApiError> {
         let _guard = InFlightGuard::new(&self.in_flight);
         let PreparedIndex {
             doc_id,
@@ -357,10 +353,8 @@ impl DistillServerState {
             },
             &self.config,
             self.store.as_ref(),
-            on_progress,
         );
-        // A panic here would otherwise unwind out of a spawned task (stream
-        // route) with no response, or become an untyped 500: surface it as a
+        // A panic here would otherwise become an untyped 500: surface it as a
         // typed, non-retryable failure and name the document.
         let chunks =
             match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(work)).await {
@@ -712,7 +706,7 @@ mod tests {
                 IN_ACADEMIC,
             ))
             .unwrap();
-        let result = h.state.run_index(job, |_| {}).await.unwrap();
+        let result = h.state.run_index(job).await.unwrap();
         assert_eq!(result.doc_id, "10.1609_aaai.v38i16.29728");
         assert!(result.chunks_indexed > 0);
         assert_eq!(result.embedding_device, "cuda");
@@ -1274,10 +1268,7 @@ mod tests {
             .state
             .prepare_index(index_req(Some("d.md"), Some(&prose(6)), IN_ACADEMIC))
             .unwrap();
-        assert_eq!(
-            kind(h.state.run_index(job, |_| {}).await),
-            ErrorKind::Unavailable
-        );
+        assert_eq!(kind(h.state.run_index(job).await), ErrorKind::Unavailable);
     }
 
     #[tokio::test]
@@ -1290,7 +1281,7 @@ mod tests {
                 .prepare_index(index_req(Some("d.md"), Some(&prose(6)), IN_ACADEMIC))
                 .unwrap();
             assert_eq!(
-                kind(h.state.run_index(job, |_| {}).await),
+                kind(h.state.run_index(job).await),
                 ErrorKind::Unavailable,
                 "{mode:?}"
             );
@@ -1316,7 +1307,7 @@ mod tests {
                 Some(store),
             ))
             .unwrap();
-        h.state.run_index(job, |_| {}).await.unwrap().chunks_indexed
+        h.state.run_index(job).await.unwrap().chunks_indexed
     }
 
     #[tokio::test]
@@ -1412,7 +1403,7 @@ mod tests {
             .state
             .prepare_index(index_req(Some("d.md"), Some(&prose(6)), IN_ACADEMIC))
             .unwrap();
-        let err = h.state.run_index(job, |_| {}).await.expect_err("must fail");
+        let err = h.state.run_index(job).await.expect_err("must fail");
         assert_eq!(err.kind, ErrorKind::Panicked);
         assert!(
             err.message.starts_with(PANIC_CODE) && err.message.contains("d"),

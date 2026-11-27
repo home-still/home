@@ -71,7 +71,6 @@ hs scribe [OPTIONS] <COMMAND>
 | `hs scribe convert` | Convert a PDF to markdown (sends to scribe server). |
 | `hs scribe watch-events` | Consume `papers.ingested` and `scribe.boxes` events from the event bus: convert each ingested document through the scribe servers and write the markdown back to storage, and build and store the word boxes of each PDF that is asked for. |
 | `hs scribe inbox` | Sweep `papers/manually_downloaded/` in storage, move each file to its place under `papers/`, and publish `papers.ingested` so conversion starts. |
-| `hs scribe catalog-backfill` | Create catalog entries for markdown files in `scribe.output_dir` that have none. |
 | `hs scribe reconvert` | Clear a document's conversion stamps and derived artifacts, then republish `papers.ingested` so the watcher converts it again. |
 | `hs scribe boxes` | Word-box sidecars: where every word of a PDF sits on its page, which is what lets a quotation be highlighted in the document it is from. |
 | `hs scribe queue` | Announce that one stored source needs converting: publish `papers.ingested` so the scribe watcher converts it. |
@@ -254,24 +253,6 @@ Example:
 hs scribe inbox status
 ```
 
-### `hs scribe catalog-backfill`
-
-Create catalog entries for markdown files in `scribe.output_dir` that have none.
-
-```text
-hs scribe catalog-backfill [OPTIONS]
-```
-
-The command takes no arguments or flags of its own.
-
-Works on the local directories `scribe.output_dir` (markdown), `scribe.catalog_dir` (catalog) and `scribe.watch_dir` (PDFs). For each markdown file without a catalog entry it writes one with the title taken from the first non-empty line, the source PDF path when the PDF exists, and the page accounting. It prints how many entries were created, already existed or were unreadable, and exits non-zero when any file was unreadable.
-
-Example:
-
-```bash
-hs scribe catalog-backfill
-```
-
 ### `hs scribe reconvert`
 
 Clear a document's conversion stamps and derived artifacts, then republish `papers.ingested` so the watcher converts it again.
@@ -360,7 +341,7 @@ Lists each store's PDFs, markdown and sidecars, and publishes one `scribe.boxes`
 
 The command does not read the queue. Run again while earlier requests are still waiting, it queues those PDFs a second time, and the second build replaces the sidecar with an identical one; check `hs scribe boxes status` first. `--dry-run` writes the keys to standard output.
 
-It ends with `boxes_requested=<n> errors=<n>` and exits non-zero when a request could not be published or the run was interrupted.
+It writes its result to standard output: `Queued <n> of <m> word-box builds (<k> failed to publish)`, or `Nothing to do — every converted PDF has its word boxes.` when no PDF lacks a sidecar. With `--output json` the result is one JSON object (`dry_run`, `stores`, `missing`, `requested`, `errors`, and for `--dry-run` the `keys`); with `--output ndjson`, the same object on one line. The command exits non-zero when a request could not be published or the run was interrupted.
 
 Example:
 
@@ -378,9 +359,9 @@ hs scribe boxes status [OPTIONS]
 
 The command takes no arguments or flags of its own.
 
-Prints one line for each store that holds PDFs: its PDFs, how many of them are converted, how many have word boxes, and how many converted PDFs are missing them. The last line sums up: `missing` over all stores, `queued` (requests waiting on the `scribe.boxes` queue) and `building` (requests a watcher has taken and not finished).
+Writes its result to standard output, one line for each store that holds PDFs: its PDFs, how many of them are converted, how many have word boxes, and how many converted PDFs are missing them. The last line sums up: the PDFs missing word boxes over all stores, `queued` (requests waiting on the `scribe.boxes` queue) and `building` (requests a watcher has taken and not finished). With `--output json` the result is one JSON object (`stores`, `missing`, `queued`, `building`); with `--output ndjson`, the same object on one line. The `Scan` progress lines go to standard error.
 
-The command needs `storage:` and `events:`. It prints the store lines first and then fails if the queue cannot be read, which is the case until an `hs scribe watch-events` of this version has started once and created the queue's consumer.
+The command needs `storage:` and `events:`. It fails if the queue cannot be read, which is the case until an `hs scribe watch-events` of this version has started once and created the queue's consumer; the store lines are then written to standard error.
 
 Example:
 
@@ -756,7 +737,7 @@ hs distill [OPTIONS] <COMMAND>
 | `hs distill reindex` | Index documents of the `academic` store again from their stored markdown and catalog entry, replacing their records in place. |
 | `hs distill backfill` | Index the converted documents that were never embedded. |
 | `hs distill scan-repetitions` | Report stored markdown that the repetition cleaner would cut heavily. |
-| `hs distill purge` | Delete every stored chunk for a `doc_id`. |
+| `hs distill purge` | Delete one document from a store: its records and every object storage holds for it. |
 | `hs distill abstracts` | Manage the `abstracts` store, which holds one record per paper built from its title and abstract. |
 
 The distill commands talk to the distill server named by `distill.servers` and read `storage:`; the watcher also needs `events:`. See [configuration](configuration.md).
@@ -872,6 +853,8 @@ hs distill reconcile [OPTIONS]
 
 Without flags the command only reports counts and examples: the documents that are `ok`, those missing their `embedding` stamp (embedded but unstamped), and those whose markdown never reached the store. `--fix-stamps` writes the missing stamps. `--reembed` re-indexes the markdown that never reached the store. The command lists every markdown object, every indexed `doc_id` and every catalog entry, so it takes time on a large corpus.
 
+The command also checks the other direction, for the `academic` store only: a `doc_id` the store holds that has no markdown object in storage is store-only. Ids are compared exactly, letter case included. The command prints every store-only id, one per line on stdout, adds `store_only=<count>` to the summary and exits non-zero, with or without `--fix-stamps` and `--reembed`. It never deletes them; remove one with `hs distill purge --store academic <doc_id>`.
+
 Example:
 
 ```bash
@@ -950,23 +933,28 @@ hs distill scan-repetitions --threshold 50
 
 ### `hs distill purge`
 
-Delete every stored chunk for a `doc_id`.
+Delete one document from a store: its records in the search index, then every object storage holds for it.
 
 ```text
-hs distill purge [OPTIONS] <DOC_ID>
+hs distill purge [OPTIONS] --store <STORE> <DOC_ID>
 ```
 
 | Name | Default | Meaning |
 |---|---|---|
-| `<DOC_ID>` | required | doc_id whose chunks should be deleted. |
+| `--store <STORE>` | required | The store the document is in. Only a store that holds documents of its own is accepted: `academic`, `personal`, `web` and `syntheses`. `references` and `abstracts` are made from the `academic` documents and go with them; `memory` has no documents in storage. Any other store is refused with an error that names the ones purge accepts. |
+| `<DOC_ID>` | required | doc_id of the document to delete. |
 | `--server <SERVER>` | none | Override server URL. |
+| `-y`, `--yes` | off | Skip the confirmation prompt. |
 
-The command is CLI-only because it is a destructive write. It has no dry run and no confirmation prompt: it asks the distill server to delete the document's chunks from the `academic` store, and its reference lists with them, and prints how many were deleted. The markdown, the source, the catalog entry and the paper's record in the `abstracts` store are not touched.
+The command is CLI-only because it is a destructive write. It first looks at what the document has: how many records the store holds for it (for `academic`, the paper's abstract in the `abstracts` store included, and its reference lists with the chunks) and which of these objects exist under the store's storage layout: the source (under whichever extension it has), the converted markdown, the catalog entry and the word boxes. It lists them and asks for confirmation unless `--yes` is given. It then deletes the records and each object, printing every key it deleted. A failed delete is an error that names the object. A document with no records and no objects is an error.
+
+The objects go too because `hs distill reconcile --reembed` indexes any markdown object that has no records: records deleted alone come back the next night.
 
 Example:
 
 ```bash
-hs distill purge 10.48550_arxiv.2312.10997
+hs distill purge --store academic 10.48550_arxiv.2312.10997
+hs distill purge --store web --yes 3f2a9c1e7b4d4a0e9c6d5b8a1f2e3d4c
 ```
 
 ### `hs distill abstracts`
@@ -1139,6 +1127,8 @@ hs restart [OPTIONS]
 The command takes no arguments or flags of its own.
 
 Discovers the units that run this host's home-still binaries (systemd system units, systemd user units and launchd agents), matches them by the executable they run, and restarts them. It also restarts the scribe compose containers (`~/.home-still/docker-compose.yml`, when `scribe.local_server` is on), and exits non-zero when any restart failed. One-shot timer jobs are left alone.
+
+A restart is checked twice. Right after it, the unit must be running the installed binary. Five seconds later the same process (same pid) must still be running; a unit that exited, or that its supervisor respawned under a new pid, is a failed restart. The failure message carries the supervisor's last exit status (`launchctl print`'s `last exit code`, or systemd's `Result` and `ExecMainStatus`) and, for a launchd agent whose plist sets `StandardErrorPath`, the last lines of that log. `hs upgrade` restarts through the same check.
 
 Example:
 

@@ -301,6 +301,9 @@ jobs:
             checksums-sha256.txt
           generate_release_notes: true
           draft: false
+          # An rc is a pre-release, so `hs upgrade` without `--pre` (GitHub's
+          # "latest") installs only a release without `-rc.` in its tag.
+          prerelease: ${{ contains(github.ref_name, '-rc.') }}
           fail_on_unmatched_files: true
 
   # One Dockerfile for both architectures, each built natively on its own

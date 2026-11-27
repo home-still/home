@@ -118,11 +118,13 @@ with `recall` on the `myelin` server, naming the store: `stores: ["abstracts"]`.
    hs distill diagnose 10.48550_arxiv.1706.03762
    ```
 
-4. Delete every passage of one document from the `academic` store, for
-   example after its markdown was removed:
+4. Delete one document from a store: its passages and every object
+   storage holds for it (source, markdown, catalog entry and word boxes).
+   The command lists what it found and asks first; `--yes` skips the
+   question:
 
    ```sh
-   hs distill purge 10.48550_arxiv.1706.03762
+   hs distill purge --store academic 10.48550_arxiv.1706.03762
    ```
 
 5. Fill an empty index, after you first set up myelin or after a rebuild,

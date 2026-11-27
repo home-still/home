@@ -1,5 +1,5 @@
-//! axum adapter over [`crate::api`]: routing, JSON, status codes, NDJSON
-//! streaming. No request logic lives here.
+//! axum adapter over [`crate::api`]: routing, JSON, status codes. No request
+//! logic lives here.
 //!
 //! Every route except `GET /health` and `GET /readiness` requires the shared
 //! backend bearer token (`hs_common::auth::backend`, enforced by the
@@ -10,7 +10,6 @@
 use std::sync::Arc;
 
 use axum::{
-    body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, StatusCode},
     middleware,
@@ -20,18 +19,15 @@ use axum::{
 };
 use hs_common::auth::backend::BackendToken;
 use serde::Deserialize;
-use tokio_stream::wrappers::ReceiverStream;
 
 pub use crate::api::DistillServerState;
 use crate::api::{ApiError, ErrorKind, IndexRequest, SearchRequest};
-use crate::client::{DistillProgress, DistillStreamLine};
 
 /// The router. `GET /health` and `GET /readiness` are open (probes and
 /// pools); every other route requires `Authorization: Bearer <token>`.
 pub fn app(state: Arc<DistillServerState>, token: BackendToken) -> Router {
     let protected = Router::new()
         .route("/distill", post(handle_distill))
-        .route("/distill/stream", post(handle_distill_stream))
         .route("/search", post(handle_search))
         .route("/status", get(handle_status))
         .route("/exists/{doc_id}", get(handle_exists))
@@ -205,47 +201,7 @@ async fn handle_distill(
         Ok(job) => job,
         Err(e) => return error_response(e),
     };
-    reply(state.run_index(job, |_| {}).await)
-}
-
-async fn handle_distill_stream(
-    State(state): State<Arc<DistillServerState>>,
-    Json(req): Json<IndexRequest>,
-) -> Response {
-    // A request that is wrong on its face is a 400 before any streaming
-    // starts, not a 200 whose only line is an error.
-    let job = match state.prepare_index(req) {
-        Ok(job) => job,
-        Err(e) => return error_response(e),
-    };
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
-
-    tokio::spawn(async move {
-        let tx_progress = tx.clone();
-        let on_progress = move |event: DistillProgress| {
-            let line: DistillStreamLine = hs_common::service::protocol::StreamLine::Progress(event);
-            if let Ok(json) = serde_json::to_string(&line) {
-                let _ = tx_progress.try_send(Ok(format!("{json}\n")));
-            }
-        };
-
-        let line: DistillStreamLine = match state.run_index(job, on_progress).await {
-            Ok(result) => hs_common::service::protocol::StreamLine::Result(result),
-            Err(e) => hs_common::service::protocol::StreamLine::Error(e.message),
-        };
-        if let Ok(json) = serde_json::to_string(&line) {
-            let _ = tx.send(Ok(format!("{json}\n"))).await;
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = Body::from_stream(stream);
-
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/x-ndjson")
-        .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    reply(state.run_index(job).await)
 }
 
 async fn handle_search(
@@ -258,9 +214,8 @@ async fn handle_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{DistillStreamLine, ReadinessResponse};
+    use crate::client::ReadinessResponse;
     use crate::testutil::{fake_state, prose, FakeOllama, FakeStore, OllamaMode};
-    use hs_common::service::protocol::StreamLine;
     use hs_common::stores::{ACADEMIC, PERSONAL};
 
     /// A real axum server on an ephemeral loopback port, over fakes.
@@ -335,17 +290,15 @@ mod tests {
         let file = dir.path().join("hostname.md");
         std::fs::write(&file, "UNIQUE-SECRET-TEXT ".repeat(40)).unwrap();
 
-        for route in ["/distill", "/distill/stream"] {
-            for body in [
-                serde_json::json!({ "path": file }),
-                serde_json::json!({ "path": file, "content": null }),
-            ] {
-                let resp = h.post(route, body).await;
-                assert_eq!(resp.status(), 400, "{route}");
-                let text = resp.text().await.unwrap();
-                assert!(text.contains("content"), "{route}: {text}");
-                assert!(!text.contains("UNIQUE-SECRET"), "{route}: {text}");
-            }
+        for body in [
+            serde_json::json!({ "path": file }),
+            serde_json::json!({ "path": file, "content": null }),
+        ] {
+            let resp = h.post("/distill", body).await;
+            assert_eq!(resp.status(), 400);
+            let text = resp.text().await.unwrap();
+            assert!(text.contains("content"), "{text}");
+            assert!(!text.contains("UNIQUE-SECRET"), "{text}");
         }
         assert!(h.ollama.http.recorded().is_empty());
         assert_eq!(h.store.ops(), []);
@@ -371,58 +324,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn distill_stream_emits_progress_then_a_result_line() {
-        let h = start().await;
-        let text = h
-            .post(
-                "/distill/stream",
-                serde_json::json!({ "path": "doc.md", "content": prose(6), "store": ACADEMIC }),
-            )
-            .await
-            .text()
-            .await
-            .unwrap();
-        let lines: Vec<DistillStreamLine> = text
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-        assert!(lines.len() >= 2, "{text}");
-        assert!(matches!(lines[0], StreamLine::Progress(_)));
-        match lines.last().unwrap() {
-            StreamLine::Result(r) => assert_eq!(r.doc_id, "doc"),
-            other => panic!("last line should be the result: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_failure_after_streaming_started_is_an_error_line() {
-        let h = start().await;
-        h.store.state.lock().fail_write_from_call = Some(0);
-        let text = h
-            .post(
-                "/distill/stream",
-                serde_json::json!({ "path": "doc.md", "content": prose(6), "store": ACADEMIC }),
-            )
-            .await
-            .text()
-            .await
-            .unwrap();
-        let last: DistillStreamLine = serde_json::from_str(text.lines().last().unwrap()).unwrap();
-        assert!(matches!(last, StreamLine::Error(_)), "{text}");
-    }
-
-    #[tokio::test]
     async fn an_unknown_store_is_400_on_every_route_and_touches_nothing() {
         let h = start().await;
         let q = "store=made_up";
         let responses = vec![
             h.post(
                 "/distill",
-                serde_json::json!({"path":"a.md","content":"x","store":"made_up"}),
-            )
-            .await,
-            h.post(
-                "/distill/stream",
                 serde_json::json!({"path":"a.md","content":"x","store":"made_up"}),
             )
             .await,
@@ -473,11 +380,6 @@ mod tests {
         let responses = vec![
             h.post("/distill", serde_json::json!({"path":"a.md","content":"x"}))
                 .await,
-            h.post(
-                "/distill/stream",
-                serde_json::json!({"path":"a.md","content":"x"}),
-            )
-            .await,
             h.http.get(h.url("/status")).send().await.unwrap(),
             h.http.get(h.url("/exists/d")).send().await.unwrap(),
             h.http.get(h.url("/docs")).send().await.unwrap(),
@@ -767,7 +669,6 @@ mod tests {
     fn protected_routes() -> Vec<(&'static str, &'static str)> {
         vec![
             ("POST", "/distill"),
-            ("POST", "/distill/stream"),
             ("POST", "/search"),
             ("GET", "/status"),
             ("GET", "/exists/d"),
@@ -833,7 +734,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_indexing_panic_is_a_typed_500_on_both_routes_and_the_server_survives() {
+    async fn an_indexing_panic_is_a_typed_500_and_the_server_survives() {
         let h = start().await;
         h.store.state.lock().panic_on_write = true;
 
@@ -845,21 +746,6 @@ mod tests {
             .await;
         assert_eq!(resp.status(), 500);
         assert_eq!(resp.headers()["x-hs-error-code"], crate::api::PANIC_CODE);
-
-        let text = h
-            .post(
-                "/distill/stream",
-                serde_json::json!({"path":"boom.md","content":prose(6),"store":ACADEMIC}),
-            )
-            .await
-            .text()
-            .await
-            .unwrap();
-        let last: DistillStreamLine = serde_json::from_str(text.lines().last().unwrap()).unwrap();
-        match last {
-            StreamLine::Error(m) => assert!(m.starts_with(crate::api::PANIC_CODE), "{m}"),
-            other => panic!("expected an error line: {other:?}"),
-        }
 
         // The client sees a typed, permanent rejection.
         let client = crate::client::DistillClient::new_with_client(

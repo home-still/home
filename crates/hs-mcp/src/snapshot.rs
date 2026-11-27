@@ -17,6 +17,20 @@ fn split_result<T, E: std::fmt::Display>(r: Result<T, E>) -> (Option<T>, Option<
     }
 }
 
+/// What a pool's in-flight total is when some members did not report: the
+/// sum when every one did, otherwise unknown. A scribe whose readiness call
+/// failed is not idle, so it must not be counted as zero.
+fn total_in_flight_reported(reports: &[Option<u64>]) -> Option<u64> {
+    reports
+        .iter()
+        .copied()
+        .try_fold(0u64, |total, r| r.map(|n| total + n))
+}
+
+/// What a service that answered `/health` but not `/readiness` shows in
+/// place of `idle`.
+const IN_FLIGHT_UNAVAILABLE: &str = "in-flight count unavailable";
+
 /// `"health: <why>; readiness: <why>"` for the calls that failed; `None`
 /// when none did. Carried into the system snapshot so an unhealthy instance
 /// says why.
@@ -189,6 +203,8 @@ impl HomeStillMcp {
             let in_flight = readiness.as_ref().map(|r| r.in_flight as u64).unwrap_or(0);
             let activity = if !healthy {
                 format!("unhealthy: {}", health_err.as_deref().unwrap_or("unknown"))
+            } else if readiness.is_none() {
+                IN_FLIGHT_UNAVAILABLE.to_string()
             } else if in_flight > 0 {
                 format!("{in_flight} embedding")
             } else {
@@ -235,6 +251,7 @@ impl HomeStillMcp {
 
         // Per-scribe health fanout.
         let mut scribe_instances: Vec<ServiceInstance> = Vec::new();
+        let mut scribe_in_flight_reports: Vec<Option<u64>> = Vec::new();
         for url in &self.scribe_servers {
             let client = match hs_scribe::client::ScribeClient::new(url) {
                 Ok(c) => c,
@@ -257,6 +274,8 @@ impl HomeStillMcp {
                 .as_ref()
                 .map(|h| h.version.clone())
                 .unwrap_or_default();
+            scribe_in_flight_reports
+                .push(readiness.as_ref().map(|r| r.in_flight_conversions as u64));
             let (in_flight, slots_total, slots_available) = match readiness.as_ref() {
                 Some(r) => (
                     r.in_flight_conversions as u64,
@@ -277,6 +296,8 @@ impl HomeStillMcp {
                     "unhealthy: {}",
                     health_err.as_deref().unwrap_or("status not ok")
                 )
+            } else if readiness.is_none() {
+                IN_FLIGHT_UNAVAILABLE.to_string()
             } else if in_flight > 0 {
                 format!("{in_flight} converting")
             } else {
@@ -453,7 +474,7 @@ impl HomeStillMcp {
         pipeline.pipeline_drift_threshold = hs_common::status::PIPELINE_DRIFT_THRESHOLD;
         pipeline.failed_conversions = failed_conversions;
         pipeline.inbox_pending = inbox_pending;
-        pipeline.in_flight_conversions = Some(total_in_flight);
+        pipeline.in_flight_conversions = total_in_flight_reported(&scribe_in_flight_reports);
 
         // History from the catalog — same source and same default filter as
         // `catalog_recent` so the two activity feeds can never disagree.
@@ -488,6 +509,19 @@ impl HomeStillMcp {
             inbox_heartbeat,
             generated_at: Some(chrono::Utc::now().to_rfc3339()),
         }
+    }
+}
+
+#[cfg(test)]
+mod in_flight_total_tests {
+    use super::*;
+
+    #[test]
+    fn a_scribe_that_did_not_report_makes_the_total_unknown_not_smaller() {
+        assert_eq!(total_in_flight_reported(&[Some(2), Some(1)]), Some(3));
+        assert_eq!(total_in_flight_reported(&[Some(2), None]), None);
+        assert_eq!(total_in_flight_reported(&[None]), None);
+        assert_eq!(total_in_flight_reported(&[]), Some(0));
     }
 }
 

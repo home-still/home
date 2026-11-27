@@ -25,13 +25,35 @@ const ANSI_RESET: &str = "\x1b[0m";
 pub struct TtyReporter {
     mp: MultiProgress,
     use_color: bool,
+    /// Where a line goes when `mp` has no terminal to draw on.
+    undrawn_sink: UndrawnSink,
 }
+
+/// Receives each line the reporter could not draw (see [`TtyReporter::emit`]).
+type UndrawnSink = Box<dyn Fn(&str) + Send + Sync>;
 
 impl TtyReporter {
     pub fn new(use_color: bool) -> Self {
         Self {
             mp: MultiProgress::new(),
             use_color,
+            undrawn_sink: Box::new(|line| eprintln!("{line}")),
+        }
+    }
+
+    /// Print one line above the progress bars.
+    ///
+    /// `MultiProgress` draws nothing when stderr is not an interactive
+    /// terminal (`TERM=dumb`, a pipe or file under `--color never`, ...), and
+    /// its `println` is then a silent no-op: a status or error line vanished
+    /// and the command looked like it printed nothing. Without a terminal
+    /// there are no bars to keep clear of, so the line goes straight to
+    /// stderr.
+    fn emit(&self, line: String) {
+        if self.mp.is_hidden() {
+            (self.undrawn_sink)(&line);
+        } else {
+            let _ = self.mp.println(line);
         }
     }
 }
@@ -39,31 +61,25 @@ impl TtyReporter {
 impl Reporter for TtyReporter {
     fn status(&self, verb: &str, message: &str) {
         if self.use_color {
-            let _ = self
-                .mp
-                .println(format!("{:>12} {}", verb.green().bold(), message));
+            self.emit(format!("{:>12} {}", verb.green().bold(), message));
         } else {
-            let _ = self.mp.println(format!("{:>12} {}", verb, message));
+            self.emit(format!("{:>12} {}", verb, message));
         }
     }
 
     fn warn(&self, message: &str) {
         if self.use_color {
-            let _ = self
-                .mp
-                .println(format!("{}: {}", "warning".yellow().bold(), message));
+            self.emit(format!("{}: {}", "warning".yellow().bold(), message));
         } else {
-            let _ = self.mp.println(format!("warning: {}", message));
+            self.emit(format!("warning: {}", message));
         }
     }
 
     fn error(&self, message: &str) {
         if self.use_color {
-            let _ = self
-                .mp
-                .println(format!("{}: {}", "error".red().bold(), message));
+            self.emit(format!("{}: {}", "error".red().bold(), message));
         } else {
-            let _ = self.mp.println(format!("error: {}", message));
+            self.emit(format!("error: {}", message));
         }
     }
 
@@ -179,11 +195,9 @@ impl Reporter for TtyReporter {
 
     fn finish(&self, summary: &str) {
         if self.use_color {
-            let _ = self
-                .mp
-                .println(format!("{:>12} {}", "Done".green().bold(), summary));
+            self.emit(format!("{:>12} {}", "Done".green().bold(), summary));
         } else {
-            let _ = self.mp.println(format!("{:>12} {}", "Done", summary));
+            self.emit(format!("{:>12} {}", "Done", summary));
         }
     }
 }
@@ -397,4 +411,46 @@ fn color_split_prefix(title: &str, fraction: f64, prefix_width: usize) -> String
 /// Color an entire prefix with a single ANSI style (for failed/skipped states).
 fn color_full_prefix(title: &str, ansi_code: &str, _prefix_width: usize) -> String {
     format!("{}{}{}", ansi_code, title, ANSI_RESET)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use indicatif::ProgressDrawTarget;
+
+    use super::*;
+
+    /// A plain reporter whose draw target is hidden, as it is when stderr is
+    /// not an interactive terminal, and the lines it could not draw.
+    fn undrawn_reporter() -> (TtyReporter, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink_lines = Arc::clone(&lines);
+        let reporter = TtyReporter {
+            mp: MultiProgress::with_draw_target(ProgressDrawTarget::hidden()),
+            use_color: false,
+            undrawn_sink: Box::new(move |line| sink_lines.lock().unwrap().push(line.to_string())),
+        };
+        (reporter, lines)
+    }
+
+    #[test]
+    fn every_line_is_printed_when_there_is_no_terminal_to_draw_on() {
+        let (reporter, lines) = undrawn_reporter();
+
+        reporter.status("Scan", "store academic");
+        reporter.warn("slow disk");
+        reporter.error("Error: no such stem");
+        reporter.finish("Word boxes — missing=1");
+
+        assert_eq!(
+            *lines.lock().unwrap(),
+            [
+                "        Scan store academic",
+                "warning: slow disk",
+                "error: Error: no such stem",
+                "        Done Word boxes — missing=1",
+            ]
+        );
+    }
 }

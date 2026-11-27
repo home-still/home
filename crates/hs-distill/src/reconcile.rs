@@ -102,6 +102,24 @@ fn is_intentional_skip(reason: Option<&str>) -> bool {
     reason.is_some() && !is_embed_failure(reason)
 }
 
+/// Document ids the store holds that storage holds no markdown for, sorted.
+///
+/// `partition` walks storage → store, so it cannot see these: a document
+/// whose records outlived its markdown (or never had any in this storage)
+/// is invisible to it. Ids are compared exactly, letter case included: an id
+/// that differs from a stem only in case is a different document, so the
+/// store's copy is store-only.
+pub fn store_only_docs(markdown_stems: &[String], indexed_docs: &HashSet<String>) -> Vec<String> {
+    let in_storage: HashSet<&str> = markdown_stems.iter().map(String::as_str).collect();
+    let mut only: Vec<String> = indexed_docs
+        .iter()
+        .filter(|id| !in_storage.contains(id.as_str()))
+        .cloned()
+        .collect();
+    only.sort();
+    only
+}
+
 /// Counts for each bucket. Used for the reconcile summary report.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileCounts {
@@ -135,6 +153,40 @@ mod tests {
 
     fn stems(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_store_only_id_is_reported() {
+        let md = stems(&["a", "b"]);
+        let indexed = s(&["a", "b", "orphan"]);
+        assert_eq!(store_only_docs(&md, &indexed), vec!["orphan".to_string()]);
+    }
+
+    #[test]
+    fn an_id_differing_only_in_case_is_store_only() {
+        let md = stems(&["10.1000_abc"]);
+        let indexed = s(&["10.1000_ABC"]);
+        assert_eq!(
+            store_only_docs(&md, &indexed),
+            vec!["10.1000_ABC".to_string()]
+        );
+    }
+
+    #[test]
+    fn ids_present_on_both_sides_are_not_store_only() {
+        let md = stems(&["a", "b", "only_in_storage"]);
+        let indexed = s(&["a", "b"]);
+        assert!(store_only_docs(&md, &indexed).is_empty());
+    }
+
+    #[test]
+    fn store_only_ids_come_back_sorted() {
+        let md = stems(&["a"]);
+        let indexed = s(&["z", "a", "m"]);
+        assert_eq!(
+            store_only_docs(&md, &indexed),
+            vec!["m".to_string(), "z".to_string()]
+        );
     }
 
     #[test]

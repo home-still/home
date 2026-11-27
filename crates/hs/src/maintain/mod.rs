@@ -17,6 +17,7 @@ use hs_distill::config::DistillClientConfig;
 pub(crate) mod backfill_titles;
 pub(crate) mod dedupe_url_encoded;
 pub(crate) mod distill_backfill;
+pub(crate) mod purge;
 pub(crate) mod reindex;
 pub(crate) mod repair_catalog;
 pub(crate) mod scan_repetitions;

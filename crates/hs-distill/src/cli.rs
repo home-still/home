@@ -118,11 +118,16 @@ pub enum DistillCmd {
         #[arg(long)]
         threshold: Option<usize>,
     },
-    /// Delete every stored chunk for a doc_id. CLI-only (no MCP) because
-    /// this is a destructive write — use to clear orphaned chunks after
-    /// markdown has been removed, or to force a clean re-index.
+    /// Delete one document from a store: its records in the search index
+    /// and every object storage holds for it (source, markdown, catalog
+    /// entry, word boxes). CLI-only (no MCP) because this is a destructive
+    /// write. Asks for confirmation unless `--yes` is given.
     Purge {
-        /// doc_id whose chunks should be deleted
+        /// The store the document is in. Only a store that holds documents
+        /// of its own is accepted; a refusal names them
+        #[arg(long)]
+        store: String,
+        /// doc_id of the document to delete
         doc_id: String,
         /// Override server URL
         #[arg(long)]

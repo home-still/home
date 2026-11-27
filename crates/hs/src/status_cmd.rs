@@ -22,12 +22,14 @@ struct DashboardData {
     catalog_count: Option<u64>,
     /// Catalog rows stamped `conversion_failed`, by what a retry can do.
     failed: Option<FailedConversions>,
-    embedded_docs: u64,
-    embedded_chunks: u64,
+    /// `(documents, chunks)` the distill server holds, or why it could not
+    /// say. An unread count is never zero: zero is a real corpus size.
+    embedded: Result<(u64, u64), String>,
     /// Catalog rows stamped `embedding_skip` (zero-chunk / junk-HTML).
     /// Excluded from the Embedded-% denominator so the bar reflects
-    /// embeddable docs, not intentional skips.
-    embedding_skipped: u64,
+    /// embeddable docs, not intentional skips. `None` = the catalog could
+    /// not be read.
+    embedding_skipped: Option<u64>,
     /// Files sitting in `papers/manually_downloaded/` waiting for the
     /// next sweep. `None` on the loading frame before the first snapshot
     /// arrives; `Some(0)` once a real snapshot confirms empty.
@@ -69,6 +71,48 @@ struct DashboardData {
 /// queue depth nor a queue error.
 const QUEUE_SERVER_TOO_OLD: &str = "MCP server predates queue reporting — upgrade it";
 
+/// Why the Embedded count is unknown on a frame no server snapshot reached.
+const EMBEDDED_NOT_READ: &str = "no status from the MCP server";
+
+/// Why the Embedded count is unknown when the snapshot carries none and no
+/// distill server is configured.
+const NO_DISTILL_SERVER: &str = "no distill server configured";
+
+/// Shown for In-flight when a snapshot arrived but a scribe did not report
+/// its in-flight count.
+const IN_FLIGHT_UNKNOWN: &str = "a scribe did not report its in-flight count";
+
+/// The error a distill instance recorded for its `status` call.
+const DISTILL_STATUS_ERROR_PREFIX: &str = "status: ";
+
+/// Separator `join_call_errors` puts between the per-call errors.
+const CALL_ERROR_SEPARATOR: &str = "; ";
+
+/// Why the embedded counts are unknown: what each distill server said when
+/// asked for its `status`, falling back to its whole error.
+fn embedded_unread_reason(distill: &[hs_common::status::ServiceInstance]) -> String {
+    let reasons: Vec<String> = distill
+        .iter()
+        .filter_map(|inst| {
+            let err = inst.error.as_deref()?;
+            let status_err = err
+                .split(CALL_ERROR_SEPARATOR)
+                .find_map(|part| part.strip_prefix(DISTILL_STATUS_ERROR_PREFIX))
+                .unwrap_or(err);
+            Some(format!("{}: {status_err}", inst.url))
+        })
+        .collect();
+    if reasons.is_empty() {
+        if distill.is_empty() {
+            NO_DISTILL_SERVER.to_string()
+        } else {
+            "the distill server sent no counts".to_string()
+        }
+    } else {
+        reasons.join(CALL_ERROR_SEPARATOR)
+    }
+}
+
 impl DashboardData {
     /// A server that reports the queue always sets `queued_conversions` or
     /// `queue_error` once it has built a snapshot, so neither being set on a
@@ -87,7 +131,13 @@ impl DashboardData {
         self.catalog_count = new.catalog_count.or(self.catalog_count);
         self.failed = new.failed.or(self.failed.take());
         self.inbox_pending = new.inbox_pending.or(self.inbox_pending);
-        self.in_flight_conversions = new.in_flight_conversions.or(self.in_flight_conversions);
+        // A real snapshot that could not total the in-flight work says
+        // so; only a frame that never reached a server keeps the old value.
+        self.in_flight_conversions = if new.snapshot_received {
+            new.in_flight_conversions
+        } else {
+            new.in_flight_conversions.or(self.in_flight_conversions)
+        };
         // Not carried over: a stale "queue empty" would hide a broker outage.
         self.queued_conversions = new.queued_conversions;
         self.stalled_conversions = new.stalled_conversions;
@@ -102,8 +152,7 @@ impl DashboardData {
         self.store_url = new.store_url;
         self.store_name = new.store_name;
         self.store_version = new.store_version;
-        self.embedded_docs = new.embedded_docs;
-        self.embedded_chunks = new.embedded_chunks;
+        self.embedded = new.embedded;
         self.embedding_skipped = new.embedding_skipped;
         self.watcher = new.watcher;
         self.history = new.history;
@@ -119,9 +168,8 @@ impl DashboardData {
             markdown_counts: None,
             catalog_count: None,
             failed: None,
-            embedded_docs: 0,
-            embedded_chunks: 0,
-            embedding_skipped: 0,
+            embedded: Err(EMBEDDED_NOT_READ.to_string()),
+            embedding_skipped: None,
             inbox_pending: None,
             in_flight_conversions: None,
             queued_conversions: None,
@@ -262,6 +310,15 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         })
         .collect();
 
+    // A count nobody read is unknown, never zero.
+    let embedded = match (
+        snap.pipeline.embedded_documents,
+        snap.pipeline.embedded_chunks,
+    ) {
+        (Some(docs), Some(chunks)) => Ok((docs, chunks)),
+        _ => Err(embedded_unread_reason(&snap.distill_instances)),
+    };
+
     // Counts the storage layer could not take are unknown, not zero.
     let counts_ok = snap.pipeline.counts_error.is_none();
     DashboardData {
@@ -270,9 +327,8 @@ fn snapshot_to_dashboard(snap: hs_common::status::StatusSnapshot) -> DashboardDa
         catalog_count: counts_ok.then_some(snap.pipeline.catalog_entries),
         counts_error: snap.pipeline.counts_error.clone(),
         failed: snap.pipeline.failed_conversions.clone(),
-        embedded_docs: snap.pipeline.embedded_documents.unwrap_or(0),
-        embedded_chunks: snap.pipeline.embedded_chunks.unwrap_or(0),
-        embedding_skipped: snap.pipeline.embedding_skipped.unwrap_or(0),
+        embedded,
+        embedding_skipped: snap.pipeline.embedding_skipped,
         inbox_pending: snap.pipeline.inbox_pending,
         in_flight_conversions: snap.pipeline.in_flight_conversions,
         queued_conversions: snap.pipeline.queued_conversions,
@@ -504,12 +560,40 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
     // stamped `embedding_skip` (zero-chunk HTML stubs etc.). Those docs
     // count toward markdown but will never be embedded, so including
     // them in the denominator makes the bar permanently under 100%.
-    let embeddable = markdown_count.saturating_sub(data.embedding_skipped);
-    let md_to_embed = if embeddable > 0 {
-        (data.embedded_docs as f64 / embeddable as f64).min(1.0)
-    } else {
-        0.0
+    // Unknown (None) when the embedded count, the markdown count or the
+    // skip count was not read: a percentage of an unread number is blank.
+    let md_to_embed: Option<f64> =
+        match (&data.embedded, data.markdown_counts, data.embedding_skipped) {
+            (Ok((embedded_docs, _)), Some((markdown_total, _)), Some(skipped)) => {
+                let embeddable = markdown_total.saturating_sub(skipped);
+                Some(if embeddable > 0 {
+                    (*embedded_docs as f64 / embeddable as f64).min(1.0)
+                } else {
+                    0.0
+                })
+            }
+            _ => None,
+        };
+    let embedded_row = match &data.embedded {
+        Ok((docs, chunks)) => [
+            Cell::from(format!("{docs:>6}")).style(if *docs > 0 {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default()
+            }),
+            Cell::from(match data.embedding_skipped {
+                Some(skipped) if skipped > 0 => {
+                    format!("{chunks:>5} chunks · {skipped} skipped")
+                }
+                _ => format!("{chunks:>5} chunks"),
+            }),
+        ],
+        Err(reason) => [
+            Cell::from("unknown").style(Style::default().fg(Color::Yellow)),
+            Cell::from(reason.clone()).style(Style::default().fg(Color::Yellow)),
+        ],
     };
+    let [embedded_count_cell, embedded_detail_cell] = embedded_row;
 
     // Helper: show "Scanning..." when None, count when Some.
     let scanning = if data.counts_error.is_some() {
@@ -564,25 +648,18 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
         ]),
         Row::new(vec![
             Cell::from("Embedded"),
-            Cell::from(format!("{:>6}", data.embedded_docs)).style(if data.embedded_docs > 0 {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default()
+            embedded_count_cell,
+            embedded_detail_cell,
+            Cell::from(match md_to_embed {
+                Some(ratio) => format!("{:>5.1}%", ratio * 100.0),
+                None => String::new(),
             }),
-            Cell::from(if data.embedding_skipped > 0 {
-                format!(
-                    "{:>5} chunks · {} skipped",
-                    data.embedded_chunks, data.embedding_skipped
-                )
-            } else {
-                format!("{:>5} chunks", data.embedded_chunks)
-            }),
-            Cell::from(format!("{:>5.1}%", md_to_embed * 100.0)),
         ]),
         Row::new(vec![
             Cell::from("In-flight"),
             Cell::from(match data.in_flight_conversions {
                 Some(n) => format!("{n:>6}"),
+                None if data.snapshot_received => "     ?".to_string(),
                 None => scanning.clone(),
             })
             .style(match data.in_flight_conversions {
@@ -600,6 +677,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, data: &DashboardData) {
                     }
                 ),
                 Some(_) => "idle".to_string(),
+                None if data.snapshot_received => IN_FLIGHT_UNKNOWN.to_string(),
                 None => String::new(),
             }),
             Cell::from(""),
@@ -1146,6 +1224,16 @@ fn status_json_text(snapshot: &serde_json::Value, ndjson: bool) -> Result<String
     })
 }
 
+/// The text rendering of the Embedded count: the numbers, or `unknown`
+/// with the reason they could not be read. Never `0 docs` for a count
+/// nobody read.
+fn embedded_text(embedded: &Result<(u64, u64), String>) -> String {
+    match embedded {
+        Ok((docs, chunks)) => format!("{docs} docs, {chunks} chunks"),
+        Err(reason) => format!("unknown ({reason})"),
+    }
+}
+
 async fn run_oneshot_text() -> Result<()> {
     // A status command that cannot get the status fails (non-zero exit); only
     // the interactive dashboard keeps going with a "status unavailable" banner.
@@ -1165,10 +1253,7 @@ async fn run_oneshot_text() -> Result<()> {
     if let Some(cat) = data.catalog_count {
         println!("  Cataloged : {cat}");
     }
-    println!(
-        "  Embedded  : {} docs, {} chunks",
-        data.embedded_docs, data.embedded_chunks
-    );
+    println!("  Embedded  : {}", embedded_text(&data.embedded));
     if let Some(f) = &data.failed {
         for line in failed_text_lines(f) {
             println!("  {line}");
@@ -1720,12 +1805,90 @@ mod tests {
         snap.pipeline.documents = 200;
         snap.pipeline.markdown = 100;
         snap.pipeline.embedded_documents = Some(90);
+        snap.pipeline.embedded_chunks = Some(900);
         snap.pipeline.embedding_skipped = Some(10);
         let mut shown = DashboardData::blank(true, None);
         shown.absorb(snapshot_to_dashboard(snap));
         let screen = draw(&shown);
         assert!(screen.contains("10 skipped"), "{screen}");
         assert!(screen.contains("100.0%"), "{screen}");
+    }
+
+    fn distill_instance(url: &str, error: Option<&str>) -> hs_common::status::ServiceInstance {
+        hs_common::status::ServiceInstance {
+            url: url.to_string(),
+            error: error.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    /// The distill server timed out on `/status`: the snapshot carries no
+    /// embedded counts, and the dashboard must say so rather than print
+    /// `0 docs, 0 chunks` for a store that holds thousands.
+    #[test]
+    fn an_unread_embedded_count_is_unknown_in_text_and_on_screen() {
+        let mut snap = snapshot_with(Some(0), Some(0), None);
+        snap.pipeline.documents = 200;
+        snap.pipeline.markdown = 100;
+        snap.pipeline.embedding_skipped = Some(0);
+        snap.distill_instances.push(distill_instance(
+            "http://distill.example.local:7434",
+            Some("health: ok; status: timed out after 5s"),
+        ));
+        let data = snapshot_to_dashboard(snap);
+
+        let text = embedded_text(&data.embedded);
+        assert_eq!(
+            text,
+            "unknown (http://distill.example.local:7434: timed out after 5s)"
+        );
+        assert!(!text.contains("0 docs"), "{text}");
+
+        let screen = draw(&data);
+        assert!(screen.contains("unknown"), "{screen}");
+        assert!(!screen.contains("0 chunks"), "{screen}");
+        // The Embedded percentage is blank, not 0.0%: only Markdown shows
+        // a percentage (0.0% of 200 is not what is on this row).
+        assert!(!screen.contains("  0.0%"), "{screen}");
+    }
+
+    #[test]
+    fn a_read_embedded_count_of_zero_is_still_zero() {
+        let mut snap = snapshot_with(Some(0), Some(0), None);
+        snap.pipeline.embedded_documents = Some(0);
+        snap.pipeline.embedded_chunks = Some(0);
+        let data = snapshot_to_dashboard(snap);
+        assert_eq!(embedded_text(&data.embedded), "0 docs, 0 chunks");
+    }
+
+    #[test]
+    fn the_unknown_reason_names_the_missing_server_when_none_is_configured() {
+        let data = snapshot_to_dashboard(snapshot_with(Some(0), Some(0), None));
+        assert_eq!(
+            embedded_text(&data.embedded),
+            format!("unknown ({NO_DISTILL_SERVER})")
+        );
+        let before_any_snapshot = DashboardData::blank(false, Some("down".into()));
+        assert_eq!(
+            embedded_text(&before_any_snapshot.embedded),
+            format!("unknown ({EMBEDDED_NOT_READ})")
+        );
+    }
+
+    /// A snapshot whose scribe could not report in-flight work carries no
+    /// total; the row says so instead of reading as an idle pool, and the
+    /// next frame must not paper over it with the previous frame's number.
+    #[test]
+    fn an_unreported_in_flight_total_is_unknown_and_not_carried_over() {
+        let mut shown = DashboardData::blank(true, None);
+        let mut first = snapshot_with(Some(0), Some(0), None);
+        first.pipeline.in_flight_conversions = Some(3);
+        shown.absorb(snapshot_to_dashboard(first));
+        assert_eq!(shown.in_flight_conversions, Some(3));
+
+        shown.absorb(snapshot_to_dashboard(snapshot_with(Some(0), Some(0), None)));
+        assert_eq!(shown.in_flight_conversions, None);
+        assert!(draw(&shown).contains(IN_FLIGHT_UNKNOWN));
     }
 
     #[test]

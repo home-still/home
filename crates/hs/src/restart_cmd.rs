@@ -415,7 +415,7 @@ async fn restart_systemd_unit(unit: &ServiceUnit) -> Result<(), String> {
         ));
     }
 
-    verify_systemd_unit(unit).await
+    verify_systemd_unit(&SystemSystemctl, unit).await
 }
 
 /// How long a just-restarted unit is given to settle before its verification
@@ -425,40 +425,176 @@ async fn restart_systemd_unit(unit: &ServiceUnit) -> Result<(), String> {
 const VERIFY_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const VERIFY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Re-read the unit until it is `active` on the binary we are meant to be
-/// running. Without this an upgrade can replace a binary, fail to re-exec it,
-/// and still print OK.
-async fn verify_systemd_unit(unit: &ServiceUnit) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + VERIFY_SETTLE_TIMEOUT;
-    loop {
-        match inspect_systemd_unit(unit).await {
-            Ok(()) => return Ok(()),
-            Err(failure) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(failure);
-                }
-                tokio::time::sleep(VERIFY_POLL_INTERVAL).await;
-            }
-        }
+/// How long the process that came up must keep running before the restart is
+/// called good: the same pid, still running the installed binary, after this
+/// long. A service that dies right after starting has a pid at the instant
+/// the restart is checked (BACKLOG P1-51: a LaunchAgent exited a second after
+/// each start and was reported `OK` 34 times), so "has a pid" proves nothing.
+///
+/// Chosen from launchd's default `ThrottleInterval` of 10 s, which spaces
+/// respawns of a crashing job at least that far apart. Shorter than that, a
+/// crash shows as *no pid* until the throttle expires; longer, as a *new
+/// pid*. Either is a failure, so a respawn cannot pass for the service we
+/// started. systemd's default `RestartSec` is 100 ms, so any settle catches
+/// its respawns as a changed pid. One rule, both supervisors.
+const RESTART_STABLE_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The one stability rule: the pid seen right after the restart must still be
+/// the service's pid after [`RESTART_STABLE_SETTLE`]. `Err` says which way it
+/// failed; callers add the supervisor's own diagnosis (exit status, log).
+fn require_same_pid(label: &str, first: u32, later: Option<u32>) -> Result<(), String> {
+    let settle_secs = RESTART_STABLE_SETTLE.as_secs();
+    match later {
+        Some(pid) if pid == first => Ok(()),
+        Some(pid) => Err(format!(
+            "{label}: unstable after restart — pid {first} was replaced by pid {pid} within \
+             {settle_secs}s, so it is crash-looping"
+        )),
+        None => Err(format!(
+            "{label}: unstable after restart — pid {first} exited within {settle_secs}s of starting"
+        )),
     }
 }
 
-/// One verification attempt. `Err` is why this attempt did not pass.
-async fn inspect_systemd_unit(unit: &ServiceUnit) -> Result<(), String> {
-    let mut cmd = tokio::process::Command::new("systemctl");
-    if unit.scope == UnitScope::User {
-        cmd.arg("--user");
+/// What `systemctl show` says about the unit's executable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum UnitExe {
+    /// Not checked on this platform.
+    NotChecked,
+    /// `/proc/<pid>/exe` could not be read.
+    Unreadable,
+    Path(PathBuf),
+}
+
+/// One reading of a systemd unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnitReading {
+    state: String,
+    /// `MainPID`; 0 = nothing is running under the unit.
+    pid: u32,
+    exe: UnitExe,
+    /// `Result=…, ExecMainStatus=…`: how the last run of the main process
+    /// ended.
+    last_exit: String,
+}
+
+/// The commands [`verify_systemd_unit`] issues, so the settle rule can be
+/// driven without systemd.
+trait SystemdRunner {
+    /// Read the unit. `Err` is "could not run `systemctl show`".
+    async fn read_unit(&self, unit: &ServiceUnit) -> Result<UnitReading, String>;
+    async fn sleep(&self, duration: std::time::Duration);
+}
+
+struct SystemSystemctl;
+
+impl SystemdRunner for SystemSystemctl {
+    async fn read_unit(&self, unit: &ServiceUnit) -> Result<UnitReading, String> {
+        let mut cmd = tokio::process::Command::new("systemctl");
+        if unit.scope == UnitScope::User {
+            cmd.arg("--user");
+        }
+        cmd.args([
+            "show",
+            &unit.name,
+            "-p",
+            "ActiveState",
+            "-p",
+            "MainPID",
+            "-p",
+            "Result",
+            "-p",
+            "ExecMainStatus",
+        ]);
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| format!("{}: systemctl show failed: {e}", unit.name))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let pid = property(&stdout, "MainPID")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        #[cfg(target_os = "linux")]
+        let exe = if pid != 0 {
+            match std::fs::read_link(format!("/proc/{pid}/exe")) {
+                Ok(path) => UnitExe::Path(path),
+                Err(_) => UnitExe::Unreadable,
+            }
+        } else {
+            UnitExe::NotChecked
+        };
+        #[cfg(not(target_os = "linux"))]
+        let exe = UnitExe::NotChecked;
+        Ok(UnitReading {
+            state: property(&stdout, "ActiveState")
+                .unwrap_or("unknown")
+                .to_string(),
+            pid,
+            exe,
+            last_exit: format!(
+                "Result={}, ExecMainStatus={}",
+                property(&stdout, "Result").unwrap_or("unknown"),
+                property(&stdout, "ExecMainStatus").unwrap_or("unknown")
+            ),
+        })
     }
-    cmd.args(["show", &unit.name, "-p", "ActiveState", "-p", "MainPID"]);
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("{}: systemctl show failed: {e}", unit.name))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let state = property(&stdout, "ActiveState").unwrap_or("unknown");
-    let pid = property(&stdout, "MainPID").unwrap_or("0");
+    async fn sleep(&self, duration: std::time::Duration) {
+        tokio::time::sleep(duration).await;
+    }
+}
 
+/// Re-read the unit until it is `active` on the binary we are meant to be
+/// running, then require that same process to still be running after
+/// [`RESTART_STABLE_SETTLE`]. Without the first half an upgrade can replace a
+/// binary, fail to re-exec it, and still print OK; without the second, a
+/// service that dies a second after starting passes too.
+async fn verify_systemd_unit<R: SystemdRunner>(
+    runner: &R,
+    unit: &ServiceUnit,
+) -> Result<(), String> {
+    let polls = (VERIFY_SETTLE_TIMEOUT.as_millis() / VERIFY_POLL_INTERVAL.as_millis()) as u32;
+    let mut attempt = 0;
+    let first_pid = loop {
+        attempt += 1;
+        let failure = match runner.read_unit(unit).await {
+            Ok(reading) => match judge_unit_reading(unit, &reading) {
+                Ok(pid) => break pid,
+                Err(failure) => failure,
+            },
+            Err(failure) => failure,
+        };
+        if attempt >= polls {
+            return Err(failure);
+        }
+        runner.sleep(VERIFY_POLL_INTERVAL).await;
+    };
+
+    // Nothing running under the unit (deliberately left stopped): nothing to
+    // keep alive.
+    if first_pid == 0 {
+        return Ok(());
+    }
+
+    runner.sleep(RESTART_STABLE_SETTLE).await;
+    let later = runner.read_unit(unit).await?;
+    let later_pid = (later.state == "active" && later.pid != 0).then_some(later.pid);
+    require_same_pid(&unit.name, first_pid, later_pid).map_err(|why| {
+        format!(
+            "{why} (ActiveState={}, {}) — try `journalctl -u {} -n 50`",
+            later.state, later.last_exit, unit.name
+        )
+    })
+}
+
+/// One verification attempt. `Ok` is the pid running the new binary (0 = none
+/// running); `Err` is why this attempt did not pass.
+fn judge_unit_reading(unit: &ServiceUnit, reading: &UnitReading) -> Result<u32, String> {
+    let UnitReading {
+        state, pid, exe, ..
+    } = reading;
     if state != "active" {
         return Err(format!(
             "{}: still not running the new binary after restart (ActiveState={state}, MainPID={pid})",
@@ -468,23 +604,27 @@ async fn inspect_systemd_unit(unit: &ServiceUnit) -> Result<(), String> {
 
     // `MainPID=0` means nothing is running under the unit (fine for units we
     // deliberately left stopped); otherwise the exe must be the new binary.
-    #[cfg(target_os = "linux")]
-    if pid != "0" {
+    if *pid != 0 {
         let expected = canonical_or(&unit.exec_path);
-        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
-        let running = exe.as_deref().map(canonical_or);
+        let running = match exe {
+            UnitExe::NotChecked => Some(expected.clone()),
+            UnitExe::Unreadable => None,
+            UnitExe::Path(path) => Some(canonical_or(path)),
+        };
         if running.as_deref() != Some(expected.as_path()) {
             return Err(format!(
                 "{}: still not running the new binary after restart (ActiveState={state}, \
                  MainPID={pid}, exe={})",
                 unit.name,
-                exe.map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "unreadable".to_string())
+                match exe {
+                    UnitExe::Path(path) => path.display().to_string(),
+                    _ => "unreadable".to_string(),
+                }
             ));
         }
     }
 
-    Ok(())
+    Ok(*pid)
 }
 
 /// Restart a LaunchAgent so it runs the plist and binary on disk now.
@@ -542,6 +682,8 @@ trait LaunchdRunner {
     async fn launchctl(&self, args: &[&str]) -> Result<LaunchctlExit, String>;
     /// Executable path of a running process.
     async fn exe_of(&self, pid: u32) -> Result<PathBuf, String>;
+    /// The last `max_bytes` of a file, lossily decoded.
+    async fn read_tail(&self, path: &Path, max_bytes: u64) -> Result<String, String>;
     async fn sleep(&self, duration: std::time::Duration);
 }
 
@@ -577,6 +719,21 @@ impl LaunchdRunner for SystemLaunchctl {
         Ok(PathBuf::from(comm))
     }
 
+    async fn read_tail(&self, path: &Path, max_bytes: u64) -> Result<String, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let read = || -> std::io::Result<Vec<u8>> {
+            let mut file = std::fs::File::open(path)?;
+            let len = file.metadata()?.len();
+            file.seek(SeekFrom::Start(len.saturating_sub(max_bytes)))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        read()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))
+    }
+
     async fn sleep(&self, duration: std::time::Duration) {
         tokio::time::sleep(duration).await;
     }
@@ -609,8 +766,19 @@ const LAUNCHD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_EXE_SETTLE_POLLS: u32 = 6;
 
+/// How much of a plist is read to find its `StandardErrorPath`.
+#[cfg(any(target_os = "macos", test))]
+const PLIST_READ_MAX_BYTES: u64 = 1_048_576;
+/// How much of the end of a job's stderr log is read for a failure report.
+#[cfg(any(target_os = "macos", test))]
+const STDERR_TAIL_MAX_BYTES: u64 = 8_192;
+/// How many of those bytes' last lines a failure report quotes.
+#[cfg(any(target_os = "macos", test))]
+const STDERR_TAIL_LINES: usize = 10;
+
 /// bootout → bootstrap (retrying the transient I/O error) → wait for a pid →
-/// require that pid to be running `expected`, the installed binary.
+/// require that pid to be running `expected`, the installed binary → require
+/// that same pid to still be running after [`RESTART_STABLE_SETTLE`].
 #[cfg(any(target_os = "macos", test))]
 async fn restart_launchd_job<R: LaunchdRunner>(
     runner: &R,
@@ -671,7 +839,9 @@ async fn restart_launchd_job<R: LaunchdRunner>(
         };
         with_pid += 1;
         let seen = match runner.exe_of(pid).await {
-            Ok(exe) if canonical_or(&exe) == expected_exe => return Ok(()),
+            Ok(exe) if canonical_or(&exe) == expected_exe => {
+                return require_launchd_stable(runner, &target, label, plist, pid).await;
+            }
             Ok(exe) => exe.display().to_string(),
             Err(e) => e,
         };
@@ -689,14 +859,79 @@ async fn restart_launchd_job<R: LaunchdRunner>(
     ))
 }
 
+/// After [`RESTART_STABLE_SETTLE`] the job must still have the pid that was
+/// seen running the installed binary. A job that exited (or that launchd
+/// respawned under a new pid) is reported with launchd's last exit status and
+/// the tail of the stderr log its plist names, which is where the reason is
+/// (`No route to host`, a missing config key).
+#[cfg(any(target_os = "macos", test))]
+async fn require_launchd_stable<R: LaunchdRunner>(
+    runner: &R,
+    target: &str,
+    label: &str,
+    plist: &Path,
+    first_pid: u32,
+) -> Result<(), String> {
+    runner.sleep(RESTART_STABLE_SETTLE).await;
+    let print = launchd_print(runner, target).await;
+    let later_pid = print
+        .as_ref()
+        .and_then(|out| parse_launchd_print_pid(&out.stdout));
+    let Err(why) = require_same_pid(label, first_pid, later_pid) else {
+        return Ok(());
+    };
+
+    let mut report = why;
+    match print
+        .as_ref()
+        .and_then(|out| parse_launchd_print_last_exit(&out.stdout))
+    {
+        Some(status) => report.push_str(&format!("; launchd last exit {status}")),
+        None => report.push_str("; launchd reports no last exit status"),
+    }
+    report.push_str(&launchd_stderr_report(runner, plist).await);
+    Err(report)
+}
+
+/// `; last stderr lines of <path>: …` for the stderr log the plist names, or
+/// why there is none to show.
+#[cfg(any(target_os = "macos", test))]
+async fn launchd_stderr_report<R: LaunchdRunner>(runner: &R, plist: &Path) -> String {
+    let plist_text = match runner.read_tail(plist, PLIST_READ_MAX_BYTES).await {
+        Ok(text) => text,
+        Err(e) => return format!("; no stderr to show ({e})"),
+    };
+    let Some(log) = parse_plist_string_value(&plist_text, "StandardErrorPath") else {
+        return "; its plist names no StandardErrorPath, so there is no stderr to show".to_string();
+    };
+    match runner
+        .read_tail(Path::new(&log), STDERR_TAIL_MAX_BYTES)
+        .await
+    {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            let tail = &lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..];
+            if tail.is_empty() {
+                format!("; {log} is empty")
+            } else {
+                format!("; last stderr lines of {log}: {}", tail.join(" | "))
+            }
+        }
+        Err(e) => format!("; no stderr to show ({e})"),
+    }
+}
+
+/// `launchctl print <target>`, `None` if the job is not loaded.
+#[cfg(any(target_os = "macos", test))]
+async fn launchd_print<R: LaunchdRunner>(runner: &R, target: &str) -> Option<LaunchctlExit> {
+    let out = runner.launchctl(&["print", target]).await.ok()?;
+    out.success().then_some(out)
+}
+
 /// The job's pid, `None` while launchd has not started it.
 #[cfg(any(target_os = "macos", test))]
 async fn launchd_pid<R: LaunchdRunner>(runner: &R, target: &str) -> Option<u32> {
-    let out = runner.launchctl(&["print", target]).await.ok()?;
-    if !out.success() {
-        return None;
-    }
-    parse_launchd_print_pid(&out.stdout)
+    parse_launchd_print_pid(&launchd_print(runner, target).await?.stdout)
 }
 
 // ── Pure helpers ───────────────────────────────────────────────
@@ -821,6 +1056,19 @@ fn parse_launchctl_list(stdout: &str) -> Vec<(Option<u32>, i32, String)> {
         .collect()
 }
 
+/// The `<string>` that follows `<key>{key}</key>` in a launchd plist.
+#[cfg(any(target_os = "macos", test))]
+fn parse_plist_string_value(plist: &str, key: &str) -> Option<String> {
+    let after = plist.split(&format!("<key>{key}</key>")).nth(1)?;
+    let value = after
+        .trim_start()
+        .strip_prefix("<string>")?
+        .split("</string>")
+        .next()?
+        .trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 /// Program path (first `ProgramArguments` string) of a launchd plist.
 #[cfg(any(target_os = "macos", test))]
 fn parse_plist_program_path(plist: &str) -> Option<PathBuf> {
@@ -866,6 +1114,21 @@ fn launchd_jobs(
         });
     }
     Ok(jobs)
+}
+
+/// The `last exit code = N` (or `last terminating signal = …`) line of
+/// `launchctl print`: how the job's previous run ended.
+#[cfg(any(target_os = "macos", test))]
+fn parse_launchd_print_last_exit(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("last exit code = ")
+            .map(|code| format!("code {}", code.trim()))
+            .or_else(|| {
+                line.strip_prefix("last terminating signal = ")
+                    .map(|sig| format!("signal {}", sig.trim()))
+            })
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1461,6 +1724,12 @@ mod tests {
         sleeps: std::cell::Cell<u32>,
         prints: std::cell::Cell<usize>,
         exe_reads: std::cell::Cell<usize>,
+        /// Sleeps of exactly `RESTART_STABLE_SETTLE`.
+        settles: std::cell::Cell<u32>,
+        /// `last exit code = N` that `launchctl print` shows.
+        last_exit: Option<i32>,
+        /// Files `read_tail` can read, by path.
+        files: Vec<(&'static str, &'static str)>,
     }
 
     impl FakeLaunchd {
@@ -1479,7 +1748,20 @@ mod tests {
                 sleeps: Default::default(),
                 prints: Default::default(),
                 exe_reads: Default::default(),
+                settles: Default::default(),
+                last_exit: None,
+                files: Vec::new(),
             }
+        }
+
+        fn with_last_exit(mut self, code: i32) -> Self {
+            self.last_exit = Some(code);
+            self
+        }
+
+        fn with_files(mut self, files: &[(&'static str, &'static str)]) -> Self {
+            self.files = files.to_vec();
+            self
         }
 
         fn calls(&self) -> Vec<String> {
@@ -1522,9 +1804,15 @@ mod tests {
                 "print" => {
                     let n = self.prints.get();
                     self.prints.set(n + 1);
+                    let last_exit = self
+                        .last_exit
+                        .map(|code| format!("\tlast exit code = {code}\n"))
+                        .unwrap_or_default();
                     match nth(&self.pids, n) {
-                        Some(pid) => Self::exit(0, format!("state = running\n\tpid = {pid}\n")),
-                        None => Self::exit(0, "state = waiting\n".to_string()),
+                        Some(pid) => {
+                            Self::exit(0, format!("state = running\n\tpid = {pid}\n{last_exit}"))
+                        }
+                        None => Self::exit(0, format!("state = waiting\n{last_exit}")),
                     }
                 }
                 other => panic!("unexpected launchctl {other}"),
@@ -1539,8 +1827,19 @@ mod tests {
                 .map_err(str::to_string)
         }
 
-        async fn sleep(&self, _duration: std::time::Duration) {
+        async fn read_tail(&self, path: &Path, _max_bytes: u64) -> Result<String, String> {
+            self.files
+                .iter()
+                .find(|(file, _)| Path::new(file) == path)
+                .map(|(_, text)| (*text).to_string())
+                .ok_or_else(|| format!("cannot read {}: not found", path.display()))
+        }
+
+        async fn sleep(&self, duration: std::time::Duration) {
             self.sleeps.set(self.sleeps.get() + 1);
+            if duration == RESTART_STABLE_SETTLE {
+                self.settles.set(self.settles.get() + 1);
+            }
         }
     }
 
@@ -1558,8 +1857,11 @@ mod tests {
                 format!("bootout {DOMAIN}/{LABEL}"),
                 format!("bootstrap {DOMAIN} {PLIST}"),
                 format!("print {DOMAIN}/{LABEL}"),
+                // The settle check: the same job is asked again.
+                format!("print {DOMAIN}/{LABEL}"),
             ]
         );
+        assert_eq!(fake.settles.get(), 1);
     }
 
     #[tokio::test]
@@ -1567,7 +1869,8 @@ mod tests {
         let fake = FakeLaunchd::new(0, &[5, 5, 0], &[Some(4242)], &[Ok(INSTALLED)]);
         restart(&fake).await.unwrap();
         assert_eq!(fake.bootstraps(), 3);
-        assert_eq!(fake.sleeps.get(), 2);
+        // Two bootstrap retries and the settle.
+        assert_eq!(fake.sleeps.get(), 3);
     }
 
     #[tokio::test]
@@ -1609,7 +1912,8 @@ mod tests {
     async fn a_pid_that_appears_after_respawns_is_waited_for() {
         let fake = FakeLaunchd::new(0, &[0], &[None, None, None, Some(4242)], &[Ok(INSTALLED)]);
         restart(&fake).await.unwrap();
-        assert_eq!(fake.sleeps.get(), 3);
+        // Three polls without a pid, then the settle.
+        assert_eq!(fake.sleeps.get(), 4);
     }
 
     #[tokio::test]
@@ -1638,6 +1942,193 @@ mod tests {
             &[Err("no such process"), Ok(INSTALLED)],
         );
         restart(&fake).await.unwrap();
+    }
+
+    const STDERR_LOG: &str = "/Users/u/Library/Logs/home-still/scribe-inbox.err.log";
+    const PLIST_WITH_STDERR: &str = "<plist><dict>\
+        <key>StandardErrorPath</key>\n<string>/Users/u/Library/Logs/home-still/scribe-inbox.err.log</string>\
+        </dict></plist>";
+
+    /// BACKLOG P1-51: the job had a pid right after the restart and exited a
+    /// second later; launchd respawned it every 10 s. The restart must fail
+    /// and say why, not print OK.
+    #[tokio::test]
+    async fn a_pid_that_is_gone_after_the_settle_fails_with_exit_status_and_stderr() {
+        let fake = FakeLaunchd::new(0, &[0], &[Some(4242), None], &[Ok(INSTALLED)])
+            .with_last_exit(1)
+            .with_files(&[
+                (PLIST, PLIST_WITH_STDERR),
+                (
+                    STDERR_LOG,
+                    "starting\nError: nats: No route to host\n\nexiting\n",
+                ),
+            ]);
+        let err = restart(&fake).await.unwrap_err();
+        assert!(err.contains("pid 4242 exited within 5s"), "{err}");
+        assert!(err.contains("launchd last exit code 1"), "{err}");
+        assert!(err.contains(STDERR_LOG), "{err}");
+        assert!(err.contains("nats: No route to host"), "{err}");
+        assert_eq!(fake.settles.get(), 1);
+    }
+
+    /// launchd's throttle respawns a crashing job under a new pid: the old pid
+    /// is not there, and the new one is not the process that was checked.
+    #[tokio::test]
+    async fn a_pid_that_changed_after_the_settle_fails() {
+        let fake = FakeLaunchd::new(0, &[0], &[Some(4242), Some(4300)], &[Ok(INSTALLED)]);
+        let err = restart(&fake).await.unwrap_err();
+        assert!(
+            err.contains("pid 4242 was replaced by pid 4300") && err.contains("crash-looping"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_without_a_stderr_log_says_so() {
+        let fake = FakeLaunchd::new(0, &[0], &[Some(4242), None], &[Ok(INSTALLED)])
+            .with_files(&[(PLIST, "<plist><dict></dict></plist>")]);
+        let err = restart(&fake).await.unwrap_err();
+        assert!(err.contains("launchd reports no last exit status"), "{err}");
+        assert!(err.contains("names no StandardErrorPath"), "{err}");
+
+        let unreadable = FakeLaunchd::new(0, &[0], &[Some(4242), None], &[Ok(INSTALLED)])
+            .with_files(&[(PLIST, PLIST_WITH_STDERR)]);
+        let err = restart(&unreadable).await.unwrap_err();
+        assert!(err.contains("no stderr to show"), "{err}");
+    }
+
+    #[test]
+    fn the_last_exit_is_read_from_launchctl_print() {
+        assert_eq!(
+            parse_launchd_print_last_exit("state = waiting\n\tlast exit code = 78\n"),
+            Some("code 78".to_string())
+        );
+        assert_eq!(
+            parse_launchd_print_last_exit("\tlast terminating signal = Killed: 9\n"),
+            Some("signal Killed: 9".to_string())
+        );
+        assert_eq!(parse_launchd_print_last_exit("state = running\n"), None);
+    }
+
+    #[test]
+    fn a_plist_string_value_is_the_string_right_after_its_key() {
+        assert_eq!(
+            parse_plist_string_value(PLIST_WITH_STDERR, "StandardErrorPath").as_deref(),
+            Some(STDERR_LOG)
+        );
+        // A later key's string is not this key's value.
+        let other = "<key>StandardErrorPath</key><true/><key>Label</key><string>x</string>";
+        assert_eq!(parse_plist_string_value(other, "StandardErrorPath"), None);
+    }
+
+    // ── one stability rule for launchd and systemd ─────────────
+
+    #[test]
+    fn the_stability_rule_accepts_only_the_same_pid() {
+        assert!(require_same_pid("svc", 7, Some(7)).is_ok());
+        let changed = require_same_pid("svc", 7, Some(9)).unwrap_err();
+        assert!(changed.contains("pid 7 was replaced by pid 9"), "{changed}");
+        let gone = require_same_pid("svc", 7, None).unwrap_err();
+        assert!(gone.contains("pid 7 exited within 5s"), "{gone}");
+    }
+
+    struct FakeSystemd {
+        readings: Vec<Result<UnitReading, String>>,
+        reads: std::cell::Cell<usize>,
+        sleeps: std::cell::RefCell<Vec<std::time::Duration>>,
+    }
+
+    impl FakeSystemd {
+        fn new(readings: Vec<Result<UnitReading, String>>) -> Self {
+            Self {
+                readings,
+                reads: Default::default(),
+                sleeps: Default::default(),
+            }
+        }
+    }
+
+    impl SystemdRunner for FakeSystemd {
+        async fn read_unit(&self, _unit: &ServiceUnit) -> Result<UnitReading, String> {
+            let n = self.reads.get();
+            self.reads.set(n + 1);
+            nth(&self.readings, n)
+        }
+
+        async fn sleep(&self, duration: std::time::Duration) {
+            self.sleeps.borrow_mut().push(duration);
+        }
+    }
+
+    fn reading(state: &str, pid: u32) -> Result<UnitReading, String> {
+        Ok(UnitReading {
+            state: state.to_string(),
+            pid,
+            exe: UnitExe::Path(PathBuf::from("/nonexistent/bin/hs")),
+            last_exit: "Result=exit-code, ExecMainStatus=1".to_string(),
+        })
+    }
+
+    async fn verify(fake: &FakeSystemd) -> Result<(), String> {
+        let u = unit(
+            UnitScope::User,
+            "hs-scribe-watch-events.service",
+            "/nonexistent/bin/hs",
+        );
+        verify_systemd_unit(fake, &u).await
+    }
+
+    #[tokio::test]
+    async fn a_unit_whose_pid_is_unchanged_after_the_settle_is_ok() {
+        let fake = FakeSystemd::new(vec![reading("active", 4242)]);
+        verify(&fake).await.unwrap();
+        assert_eq!(fake.reads.get(), 2);
+        assert_eq!(fake.sleeps.borrow().as_slice(), [RESTART_STABLE_SETTLE]);
+    }
+
+    #[tokio::test]
+    async fn a_unit_whose_pid_changed_after_the_settle_fails() {
+        let fake = FakeSystemd::new(vec![reading("active", 4242), reading("active", 4300)]);
+        let err = verify(&fake).await.unwrap_err();
+        assert!(err.contains("pid 4242 was replaced by pid 4300"), "{err}");
+        assert!(err.contains("ExecMainStatus=1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_unit_that_is_gone_after_the_settle_fails() {
+        for later in [
+            reading("activating", 0),
+            reading("failed", 0),
+            reading("active", 0),
+        ] {
+            let fake = FakeSystemd::new(vec![reading("active", 4242), later]);
+            let err = verify(&fake).await.unwrap_err();
+            assert!(err.contains("pid 4242 exited within 5s"), "{err}");
+            assert!(
+                err.contains("journalctl -u hs-scribe-watch-events.service"),
+                "{err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_unit_with_nothing_running_has_nothing_to_settle() {
+        let fake = FakeSystemd::new(vec![reading("active", 0)]);
+        verify(&fake).await.unwrap();
+        assert_eq!(fake.reads.get(), 1);
+        assert!(fake.sleeps.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_unit_still_on_the_old_binary_fails_before_the_settle() {
+        let mut other = reading("active", 4242);
+        if let Ok(r) = other.as_mut() {
+            r.exe = UnitExe::Path(PathBuf::from("/old/bin/hs"));
+        }
+        let fake = FakeSystemd::new(vec![other]);
+        let err = verify(&fake).await.unwrap_err();
+        assert!(err.contains("/old/bin/hs"), "{err}");
+        assert!(!fake.sleeps.borrow().contains(&RESTART_STABLE_SETTLE));
     }
 
     // ── RA-66: compose exit status is the verdict ─────────────

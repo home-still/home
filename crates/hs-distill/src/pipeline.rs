@@ -2,7 +2,6 @@ use hs_common::catalog::{CatalogEntry, PageOffset};
 use hs_common::stores::{DerivedText, StoreKind};
 
 use crate::chunker::{chunk_markdown, ChunkerConfig};
-use crate::client::DistillProgress;
 use crate::config::DistillServerConfig;
 use crate::error::DistillError;
 use crate::metadata::extract_rule_based;
@@ -103,7 +102,6 @@ pub async fn index_document(
     job: IndexJob<'_>,
     config: &DistillServerConfig,
     store: &dyn DocumentStore,
-    on_progress: impl Fn(DistillProgress),
 ) -> Result<u32, DistillError> {
     let IndexJob {
         doc_id: stem,
@@ -115,14 +113,6 @@ pub async fn index_document(
     } = job;
     // Every store that can hold a chunk of this document.
     let targets = [Some(store_name), references];
-
-    on_progress(DistillProgress {
-        stage: "reading".into(),
-        doc: stem.to_string(),
-        chunks_done: 0,
-        chunks_total: 0,
-        message: format!("Reading {stem}"),
-    });
 
     if markdown.trim().is_empty() {
         tracing::warn!("Skipping empty document: {}", stem);
@@ -171,14 +161,6 @@ pub async fn index_document(
         .unwrap_or_default();
 
     // Extract metadata
-    on_progress(DistillProgress {
-        stage: "metadata".into(),
-        doc: stem.to_string(),
-        chunks_done: 0,
-        chunks_total: 0,
-        message: "Extracting metadata".into(),
-    });
-
     let mut meta = extract_rule_based(markdown, stem, catalog.as_ref());
 
     // Optional LLM metadata extraction. A failure fails the document
@@ -202,14 +184,6 @@ pub async fn index_document(
     }
 
     // Chunk
-    on_progress(DistillProgress {
-        stage: "chunking".into(),
-        doc: stem.to_string(),
-        chunks_done: 0,
-        chunks_total: 0,
-        message: "Chunking document".into(),
-    });
-
     let chunker_config = ChunkerConfig {
         max_tokens: config.chunk_max_tokens,
         overlap_tokens: config.chunk_overlap,
@@ -261,14 +235,6 @@ pub async fn index_document(
 
     // Write. The store embeds each chunk (header included) and keeps the
     // text verbatim.
-    on_progress(DistillProgress {
-        stage: "writing".into(),
-        doc: stem.to_string(),
-        chunks_done: 0,
-        chunks_total: total_chunks as u64,
-        message: format!("Writing {} chunks", total_chunks),
-    });
-
     let _replacing = GENERATION_LOCK.lock().await;
 
     // (store, the records of this generation in it). A store that gets no
@@ -289,14 +255,6 @@ pub async fn index_document(
     for (target, record_ids) in &generation {
         store.forget_document(target, stem, record_ids).await?;
     }
-
-    on_progress(DistillProgress {
-        stage: "done".into(),
-        doc: stem.to_string(),
-        chunks_done: total_chunks as u64,
-        chunks_total: total_chunks as u64,
-        message: format!("Indexed {} chunks", total_chunks),
-    });
 
     Ok(total_chunks)
 }
@@ -392,7 +350,6 @@ mod tests {
             },
             config,
             store,
-            |_| {},
         )
         .await
     }
@@ -780,7 +737,6 @@ mod tests {
             },
             &cfg,
             &store,
-            |_| {},
         )
         .await
         .unwrap();

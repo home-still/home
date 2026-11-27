@@ -164,8 +164,19 @@ pub async fn dispatch(
         DistillCmd::ScanRepetitions { limit, threshold } => {
             crate::maintain::scan_repetitions::cmd(limit, threshold, reporter.as_ref()).await
         }
-        DistillCmd::Purge { doc_id, server } => {
-            cmd_purge(&doc_id, server.as_deref(), reporter).await
+        DistillCmd::Purge {
+            store,
+            doc_id,
+            server,
+        } => {
+            crate::maintain::purge::cmd(
+                &store,
+                &doc_id,
+                server.as_deref(),
+                global.yes,
+                reporter.as_ref(),
+            )
+            .await
         }
         DistillCmd::Abstracts(sub) => match sub {
             hs_distill::cli::AbstractsCmd::Build { force, server } => {
@@ -177,18 +188,6 @@ pub async fn dispatch(
             hs_distill::cli::AbstractsCmd::Status => cmd_abstracts_status(reporter).await,
         },
     }
-}
-
-async fn cmd_purge(doc_id: &str, server: Option<&str>, reporter: &Arc<dyn Reporter>) -> Result<()> {
-    let servers = resolve_servers(server).await?;
-    let client = make_distill_client(&servers[0]).await?;
-    reporter.status("Purging", doc_id);
-    let deleted = client
-        .delete_doc(hs_common::stores::ACADEMIC, doc_id)
-        .await
-        .with_context(|| format!("delete_doc({doc_id})"))?;
-    reporter.finish(&format!("Deleted {deleted} chunk(s) for {doc_id}"));
-    Ok(())
 }
 
 /// Delete a paper from every store that holds part of it: its chunks (the
@@ -960,7 +959,9 @@ async fn cmd_reconcile(
     server_override: Option<&str>,
     reporter: &Arc<dyn Reporter>,
 ) -> Result<()> {
-    use hs_distill::reconcile::{partition, CatalogState, Classification, ReconcileCounts};
+    use hs_distill::reconcile::{
+        partition, store_only_docs, CatalogState, Classification, ReconcileCounts,
+    };
     use std::collections::{HashMap, HashSet};
 
     let cfg = DistillClientConfig::load().context("loading distill client config")?;
@@ -1027,6 +1028,24 @@ async fn cmd_reconcile(
         ),
     );
 
+    // The reverse direction: `partition` walks storage → store and cannot see
+    // a document the store holds that storage does not. List them all, one
+    // per line on stdout; reconcile never deletes them.
+    let store_only = store_only_docs(&markdown_stems, &indexed);
+    if !store_only.is_empty() {
+        reporter.status(
+            "Store only",
+            &format!(
+                "{} document(s) in the `{}` store have no markdown in storage:",
+                store_only.len(),
+                hs_common::stores::ACADEMIC
+            ),
+        );
+        for id in &store_only {
+            println!("{id}");
+        }
+    }
+
     // Collect the two actionable buckets so we can drive them in order.
     let stamp_missing: Vec<&str> = parts
         .iter()
@@ -1064,7 +1083,10 @@ async fn cmd_reconcile(
                     .join(", "),
             );
         }
-        return Ok(());
+        return match store_only_problem(&store_only) {
+            Some(problem) => Err(anyhow::anyhow!(problem)),
+            None => Ok(()),
+        };
     }
 
     // ── Fix stamps ────────────────────────────────────────────────
@@ -1223,17 +1245,42 @@ async fn cmd_reconcile(
     }
 
     reporter.finish(&format!(
-        "Reconcile complete: ok={} stamps_fixed={} embeds_done={} (failures: stamps={} embeds={})",
-        counts.ok, stamp_done, embed_done, stamp_failed, embed_failed
+        "Reconcile complete: ok={} stamps_fixed={} embeds_done={} store_only={} (failures: stamps={} embeds={})",
+        counts.ok,
+        stamp_done,
+        embed_done,
+        store_only.len(),
+        stamp_failed,
+        embed_failed
     ));
+    let mut problems = Vec::new();
     if stamp_failed + embed_failed > 0 {
-        anyhow::bail!(
-            "reconcile left {} stamp failure(s) and {} embed failure(s) (see the log)",
-            stamp_failed,
-            embed_failed
-        );
+        problems.push(format!(
+            "reconcile left {stamp_failed} stamp failure(s) and {embed_failed} embed failure(s) (see the log)"
+        ));
+    }
+    if let Some(problem) = store_only_problem(&store_only) {
+        problems.push(problem);
+    }
+    if !problems.is_empty() {
+        anyhow::bail!("{}", problems.join("; "));
     }
     Ok(())
+}
+
+/// The failure `hs distill reconcile` ends with when the store holds
+/// documents that storage does not, or `None` when it holds none. Names the
+/// explicit command that removes them: reconcile itself never deletes.
+fn store_only_problem(store_only: &[String]) -> Option<String> {
+    if store_only.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the `{store}` store holds {n} document(s) that storage does not (listed above); \
+         reconcile does not delete them: remove one with `hs distill purge --store {store} <doc_id>`",
+        store = hs_common::stores::ACADEMIC,
+        n = store_only.len()
+    ))
 }
 
 #[cfg(test)]
@@ -1243,6 +1290,21 @@ mod tests {
     use async_trait::async_trait;
     use hs_common::catalog::CatalogEntry;
     use hs_common::storage::{LocalFsStorage, ObjectMeta, Storage};
+
+    #[test]
+    fn store_only_documents_fail_reconcile_and_name_the_purge_command() {
+        let problem = store_only_problem(&["orphan".to_string()]).expect("one store-only id");
+        assert!(problem.contains("1 document(s)"), "{problem}");
+        assert!(
+            problem.contains("hs distill purge --store academic <doc_id>"),
+            "{problem}"
+        );
+    }
+
+    #[test]
+    fn no_store_only_documents_is_no_problem() {
+        assert_eq!(store_only_problem(&[]), None);
+    }
 
     fn long_abstract() -> String {
         "A sufficiently long abstract about vector search. ".repeat(4)
