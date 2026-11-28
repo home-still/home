@@ -68,7 +68,7 @@ and abstract. The abstract comes from the local
 OpenAlex catalog when it has the paper, else from the provider's record in
 the catalog, else from the markdown's `## Abstract` section; a paper with
 none is skipped. `hs distill abstracts build` fills it, and an agent searches
-it with `recall` on the `myelin` server.
+it with `recall` on the `home-still` server.
 
 ## From a hit to the page
 

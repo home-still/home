@@ -1382,7 +1382,7 @@ hs cloud invite [OPTIONS]
 | Name | Default | Meaning |
 |---|---|---|
 | `--name <NAME>` | `device` | Device name for the enrollment. |
-| `--scope <SCOPE>` | none | Scope to grant: `scribe`, `distill`, `mcp` or `memory`. Repeat the flag for several. Without it the code grants all four. |
+| `--scope <SCOPE>` | none | Scope to grant: `scribe`, `distill` or `mcp`. Repeat the flag for several. Without it the code grants all three. |
 
 Asks the local gateway for a one-time enrollment code and prints the code, its scopes and its lifetime. It reads `cloud.gateway.listen` and the admin key on this host, so it works only on the gateway host, and it fails when `hs-gateway` is not running.
 
@@ -1478,10 +1478,10 @@ hs mcp [OPTIONS] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `hs mcp install` | Write the `home-still` and `myelin` servers into your clients' configuration. |
-| `hs mcp uninstall` | Remove the `home-still` and `myelin` servers from your clients' configuration. |
+| `hs mcp install` | Write the `home-still` server into your clients' configuration. |
+| `hs mcp uninstall` | Remove the `home-still` server from your clients' configuration. |
 
-These commands edit two MCP server entries in each client's configuration file: `home-still`, the tools server (`hs-mcp`), whose tools are listed in [MCP tools](mcp-tools.md), and `myelin`, the memory server, where an agent searches the library and keeps what it is asked to remember.
+These commands edit one MCP server entry in each client's configuration file: `home-still` (`hs-mcp`), whose tools are listed in [MCP tools](mcp-tools.md). It is the only server an agent needs: it serves the memory and search tools as well, forwarding them to myelin.
 
 Example:
 
@@ -1491,7 +1491,7 @@ hs mcp --help
 
 ### `hs mcp install`
 
-Write the `home-still` and `myelin` servers into your clients' configuration.
+Write the `home-still` server into your clients' configuration.
 
 ```text
 hs mcp install [OPTIONS]
@@ -1500,14 +1500,14 @@ hs mcp install [OPTIONS]
 | Name | Default | Meaning |
 |---|---|---|
 | `--client <CLIENT>` | `all` | Target client: `desktop` (Claude Desktop), `code` (Claude Code), `opencode` (OpenCode) or `all`. |
-| `--remote` | off | Reach both servers through the cloud gateway instead of on this machine. |
+| `--remote` | off | Reach the server through the cloud gateway instead of on this machine. |
 | `--gateway-url <GATEWAY_URL>` | none | Gateway URL for remote mode (reads from cloud config if omitted). |
 
-Local mode writes two entries. `home-still` runs the `hs-mcp` binary as the client's child process and copies the variables from `~/.home-still/secrets.env` into the entry, so the client's file holds those values; when `hs-mcp` is not installed the command downloads it from GitHub. `myelin` is a URL entry for the memory server on this machine, `http://127.0.0.1:7463/mcp`. `--remote` writes two URL entries that point at the gateway instead, `<gateway>/mcp` and `<gateway>/memory/mcp`; it takes the gateway from `--gateway-url` or from the enrolled credentials.
+Local mode writes a command entry: `home-still` runs the `hs-mcp` binary as the client's child process and copies the variables from `~/.home-still/secrets.env` into the entry, so the client's file holds those values; when `hs-mcp` is not installed the command downloads it from GitHub. `--remote` writes a URL entry that points at the gateway instead, `<gateway>/mcp`; it takes the gateway from `--gateway-url` or from the enrolled credentials.
 
 Claude Desktop reads only commands from its file, so a URL entry is never written there: the command prints the URL to add as a connector in the app, and `--client desktop --remote` writes nothing and fails.
 
-The entries are written to `claude_desktop_config.json` (Claude Desktop), `~/.claude.json` (Claude Code) and `~/.config/opencode/opencode.json` (OpenCode). Existing content is preserved, an entry of the same name is replaced, and the file is replaced atomically.
+The entry is written to `claude_desktop_config.json` (Claude Desktop), `~/.claude.json` (Claude Code) and `~/.config/opencode/opencode.json` (OpenCode). Existing content is preserved, an entry of the same name is replaced, and the file is replaced atomically.
 
 Example:
 
@@ -1517,7 +1517,7 @@ hs mcp install --client desktop
 
 ### `hs mcp uninstall`
 
-Remove the `home-still` and `myelin` servers from your clients' configuration.
+Remove the `home-still` server from your clients' configuration.
 
 ```text
 hs mcp uninstall [OPTIONS]

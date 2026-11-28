@@ -353,6 +353,16 @@ Document links. See [Open documents with links](../how-to/open-documents-with-li
 
 `hs serve docs` requires a `storage:` section.
 
+## `mcp`
+
+The MCP server (`hs-mcp`, `hs serve mcp`). An unknown key is an error naming the section.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `myelin_url` | `http://127.0.0.1:7463/mcp` | MCP endpoint of the memory server's agent surface (myelin's `--serve-agents` listener). Must be an http(s) URL with a host. |
+
+`hs-mcp` serves every tool of that surface as its own, so a client connects to one server. At start-up it opens a session to `myelin_url` and reads the tool list; it refuses to start, naming the URL and `mcp.myelin_url`, when the memory server cannot be reached, answers an error or offers no tools, or when one of its tool names is also a tool of `hs-mcp`. A call to one of those tools opens a session to the memory server, forwards the arguments unchanged and returns its answer unchanged. A memory server that is down at that moment fails that call, not the server. No token is sent: the agent surface is not a home-still service.
+
 ## `cloud.gateway`
 
 The gateway (`hs-gateway`). There is no default gateway: a missing `cloud.gateway` section stops it. An unknown key is an error, except `key_rotation_days`, which is ignored with a warning.

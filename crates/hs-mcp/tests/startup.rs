@@ -106,6 +106,111 @@ fn write_config(home: &tempfile::TempDir, config: &str) {
     std::fs::write(home.path().join(".home-still/config.yaml"), config).unwrap();
 }
 
+/// A stand-in for myelin's agent surface that offers one tool: every
+/// request is answered on its own connection, which is then closed. The
+/// server lives as long as the test process. Returns its MCP URL.
+fn fake_myelin() -> String {
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().map_while(Result::ok) {
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut content_length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let rpc: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                let (status, payload) = match rpc["method"].as_str() {
+                    Some("initialize") => (
+                        "200 OK",
+                        serde_json::json!({
+                        "jsonrpc": "2.0", "id": rpc["id"], "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "fake-myelin", "version": "0"}}}),
+                    ),
+                    Some("tools/list") => (
+                        "200 OK",
+                        serde_json::json!({
+                        "jsonrpc": "2.0", "id": rpc["id"], "result": {"tools": [
+                            {"name": "recall", "description": "search",
+                             "inputSchema": {"type": "object"}}]}}),
+                    ),
+                    _ => ("202 Accepted", serde_json::Value::Null),
+                };
+                let body = if payload.is_null() {
+                    String::new()
+                } else {
+                    payload.to_string()
+                };
+                let mut stream = stream;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     mcp-session-id: fake\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    url
+}
+
+#[test]
+fn a_memory_server_that_cannot_be_reached_stops_the_server_naming_the_url_and_the_key() {
+    let home = home_with(None, Some(&format!("{TOKEN_VAR}={TOKEN}\n")));
+    let root = home.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    // A closed loopback port is the memory server.
+    write_config(
+        &home,
+        &format!(
+            "{}events:\n  backend: nats\n  nats:\n    url: nats://127.0.0.1:1\n\
+             mcp:\n  myelin_url: http://127.0.0.1:1/mcp\n",
+            storage_section(&root)
+        ),
+    );
+    let out = run_http(home.path());
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("http://127.0.0.1:1/mcp"), "{err}");
+    assert!(err.contains("mcp.myelin_url"), "{err}");
+}
+
+#[test]
+fn an_invalid_myelin_url_stops_the_server_naming_the_key() {
+    let home = home_with(None, Some(&format!("{TOKEN_VAR}={TOKEN}\n")));
+    let root = home.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    write_config(
+        &home,
+        &format!(
+            "{}events:\n  backend: nats\n  nats:\n    url: nats://127.0.0.1:1\n\
+             mcp:\n  myelin_url: ftp://memory.example/mcp\n",
+            storage_section(&root)
+        ),
+    );
+    let out = run_http(home.path());
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("mcp.myelin_url"), "{}", stderr(&out));
+}
+
 #[test]
 fn an_invalid_events_section_still_stops_the_server_at_startup() {
     // The broker connection is deferred; the configuration is not.
@@ -147,8 +252,9 @@ fn an_unreachable_broker_does_not_stop_the_server_from_starting() {
     write_config(
         &home,
         &format!(
-            "{}events:\n  backend: nats\n  nats:\n    url: nats://127.0.0.1:1\n",
-            storage_section(&root)
+            "{}events:\n  backend: nats\n  nats:\n    url: nats://127.0.0.1:1\nmcp:\n  myelin_url: {}\n",
+            storage_section(&root),
+            fake_myelin()
         ),
     );
     // Port 0, read back from the server's log: a port chosen by the test and

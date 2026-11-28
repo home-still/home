@@ -1731,6 +1731,8 @@ own token from `~/.home-still/cloud-token`; `myelin` was added the same way, wit
 set to the gateway's `/memory/mcp`. The local mode copies every key of `secrets.env`, the S3 keys
 among them, into the client's config. Choose one way, make `hs mcp install` write it for omp too,
 and stop copying secrets a server does not need.
+**Partly fixed v0.1.0-rc.398 (P0-33):** `hs mcp install` writes one entry, `home-still`, not two.
+The bridge-or-URL choice, the secrets copied by the local mode and omp's entry are still open.
 
 ### P2-17. `hs scribe boxes status` and `hs scribe boxes catch-up` print nothing (found 2026-11-27)
 Both exit 0 with no output, through a pipe, to a file, with `--output json`, and in a
@@ -1757,6 +1759,19 @@ declares 718,582. pdfium refuses it (`PDF cannot be opened (pdfium error 3)`), s
 `hs scribe boxes catch-up` ends in a permanent failure for it, and it is the one `academic` PDF
 without word boxes. It has markdown and records. Download it again and replace it, or move it to
 `corrupted/`.
+
+### P0-33. Agents reach myelin directly, not through home-still (found 2026-11-27, by the owner)
+The owner's requirement is one door: every myelin call an agent makes goes through home-still.
+rc.395 shipped two MCP servers instead: `home-still`, and myelin's agent surface as a second
+server (`/memory/mcp` on the gateway, a `memory` token scope, a second entry written by
+`hs mcp install`), and on 2026-11-27 the go-live pass installed that second entry, `myelin`, in
+Claude Code and omp on all four agent hosts. An agent then called `stores` and `recall` on
+myelin directly, and the owner saw it.
+**FIXED v0.1.0-rc.398.** The home-still MCP server lists myelin's agent tools and forwards every
+call to myelin's agent surface on the memory host's loopback interface (`mcp.myelin_url`); it
+refuses to start when it cannot list them. The gateway's `memory` route and scope, and the second
+`hs mcp install` entry, are gone. The `myelin` client entries were removed by hand on the four
+hosts and myelin's agent listener serves loopback only.
 
 ### Owner-only items after the rc.395 cutover (2026-11-27)
 - The GPU host's firewall does not admit the gateway host on TCP 7463, so the remote memory route

@@ -19,7 +19,7 @@
 //! reads the home-still MCP server's dashboard snapshot over plain HTTP,
 //! from the route beside the MCP endpoint.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::auth::client::{AuthedHttp, AuthenticatedClient};
@@ -231,6 +231,162 @@ impl McpClient {
             tracing::warn!(error = %e, "could not end the MCP session; the server keeps it until it expires");
         }
     }
+
+    /// Every tool the server offers, each as the JSON object the server
+    /// sent (name, description, input schema, annotations, ...), following
+    /// `nextCursor` until the list ends. A JSON-RPC error is an `Err`.
+    pub async fn list_tools(&self) -> Result<Vec<Value>> {
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_TOOL_LIST_PAGES {
+            let params = match &cursor {
+                Some(cursor) => json!({ "cursor": cursor }),
+                None => json!({}),
+            };
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": params
+            });
+            let body = self.post(&req).await?;
+            let reply = rpc_reply(&body).ok_or_else(|| {
+                anyhow!(
+                    "no tools/list result in MCP response: body={}",
+                    excerpt(&body)
+                )
+            })?;
+            if let Some(err) = reply.get("error") {
+                bail!("tools/list answered an error: {}", rpc_error_message(err));
+            }
+            let result = reply.get("result").ok_or_else(|| {
+                anyhow!(
+                    "tools/list reply has no result: {}",
+                    excerpt(&reply.to_string())
+                )
+            })?;
+            let page = result
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("tools/list result has no `tools` array"))?;
+            tools.extend(page.iter().cloned());
+            match result.get("nextCursor").and_then(Value::as_str) {
+                Some(next) => cursor = Some(next.to_string()),
+                None => return Ok(tools),
+            }
+        }
+        bail!("tools/list did not end after {MAX_TOOL_LIST_PAGES} pages")
+    }
+
+    /// Invoke a tool and return the server's answer as it came, without
+    /// reading anything into it: the JSON-RPC `result` (content,
+    /// structuredContent, isError, ... untouched) or the JSON-RPC `error`.
+    /// `arguments` is sent as given, and left out when `None`. An `Err` is a
+    /// failure to get any answer (the transport, a non-2xx status, a body
+    /// with no reply).
+    pub async fn call_tool_raw(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<RawToolOutcome> {
+        let mut params = json!({ "name": name });
+        if let Some(arguments) = arguments {
+            params["arguments"] = arguments;
+        }
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": params
+        });
+        let body = self.post(&req).await?;
+        let mut reply = rpc_reply(&body).ok_or_else(|| {
+            anyhow!(
+                "no tool result in MCP response for '{name}': body={}",
+                excerpt(&body)
+            )
+        })?;
+        if let Some(error) = reply.get_mut("error").map(Value::take) {
+            return Ok(RawToolOutcome::Error(error));
+        }
+        match reply.get_mut("result").map(Value::take) {
+            Some(result) => Ok(RawToolOutcome::Result(result)),
+            None => bail!("MCP reply for '{name}' has neither result nor error"),
+        }
+    }
+}
+
+/// What a server answered to a tool call, unread: see
+/// [`McpClient::call_tool_raw`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawToolOutcome {
+    /// The JSON-RPC `result` object.
+    Result(Value),
+    /// The JSON-RPC `error` object (`code`, `message`, `data`).
+    Error(Value),
+}
+
+/// The first JSON-RPC message in `body` (an SSE stream of `data:` frames,
+/// or one plain JSON body) that carries a `result` or an `error`. Frames
+/// without one (the empty priming event, progress notifications) are
+/// skipped.
+fn rpc_reply(body: &str) -> Option<Value> {
+    let frames = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .chain(std::iter::once(body));
+    frames
+        .filter_map(|payload| serde_json::from_str::<Value>(payload.trim()).ok())
+        .find(|v| v.get("result").is_some() || v.get("error").is_some())
+}
+
+fn rpc_error_message(err: &Value) -> String {
+    err.get("message")
+        .and_then(Value::as_str)
+        .map(excerpt)
+        .unwrap_or_else(|| excerpt(&err.to_string()))
+}
+
+/// How many pages of `tools/list` are read before the server is called
+/// broken.
+const MAX_TOOL_LIST_PAGES: usize = 100;
+
+/// The `mcp` section of `~/.home-still/config.yaml`: what `hs-mcp` is
+/// configured with. An unknown key is an error naming the section.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpSection {
+    myelin_url: Option<String>,
+}
+
+/// Where `hs-mcp` reaches the memory server's agent surface when
+/// `mcp.myelin_url` is not set.
+pub const MYELIN_URL_DEFAULT: &str = "http://127.0.0.1:7463/mcp";
+
+/// The `mcp.myelin_url` key: the MCP endpoint of myelin's agent surface,
+/// whose tools `hs-mcp` serves as its own.
+///
+/// Absent means [`MYELIN_URL_DEFAULT`]. A value that is not an http(s) URL
+/// with a host is an error naming the key, never a default.
+pub fn myelin_url(
+    file: &crate::config_file::ConfigFile,
+) -> Result<String, crate::config_file::ConfigError> {
+    let section = file.section::<McpSection>("mcp")?.unwrap_or_default();
+    let value = section
+        .myelin_url
+        .unwrap_or_else(|| MYELIN_URL_DEFAULT.to_string());
+    let invalid = |reason: String| {
+        crate::config_file::ConfigError::section(
+            file.path(),
+            "mcp",
+            format!("`mcp.myelin_url` {value:?} {reason}"),
+        )
+    };
+    let url = reqwest::Url::parse(&value).map_err(|e| invalid(format!("is invalid: {e}")))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(invalid("must be an http(s) URL with a host".to_string()));
+    }
+    Ok(value)
 }
 
 /// `result.serverInfo` of an initialize response, which is either an SSE
@@ -580,5 +736,172 @@ mod tests {
         client.close().await.unwrap();
 
         assert!(server.requests().iter().all(|r| r.method != "DELETE"));
+    }
+
+    fn tools_page(tools: Value, next: Option<&str>) -> Response {
+        let mut result = json!({ "tools": tools });
+        if let Some(next) = next {
+            result["nextCursor"] = json!(next);
+        }
+        sse(json!({"jsonrpc": "2.0", "id": 2, "result": result}))
+    }
+
+    #[tokio::test]
+    async fn list_tools_follows_the_cursor_and_returns_each_tool_as_sent() {
+        let server = FakeServer::start(|req| {
+            let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            match rpc["method"].as_str() {
+                Some("initialize") => sse(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+                Some("tools/list") if rpc["params"]["cursor"] == "p2" => tools_page(
+                    json!([{"name": "b", "inputSchema": {"type": "object"}}]),
+                    None,
+                ),
+                Some("tools/list") => tools_page(
+                    json!([{"name": "a", "description": "first", "inputSchema": {"type": "object"},
+                            "annotations": {"readOnlyHint": true}}]),
+                    Some("p2"),
+                ),
+                _ => Response::raw(202, "text/plain", ""),
+            }
+        })
+        .await;
+        let client = client(&server).await.unwrap();
+
+        let tools = client.list_tools().await.unwrap();
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "a");
+        assert_eq!(tools[0]["annotations"]["readOnlyHint"], true);
+        assert_eq!(tools[1]["name"], "b");
+    }
+
+    #[tokio::test]
+    async fn list_tools_reports_a_json_rpc_error() {
+        let server = FakeServer::start(|req| {
+            let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            match rpc["method"].as_str() {
+                Some("initialize") => sse(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+                Some("tools/list") => sse(json!({"jsonrpc": "2.0", "id": 2,
+                    "error": {"code": -32603, "message": "store unavailable"}})),
+                _ => Response::raw(202, "text/plain", ""),
+            }
+        })
+        .await;
+        let client = client(&server).await.unwrap();
+
+        let err = client.list_tools().await.expect_err("an error answer");
+
+        assert!(format!("{err:#}").contains("store unavailable"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_raw_call_returns_the_result_unread_and_sends_the_arguments_verbatim() {
+        let answer = json!({"content": [{"type": "text", "text": "no"}],
+            "structuredContent": {"n": 1}, "isError": true});
+        let reply = answer.clone();
+        let server = FakeServer::start(move |req| {
+            let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            match rpc["method"].as_str() {
+                Some("initialize") => sse(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+                Some("tools/call") => sse(json!({"jsonrpc": "2.0", "id": 99, "result": reply})),
+                _ => Response::raw(202, "text/plain", ""),
+            }
+        })
+        .await;
+        let client = client(&server).await.unwrap();
+
+        let args = json!({"query": "x", "stores": ["a"]});
+        let outcome = client
+            .call_tool_raw("recall", Some(args.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RawToolOutcome::Result(answer));
+        let call: Value = server
+            .requests()
+            .iter()
+            .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+            .find(|rpc| rpc["method"] == "tools/call")
+            .unwrap();
+        assert_eq!(call["params"]["name"], "recall");
+        assert_eq!(call["params"]["arguments"], args);
+    }
+
+    #[tokio::test]
+    async fn a_raw_call_returns_a_json_rpc_error_as_the_answer() {
+        let server = FakeServer::start(|req| {
+            let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            match rpc["method"].as_str() {
+                Some("initialize") => sse(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+                Some("tools/call") => sse(json!({"jsonrpc": "2.0", "id": 99,
+                    "error": {"code": -32602, "message": "name a store"}})),
+                _ => Response::raw(202, "text/plain", ""),
+            }
+        })
+        .await;
+        let client = client(&server).await.unwrap();
+
+        let outcome = client.call_tool_raw("recall", None).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            RawToolOutcome::Error(json!({"code": -32602, "message": "name a store"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_raw_call_to_a_server_that_says_nothing_is_an_error() {
+        let server = FakeServer::start(|req| {
+            let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            match rpc["method"].as_str() {
+                Some("initialize") => sse(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+                Some("tools/call") => Response::raw(200, "text/event-stream", "data: \n\n"),
+                _ => Response::raw(202, "text/plain", ""),
+            }
+        })
+        .await;
+        let client = client(&server).await.unwrap();
+
+        let err = client
+            .call_tool_raw("recall", None)
+            .await
+            .expect_err("no reply");
+
+        assert!(format!("{err:#}").contains("no tool result"), "{err:#}");
+    }
+
+    fn mcp_section(yaml: &str) -> (tempfile::TempDir, crate::config_file::ConfigFile) {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".home-still");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), yaml).unwrap();
+        let file = crate::config_file::ConfigFile::load_in(home.path()).unwrap();
+        (home, file)
+    }
+
+    #[test]
+    fn the_myelin_url_defaults_and_is_read_from_the_mcp_section() {
+        let (_home, file) = mcp_section("storage:\n  backend: local\n");
+        assert_eq!(myelin_url(&file).unwrap(), MYELIN_URL_DEFAULT);
+
+        let (_home, file) = mcp_section("mcp:\n  myelin_url: http://memory.example:7463/mcp\n");
+        assert_eq!(myelin_url(&file).unwrap(), "http://memory.example:7463/mcp");
+    }
+
+    #[test]
+    fn a_bad_myelin_url_or_an_unknown_mcp_key_is_an_error_naming_the_key() {
+        for yaml in [
+            "mcp:\n  myelin_url: not a url\n",
+            "mcp:\n  myelin_url: ftp://memory.example/mcp\n",
+            "mcp:\n  myelin_url: 7463\n",
+            "mcp:\n  myelin_ulr: http://memory.example/mcp\n",
+        ] {
+            let (_home, file) = mcp_section(yaml);
+            let err = myelin_url(&file).expect_err(yaml);
+            assert!(err.to_string().contains("mcp"), "{yaml}: {err}");
+        }
+        let (_home, file) = mcp_section("mcp:\n  myelin_url: ftp://memory.example/mcp\n");
+        let msg = myelin_url(&file).unwrap_err().to_string();
+        assert!(msg.contains("mcp.myelin_url"), "{msg}");
     }
 }

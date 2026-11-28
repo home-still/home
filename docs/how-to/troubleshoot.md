@@ -332,11 +332,12 @@ an error.
 
 **Cause.** The gateway checks its configuration before it listens. It stops
 when `cloud.gateway.routes` has no backend for one of `scribe`, `distill`,
-`mcp`, `memory` or `docs` (the error names the line to add), when a key in
+`mcp` or `docs` (the error names the line to add), when a key under it names
+a service the gateway does not route (a `memory` route left over from an
+earlier release is one: delete the line), when a key in
 `cloud.gateway` does not exist, when `--gateway-url` is missing or does not
 start with `https://`, and when `HS_BACKEND_TOKEN` is unset or shorter than 32
-bytes. A gateway upgraded from a release that had no `memory` route stops on
-its first start for that reason: add `memory: http://<memory-host>:7463`.
+bytes.
 
 **Fix.**
 

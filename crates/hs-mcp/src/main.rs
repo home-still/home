@@ -20,6 +20,7 @@ use rmcp::{
 
 mod http_app;
 mod links;
+mod myelin;
 mod openalex;
 mod snapshot;
 mod stem;
@@ -62,6 +63,9 @@ struct HomeStillMcp {
     /// The stores of the corpus: what a `store` argument and a link's
     /// `col` are checked against.
     stores: hs_common::stores::Stores,
+    /// The memory server's tools, served as this server's own and forwarded
+    /// to the memory server's agent surface.
+    myelin: Arc<myelin::MyelinTools>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -77,6 +81,7 @@ struct Deps {
     openalex: openalex::OpenAlexCorpus,
     link_minter: Option<Arc<crate::links::LinkMinter>>,
     stores: hs_common::stores::Stores,
+    myelin: myelin::MyelinTools,
 }
 
 /// Serialize a tool result. A serialization failure is a tool error, never
@@ -210,6 +215,10 @@ impl HomeStillMcp {
                  `docs.remote_base_url` in ~/.home-still/config.yaml"
             );
         }
+        // Last: everything that can be wrong with this host's own
+        // configuration is reported before the memory server is asked.
+        let myelin =
+            myelin::MyelinTools::connect(&hs_common::mcp_client::myelin_url(&file)?).await?;
         Self::from_deps(Deps {
             storage,
             events,
@@ -219,6 +228,7 @@ impl HomeStillMcp {
             paper_config,
             link_minter: Some(link_minter),
             stores: hs_common::stores::Stores::from_config(&file.load_system()?, &file)?,
+            myelin,
         })
     }
 
@@ -232,6 +242,7 @@ impl HomeStillMcp {
             openalex,
             link_minter,
             stores,
+            myelin,
         } = deps;
 
         // The academic store's layout, from the registry.
@@ -257,6 +268,9 @@ impl HomeStillMcp {
             .map_err(|e| anyhow::anyhow!("paper downloader: {e:#}"))?,
         );
 
+        let tool_router = Self::tool_router();
+        myelin.refuse_collisions(tool_router.list_all().iter().map(|tool| tool.name.as_ref()))?;
+
         Ok(Self {
             short_links: hs_common::docs::ShortLinks::new(storage.clone()),
             storage,
@@ -269,7 +283,8 @@ impl HomeStillMcp {
             openalex,
             link_minter,
             stores,
-            tool_router: Self::tool_router(),
+            myelin: Arc::new(myelin),
+            tool_router,
             prompt_router: Self::prompt_router(),
         })
     }
@@ -299,9 +314,10 @@ impl HomeStillMcp {
 
 // ── Tools ───────────────────────────────────────────────────────
 //
-// Ten tools. Each one's arguments and logic are in its own file under
-// `tools/`; this is the one place that names and describes them. Search is
-// not here: it is the `myelin` server's `recall`.
+// Ten tools of its own, and the memory server's: `recall`, `remember` and the
+// rest of the agent surface, forwarded (`myelin.rs`). Each of the ten has its
+// arguments and logic in its own file under `tools/`; this is the one place
+// that names and describes them.
 
 #[tool_router]
 impl HomeStillMcp {
@@ -327,7 +343,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "Read a document: its catalog card and a slice of its text. `store` and `doc_id` are a search hit's `store` and `meta.doc_id` (the `myelin` server's `recall`), or a row of `documents`. Returns two parts: a JSON answer with the card (title, authors, year, DOI, abstract, when it was added), `converted`, the `slice` returned (`line_start`, `line_end`, `page`, `total_lines`, `total_pages`, `next_line`) and signed links that open the document; then the text, every line behind its number (`12: ...`). Select with `page` (one page of the source) or `lines: [first, last]`, not both; with neither, reading starts at line 1. At most `max_chars` characters come back (12,000 by default), in whole lines: when the selection did not fit, `slice.next_line` is the line to call again from. A document that is stored and not yet converted answers `converted: false` with its card and no text: ask `status` with its `doc_id`. The line numbers are the ones `cite` reports and takes as `near_line`. Reading is for context: anything you quote goes through `cite`.",
+        description = "Read a document: its catalog card and a slice of its text. `store` and `doc_id` are a search hit's `store` and `meta.doc_id` (from `recall`), or a row of `documents`. Returns two parts: a JSON answer with the card (title, authors, year, DOI, abstract, when it was added), `converted`, the `slice` returned (`line_start`, `line_end`, `page`, `total_lines`, `total_pages`, `next_line`) and signed links that open the document; then the text, every line behind its number (`12: ...`). Select with `page` (one page of the source) or `lines: [first, last]`, not both; with neither, reading starts at line 1. At most `max_chars` characters come back (12,000 by default), in whole lines: when the selection did not fit, `slice.next_line` is the line to call again from. A document that is stored and not yet converted answers `converted: false` with its card and no text: ask `status` with its `doc_id`. The line numbers are the ones `cite` reports and takes as `near_line`. Reading is for context: anything you quote goes through `cite`.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -343,7 +359,7 @@ impl HomeStillMcp {
     }
 
     #[tool(
-        description = "List the documents of one store, newest first: `academic` (papers; the default), `personal` (the user's own records), `web` (captured pages) or `syntheses` (saved answers). Each row has the `doc_id` that `read`, `cite` and `status` take, with the title, authors, year, DOI, when it was added, and whether it is converted to text and indexed for search. Narrow with `title_contains` and `added_after`. A page holds `limit` rows (20 by default, 200 at most); `next_cursor`, when present, is the `cursor` of the next page with the same filters. This lists what the corpus holds; to find documents by what they say, search with the `myelin` server's `recall`.",
+        description = "List the documents of one store, newest first: `academic` (papers; the default), `personal` (the user's own records), `web` (captured pages) or `syntheses` (saved answers). Each row has the `doc_id` that `read`, `cite` and `status` take, with the title, authors, year, DOI, when it was added, and whether it is converted to text and indexed for search. Narrow with `title_contains` and `added_after`. A page holds `limit` rows (20 by default, 200 at most); `next_cursor`, when present, is the `cursor` of the next page with the same filters. This lists what the corpus holds; to find documents by what they say, search with `recall`.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -506,15 +522,15 @@ impl HomeStillMcp {
             PromptMessageRole::User,
             format!(
                 "Answer this question from the user's corpus: \"{}\"\n\n\
-                 1. `profile` (myelin): read what the user is known to prefer, and let it shape \
+                 1. `profile`: read what the user is known to prefer, and let it shape \
                  the form of the answer.\n\
-                 2. `stores` (myelin), then `recall` over the stores the question needs: \
+                 2. `stores`, then `recall` over the stores the question needs: \
                  `academic` for papers, `abstracts` for a broad first pass, `web` for captured \
                  pages, `syntheses` for earlier answers, `memory` for what was said before, and \
                  `personal` only when the question is about the user's own records. Use \
                  `investigate` when one search is not enough.\n\
-                 3. `read` (home-still) a hit's document when the passage needs its context.\n\
-                 4. `cite` (home-still) every passage you intend to quote, with the hit's \
+                 3. `read` a hit's document when the passage needs its context.\n\
+                 4. `cite` every passage you intend to quote, with the hit's \
                  `store`, its `meta.doc_id` and the exact words. A quote that `cite` refuses is \
                  not in the document: quote the passage it names instead, or drop the claim.\n\
                  5. Answer. Give each quotation with its citation's link (`links.viewer` for a \
@@ -535,11 +551,11 @@ impl HomeStillMcp {
             PromptMessageRole::User,
             format!(
                 "Check this claim against the user's corpus: \"{}\"\n\n\
-                 1. `recall` (myelin) twice: once for passages that support the claim, once \
+                 1. `recall` twice: once for passages that support the claim, once \
                  for passages that contradict or qualify it.\n\
-                 2. `read` (home-still) around the strongest passages, so none is taken out \
+                 2. `read` around the strongest passages, so none is taken out \
                  of its context.\n\
-                 3. `cite` (home-still) each passage you rely on. Only a passage `cite` \
+                 3. `cite` each passage you rely on. Only a passage `cite` \
                  accepts counts as evidence.\n\
                  4. Give a verdict: supported, contradicted, mixed, or not in the corpus. \
                  List the cited passages for and against, each with its link. \"Not in the \
@@ -558,9 +574,9 @@ impl HomeStillMcp {
             PromptMessageRole::User,
             format!(
                 "Write a brief on \"{}\" from the user's corpus.\n\n\
-                 1. `recall` (myelin) over `abstracts` to find the documents that matter, \
+                 1. `recall` over `abstracts` to find the documents that matter, \
                  then over `academic`, `web` and `syntheses` for their passages.\n\
-                 2. `read` (home-still) the central documents where the passages are.\n\
+                 2. `read` the central documents where the passages are.\n\
                  3. If the corpus is thin: `discover` and `graph` to find the central works, \
                  `acquire` them (or `capture` a page you have read), and ask `status` until \
                  they are converted.\n\
@@ -579,17 +595,26 @@ impl HomeStillMcp {
 
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for HomeStillMcp {
-    /// What `#[tool_handler]` generates, plus a panic guard. A panic inside
-    /// a tool would otherwise unwind the rmcp session task, which ends the
-    /// whole session with no answer to the call (the HTTP catch layer cannot
-    /// see it: the session runs on its own task). It becomes a tool error,
-    /// logged with the tool name, and the session keeps serving.
+    /// What `#[tool_handler]` generates, plus a panic guard, plus the
+    /// memory server's tools. A call to one of those is forwarded to the
+    /// memory server and answered with its answer, unchanged. A panic
+    /// inside a home-still tool would otherwise unwind the rmcp session
+    /// task, which ends the whole session with no answer to the call (the
+    /// HTTP catch layer cannot see it: the session runs on its own task).
+    /// It becomes a tool error, logged with the tool name, and the session
+    /// keeps serving.
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let tool = request.name.to_string();
+        if self.myelin.get(&tool).is_some() {
+            // A forwarded call can run for minutes (`investigate`): keep
+            // the caller's timer and the session's idle clock fed.
+            let _heartbeat = ProgressHeartbeat::start(&context, tool.clone());
+            return self.myelin.call(request).await;
+        }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         match hs_common::panic_guard::catch_panic(self.tool_router.call(tcc)).await {
             Ok(result) => result,
@@ -609,15 +634,20 @@ impl ServerHandler for HomeStillMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        tools.extend(self.myelin.tools().iter().cloned());
         Ok(rmcp::model::ListToolsResult {
-            tools: self.tool_router.list_all(),
+            tools,
             meta: None,
             next_cursor: None,
         })
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        self.tool_router.get(name).cloned()
+        self.tool_router
+            .get(name)
+            .cloned()
+            .or_else(|| self.myelin.get(name).cloned())
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -628,11 +658,13 @@ impl ServerHandler for HomeStillMcp {
                 .build(),
         )
         .with_instructions(
-            "home-still: the user's document corpus, with citations a reader can check.\n\n\
-             Search and memory are the `myelin` server's, not this one's: `recall` (or \
-             `investigate`) searches the stores, `remember` keeps what the user tells you, \
-             `profile` says what they prefer. A hit names its `store` and its `meta.doc_id`; \
-             every tool here takes those two.\n\n\
+            "home-still: the user's document corpus and memory, with citations a reader can \
+             check. One server: search and memory tools come with it.\n\n\
+             Search and memory: call `stores` first; it lists the stores, what each holds and \
+             which you may write. `recall` (or `investigate`, when one search is not enough) \
+             searches the default stores unless you name others, `remember` keeps what the \
+             user tells you, `profile` says what they prefer. A hit names its `store` and \
+             its `meta.doc_id`; `read`, `cite` and `status` take those two.\n\n\
              - `cite` every passage you quote from the corpus BEFORE you present it. A quote \
              it refuses is not in the document.\n\
              - `read` a document for the context around a hit; `documents` lists what a \

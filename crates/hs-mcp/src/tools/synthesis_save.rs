@@ -222,7 +222,7 @@ impl HomeStillMcp {
             doc_id: stem,
             citations_verified: verified.len(),
             next: "The synthesis is queued for indexing. `status` with this `doc_id` and store \
-                   `syntheses` says when it is indexed; then myelin's `recall` over `syntheses` \
+                   `syntheses` says when it is indexed; then `recall` over `syntheses` \
                    finds it.",
         })
     }

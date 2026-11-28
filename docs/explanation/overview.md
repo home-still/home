@@ -81,9 +81,10 @@ shows the whole pipeline.
 ## Using it through an AI assistant
 
 Search returns passages. To get a synthesis across several papers, you
-connect an MCP client such as Claude to two MCP servers: `myelin`, where the
-assistant searches, and home-still's [MCP server](../reference/mcp-tools.md),
-which reads and cites. The assistant can then search your
+connect an MCP client such as Claude to home-still's
+[MCP server](../reference/mcp-tools.md), the one server it needs. It searches
+(the server forwards `recall` and the other memory tools to myelin), reads and
+cites. The assistant can then search your
 library, read whole papers, follow citations and hand you links to the exact
 page, and answer with citations you can verify.
 
