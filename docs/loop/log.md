@@ -3628,3 +3628,133 @@ changed in this pass.
    (BACKLOG P1-51).
 5. **`hs distill reconcile` is blind to a document the store holds and
    storage does not** (BACKLOG P1-47).
+
+## 2026-11-28-01 — One door: agents reach myelin only through home-still; v0.1.0 on eight hosts
+
+**What the owner required, and what had shipped.** Every myelin call an
+agent makes goes through home-still, as one MCP server. Entry -04 did the
+opposite: it added a second server, `myelin`, to Claude Code and omp on four
+hosts, and an agent called `stores` and `recall` on myelin directly. That
+was my mistake, not a design the owner chose.
+
+**What changed (v0.1.0-rc.398, then v0.1.0 on the same commit).**
+
+- The home-still MCP server lists myelin's agent tools when it starts and
+  forwards each call to myelin's agent surface on the memory host's
+  loopback, one session per call, the answer unchanged. It refuses to start
+  when myelin is unreachable or a tool name collides.
+- The gateway has no `/memory` route and no `memory` scope. A `memory:` line
+  in `cloud.gateway.routes` is refused as an unknown service, so it was
+  removed from the gateway host's config before the upgrade.
+- `hs mcp install` writes one entry, `home-still`.
+- myelin's unit serves 127.0.0.1:7462 and 127.0.0.1:7463 and nothing else.
+  The LAN listener is gone; `ss` shows no socket on it.
+
+**Measured, on each host, from the client's own config.** A check started
+the `home-still` entry exactly as the config names it, required that the
+config holds no `myelin` entry, then asked through it.
+
+| Host | Clients | Entries | `tools/list` | `stores` | `recall` | `cite` | Links |
+|---|---|---|---|---|---|---|---|
+| GPU host | omp, Claude Code | `home-still` | 21 | 7 | 2 hits | page 1, exact, boxes located | 200, 200, 206, 206 (LAN) |
+| `bmb` | omp, Claude Code | `home-still` | 21 | 7 | 2 hits | page 1, exact, boxes located | 200, 200, 206, 206 (remote) |
+| `mac_air` | omp, Claude Code | `home-still` | 21 | 7 | 2 hits | page 1, exact, boxes located | 200, 200, 206, 206 (remote) |
+| `big_mac` | omp, Claude Code | `home-still` | 21 | 7 | 2 hits | page 1, exact, boxes located | 200, 200, 206, 206 (remote) |
+
+21 is the ten home-still tools and myelin's eleven. `claude mcp list` shows
+`home-still` connected on all four. The checks on the Macs ran again after
+the gateway host was upgraded and passed. A valid token on `/memory/mcp`
+now gets `404 No such service`.
+
+Restarting myelin to drop the LAN listener changed no count: abstracts
+16,835 records in 14,091 namespaces, academic 381,153 in 19,291, personal
+3,834 in 86, references 97,248 in 16,784, web 27 in 8, syntheses 0, memory
+0, identical before and after. `hs distill reconcile` reports `ok=19357
+stamp_missing=0 embed_missing=0`.
+
+**Releases.**
+
+| Tag | Kind | Commit | How it ran |
+|---|---|---|---|
+| `v0.0.1-rc.397` | pre-release | PR #24 | gate green on three legs; release run green |
+| `v0.1.0-rc.398` | pre-release | PR #25, `3883523` | gate green; 5 builds; run about 1 h 5 min |
+| `v0.1.0` | **Latest** | same `3883523` | same gate and builds; run about 1 h 3 min |
+
+`hs upgrade --pre` takes the highest version, and 0.1.0 is above
+0.1.0-rc.398, so every host went to v0.1.0 and no host ran rc.398 itself.
+It is the same commit; the version bake was checked on both (`hs
+0.1.0-rc.398`, `hs 0.1.0`). Later pre-releases are `v0.1.1-rc.399` and up.
+
+**Fleet.** All at 0.1.0, one host at a time, GPU host first. Logs are in
+the evidence directory.
+
+| Host | Before | Restarted | Note |
+|---|---|---|---|
+| GPU host | rc.397 | 8 units: distill, mcp, scribe, scribe inbox, docs, three watchers | the mcp unit came up and listed myelin's tools |
+| `bmb` | rc.396 | scribe agent | `/health` answers, 0.1.0 in `hs status` |
+| `mac_air` | rc.396 | scribe inbox agent | pid stable, sweep `found=161 errors=0` |
+| `big_mac` | rc.396 | none running | |
+| gateway host | rc.396 | gateway | routes `distill, docs, scribe, mcp` |
+| `one`, `three`, `four` | rc.396 | none running | |
+| `five` | unknown | | still `No route to host` |
+
+**Left over from the backup and cutover.** The backup of the new store is on
+the GPU host's disk (14 GB, with a restore runbook and checksums). The old
+Qdrant data stays until 2026-12-04, as the owner decided.
+
+**Abstracts.** `hs distill abstracts build --force` ran to the end under a
+GPU lease: 19,557 catalog entries, 0 errors, 5,466 without a usable
+abstract. `hs distill abstracts status` then reports 16,288 indexed (2,197 of
+them with a title only) and 3,269 with neither. The store lists 14,091
+namespaces and 16,835 records. I did not account for the difference, and I
+did not measure afterwards whether any vector from before the pooling fix
+remains: the build does not report it, and the earlier "33 of 2,860" came
+from the older build's stamps. One namespace with four records, dated
+2026-11-26, holds an "abstract" whose later chunks read as body text with
+citations (BACKLOG P2-20). The lease was released.
+
+**Configs cleaned.** `unknown config key` and `environment variable sets
+nothing` warnings are gone on every host: `scribe.autotune` and
+`scribe.use_cuda` on the three Macs and `scribe.autotune`,
+`scribe.timeout_policy.fallback_secs` and `openalex.ingest_workers` on the
+GPU host, `HS_SCRIBE_OPENAI_MODEL` in `secrets.env` on the GPU host and the
+gateway host, `cloud.gateway.key_rotation_days` on the gateway host. Each
+file has a copy from before beside it (`*.bak-golive*`, `*.bak-onedoor`).
+
+**mac_air, the question BACKLOG P1-51 (b) asked.** I cannot see the screen
+and the owner does not know whether macOS asked. What the log shows: the
+inbox agent restarted by the upgrade at 16:40:31Z connected to NATS in the
+same second and swept 161 files with no error. Its log shipping logged `No
+route to host (os error 65)` for the archive's S3 endpoint in that second;
+`curl` from an ssh shell on the same Mac gets `403` from that endpoint. The
+same line appears 36 times in the log in all. So a process
+started by launchd is refused where an ssh child is not, for some
+connections and not others; the warning is logged once per start, so I do
+not know whether shipping recovers.
+
+**Also removed.** `mac_air`'s Claude Code held `home-still-http`, a direct
+entry to port 7445 whose token variable was not set; it answered `401`. It
+was a second way into the same server, so it went with the `myelin` entries.
+
+**Mistakes in this pass.**
+
+- Entry -04 installed the second server. See the top of this entry.
+- I asked the owner for decisions that tools could settle, and was told so.
+- A release watcher with a 3,500 s limit ended while the macOS builds were
+  still running; it was started again, and nothing was lost.
+
+**Version.** `main` at `3883523` plus this entry; tags `v0.0.1-rc.397`,
+`v0.1.0-rc.398`, `v0.1.0`. v0.1.0 on every reachable host.
+
+### Top 5 remaining items
+
+1. **Owner-only deletions** (list in BACKLOG, "Owner-only items after
+   v0.1.0"): the old Qdrant data on 2026-12-04, the unused firewall rule
+   for TCP 7463, the unused `mcp.env`, the system units, the `*.bak-*`
+   copies.
+2. **The abstracts store** holds records the build does not account for
+   (BACKLOG P2-20).
+3. **`mac_air`'s LaunchAgent and the LAN** (BACKLOG P1-51 (b)).
+4. **One way to install the MCP servers** (BACKLOG P1-53): the bridge or
+   URL choice, the secrets the local mode copies, omp's entry.
+5. **The truncated PDF** (BACKLOG P2-19).
