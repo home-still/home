@@ -6,18 +6,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context};
 use serde::Deserialize;
 
-use crate::auth::{MEMORY_SERVICE, ROUTABLE_SERVICES};
+use crate::auth::ROUTABLE_SERVICES;
 use crate::backend_url;
 
 /// The port each routable service listens on unless told otherwise. Only
 /// the missing-route error reads it, to show the operator a line they can
 /// paste and correct; the gateway never assumes an address.
-const DEFAULT_SERVICE_PORTS: [(&str, u16); 5] = [
+const DEFAULT_SERVICE_PORTS: [(&str, u16); 4] = [
     ("scribe", 7433),
     ("distill", 7434),
     ("mcp", 7445),
     ("docs", 7446),
-    (MEMORY_SERVICE, 7463),
 ];
 
 /// The `cloud.gateway.routes` line that would give `service` a backend.
@@ -380,13 +379,13 @@ mod tests {
 
     #[test]
     fn missing_listen_is_an_error() {
-        let msg = err_of("cloud:\n  gateway:\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      memory: http://127.0.0.1:7463\n");
+        let msg = err_of("cloud:\n  gateway:\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n");
         assert!(msg.contains("listen"), "{msg}");
     }
 
     #[test]
     fn a_retired_key_is_stripped_and_reported() {
-        let yaml = "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    key_rotation_days: 90\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      memory: http://127.0.0.1:7463\n";
+        let yaml = "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    key_rotation_days: 90\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n";
         assert!(GatewayConfig::from_yaml(yaml, Path::new(PATH)).is_ok());
         let mut section =
             serde_yaml_ng::from_str::<serde_json::Value>(yaml).unwrap()["cloud"]["gateway"].clone();
@@ -396,14 +395,14 @@ mod tests {
 
     #[test]
     fn an_unknown_key_is_an_error_naming_it() {
-        let msg = err_of("cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    max_concurrent_proxy_request: 5\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      memory: http://127.0.0.1:7463\n");
+        let msg = err_of("cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    max_concurrent_proxy_request: 5\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n");
         assert!(msg.contains("max_concurrent_proxy_request"), "{msg}");
     }
 
     #[test]
     fn valid_section_parses() {
         let config = GatewayConfig::from_yaml(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      memory: http://127.0.0.1:7463\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n",
             Path::new(PATH),
         )
         .expect("valid section");
@@ -432,7 +431,7 @@ mod tests {
     #[test]
     fn routes_are_normalized() {
         let config = GatewayConfig::from_yaml(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://big.example.local:7433/\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      memory: http://127.0.0.1:7463\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://big.example.local:7433/\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n",
             Path::new(PATH),
         )
         .unwrap();
@@ -442,7 +441,7 @@ mod tests {
     #[test]
     fn a_route_may_be_a_single_url_or_a_list() {
         let config = GatewayConfig::from_yaml(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      memory: http://127.0.0.1:7463\n      scribe:\n        - http://gpu-a.example.local:7433\n        - http://gpu-b.example.local:7433/\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      scribe:\n        - http://gpu-a.example.local:7433\n        - http://gpu-b.example.local:7433/\n",
             Path::new(PATH),
         )
         .unwrap();
@@ -483,7 +482,7 @@ mod tests {
     #[test]
     fn a_routable_service_with_no_backend_is_an_error_naming_the_key() {
         let msg = err_of(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      distill: http://127.0.0.1:7434\n      mcp: http://127.0.0.1:7445\n      memory: http://127.0.0.1:7463\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      distill: http://127.0.0.1:7434\n      mcp: http://127.0.0.1:7445\n",
         );
         assert!(msg.contains("docs"), "{msg}");
         assert!(msg.contains("cloud.gateway.routes"), "{msg}");
@@ -494,24 +493,13 @@ mod tests {
         assert!(msg.contains("docs: http://<docs-host>:7446"), "{msg}");
     }
 
-    /// A gateway upgraded from a release that had no memory route meets
-    /// this error on its first start, so it has to say exactly what to add.
-    #[test]
-    fn a_missing_memory_route_names_the_line_to_add() {
-        let msg = err_of(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      distill: http://127.0.0.1:7434\n      mcp: http://127.0.0.1:7445\n      docs: http://127.0.0.1:7446\n",
-        );
-        assert!(msg.contains("`memory`"), "{msg}");
-        assert!(msg.contains("memory: http://<memory-host>:7463"), "{msg}");
-    }
-
     /// The check names **every** missing service, not just the first.
     #[test]
     fn every_missing_service_is_named() {
         let msg = err_of(
             "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n",
         );
-        for service in ["distill", "mcp", "memory", "docs"] {
+        for service in ["distill", "mcp", "docs"] {
             assert!(msg.contains(service), "the message lost `{service}`: {msg}");
         }
     }
@@ -520,7 +508,7 @@ mod tests {
     #[test]
     fn a_route_for_every_routable_service_is_valid() {
         let config = GatewayConfig::from_yaml(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      distill: http://127.0.0.1:7434\n      mcp: http://127.0.0.1:7445\n      memory: http://127.0.0.1:7463\n      docs: http://127.0.0.1:7446\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      distill: http://127.0.0.1:7434\n      mcp: http://127.0.0.1:7445\n      docs: http://127.0.0.1:7446\n",
             Path::new(PATH),
         )
         .expect("every routable service has a backend");
@@ -531,15 +519,27 @@ mod tests {
     #[test]
     fn a_route_that_can_never_be_reached_is_an_error() {
         let msg = err_of(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      memory: http://127.0.0.1:7463\n      searhc: http://127.0.0.1:7434\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      searhc: http://127.0.0.1:7434\n",
         );
         assert!(msg.contains("searhc"), "{msg}");
+    }
+
+    /// `memory` was a routable service for a while and is not one now. A
+    /// config that still carries it is refused like any other unknown
+    /// service.
+    #[test]
+    fn a_retired_memory_route_is_refused_as_an_unknown_service() {
+        let msg = err_of(
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: http://127.0.0.1:7433\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      memory: http://127.0.0.1:7463\n",
+        );
+        assert!(msg.contains("memory"), "{msg}");
+        assert!(msg.contains("not a routable service"), "{msg}");
     }
 
     #[test]
     fn a_malformed_route_url_is_an_error() {
         let msg = err_of(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: ftp://host\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      memory: http://127.0.0.1:7463\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    routes:\n      scribe: ftp://host\n      mcp: http://127.0.0.1:7445\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n",
         );
         assert!(msg.contains("scribe"), "{msg}");
     }
@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn zero_limits_are_errors() {
         let msg = err_of(
-            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    max_concurrent_proxy_requests: 0\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n      memory: http://127.0.0.1:7463\n",
+            "cloud:\n  gateway:\n    listen: 127.0.0.1:7440\n    max_concurrent_proxy_requests: 0\n    routes:\n      mcp: http://127.0.0.1:7445\n      scribe: http://127.0.0.1:7435\n      distill: http://127.0.0.1:7434\n      docs: http://127.0.0.1:7446\n",
         );
         assert!(msg.contains("max_concurrent_proxy_requests"), "{msg}");
     }

@@ -2,6 +2,37 @@
 
 Changes that need action when upgrading. Binaries and full notes: GitHub Releases.
 
+## v0.1.0
+
+The first release that is not a release candidate: the same code as
+v0.1.0-rc.398. Nothing to do when upgrading from rc.398.
+
+- **Channels.** `hs upgrade` installs the newest release; `hs upgrade --pre`
+  also installs release candidates. A candidate is a GitHub pre-release
+  tagged `vX.Y.Z-rc.N`; the candidates after this release are
+  `v0.1.1-rc.399` onward, so the rc counter keeps counting.
+- **Upgrading from v0.0.1-rc.397 or earlier:** read the rc.398 and rc.397
+  entries below.
+
+## v0.1.0-rc.398
+
+- **One MCP server.** home-still's MCP server now serves myelin's agent
+  tools itself (`recall`, `investigate`, `remember`, `forget`, `explain`,
+  `neighbors`, `profile`, `search`, `stores`, `namespaces`,
+  `trajectories`: whatever myelin's agent surface lists), forwarding each
+  call to myelin and returning its answer unchanged. Agents reach myelin
+  only through home-still.
+  - New key `mcp.myelin_url` (default `http://127.0.0.1:7463/mcp`): where
+    the MCP server finds myelin's agent surface. The MCP server refuses to
+    start when it cannot list myelin's tools there.
+  - **Action:** remove the `myelin` (or `memory`) entry from every MCP
+    client (`claude mcp remove <name> -s user`; omp's `mcp.json`).
+    `hs mcp install` now writes only `home-still`.
+- **The gateway no longer routes `/memory/*`** and enrollment no longer
+  grants a `memory` scope. Remove a `memory` backend from
+  `cloud.gateway.routes`. myelin's agent listener needs no LAN address
+  any more: serve it on loopback only.
+
 ## v0.0.1-rc.397
 
 - **rc releases are GitHub pre-releases from this one on.** `hs upgrade

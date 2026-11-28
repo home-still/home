@@ -25,7 +25,7 @@ pub enum CloudCmd {
         /// Device name for the enrollment
         #[arg(long, default_value = "device")]
         name: String,
-        /// Scope to grant (scribe, distill, mcp, memory); repeat for several. Default: all four.
+        /// Scope to grant (scribe, distill, mcp); repeat for several. Default: all three.
         #[arg(long = "scope", value_name = "SCOPE")]
         scopes: Vec<String>,
     },

@@ -84,12 +84,15 @@ each chunk with Ollama's `bge-m3` on the GPU, keeps the vectors in a Qdrant
 of its own, fuses keyword and vector candidates and reranks them with a
 cross-encoder. home-still no longer runs or manages a Qdrant. myelin serves
 two MCP surfaces: the full one, used by the distill server, and an agent
-surface, where an assistant searches. See
+surface, which only the MCP server (`hs-mcp`) reaches. See
 [set up myelin](../tutorials/home-cloud-cluster.md#8-set-up-myelin-on-the-gpu-host).
 
 **The MCP server** (`hs-mcp`) reads storage, the catalog and the distill
 server, and offers them as tools to an AI assistant: it reads, cites and
-acquires, while search is the `myelin` server's. `hs status` asks
+acquires. It also serves the memory and search tools (`recall`, `investigate`,
+`remember` and the rest), which it forwards to myelin's agent surface on its
+own host's loopback interface and answers with myelin's result unchanged, so an
+assistant connects to this one server and nothing else. `hs status` asks
 it for the pipeline's numbers, so the dashboard and an assistant always agree.
 
 ## The scribe tier chain
@@ -139,7 +142,7 @@ the gateway, not the caller.
 
 - **Devices** enroll with a one-time code created on the gateway host. The
   code fixes the device's name and its **scopes**: `scribe`, `distill`,
-  `mcp`, `memory`. A device gets a refresh token and trades it for short-lived access
+  `mcp`. A device gets a refresh token and trades it for short-lived access
   tokens; each proxied request needs an access token whose scopes cover the
   service.
 - **Claude Desktop** uses OAuth 2.1 with PKCE against the same gateway; the

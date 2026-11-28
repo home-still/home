@@ -41,13 +41,14 @@ hardware. One of the two storage backends.
 until consumers acknowledge them.
 
 **MCP.** The Model Context Protocol, a standard for letting AI assistants use
-tools. `hs-mcp` exposes home-still's research tools; myelin exposes the
-search and memory tools.
+tools. `hs-mcp` is the one MCP server an assistant connects to. It exposes
+home-still's research tools and forwards the search and memory tools to
+myelin's agent surface.
 
 **myelin.** A separate memory server (`github.com/home-still/myelin`) that
 holds home-still's search index. It embeds, stores, searches and reranks
 passages, and serves two MCP surfaces: a full one for the distill server and
-an agent one for assistants.
+an agent one that only `hs-mcp` reaches, on the loopback.
 
 **NATS.** The message broker that carries home-still's events between
 machines.

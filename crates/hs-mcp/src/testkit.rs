@@ -1,6 +1,6 @@
 //! Fakes for tool-level tests: a storage that fails on demand, a loopback
-//! distill server, an event bus that remembers what was published, and a
-//! synthetic OpenAlex corpus.
+//! distill server, a loopback memory server, an event bus that remembers
+//! what was published, and a synthetic OpenAlex corpus.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,6 +10,15 @@ use hs_common::storage::{LocalFsStorage, ObjectMeta, Storage};
 
 use crate::openalex::OpenAlexCorpus;
 use crate::{Deps, HomeStillMcp};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, Content, ErrorData, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+};
+use rmcp::service::RequestContext;
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
+use rmcp::{RoleServer, ServerHandler};
 
 /// A `LocalFsStorage` in a temp dir whose operations can be made to fail like
 /// an S3 outage (an error that is *not* "not found").
@@ -149,6 +158,10 @@ fn deps(
             hs_common::stores::PERSONAL_PREFIX_DEFAULT,
         )
         .unwrap(),
+        // A memory server that offers nothing: the tests that need its
+        // tools build the server with `FakeMyelin::server`.
+        myelin: crate::myelin::MyelinTools::from_tools("http://127.0.0.1:9/mcp", Vec::new())
+            .unwrap(),
     }
 }
 
@@ -296,4 +309,118 @@ pub async fn seed_catalog(storage: &dyn Storage, stem: &str) {
     hs_common::catalog::write_catalog_entry_via(storage, "catalog", stem, &entry)
         .await
         .unwrap();
+}
+
+/// The tool of [`FakeMyelin`] whose call is answered with a result flagged
+/// `isError`.
+pub const FAKE_MYELIN_ERROR_TOOL: &str = "forget";
+
+/// The tool of [`FakeMyelin`] whose call is answered with a JSON-RPC error.
+pub const FAKE_MYELIN_REFUSING_TOOL: &str = "refuse";
+
+/// A loopback stand-in for myelin's agent surface, served by rmcp's own
+/// streamable-HTTP service as the real one is. It offers the tools it was
+/// started with. A call to [`FAKE_MYELIN_ERROR_TOOL`] answers a result
+/// flagged `isError`, a call to [`FAKE_MYELIN_REFUSING_TOOL`] a JSON-RPC
+/// error, any other call a success with structured content that echoes the
+/// tool and the arguments it got.
+pub struct FakeMyelin {
+    pub url: String,
+}
+
+#[derive(Clone)]
+struct FakeMyelinHandler {
+    tools: Arc<Vec<Tool>>,
+}
+
+impl ServerHandler for FakeMyelinHandler {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match request.name.as_ref() {
+            FAKE_MYELIN_ERROR_TOOL => Ok(CallToolResult::error(vec![Content::text(
+                "refused: only a soft forget is allowed",
+            )])),
+            FAKE_MYELIN_REFUSING_TOOL => Err(ErrorData::invalid_params(
+                "name a store; no default store is defined",
+                None,
+            )),
+            name => {
+                let mut result =
+                    CallToolResult::success(vec![Content::text(format!("ran {name}"))]);
+                result.structured_content = Some(serde_json::json!({
+                    "tool": name,
+                    "arguments": request.arguments,
+                }));
+                Ok(result)
+            }
+        }
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: self.tools.as_ref().clone(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+}
+
+impl FakeMyelin {
+    /// Serve one tool per name. Each takes a free-form object and carries
+    /// the annotations a client plans a call by, so a test can see them
+    /// pass through.
+    pub async fn start(tool_names: &[&'static str]) -> Self {
+        let tools: Vec<Tool> = tool_names
+            .iter()
+            .map(|name| {
+                let schema = serde_json::json!({
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } },
+                });
+                let schema = schema.as_object().unwrap().clone();
+                let mut tool = Tool::new(*name, format!("the stand-in's {name}"), schema);
+                tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
+                tool
+            })
+            .collect();
+        let handler = FakeMyelinHandler {
+            tools: Arc::new(tools),
+        };
+        let service = StreamableHttpService::new(
+            move || Ok(handler.clone()),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback_service(service);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self { url }
+    }
+
+    /// A [`HomeStillMcp`] over empty storage whose memory tools are this
+    /// stand-in's, read the way startup reads them.
+    pub async fn server(&self) -> anyhow::Result<HomeStillMcp> {
+        let mut d = deps(
+            FaultyStorage::new(),
+            Arc::new(NoOpBus),
+            Vec::new(),
+            Vec::new(),
+        );
+        d.myelin = crate::myelin::MyelinTools::connect(&self.url).await?;
+        HomeStillMcp::from_deps(d)
+    }
 }

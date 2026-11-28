@@ -219,17 +219,17 @@ relevance score, found by meaning even where they share none of your words.
 hs mcp install --client code
 ```
 
-An assistant uses two MCP servers: `home-still`, which reads and cites, and
-`myelin`, where it searches. The command writes both into Claude Code's
-configuration. Start a new Claude Code session and ask "Search my home-still
-library for how the Transformer's attention is computed, and cite the page."
-The assistant searches with `recall` on `myelin`, checks each quote with
+An assistant uses one MCP server, `home-still`, which searches (`recall`
+reaches myelin through it), reads and cites. The command writes it into Claude
+Code's configuration. Start a new Claude Code session and ask "Search my
+home-still library for how the Transformer's attention is computed, and cite
+the page." The assistant searches with `recall`, checks each quote with
 `cite`, and answers with citations.
 
-Claude Desktop's configuration file takes only commands, so
-`hs mcp install --client desktop` gives it `home-still` alone and says so. It
-reaches the memory server through a gateway, as a server you add in the app:
-see [connect Claude and agents](../how-to/connect-claude-and-agents.md).
+Claude Desktop's configuration file takes only commands, and
+`hs mcp install --client desktop` writes the `home-still` command entry there.
+To reach the server through a gateway instead, add it in the app: see
+[connect Claude and agents](../how-to/connect-claude-and-agents.md).
 
 ## 9. Make it automatic
 

@@ -194,7 +194,7 @@ impl HomeStillMcp {
             size_bytes,
             replaced,
             next: "The page is queued for conversion and indexing. `status` with this `doc_id` \
-                   and store `web` says when it is converted and indexed; then myelin's `recall` \
+                   and store `web` says when it is converted and indexed; then `recall` \
                    finds it and `cite` checks quotes against it.",
         })
     }

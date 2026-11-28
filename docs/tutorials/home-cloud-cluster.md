@@ -390,14 +390,8 @@ MYELIN_RERANK__URL=<rerank-url>
 MYELIN_RERANK__MODEL=bge-reranker-v2-m3
 MYELIN_LLM__URL=<llm-url>
 MYELIN_LLM__MODEL=<llm-model>
-MYELIN_MCP_TOKEN=<token>
 ENV
 ```
-
-`MYELIN_MCP_TOKEN` is the secret that a listener on a network address
-requires. Give it the same value as `HS_BACKEND_TOKEN` (step 2): the gateway
-sends that secret to every backend, including the memory server. Listeners on
-the loopback need no token.
 
 `MYELIN_EMBED__MAX_CHARS` is the longest text myelin embeds in one piece.
 home-still's passages are up to about 4,400 characters, and 4500 keeps each
@@ -406,9 +400,10 @@ vectors averaged. Do not set it much higher: Ollama keeps about 1 MiB of
 system memory per token of the longest text it has embedded.
 
 Write the user service `~/.config/systemd/user/myelin-mcp.service`. It has two
-listeners for agents: one on the loopback, for the agents on this host, and one
-on `<gpu-host>`'s LAN address, which the gateway reaches (step 13). The distill
-server uses the full surface, which listens on the loopback only:
+listeners, both on the loopback and neither reachable from the network. The
+distill server uses the full surface. The agent surface is what the MCP server
+(`hs-mcp`, step 10) forwards the memory and search tools to; no client connects
+to it directly:
 
 ```ini
 [Unit]
@@ -419,7 +414,6 @@ EnvironmentFile=%h/.config/myelin-mcp.env
 ExecStart=%h/.local/bin/myelin-mcp \
   --serve 127.0.0.1:7462 \
   --serve-agents 127.0.0.1:7463 \
-  --serve-agents <gpu-host-lan-address>:7463 \
   --collection home_still \
   --ledger %h/.local/share/myelin/home_still.ledger \
   --meta-index year:integer \
@@ -433,20 +427,17 @@ RestartSec=5
 WantedBy=default.target
 ```
 
-Replace `<gpu-host-lan-address>` with the address the gateway uses to reach
-`<gpu-host>`. `--collection` names myelin's Qdrant collection and `--ledger`
+`--collection` names myelin's Qdrant collection and `--ledger`
 is the path of myelin's own database, in the directory made in item 2; keep
 both between restarts. `--rerank-depth 50` is how many passages of each store
 myelin's reranker reads for one search; home-still's search results were
-judged at 50, and myelin's own default is 25. Start the service and open port
-7463 to the gateway host only:
+judged at 50, and myelin's own default is 25. Start the service:
 
 ```sh
 sudo loginctl enable-linger "$USER"
 systemctl --user daemon-reload
 systemctl --user enable --now myelin-mcp
 systemctl --user status myelin-mcp
-sudo ufw allow from <gateway-host> to any port 7463 proto tcp
 ```
 
 The service shows `active (running)`. `myelin-mcp` has no `/health` route, so
@@ -483,7 +474,10 @@ If the server exits instead, see
 
 ## 10. Start the MCP and docs servers and open the ports
 
-The MCP server gives assistants and `hs status` their view of the pipeline.
+The MCP server gives assistants and `hs status` their view of the pipeline. It
+is the one server an assistant connects to: it also serves the memory and
+search tools, and forwards those to myelin's agent surface on this host's
+loopback (`mcp.myelin_url`, by default `http://127.0.0.1:7463/mcp`).
 The docs server serves documents over signed, expiring links. Add the link
 settings to `~/.home-still/config.yaml` on `<gpu-host>`:
 
@@ -630,13 +624,12 @@ cloud:
       scribe: http://<gpu-host>:7433
       distill: http://<gpu-host>:7434
       mcp: http://<gpu-host>:7445
-      memory: http://<gpu-host>:7463
       docs: http://<gpu-host>:7446
 ```
 
 The gateway refuses to start unless `routes` names a backend for each of
-`scribe`, `distill`, `mcp`, `memory` and `docs`. The `memory` route is the
-memory server's agent listener, where an assistant searches the library; the
+`scribe`, `distill`, `mcp` and `docs`. The `mcp` route serves the memory and
+search tools as well as the library's own; the
 `docs` route is what makes signed document links work from outside your LAN.
 The other keys, and the gateway's endpoints, are in the
 [configuration reference](../reference/configuration.md#cloudgateway)
@@ -760,27 +753,24 @@ event bus on your LAN.
 
 ## 15. Connect Claude Desktop
 
-Claude Desktop reaches two servers through the gateway, using OAuth: the tools
-server at `/mcp` and the memory server at `/memory/mcp`. Each is added on its
-own and signs in on its own, so on `<gateway-host>` create one code for each
-when you are ready to paste it (a code lasts five minutes):
+Claude Desktop reaches the MCP server through the gateway, using OAuth, at
+`/mcp`. On `<gateway-host>` create a code when you are ready to paste it (a
+code lasts five minutes):
 
 ```sh
 hs cloud invite --name claude-desktop --scope mcp
-hs cloud invite --name claude-desktop-memory --scope memory
 ```
 
-Then in Claude Desktop, once for each address:
+Then in Claude Desktop:
 
-1. Add `https://cloud.example.com/mcp`, then `https://cloud.example.com/memory/mcp`,
-   as a remote MCP server.
+1. Add `https://cloud.example.com/mcp` as a remote MCP server.
 2. Claude opens your browser on the gateway's authorization page.
-3. Paste the code for that server and select Authorize.
+3. Paste the code and select Authorize.
 
 Claude Desktop stores its tokens and refreshes them with its refresh token. In
 a new chat, ask Claude to search your library and show its source: it finds the
-passage with `recall` on the memory server and returns the page with `cite` on
-the tools server. The tools are listed in the [MCP tools reference](../reference/mcp-tools.md).
+passage with `recall` and returns the page with `cite`, both on the one server.
+The tools are listed in the [MCP tools reference](../reference/mcp-tools.md).
 
 ## 16. Watch the inbox from the laptop
 

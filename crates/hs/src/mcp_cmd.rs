@@ -1,6 +1,7 @@
-//! `hs mcp` subcommand — install/uninstall the two MCP servers in Claude and
-//! OpenCode client configuration: `home-still` (hs-mcp, the tools) and
-//! `myelin` (the memory server, where agents search and remember).
+//! `hs mcp` subcommand — install/uninstall the `home-still` MCP server in
+//! Claude and OpenCode client configuration. `home-still` (hs-mcp) is the one
+//! server an agent talks to: it serves the library's tools and forwards the
+//! memory and search tools to myelin.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,19 +24,19 @@ pub enum McpClient {
 
 #[derive(Subcommand, Debug)]
 pub enum McpCmd {
-    /// Write the `home-still` and `myelin` servers into your clients' configuration
+    /// Write the `home-still` server into your clients' configuration
     Install {
         /// Target client
         #[arg(long, value_enum, default_value = "all")]
         client: McpClient,
-        /// Reach both servers through the cloud gateway instead of on this machine
+        /// Reach the server through the cloud gateway instead of on this machine
         #[arg(long)]
         remote: bool,
         /// Gateway URL for remote mode (reads from cloud config if omitted)
         #[arg(long)]
         gateway_url: Option<String>,
     },
-    /// Remove the `home-still` and `myelin` servers from your clients' configuration
+    /// Remove the `home-still` server from your clients' configuration
     Uninstall {
         /// Target client
         #[arg(long, value_enum, default_value = "all")]
@@ -90,21 +91,11 @@ fn opencode_config_path() -> Option<PathBuf> {
     Some(home.join(".config/opencode/opencode.json"))
 }
 
-/// The entry name of the tools server, hs-mcp.
+/// The entry name of the server, hs-mcp.
 const TOOLS_SERVER: &str = "home-still";
 
-/// The entry name of the memory server, myelin: where an agent searches the
-/// corpus and keeps what it was asked to remember.
-const MEMORY_SERVER: &str = "myelin";
-
-/// Where the memory server listens for agents on its own machine.
-const LOCAL_MEMORY_URL: &str = "http://127.0.0.1:7463/mcp";
-
-/// The gateway path of the tools server.
+/// The gateway path of the server.
 const GATEWAY_TOOLS_PATH: &str = "/mcp";
-
-/// The gateway path of the memory server.
-const GATEWAY_MEMORY_PATH: &str = "/memory/mcp";
 
 /// A client whose configuration file `hs mcp install` writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,10 +253,10 @@ fn secrets_as_json() -> Result<Option<serde_json::Value>> {
     Ok(Some(serde_json::Value::Object(map)))
 }
 
-/// The gateway both servers are reached through, as a bare https origin.
+/// The gateway the server is reached through, as a bare https origin.
 /// It is written into the client's configuration and the client signs in
 /// to it, so a URL that is not one is refused here, not found out later
-/// as two servers that never connect.
+/// as a server that never connects.
 async fn resolve_gateway_url(explicit: Option<String>) -> Result<String> {
     let url = match explicit {
         Some(url) => url,
@@ -283,74 +274,50 @@ async fn resolve_gateway_url(explicit: Option<String>) -> Result<String> {
     super::cloud_cmd::require_https_origin(&url)
 }
 
-/// How a client reaches the two servers.
+/// How a client reaches the server.
 enum Mode {
     /// hs-mcp runs as the client's child process, with `secrets.env` as its
-    /// environment; the memory server is the one on this machine.
+    /// environment.
     Local {
         mcp_bin: PathBuf,
         env: Option<serde_json::Value>,
     },
-    /// Both servers are behind the gateway.
+    /// The server is behind the gateway.
     Remote { gateway_url: String },
 }
 
-/// One server as it is to be written for one client.
+/// The server as it is to be written for one client.
 struct Planned {
-    name: &'static str,
     /// The entry, or `None` when this client's file cannot name the server.
     entry: Option<serde_json::Value>,
     /// What the user does instead when it cannot.
     by_hand: String,
 }
 
-/// The servers `hs mcp install` writes for `target`, both of them in either
-/// mode.
-fn plan(target: Target, mode: &Mode) -> Vec<Planned> {
+/// The `home-still` entry `hs mcp install` writes for `target`.
+fn plan(target: Target, mode: &Mode) -> Planned {
     match mode {
-        Mode::Local { mcp_bin, env } => vec![
-            Planned {
-                name: TOOLS_SERVER,
-                entry: Some(target.command_entry(mcp_bin, env.as_ref())),
-                by_hand: String::new(),
-            },
-            Planned {
-                name: MEMORY_SERVER,
-                entry: target.url_entry(LOCAL_MEMORY_URL),
-                by_hand: format!(
-                    "the app cannot reach {LOCAL_MEMORY_URL}; add your gateway's \
-                     {GATEWAY_MEMORY_PATH} URL as a connector in the app"
-                ),
-            },
-        ],
+        Mode::Local { mcp_bin, env } => Planned {
+            entry: Some(target.command_entry(mcp_bin, env.as_ref())),
+            by_hand: String::new(),
+        },
         Mode::Remote { gateway_url } => {
-            let base = gateway_url.trim_end_matches('/');
-            [
-                (TOOLS_SERVER, GATEWAY_TOOLS_PATH),
-                (MEMORY_SERVER, GATEWAY_MEMORY_PATH),
-            ]
-            .into_iter()
-            .map(|(name, path)| {
-                let url = format!("{base}{path}");
-                Planned {
-                    name,
-                    entry: target.url_entry(&url),
-                    by_hand: format!("add {url} as a connector in the app"),
-                }
-            })
-            .collect()
+            let url = format!("{}{GATEWAY_TOOLS_PATH}", gateway_url.trim_end_matches('/'));
+            Planned {
+                entry: target.url_entry(&url),
+                by_hand: format!("add {url} as a connector in the app"),
+            }
         }
     }
 }
 
-/// Write `planned` into a client's configuration, replacing entries of the
-/// same name and leaving every other server alone. Returns the names
-/// written, and the servers this client's file cannot name.
-fn write_servers(
+/// Write `entry` into a client's configuration as `home-still`, replacing an
+/// entry of that name and leaving every other server alone.
+fn write_server(
     config: &mut serde_json::Value,
     target: Target,
-    planned: Vec<Planned>,
-) -> Result<(Vec<&'static str>, Vec<Planned>)> {
+    entry: serde_json::Value,
+) -> Result<()> {
     let key = target.servers_key();
     let servers = config
         .as_object_mut()
@@ -359,35 +326,18 @@ fn write_servers(
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
         .with_context(|| format!("{key} is not a JSON object"))?;
-
-    let mut written = Vec::new();
-    let mut by_hand = Vec::new();
-    for mut server in planned {
-        match server.entry.take() {
-            Some(entry) => {
-                servers.insert(server.name.to_string(), entry);
-                written.push(server.name);
-            }
-            None => by_hand.push(server),
-        }
-    }
-    Ok((written, by_hand))
+    servers.insert(TOOLS_SERVER.to_string(), entry);
+    Ok(())
 }
 
-/// Remove this project's servers from a client's configuration, returning
-/// the names that were there.
-fn remove_servers(config: &mut serde_json::Value, target: Target) -> Vec<&'static str> {
-    let Some(servers) = config
+/// Remove the `home-still` entry from a client's configuration, returning
+/// whether it was there. No other server is touched.
+fn remove_server(config: &mut serde_json::Value, target: Target) -> bool {
+    config
         .as_object_mut()
         .and_then(|obj| obj.get_mut(target.servers_key()))
         .and_then(|servers| servers.as_object_mut())
-    else {
-        return Vec::new();
-    };
-    [TOOLS_SERVER, MEMORY_SERVER]
-        .into_iter()
-        .filter(|name| servers.remove(*name).is_some())
-        .collect()
+        .is_some_and(|servers| servers.remove(TOOLS_SERVER).is_some())
 }
 
 async fn cmd_install(
@@ -413,13 +363,7 @@ async fn cmd_install(
                 download_mcp_binary(reporter).await?
             }
         };
-        reporter.status(
-            "Mode",
-            &format!(
-                "local (hs-mcp at {}, memory at {LOCAL_MEMORY_URL})",
-                mcp_bin.display()
-            ),
-        );
+        reporter.status("Mode", &format!("local (hs-mcp at {})", mcp_bin.display()));
         Mode::Local {
             mcp_bin,
             env: secrets_as_json()?,
@@ -428,41 +372,33 @@ async fn cmd_install(
 
     let mut files_written = 0usize;
     for (target, path) in &targets {
-        let mut config = read_config(path)?;
-        let (written, by_hand) = write_servers(&mut config, *target, plan(*target, &mode))?;
-        for server in &by_hand {
+        let Planned { entry, by_hand } = plan(*target, &mode);
+        let Some(entry) = entry else {
             reporter.status(
                 "Skipped",
                 &format!(
-                    "{}: {} is not written, because its file takes commands only: {}",
-                    target.label(),
-                    server.name,
-                    server.by_hand
+                    "{}: {TOOLS_SERVER} is not written, because its file takes commands only: {by_hand}",
+                    target.label()
                 ),
             );
-        }
-        if written.is_empty() {
             continue;
-        }
+        };
+        let mut config = read_config(path)?;
+        write_server(&mut config, *target, entry)?;
         write_config(path, &config)?;
         files_written += 1;
         reporter.status(
             "Installed",
-            &format!(
-                "{} ({}): {}",
-                target.label(),
-                path.display(),
-                written.join(", ")
-            ),
+            &format!("{} ({}): {TOOLS_SERVER}", target.label(), path.display()),
         );
     }
 
     if files_written == 0 {
         anyhow::bail!(
-            "Nothing was written: no client named by --client takes these servers from its file"
+            "Nothing was written: no client named by --client takes this server from its file"
         );
     }
-    reporter.finish("MCP servers configured. Restart your client to pick up the changes.");
+    reporter.finish("MCP server configured. Restart your client to pick up the changes.");
     Ok(())
 }
 
@@ -524,15 +460,15 @@ async fn cmd_uninstall(client: McpClient, reporter: &Arc<dyn Reporter>) -> Resul
         }
 
         let mut config = read_config(path)?;
-        let removed = remove_servers(&mut config, *target);
-        if removed.is_empty() {
+        let removed = remove_server(&mut config, *target);
+        if !removed {
             reporter.status("Skipped", &format!("{name} (not configured)"));
             continue;
         }
         write_config(path, &config)?;
         reporter.status(
             "Removed",
-            &format!("{name} ({}): {}", path.display(), removed.join(", ")),
+            &format!("{name} ({}): {TOOLS_SERVER}", path.display()),
         );
     }
 
@@ -624,30 +560,34 @@ mod tests {
         }
     }
 
-    /// Install into `config` and return it with the names written and the
-    /// names left for the user to add by hand.
+    /// Install into `config` and return it with whether the server was
+    /// written (`false`: this client's file cannot name it).
     fn install(
         mut config: serde_json::Value,
         target: Target,
         mode: &Mode,
-    ) -> (serde_json::Value, Vec<&'static str>, Vec<&'static str>) {
-        let (written, by_hand) = write_servers(&mut config, target, plan(target, mode)).unwrap();
-        let by_hand = by_hand.iter().map(|server| server.name).collect();
-        (config, written, by_hand)
+    ) -> (serde_json::Value, bool) {
+        let Planned { entry, .. } = plan(target, mode);
+        match entry {
+            Some(entry) => {
+                write_server(&mut config, target, entry).unwrap();
+                (config, true)
+            }
+            None => (config, false),
+        }
     }
 
-    /// An agent needs both servers: hs-mcp has no search of its own, and
-    /// the memory server has no `cite`. A client set up with one of them
-    /// can find a passage and not show it, or the other way round.
+    /// The one server an agent needs is `home-still`: it serves the
+    /// library's tools and forwards the memory and search tools to myelin,
+    /// so nothing else is written beside it.
     #[test]
-    fn a_local_install_gives_claude_code_both_servers() {
+    fn a_local_install_writes_exactly_one_entry() {
         let before = serde_json::json!({
             "theme": "dark",
             "mcpServers": { "other": { "command": "/bin/other" } }
         });
-        let (config, written, by_hand) = install(before, Target::Code, &local());
-        assert_eq!(written, ["home-still", "myelin"]);
-        assert!(by_hand.is_empty());
+        let (config, written) = install(before, Target::Code, &local());
+        assert!(written);
         assert_eq!(
             config,
             serde_json::json!({
@@ -657,31 +597,28 @@ mod tests {
                     "home-still": {
                         "command": "/opt/hs/hs-mcp",
                         "env": { "HS_BACKEND_TOKEN": "t0ken" }
-                    },
-                    "myelin": { "type": "http", "url": "http://127.0.0.1:7463/mcp" }
+                    }
                 }
             })
         );
     }
 
-    /// The gateway serves the two servers on two paths, and a trailing
-    /// slash on its URL must not double up in either.
+    /// A trailing slash on the gateway's URL must not double up in the path.
     #[test]
-    fn a_remote_install_points_each_server_at_its_own_gateway_path() {
-        let (config, written, _) = install(serde_json::json!({}), Target::Code, &remote());
-        assert_eq!(written, ["home-still", "myelin"]);
+    fn a_remote_install_points_the_entry_at_the_gateway_mcp_path() {
+        let (config, written) = install(serde_json::json!({}), Target::Code, &remote());
+        assert!(written);
         assert_eq!(
             config["mcpServers"],
             serde_json::json!({
-                "home-still": { "type": "http", "url": "https://cloud.example.com/mcp" },
-                "myelin": { "type": "http", "url": "https://cloud.example.com/memory/mcp" }
+                "home-still": { "type": "http", "url": "https://cloud.example.com/mcp" }
             })
         );
     }
 
     #[test]
     fn opencode_gets_its_own_entry_shapes_under_its_own_key() {
-        let (config, _, _) = install(serde_json::json!({}), Target::OpenCode, &local());
+        let (config, _) = install(serde_json::json!({}), Target::OpenCode, &local());
         assert_eq!(
             config["mcp"],
             serde_json::json!({
@@ -690,25 +627,31 @@ mod tests {
                     "command": ["/opt/hs/hs-mcp"],
                     "enabled": true,
                     "environment": { "HS_BACKEND_TOKEN": "t0ken" }
-                },
-                "myelin": {
-                    "type": "remote",
-                    "url": "http://127.0.0.1:7463/mcp",
-                    "enabled": true
                 }
             })
         );
         assert!(config.get("mcpServers").is_none());
+
+        let (config, _) = install(serde_json::json!({}), Target::OpenCode, &remote());
+        assert_eq!(
+            config["mcp"],
+            serde_json::json!({
+                "home-still": {
+                    "type": "remote",
+                    "url": "https://cloud.example.com/mcp",
+                    "enabled": true
+                }
+            })
+        );
     }
 
     /// Claude Desktop reads only commands from its file. A URL entry there
-    /// is an invalid one, so the server it cannot name is reported for the
-    /// user to add in the app and nothing is written for it.
+    /// is an invalid one, so in remote mode nothing is written for it and
+    /// the plan says what the user adds in the app instead.
     #[test]
     fn claude_desktop_is_never_given_a_url_entry() {
-        let (config, written, by_hand) = install(serde_json::json!({}), Target::Desktop, &local());
-        assert_eq!(written, ["home-still"]);
-        assert_eq!(by_hand, ["myelin"]);
+        let (config, written) = install(serde_json::json!({}), Target::Desktop, &local());
+        assert!(written);
         assert_eq!(
             config["mcpServers"],
             serde_json::json!({
@@ -719,40 +662,39 @@ mod tests {
             })
         );
 
-        let (config, written, by_hand) = install(serde_json::json!({}), Target::Desktop, &remote());
-        assert!(written.is_empty());
-        assert_eq!(by_hand, ["home-still", "myelin"]);
-        assert_eq!(config["mcpServers"], serde_json::json!({}));
+        let (config, written) = install(serde_json::json!({}), Target::Desktop, &remote());
+        assert!(!written);
+        assert_eq!(config, serde_json::json!({}));
+        assert_eq!(
+            plan(Target::Desktop, &remote()).by_hand,
+            "add https://cloud.example.com/mcp as a connector in the app"
+        );
     }
 
     #[test]
-    fn installing_again_replaces_the_entries_instead_of_adding_to_them() {
-        let (config, _, _) = install(serde_json::json!({}), Target::Code, &local());
-        let (config, _, _) = install(config, Target::Code, &remote());
+    fn installing_again_replaces_the_entry_instead_of_adding_to_it() {
+        let (config, _) = install(serde_json::json!({}), Target::Code, &local());
+        let (config, _) = install(config, Target::Code, &remote());
         assert_eq!(
             config["mcpServers"],
             serde_json::json!({
-                "home-still": { "type": "http", "url": "https://cloud.example.com/mcp" },
-                "myelin": { "type": "http", "url": "https://cloud.example.com/memory/mcp" }
+                "home-still": { "type": "http", "url": "https://cloud.example.com/mcp" }
             })
         );
     }
 
     #[test]
-    fn uninstall_removes_both_servers_and_nothing_else() {
+    fn uninstall_removes_the_home_still_entry_and_nothing_else() {
         for target in [Target::Code, Target::OpenCode] {
             let other = serde_json::json!({ "command": "/bin/other" });
             let mut before = serde_json::json!({ "theme": "dark" });
             before[target.servers_key()] = serde_json::json!({ "other": other });
-            let (mut config, _, _) = install(before.clone(), target, &local());
+            let (mut config, _) = install(before.clone(), target, &local());
 
-            assert_eq!(
-                remove_servers(&mut config, target),
-                ["home-still", "myelin"]
-            );
+            assert!(remove_server(&mut config, target));
             assert_eq!(config, before, "{target:?}");
-            assert!(remove_servers(&mut config, target).is_empty());
+            assert!(!remove_server(&mut config, target));
         }
-        assert!(remove_servers(&mut serde_json::json!({}), Target::Code).is_empty());
+        assert!(!remove_server(&mut serde_json::json!({}), Target::Code));
     }
 }

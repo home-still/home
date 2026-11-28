@@ -70,7 +70,7 @@ hs personal read lab-results-2024-q1-abcdef01
 
 `list` shows the most recently ingested documents first, with title, category and stem. `search` is semantic, over the `personal` store only. `read` prints the converted markdown of one stem. `--category` accepts any letter case.
 
-Agents search the same store with `recall` on the `myelin` server (`stores: ["personal"]`), list it with [`documents`](../reference/mcp-tools.md#documents) and read from it with [`read`](../reference/mcp-tools.md#read), both with `store: "personal"`.
+Agents search the same store with `recall` on the `home-still` server (`stores: ["personal"]`), list it with [`documents`](../reference/mcp-tools.md#documents) and read from it with [`read`](../reference/mcp-tools.md#read), both with `store: "personal"`.
 
 ## Re-index a document
 

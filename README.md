@@ -39,10 +39,10 @@ papers they can check. [Read more](docs/explanation/overview.md).
 
 ## Status
 
-home-still is under active development and ships as release candidates
-tagged `v0.0.1-rc.N` on
-[GitHub Releases](https://github.com/home-still/home/releases); the
-[changelog](CHANGELOG.md) lists what needs action when you upgrade.
+home-still is under active development. Releases are tagged `vX.Y.Z` on
+[GitHub Releases](https://github.com/home-still/home/releases) and release
+candidates `vX.Y.Z-rc.N`, published as pre-releases (`hs upgrade --pre`);
+the [changelog](CHANGELOG.md) lists what needs action when you upgrade.
 
 - **Platforms:** the `hs` command runs on macOS (Intel and Apple Silicon),
   Linux (x86-64 and ARM64) and Windows.

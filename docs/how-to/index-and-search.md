@@ -95,7 +95,7 @@ hs distill abstracts status
 ```
 
 `build --force` re-embeds papers that are already in it. An agent searches it
-with `recall` on the `myelin` server, naming the store: `stores: ["abstracts"]`.
+with `recall` on the `home-still` server, naming the store: `stores: ["abstracts"]`.
 
 ## Keep the index consistent
 

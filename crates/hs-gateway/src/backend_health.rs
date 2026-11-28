@@ -37,8 +37,8 @@ pub enum Reachability {
 ///
 /// The question is whether the backend can be reached from here, so any
 /// answer that is not a server error is a yes. Not every backend has an open
-/// `/health`: hs-mcp and the memory server ask for the backend token on
-/// every path and answer this probe with `401`, which proves the host, the
+/// `/health`: hs-mcp asks for the backend token on
+/// every path and answers this probe with `401`, which proves the host, the
 /// port and the firewall as well as a `200` does. The token is not sent,
 /// because sending it would turn a reachability question into an
 /// authentication one. A `5xx` is the backend saying it cannot serve (a
@@ -146,7 +146,7 @@ mod tests {
         assert_eq!(probe(&backend).await, Reachability::Answered(503));
     }
 
-    /// hs-mcp and the memory server have no open `/health`: they answer the
+    /// hs-mcp has no open `/health`: it answers the
     /// probe with `401`, or `404` behind a listener that needs no token.
     /// Both prove the backend can be reached, and reporting them as "not
     /// healthy" put a false warning in the log at every gateway start.
