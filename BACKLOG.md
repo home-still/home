@@ -1701,6 +1701,12 @@ agent and the screen together, to learn whether macOS asks for permission.
 throttle) and requires the same pid; otherwise it fails with the job's last exit status and the
 end of its `StandardErrorPath`. The systemd path follows the same rule (`MainPID` unchanged,
 unit `active`). (b) is still open: the owner does not know whether macOS asked on 2026-11-27.
+**(b) Watched at the v0.1.0 upgrade, 2026-11-28.** The restarted agent kept its pid, connected to
+NATS in the same second (16:40:31Z) and swept 161 files with no error. Its log shipping logged
+`No route to host (os error 65)` for the archive's S3 endpoint in that second (36 such lines in the
+log in all), while `curl` from an ssh shell on the Mac gets `403` from that endpoint. I could not
+see the screen, so whether macOS asked is still unknown; log shipping is the only thing seen
+failing, and its warning is logged once per start.
 
 ### P2-16. The gateway does not listen until its backend checks finish (found 2026-11-27)
 On the gateway host under rc.396 the unit started at 17:19:05Z and logged `Gateway listening` at
@@ -1760,6 +1766,17 @@ declares 718,582. pdfium refuses it (`PDF cannot be opened (pdfium error 3)`), s
 without word boxes. It has markdown and records. Download it again and replace it, or move it to
 `corrupted/`.
 
+### P2-20. The `abstracts` store holds records the build does not account for (found 2026-11-28)
+The store describes itself as one record per paper. After `hs distill abstracts build --force`,
+`stores` reports 16,835 records in 14,091 namespaces, and `hs distill abstracts status` reports
+16,288 entries indexed, 2,197 of them with a title only. One namespace read in full has four
+records, all dated 2026-11-26 (so the forced build did not change their date); the later chunks
+begin mid-sentence and read as body text with citations, so the abstract taken from its markdown
+ran into the body. **Not known:** how many of the 2,744 records beyond one per namespace are such
+chunks, whether the title-only entries have records, and whether any vector from before the pooling
+fix remains; the build reports none of this. **Change:** make `abstracts status` count records and
+namespaces per source, then compare a sample of stored abstracts with the catalog's text.
+
 ### P0-33. Agents reach myelin directly, not through home-still (found 2026-11-27, by the owner)
 The owner's requirement is one door: every myelin call an agent makes goes through home-still.
 rc.395 shipped two MCP servers instead: `home-still`, and myelin's agent surface as a second
@@ -1772,6 +1789,13 @@ call to myelin's agent surface on the memory host's loopback interface (`mcp.mye
 refuses to start when it cannot list them. The gateway's `memory` route and scope, and the second
 `hs mcp install` entry, are gone. The `myelin` client entries were removed by hand on the four
 hosts and myelin's agent listener serves loopback only.
+**Verified 2026-11-28 on v0.1.0.** On the GPU host, `bmb`, `mac_air` and `big_mac`, omp and Claude
+Code each hold one entry, `home-still`; `tools/list` through it returns 21 tools (its ten and
+myelin's eleven); `stores` lists 7, `recall` answers, `cite` finds the quote and its links answer
+200 and 206. A valid token on `/memory/mcp` gets `404 No such service`. myelin listens on
+127.0.0.1:7462 and 127.0.0.1:7463 and nowhere else. `mac_air`'s Claude Code also held
+`home-still-http`, a direct entry to port 7445 whose token variable was not set (it answered `401`);
+it was removed too.
 
 ### Owner-only items after the rc.395 cutover (2026-11-27)
 - The GPU host's firewall does not admit the gateway host on TCP 7463, so the remote memory route
@@ -1782,8 +1806,9 @@ hosts and myelin's agent listener serves loopback only.
   owner-only.
 - The old markdown tree under `<project_dir>/markdown` on the GPU host (2,845 files) is no longer
   read by anything in rc.396. It is the owner's to delete.
-- The abstracts store: 33 of 2,860 entries hold a vector from before the pooling fix until
-  `hs distill abstracts build --force` is run (at least 5 GB of GPU memory).
+- The abstracts store: 33 of 2,860 entries held a vector from before the pooling fix until
+  `hs distill abstracts build --force` was run. **Done 2026-11-28**; whether any such vector remains
+  was not measured afterwards (P2-20).
 
 ### Owner-only items after the rc.396 rollout (2026-11-27)
 - `bmb` and `big_mac`: `hs status` fails with `gateway rejected the refresh token (401)`. Their
@@ -1796,3 +1821,16 @@ hosts and myelin's agent listener serves loopback only.
   read or written.
 - The gateway host's config was edited to add the `memory` route; the copy from before is beside
   it as `config.yaml.bak-rc396-<time>`.
+
+### Owner-only items after v0.1.0 (2026-11-28)
+- **2026-12-04: delete the old Qdrant data** on the GPU host, as decided: `~/home-still/data/qdrant`,
+  the container `home-still_qdrant_1`, `~/.home-still/docker-compose-distill.yml`,
+  `~/.fastembed_cache`. It needs a session that day.
+- The firewall rule that admitted the gateway host on TCP 7463 is unused now (P0-33); remove it.
+- `~/.config/myelin/mcp.env` holds a bearer that no myelin listener checks now; delete it.
+- System units on the GPU host that nothing needs: `hs-distill-watch`, `hs-scribe-watch`,
+  `hs-serve-scribe-autotune`, `hs-serve-scribe`, and the masked `hs-serve-olmocr-vllm`.
+- The merged branches on the remote, the old clones, and the `*.bak-golive*` and `*.bak-onedoor`
+  copies on every host; the store backup under `~/backups/` when it is no longer needed.
+- Rotate `HS_SCRIBE_OPENAI_API_KEY`, and revoke the tokens issued to the old device names.
+- `five` still answers `No route to host`.
